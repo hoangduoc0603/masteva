@@ -3,13 +3,12 @@ import type { Progress, Tally } from '@/lib/progress/model';
 import { skippedLevels, tallyTopics, topicState, type RoadmapLite, type TopicState } from '@/lib/progress/roadmap';
 
 /**
- * Gắn trạng thái tiến độ lên sơ đồ đã render sẵn (hợp đồng DOM của RoadmapMap và TopicDrawer).
+ * Gắn trạng thái tiến độ lên sơ đồ đã render sẵn (hợp đồng DOM của RoadmapMap).
  * Sơ đồ do Server Component tạo, nên cập nhật bằng thuộc tính thay vì render lại phía trình duyệt.
  */
 export interface DomLabels {
   state: Record<TopicState, string>;
   stepCount: string;
-  itemCount: string;
 }
 
 const byAttr = (root: ParentNode, attr: string, value: string) =>
@@ -46,14 +45,7 @@ export function applyProgress(root: HTMLElement, lite: RoadmapLite, progress: Pr
           const label = chip.querySelector('[data-st-label]');
           if (label) label.textContent = `, ${labels.state[state]}`;
         });
-        byAttr(root, 'data-panel', topic.id).forEach((panel) => {
-          panel.querySelectorAll('[data-mark]').forEach((b) => b.setAttribute('aria-pressed', String(b.getAttribute('data-mark') === state)));
-        });
       }
     }
   }
-  root.querySelectorAll<HTMLElement>('[data-items]').forEach((el) => {
-    const ids = (el.dataset.items ?? '').split(' ').filter(Boolean);
-    el.textContent = ids.length > 0 ? format(labels.itemCount, { done: ids.filter((id) => progress.items[id]).length, total: ids.length }) : '';
-  });
 }

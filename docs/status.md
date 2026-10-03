@@ -14,6 +14,7 @@ Cập nhật lần cuối: 03/10/2026. File này giúp một session mới biế
 | **Tách roadmap** | 3 roadmap Java, DevOps, Microservices (58 chặng, 379 chủ đề, 3 cấp); sơ đồ trục giữa, view danh sách, khung chi tiết chủ đề (hash), "Tôi đã biết"; tiến độ v2 (trạng thái chủ đề, tự chuyển từ v1); 2 trang dự án; trang chủ, danh mục, breadcrumb và chip chủ đề trong bài; theme tối mặc định. Review toàn nhánh: sửa 3 lỗi (hash hỏng làm sập trang, nút "Chưa học", token import ra ngoài `src/`). Critique trang roadmap 23/40 (G0: 24/40); đã sửa hai lỗi P1 (thanh công cụ dính, vòng focus) và đổi màu Java (`#ff7a59` tối, `#be2f45` sáng). `pnpm verify` xanh: 68 unit test, 35 E2E | [spec](superpowers/specs/2026-10-03-tach-roadmap-design.md), [plan](superpowers/plans/2026-10-03-tach-roadmap.md) |
 | **Khung chi tiết chủ đề** | Sửa P0 của critique: tóm tắt, tài liệu chính thức, trạng thái trống có hướng đi, nút Trước/Tiếp, chip "Bài", "Học tiếp" vào thẳng bài khi có. Nội dung 67 chủ đề cấp Nền tảng Java (J1–J10), link kiểm 200 ngày 03/10/2026. `pnpm verify` xanh: 69 unit, 39 E2E | `design/topic-drawer.html`, `design/components/TopicDrawer.md` |
 | **Luồng Java dùng thử được** | Nội dung 145 chủ đề Java (J1–J20: tóm tắt và tài liệu chính thức, link kiểm 200 ngày 03/10/2026); 3 bài J1 (J1.1 JDK/javac/jshell và J1.3 Git, Javadoc đã kiểm chứng trên macOS 14.4.1, Java 25.0.3, Git 2.39.3; J1.2 IDE và debugger còn nháp vì có bước chỉ làm trên IDE); giao diện bài học theo Night Lab (`src/app/lesson.css`); hoàn thiện trang roadmap sau critique (một màu "đã xong", thanh Học tiếp mobile chỉ hiện khi cần, vùng chạm 44px, khung chi tiết đọc được bằng trình đọc màn hình, mở cấp thu gọn khi link trỏ vào); sửa lỗi tiến độ (nhập file, quota, `__proto__`); `format()` tách khỏi `messages.ts` (JS giảm ~11 KB gzip mỗi trang). `pnpm verify` xanh: 75 unit, 47 E2E | `content/steps/j1/`, `design/components/` |
+| **Cấp Nền tảng Java đủ bài** | 25 bài cho J2–J10 (mỗi chặng 2–3 bài, lab chạy thật bằng JDK 25.0.3, Maven 3.9.9, Docker 29.8 cho Testcontainers; tất cả đã kiểm chứng); ba reviewer độc lập soát kiến thức, đã sửa mọi lỗi (JEP 513, `strip`, HashMap treeify, quy tắc version plugin Maven, Testcontainers với Docker 29, bản nháp Idempotency-Key đã hết hạn…). D1.1 kiểm chứng trong VM Lima. Khung chi tiết tải nội dung từ `topics.json` (ADR-008): HTML trang Java 147 → 30 KB gzip. `pnpm verify` xanh: 76 unit, 47 E2E | `content/steps/j2…j10/`, `docs/architecture.md` ADR-008 |
 | Công cụ cho Claude Code | Đã cài cho project: plugin Impeccable, frontend-design, Superpowers; skill web-design-guidelines, vercel-react-best-practices | `.claude/settings.json`, `.claude/skills/` |
 
 ## Quyết định đã chốt
@@ -36,14 +37,14 @@ Repo local, nhánh mặc định `master`. Ngày 03/10/2026 có 3 commit; commit
 
 ## Bước tiếp theo
 
-1. **Người dùng thử luồng Java** trên bản build (`pnpm build && pnpm start`, hoặc cấu hình `site` trong `.claude/launch.json`), ghi lại chỗ vướng.
-2. **Bài học Java tiếp theo:** J2–J10 theo `content-standard.md`, mỗi chặng 2–3 bài như J1; J1.2 cần cách kiểm chứng cho bước làm trên IDE (người dùng tự làm theo, hoặc bổ sung quy tắc vào `content-standard.md` §4).
-3. **Sau khi luồng Java chuẩn:** nội dung chủ đề và bài cho DevOps, Microservices; đề cương hai dự án; trang `/setup`.
-4. **Kiểm chứng D1.1** trong VM Lima rồi đổi `status` sang `verified`.
+1. **Người dùng thử luồng Java cấp Nền tảng** (J1–J10, 28 bài) trên bản build, ghi lại chỗ vướng.
+2. **Bài cho cấp Middle (J11–J17) và Senior (J18–J20)** theo cùng quy trình: mỗi chặng một agent viết và chạy lab thật, rồi reviewer soát kiến thức. Cần Spring Boot, PostgreSQL, Kafka, Redis qua Docker.
+3. **J1.2** còn nháp: cần cách kiểm chứng bước làm trên IDE.
+4. **Sau khi luồng Java chuẩn:** nội dung chủ đề và bài cho DevOps, Microservices; đề cương hai dự án; trang `/setup`.
 
 ## Vấn đề đã biết
 
-- HTML trang roadmap Java 139 KB gzip khi đủ nội dung 145 chủ đề (ngân sách 150 KB). Khung chi tiết render sẵn mọi panel và nội dung bị lặp trong payload RSC. Trước khi điền nội dung DevOps (130 chủ đề) nên tách nội dung khung chi tiết ra file JSON tĩnh theo roadmap, tải khi mở khung.
+- HTML trang roadmap Java 30 KB gzip sau khi tách nội dung khung chi tiết ra `topics.json` (43 KB gzip, tải khi mở khung; ADR-008).
 - JavaScript (gzip, đo 03/10/2026 sau khi tách `format()`): roadmap 268 KB, bài học 287 KB, trang chủ 266 KB; vẫn trên ngân sách ~260 KB, phần lớn là nền React/Next.js/Fumadocs. Cần đo bằng Lighthouse.
 - Giao diện bài học dựa vào cấu trúc nội bộ của Fumadocs/Shiki (nút sao chép, màu token); có E2E bảo vệ vị trí nút "Sao chép". Không dùng `title=` cho khối code bên trong `<Terminal>`.
 - Lỗi nhỏ còn để lại: view danh sách nháy view sơ đồ lúc tải; `data-expanded` của cấp không bị gỡ khi đổi "Tôi đã biết"; ô tích ẩn của Check nằm lệch so với ô vẽ (ảnh hưởng điều khiển bằng giọng nói); trong Terminal chỉ dòng đầu có dấu `$`; khoá `lesson.reveal` và khối `@theme --color-track-*` trong `global.css` có thể không còn dùng.

@@ -1,6 +1,7 @@
 'use client';
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Level } from '@/lib/content/constants';
+import type { TopicDetail } from '@/lib/content/views';
 import { format } from '@/lib/format';
 import { getProgressStore } from '@/lib/progress/store';
 import { useProgress, useReplacements } from '@/lib/progress/use-progress';
@@ -10,6 +11,7 @@ import { usePref } from '@/lib/prefs';
 import { useMessages } from '@/components/messages-provider';
 import { applyProgress } from './roadmap-dom';
 import { HIDE_KEY, VIEW_KEY } from './roadmap-prefs';
+import { TopicDrawer } from './topic-drawer';
 
 /**
  * Phần tương tác của trang roadmap: nút "Học tiếp", "Tôi đã biết", view đang chọn,
@@ -45,6 +47,43 @@ export function RoadmapClient({
   const start = progress.start[lite.id];
   const rootId = `roadmap-${lite.id}`;
   const hashChecked = useRef(false);
+  const topicIds = useMemo(() => new Set(lite.levels.flatMap((l) => l.steps.flatMap((s) => s.topics.map((tp) => tp.id)))), [lite]);
+  // Khung chi tiết: chủ đề đang mở và nội dung tải từ `topics.json` khi mở lần đầu.
+  const [active, setActive] = useState<string | null>(null);
+  const [details, setDetails] = useState<Record<string, TopicDetail> | null>(null);
+  const [failed, setFailed] = useState(false);
+  // Việc làm sau khi panel mới render xong: focus (nút cùng hướng hoặc tiêu đề) và đọc tên chủ đề.
+  const afterRender = useRef<{ rel: string | null } | null>(null);
+
+  useEffect(() => {
+    if (!active || details || failed) return;
+    let cancelled = false;
+    fetch(`/${lang}/roadmaps/${lite.id}/topics.json`)
+      .then((r) => (r.ok ? (r.json() as Promise<Record<string, TopicDetail>>) : Promise.reject(new Error(String(r.status)))))
+      .then((data) => {
+        if (!cancelled) setDetails(data);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [active, details, failed, lang, lite.id]);
+
+  useEffect(() => {
+    const dialog = document.getElementById(rootId)?.querySelector('dialog[data-drawer]');
+    const panel = active ? dialog?.querySelector<HTMLElement>(`[data-panel="${CSS.escape(active)}"]`) : null;
+    if (!dialog || !panel) return;
+    dialog.scrollTop = 0;
+    const pending = afterRender.current;
+    if (!pending) return;
+    afterRender.current = null;
+    const same = pending.rel ? panel.querySelector<HTMLElement>(`.rm-panel-nav a[rel="${pending.rel}"]`) : null;
+    (same ?? panel.querySelector<HTMLElement>('.rm-panel-t'))?.focus();
+    const live = dialog.querySelector('[data-live]');
+    if (live) live.textContent = panel.querySelector('.rm-panel-t')?.textContent ?? '';
+  }, [rootId, active, details]);
 
   useEffect(() => {
     const root = document.getElementById(rootId);
@@ -71,7 +110,7 @@ export function RoadmapClient({
   useEffect(() => {
     const root = document.getElementById(rootId);
     if (!root) return;
-    applyProgress(root, lite, progress, nextTopic(progress, lite)?.step.id, { state: t.roadmap.state, stepCount: t.roadmap.stepCount, itemCount: t.roadmap.itemCount });
+    applyProgress(root, lite, progress, nextTopic(progress, lite)?.step.id, { state: t.roadmap.state, stepCount: t.roadmap.stepCount });
     // Tải thẳng URL có hash trỏ vào cấp đã thu gọn: chỉ biết cấp nào thu gọn sau khi đọc tiến độ thật
     // (lần render hydrate dùng snapshot rỗng), nên mở cấp ở đây, đúng một lần.
     if (!hashChecked.current && progress === getProgressStore().getSnapshot().progress) {
@@ -90,7 +129,6 @@ export function RoadmapClient({
     let keepHash = false;
 
     const reveal = revealLevel;
-    const live = dialog.querySelector<HTMLElement>('[data-live]');
     // Chip có thể đang ẩn (cấp thu gọn, "ẩn mục đã bỏ qua"): khi đó trả focus về tiêu đề chặng hoặc thanh công cụ.
     const focusBack = (el: HTMLElement | null) => {
       if (el?.checkVisibility()) return el.focus();
@@ -101,9 +139,8 @@ export function RoadmapClient({
       }
       root.querySelector<HTMLElement>('.rm-toolbar button')?.focus();
     };
-    const open = (id: string) => {
-      const panel = dialog.querySelector<HTMLElement>(`[data-panel="${CSS.escape(id)}"]`);
-      if (!panel) {
+    const open = (id: string): boolean => {
+      if (!topicIds.has(id)) {
         const target = document.getElementById(id);
         if (target) {
           reveal(target);
@@ -114,19 +151,15 @@ export function RoadmapClient({
           keepHash = true;
           dialog.close();
         }
-        return;
+        return false;
       }
-      dialog.querySelectorAll<HTMLElement>('[data-panel]').forEach((p) => {
-        p.hidden = p !== panel;
-      });
-      dialog.setAttribute('aria-labelledby', `t-${id}`);
-      dialog.scrollTop = 0;
+      setActive(id);
       // Đóng khung thì trả focus về chip của chủ đề đang xem, kể cả sau khi bấm Trước/Tiếp.
       opener = root.querySelector<HTMLElement>(`[data-topic="${CSS.escape(id)}"]`) ?? opener;
       reveal(opener);
       opener?.scrollIntoView({ block: 'center' });
       if (!dialog.open) dialog.showModal();
-      return panel;
+      return true;
     };
     const fromHash = () => {
       // Mã chủ đề chỉ gồm ký tự ASCII (topicIdPattern) nên không cần giải mã; hash như `#%` không làm hỏng trang.
@@ -143,13 +176,8 @@ export function RoadmapClient({
         event.preventDefault();
         const id = inPanel.hash.slice(1);
         window.history.replaceState(null, '', `#${id}`);
-        const panel = open(id);
-        if (!panel) return;
         // Giữ focus trên nút cùng hướng để bấm liên tiếp; link khác thì focus tiêu đề panel mới.
-        const rel = inPanel.getAttribute('rel');
-        const same = rel ? panel.querySelector<HTMLElement>(`.rm-panel-nav a[rel="${rel}"]`) : null;
-        (same ?? panel.querySelector<HTMLElement>('.rm-panel-t'))?.focus();
-        if (live) live.textContent = panel.querySelector('.rm-panel-t')?.textContent ?? '';
+        if (open(id)) afterRender.current = { rel: inPanel.getAttribute('rel') };
         return;
       }
       const chip = target.closest<HTMLElement>('a[data-topic]');
@@ -187,6 +215,7 @@ export function RoadmapClient({
         focusBack(opener);
       }
       opener = null;
+      setActive(null);
     };
 
     root.addEventListener('click', onClick);
@@ -198,7 +227,7 @@ export function RoadmapClient({
       dialog.removeEventListener('close', onClose);
       window.removeEventListener('hashchange', fromHash);
     };
-  }, [rootId, lite]);
+  }, [rootId, lite, topicIds]);
 
   // Nhãn cộng dồn ("Nền tảng", "Nền tảng + Middle") để rõ là đã biết đến hết cấp nào.
   const knownOptions = [
@@ -247,6 +276,14 @@ export function RoadmapClient({
           {ctaLabel}
         </a>
       ) : null}
+      <TopicDrawer
+        activeId={active}
+        detail={active ? details?.[active] : undefined}
+        failed={failed}
+        progress={progress}
+        roadmapId={lite.id}
+        lang={lang}
+      />
     </>
   );
 }

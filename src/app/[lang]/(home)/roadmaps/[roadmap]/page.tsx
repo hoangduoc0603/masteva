@@ -7,7 +7,6 @@ import { loadRoadmaps } from '@/lib/content/repo';
 import { getReplacements, getRoadmapView } from '@/lib/content/manifest';
 import { toLite } from '@/lib/content/views';
 import { RoadmapMap } from '@/components/roadmap/roadmap-map';
-import { TopicDrawer } from '@/components/roadmap/topic-drawer';
 import { RoadmapToolbar } from '@/components/roadmap/roadmap-toolbar';
 import { RoadmapClient } from '@/components/roadmap/roadmap-client';
 import { ProgressTransfer } from '@/components/progress/progress-transfer';
@@ -62,7 +61,6 @@ export default async function RoadmapPage(props: PageProps<'/[lang]/roadmaps/[ro
       </header>
       <RoadmapToolbar />
       <RoadmapMap view={view} lang={lang} t={t} />
-      <TopicDrawer view={view} lang={lang} t={t} />
       <section className="rm-xfer" aria-labelledby="progress-transfer">
         <h2 id="progress-transfer" className="rm-xfer-t">
           {t.progress.title}

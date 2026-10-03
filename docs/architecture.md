@@ -145,7 +145,7 @@ Lý do dùng component thay cho tiêu đề Markdown: vừa kiểm soát đượ
 
 ### 5.5 Manifest
 
-Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` và dựng cây roadmap → bước → bài → danh sách mã mục, cùng bảng mã thay thế. Server component truyền phần cần thiết xuống trình duyệt qua props, nên không có file JSON công khai riêng và không có file sinh ra cần quản lý. Trình duyệt dùng dữ liệu này để tính tiến độ mà không phải tải nội dung bài.
+Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` và dựng cây roadmap → bước → bài → danh sách mã mục, cùng bảng mã thay thế. Server component truyền phần cần thiết xuống trình duyệt qua props; trình duyệt dùng dữ liệu này để tính tiến độ mà không phải tải nội dung bài. Ngoại lệ duy nhất là nội dung khung chi tiết chủ đề (ADR-008): route handler tĩnh `src/app/[lang]/(home)/roadmaps/[roadmap]/topics.json/route.ts` sinh `/<lang>/roadmaps/<roadmap>/topics.json` lúc build, trang roadmap chỉ tải file này khi người học mở khung lần đầu.
 
 ## 6. Định tuyến và đa ngôn ngữ
 
@@ -276,6 +276,7 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 | ADR-004 | Tiến độ lưu trên trình duyệt ở G0–G2; Supabase cùng RLS ở G3 | Chưa cần tài khoản để có giá trị; G3 vẫn giữ được static export | Tiến độ không theo người học sang máy khác cho tới G3, trừ khi xuất/nhập file | Đã chấp nhận (03/10/2026) |
 | ADR-005 | Tokenizer tìm kiếm riêng cho tiếng Việt | Người Việt hay gõ không dấu; bộ tách từ mặc định có thể cắt nhầm chữ có dấu | Phải tự viết và kiểm thử | Đã chấp nhận (03/10/2026), đã kiểm chứng ở G0 |
 | ADR-006 | Nội dung chung repo với code, nằm trong `content/` | Đơn giản cho một người vận hành; tách repo sau vẫn dễ | Người đóng góp nội dung phải làm việc trong repo có code | Đã chấp nhận (03/10/2026) |
+| ADR-008 | Nội dung khung chi tiết chủ đề nằm trong file JSON tĩnh theo roadmap, tải khi mở khung | Render sẵn mọi panel làm HTML trang Java lên 147 KB gzip (ngân sách 150 KB), vì Next lặp nội dung server component trong payload RSC; tách ra còn 30 KB HTML và 43 KB JSON tải sau | Tóm tắt chủ đề không còn trong HTML (SEO kém hơn một chút); lần mở khung đầu tiên chờ một request; panel render phía trình duyệt (+1,5 KB JS) | Đã chấp nhận (04/10/2026) |
 | ADR-007 | Giấy phép: CC BY-NC-SA 4.0 cho nội dung, MIT cho code mẫu trong `labs/` | Cho chia sẻ nội dung nhưng không cho dùng thương mại; code mẫu dùng tự do | CC BY-NC-SA hạn chế cả đối tác thương mại muốn dùng lại | Đã chấp nhận (03/10/2026) |
 
 ## 15. Truy vết yêu cầu tới thiết kế (G0–G1)

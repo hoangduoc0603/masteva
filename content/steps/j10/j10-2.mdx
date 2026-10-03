@@ -1,0 +1,668 @@
+---
+title: Idempotency, phân trang và versioning
+description: Làm cho POST retry an toàn bằng Idempotency-Key, phân trang danh sách theo cursor kèm lọc và sắp xếp, chạy song song hai phiên bản API và báo ngừng hỗ trợ bằng Deprecation và Sunset.
+id: j10.2
+step: j10
+prerequisites: [j10.1]
+topics: [j10.idempotency, j10.phan-trang-loc-sap-xep, j10.versioning]
+status: verified
+verified:
+  date: 2026-10-03
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    curl: 8.4.0
+---
+
+<Goal>
+
+Thiết kế được ba thứ mà API nào sống đủ lâu cũng cần: retry an toàn, danh sách lớn, và thay đổi không làm hỏng client cũ. Học xong bài này, bạn giải thích được:
+
+- Vì sao mạng chập chờn một giây có thể tạo ra hai đơn hàng giống hệt, và `Idempotency-Key` chặn chuyện đó thế nào.
+- Vì sao phân trang bằng `offset` làm người dùng thấy một đơn hai lần khi có đơn mới chen vào.
+- Đổi tên một field trong JSON là thay đổi phá vỡ, còn thêm field thì thường không.
+
+</Goal>
+
+<Knowledge>
+
+### Idempotency và retry
+
+Một request **idempotent** là request gửi nhiều lần để lại trên server cùng trạng thái như gửi một lần. Điều được so sánh là **trạng thái**, không phải response: `DELETE /orders/3` lần đầu trả `204`, lần hai trả `404`, nhưng sau cả hai lần đơn 3 đều không còn. Theo RFC 9110, `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE` là idempotent; `POST` thì không.
+
+Tính chất này quan trọng vì client **không phân biệt được** "request không tới server" với "server đã xử lý nhưng response bị mất":
+
+```text
+ Không có khoá                          Có Idempotency-Key: "k1"
+ client            server               client                server
+   | POST /orders     |                   | POST, k1             |
+   |----------------->| tạo đơn 2         |--------------------->| tạo đơn 2, lưu k1 -> kết quả
+   |   x  timeout     |                   |   x  timeout         |
+   | POST /orders     |                   | POST, k1 (gửi lại)   |
+   |----------------->| tạo đơn 3 (trùng) |--------------------->| thấy k1: trả lại kết quả đã lưu
+   |<-----------------|                   |<---------------------|
+```
+
+Bản nháp IETF "The Idempotency-Key HTTP Header Field" mô tả cách làm bên phải:
+
+- Client sinh một khoá duy nhất cho **mỗi thao tác** (thường là UUID), gửi trong header `Idempotency-Key`, và dùng lại đúng khoá đó khi retry.
+- Server lưu khoá cùng kết quả. Gặp lại khoá với cùng nội dung: trả lại kết quả cũ, không làm lại.
+- Cùng khoá nhưng body khác: `422`. Request trước với khoá đó còn đang xử lý: `409`. Bắt buộc có khoá mà thiếu: `400`.
+- Khoá có thời hạn (ví dụ 24 giờ), ghi rõ trong tài liệu API.
+
+Lab so sánh body bằng một **fingerprint** (dấu vân tay): phiên bản API cộng body sau khi đọc và ghi lại, nên khác biệt về khoảng trắng không tính. Đây vẫn là bản nháp (bản -07, 10/2025, đã hết hạn), chưa thành RFC; nhưng Stripe và nhiều cổng thanh toán đã dùng cách này từ lâu.
+
+<Callout kind="production">
+
+App thanh toán gửi `POST /payments`, mạng 4G mất 5 giây nên app báo lỗi, người dùng bấm "Thanh toán" lần nữa. Server đã xử lý cả hai: khách bị trừ tiền hai lần. Cách sửa là app sinh `Idempotency-Key` **lúc mở màn hình thanh toán**, không phải lúc bấm nút, và giữ khoá đó cho mọi lần thử lại.
+
+</Callout>
+
+<Check id="j10.2.idempotency-concept">Giải thích được idempotent nghĩa là gì, vì sao POST không idempotent, và server dùng `Idempotency-Key` để retry an toàn ra sao.</Check>
+
+### Phân trang, lọc và sắp xếp
+
+API không bao giờ nên trả toàn bộ một bảng có thể lớn mãi. Có hai cách chia trang:
+
+| | Offset: `?offset=40&limit=20` | Cursor: `?pageToken=...&limit=20` |
+|---|---|---|
+| Server làm gì | Bỏ qua 40 dòng đầu, lấy 20 | Lấy 20 dòng đứng **sau** phần tử cuối của trang trước |
+| Nhảy tới trang 37 | Được | Không, chỉ đi tuần tự |
+| Có phần tử mới chen vào | Mọi thứ dịch đi: thấy trùng hoặc bị sót | Không ảnh hưởng trang tiếp theo |
+| Chi phí với database | `OFFSET 100000` vẫn phải đọc qua 100.000 dòng | Dùng index để nhảy thẳng tới vị trí |
+
+```text
+ Sắp xếp giảm dần theo amount, limit=2
+ Trước khi có đơn mới:  [Bình 450k, Dũng 450k] | [An 300k, An 120k] | ...
+ Đơn Em 500k chen vào:  [Em 500k, Bình 450k] | [Dũng 450k, An 300k] | ...
+ Offset trang 2 (bỏ 2): Dũng 450k, An 300k      -> Dũng xuất hiện lần thứ hai
+ Cursor "sau Dũng":     An 300k, An 120k        -> không trùng, không sót
+```
+
+Cursor lưu **giá trị sắp xếp và id** của phần tử cuối trang. Phải có id để phá thế hoà: hai đơn cùng 450.000 đồng vẫn có thứ tự xác định. Theo AIP-158, token phải **mờ** (opaque): client chỉ chuyền nó đi, không đọc hay tự tạo; server được đổi cách mã hoá bất cứ lúc nào. Token cũng chỉ hợp lệ với đúng bộ lọc và cách sắp xếp đã sinh ra nó. Lab đóng gói token bằng Base64 cho gọn. Base64 chỉ là mã hoá, không che giấu: ai cũng giải ra và sửa được. Production nên ký (HMAC) hoặc mã hoá token.
+
+Quy ước tham số trong lab, theo tinh thần AIP-132:
+
+| Tham số | Ví dụ | Ghi chú |
+|---|---|---|
+| Lọc | `status=NEW`, `customer=Bình` | Tên tham số trùng tên field |
+| Sắp xếp | `sort=-amount` | Dấu `-` là giảm dần; chỉ nhận field có trong danh sách cho phép |
+| Cỡ trang | `limit=20` | Có mặc định và giới hạn trên (100). Lab chọn từ chối giá trị vượt (`400`) cho chặt; AIP-158 gợi ý hạ về mức tối đa thay vì báo lỗi |
+| Trang sau | `pageToken=...` | Lấy từ `nextPageToken`; không có field này nghĩa là trang cuối |
+
+Link tới trang sau nằm ở cả body (`nextPageToken`) và header `Link: <...>; rel="next"` theo RFC 8288, để client chung chung đi theo được mà không cần hiểu body.
+
+<Check id="j10.2.cursor-vs-offset">Giải thích được vì sao offset làm trùng hoặc sót phần tử khi dữ liệu thay đổi, và cursor cần những gì để tránh điều đó.</Check>
+
+### Versioning
+
+Client của API (app di động, đối tác, service khác) không cập nhật cùng lúc với bạn. Vì vậy phải phân biệt hai loại thay đổi:
+
+| Tương thích (không cần phiên bản mới) | Phá vỡ (cần phiên bản mới) |
+|---|---|
+| Thêm field mới vào response | Đổi tên hoặc xoá field |
+| Thêm endpoint mới | Đổi kiểu field, ví dụ số thành object |
+| Thêm tham số tuỳ chọn | Thêm tham số bắt buộc |
+| Thêm giá trị enum, nếu client được dặn bỏ qua giá trị lạ | Đổi ý nghĩa của status code hay field |
+
+Cách gắn phiên bản phổ biến:
+
+| Cách | Ví dụ | Ưu | Nhược |
+|---|---|---|---|
+| Đường dẫn | `/v2/orders` | Dễ thấy, dễ route, dễ cache | URL của cùng một resource đổi theo phiên bản |
+| Header | `Api-Version: 2` | URL ổn định | Khó thử bằng trình duyệt, dễ quên |
+| Media type | `Accept: application/vnd.shop.v2+json` | Đúng tinh thần HTTP nhất | Phức tạp với client và tài liệu |
+
+Lab dùng đường dẫn. Phiên bản `v2` đổi `total` thành hai field `amount` và `currency`, chuẩn bị cho việc bán bằng ngoại tệ; đó là thay đổi phá vỡ. Phiên bản cũ không bị tắt ngay mà được **báo trước** bằng ba header:
+
+| Header | Chuẩn | Ý nghĩa | Lab trả |
+|---|---|---|---|
+| `Deprecation` | RFC 9745 | Từ thời điểm này, không nên dùng nữa | `@1790812800` (01/10/2026, dạng Unix time) |
+| `Sunset` | RFC 8594 | Thời điểm sẽ ngừng hẳn; không được sớm hơn `Deprecation` | `Thu, 01 Apr 2027 00:00:00 GMT` |
+| `Link` | RFC 8288 (rel `deprecation` từ RFC 9745) | Trang hướng dẫn chuyển đổi, `rel="deprecation"` | Một URL tài liệu |
+
+<Callout kind="production">
+
+Ứng dụng di động không ép được mọi người cập nhật: một năm sau khi ra `v2`, vẫn còn vài phần trăm người dùng chạy bản app gọi `v1`. Nhóm vận hành theo dõi lượng request còn vào `v1` (nhờ log có phiên bản trong path), gửi header `Deprecation` và `Sunset` từ sớm để SDK và đối tác in cảnh báo, rồi mới tắt `v1` khi lượng gọi đủ nhỏ.
+
+</Callout>
+
+<Check id="j10.2.breaking-change">Phân loại được một thay đổi API là tương thích hay phá vỡ, và nêu được cách báo trước khi ngừng một phiên bản.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [RFC 9110: Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110.html#name-idempotent-methods): định nghĩa chính thức, ngắn, đọc hết mục 9.2.2.
+- [The Idempotency-Key HTTP Header Field](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/): bản nháp IETF (đã hết hạn, chưa thành RFC); đọc phần "Error Scenarios" để biết status code cho từng tình huống.
+- [AIP-158: Pagination](https://google.aip.dev/158): quy tắc page token, page size và tham số phải giữ nguyên giữa các trang.
+- [AIP-185: API Versioning](https://google.aip.dev/185): cách Google đánh phiên bản và định nghĩa thay đổi tương thích.
+- [RFC 9745: The Deprecation HTTP Response Header Field](https://www.rfc-editor.org/rfc/rfc9745.html): cú pháp header `Deprecation` và quan hệ với `Sunset`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài J10.1, có `~/masteva-j10` với bảy file nguồn. Hai tab Terminal như bài trước. Các lệnh giống nhau trên Mac và Linux.
+
+### 1. Thay OrdersApi.java
+
+File mới giữ mọi thứ của bài J10.1 và thêm ba việc: phục vụ cả `/v1` và `/v2`, idempotency cho `POST`, phân trang có lọc và sắp xếp cho `GET` collection. Các file khác giữ nguyên.
+
+<Terminal where="mac" title="Thay src/OrdersApi.java">
+
+```bash
+cd ~/masteva-j10
+cat > src/OrdersApi.java <<'EOF'
+import com.sun.net.httpserver.HttpExchange;
+import java.io.IOException;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** /v1/orders và /v2/orders: idempotency cho POST, phân trang theo cursor, hai phiên bản biểu diễn. */
+public class OrdersApi {
+    private static final List<String> STATUSES = List.of("NEW", "PAID", "CANCELLED");
+    private final Map<Long, Order> orders = new ConcurrentSkipListMap<>();
+    private final AtomicLong nextId = new AtomicLong(1);
+    private final Map<String, Saved> idempotency = new ConcurrentHashMap<>();
+
+    /** Kết quả đã trả cho một Idempotency-Key, cùng dấu vân tay của request đã tạo ra nó. */
+    private record Saved(String fingerprint, String location, Object body) {}
+
+    public void handle(HttpExchange ex) throws IOException {
+        Http.requireAcceptJson(ex);
+        String path = ex.getRequestURI().getPath();
+        String[] parts = path.split("/");
+        if (parts.length < 3 || parts.length > 4 || !List.of("v1", "v2").contains(parts[1])
+                || !parts[2].equals("orders")) {
+            throw new ApiException(404, "not-found", "Không có resource " + path);
+        }
+        String version = parts[1];
+        if (version.equals("v1")) {
+            var headers = ex.getResponseHeaders();
+            headers.set("Deprecation", "@1790812800"); // 2026-10-01T00:00:00Z
+            headers.set("Sunset", "Thu, 01 Apr 2027 00:00:00 GMT");
+            headers.add("Link", "<https://example.com/docs/orders-v2>; rel=\"deprecation\"; type=\"text/html\"");
+        }
+        String method = ex.getRequestMethod();
+        if (parts.length == 3) {
+            switch (method) {
+                case "GET" -> list(ex, version);
+                case "POST" -> create(ex, version);
+                default -> notAllowed(ex, "GET, POST");
+            }
+            return;
+        }
+        Order order = find(parts[3]);
+        switch (method) {
+            case "GET" -> Http.json(ex, 200, toJson(order, version));
+            case "PATCH" -> changeStatus(ex, order, version);
+            case "DELETE" -> delete(ex, order);
+            default -> notAllowed(ex, "GET, PATCH, DELETE");
+        }
+    }
+
+    private synchronized void create(HttpExchange ex, String version) throws IOException {
+        Map<String, Object> body = Http.readJson(ex);
+        String key = ex.getRequestHeaders().getFirst("Idempotency-Key");
+        String fingerprint = version + " " + Json.write(body);
+        if (key != null) {
+            key = key.replace("\"", "");
+            Saved saved = idempotency.get(key);
+            if (saved != null && !saved.fingerprint().equals(fingerprint)) {
+                throw new ApiException(422, "idempotency-key-reused", "Idempotency-Key này đã dùng cho một request khác");
+            }
+            if (saved != null) {
+                ex.getResponseHeaders().set("Location", saved.location());
+                Http.json(ex, 201, saved.body());
+                return;
+            }
+        }
+        String amountField = version.equals("v1") ? "total" : "amount";
+        var errors = new ArrayList<Map<String, String>>();
+        if (!(body.get("customer") instanceof String c) || c.isBlank()) {
+            errors.add(Errors.field("customer", "bắt buộc, là chuỗi khác rỗng"));
+        }
+        if (!(body.get(amountField) instanceof Long t) || t <= 0) {
+            errors.add(Errors.field(amountField, "bắt buộc, là số nguyên dương (đồng)"));
+        }
+        if (version.equals("v2") && !"VND".equals(body.get("currency"))) {
+            errors.add(Errors.field("currency", "hiện chỉ hỗ trợ VND"));
+        }
+        if (!errors.isEmpty()) {
+            throw new ApiException(422, "validation-failed", "Dữ liệu đơn hàng không hợp lệ", errors);
+        }
+        var order = new Order(nextId.getAndIncrement(), (String) body.get("customer"), (Long) body.get(amountField), "NEW");
+        orders.put(order.id(), order);
+        String location = "/" + version + "/orders/" + order.id();
+        Object json = toJson(order, version);
+        if (key != null) idempotency.put(key, new Saved(fingerprint, location, json));
+        ex.getResponseHeaders().set("Location", location);
+        Http.json(ex, 201, json);
+    }
+
+    private void list(HttpExchange ex, String version) throws IOException {
+        Map<String, String> query = query(ex);
+        String status = query.get("status");
+        if (status != null && !STATUSES.contains(status)) {
+            throw new ApiException(400, "invalid-query", "status phải là NEW, PAID hoặc CANCELLED");
+        }
+        String customer = query.get("customer");
+        String sort = query.getOrDefault("sort", "id");
+        String limitText = query.getOrDefault("limit", "20");
+        if (!limitText.matches("\\d{1,3}") || Integer.parseInt(limitText) < 1 || Integer.parseInt(limitText) > 100) {
+            throw new ApiException(400, "invalid-query", "limit phải từ 1 đến 100");
+        }
+        int limit = Integer.parseInt(limitText);
+        Comparator<Order> comparator = comparator(sort, version);
+        String scope = version + "|" + status + "|" + customer + "|" + sort;
+        Order after = query.containsKey("pageToken") ? decodeToken(query.get("pageToken"), scope) : null;
+
+        List<Order> matched = orders.values().stream()
+                .filter(o -> status == null || o.status().equals(status))
+                .filter(o -> customer == null || o.customer().equals(customer))
+                .sorted(comparator)
+                .filter(o -> after == null || comparator.compare(o, after) > 0)
+                .limit(limit + 1)
+                .toList();
+        List<Order> page = matched.size() > limit ? matched.subList(0, limit) : matched;
+        var body = new LinkedHashMap<String, Object>();
+        body.put("items", page.stream().map(o -> toJson(o, version)).toList());
+        if (matched.size() > limit) {
+            String token = encodeToken(page.getLast(), scope);
+            body.put("nextPageToken", token);
+            query.put("pageToken", token);
+            var pairs = new ArrayList<String>();
+            query.forEach((k, v) -> pairs.add(k + "=" + URLEncoder.encode(v, StandardCharsets.UTF_8)));
+            ex.getResponseHeaders().add("Link", "<" + ex.getRequestURI().getPath() + "?" + String.join("&", pairs) + ">; rel=\"next\"");
+        }
+        Http.json(ex, 200, body);
+    }
+
+    private static Comparator<Order> comparator(String sort, String version) {
+        String amountField = version.equals("v1") ? "total" : "amount";
+        String field = sort.startsWith("-") ? sort.substring(1) : sort;
+        Comparator<Order> comparator;
+        if (field.equals("id")) {
+            comparator = Comparator.comparingLong(Order::id);
+        } else if (field.equals(amountField)) {
+            comparator = Comparator.comparingLong(Order::total);
+        } else {
+            throw new ApiException(400, "invalid-query", "sort chỉ nhận id, -id, " + amountField + ", -" + amountField);
+        }
+        if (sort.startsWith("-")) comparator = comparator.reversed();
+        return comparator.thenComparingLong(Order::id); // id là duy nhất: thứ tự luôn xác định
+    }
+
+    /** Cursor = giá trị sắp xếp và id của phần tử cuối trang, kèm phạm vi truy vấn, mã hoá Base64 URL (không che giấu; production nên ký HMAC). */
+    private static String encodeToken(Order last, String scope) {
+        String raw = last.total() + ":" + last.id() + ":" + scope;
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static Order decodeToken(String token, String scope) {
+        try {
+            String[] p = new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8).split(":", 3);
+            if (p.length == 3 && p[2].equals(scope)) {
+                return new Order(Long.parseLong(p[1]), "", Long.parseLong(p[0]), "");
+            }
+        } catch (IllegalArgumentException e) {
+            // token hỏng: rơi xuống lỗi 400 bên dưới
+        }
+        throw new ApiException(400, "invalid-query", "pageToken không hợp lệ hoặc không khớp bộ lọc và cách sắp xếp");
+    }
+
+    private static Map<String, String> query(HttpExchange ex) {
+        var result = new LinkedHashMap<String, String>();
+        String raw = ex.getRequestURI().getRawQuery();
+        if (raw == null) return result;
+        try {
+            for (String pair : raw.split("&")) {
+                String[] kv = pair.split("=", 2);
+                result.put(URLDecoder.decode(kv[0], StandardCharsets.UTF_8),
+                        kv.length == 2 ? URLDecoder.decode(kv[1], StandardCharsets.UTF_8) : "");
+            }
+        } catch (IllegalArgumentException e) {
+            throw new ApiException(400, "invalid-query", "Query string mã hoá sai");
+        }
+        return result;
+    }
+
+    private void changeStatus(HttpExchange ex, Order order, String version) throws IOException {
+        Map<String, Object> body = Http.readJson(ex);
+        String status = (String) body.get("status");
+        if (status == null || !STATUSES.contains(status)) {
+            throw new ApiException(422, "validation-failed", "Trạng thái không hợp lệ",
+                    List.of(Errors.field("status", "một trong NEW, PAID, CANCELLED")));
+        }
+        boolean allowed = status.equals(order.status()) || order.status().equals("NEW");
+        if (!allowed) {
+            throw new ApiException(409, "invalid-state",
+                    "Không chuyển được đơn " + order.id() + " từ " + order.status() + " sang " + status);
+        }
+        Order updated = order.withStatus(status);
+        orders.put(updated.id(), updated);
+        Http.json(ex, 200, toJson(updated, version));
+    }
+
+    private void delete(HttpExchange ex, Order order) throws IOException {
+        if (order.status().equals("PAID")) {
+            throw new ApiException(409, "invalid-state", "Đơn " + order.id() + " đã thanh toán, không xoá được");
+        }
+        orders.remove(order.id());
+        Http.send(ex, 204, null, null);
+    }
+
+    private Order find(String rawId) {
+        Order order = rawId.matches("\\d{1,18}") ? orders.get(Long.parseLong(rawId)) : null;
+        if (order == null) throw new ApiException(404, "not-found", "Không có đơn hàng " + rawId);
+        return order;
+    }
+
+    private static void notAllowed(HttpExchange ex, String allow) {
+        ex.getResponseHeaders().set("Allow", allow);
+        throw new ApiException(405, "method-not-allowed", ex.getRequestMethod() + " không dùng được ở đây");
+    }
+
+    private Map<String, Object> toJson(Order o, String version) {
+        var json = new LinkedHashMap<String, Object>();
+        json.put("id", o.id());
+        json.put("customer", o.customer());
+        if (version.equals("v1")) {
+            json.put("total", o.total());
+        } else {
+            json.put("amount", o.total());
+            json.put("currency", "VND");
+        }
+        json.put("status", o.status());
+        return json;
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Những phần mới đáng đọc:
+
+- `handle` thêm ba header `Deprecation`, `Sunset`, `Link` cho mọi phản hồi của `v1`. `toJson` và `create` chọn tên field theo phiên bản; dữ liệu bên dưới vẫn là một `Order`.
+- `create` đọc body rồi tra `Idempotency-Key` trước khi kiểm tra dữ liệu và tạo đơn. Method có `synchronized` để hai request cùng khoá tới cùng lúc không cùng tạo đơn; điều này chỉ đúng khi có **một** instance server (xem phần Đào sâu).
+- `list` lọc, sắp xếp, rồi chỉ lấy phần tử đứng sau cursor. Nó lấy `limit + 1` phần tử: có phần tử thứ `limit + 1` nghĩa là còn trang sau, không cần đếm tổng.
+
+Tắt server cũ bằng Ctrl+C ở tab 1, rồi biên dịch và chạy lại:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j10 && javac -d out src/*.java && java -cp out Main
+```
+
+</Terminal>
+
+### 2. Hai phiên bản trên cùng dữ liệu
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -w '\n' -X POST http://localhost:8765/v1/orders -H 'Content-Type: application/json' -d '{"customer":"An","total":120000}'
+curl -si -w '\n' http://localhost:8765/v1/orders/1
+curl -s -w '\n' http://localhost:8765/v2/orders/1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":1,"customer":"An","total":120000,"status":"NEW"}
+HTTP/1.1 200 OK
+Sunset: Thu, 01 Apr 2027 00:00:00 GMT
+Content-type: application/json
+Deprecation: @1790812800
+Content-length: 54
+Link: <https://example.com/docs/orders-v2>; rel="deprecation"; type="text/html"
+Cache-control: no-store
+
+{"id":1,"customer":"An","total":120000,"status":"NEW"}
+{"id":1,"customer":"An","amount":120000,"currency":"VND","status":"NEW"}
+```
+
+</Expected>
+
+`-s` tắt thanh tiến trình của curl, `-si` là `-s` cộng `-i`; `-w '\n'` xuống dòng sau body như ở bài J10.1. Cùng đơn 1, `v1` thấy `total`, `v2` thấy `amount` và `currency`. Client `v1` cũ vẫn chạy, đồng thời được báo hạn chót để chuyển. Từ đây bài dùng `v2`.
+
+<Check id="j10.2.lab-versions">Gọi được cùng một đơn qua `v1` và `v2`, chỉ ra field khác nhau và ba header báo ngừng hỗ trợ của `v1`.</Check>
+
+### 3. Retry có và không có Idempotency-Key
+
+Vòng lặp dưới đây giả lập một client gửi lại request vì tưởng lần đầu đã thất bại:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for attempt in 1 2; do
+  curl -s -w '\n' -X POST http://localhost:8765/v2/orders -H 'Content-Type: application/json' \
+    -d '{"customer":"Bình","amount":450000,"currency":"VND"}'
+done
+for attempt in 1 2; do
+  curl -s -w '\n' -X POST http://localhost:8765/v2/orders -H 'Content-Type: application/json' \
+    -H 'Idempotency-Key: "7c4f1e2a-93b5-4d8e-a1f0-5b6c2d9e8f31"' \
+    -d '{"customer":"Chi","amount":80000,"currency":"VND"}'
+done
+```
+
+</Terminal>
+
+<Predict question="Hai vòng lặp, mỗi vòng gửi hai lần. Bao nhiêu đơn được tạo?">
+
+Ba đơn. Vòng đầu không có khoá nên tạo hai đơn trùng (id 2 và 3). Vòng sau có khoá: lần gửi thứ hai nhận lại đúng response của lần đầu, cùng id 4.
+
+```text
+{"id":2,"customer":"Bình","amount":450000,"currency":"VND","status":"NEW"}
+{"id":3,"customer":"Bình","amount":450000,"currency":"VND","status":"NEW"}
+{"id":4,"customer":"Chi","amount":80000,"currency":"VND","status":"NEW"}
+{"id":4,"customer":"Chi","amount":80000,"currency":"VND","status":"NEW"}
+```
+
+</Predict>
+
+Giá trị khoá nằm trong dấu nháy kép vì bản nháp IETF định nghĩa nó là một String theo Structured Fields (RFC 8941); server của lab chấp nhận cả khi không có nháy. Giờ dùng lại khoá đó cho một body khác, rồi xoá đơn trùng hai lần:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -si -w '\n' -X POST http://localhost:8765/v2/orders -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: "7c4f1e2a-93b5-4d8e-a1f0-5b6c2d9e8f31"' \
+  -d '{"customer":"Chi","amount":90000,"currency":"VND"}'
+curl -si -w '\n' -X DELETE http://localhost:8765/v2/orders/3
+curl -si -w '\n' -X DELETE http://localhost:8765/v2/orders/3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HTTP/1.1 422 
+{"error":"idempotency-key-reused","message":"Idempotency-Key này đã dùng cho một request khác"}
+HTTP/1.1 204 No Content
+HTTP/1.1 404 Not Found
+{"error":"not-found","message":"Không có đơn hàng 3"}
+```
+
+</Expected>
+
+Đã bỏ các dòng header. Server từ chối thay vì lặng lẽ trả đơn cũ, vì nhiều khả năng client đã dùng nhầm khoá cho một thao tác khác. Hai lần `DELETE` trả hai mã khác nhau, nhưng trạng thái sau cùng giống nhau: đơn 3 không còn. Đó chính là idempotent.
+
+<Check id="j10.2.lab-idempotency-key">Chứng minh được bằng curl: retry không có khoá tạo đơn trùng, có khoá thì không, và dùng lại khoá với body khác nhận `422`.</Check>
+
+### 4. Phân trang theo cursor, lọc và sắp xếp
+
+Thêm vài đơn, rồi xin trang đầu tiên, sắp giảm dần theo số tiền, mỗi trang hai đơn:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+while read -r customer amount; do
+  curl -s -w '\n' -X POST http://localhost:8765/v2/orders -H 'Content-Type: application/json' \
+    -d "{\"customer\":\"$customer\",\"amount\":$amount,\"currency\":\"VND\"}"
+done <<'EOF'
+An 300000
+Dũng 450000
+Bình 95000
+EOF
+curl -si -w '\n' 'http://localhost:8765/v2/orders?sort=-amount&limit=2'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":5,"customer":"An","amount":300000,"currency":"VND","status":"NEW"}
+{"id":6,"customer":"Dũng","amount":450000,"currency":"VND","status":"NEW"}
+{"id":7,"customer":"Bình","amount":95000,"currency":"VND","status":"NEW"}
+HTTP/1.1 200 OK
+Content-type: application/json
+Content-length: 221
+Link: </v2/orders?sort=-amount&limit=2&pageToken=NDUwMDAwOjY6djJ8bnVsbHxudWxsfC1hbW91bnQ>; rel="next"
+Cache-control: no-store
+
+{"items":[{"id":2,"customer":"Bình","amount":450000,"currency":"VND","status":"NEW"},{"id":6,"customer":"Dũng","amount":450000,"currency":"VND","status":"NEW"}],"nextPageToken":"NDUwMDAwOjY6djJ8bnVsbHxudWxsfC1hbW91bnQ"}
+```
+
+</Expected>
+
+Đơn 2 và 6 cùng 450.000 đồng; id phá thế hoà nên đơn 2 đứng trước. URL luôn đặt trong dấu nháy đơn: với zsh, dấu `?` và `&` trần có ý nghĩa riêng. Lưu token vào biến, rồi tạo một đơn **lớn hơn mọi đơn** trước khi xin trang hai:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+TOKEN=$(curl -s 'http://localhost:8765/v2/orders?sort=-amount&limit=2' | grep -o '"nextPageToken":"[^"]*"' | cut -d'"' -f4)
+curl -s -w '\n' -X POST http://localhost:8765/v2/orders -H 'Content-Type: application/json' \
+  -d '{"customer":"Em","amount":500000,"currency":"VND"}'
+curl -s -w '\n' "http://localhost:8765/v2/orders?sort=-amount&limit=2&pageToken=$TOKEN"
+```
+
+</Terminal>
+
+<Predict question="Đơn Em 500.000 đồng chen lên đầu danh sách. Trang hai có lặp lại Dũng không?">
+
+Không. Trang hai bắt đầu ngay sau "450.000 đồng, id 6", bất kể phía trước có thêm gì:
+
+```text
+{"id":8,"customer":"Em","amount":500000,"currency":"VND","status":"NEW"}
+{"items":[{"id":5,"customer":"An","amount":300000,"currency":"VND","status":"NEW"},{"id":1,"customer":"An","amount":120000,"currency":"VND","status":"NEW"}],"nextPageToken":"MTIwMDAwOjE6djJ8bnVsbHxudWxsfC1hbW91bnQ"}
+```
+
+Với `offset=2`, trang hai sẽ là Dũng và An: Dũng xuất hiện lần thứ hai vì Em đẩy mọi thứ lùi một chỗ.
+
+</Predict>
+
+Lọc theo khách có dấu tiếng Việt, rồi thử dùng token cũ với bộ lọc khác và một kiểu sắp xếp không được hỗ trợ:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -w '\n' -G http://localhost:8765/v2/orders -d status=NEW --data-urlencode 'customer=Bình'
+curl -s -w '\n' "http://localhost:8765/v2/orders?status=PAID&sort=-amount&limit=2&pageToken=$TOKEN"
+curl -s -w '\n' 'http://localhost:8765/v2/orders?sort=total'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"items":[{"id":2,"customer":"Bình","amount":450000,"currency":"VND","status":"NEW"},{"id":7,"customer":"Bình","amount":95000,"currency":"VND","status":"NEW"}]}
+{"error":"invalid-query","message":"pageToken không hợp lệ hoặc không khớp bộ lọc và cách sắp xếp"}
+{"error":"invalid-query","message":"sort chỉ nhận id, -id, amount, -amount"}
+```
+
+</Expected>
+
+`-G` bảo curl đưa các tham số `-d` vào query string của một request `GET` thay vì vào body; `--data-urlencode` percent-encode giá trị, nên `Bình` đi trên dây thành `B%C3%ACnh`. Không có `nextPageToken` nghĩa là đây là trang cuối. `sort=total` bị từ chối vì `v2` không còn field `total`: tham số của một phiên bản phải dùng tên field của chính phiên bản đó.
+
+<Check id="j10.2.lab-pagination">Đi được từ trang một sang trang hai bằng `pageToken`, lọc được theo trạng thái và tên khách có dấu, và giải thích được vì sao token cũ bị từ chối khi đổi bộ lọc.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `zsh: no matches found: http://localhost:8765/v2/orders?sort=...`: URL có `?` mà không nằm trong dấu nháy. Bọc cả URL trong `'...'`, hoặc `"..."` khi cần dùng biến như `$TOKEN`.
+- Chỉ nhận được `{"items":[...]}` thiếu tham số phía sau: dấu `&` không nằm trong nháy nên shell coi phần trước là một lệnh chạy nền.
+- `pageToken không hợp lệ`: biến `TOKEN` rỗng (server đã khởi động lại, dữ liệu mất) hoặc bạn đổi `status`, `customer`, `sort` giữa hai trang. Giữ nguyên mọi tham số, chỉ thêm `pageToken`.
+- Id trên máy bạn khác bài: bạn đã gửi thêm request, hoặc server chưa khởi động lại sau bước 1. Đơn bắt đầu từ id 1 sau mỗi lần khởi động.
+- `422` khi tạo đơn qua `v2`: thiếu `currency` hoặc vẫn gửi `total` thay vì `amount`. Đọc mảng `errors` trong response.
+
+</Callout>
+
+### 5. Dừng server
+
+Bấm **Ctrl+C** ở tab 1. Mã nguồn được giữ lại cho bài J10.3.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Chạy ba instance sau load balancer thì idempotency của lab còn đúng không?">
+
+Không. `Map` khoá và `synchronized` chỉ nằm trong một JVM: lần thử thứ hai có thể rơi vào instance khác, nơi không biết khoá đó. Khoá phải lưu ở chỗ chung, thường là chính database, trong **cùng transaction** với việc tạo đơn: bảng `idempotency_keys` có ràng buộc `UNIQUE` trên khoá (và mã khách hàng), insert khoá trước, insert trùng thì đọc lại kết quả đã lưu. Redis với `SET key value NX EX 86400` là lựa chọn khác, nhưng khi đó việc tạo đơn và lưu khoá không còn chung một transaction, và bạn phải tự xử lý trường hợp lỗi giữa hai bước.
+
+</Reveal>
+
+<Reveal title="Sao không tự nhận ra request trùng bằng cách so body?">
+
+Vì hai request giống hệt nhau có thể đều hợp lệ: khách cố ý đặt hai đơn cà phê giống nhau trong năm phút. Chỉ client biết hai lần gửi là "cùng một ý định" hay hai ý định khác nhau. Khoá idempotency là cách client nói điều đó cho server. Fingerprint body chỉ dùng để phát hiện client dùng nhầm khoá.
+
+</Reveal>
+
+<Reveal title="Có khi nào offset vẫn là lựa chọn đúng?">
+
+Có: trang quản trị cần "trang 1, 2, 3 ... 50" và nhảy thẳng tới một trang, dữ liệu nhỏ và ít thay đổi. Khi đó offset đơn giản hơn. Còn "tổng số phần tử" thì cẩn thận: `COUNT(*)` trên bảng lớn có điều kiện lọc rất tốn, nên API dùng cursor thường không trả tổng, hoặc chỉ trả con số ước lượng.
+
+</Reveal>
+
+<Reveal title="Thêm một field vào response có thật sự luôn an toàn?">
+
+Chỉ khi client bỏ qua field lạ. `ObjectMapper` của Jackson 2 mặc định bật `FAIL_ON_UNKNOWN_PROPERTIES` (Jackson 3 ở J9 thì mặc định bỏ qua), nên client Java dùng Jackson 2 viết vội sẽ ném exception khi server thêm field mới; Spring Boot thì tắt tuỳ chọn này sẵn. Vì vậy tài liệu API nên ghi rõ "client phải bỏ qua field không biết", và client của bạn nên được cấu hình như vậy. Thêm giá trị mới cho enum cũng tương tự: client dùng `switch` không có nhánh mặc định sẽ gãy.
+
+</Reveal>
+
+<Reveal title="PATCH đổi trạng thái của lab có idempotent không?">
+
+Có, do cách lab định nghĩa: gửi `{"status":"PAID"}` hai lần, lần hai là no-op và trả `200` với cùng trạng thái. Nhưng `PATCH` nói chung không bắt buộc idempotent: `PATCH /cart` với "thêm 1 sản phẩm" gửi hai lần là hai sản phẩm. Khi thiết kế, hãy viết rõ trong tài liệu thao tác nào an toàn để retry.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI liệt kê các thay đổi trong một pull request và phân loại tương thích hay phá vỡ, hoặc viết test cho phân trang với dữ liệu có giá trị trùng nhau. AI hay sinh phân trang bằng offset mà không nói rõ nhược điểm, quên phá thế hoà bằng id, để token lộ cấu trúc cho client tự ghép, và triển khai idempotency bằng một `Map` trong bộ nhớ như lab mà không cảnh báo về nhiều instance. Kiểm tra lại bằng cách tự chèn dữ liệu giữa hai lần lấy trang, như bước 4, và gửi hai request cùng khoá gần như đồng thời.
+
+</Callout>
+
+<Callout kind="link">
+
+J10.3 mô tả đúng API `v2` này bằng OpenAPI và đổi mọi phản hồi lỗi sang Problem Details. J11 viết lại các endpoint bằng Spring MVC. J12 (SQL, index, transaction) cho bạn công cụ để làm cursor bằng câu truy vấn có index trên cặp `(amount, id)` và lưu khoá idempotency trong cùng transaction với dữ liệu. J16 gặp lại idempotency ở consumer của message queue, nơi một message có thể được giao nhiều lần.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j10.2.mastery-retry-safe">Thiết kế được cách để một thao tác tạo mới (đơn, thanh toán) retry an toàn: client sinh khoá khi nào, server lưu gì, trả gì cho từng tình huống.</Check>
+
+<Check id="j10.2.mastery-list-api">Thiết kế được endpoint danh sách có lọc, sắp xếp, phân trang theo cursor và kế hoạch đưa ra phiên bản mới cho nó mà không làm hỏng client cũ.</Check>
+
+</Mastery>

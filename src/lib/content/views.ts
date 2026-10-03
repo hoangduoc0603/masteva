@@ -272,6 +272,26 @@ export function buildRoadmapView(input: ViewInput, roadmapId: string): RoadmapVi
   };
 }
 
+/** Một chủ đề trong file JSON của khung chi tiết: dữ liệu của chủ đề kèm chặng và cấp chứa nó. */
+export interface TopicDetail extends TopicView {
+  step: { code: string; title: string };
+  level: string;
+}
+
+/**
+ * Dữ liệu khung chi tiết của cả roadmap, theo mã chủ đề. Xuất thành file JSON tĩnh và
+ * chỉ tải khi người học mở khung lần đầu, để HTML trang roadmap không phải chở nội dung này.
+ */
+export function topicDetails(view: RoadmapView): Record<string, TopicDetail> {
+  const details: Record<string, TopicDetail> = {};
+  for (const level of view.levels) {
+    for (const step of level.steps) {
+      for (const topic of step.topics) details[topic.id] = { ...topic, step: { code: step.code, title: step.title }, level: level.title };
+    }
+  }
+  return details;
+}
+
 export function toLite(view: RoadmapView): RoadmapLite {
   return {
     id: view.id,

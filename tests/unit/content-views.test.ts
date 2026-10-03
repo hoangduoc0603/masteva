@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Topic } from '@/lib/content/schema';
-import { buildLessonContext, buildProjectView, buildRoadmapView, toLite, type ViewInput } from '@/lib/content/views';
+import { buildLessonContext, buildProjectView, buildRoadmapView, toLite, topicDetails, type ViewInput } from '@/lib/content/views';
 
 const topic = (id: string, extra: Partial<Topic> = {}): Topic => ({ id, title: id.toUpperCase(), kind: 'core', requires: [], resources: [], ...extra });
 
@@ -150,6 +150,21 @@ describe('buildLessonContext', () => {
       roadmap: { id: 'devops', title: 'DevOps', track: 'devops' },
       step: { id: 'd1', code: 'D1', title: 'Linux', roadmapId: 'devops' },
       topics: [{ id: 'd1.x', title: 'D1.X', stepId: 'd1', roadmapId: 'devops' }],
+    });
+  });
+});
+
+describe('topicDetails', () => {
+  it('keys every topic by id with its step and level, for the drawer JSON', () => {
+    const details = topicDetails(buildRoadmapView(input, 'java')!);
+    expect(Object.keys(details)).toEqual(['j1.a', 'j2.b']);
+    expect(details['j2.b']).toMatchObject({
+      id: 'j2.b',
+      step: { code: 'J2', title: 'Hai' },
+      level: 'Middle',
+      position: { index: 1, count: 1 },
+      prev: { id: 'j1.a' },
+      requires: [{ id: 'j1.a', roadmapId: 'java' }],
     });
   });
 });
