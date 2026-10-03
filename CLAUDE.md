@@ -11,6 +11,28 @@ Fumadocs trên Next.js, static export (không có máy chủ), host trên Cloudf
 - Không thêm tính năng cần máy chủ (route động, middleware, server action). Mọi thứ phải chạy lúc build hoặc trên trình duyệt.
 - Component phía trình duyệt không được import Zod hay các module chỉ dùng lúc build (`src/lib/content/repo.ts`, `manifest.ts`), để giữ ngân sách JavaScript.
 
+## Dùng Superpowers có chọn lọc
+
+Quy tắc này ghi đè yêu cầu "luôn dùng skill" của `using-superpowers`, theo đúng thứ tự ưu tiên mà chính skill đó nêu.
+
+**Dùng khi:**
+
+- Tính năng mới, thay đổi nhiều file hoặc thay đổi kiến trúc: `brainstorming` để làm rõ yêu cầu, rồi `writing-plans` (kết hợp Plan mode) trước khi code.
+- Bug khó, chưa rõ nguyên nhân sau một lần thử: `systematic-debugging`.
+- Trước khi báo xong một việc lớn: `verification-before-completion`.
+
+**Không dùng, làm trực tiếp:**
+
+- Câu hỏi, giải thích, tra cứu, đọc code.
+- Sửa nhỏ và rõ ràng (khoảng 1–3 file), sửa nội dung bài học, cập nhật tài liệu, chạy lệnh.
+- Việc người dùng đã mô tả cụ thể từng bước.
+
+**Giới hạn:**
+
+- TDD bắt buộc chỉ cho logic lõi: tiến độ (`src/lib/progress`), kiểm tra nội dung (`src/lib/content`), tokenizer tìm kiếm. Không áp TDD cho giao diện hay nội dung bài học.
+- Không dùng `subagent-driven-development`, `dispatching-parallel-agents` hay `using-git-worktrees` trừ khi người dùng yêu cầu.
+- Người dùng nói "dùng superpowers" thì chạy đủ quy trình; nói "làm nhanh" thì bỏ qua.
+
 ## Viết và sửa bài học
 
 Theo `docs/content-standard.md`. Những điểm hay sai:
