@@ -6,7 +6,7 @@ Nền tảng học dành cho lập trình viên nói chung: lộ trình đầy �
 
 ## Trạng thái
 
-Giai đoạn 0 (nền móng): site đọc được bài theo roadmap, đánh dấu tiến độ trên trình duyệt, tìm kiếm không dấu. Có một bài mẫu (D1.1); 28 bước còn lại đang soạn. Chưa deploy.
+Giai đoạn 0 (nền móng) và tách roadmap: ba roadmap Java, DevOps, Microservices (58 chặng, 379 chủ đề) có sơ đồ "trục giữa", khung chi tiết chủ đề, tiến độ theo chủ đề trên trình duyệt; hai trang dự án; tìm kiếm không dấu. Có một bài mẫu (D1.1); các chặng còn lại đang soạn bài. Giao diện theo hướng Night Lab, theme tối mặc định. Chưa deploy.
 
 ## Chạy
 
@@ -23,8 +23,9 @@ pnpm dev            # http://localhost:3000/vi
 | `pnpm start` | Phục vụ `out/` để xem bản build |
 | `pnpm typecheck` / `pnpm lint` | Kiểm tra TypeScript và ESLint |
 | `pnpm test` | Unit test (Vitest) |
-| `pnpm content:check` | Kiểm tra nội dung: khung 6 phần, mã mục, file khoá, link nội bộ |
-| `pnpm content:lock` | Như trên và thêm mã mục mới vào file khoá |
+| `pnpm content:check` | Kiểm tra nội dung: khung 6 phần, mã mục, chủ đề, quan hệ roadmap/chặng/dự án, file khoá, link nội bộ |
+| `pnpm content:lock` | Như trên và thêm mã mục, mã chủ đề, mã mốc mới vào file khoá |
+| `pnpm exec serve design -l 4400` | Xem thiết kế local (`design/index.html`) |
 | `pnpm e2e` | Build với `vi,en` rồi chạy E2E (Playwright). Lần đầu chạy `pnpm exec playwright install chromium` |
 | `pnpm verify` | Chạy tất cả các bước trên |
 
@@ -38,7 +39,8 @@ Biến môi trường (đều không bắt buộc):
 ## Cấu trúc
 
 ```text
-content/        roadmap, bước, bài học (MDX), ids.lock.json — CC BY-NC-SA 4.0
+content/        roadmaps/ (java, devops, microservices), steps/ (chặng: meta.json có topics, bài MDX), projects/, ids.lock.json — CC BY-NC-SA 4.0
+design/         thiết kế Night Lab: tokens.css (nguồn token), roadmap.css (chép sang src/app/), trang mẫu, design system
 messages/       chữ giao diện theo ngôn ngữ
 src/app/        các trang theo /[lang]/, trang / chuyển hướng, chỉ mục tìm kiếm
 src/components/ khung bài học, roadmap, tiến độ, tìm kiếm
@@ -49,7 +51,7 @@ tests/          unit và E2E
 docs/           tài liệu sản phẩm và kiến trúc
 ```
 
-Kiến trúc chi tiết: [docs/architecture.md](docs/architecture.md). Cách viết bài: [docs/content-standard.md](docs/content-standard.md).
+Kiến trúc chi tiết: [docs/architecture.md](docs/architecture.md). Cách viết bài: [docs/content-standard.md](docs/content-standard.md). Giao diện: [docs/design-direction.md](docs/design-direction.md).
 
 ## Deploy
 

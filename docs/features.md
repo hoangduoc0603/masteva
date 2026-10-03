@@ -15,7 +15,7 @@ Ký hiệu giai đoạn:
 
 ## 1. Luồng chính của người học
 
-1. Vào trang chủ, xem danh sách roadmap, chọn một roadmap (ví dụ "Senior Java · DevOps · Microservices").
+1. Vào trang chủ, xem danh sách roadmap, chọn một roadmap (ví dụ "Java backend, từ nền tảng tới Senior").
 2. Xem các bước theo thứ tự, biết bước nào đã xong và bước nào tiếp theo.
 3. Mở một bước, học bài theo khung 6 phần: mục tiêu, kiến thức, tài liệu, thực hành, đào sâu, dấu hiệu nắm chắc.
 4. Làm lab trên máy mình theo hướng dẫn, so kết quả với kết quả mong đợi.
@@ -28,12 +28,14 @@ Ký hiệu giai đoạn:
 | Mã | Yêu cầu | GĐ |
 |---|---|---|
 | FR-ROADMAP-001 | Trang danh mục hiển thị mọi roadmap, mỗi roadmap có mô tả ngắn, đối tượng phù hợp, số bước và tiến độ của người học | G0–G1 |
-| FR-ROADMAP-002 | Trang roadmap hiển thị các bước theo thứ tự, mỗi bước có mã (ví dụ D1), tên, nhánh và tiến độ | G0–G1 |
+| FR-ROADMAP-002 | Trang roadmap hiển thị cấp, chặng theo thứ tự và chủ đề của từng chặng; mỗi chặng có mã (ví dụ D1), tên và tiến độ | G0–G1 |
 | FR-ROADMAP-003 | Mỗi bước khai báo các bước tiên quyết; giao diện cảnh báo khi người học mở bước chưa đủ điều kiện, nhưng không chặn | G0–G1 |
-| FR-ROADMAP-004 | Một roadmap có thể ghép nhiều nhánh (Java, DevOps, Microservices, dự án) và cho lọc theo nhánh | G0–G1 |
-| FR-ROADMAP-005 | Điểm hội tụ (mốc dự án) hiển thị ngay sau bước hoàn thành chúng | G0–G1 |
-| FR-ROADMAP-006 | Chế độ xem sơ đồ cho thấy quan hệ giữa các bước, bên cạnh chế độ danh sách | G2 |
-| FR-ROADMAP-007 | Nút "Học tiếp" đưa người học tới mục chưa hoàn thành đầu tiên | G0–G1 |
+| FR-ROADMAP-004 | Mỗi roadmap là một nhánh riêng (Java, DevOps, Microservices); chủ đề chung được liên kết sang roadmap dạy đầy đủ thay vì viết lại | G0–G1 |
+| FR-ROADMAP-005 | Thẻ chặng hiện dự án và mốc dùng kiến thức của chặng | G0–G1 |
+| FR-ROADMAP-006 | Sơ đồ "trục giữa" là view mặc định, kèm view danh sách từ cùng HTML | G0–G1 |
+| FR-ROADMAP-007 | Nút "Học tiếp" đưa người học tới chủ đề đang học, hoặc chủ đề chính chưa học đầu tiên | G0–G1 |
+| FR-ROADMAP-010 | Khung chi tiết chủ đề (mô tả, trạng thái, bài học, nên học trước, dự án, đọc thêm), mở bằng click hoặc hash `#<mã chủ đề>` | G0–G1 |
+| FR-ROADMAP-011 | "Tôi đã biết": chọn cấp bắt đầu, thu gọn các cấp trước đó | G0–G1 |
 | FR-ROADMAP-008 | Một bước có thể dùng chung giữa nhiều roadmap, ví dụ "Linux và mạng" thuộc cả DevOps lẫn Backend | G2 |
 | FR-ROADMAP-009 | Danh mục roadmap phân loại theo mảng (Backend, Frontend, Mobile, DevOps, Data, AI…) và theo cấp độ | G2 |
 
@@ -76,7 +78,7 @@ Ký hiệu giai đoạn:
 | FR-PROJECT-003 | Mỗi mốc liên kết hai chiều với các bước học cung cấp kiến thức cho nó | G0–G1 |
 | FR-PROJECT-004 | Lời giải tham khảo dạng nhánh Git cho từng mốc, kèm ADR giải thích quyết định | G2 |
 | FR-PROJECT-005 | Bộ test nghiệm thu chạy được cho từng mốc | G3 |
-| FR-PROJECT-006 | Dự án ban đầu: Hub hội thoại đa kênh (C1–C5) và Neobank mini (B0–B4) | G0–G1 (đề cương), G2 (đầy đủ) |
+| FR-PROJECT-006 | Dự án ban đầu: Hub hội thoại đa kênh (6 mốc) và Neobank mini (5 mốc); mỗi mốc tham chiếu chặng hoặc chủ đề của cả ba roadmap | G0–G1 (đề cương), G2 (đầy đủ) |
 
 ## 6. Module PROGRESS (theo dõi tiến độ)
 
@@ -89,6 +91,7 @@ Ký hiệu giai đoạn:
 | FR-PROGRESS-005 | Đồng bộ tiến độ theo tài khoản; gộp tiến độ trên trình duyệt vào tài khoản khi đăng nhập lần đầu | G3 |
 | FR-PROGRESS-006 | Trang tiến độ công khai (tuỳ chọn) để chia sẻ như một phần hồ sơ | G3 |
 | FR-PROGRESS-007 | Giữ nguyên tiến độ khi nội dung được sửa (mã mục ổn định, không phụ thuộc vị trí) | G0–G1 |
+| FR-PROGRESS-008 | Trạng thái người học tự đặt cho chủ đề: đang học, đã xong, bỏ qua; nếu không đặt thì suy ra từ mục đã tích trong bài | G0–G1 |
 
 ## 7. Module REVIEW (tự kiểm tra và ôn tập)
 
@@ -186,7 +189,7 @@ Lý do để tài khoản ở G3: theo dõi tiến độ trên trình duyệt đ
 ## 17. Tiêu chí nghiệm thu bản đầu (hết G1)
 
 1. Trang web có danh mục roadmap, trang roadmap, trang bài học, tìm kiếm và theo dõi tiến độ trên trình duyệt; đường dẫn và giao diện đã có cấu trúc đa ngôn ngữ.
-2. Roadmap "Senior Java · DevOps · Microservices" có đủ 29 bước, mỗi bước có ít nhất một bài theo đúng khung 6 phần.
+2. Ba roadmap Java, DevOps, Microservices có đủ 58 chặng, mỗi chặng có ít nhất một bài theo đúng khung 6 phần.
 3. Hai dự án có trang tổng quan và đủ các mốc với tiêu chí nghiệm thu.
 4. Build tự động kiểm tra được link hỏng, mã trùng và bài thiếu phần bắt buộc.
 5. Ít nhất các bài của D0, D1 và J1 đạt trạng thái "đã kiểm chứng".

@@ -1,12 +1,15 @@
 import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
-import { i18n, isLanguage, type Language } from '@/lib/i18n';
-import { getMessages } from '@/lib/messages';
+import { isLanguage, i18n, type Language } from '@/lib/i18n';
+import { format, getMessages } from '@/lib/messages';
 import { alternatesFor } from '@/lib/site';
 import { loadRoadmaps } from '@/lib/content/repo';
-import { getRoadmapManifest, type ManifestStep } from '@/lib/content/manifest';
-import { localized } from '@/components/roadmap/roadmap-cards';
-import { RoadmapSteps, type RoadmapStepView } from '@/components/roadmap/roadmap-steps';
+import { getReplacements, getRoadmapView } from '@/lib/content/manifest';
+import { toLite } from '@/lib/content/views';
+import { RoadmapMap } from '@/components/roadmap/roadmap-map';
+import { TopicDrawer } from '@/components/roadmap/topic-drawer';
+import { RoadmapToolbar } from '@/components/roadmap/roadmap-toolbar';
+import { RoadmapClient } from '@/components/roadmap/roadmap-client';
 import { ProgressTransfer } from '@/components/progress/progress-transfer';
 
 export const dynamicParams = false;
@@ -15,58 +18,57 @@ export function generateStaticParams() {
   return i18n.languages.flatMap((lang) => loadRoadmaps().map((r) => ({ lang, roadmap: r.id })));
 }
 
-function toView(step: ManifestStep): RoadmapStepView {
-  return {
-    id: step.id,
-    code: step.code,
-    title: step.title,
-    track: step.track,
-    prerequisites: step.prerequisites,
-    lessons: step.lessons,
-  };
-}
-
 async function resolve(props: PageProps<'/[lang]/roadmaps/[roadmap]'>) {
-  const { lang, roadmap: id } = await props.params;
+  const { lang, roadmap } = await props.params;
   if (!isLanguage(lang)) notFound();
-  const manifest = getRoadmapManifest(id);
-  if (!manifest) notFound();
-  return { lang: lang as Language, manifest };
+  const view = getRoadmapView(roadmap, lang);
+  if (!view) notFound();
+  return { lang: lang as Language, view };
 }
 
 export async function generateMetadata(props: PageProps<'/[lang]/roadmaps/[roadmap]'>): Promise<Metadata> {
-  const { lang, manifest } = await resolve(props);
-  return {
-    title: localized(manifest.roadmap.title, lang),
-    description: localized(manifest.roadmap.description, lang),
-    alternates: alternatesFor(lang, `/roadmaps/${manifest.roadmap.id}`),
-  };
+  const { lang, view } = await resolve(props);
+  return { title: view.title, description: view.description, alternates: alternatesFor(lang, `/roadmaps/${view.id}`) };
 }
 
 export default async function RoadmapPage(props: PageProps<'/[lang]/roadmaps/[roadmap]'>) {
-  const { lang, manifest } = await resolve(props);
+  const { lang, view } = await resolve(props);
   const t = getMessages(lang);
-  const { roadmap } = manifest;
-
   return (
-    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-8 px-4 py-12">
-      <header className="flex flex-col gap-3">
-        <span className="text-xs font-medium uppercase tracking-wide text-fd-muted-foreground">{roadmap.area}</span>
-        <h1 className="text-3xl font-bold tracking-tight">{localized(roadmap.title, lang)}</h1>
-        <p className="max-w-3xl text-fd-muted-foreground">{localized(roadmap.description, lang)}</p>
-        <ProgressTransfer />
+    <main className="rm-page" id={`roadmap-${view.id}`} data-track={view.track} data-view="map">
+      <header>
+        <p className="rm-kicker">{format(t.roadmap.kicker, { track: t.tracks[view.track] })}</p>
+        <h1 className="rm-title">{view.title}</h1>
+        <p className="rm-desc">{view.description}</p>
+        <ul className="rm-facts">
+          <li>{format(t.roadmap.levels, { count: view.levels.length })}</li>
+          <li>{format(t.roadmap.steps, { count: view.stepCount })}</li>
+          <li>{format(t.roadmap.topics, { count: view.levels.flatMap((l) => l.steps.flatMap((s) => s.topics)).filter((tp) => tp.kind !== 'opt').length })}</li>
+        </ul>
+        {view.recommended.length > 0 ? (
+          <p className="rm-recommended">
+            {t.roadmap.recommended}:{' '}
+            {view.recommended.map((step, i) => (
+              <span key={step.id}>
+                {i > 0 ? ', ' : null}
+                <a href={`/${lang}/roadmaps/${step.roadmapId}#step-${step.id}`}>
+                  {step.code} {step.title}
+                </a>
+              </span>
+            ))}
+          </p>
+        ) : null}
+        <RoadmapClient lang={lang} lite={toLite(view)} levels={view.levels.map((l) => ({ id: l.id, title: l.title }))} replacements={getReplacements()} />
       </header>
-      <section className="flex flex-col gap-4" aria-labelledby="steps-title">
-        <h2 id="steps-title" className="text-xl font-semibold">
-          {t.roadmap.stepsTitle}
+      <RoadmapToolbar />
+      <RoadmapMap view={view} lang={lang} t={t} />
+      <TopicDrawer view={view} lang={lang} t={t} />
+      <section className="rm-xfer" aria-labelledby="progress-transfer">
+        <h2 id="progress-transfer" className="rm-xfer-t">
+          {t.progress.title}
         </h2>
-        <RoadmapSteps
-          lang={lang}
-          steps={manifest.steps.map(toView)}
-          optional={manifest.optional.map(toView)}
-          hubs={roadmap.hubs.map((h) => ({ id: h.id, after: h.after, title: localized(h.title, lang) }))}
-          replacements={manifest.replacements}
-        />
+        <p className="rm-xfer-d">{t.progress.desc}</p>
+        <ProgressTransfer />
       </section>
     </main>
   );

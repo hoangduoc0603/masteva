@@ -55,15 +55,15 @@ Phiên bản cụ thể của từng thư viện được ghi trong `package.jso
 ```text
 masteva/
 ├── content/
-│   ├── roadmaps/              # định nghĩa roadmap: thứ tự bước, điểm hội tụ
+│   ├── roadmaps/              # roadmap: cấp và thứ tự chặng (java, devops, microservices)
 │   ├── steps/                 # mỗi bước một thư mục, chứa các bài học
 │   │   └── d1/
-│   │       ├── meta.json      # thông tin bước, thứ tự bài
+│   │       ├── meta.json      # thông tin chặng, chủ đề trên sơ đồ, liên kết, thứ tự bài
 │   │       ├── d1-1.mdx       # bản gốc tiếng Việt
 │   │       └── d1-1.en.mdx    # bản dịch (khi có)
-│   ├── projects/              # dự án xuyên suốt và các mốc
+│   ├── projects/              # dự án xuyên suốt và các mốc (neobank, hub-chat)
 │   ├── pages/                 # trang nội dung chung: chuẩn bị môi trường, giới thiệu
-│   ├── ids.lock.json          # file khoá mã mục (mục 5.4), cập nhật bằng `pnpm content:lock`
+│   ├── ids.lock.json          # file khoá mã mục, mã chủ đề, mã mốc (mục 5.4), cập nhật bằng `pnpm content:lock`
 │   └── LICENSE                # CC BY-NC-SA 4.0
 ├── messages/                  # chữ giao diện: vi.json, en.json
 ├── src/
@@ -89,12 +89,13 @@ Quy tắc phụ thuộc:
 
 | Thực thể | Định danh | Chứa gì | Ghi chú |
 |---|---|---|---|
-| Roadmap | `senior-backend` | Tên, mô tả, danh sách bước theo thứ tự, điểm hội tụ sau bước nào, mảng (backend, frontend…) | Chỉ tham chiếu tới bước, không chứa bài |
-| Bước | `d1` | Tên, nhánh (java, ops, ms, project…), bước tiên quyết, danh sách bài | Dùng chung được cho nhiều roadmap (FR-ROADMAP-008) |
+| Roadmap | `java`, `devops`, `microservices` | Tên, mô tả, màu (`track`), ba cấp (Nền tảng, Middle, Senior) mỗi cấp có mục tiêu và danh sách chặng; bước nên học trước từ roadmap khác (`recommended`) | Chỉ tham chiếu tới chặng, không chứa bài |
+| Bước (chặng) | `d1` | Tên, nhánh, bước tiên quyết, chủ đề trên sơ đồ, liên kết sang chặng của roadmap khác, danh sách bài; `optional` cho chặng tuỳ chọn | Mỗi chặng thuộc đúng một roadmap |
+| Chủ đề | `j5.generics` | Tên, loại (`core`, `pick` kèm `options`, `opt`), mô tả ngắn, chủ đề nên học trước, đọc thêm | Nút trên sơ đồ; bài khai báo chủ đề mình bao phủ bằng frontmatter `topics` |
 | Bài học | `d1.1` | Metadata (mục 5.2) và nội dung 6 phần | File MDX |
 | Mục đánh dấu | `d1.1.exit-code` | Một ý kiến thức, một bước thực hành hoặc một tiêu chí | Khai báo bằng component trong MDX |
 | Dự án | `neobank` | Bài toán, kiến trúc mục tiêu, các mốc | |
-| Mốc dự án | `neobank.b1` | Yêu cầu, tiêu chí nghiệm thu, các bước liên quan | Liên kết hai chiều với bước |
+| Mốc dự án | `neobank.ledger` | Tên, các chặng hoặc chủ đề cần học (`needs`) từ cả ba roadmap | Trang roadmap hiện "Dùng ở dự án" từ dữ liệu này |
 
 Mọi định danh đều độc lập với ngôn ngữ (FR-I18N-003).
 
@@ -134,6 +135,7 @@ Lý do dùng component thay cho tiêu đề Markdown: vừa kiểm soát đượ
 Đáp ứng BR-003 (không làm mất tiến độ người học) và FR-PROGRESS-007.
 
 - Mã mục được **viết tường minh** trong MDX, không suy ra từ vị trí.
+- Mã chủ đề (`topics`) và mã mốc dự án (`milestones`) cũng được khoá trong cùng file, dùng chung `replacements`.
 - `content/ids.lock.json` liệt kê mọi mã đã từng phát hành, kèm mã thay thế nếu mục đã bị gộp hoặc đổi tên.
 - **Khi build:**
   - Mã mới chưa có trong file khoá: được phép; script cập nhật file khoá thêm vào.
@@ -152,9 +154,9 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 | Nhóm | Ví dụ |
 |---|---|
 | Trang chủ | `/vi/` |
-| Danh mục và chi tiết roadmap | `/vi/roadmaps`, `/vi/roadmaps/senior-backend` |
+| Danh mục và chi tiết roadmap | `/vi/roadmaps`, `/vi/roadmaps/java` (sơ đồ, `#<mã chủ đề>` mở khung chi tiết); `/vi/roadmaps/senior-backend` là trang tĩnh trỏ tới ba roadmap mới |
 | Bài học | `/vi/learn/d1/d1-1` |
-| Dự án và mốc | `/vi/projects/neobank/b1` |
+| Dự án | `/vi/projects/neobank` |
 | Tiến độ của tôi | `/vi/progress` |
 | Trang chung | `/vi/setup` (chuẩn bị môi trường) |
 
@@ -172,13 +174,14 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 
 ### 7.1 G0–G2: lưu trên trình duyệt
 
-- **Nơi lưu:** `localStorage`, khoá có phiên bản (ví dụ `masteva:progress:v1`).
-- **Dữ liệu:** phiên bản schema, và ánh xạ `mã mục → thời điểm hoàn thành`. Chỉ lưu mục đã hoàn thành, không lưu theo ngôn ngữ.
+- **Nơi lưu:** `localStorage`, khoá `masteva:progress:v2`. Dữ liệu ở khoá v1 được chuyển sang v2 một lần, khoá v1 giữ lại.
+- **Dữ liệu:** phiên bản schema; `items` (mã mục → thời điểm hoàn thành); `topics` (mã chủ đề → trạng thái tự đặt `learning`/`done`/`skipped` và thời điểm); `start` (roadmap → cấp bắt đầu). Không lưu theo ngôn ngữ.
+- **Trạng thái chủ đề:** trạng thái tự đặt thắng; nếu không có thì suy ra từ mục đã tích trong các bài gắn với chủ đề. Chủ đề `opt` và chủ đề bỏ qua không tính vào tổng.
 - **Tính tổng:** tiến độ của bài, bước và roadmap được tính trên trình duyệt từ manifest. Không lưu số tổng, nên không bao giờ bị lệch.
 - **Nhiều tab:** lắng nghe sự kiện `storage` để các tab đồng bộ với nhau.
 - **Nâng cấp schema:** khi phiên bản trong máy cũ hơn, chạy hàm chuyển đổi rồi ghi lại.
 - **Lỗi lưu trữ** (chế độ ẩn danh, bị chặn, đầy): vẫn cho tích trong phiên hiện tại và hiện cảnh báo "tiến độ sẽ không được lưu".
-- **Xuất và nhập:** file JSON gồm phiên bản schema và danh sách mục. Khi nhập thì **gộp** (lấy hợp, giữ thời điểm sớm hơn), không ghi đè (FR-PROGRESS-003).
+- **Xuất và nhập:** file JSON v2 (nhận cả v1). Khi nhập thì **gộp**: mục lấy hợp và giữ thời điểm sớm hơn, chủ đề giữ trạng thái đặt sau cùng, cấp bắt đầu giữ bản hiện có (FR-PROGRESS-003).
 - **Hiệu năng:** tích một mục chỉ ghi `localStorage` và cập nhật giao diện ngay, không có I/O mạng.
 
 ### 7.2 G3: đồng bộ theo tài khoản (định hướng)

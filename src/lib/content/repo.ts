@@ -7,14 +7,17 @@ import {
   LESSON_SECTIONS,
   idsLockSchema,
   lessonFields,
+  projectSchema,
   refineLesson,
   roadmapSchema,
   stepFields,
   type IdsLock,
+  type Project,
   type Roadmap,
 } from './schema';
 import {
-  mergeLock,
+  mergeKeys,
+  validateGraph,
   validateInternalLinks,
   validateLessonStructure,
   validateLock,
@@ -28,6 +31,7 @@ import {
 const CONTENT_DIR = path.join(process.cwd(), 'content');
 const STEPS_DIR = path.join(CONTENT_DIR, 'steps');
 const ROADMAPS_DIR = path.join(CONTENT_DIR, 'roadmaps');
+const PROJECTS_DIR = path.join(CONTENT_DIR, 'projects');
 export const LOCK_FILE = path.join(CONTENT_DIR, 'ids.lock.json');
 const DEFAULT_LANG = 'vi';
 
@@ -54,6 +58,8 @@ export interface LessonEntry {
   path: string;
   title: string;
   checkIds: string[];
+  /** Chủ đề trên sơ đồ mà bài bao phủ. */
+  topics: string[];
   /** Hash nội dung bản gốc, để bản dịch ghi lại nó dựa vào phiên bản nào. */
   sourceHash: string;
 }
@@ -70,6 +76,18 @@ export function loadRoadmaps(): Roadmap[] {
     .sort()
     .map((f) => roadmapSchema.parse(readJson(path.join(ROADMAPS_DIR, f))));
   return roadmapsCache;
+}
+
+let projectsCache: Project[] | undefined;
+export function loadProjects(): Project[] {
+  projectsCache ??= fs.existsSync(PROJECTS_DIR)
+    ? fs
+        .readdirSync(PROJECTS_DIR)
+        .filter((f) => f.endsWith('.json'))
+        .sort()
+        .map((f) => projectSchema.parse(readJson(path.join(PROJECTS_DIR, f))))
+    : [];
+  return projectsCache;
 }
 
 let stepsCache: Map<string, StepMeta> | undefined;
@@ -113,7 +131,7 @@ export function hashContent(raw: string): string {
 }
 
 export function loadLock(): IdsLock {
-  if (!fs.existsSync(LOCK_FILE)) return { ids: [], replacements: {} };
+  if (!fs.existsSync(LOCK_FILE)) return { ids: [], topics: [], milestones: [], replacements: {} };
   return idsLockSchema.parse(readJson(LOCK_FILE));
 }
 
@@ -151,6 +169,7 @@ export function loadLessons(): LessonEntry[] {
         path: `/learn/${f.stepId}/${f.slug}`,
         title: frontmatter?.title ?? f.slug,
         checkIds: extracted.checkIds,
+        topics: frontmatter?.topics ?? [],
         sourceHash: hashContent(f.raw),
       };
     });
@@ -160,6 +179,8 @@ export function loadLessons(): LessonEntry[] {
 export interface ContentReport {
   errors: string[];
   currentIds: Set<string>;
+  currentTopics: Set<string>;
+  currentMilestones: Set<string>;
 }
 
 /** Chạy mọi kiểm tra nội dung (architecture §10). */
@@ -201,24 +222,49 @@ export function checkContent(): ContentReport {
     }
   }
 
-  for (const roadmap of loadRoadmaps()) {
-    for (const stepId of [...roadmap.steps, ...roadmap.optional]) {
-      if (!steps.has(stepId)) errors.push(`roadmap "${roadmap.id}": bước "${stepId}" không tồn tại`);
-    }
-    for (const hub of roadmap.hubs) {
-      if (!roadmap.steps.includes(hub.after)) errors.push(`roadmap "${roadmap.id}": ${hub.id} đặt sau bước không có trong roadmap`);
-    }
-  }
+  const projects = loadProjects();
+  validateGraph({
+    roadmaps: loadRoadmaps().map((r) => ({ id: r.id, recommended: r.recommended, levels: r.levels })),
+    steps: [...steps.values()].map((s) => ({
+      id: s.id,
+      topics: s.topics.map((t) => ({ id: t.id, requires: t.requires })),
+      links: s.links,
+    })),
+    projects: projects.map((p) => ({ id: p.id, milestones: p.milestones.map((m) => ({ id: m.id, needs: m.needs })) })),
+    lessons: parsed.flatMap((p) =>
+      p.file.lang === DEFAULT_LANG && p.frontmatter
+        ? [{ id: p.frontmatter.id, stepId: p.file.stepId, topics: p.frontmatter.topics }]
+        : [],
+    ),
+  }).forEach((e) => errors.push(e));
 
-  validateLock(loadLock(), currentIds).forEach((e) => errors.push(`ids.lock.json: ${e}`));
-  return { errors, currentIds };
+  const currentTopics = new Set([...steps.values()].flatMap((s) => s.topics.map((t) => t.id)));
+  const currentMilestones = new Set(projects.flatMap((p) => p.milestones.map((m) => m.id)));
+  const lock = loadLock();
+  validateLock(lock, currentIds).forEach((e) => errors.push(`ids.lock.json: ${e}`));
+  validateLock({ ids: lock.topics, replacements: lock.replacements }, currentTopics).forEach((e) =>
+    errors.push(`ids.lock.json (topics): ${e}`),
+  );
+  validateLock({ ids: lock.milestones, replacements: lock.replacements }, currentMilestones).forEach((e) =>
+    errors.push(`ids.lock.json (milestones): ${e}`),
+  );
+  return { errors, currentIds, currentTopics, currentMilestones };
 }
 
-/** Thêm mã mục mới vào file khoá. Trả về số mã đã thêm. */
-export function updateLock(currentIds: Set<string>): number {
+/** Thêm mã mục, mã chủ đề, mã mốc mới vào file khoá. Trả về số mã đã thêm theo từng loại. */
+export function updateLock(report: ContentReport): { ids: number; topics: number; milestones: number } {
   const lock = loadLock();
-  const next = mergeLock(lock, currentIds);
-  const added = next.ids.length - lock.ids.length;
-  if (added > 0) writeLock(next);
+  const next: IdsLock = {
+    ids: mergeKeys(lock.ids, report.currentIds),
+    topics: mergeKeys(lock.topics, report.currentTopics),
+    milestones: mergeKeys(lock.milestones, report.currentMilestones),
+    replacements: lock.replacements,
+  };
+  const added = {
+    ids: next.ids.length - lock.ids.length,
+    topics: next.topics.length - lock.topics.length,
+    milestones: next.milestones.length - lock.milestones.length,
+  };
+  if (added.ids + added.topics + added.milestones > 0) writeLock(next);
   return added;
 }

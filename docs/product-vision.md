@@ -20,7 +20,7 @@
 
 **Phạm vi nội dung:**
 - Masteva dành cho lập trình viên nói chung: backend, frontend, mobile, DevOps, data, AI engineering và kiến thức nền tảng.
-- Nhóm roadmap đầu tiên là **backend**, gồm lộ trình Senior Java · DevOps · Microservices cùng hai dự án xuyên suốt. Đây là nơi người sáng lập có chuyên môn và đang tự học, nên nội dung được kiểm chứng tốt nhất.
+- Nhóm roadmap đầu tiên là **backend**, gồm ba roadmap Java, DevOps và Microservices, mỗi roadmap đi từ nền tảng tới Senior, cùng hai dự án xuyên suốt (Neobank mini, Hub hội thoại). Đây là nơi người sáng lập có chuyên môn và đang tự học, nên nội dung được kiểm chứng tốt nhất.
 - Các mảng khác được thêm dần sau khi chuẩn nội dung và trang web đã ổn định.
 
 **Ngôn ngữ:** tiếng Việt là ngôn ngữ mặc định. Nội dung và trang web được thiết kế sẵn cho đa ngôn ngữ, bản tiếng Anh là ngôn ngữ thứ hai dự kiến.
@@ -110,7 +110,7 @@
 | Giai đoạn | Mục tiêu | Kết quả |
 |---|---|---|
 | **0. Nền móng** | Chuẩn nội dung, khung trang web, roadmap đầu tiên chạy được | Site đọc được bài theo roadmap, có đánh dấu tiến độ |
-| **1. Hoàn thiện 3 roadmap** | Viết đủ nội dung Java, DevOps, Microservices theo chuẩn, cùng đề cương hai dự án | 29 bước có bài học; lab đã chạy thử |
+| **1. Hoàn thiện 3 roadmap** | Viết đủ nội dung Java, DevOps, Microservices theo chuẩn, cùng đề cương hai dự án | 58 chặng có bài học; lab đã chạy thử |
 | **2. Vừa học vừa tối ưu** | Người sáng lập học thật, sửa nội dung và trang web theo trải nghiệm | Bài đạt trạng thái "đã kiểm chứng"; mở beta công khai |
 | **3. Cộng đồng và kiểm chứng tự động** | Tài khoản, đồng bộ tiến độ, CLI chấm bài, thảo luận theo bài | Người học bên ngoài dùng thường xuyên |
 | **4. Mở rộng** | Roadmap cho các mảng khác (frontend, mobile, data…), ngôn ngữ thứ hai, AI hỏi đáp, ôn tập giãn cách, cân nhắc thu tiền | Theo dữ liệu metric |
@@ -128,3 +128,5 @@ Giai đoạn 0 và 1 làm trước khi tiếp tục học, theo quyết định 
 | 03/10/2026 | Tiếng Việt là ngôn ngữ mặc định; sản phẩm sẽ đa ngôn ngữ về sau, nên thiết kế sẵn từ đầu |
 | 03/10/2026 | Framework web: Fumadocs trên Next.js ([so sánh](framework-comparison.md)) |
 | 03/10/2026 | Kiến trúc đã duyệt: static export trên Cloudflare Pages, nội dung chung repo, CC BY-NC-SA cho nội dung và MIT cho code mẫu ([architecture.md](architecture.md)) |
+| 03/10/2026 | Tách thành ba roadmap độc lập Java, DevOps, Microservices (từ nền tảng tới Senior, 58 chặng, 379 chủ đề); dự án thành trang riêng ([spec](superpowers/specs/2026-10-03-tach-roadmap-design.md)) |
+| 03/10/2026 | Giao diện theo hướng Night Lab, theme tối mặc định ([design-direction.md](design-direction.md)) |

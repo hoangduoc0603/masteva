@@ -2,21 +2,24 @@
 import { tally } from '@/lib/progress/model';
 import { useProgress, useReplacements } from '@/lib/progress/use-progress';
 import { useMessages } from '@/components/messages-provider';
-import { format } from '@/lib/messages';
+import { format } from '@/lib/format';
 import { cn } from '@/lib/cn';
 
 export function Bar({ done, total, label, className }: { done: number; total: number; label: string; className?: string }) {
-  const pct = total === 0 ? 0 : Math.round((done / total) * 100);
+  const ratio = total === 0 ? 0 : done / total;
   return (
     <div
-      className={cn('h-1.5 overflow-hidden rounded-full bg-fd-muted', className)}
+      className={cn('relative h-2 overflow-hidden rounded-full bg-[var(--surface)] shadow-[inset_0_0_0_1px_var(--field)]', className)}
       role="progressbar"
       aria-label={label}
       aria-valuemin={0}
       aria-valuemax={total}
       aria-valuenow={done}
     >
-      <div className="h-full rounded-full bg-fd-primary transition-[width]" style={{ width: `${pct}%` }} />
+      <div
+        className="absolute inset-0 origin-left bg-[var(--accent)] transition-transform motion-reduce:transition-none"
+        style={{ transform: `scaleX(${ratio})` }}
+      />
     </div>
   );
 }

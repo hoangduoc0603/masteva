@@ -5,16 +5,28 @@ Nội dung là sản phẩm chính của Masteva. Tài liệu này định nghĩ
 ## 1. Cấu trúc nội dung
 
 ```text
-Roadmap        Senior Java · DevOps · Microservices
-└── Bước       D1 · Linux, mạng và scripting
-    └── Bài    D1.1 · Tiến trình, signal, systemd, journald
-        └── Mục   các ý kiến thức, lab, tiêu chí có thể đánh dấu
+Roadmap        DevOps, từ Linux tới vận hành ở quy mô
+└── Cấp        Nền tảng · Middle · Senior
+    └── Chặng  D1 · Linux
+        ├── Chủ đề  d1.tien-trinh-signal-exit-code (nút trên sơ đồ)
+        └── Bài     D1.1 · Tiến trình, signal, systemd, journald
+            └── Mục   các ý kiến thức, lab, tiêu chí có thể đánh dấu
 ```
 
-- **Roadmap:** chuỗi bước có thứ tự, có thể ghép nhiều nhánh.
-- **Bước:** một giai đoạn kiến thức trọn vẹn, ví dụ D1, J1, M0. Một bước gồm nhiều bài.
+- **Roadmap:** một nhánh (Java, DevOps hoặc Microservices) từ nền tảng tới Senior, chia ba cấp.
+- **Chặng (bước):** một giai đoạn kiến thức trọn vẹn, ví dụ D1, J5, M3. Một chặng có danh sách chủ đề và nhiều bài.
+- **Chủ đề:** một nút trên sơ đồ roadmap, có mã ổn định dạng `<chặng>.<slug>`. Người học có thể tự đánh dấu chủ đề kể cả khi chưa có bài.
 - **Bài:** một đơn vị học trọn vẹn, đủ để nắm một nhóm khái niệm và làm được lab của nó.
 - **Mục:** đơn vị nhỏ nhất để đánh dấu tiến độ, có mã ổn định.
+
+### 1.1 Chủ đề trên sơ đồ
+
+- Chủ đề khai báo trong `topics` của `meta.json` chặng: `id`, `title`, `kind` (`core` mặc định, `pick` kèm `options`, `opt`), `summary` 1–2 câu, `requires`, tối đa 3 `resources`.
+- `summary` hiện ở khung chi tiết khi chủ đề chưa có bài, nên phải tự đứng được: 1–2 câu, 25–55 từ, nói chủ đề là gì và ở cấp này người học cần làm được gì. Thuật ngữ giữ tiếng Anh; không quảng cáo, không câu hỏi tu từ. Chỉ ghi phiên bản khi nó quan trọng (ví dụ "từ Java 21").
+- `resources`: tài liệu chính thức hoặc chuẩn (docs.oracle.com, dev.java, openjdk.org, RFC, trang tài liệu của công cụ), không blog hay video. `title` là tên thật của trang, `note` một câu tiếng Việt nói nên đọc gì ở đó. Mọi link phải kiểm trả về 200 trước khi thêm. Chủ đề `pick` có tài liệu cho mỗi lựa chọn.
+- Mã chủ đề được khoá trong `content/ids.lock.json`; đổi hay gộp thì thêm cặp vào `replacements`.
+- Mỗi bài khai báo chủ đề mình bao phủ trong frontmatter `topics` (bắt buộc, ít nhất một). Chủ đề phải thuộc chặng của bài, hoặc chặng có trong `links`.
+- Chủ đề chung giữa các roadmap chỉ dạy đầy đủ ở một nơi; nơi khác dùng `links` trỏ sang.
 
 ## 2. Khung 6 phần của một bài
 
@@ -86,6 +98,8 @@ Một bài đi qua ba trạng thái:
 | **Nháp** | Đã viết đủ 6 phần | Có nhãn "Nháp, chưa kiểm chứng" |
 | **Đã kiểm chứng** | Mọi lệnh và code đã chạy thành công trên môi trường ghi trong metadata; kiến thức đã được rà lại với nguồn chính thức | Nhãn "Đã kiểm chứng ngày …, với phiên bản …" |
 | **Cần cập nhật** | Công cụ ra phiên bản mới làm thay đổi kết quả, hoặc có lỗi được báo | Nhãn cảnh báo và mô tả phần có thể đã cũ |
+
+**Ngoại lệ khi kiểm chứng** (người dùng chấp nhận ngày 03/10/2026): lệnh cài đặt làm thay đổi hệ thống (`brew install`, trình cài gói) và lệnh dọn dẹp cuối bài (`rm -rf` thư mục lab) không bắt buộc chạy thật, miễn là lệnh cài đã được kiểm bằng chế độ thử (ví dụ `--dry-run`) và lệnh dọn dẹp chỉ xoá thứ bài vừa tạo. Bước chỉ làm được trên giao diện (IDE) không thuộc ngoại lệ này.
 
 **Metadata bắt buộc của mỗi bài:**
 - Mã bài (ví dụ `d1.1`), roadmap, bước.

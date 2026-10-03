@@ -7,7 +7,7 @@ import { source, learnRoute } from '@/lib/source';
 import { DEFAULT_LANGUAGE, i18n, isLanguage } from '@/lib/i18n';
 import { getMessages } from '@/lib/messages';
 import { alternatesFor } from '@/lib/site';
-import { getLessonItems, getLessonSourceHash, getReplacements, hasTranslation } from '@/lib/content/manifest';
+import { getLessonContext, getLessonItems, getLessonSourceHash, getReplacements, hasTranslation } from '@/lib/content/manifest';
 import { getMDXComponents } from '@/components/mdx';
 import { sectionToc } from '@/components/lesson/sections';
 import { LessonStatusBadge } from '@/components/lesson/lesson-meta';
@@ -49,19 +49,41 @@ export default async function LessonPage(props: PageProps<'/[lang]/learn/[[...sl
   const MDX = page.data.body;
   const [stepId, slug] = page.slugs;
   const sourceHash = getLessonSourceHash(stepId, slug);
+  const context = getLessonContext(page.data.id, lang);
   const staleTranslation = !showingFallback && lang !== DEFAULT_LANGUAGE && page.data.source !== sourceHash;
 
   return (
-    <DocsPage toc={sectionToc(t)}>
-      <DocsTitle>{page.data.title}</DocsTitle>
-      <DocsDescription className="mb-0">{page.data.description}</DocsDescription>
-      <div className="flex flex-col gap-3 border-b pb-6">
+    <DocsPage toc={sectionToc(t)} breadcrumb={{ enabled: false }}>
+      {context ? (
+        <nav className="ls-crumb" aria-label={t.lesson.breadcrumb}>
+          <a href={`/${lang}/roadmaps/${context.roadmap.id}`}>{context.roadmap.title}</a>
+          <span aria-hidden="true">/</span>
+          <a href={`/${lang}/roadmaps/${context.roadmap.id}#step-${context.step.id}`}>
+            {context.step.code} {context.step.title}
+          </a>
+        </nav>
+      ) : null}
+      <DocsTitle className="ms-title">{page.data.title}</DocsTitle>
+      <DocsDescription className="ms-lede mb-0">{page.data.description}</DocsDescription>
+      <div className="ms-head flex flex-col gap-3">
         <LessonStatusBadge
           t={t}
           status={page.data.status}
           verified={page.data.verified}
           outdatedNote={page.data.outdatedNote}
         />
+        {context && context.topics.length > 0 ? (
+          <div className="ls-topics">
+            <span className="ls-topics-k">{t.lesson.topics}</span>
+            <ul>
+              {context.topics.map((topic) => (
+                <li key={topic.id}>
+                  <a href={`/${lang}/roadmaps/${topic.roadmapId}#${topic.id}`}>{topic.title}</a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
         {showingFallback ? (
           <Callout type="info" data-testid="untranslated-notice">
             {t.lesson.untranslated}
@@ -70,7 +92,7 @@ export default async function LessonPage(props: PageProps<'/[lang]/learn/[[...sl
         {staleTranslation ? <Callout type="warning">{t.lesson.staleTranslation}</Callout> : null}
         <LessonProgress items={getLessonItems(page.data.id)} replacements={getReplacements()} />
       </div>
-      <DocsBody>
+      <DocsBody className="ms-lesson">
         <MDX components={getMDXComponents(t, { a: createRelativeLink(source, page) })} />
       </DocsBody>
     </DocsPage>

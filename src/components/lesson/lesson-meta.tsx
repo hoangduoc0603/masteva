@@ -1,5 +1,6 @@
 import type { LessonStatus } from '@/lib/content/constants';
-import { format, type Messages } from '@/lib/messages';
+import { format } from '@/lib/format';
+import type { Messages } from '@/lib/messages';
 
 interface Verified {
   date: string;
@@ -30,14 +31,14 @@ export function LessonStatusBadge({
     : '';
 
   return (
-    <div className="not-prose flex flex-wrap items-center gap-2 text-xs">
-      <span className="lesson-status" data-status={status}>
+    <div className="ms-meta not-prose">
+      <span className="ms-badge" data-status={status}>
         {label}
       </span>
       {verified ? (
-        <span className="text-fd-muted-foreground">{format(t.lesson.verifiedEnv, { os: verified.os, tools })}</span>
+        <span className="ms-meta-item">{format(t.lesson.verifiedEnv, { os: verified.os, tools })}</span>
       ) : null}
-      {status === 'outdated' && outdatedNote ? <span className="text-fd-muted-foreground">{outdatedNote}</span> : null}
+      {status === 'outdated' && outdatedNote ? <span className="ms-meta-item">{outdatedNote}</span> : null}
     </div>
   );
 }

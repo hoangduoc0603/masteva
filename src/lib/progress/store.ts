@@ -1,4 +1,16 @@
-import { emptyProgress, mergeProgress, parseProgress, PROGRESS_STORAGE_KEY, toggleItem, type Progress } from './model';
+import type { Level } from '@/lib/content/constants';
+import {
+  emptyProgress,
+  LEGACY_PROGRESS_STORAGE_KEY,
+  mergeProgress,
+  parseProgress,
+  PROGRESS_STORAGE_KEY,
+  setStart,
+  setTopicMark,
+  toggleItem,
+  type Progress,
+  type TopicMark,
+} from './model';
 
 /**
  * Kho tiến độ trên trình duyệt (architecture §7.1).
@@ -45,13 +57,20 @@ export class ProgressStore {
     this.write(toggleItem(this.snapshot.progress, id));
   }
 
-  /** Gộp tiến độ từ file nhập vào tiến độ hiện có. Trả về số mục sau khi gộp, hoặc `null` nếu file sai. */
+  setTopic(id: string, mark: TopicMark | null): void {
+    this.write(setTopicMark(this.snapshot.progress, id, mark));
+  }
+
+  setStart(roadmapId: string, level: Level | null): void {
+    this.write(setStart(this.snapshot.progress, roadmapId, level));
+  }
+
+  /** Gộp tiến độ từ file nhập. Trả về số mục và chủ đề có trong file, hoặc `null` nếu file sai. */
   importData(raw: unknown): number | null {
     const incoming = parseProgress(raw, this.replacements);
     if (!incoming) return null;
-    const merged = mergeProgress(this.snapshot.progress, incoming);
-    this.write(merged);
-    return Object.keys(merged.items).length;
+    this.write(mergeProgress(this.snapshot.progress, incoming));
+    return Object.keys(incoming.items).length + Object.keys(incoming.topics).length;
   }
 
   exportData(): Progress {
@@ -68,8 +87,18 @@ export class ProgressStore {
     if (!this.storage) return { progress: this.snapshot?.progress ?? emptyProgress(), persistent: false };
     try {
       const raw = this.storage.getItem(PROGRESS_STORAGE_KEY);
-      const progress = raw ? parseProgress(JSON.parse(raw), this.replacements) : null;
-      return { progress: progress ?? emptyProgress(), persistent: true };
+      if (raw) return { progress: parseProgress(JSON.parse(raw), this.replacements) ?? emptyProgress(), persistent: true };
+      const legacy = this.storage.getItem(LEGACY_PROGRESS_STORAGE_KEY);
+      const migrated = legacy ? parseProgress(JSON.parse(legacy), this.replacements) : null;
+      if (!migrated) return { progress: emptyProgress(), persistent: true };
+      // Chuyển dữ liệu v1 sang khoá v2 một lần; giữ khoá v1 để có thể quay lui (spec §5).
+      // Ghi lỗi (hết quota) thì vẫn dùng bản đã đọc, chỉ báo là không lưu được.
+      try {
+        this.storage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(migrated));
+        return { progress: migrated, persistent: true };
+      } catch {
+        return { progress: migrated, persistent: false };
+      }
     } catch {
       return { progress: this.snapshot?.progress ?? emptyProgress(), persistent: false };
     }

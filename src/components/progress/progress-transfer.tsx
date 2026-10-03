@@ -3,7 +3,7 @@ import { useRef, useState } from 'react';
 import { getProgressStore } from '@/lib/progress/store';
 import { useProgress } from '@/lib/progress/use-progress';
 import { useMessages } from '@/components/messages-provider';
-import { format } from '@/lib/messages';
+import { format } from '@/lib/format';
 import { PersistWarning } from './progress-bar';
 
 /** Xuất và nhập tiến độ dạng file JSON (FR-PROGRESS-003). Khi nhập thì gộp, không ghi đè. */
@@ -34,10 +34,10 @@ export function ProgressTransfer() {
 
   return (
     <div className="flex flex-wrap items-center gap-2 text-sm">
-      <button type="button" className="roadmap-filter" onClick={exportProgress}>
+      <button type="button" className="rm-close" onClick={exportProgress}>
         {t.progress.export}
       </button>
-      <button type="button" className="roadmap-filter" onClick={() => fileRef.current?.click()}>
+      <button type="button" className="rm-close" onClick={() => fileRef.current?.click()}>
         {t.progress.import}
       </button>
       <input

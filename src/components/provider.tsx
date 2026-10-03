@@ -32,7 +32,7 @@ export function Provider({
   }, [lang]);
 
   return (
-    <RootProvider i18n={i18n} search={{ SearchDialog }}>
+    <RootProvider i18n={i18n} search={{ SearchDialog }} theme={{ defaultTheme: 'dark' }}>
       <MessagesProvider messages={messages}>{children}</MessagesProvider>
     </RootProvider>
   );

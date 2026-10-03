@@ -27,19 +27,23 @@ export function sectionToc(t: Messages) {
  * Tiêu đề phần do component sinh ra, tác giả không tự viết.
  */
 export function createSectionComponents(t: Messages): Record<SectionName, (props: { children?: ReactNode }) => ReactNode> {
-  const make = (name: SectionName) =>
+  const make = (name: SectionName, index: number) =>
     function Section({ children }: { children?: ReactNode }) {
       const anchor = SECTION_ANCHORS[name];
       return (
-        <section aria-labelledby={anchor} data-section={name} className="lesson-section">
-          <h2 id={anchor} className="scroll-mt-24">
-            {t.lesson.sections[name]}
+        <section aria-labelledby={anchor} data-section={name} className="ms-sec">
+          <h2 id={anchor} className="ms-sec-h">
+            {/* Số thứ tự chỉ để nhìn; tên phần là tên của heading. */}
+            <span className="ms-sec-n" aria-hidden="true">
+              {index + 1}
+            </span>
+            <span>{t.lesson.sections[name]}</span>
           </h2>
           {children}
         </section>
       );
     };
-  return Object.fromEntries(LESSON_SECTIONS.map((name) => [name, make(name)])) as Record<
+  return Object.fromEntries(LESSON_SECTIONS.map((name, index) => [name, make(name, index)])) as Record<
     SectionName,
     (props: { children?: ReactNode }) => ReactNode
   >;
