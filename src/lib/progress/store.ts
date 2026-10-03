@@ -1,0 +1,120 @@
+import { emptyProgress, mergeProgress, parseProgress, PROGRESS_STORAGE_KEY, toggleItem, type Progress } from './model';
+
+/**
+ * Kho tiến độ trên trình duyệt (architecture §7.1).
+ * Ghi `localStorage`; nếu bị chặn thì giữ trong bộ nhớ và báo `persistent = false`.
+ * Các tab đồng bộ với nhau qua sự kiện `storage`.
+ */
+export interface StorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+export interface ProgressSnapshot {
+  progress: Progress;
+  persistent: boolean;
+}
+
+type Listener = () => void;
+
+export class ProgressStore {
+  private snapshot: ProgressSnapshot;
+  private readonly listeners = new Set<Listener>();
+
+  constructor(
+    private readonly storage: StorageLike | null,
+    private replacements: Readonly<Record<string, string>> = {},
+  ) {
+    this.snapshot = this.read();
+  }
+
+  getSnapshot = (): ProgressSnapshot => this.snapshot;
+
+  subscribe = (listener: Listener): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  /** Cập nhật bảng mã thay thế khi trang có manifest mới. */
+  setReplacements(replacements: Readonly<Record<string, string>>): void {
+    this.replacements = replacements;
+    this.reload();
+  }
+
+  toggle(id: string): void {
+    this.write(toggleItem(this.snapshot.progress, id));
+  }
+
+  /** Gộp tiến độ từ file nhập vào tiến độ hiện có. Trả về số mục sau khi gộp, hoặc `null` nếu file sai. */
+  importData(raw: unknown): number | null {
+    const incoming = parseProgress(raw, this.replacements);
+    if (!incoming) return null;
+    const merged = mergeProgress(this.snapshot.progress, incoming);
+    this.write(merged);
+    return Object.keys(merged.items).length;
+  }
+
+  exportData(): Progress {
+    return this.snapshot.progress;
+  }
+
+  /** Đọc lại từ storage, dùng khi tab khác vừa ghi. */
+  reload(): void {
+    this.snapshot = this.read();
+    this.emit();
+  }
+
+  private read(): ProgressSnapshot {
+    if (!this.storage) return { progress: this.snapshot?.progress ?? emptyProgress(), persistent: false };
+    try {
+      const raw = this.storage.getItem(PROGRESS_STORAGE_KEY);
+      const progress = raw ? parseProgress(JSON.parse(raw), this.replacements) : null;
+      return { progress: progress ?? emptyProgress(), persistent: true };
+    } catch {
+      return { progress: this.snapshot?.progress ?? emptyProgress(), persistent: false };
+    }
+  }
+
+  private write(progress: Progress): void {
+    let persistent = this.storage !== null;
+    if (this.storage) {
+      try {
+        this.storage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(progress));
+      } catch {
+        persistent = false;
+      }
+    }
+    this.snapshot = { progress, persistent };
+    this.emit();
+  }
+
+  private emit(): void {
+    for (const listener of this.listeners) listener();
+  }
+}
+
+function browserStorage(): StorageLike | null {
+  try {
+    const storage = window.localStorage;
+    const probe = '__masteva_probe__';
+    storage.setItem(probe, '1');
+    storage.removeItem(probe);
+    return storage;
+  } catch {
+    return null;
+  }
+}
+
+let shared: ProgressStore | undefined;
+
+/** Kho dùng chung cho cả trang. Chỉ gọi ở trình duyệt. */
+export function getProgressStore(): ProgressStore {
+  if (!shared) {
+    const store = new ProgressStore(browserStorage());
+    window.addEventListener('storage', (event) => {
+      if (event.key === PROGRESS_STORAGE_KEY) store.reload();
+    });
+    shared = store;
+  }
+  return shared;
+}
