@@ -1,0 +1,611 @@
+---
+title: Scheduling, nhiều instance và ShedLock
+description: Dùng @Scheduled với fixedDelay, fixedRate và cron có múi giờ rõ ràng; tái hiện việc job chạy trùng khi có hai instance, rồi sửa bằng ShedLock trên Redis và hiểu ý nghĩa của lockAtMostFor, lockAtLeastFor.
+id: j16.3
+step: j16
+prerequisites: [j16.2]
+topics: [j16.scheduling]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    shedlock: 7.10.1
+    docker: 29.8.0
+    redis: 8.10.2
+    kafka: 4.3.1
+    curl: 8.4.0
+---
+
+<Goal>
+
+Viết được job định kỳ bằng Spring, chọn đúng kiểu lịch và múi giờ, và giữ cho job chỉ chạy một lần khi ứng dụng có nhiều instance. Học xong bài này, bạn giải thích được:
+
+- Vì sao job "mỗi 10 giây" lại chạy cách nhau 12 giây.
+- Vì sao job báo cáo đặt `0 0 2 * * *` chạy lúc 9 giờ sáng giờ Việt Nam sau khi deploy lên server.
+- Vì sao scale ứng dụng lên hai instance làm khách nhận hai email nhắc thanh toán, và vì sao chỉ thêm khoá là chưa đủ nếu vẫn dùng `fixedDelay`.
+
+</Goal>
+
+<Knowledge>
+
+### @Scheduled và scheduler của Spring
+
+`@EnableScheduling` bật việc quét các method có `@Scheduled`. Spring Boot tạo sẵn một `ThreadPoolTaskScheduler` với **một thread** tên `scheduling-1` (đổi bằng `spring.task.scheduling.pool.size`). Mọi job dùng chung thread đó: một job chạy 5 phút thì các job khác chờ 5 phút.
+
+| Kiểu | Nghĩa | Ví dụ |
+|---|---|---|
+| `fixedDelay` | Lần sau bắt đầu sau khi lần trước **kết thúc** một khoảng cố định | Quét hàng đợi việc, không muốn chạy chồng |
+| `fixedRate` | Lần sau bắt đầu sau khi lần trước **bắt đầu** một khoảng cố định | Lấy mẫu số liệu đều đặn |
+| `cron` | Chạy theo lịch đồng hồ | 2 giờ sáng mỗi ngày, mỗi 10 giây đúng giây 0, 10, 20 |
+| `initialDelay` | Chờ thêm trước lần chạy đầu, đi kèm `fixedDelay` hoặc `fixedRate` | Tránh chạy ngay lúc ứng dụng vừa khởi động |
+
+Với một job mất 2 giây và chu kỳ 10 giây:
+
+```text
+fixedDelay = 10s   |██|..........|██|..........|██|        bắt đầu ở 0, 12, 24
+fixedRate  = 10s   |██|........|██|........|██|            bắt đầu ở 0, 10, 20
+cron */10 giây     |██|........|██|........|██|            bắt đầu ở giây :00, :10, :20 của đồng hồ
+                   0         10        20        30  (giây)
+```
+
+Với scheduler mặc định (`ThreadPoolTaskScheduler`), job chạy lâu hơn chu kỳ thì `fixedRate` không chạy chồng mà chạy liền lần sau ngay khi lần trước xong. Job ném exception thì Spring ghi log lỗi và vẫn chạy lần sau theo lịch.
+
+**Cron của Spring có 6 trường**, trường đầu là giây: `giây phút giờ ngày tháng thứ`. Cron của Linux chỉ có 5 trường, nên chép `0 2 * * *` từ crontab sang Spring là báo lỗi lúc khởi động, vì thiếu một trường.
+
+| Biểu thức | Nghĩa |
+|---|---|
+| `*/10 * * * * *` | Mỗi 10 giây, ở giây 0, 10, 20, ... |
+| `0 0 2 * * *` | 2:00:00 mỗi ngày |
+| `0 30 8 * * MON-FRI` | 8:30 các ngày trong tuần |
+| `@daily` | Nửa đêm mỗi ngày, tương đương `0 0 0 * * *` |
+
+<Check id="j16.3.schedule-modes">Phân biệt được `fixedDelay`, `fixedRate` và `cron` trên một dòng thời gian, và đọc được biểu thức cron 6 trường của Spring.</Check>
+
+### Múi giờ
+
+Cron không ghi `zone` thì tính theo múi giờ mặc định của JVM, lấy từ hệ điều hành. Máy lập trình ở Việt Nam là `Asia/Ho_Chi_Minh` (UTC+7); server và container thường là `UTC`. Cùng biểu thức `0 0 2 * * *`:
+
+| Máy chạy | Giờ chạy thật (giờ Việt Nam) |
+|---|---|
+| Laptop ở Hà Nội | 2:00 |
+| Container mặc định UTC | 9:00 |
+| Có `zone = "Asia/Ho_Chi_Minh"` | 2:00 ở mọi nơi |
+
+Ghi `zone` cho mọi job gắn với giờ nghiệp vụ. Ở các nước có giờ mùa hè (DST), job đặt 2:30 sáng có thể bị bỏ qua hoặc chạy hai lần vào ngày đổi giờ; Việt Nam không có DST nhưng khách hàng ở nước khác thì có.
+
+### Khi có nhiều instance
+
+Mỗi instance là một JVM với scheduler riêng, không biết instance kia tồn tại. Scale lên hai instance là mọi job chạy hai lần.
+
+```text
+          giây :00                     giây :10
+instance A  ── remind() ──>  email     ── remind() ──>  email
+instance B  ── remind() ──>  email     ── remind() ──>  email     khách nhận 2 email mỗi lần
+```
+
+| Cách | Ý tưởng | Đổi lại |
+|---|---|---|
+| ShedLock | Mọi instance cùng kích hoạt, chỉ instance giành được khoá trong store chung (Redis, database) chạy | Thêm một thư viện nhỏ; cần store chung |
+| Lịch bên ngoài | Kubernetes CronJob hoặc dịch vụ lịch gọi một endpoint hay chạy một tiến trình riêng | Thêm hạ tầng; job tách khỏi ứng dụng |
+| Quartz ở chế độ cluster | Quartz lưu lịch và khoá trong database | Nặng, nhiều bảng, cấu hình phức tạp |
+| Chỉ một instance bật scheduler | Cờ cấu hình chỉ bật trên một instance | Instance đó chết thì job dừng, không ai thay |
+
+### ShedLock
+
+ShedLock không phải scheduler. Nó bọc method có `@SchedulerLock`: trước khi chạy, thử ghi một khoá vào store chung; ghi được thì chạy, không được thì bỏ qua lần này.
+
+```text
+giây :10      instance A: SET job-lock:shop:unpaidReminder ... NX PX 30000  -> OK, chạy job
+              instance B: SET job-lock:shop:unpaidReminder ... NX PX 30000  -> nil, bỏ qua
+giây :12      A chạy xong: đặt lại hạn khoá thành :10 + lockAtLeastFor (5 s) = :15
+giây :15      khoá hết hạn
+giây :20      cả hai lại tranh khoá; ai thắng thì chạy
+```
+
+- `lockAtMostFor`: khoá tự hết hạn sau khoảng này, kể cả khi instance giữ khoá chết giữa chừng. Phải **dài hơn** thời gian chạy lâu nhất của job; ngắn hơn thì instance khác có thể chạy chồng trong lúc job vẫn đang chạy.
+- `lockAtLeastFor`: giữ khoá tối thiểu khoảng này dù job xong sớm. Nó che độ lệch đồng hồ giữa các máy: instance có đồng hồ chậm vài giây kích hoạt muộn hơn, vẫn thấy khoá còn và bỏ qua.
+
+ShedLock chỉ chặn chạy **chồng nhau**, không chặn chạy **hai lần lệch nhau**. Với `fixedDelay`, mỗi instance kích hoạt theo thời điểm khởi động của nó; hai lần kích hoạt cách nhau vài giây thì khoá của lần trước đã nhả, và job vẫn chạy hai lần. Dùng `cron` để mọi instance kích hoạt cùng một mốc đồng hồ, và giữ job idempotent cho trường hợp còn lại.
+
+<Callout kind="production">
+
+Job "gửi nhắc thanh toán" chạy ổn nhiều tháng với một instance. Đợt khuyến mãi, đội vận hành scale lên 4 instance; sáng hôm sau tổng đài nhận phàn nàn vì mỗi khách nhận 4 email. Không có dòng code nào thay đổi. Mọi job định kỳ cần được thiết kế cho nhiều instance ngay từ đầu: khoá như ShedLock, cộng với dấu "đã gửi" cho từng đơn để chạy lại không gửi trùng.
+
+</Callout>
+
+<Check id="j16.3.multi-instance">Giải thích được vì sao job chạy trùng khi có nhiều instance, ShedLock chặn điều đó thế nào, và vì sao nó cần lịch `cron` thay vì `fixedDelay`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Task Execution and Scheduling](https://docs.spring.io/spring-framework/reference/integration/scheduling.html): mục "The @Scheduled annotation" về `fixedDelay`, `fixedRate`, `zone` và cú pháp cron 6 trường.
+- [Scheduling Tasks](https://spring.io/guides/gs/scheduling-tasks/): ví dụ ngắn chạy được với `@EnableScheduling`.
+- [ShedLock](https://github.com/lukas-krecan/ShedLock): phần README về `lockAtMostFor`, `lockAtLeastFor`, các lock provider và mục cảnh báo về đồng hồ.
+- [Spring Batch Overview](https://docs.spring.io/spring-batch/reference/): đọc khi job vượt quá một method `@Scheduled`, xem phần Đào sâu.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** project `~/masteva-j16/shop` và hai container Redis, Kafka từ J16.2. Instance A chạy ở cổng **20160**, instance B ở **20161**. Mở **ba tab Terminal**: tab 1 cho instance A, tab 2 cho instance B, tab 3 để kiểm tra. Ở mỗi tab trỏ Maven về JDK 25; ở một tab, bật lại hai container nếu chúng đang dừng:
+
+<Terminal where="mac">
+
+```bash
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+docker start masteva-j16-redis masteva-j16-kafka
+```
+
+</Terminal>
+
+### 1. Job nhắc thanh toán với fixedDelay
+
+`ReminderJob` giả lập quét đơn chưa thanh toán và gửi email nhắc, mất 2 giây mỗi lần. Mỗi lần chạy tăng bộ đếm `reminder:runs` trong Redis, để đếm được tổng số lần chạy của mọi instance. `NightlyJobs` có hai job 2 giờ sáng, một có `zone`, một không, để so múi giờ. Dòng `perl` mở thêm endpoint `/actuator/scheduledtasks`.
+
+<Terminal where="mac" title="Tạo SchedulingConfig, ReminderJob, NightlyJobs">
+
+```bash
+cd ~/masteva-j16/shop
+mkdir -p src/main/java/dev/masteva/shop/jobs
+perl -pi -e 's/^management.endpoints.web.exposure.include=.*/management.endpoints.web.exposure.include=health,caches,scheduledtasks/' src/main/resources/application.properties
+cat > src/main/java/dev/masteva/shop/jobs/SchedulingConfig.java <<'EOF'
+package dev.masteva.shop.jobs;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@Configuration
+@EnableScheduling
+public class SchedulingConfig {
+}
+EOF
+cat > src/main/java/dev/masteva/shop/jobs/ReminderJob.java <<'EOF'
+package dev.masteva.shop.jobs;
+
+import java.util.concurrent.TimeUnit;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+public class ReminderJob {
+    private static final Logger log = LoggerFactory.getLogger(ReminderJob.class);
+    private final StringRedisTemplate redis;
+    private final int port;
+
+    public ReminderJob(StringRedisTemplate redis, @Value("${server.port}") int port) {
+        this.redis = redis;
+        this.port = port;
+    }
+
+    @Scheduled(fixedDelay = 10, timeUnit = TimeUnit.SECONDS)
+    public void remindUnpaidOrders() throws InterruptedException {
+        Long run = redis.opsForValue().increment("reminder:runs");
+        log.info("reminder run #{} on port {}", run, port);
+        Thread.sleep(2_000); // giả lập quét đơn chưa thanh toán và gửi email nhắc
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/shop/jobs/NightlyJobs.java <<'EOF'
+package dev.masteva.shop.jobs;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+public class NightlyJobs {
+    private static final Logger log = LoggerFactory.getLogger(NightlyJobs.class);
+
+    @Scheduled(cron = "0 0 2 * * *", zone = "Asia/Ho_Chi_Minh")
+    public void dailyReport() {
+        log.info("daily report");
+    }
+
+    @Scheduled(cron = "0 0 2 * * *")
+    public void purgeExpiredCarts() {
+        log.info("purge expired carts");
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Chạy instance A với `-Duser.timezone=UTC`, giả lập một server để múi giờ mặc định là UTC:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j16/shop && mvn -q package -DskipTests && java -Duser.timezone=UTC -jar target/shop-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+Đợi khoảng 30 giây, rồi ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-j16/shop && grep ReminderJob app.log
+```
+
+</Terminal>
+
+<Predict question="fixedDelay = 10 giây, job mất 2 giây. Các lần chạy cách nhau bao lâu?">
+
+```text
+18:25:21.497 INFO  [   scheduling-1] ReminderJob: reminder run #1 on port 20160
+18:25:33.510 INFO  [   scheduling-1] ReminderJob: reminder run #2 on port 20160
+18:25:45.521 INFO  [   scheduling-1] ReminderJob: reminder run #3 on port 20160
+```
+
+12 giây: 2 giây chạy cộng 10 giây chờ sau khi xong. Giờ trong log là UTC vì JVM chạy với `-Duser.timezone=UTC`; trên máy kiểm chứng, 18:25 UTC là 01:25 sáng giờ Việt Nam. Lần đầu chạy ngay khi ứng dụng khởi động vì `initialDelay` mặc định là 0.
+
+</Predict>
+
+### 2. Hai job 2 giờ sáng chạy lúc nào
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:20160/actuator/scheduledtasks \
+  | grep -oE '"(expression|interval)":[^,]*|"nextExecution":\{"time":"[^"]*"|"target":"[^"]*"'
+```
+
+</Terminal>
+
+<Predict question="Hai job cùng biểu thức 0 0 2 * * *. Lần chạy tới của chúng có giống nhau không?">
+
+```text
+"expression":"0 0 2 * * *"
+"nextExecution":{"time":"2026-10-03T18:59:59.999531Z"
+"target":"dev.masteva.shop.jobs.NightlyJobs.dailyReport"
+"expression":"0 0 2 * * *"
+"nextExecution":{"time":"2026-10-04T01:59:59.999662Z"
+"target":"dev.masteva.shop.jobs.NightlyJobs.purgeExpiredCarts"
+"interval":10000
+"nextExecution":{"time":"2026-10-03T18:25:57.525571Z"
+"target":"dev.masteva.shop.jobs.ReminderJob.remindUnpaidOrders"
+```
+
+Không. Actuator in mọi thời điểm theo UTC. `dailyReport` có `zone = "Asia/Ho_Chi_Minh"` nên chạy lúc 19:00 UTC, tức 2:00 sáng giờ Việt Nam. `purgeExpiredCarts` không có `zone` nên theo múi giờ của JVM (UTC) và chạy lúc 02:00 UTC, tức **9:00 sáng** giờ Việt Nam, giữa giờ cao điểm. Actuator ước lượng lần chạy tới nên lệch vài phần nghìn giây trước mốc tròn. Ngày giờ trên máy bạn khác, nhưng khoảng cách 7 tiếng giữa hai job thì giống.
+
+</Predict>
+
+<Check id="j16.3.lab-schedule">Đọc được khoảng cách giữa các lần chạy `fixedDelay` trong log, và dùng `/actuator/scheduledtasks` chỉ ra job cron nào sẽ chạy sai giờ vì thiếu `zone`.</Check>
+
+### 3. Thêm instance thứ hai
+
+Ở tab 2, chạy instance B từ cùng file jar, đổi cổng và file log:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j16/shop
+java -Duser.timezone=UTC -jar target/shop-0.0.1-SNAPSHOT.jar --server.port=20161 --logging.file.name=app2.log
+```
+
+</Terminal>
+
+Đợi khoảng 30 giây, rồi ở tab 3 gộp log của hai instance theo thời gian, và xem consumer group Kafka:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+grep -h ReminderJob app.log app2.log | sort | tail -n 6
+docker exec masteva-j16-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:20163 \
+  --describe --group inventory --members
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+18:25:54.946 INFO  [   scheduling-1] ReminderJob: reminder run #4 on port 20161
+18:25:57.533 INFO  [   scheduling-1] ReminderJob: reminder run #5 on port 20160
+18:26:06.960 INFO  [   scheduling-1] ReminderJob: reminder run #6 on port 20161
+18:26:09.550 INFO  [   scheduling-1] ReminderJob: reminder run #7 on port 20160
+18:26:18.984 INFO  [   scheduling-1] ReminderJob: reminder run #8 on port 20161
+18:26:21.577 INFO  [   scheduling-1] ReminderJob: reminder run #9 on port 20160
+
+GROUP           CONSUMER-ID                                               HOST            CLIENT-ID            #PARTITIONS     
+inventory       consumer-inventory-2-c4d830e8-e4da-4044-8df1-20a7bc122d86 /192.168.65.1   consumer-inventory-2 0               
+inventory       consumer-inventory-3-3d0c080d-1e53-4928-b3e7-23811aa163e9 /192.168.65.1   consumer-inventory-3 0               
+inventory       consumer-inventory-1-733e3659-123a-460e-adcc-42546554c075 /192.168.65.1   consumer-inventory-1 1               
+inventory       consumer-inventory-2-a33a04ba-9c96-4bd9-8ac0-149a60b7818f /192.168.65.1   consumer-inventory-2 1               
+inventory       consumer-inventory-1-db290a06-e080-4bd2-8e5a-cacab578b995 /192.168.65.1   consumer-inventory-1 1               
+inventory       consumer-inventory-3-c4352c9d-719e-4d24-b1f3-6d80b2f81b52 /192.168.65.1   consumer-inventory-3 0               
+```
+
+</Expected>
+
+Mỗi chu kỳ 12 giây giờ có hai lần chạy, một ở mỗi cổng, lệch nhau vài giây theo lúc từng instance khởi động: mỗi khách nhận hai email nhắc. Ở phía Kafka, hai instance mỗi bên 3 consumer thành 6 consumer cho 3 partition, nên 3 consumer có `#PARTITIONS` bằng 0, đúng như J16.2 đã nói.
+
+<Check id="j16.3.lab-duplicate">Chạy được hai instance từ cùng một jar và chỉ ra trong log rằng job chạy ở cả hai, mỗi chu kỳ hai lần.</Check>
+
+### 4. Thêm ShedLock, chuyển sang cron
+
+Bấm Ctrl+C ở tab 1 và tab 2. Thêm ShedLock 7.10.1, bản mới nhất lúc kiểm chứng, được build cho Spring Framework 7 và Spring Boot 4.1. Cấu hình khoá trên Redis và đổi `ReminderJob` sang cron:
+
+<Terminal where="mac" title="Thêm ShedLock, sửa SchedulingConfig và ReminderJob">
+
+```bash
+cd ~/masteva-j16/shop
+perl -0pi -e 's|</dependencies>|\t<dependency>\n\t\t\t<groupId>net.javacrumbs.shedlock</groupId>\n\t\t\t<artifactId>shedlock-spring</artifactId>\n\t\t\t<version>7.10.1</version>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>net.javacrumbs.shedlock</groupId>\n\t\t\t<artifactId>shedlock-provider-redis-spring</artifactId>\n\t\t\t<version>7.10.1</version>\n\t\t</dependency>\n\t</dependencies>|' pom.xml
+cat > src/main/java/dev/masteva/shop/jobs/SchedulingConfig.java <<'EOF'
+package dev.masteva.shop.jobs;
+
+import net.javacrumbs.shedlock.core.LockProvider;
+import net.javacrumbs.shedlock.provider.redis.spring.RedisLockProvider;
+import net.javacrumbs.shedlock.spring.annotation.EnableSchedulerLock;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@Configuration
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "PT1M")
+public class SchedulingConfig {
+
+    /** Khoá lưu trong Redis dưới key job-lock:shop:<tên job>. */
+    @Bean
+    LockProvider lockProvider(RedisConnectionFactory connectionFactory) {
+        return new RedisLockProvider(connectionFactory, "shop");
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/shop/jobs/ReminderJob.java <<'EOF'
+package dev.masteva.shop.jobs;
+
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+public class ReminderJob {
+    private static final Logger log = LoggerFactory.getLogger(ReminderJob.class);
+    private final StringRedisTemplate redis;
+    private final int port;
+
+    public ReminderJob(StringRedisTemplate redis, @Value("${server.port}") int port) {
+        this.redis = redis;
+        this.port = port;
+    }
+
+    // Giây 0, 10, 20...: mọi instance kích hoạt cùng lúc, chỉ instance giành được khoá chạy
+    @Scheduled(cron = "*/10 * * * * *", zone = "Asia/Ho_Chi_Minh")
+    @SchedulerLock(name = "unpaidReminder", lockAtLeastFor = "PT5S", lockAtMostFor = "PT30S")
+    public void remindUnpaidOrders() throws InterruptedException {
+        Long run = redis.opsForValue().increment("reminder:runs");
+        log.info("reminder run #{} on port {}", run, port);
+        Thread.sleep(2_000); // giả lập quét đơn chưa thanh toán và gửi email nhắc
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `@EnableSchedulerLock(defaultLockAtMostFor = "PT1M")`: hạn tối đa mặc định cho mọi job có khoá, viết theo định dạng ISO-8601 của `Duration`.
+- `new RedisLockProvider(connectionFactory, "shop")`: khoá lưu ở key `job-lock:shop:<tên job>`. Chữ `shop` là tên môi trường, giúp nhiều ứng dụng dùng chung một Redis mà không đụng khoá của nhau.
+- `@SchedulerLock(name = "unpaidReminder", lockAtLeastFor = "PT5S", lockAtMostFor = "PT30S")`: job mất 2 giây, khoá giữ ít nhất 5 giây và tự hết hạn sau tối đa 30 giây.
+- `cron = "*/10 * * * * *"` kèm `zone`: hai instance cùng kích hoạt ở giây 0, 10, 20 và tranh nhau một khoá.
+
+Build và xoá bộ đếm ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-j16/shop && mvn -q package -DskipTests && docker exec masteva-j16-redis redis-cli DEL reminder:runs
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1
+```
+
+</Expected>
+
+Chạy lại hai instance, lần này không cần build:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+java -Duser.timezone=UTC -jar target/shop-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+java -Duser.timezone=UTC -jar target/shop-0.0.1-SNAPSHOT.jar --server.port=20161 --logging.file.name=app2.log
+```
+
+</Terminal>
+
+Đợi khoảng 30 giây, rồi ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+grep -h ReminderJob app.log app2.log | sort | tail -n 3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+18:26:40.075 INFO  [   scheduling-1] ReminderJob: reminder run #1 on port 20160
+18:26:50.013 INFO  [   scheduling-1] ReminderJob: reminder run #2 on port 20160
+18:27:00.014 INFO  [   scheduling-1] ReminderJob: reminder run #3 on port 20160
+```
+
+</Expected>
+
+Mỗi mốc 10 giây chỉ còn một lần chạy, số thứ tự tăng 1, 2, 3 không nhảy cóc. Instance nào thắng ở mỗi mốc là ngẫu nhiên: ở lần kiểm chứng này cả ba lần đều là 20160, ở một lần chạy khác 20161 thắng hai trong ba mốc. Điều không bao giờ xảy ra là hai dòng cùng một mốc.
+
+### 5. Nhìn vào khoá
+
+Lệnh dưới chờ tới lúc job đang chạy (TTL của khoá lớn hơn 20 giây), đọc giá trị khoá, rồi in TTL mỗi giây trong 6 giây:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+until [ "$(docker exec masteva-j16-redis redis-cli TTL job-lock:shop:unpaidReminder)" -gt 20 ]; do sleep 0.2; done
+docker exec masteva-j16-redis redis-cli GET job-lock:shop:unpaidReminder
+for i in $(seq 6); do docker exec masteva-j16-redis redis-cli TTL job-lock:shop:unpaidReminder; sleep 1; done | paste -sd' ' -
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ADDED:2026-10-03T18:30:10.008Z@my-mac.local:79b4868f-04f9-4d45-82a8-da16bc0637b3
+28 2 1 -2 -2 -2
+```
+
+</Expected>
+
+Giá trị khoá ghi thời điểm lấy khoá và instance đang giữ nó; phần sau `@` là tên máy của bạn (ở đây đã được thay bằng `my-mac.local`) kèm một id ngẫu nhiên. Dãy TTL kể lại đúng phần Kiến thức: khoảng 30 giây (`lockAtMostFor`) lúc job đang chạy; còn 2 rồi 1 giây sau khi job xong, vì ShedLock rút hạn về mốc bắt đầu cộng `lockAtLeastFor` 5 giây; rồi `-2` khi khoá đã hết hạn và chờ mốc kế tiếp.
+
+<Check id="j16.3.lab-shedlock">Cấu hình được ShedLock trên Redis, thấy mỗi mốc cron chỉ một instance chạy, và đọc được TTL của khoá thay đổi theo `lockAtMostFor` và `lockAtLeastFor`.</Check>
+
+### 6. Một instance chết
+
+Bấm Ctrl+C ở tab 1. Đợi khoảng 25 giây, rồi ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+grep ReminderJob app2.log | tail -n 2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+18:30:30.016 INFO  [   scheduling-1] ReminderJob: reminder run #19 on port 20161
+18:30:40.015 INFO  [   scheduling-1] ReminderJob: reminder run #20 on port 20161
+```
+
+</Expected>
+
+Instance B tự nhận mọi mốc, không cần ai chỉ định lại. Đây là điểm hơn của khoá so với cách "chỉ bật scheduler trên một instance". Giờ và số thứ tự trên máy bạn khác: bộ đếm `reminder:runs` đếm tiếp từ lúc xoá ở bước 4, nên số phụ thuộc vào bạn đợi bao lâu giữa các bước.
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Cron expression must consist of 6 fields (found 5 in "0 2 * * *")` lúc khởi động: bạn chép cron 5 trường của Linux. Thêm trường giây ở đầu.
+- Job không chạy lần nào: thiếu `@EnableScheduling`, hoặc class chứa job không phải bean (thiếu `@Component`).
+- `Only no-arg methods may be annotated with @Scheduled` lúc khởi động: method `@Scheduled` có tham số. Bỏ tham số, lấy dữ liệu cần dùng từ bean được inject.
+- Hai instance vẫn chạy cùng một mốc dù đã có `@SchedulerLock`: thiếu `@EnableSchedulerLock`, nên annotation khoá bị bỏ qua. Kiểm tra key `job-lock:*` trong Redis.
+- `Web server failed to start. Port 20161 was already in use.`: instance B ở lần trước chưa tắt. Tìm bằng `lsof -nP -iTCP:20161 -sTCP:LISTEN`.
+- Tab 2 báo `Unable to access jarfile`: tab 2 chưa `cd` vào `~/masteva-j16/shop`.
+
+</Callout>
+
+### Dọn dẹp
+
+Bấm Ctrl+C ở tab 2. Đây là bài cuối của chặng J16, nên xoá hai container và thư mục lab.
+
+<Callout kind="danger">
+
+`docker rm -f` dừng và xoá hai container của chặng J16, gồm toàn bộ dữ liệu trong Redis và Kafka (topic `orders`, `orders-dlt`, offset của group). Image `redis:8-alpine` và `apache/kafka:4.3.1` vẫn còn; xoá bằng `docker image rm` nếu muốn lấy lại dung lượng.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp container">
+
+```bash
+docker rm -f masteva-j16-redis masteva-j16-kafka
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá toàn bộ project của chặng J16, gồm mã nguồn ba bài. Chỉ chạy khi bạn không cần nó nữa.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp thư mục lab">
+
+```bash
+rm -rf ~/masteva-j16
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Job xuất báo cáo đối soát 2 triệu giao dịch mỗi đêm, chết ở giao dịch thứ 1,3 triệu. Một method @Scheduled có đủ không?">
+
+Không. Chạy lại phải làm từ đầu, không biết dòng nào đã xử lý, một dòng lỗi làm hỏng cả lần chạy. Đây là việc của **Spring Batch**: một `Job` gồm nhiều `Step`; mỗi step đọc, xử lý, ghi theo từng **chunk** (ví dụ 1.000 dòng một transaction), và lưu tiến độ vào `JobRepository` trong database. Job chết thì chạy lại tiếp từ chunk cuối cùng đã ghi; dòng lỗi có thể được `skip` hoặc `retry` theo cấu hình. `@Scheduled` (kèm ShedLock) vẫn là thứ kích hoạt job theo lịch; Spring Batch lo phần chạy cho đúng. Với việc nhỏ chạy vài giây như lab này, Spring Batch là thừa.
+
+</Reveal>
+
+<Reveal title="Đặt lockAtMostFor = 30 giây cho job đôi khi chạy 45 giây. Chuyện gì xảy ra?">
+
+Ở giây 30, khoá tự hết hạn trong khi job vẫn chạy. Nếu mốc cron kế tiếp rơi vào lúc đó, instance khác lấy được khoá và chạy song song: đúng điều khoá muốn ngăn. ShedLock không gia hạn khoá theo mặc định (có tiện ích `KeepAliveLockProvider` cho việc này). Đặt `lockAtMostFor` theo thời gian chạy tệ nhất cộng biên an toàn, theo dõi thời gian chạy thật qua metrics, và vẫn giữ job idempotent.
+
+</Reveal>
+
+<Reveal title="Spring Boot có bật virtual thread cho scheduler không, và có nên tăng pool size?">
+
+Với `spring.threads.virtual.enabled=true`, Spring Boot dùng `SimpleAsyncTaskScheduler`: mỗi lần kích hoạt job `fixedRate` hoặc `cron` chạy trên một virtual thread mới, nên không chặn job khác, nhưng hai lần chạy của cùng một job có thể chồng nhau khi job lâu hơn chu kỳ. Job `fixedDelay` vẫn chạy tuần tự trên một thread riêng của scheduler, nên các job `fixedDelay` vẫn chặn nhau (J14 nói về virtual thread). Tăng `spring.task.scheduling.pool.size` cũng giúp các job không chặn nhau với thread thường, và hai lần chạy của cùng một job vẫn không chồng nhau. Cả hai đều không thay đổi chuyện nhiều instance: mỗi JVM vẫn kích hoạt job của riêng nó.
+
+</Reveal>
+
+<Reveal title="Có nên chuyển hết job sang Kubernetes CronJob?">
+
+CronJob tạo một pod mới cho mỗi lần chạy: không chạy trùng giữa các replica, tài nguyên tách khỏi ứng dụng phục vụ request, xem lịch sử bằng `kubectl`. Đổi lại là khởi động JVM mỗi lần (vài giây tới vài chục giây), cần image và cấu hình riêng, và job mỗi 10 giây thì không hợp. Job vài phút một lần trong ứng dụng thì ShedLock gọn hơn; job nặng chạy mỗi đêm thì CronJob, có khi kèm Spring Batch, là lựa chọn tốt. Lộ trình DevOps đi sâu vào CronJob.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết biểu thức cron hoặc cấu hình ShedLock. AI hay đưa cron 5 trường của Linux, quên `zone`, dùng `@EnableSchedulerLock` mà thiếu bean `LockProvider`, hoặc khẳng định ShedLock đảm bảo job "chạy đúng một lần mỗi chu kỳ" cả với `fixedDelay`. Kiểm tra lại: `/actuator/scheduledtasks` cho biết lần chạy tới theo UTC; chạy hai instance và gộp log như bước 3 và 4.
+
+</Callout>
+
+<Callout kind="link">
+
+J14 giải thích thread pool và virtual thread mà scheduler dùng. Dùng Micrometer như J15 để đo thời gian chạy và số lần lỗi của job. J17 đóng gói ứng dụng thành image, nơi múi giờ mặc định của container là UTC. Lộ trình Microservices, chặng M5, dùng job định kỳ để đẩy bảng outbox sang broker.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j16.3.mastery-job-design">Với một job nghiệp vụ cho trước, chọn được kiểu lịch, múi giờ, cách chống chạy trùng khi nhiều instance, và cách làm job idempotent, kèm lý do.</Check>
+
+<Check id="j16.3.mastery-shedlock-params">Chọn được `lockAtMostFor` và `lockAtLeastFor` cho một job dựa trên thời gian chạy và độ lệch đồng hồ, và giải thích được điều gì xảy ra khi đặt sai từng giá trị.</Check>
+
+</Mastery>

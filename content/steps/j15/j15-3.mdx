@@ -1,0 +1,539 @@
+---
+title: Health check, liveness, readiness và graceful shutdown
+description: Tách liveness với readiness bằng health group của Actuator, viết HealthIndicator riêng, và cho service tắt êm khi nhận SIGTERM, để request đang chạy được làm xong, request mới bị từ chối, có giới hạn thời gian rõ ràng.
+id: j15.3
+step: j15
+prerequisites: [j15.2]
+topics: [j15.actuator-health-readiness, j15.graceful-shutdown]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    curl: 8.4.0
+---
+
+<Goal>
+
+Cho nền tảng chạy service (Kubernetes, load balancer) biết chính xác khi nào service còn sống, khi nào nhận được traffic, và tắt service mà không làm rơi request. Học xong bài này, bạn giải thích được:
+
+- Vì sao đưa database vào liveness check có thể làm Kubernetes khởi động lại mọi pod đúng lúc database chỉ chậm.
+- Vì sao mỗi lần deploy lại có vài request lỗi, và cấu hình nào giúp request đang chạy được làm xong.
+- Vì sao service thoát với exit code 143 khi deploy là bình thường, còn 137 thì cần điều tra.
+
+</Goal>
+
+<Knowledge>
+
+### Endpoint health của Actuator
+
+`/actuator/health` gộp kết quả của mọi **HealthIndicator** thành một trạng thái chung. Spring Boot tự thêm indicator cho thứ có trên classpath: dung lượng đĩa, datasource, Redis, Kafka...
+
+| Trạng thái | Nghĩa | Mã HTTP mặc định |
+|---|---|---|
+| `UP` | Hoạt động bình thường | 200 |
+| `DOWN` | Hỏng | 503 |
+| `OUT_OF_SERVICE` | Còn chạy nhưng tạm không nên nhận việc | 503 |
+| `UNKNOWN` | Không xác định | 200 |
+
+Chi tiết từng thành phần ẩn đi mặc định (`show-details=never`), vì nó lộ đường dẫn, phiên bản, tên máy chủ database. Trên production dùng `when-authorized`; lab đặt `always` để bạn thấy.
+
+Bạn tự viết indicator bằng cách tạo một bean cài `HealthIndicator` và trả về `Health`. Tên của nó trong kết quả là tên bean bỏ hậu tố `HealthIndicator`: `CatalogHealthIndicator` thành `catalog`. Indicator được gọi mỗi lần có request tới endpoint, nên phải nhanh; Spring Boot ghi cảnh báo nếu một indicator chạy quá 10 giây.
+
+### Liveness và readiness
+
+Kubernetes hỏi một ứng dụng hai câu khác nhau, và phản ứng khác nhau:
+
+| | Liveness | Readiness |
+|---|---|---|
+| Câu hỏi | Tiến trình còn chạy được không, hay đã kẹt? | Lúc này có nên gửi request tới không? |
+| Khi trả lỗi | Kubernetes **giết và khởi động lại** container | Kubernetes **ngừng gửi traffic**, không giết |
+| Endpoint | `/actuator/health/liveness` | `/actuator/health/readiness` |
+| Nên chứa | Chỉ trạng thái nội bộ (`livenessState`) | `readinessState` cộng thứ riêng của instance: cache đã nạp, catalog đã tải |
+| Không được chứa | Database, service khác, bất cứ thứ gì ở ngoài | Cân nhắc kỹ với thứ dùng chung bởi mọi instance |
+
+Spring Boot tạo sẵn hai **health group** này. Một health group là một tập indicator có endpoint riêng; thêm indicator vào group bằng `management.endpoint.health.group.readiness.include=readinessState,catalog`.
+
+Trạng thái của hai probe đi theo vòng đời ứng dụng:
+
+| Giai đoạn | Liveness | Readiness | HTTP server |
+|---|---|---|---|
+| Đang khởi động | `BROKEN` | `REFUSING_TRAFFIC` | chưa chạy |
+| Context đã dựng, đang chạy runner lúc khởi động | `CORRECT` | `REFUSING_TRAFFIC` | chưa nhận traffic |
+| Sẵn sàng | `CORRECT` | `ACCEPTING_TRAFFIC` | nhận request |
+| Nhận SIGTERM, đang tắt êm | `CORRECT` | `REFUSING_TRAFFIC` | từ chối request mới |
+
+<Callout kind="production">
+
+Một đội thêm indicator của database vào liveness "cho chắc". Một tối database chậm vì một truy vấn nặng, health check quá thời gian chờ, liveness báo lỗi trên mọi pod cùng lúc. Kubernetes khởi động lại tất cả; mỗi pod khởi động lại mở thêm kết nối mới tới database đang quá tải, làm nó chậm hơn nữa. Một sự cố database 2 phút thành sự cố toàn hệ thống 20 phút. Liveness chỉ nên trả lời "JVM này còn xử lý được không", không phải "mọi thứ xung quanh có ổn không".
+
+</Callout>
+
+<Check id="j15.3.liveness-readiness">Giải thích được Kubernetes làm gì khi liveness lỗi và khi readiness lỗi, và xếp được database, cache cục bộ, catalog đang tải vào đúng probe.</Check>
+
+### Graceful shutdown
+
+Khi Kubernetes thay pod (deploy, scale xuống, dời node), nó gửi **SIGTERM** rồi chờ tối đa `terminationGracePeriodSeconds` (mặc định 30 giây). Hết hạn mà tiến trình chưa thoát thì gửi **SIGKILL**, không bắt được, không dọn dẹp được. D1.1 giải thích signal và exit code ở tầng Linux; đây là phần của Spring Boot:
+
+```text
+SIGTERM
+  |
+  v
+JVM chạy shutdown hook -> Spring đóng ApplicationContext
+  |
+  |  1. readiness = REFUSING_TRAFFIC
+  |  2. web server: ngừng nhận kết nối mới,
+  |     chờ request đang chạy xong       <- tối đa spring.lifecycle.timeout-per-shutdown-phase
+  |  3. các SmartLifecycle khác dừng theo phase (consumer Kafka, scheduler...), mỗi phase cùng giới hạn đó
+  |  4. huỷ bean: @PreDestroy, đóng connection pool, executor
+  v
+JVM thoát, exit code 143 = 128 + 15 (SIGTERM)
+
+Nếu cả quá trình vượt terminationGracePeriodSeconds:
+SIGKILL -> chết ngay giữa chừng, exit code 137 = 128 + 9
+```
+
+| Cấu hình | Mặc định | Ý nghĩa |
+|---|---|---|
+| `server.shutdown` | `graceful` | `immediate` thì đóng ngay, request đang chạy bị cắt |
+| `spring.lifecycle.timeout-per-shutdown-phase` | `30s` | Thời gian tối đa **mỗi phase**; quá hạn thì bỏ qua phase đó và đi tiếp |
+| `terminationGracePeriodSeconds` (Kubernetes) | `30` | Tổng thời gian trước SIGKILL |
+
+Quy tắc chọn: thời gian tắt của ứng dụng phải nằm trọn trong grace period của Kubernetes, kèm khoảng dư. Nếu `timeout-per-shutdown-phase` bằng đúng 30 giây và grace period cũng 30 giây, một request dài sẽ bị SIGKILL trước khi Spring kịp dọn dẹp.
+
+<Callout kind="pitfall">
+
+Graceful shutdown chỉ bảo vệ request **đã tới** ứng dụng. Kubernetes gửi SIGTERM và gỡ pod khỏi danh sách endpoint cùng lúc, nhưng việc gỡ cần vài giây để lan tới kube-proxy và ingress. Trong vài giây đó traffic vẫn được gửi tới một server đã đóng cổng, và client nhận lỗi kết nối hay 502. Cách sửa thường dùng là `preStop` hook ngủ 5 tới 10 giây để pod vẫn phục vụ trong lúc endpoint được gỡ; thời gian đó cũng tính vào grace period. D11 cấu hình phần này trên Kubernetes.
+
+</Callout>
+
+<Check id="j15.3.shutdown-sequence">Kể được trình tự từ SIGTERM tới khi JVM thoát, và giải thích được quan hệ giữa `timeout-per-shutdown-phase`, `preStop` và `terminationGracePeriodSeconds`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Endpoints (Spring Boot)](https://docs.spring.io/spring-boot/reference/actuator/endpoints.html): các mục "Writing Custom HealthIndicators" và "Health Groups", cách mở và bảo vệ endpoint.
+- [Kubernetes Probes (Spring Boot)](https://docs.spring.io/spring-boot/reference/actuator/endpoints.html#actuator.endpoints.kubernetes-probes): bảng trạng thái probe theo vòng đời và lời khuyên về thứ được đưa vào readiness.
+- [Graceful Shutdown (Spring Boot)](https://docs.spring.io/spring-boot/reference/web/graceful-shutdown.html): cách từng web server từ chối request mới trong thời gian chờ.
+- [Pod Lifecycle: Termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination): trình tự SIGTERM, `preStop` và grace period phía Kubernetes.
+- [Runtime (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Runtime.html): `addShutdownHook` và các trường hợp shutdown hook không chạy.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm J15.2, có `~/masteva-j15/orders`. Hai tab Terminal như trước, mỗi tab đã `export JAVA_HOME=$(/usr/libexec/java_home -v 25)`, cổng 20150 trống. Container Jaeger đã xoá ở cuối J15.2; tracing vẫn bật trong cấu hình nên span bị bỏ đi. Khoảng 10 giây sau khi khởi động, tab 1 có thể in một dòng `ERROR ... HttpExporter : Failed to export spans` kèm `java.net.ConnectException ... :20152`; đó là exporter không gửi được span, không ảnh hưởng tới lab. Lệnh `kill` và `lsof` có sẵn trên Mac và Linux.
+
+### 1. Catalog nạp nền, indicator riêng, endpoint chậm
+
+Service cần bảng giá trong bộ nhớ trước khi nhận đơn. Bảng giá nạp mất 15 giây ở một virtual thread (J14.3) để không chặn khởi động. Trong lúc đó service còn sống nhưng chưa sẵn sàng.
+
+<Terminal where="mac" title="Thêm cấu hình, tạo Catalog, CatalogHealthIndicator, ReportController">
+
+```bash
+cd ~/masteva-j15/orders
+cat >> src/main/resources/application.properties <<'EOF'
+catalog.load-seconds=15
+management.endpoint.health.show-details=always
+management.endpoint.health.group.readiness.include=readinessState,catalog
+server.shutdown=graceful
+spring.lifecycle.timeout-per-shutdown-phase=20s
+EOF
+cat > src/main/java/dev/masteva/orders/Catalog.java <<'EOF'
+package dev.masteva.orders;
+
+import jakarta.annotation.PreDestroy;
+import java.time.Duration;
+import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
+
+@Component
+public class Catalog {
+    private static final Logger log = LoggerFactory.getLogger(Catalog.class);
+
+    private final Duration loadTime;
+    private volatile Map<String, Long> prices = Map.of();
+    private volatile boolean loaded;
+
+    Catalog(@Value("${catalog.load-seconds}") long loadSeconds) {
+        this.loadTime = Duration.ofSeconds(loadSeconds);
+    }
+
+    @EventListener(ApplicationReadyEvent.class)
+    void loadInBackground() {
+        Thread.ofVirtual().name("catalog-loader").start(() -> {
+            log.info("loading catalog, takes {}s", loadTime.toSeconds());
+            try {
+                Thread.sleep(loadTime);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            prices = Map.of("BOOK-1", 120_000L, "BOOK-2", 180_000L, "PEN-1", 15_000L);
+            loaded = true;
+            log.info("catalog loaded items={}", prices.size());
+        });
+    }
+
+    boolean isLoaded() {
+        return loaded;
+    }
+
+    int size() {
+        return prices.size();
+    }
+
+    @PreDestroy
+    void close() {
+        log.info("catalog released");
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/orders/CatalogHealthIndicator.java <<'EOF'
+package dev.masteva.orders;
+
+import org.springframework.boot.health.contributor.Health;
+import org.springframework.boot.health.contributor.HealthIndicator;
+import org.springframework.stereotype.Component;
+
+@Component
+public class CatalogHealthIndicator implements HealthIndicator {
+    private final Catalog catalog;
+
+    CatalogHealthIndicator(Catalog catalog) {
+        this.catalog = catalog;
+    }
+
+    @Override
+    public Health health() {
+        if (!catalog.isLoaded()) {
+            return Health.outOfService().withDetail("loaded", false).build();
+        }
+        return Health.up().withDetail("items", catalog.size()).build();
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/orders/ReportController.java <<'EOF'
+package dev.masteva.orders;
+
+import java.time.Duration;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ReportController {
+    private static final Logger log = LoggerFactory.getLogger(ReportController.class);
+
+    record Report(int seconds, String status) {}
+
+    @GetMapping("/reports/slow")
+    Report slow(@RequestParam(defaultValue = "5") int seconds) throws InterruptedException {
+        log.info("report started seconds={}", seconds);
+        Thread.sleep(Duration.ofSeconds(seconds));
+        log.info("report finished seconds={}", seconds);
+        return new Report(seconds, "done");
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `Catalog` bắt đầu nạp khi nhận `ApplicationReadyEvent`, tức khi ứng dụng đã khởi động xong. Hai field `volatile` để thread HTTP thấy giá trị mà virtual thread ghi (J14.1).
+- `CatalogHealthIndicator` trả `OUT_OF_SERVICE` khi chưa nạp xong. Indicator chỉ đọc một biến, không làm I/O, nên trả lời ngay.
+- Chỉ group `readiness` có `catalog`. Group `liveness` giữ mặc định.
+- `@PreDestroy` trên `Catalog` in một dòng để bạn thấy bean được huỷ **sau** khi web server đã dừng.
+- `/reports/slow` giả lập một request dài như xuất báo cáo. `server.shutdown=graceful` là giá trị mặc định, được ghi ra để người đọc cấu hình biết ý định.
+
+### 2. Readiness lúc khởi động
+
+Chạy ứng dụng ở tab 1. Lệnh `echo` cuối in exit code khi tiến trình kết thúc:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j15/orders && mvn -q package -DskipTests && java -jar target/orders-0.0.1-SNAPSHOT.jar; echo "exit=$?"
+```
+
+</Terminal>
+
+Ngay sau đó, ở tab 2 chạy lệnh dưới. Vòng `until` chờ tới khi ứng dụng trả lời, nên chạy sớm cũng không sao:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+until curl -s -o /dev/null localhost:20150/actuator/health/liveness; do sleep 0.5; done
+curl -s -w '  http=%{http_code}\n' localhost:20150/actuator/health/liveness
+curl -s -w '  http=%{http_code}\n' localhost:20150/actuator/health/readiness
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"status":"UP"}  http=200
+{"components":{"catalog":{"details":{"loaded":false},"status":"OUT_OF_SERVICE"},"readinessState":{"status":"UP"}},"status":"OUT_OF_SERVICE"}  http=503
+```
+
+</Expected>
+
+Liveness `200`: tiến trình khoẻ, không có lý do khởi động lại. Phản hồi liveness không có `components` vì group probe do Spring Boot tự tạo luôn ẩn chi tiết thành phần, bất kể `show-details`, cho tới khi bạn khai báo lại group đó như `readiness` ở đây. Readiness `503`: `readinessState` đã `UP` nhưng `catalog` chưa, và trạng thái chung lấy trạng thái xấu nhất. Theo dõi readiness và liveness mỗi 2 giây:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for i in {1..10}; do
+  echo "$(date +%T) live=$(curl -s -o /dev/null -w '%{http_code}' localhost:20150/actuator/health/liveness) ready=$(curl -s -o /dev/null -w '%{http_code}' localhost:20150/actuator/health/readiness)"
+  sleep 2
+done
+curl -s -w '  http=%{http_code}\n' localhost:20150/actuator/health/readiness
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+01:06:56 live=200 ready=503
+01:06:58 live=200 ready=503
+01:07:00 live=200 ready=503
+01:07:02 live=200 ready=503
+01:07:04 live=200 ready=503
+01:07:06 live=200 ready=503
+01:07:08 live=200 ready=503
+01:07:10 live=200 ready=503
+01:07:12 live=200 ready=200
+01:07:14 live=200 ready=200
+{"components":{"catalog":{"details":{"items":3},"status":"UP"},"readinessState":{"status":"UP"}},"status":"UP"}  http=200
+```
+
+</Expected>
+
+Số dòng `503` tuỳ bạn chạy lệnh nhanh hay chậm sau khi khởi động. Điều cần thấy: liveness luôn `200`, readiness chuyển từ `503` sang `200` khi tab 1 in dòng `catalog loaded items=3`. Trên Kubernetes, pod chỉ được đưa vào Service từ lúc đó.
+
+<Check id="j15.3.lab-readiness">Thấy được readiness trả `503` với `catalog` là `OUT_OF_SERVICE` trong khi liveness trả `200`, rồi readiness chuyển sang `200` khi catalog nạp xong.</Check>
+
+### 3. SIGTERM giữa một request dài
+
+Ở tab 2, gửi một request mất 8 giây ở nền, một giây sau gửi SIGTERM cho tiến trình đang nghe cổng 20150, rồi thử một request mới:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -w '  http=%{http_code} time=%{time_total}s\n' 'localhost:20150/reports/slow?seconds=8' &
+sleep 1
+kill -TERM $(lsof -ti tcp:20150 -sTCP:LISTEN)
+sleep 1
+curl -s -o /dev/null -w 'new request: http=%{http_code}' localhost:20150/orders/1; echo " curl exit=$?"
+wait
+```
+
+</Terminal>
+
+`lsof -ti tcp:20150 -sTCP:LISTEN` in PID của tiến trình đang nghe cổng 20150, tức ứng dụng ở tab 1. zsh in thêm các dòng `[1] 12345` và `[1] + done` cho job nền; khối dưới đã lược chúng.
+
+<Predict question="Request 8 giây và request mới nhận được gì?">
+
+```text
+new request: http=000 curl exit=7
+{"seconds":8,"status":"done"}  http=200 time=8.014885s
+```
+
+Request mới không kết nối được: `000` nghĩa là không có phản hồi HTTP, exit code 7 của `curl` là "failed to connect". Tomcat đã đóng cổng nghe ngay khi bắt đầu tắt. Request dài vẫn được làm xong và trả `200` sau đủ 8 giây, dù tiến trình đã nhận SIGTERM từ giây thứ nhất.
+
+</Predict>
+
+Tab 1 kể lại cùng câu chuyện theo thời gian (đã lược phần giữa mỗi dòng):
+
+<Expected>
+
+```text
+01:07:16.978  INFO [5ef0a8ea] ... ReportController : report started seconds=8
+01:07:18.034  INFO [] ... GracefulShutdown : Commencing graceful shutdown. Waiting for active requests to complete
+01:07:24.984  INFO [5ef0a8ea] ... ReportController : report finished seconds=8
+01:07:25.029  INFO [] ... GracefulShutdown : Graceful shutdown complete
+01:07:25.032  INFO [] ... Catalog : catalog released
+exit=143
+```
+
+</Expected>
+
+Đọc theo thứ tự: SIGTERM tới lúc `:18`, server ngừng nhận và chờ; request xong lúc `:24`, đủ 8 giây kể từ `:16`; ngay sau đó server báo xong, rồi mới tới `@PreDestroy`. Exit code 143 = 128 + 15: tiến trình thoát vì SIGTERM, đúng như mong đợi của một lần tắt bình thường.
+
+<Check id="j15.3.lab-graceful">Gửi SIGTERM khi đang có request dài, thấy request đó vẫn trả `200`, request mới bị từ chối, và ứng dụng thoát với exit code 143.</Check>
+
+### 4. Khi request dài hơn thời gian chờ
+
+Chạy lại ở tab 1, lần này giới hạn mỗi phase còn 3 giây bằng tham số dòng lệnh:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+java -jar target/orders-0.0.1-SNAPSHOT.jar --spring.lifecycle.timeout-per-shutdown-phase=3s; echo "exit=$?"
+```
+
+</Terminal>
+
+Khi tab 1 in `Started OrdersApplication`, gửi request 10 giây rồi SIGTERM:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -w '  http=%{http_code} time=%{time_total}s\n' 'localhost:20150/reports/slow?seconds=10' & C=$!
+sleep 1
+kill -TERM $(lsof -ti tcp:20150 -sTCP:LISTEN)
+wait $C; echo "curl exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  http=000 time=4.078861s
+curl exit=52
+```
+
+</Expected>
+
+<Expected>
+
+```text
+01:07:35.573  INFO [399901f2] ... ReportController : report started seconds=10
+01:07:36.637  INFO [] ... GracefulShutdown : Commencing graceful shutdown. Waiting for active requests to complete
+01:07:39.647  INFO [] ... DefaultLifecycleProcessor : Shutdown phase 2147482623 ends with 1 bean still running after timeout of 3000ms: [webServerGracefulShutdown]
+01:07:39.661  INFO [] ... Catalog : catalog released
+01:07:39.690  INFO [] ... GracefulShutdown : Graceful shutdown aborted with one or more requests still active
+exit=143
+```
+
+</Expected>
+
+Sau 3 giây Spring bỏ cuộc chờ phase của web server (dòng `DefaultLifecycleProcessor`), Tomcat báo `Graceful shutdown aborted`, đi tiếp các bước còn lại và JVM thoát; request đang chạy bị cắt. `curl` exit 52 là "empty reply from server": kết nối đóng mà không có phản hồi. Không có dòng `report finished`. Exit code vẫn là 143 vì JVM tự thoát sau SIGTERM; nhìn exit code không biết request có bị cắt hay không, phải đọc log.
+
+### 5. SIGKILL thì sao
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+java -jar target/orders-0.0.1-SNAPSHOT.jar; echo "exit=$?"
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -w '  http=%{http_code} time=%{time_total}s\n' 'localhost:20150/reports/slow?seconds=10' & C=$!
+sleep 1
+kill -KILL $(lsof -ti tcp:20150 -sTCP:LISTEN)
+wait $C; echo "curl exit=$?"
+```
+
+</Terminal>
+
+<Predict question="Tab 1 in gì sau dòng report started?">
+
+```text
+01:07:51.213  INFO [ca045118] ... ReportController : report started seconds=10
+exit=137
+```
+
+Không có dòng nào nữa: không `Commencing graceful shutdown`, không `catalog released`. SIGKILL do kernel thực hiện, JVM không được báo trước nên shutdown hook không chạy. Exit code 137 = 128 + 9. Tab 2 nhận `http=000` và `curl exit=52` sau khoảng 1 giây. Trên Kubernetes, thấy 137 nghĩa là ứng dụng tắt không kịp trong grace period, hoặc bị giết vì vượt giới hạn bộ nhớ (OOMKilled).
+
+</Predict>
+
+<Check id="j15.3.lab-exit-codes">Phân biệt được exit code 143 và 137 trên chính ứng dụng của mình, và nói được mỗi mã cho biết điều gì về lần tắt đó.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Readiness luôn `200` dù catalog chưa nạp: `catalog` chưa có trong `management.endpoint.health.group.readiness.include`, hoặc chưa build lại. Tên trong `include` phải khớp tên bean bỏ hậu tố `HealthIndicator`.
+- Ứng dụng không khởi động, báo health group chứa indicator không tồn tại: tên trong `include` viết sai. Spring Boot kiểm tra tên lúc khởi động để bạn không có một probe âm thầm thiếu thành phần.
+- `kill: not enough arguments`: `lsof` không thấy tiến trình nào ở cổng 20150, thường vì ứng dụng ở tab 1 đã dừng.
+- Không thấy dòng `Commencing graceful shutdown`: ứng dụng được dừng bằng nút Stop của IDE hoặc bị SIGKILL. Một số IDE không gửi SIGTERM.
+- Request dài vẫn bị cắt dù đã có `server.shutdown=graceful`: request dài hơn `spring.lifecycle.timeout-per-shutdown-phase`, như ở bước 4.
+
+</Callout>
+
+### Dọn dẹp
+
+Ứng dụng đã dừng ở bước 5. Container Jaeger đã xoá ở J15.2. Image `jaegertracing/jaeger:2.21.0` có thể giữ lại hoặc xoá bằng `docker image rm`.
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá toàn bộ project của chặng J15, gồm mã nguồn ba bài. Chỉ chạy khi bạn không cần nó nữa.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+rm -rf ~/masteva-j15
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Readiness có nên kiểm tra database không?">
+
+Không có câu trả lời chung, và tài liệu Spring Boot cũng nói đây là quyết định của người viết ứng dụng. Database dùng chung bởi mọi instance: khi nó chết, mọi pod cùng chưa sẵn sàng, Service không còn endpoint nào và client nhận lỗi kết nối thay vì một lỗi `503` có thông báo rõ ràng. Nhiều đội vì vậy để database ngoài readiness và xử lý lỗi ở tầng gọi: timeout, circuit breaker, trả lỗi có nghĩa. Thứ chỉ thuộc về một instance (cache cục bộ chưa nạp, catalog chưa tải, kết nối tới một shard riêng) thì hợp với readiness. Hỏi câu: "nếu thứ này hỏng, chuyển traffic sang instance khác có giúp gì không?". Có thì đưa vào readiness.
+
+</Reveal>
+
+<Reveal title="Spring đã đặt readiness thành REFUSING_TRAFFIC khi tắt, sao vẫn cần preStop?">
+
+Vì lúc đó web server cũng đã ngừng nhận kết nối, nên probe readiness của Kubernetes không gọi được tới ứng dụng để thấy trạng thái mới; bạn đã thấy ở bước 3 request mới nhận `curl exit=7`. Kubernetes gỡ pod khỏi endpoint vì nhận lệnh xoá pod, không phải vì đọc readiness. Thứ còn thiếu là thời gian để việc gỡ đó lan tới mọi load balancer. `preStop` ngủ vài giây giữ pod phục vụ bình thường trong khoảng đó, rồi SIGTERM mới tới.
+
+</Reveal>
+
+<Reveal title="Grace period 30 giây chia thế nào cho đủ?">
+
+Ví dụ một service có `preStop` ngủ 10 giây, phase web server tối đa 15 giây, consumer Kafka ở một phase khác dừng mất tối đa 5 giây, và đóng connection pool khoảng 1 giây: tổng là 31 giây, vượt 30. Request dài nhất hoặc consumer chậm nhất sẽ bị SIGKILL giữa chừng. Hoặc tăng `terminationGracePeriodSeconds` lên 45, hoặc giảm `timeout-per-shutdown-phase` xuống 10 giây và đảm bảo không request nào được phép chạy lâu hơn thế. Request dài như xuất báo cáo lớn nên chuyển thành job nền có thể chạy lại, không giữ trong một request HTTP.
+
+</Reveal>
+
+<Reveal title="Executor và consumer của mình có tự tắt êm không?">
+
+Chỉ khi chúng được Spring quản lý hoặc bạn tự viết phần dọn dẹp. Executor do Spring Boot tạo (cho `@Async`, scheduling) dừng theo vòng đời của context, nhưng mặc định không chờ task đang chạy; đặt `spring.task.execution.shutdown.await-termination=true` và `spring.task.execution.shutdown.await-termination-period` (với scheduling là `spring.task.scheduling.shutdown.*`) nếu cần. Executor bạn tự `new` thì cần `@PreDestroy` gọi `shutdown()` rồi `awaitTermination` có giới hạn. Code trong task phải tôn trọng interrupt (J14.1): nuốt `InterruptedException` làm task không dừng, và cả quá trình tắt chờ tới SIGKILL. Listener container của Spring Kafka cũng là `SmartLifecycle` và dừng trong phase riêng của nó; J16 nói về consumer.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết `HealthIndicator`, cấu hình health group, hay tính ngân sách thời gian tắt. AI hay đưa database và service khác vào liveness, hay đặt `timeout-per-shutdown-phase` bằng đúng `terminationGracePeriodSeconds`, và hay quên `preStop`. Nó cũng hay dùng tên package cũ của Spring Boot 3 (`org.springframework.boot.actuate.health.HealthIndicator`) trong khi Boot 4 dùng `org.springframework.boot.health.contributor`. Kiểm tra bằng cách chạy lại bước 2 và bước 3 của lab với cấu hình AI đưa ra.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.1 giải thích SIGTERM, SIGKILL và công thức exit code 128 + N ở tầng Linux, và vì sao `exec` trong ENTRYPOINT quyết định JVM có nhận được SIGTERM hay không. J14.1 nói về interrupt, thứ quyết định code của bạn có dừng được không. J17 đóng gói service vào container; D11 cấu hình probe, `preStop`, grace period khi chạy trên Kubernetes. D12 cảnh báo dựa trên health và metric của bài này.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j15.3.mastery-probes">Tự cấu hình được liveness và readiness cho một service có database, cache cục bộ và một service phụ thuộc, và bảo vệ được lựa chọn của mình.</Check>
+
+<Check id="j15.3.mastery-shutdown-budget">Tính được ngân sách thời gian tắt từ `preStop`, các phase của Spring và `terminationGracePeriodSeconds`, và chứng minh bằng log rằng một request đang chạy được làm xong khi nhận SIGTERM.</Check>
+
+</Mastery>

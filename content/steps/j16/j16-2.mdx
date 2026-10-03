@@ -1,0 +1,832 @@
+---
+title: Kafka với Spring, retry và dead letter topic
+description: Chọn giữa Kafka và RabbitMQ có lý do, hiểu topic, partition, consumer group và offset; viết producer, consumer idempotent bằng Spring for Apache Kafka, cấu hình retry có backoff và đẩy message hỏng sang dead letter topic.
+id: j16.2
+step: j16
+prerequisites: [j16.1]
+topics: [j16.kafka-rabbitmq, j16.producer-consumer-retry-dlq]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    spring-kafka: 4.1.1
+    docker: 29.8.0
+    kafka: 4.3.1
+    redis: 8.10.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Hiểu Kafka lưu và giao message thế nào, đủ để thiết kế một luồng sự kiện chịu được lỗi: message trùng, lỗi tạm thời, message hỏng. Học xong bài này, bạn tự dựng được producer và consumer bằng Spring for Apache Kafka, và giải thích được:
+
+- Vì sao hai đơn của cùng một khách luôn được xử lý theo đúng thứ tự, còn đơn của hai khách khác nhau thì không.
+- Vì sao consumer phải chịu được việc nhận cùng một message hai lần, dù producer đã bật idempotence.
+- Vì sao một message JSON hỏng đi thẳng vào dead letter topic, còn đơn lỗi do kho chậm thì được thử lại.
+
+</Goal>
+
+<Knowledge>
+
+### Vì sao cần message broker
+
+Nếu API đặt hàng ở J10 phải báo cho ba bên khác bằng HTTP đồng bộ khi "có đơn mới" (giữ hàng, gửi email, thống kê), gọi lần lượt nghĩa là: một bên chậm thì khách chờ, một bên chết thì đặt hàng lỗi, thêm bên thứ tư thì phải sửa code đặt hàng.
+
+**Message broker** đứng giữa: bên gửi (**producer**) ghi message vào broker rồi trả lời khách ngay; các bên nhận (**consumer**) đọc message theo tốc độ của mình. Producer không cần biết ai đọc.
+
+```text
+                         ┌──────────────┐
+ POST /orders ──> shop ──>│ topic orders │──> inventory (giữ hàng)
+       202 ngay          │   (Kafka)    │──> email (gửi xác nhận)
+                         └──────────────┘──> analytics (thống kê, đọc lại từ đầu được)
+```
+
+Cái giá: hệ thống thành **bất đồng bộ**. Khách nhận `202 Accepted` trước khi hàng được giữ; lỗi xảy ra sau đó phải được xử lý mà không còn request nào để trả lỗi về.
+
+### Kafka hay RabbitMQ
+
+Hai broker phổ biến nhất trong hệ Java, theo hai mô hình khác nhau:
+
+| | Kafka | RabbitMQ |
+|---|---|---|
+| Mô hình | **Log**: message được ghi nối đuôi vào partition, đọc theo vị trí (offset) | Queue thường (classic, quorum): message vào hàng đợi, giao cho một consumer, xoá khi consumer xác nhận (ack) |
+| Sau khi đọc | Vẫn giữ tới hết thời hạn lưu (mặc định 7 ngày) | Queue thường (classic, quorum): bị xoá khỏi queue |
+| Đọc lại | Được: dời offset về trước, hoặc thêm consumer group mới | Queue thường thì không; RabbitMQ Streams (từ 3.9) là log đọc lại được theo offset |
+| Thứ tự | Đảm bảo trong một partition | Đảm bảo trong một queue với một consumer |
+| Định tuyến | Theo topic và key | Exchange (direct, topic, fanout, headers) định tuyến linh hoạt tới nhiều queue |
+| Song song | Tối đa bằng số partition trong một group | Queue thường (classic, quorum): thêm consumer vào queue là chia việc |
+| Message lỗi | Ứng dụng tự gửi sang dead letter topic | Broker có sẵn dead letter exchange |
+| Hợp với | Luồng sự kiện lưu lượng lớn, nhiều bên cùng đọc, cần đọc lại | Hàng đợi công việc, định tuyến phức tạp, ưu tiên, request/reply |
+
+Từ Kafka 4.2, **share group** (KIP-932, "Queues for Kafka") đã sẵn sàng cho production: nhiều consumer cùng đọc một partition và xác nhận từng message, nên giới hạn "song song tối đa bằng số partition" chỉ còn đúng với consumer group thường. Bài này dùng consumer group thường.
+
+Bài này chọn **Kafka**, vì đơn hàng là sự kiện nhiều bên cùng quan tâm và cần đọc lại được khi thêm service mới. Các khái niệm producer, consumer, xác nhận, retry, dead letter dùng lại nguyên vẹn nếu đội bạn dùng RabbitMQ; chỉ tên gọi và nơi cấu hình khác. Với RabbitMQ, Spring Boot dùng `spring-boot-starter-amqp` và `@RabbitListener`.
+
+<Check id="j16.2.kafka-vs-rabbitmq">So sánh được Kafka và RabbitMQ ở mô hình lưu, khả năng đọc lại, thứ tự và cách xử lý message lỗi, và chọn được một bên cho một bài toán cụ thể.</Check>
+
+### Topic, partition, offset, consumer group
+
+```text
+topic orders, 3 partition (offset tăng dần trong từng partition)
+
+ partition 0: [0:o-4]
+ partition 1: [0:o-2] [1:o-5] [2:o-6] [3:not-json]
+ partition 2: [0:o-1] [1:o-3] [2:o-1]
+                                    ^ log-end-offset
+
+consumer group "inventory" (3 consumer)       consumer group "analytics"
+  consumer-1 <- partition 0                     đọc cả 3 partition,
+  consumer-2 <- partition 1                     offset riêng, không ảnh hưởng
+  consumer-3 <- partition 2                     group inventory
+```
+
+- **Topic** là tên của một luồng message. **Partition** là một log con của topic; mỗi message trong partition có một số thứ tự gọi là **offset**.
+- Producer gửi message kèm **key**. Kafka băm key để chọn partition, nên cùng key luôn vào cùng partition và giữ đúng thứ tự. Lab dùng `customerId` làm key: mọi đơn của khách `an` nằm chung một partition.
+- **Consumer group** là một nhóm consumer chia nhau đọc một topic; mỗi partition chỉ giao cho đúng một consumer trong group. Số consumer làm việc thật tối đa bằng số partition.
+- Mỗi group lưu offset đã xử lý xong cho từng partition (**committed offset**). **Lag** bằng `log-end-offset` trừ committed offset: số message đang chờ. Lag tăng đều là dấu hiệu consumer không theo kịp.
+- Khi consumer vào hoặc ra khỏi group, Kafka **rebalance**: chia lại partition cho các consumer còn lại.
+
+<Check id="j16.2.partition-group">Giải thích được key quyết định partition thế nào, vì sao số consumer có ích không vượt quá số partition, và lag được tính ra sao.</Check>
+
+### Producer: acks và idempotence
+
+| `acks` | Producer coi là gửi xong khi | Rủi ro |
+|---|---|---|
+| `0` | Đã gửi đi, không chờ trả lời | Mất message mà không biết |
+| `1` | Leader của partition đã ghi | Leader chết trước khi bản sao kịp chép thì mất |
+| `all` (`-1`) | Mọi bản sao đồng bộ (in-sync replica) đã ghi | Chậm hơn một chút; đây là mặc định từ Kafka 3.0 |
+
+Mạng chập chờn làm producer gửi lại một batch mà broker thực ra đã ghi, và message bị ghi hai lần. **Idempotent producer** (`enable.idempotence=true`, mặc định từ Kafka 3.0) gắn cho producer một id và đánh số thứ tự từng batch; broker thấy số thứ tự đã ghi thì bỏ qua. Nó cần `acks=all`, `retries` lớn hơn 0 và `max.in.flight.requests.per.connection` tối đa 5.
+
+Idempotence của producer chỉ chống trùng do **chính producer gửi lại** trong một phiên. Nó không chống được việc client gọi `POST /orders` hai lần, hay consumer xử lý xong mà chết trước khi lưu offset. Hai trường hợp đó vẫn sinh message trùng ở phía consumer.
+
+### Giao ít nhất một lần và consumer idempotent
+
+| Cách giao | Khi nào lưu offset | Hậu quả khi consumer chết giữa chừng |
+|---|---|---|
+| At-most-once | Trước khi xử lý | Mất message |
+| At-least-once | Sau khi xử lý | Nhận lại message, xử lý hai lần |
+| Exactly-once | Trong cùng transaction với kết quả | Chỉ làm được trọn vẹn khi kết quả cũng ghi vào Kafka |
+
+Spring for Apache Kafka mặc định lưu offset sau khi listener xử lý xong cả lô record của một lần `poll()` (`AckMode.BATCH`), tức **at-least-once**. Vì vậy consumer phải **idempotent**: xử lý một message hai lần cho cùng kết quả như một lần. Cách làm phổ biến là ghi lại id của message đã xử lý ở nơi có thao tác nguyên tử: unique constraint trong database, hoặc `SET ... NX` trong Redis như lab này.
+
+<Callout kind="production">
+
+Service gửi email xác nhận đơn hàng bị deploy lại giữa lúc đang xử lý. Offset của 200 message cuối chưa kịp lưu, nên instance mới đọc lại và gửi 200 email lần hai. Không có gì sai ở Kafka: đây đúng là at-least-once. Sửa bằng cách ghi `orderId` đã gửi vào bảng có unique constraint trước khi gửi, và bỏ qua khi bị trùng. Cách này chấp nhận mất email khi service chết đúng giữa hai bước, đổi lại không bao giờ gửi trùng.
+
+</Callout>
+
+### Retry, backoff và dead letter topic
+
+Listener ném exception thì `DefaultErrorHandler` của Spring Kafka quyết định:
+
+```text
+ record orders-1@2
+   │ listener ném exception
+   v
+ exception thuộc loại không nên thử lại? (lỗi chuyển JSON, lỗi deserialize, ...)
+   ├─ có ──────────────────────────────────────────────┐
+   └─ không: chờ theo backoff (1 s, 2 s, ...),          │
+             đọc lại đúng record đó, gọi listener lại   │
+             hết số lần thử mà vẫn lỗi ─────────────────┤
+                                                        v
+                         recoverer: DeadLetterPublishingRecoverer
+                         gửi record sang orders-dlt, cùng số partition,
+                         kèm header lý do lỗi; rồi lưu offset và đi tiếp
+```
+
+- **Backoff** là khoảng chờ giữa các lần thử, thường tăng theo cấp số nhân để hệ thống phía sau kịp hồi phục.
+- **Dead letter topic** (DLT, bên RabbitMQ gọi là dead letter queue) giữ message không xử lý được, để partition không bị kẹt và để người vận hành xem lại, sửa, gửi lại. Spring Kafka 4 đặt tên mặc định là `<topic>-dlt`.
+- **Poison message** là message không bao giờ xử lý được, ví dụ JSON hỏng. Thử lại nó chỉ phí thời gian, nên các lỗi chuyển đổi được xếp vào loại không thử lại.
+
+Retry trong `DefaultErrorHandler` là **blocking**: trong lúc chờ backoff, partition đó đứng yên, các message sau phải đợi. Spring Kafka còn có **non-blocking retry** (`@RetryableTopic`): message lỗi được chuyển sang các topic `-retry` và xử lý sau, partition gốc chạy tiếp.
+
+| | Blocking (`DefaultErrorHandler`) | Non-blocking (`@RetryableTopic`) |
+|---|---|---|
+| Thứ tự trong partition | Giữ nguyên | Mất: message sau có thể xong trước message lỗi |
+| Partition khi đang thử lại | Đứng yên | Chạy tiếp |
+| Hợp với | Backoff ngắn, thứ tự quan trọng | Backoff dài (phút), thứ tự không quan trọng |
+
+<Check id="j16.2.retry-dlt-flow">Mô tả được luồng của `DefaultErrorHandler` từ lúc listener ném exception tới khi record nằm trong DLT, và chọn được giữa retry blocking và non-blocking.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Apache Kafka: Introduction](https://kafka.apache.org/intro): mục "Main Concepts and Terminology" về topic, partition, consumer group.
+- [Kafka Design](https://kafka.apache.org/43/design/design/): mục "Message Delivery Semantics" về at-most-once, at-least-once, exactly-once và idempotent producer.
+- [Handling Exceptions (Spring Kafka)](https://docs.spring.io/spring-kafka/reference/kafka/annotation-error-handling.html): `DefaultErrorHandler`, các exception không thử lại và `DeadLetterPublishingRecoverer`.
+- [Messaging (Spring Boot)](https://docs.spring.io/spring-boot/reference/messaging/index.html): các thuộc tính `spring.kafka.*` và cách Boot nối bean error handler, message converter vào listener.
+- [RabbitMQ Tutorials](https://www.rabbitmq.com/tutorials): nếu đội bạn dùng RabbitMQ, đọc "Work Queues" và "Routing" để thấy cùng khái niệm ở mô hình queue.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** project `~/masteva-j16/shop` và container Redis từ J16.1. Kafka chạy ở cổng **20163**, ứng dụng ở cổng **20160**. Image Kafka chiếm khoảng 700 MB trên đĩa (Docker Desktop trên Mac chip M); container giới hạn heap 384 MB. Mở **hai tab Terminal**: tab 1 chạy ứng dụng, tab 2 gửi request và chạy công cụ Kafka.
+
+Ở mỗi tab, trỏ Maven về JDK 25. Ở một tab, bật lại Redis nếu nó đang dừng:
+
+<Terminal where="mac">
+
+```bash
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+docker start masteva-j16-redis
+```
+
+</Terminal>
+
+### 1. Chạy Kafka một node ở chế độ KRaft
+
+Từ Kafka 4.0, Kafka không còn dùng ZooKeeper; các node tự bầu controller bằng giao thức **KRaft**. Lab chạy một node kiêm cả broker lẫn controller.
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name masteva-j16-kafka -p 20163:20163 \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_PROCESS_ROLES=broker,controller \
+  -e KAFKA_LISTENERS=PLAINTEXT://:20163,CONTROLLER://:9093 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:20163 \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+  -e KAFKA_HEAP_OPTS="-Xmx384m -Xms384m" \
+  apache/kafka:4.3.1
+```
+
+</Terminal>
+
+- `KAFKA_LISTENERS`: broker nghe client ở cổng 20163, controller ở 9093 (chỉ dùng trong container).
+- `KAFKA_ADVERTISED_LISTENERS`: địa chỉ broker báo cho client để kết nối tiếp. Client chỉ dùng `bootstrap-servers` cho lần chào đầu, sau đó đi theo địa chỉ này. Báo sai địa chỉ là lỗi cấu hình Kafka hay gặp nhất: kết nối đầu thành công, rồi mọi lệnh gửi đều timeout.
+- Hai biến `..._REPLICATION_FACTOR` và biến `..._MIN_ISR` bằng 1 vì chỉ có một node. Production cần ít nhất 3 node và replication factor 3.
+
+Đợi khoảng 10 giây rồi kiểm tra:
+
+<Terminal where="mac">
+
+```bash
+docker logs masteva-j16-kafka 2>&1 | grep -o 'Kafka Server started.*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Kafka Server started (kafka.server.KafkaRaftServer)
+```
+
+</Expected>
+
+### 2. Tạo topic có 3 partition
+
+Công cụ dòng lệnh của Kafka nằm sẵn trong container, ở `/opt/kafka/bin`.
+
+<Terminal where="mac">
+
+```bash
+docker exec masteva-j16-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:20163 \
+  --create --topic orders --partitions 3 --replication-factor 1
+docker exec masteva-j16-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:20163 \
+  --describe --topic orders
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Created topic orders.
+Topic: orders	TopicId: NHLtDCJtS_S4ecfsaBRbBw	PartitionCount: 3	ReplicationFactor: 1	Configs: min.insync.replicas=1
+	Topic: orders	Partition: 0	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: orders	Partition: 1	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+	Topic: orders	Partition: 2	Leader: 1	Replicas: 1	Isr: 1	Elr: 	LastKnownElr: 
+```
+
+</Expected>
+
+`TopicId` khác trên máy bạn. Mỗi partition có leader là node 1 và một bản sao duy nhất (`Isr: 1`).
+
+### 3. Thêm Spring for Apache Kafka
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j16/shop
+perl -0pi -e 's|</dependencies>|\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-starter-kafka</artifactId>\n\t\t</dependency>\n\t</dependencies>|' pom.xml
+mvn dependency:tree | grep -E "starter-kafka|spring-kafka|kafka-clients"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[INFO] \- org.springframework.boot:spring-boot-starter-kafka:jar:4.1.1:compile
+[INFO]       \- org.springframework.kafka:spring-kafka:jar:4.1.1:compile
+[INFO]          \- org.apache.kafka:kafka-clients:jar:4.2.1:compile
+```
+
+</Expected>
+
+Lệnh `perl` chèn khối `<dependency>` ngay trước `</dependencies>` của `pom.xml`; bạn cũng có thể mở file và chèn bằng tay. Client 4.2.1 nói chuyện được với broker 4.3.1: Kafka giữ tương thích giữa client và broker qua nhiều phiên bản.
+
+### 4. Producer, consumer và error handler
+
+<Terminal where="mac" title="Cấu hình Kafka, OrderPlaced, OrderController, InventoryListener, KafkaConfig">
+
+```bash
+cd ~/masteva-j16/shop
+mkdir -p src/main/java/dev/masteva/shop/order
+cat >> src/main/resources/application.properties <<'EOF'
+spring.kafka.bootstrap-servers=localhost:20163
+spring.kafka.producer.acks=all
+spring.kafka.producer.properties.enable.idempotence=true
+spring.kafka.consumer.group-id=inventory
+spring.kafka.consumer.auto-offset-reset=earliest
+spring.kafka.listener.concurrency=3
+EOF
+cat > src/main/java/dev/masteva/shop/order/OrderPlaced.java <<'EOF'
+package dev.masteva.shop.order;
+
+public record OrderPlaced(String orderId, String customerId, long productId, int quantity) {
+}
+EOF
+cat > src/main/java/dev/masteva/shop/order/OrderController.java <<'EOF'
+package dev.masteva.shop.order;
+
+import java.util.concurrent.TimeUnit;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.springframework.http.HttpStatus;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+import tools.jackson.databind.json.JsonMapper;
+
+@RestController
+public class OrderController {
+    private final KafkaTemplate<String, String> kafka;
+    private final JsonMapper json;
+
+    public OrderController(KafkaTemplate<String, String> kafka, JsonMapper json) {
+        this.kafka = kafka;
+        this.json = json;
+    }
+
+    public record Placed(String orderId, int partition, long offset) {
+    }
+
+    @PostMapping("/orders")
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    public Placed place(@RequestBody OrderPlaced event) throws Exception {
+        // key = customerId: mọi đơn của một khách vào cùng partition, giữ đúng thứ tự
+        RecordMetadata meta = kafka.send("orders", event.customerId(), json.writeValueAsString(event))
+                .get(5, TimeUnit.SECONDS)
+                .getRecordMetadata();
+        return new Placed(event.orderId(), meta.partition(), meta.offset());
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/shop/order/InventoryListener.java <<'EOF'
+package dev.masteva.shop.order;
+
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.KafkaHeaders;
+import org.springframework.messaging.handler.annotation.Header;
+import org.springframework.stereotype.Component;
+
+@Component
+public class InventoryListener {
+    private static final Logger log = LoggerFactory.getLogger(InventoryListener.class);
+    private final StringRedisTemplate redis;
+    private final Map<String, Integer> warehouseCalls = new ConcurrentHashMap<>();
+
+    public InventoryListener(StringRedisTemplate redis) {
+        this.redis = redis;
+    }
+
+    @KafkaListener(topics = "orders")
+    public void on(OrderPlaced event,
+                   @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
+                   @Header(KafkaHeaders.OFFSET) long offset) {
+        log.info("order {} from orders-{}@{}", event.orderId(), partition, offset);
+        // Kafka giao ít nhất một lần, nên đánh dấu đơn đã xử lý trong Redis để bỏ qua bản trùng
+        String key = "processed:order:" + event.orderId();
+        Boolean first = redis.opsForValue().setIfAbsent(key, "1", Duration.ofDays(1));
+        if (!Boolean.TRUE.equals(first)) {
+            log.info("order {} already processed, skip", event.orderId());
+            return;
+        }
+        try {
+            reserve(event);
+        } catch (RuntimeException e) {
+            redis.delete(key); // xử lý hỏng thì bỏ dấu, để lần thử lại được chạy
+            throw e;
+        }
+    }
+
+    private void reserve(OrderPlaced event) {
+        if (event.productId() == 404) {
+            throw new IllegalStateException("unknown product 404");
+        }
+        // Sản phẩm 99 giả lập kho trả lời chậm: hai lần gọi đầu lỗi, lần thứ ba thành công
+        if (event.productId() == 99 && warehouseCalls.merge(event.orderId(), 1, Integer::sum) < 3) {
+            throw new IllegalStateException("warehouse timeout");
+        }
+        log.info("order {} reserved {} x product {}", event.orderId(), event.quantity(), event.productId());
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/shop/order/KafkaConfig.java <<'EOF'
+package dev.masteva.shop.order;
+
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.TopicBuilder;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.kafka.listener.RetryListener;
+import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
+import org.springframework.kafka.support.converter.StringJacksonJsonMessageConverter;
+
+@Configuration
+public class KafkaConfig {
+    private static final Logger log = LoggerFactory.getLogger(KafkaConfig.class);
+
+    /** Dead letter topic: cùng số partition với orders, vì recoverer giữ nguyên số partition. */
+    @Bean
+    NewTopic ordersDlt() {
+        return TopicBuilder.name("orders-dlt").partitions(3).replicas(1).build();
+    }
+
+    /** Chuyển chuỗi JSON trong record thành tham số OrderPlaced của listener. */
+    @Bean
+    StringJacksonJsonMessageConverter messageConverter() {
+        return new StringJacksonJsonMessageConverter();
+    }
+
+    /** Thử lại 2 lần, chờ 1 s rồi 2 s; vẫn lỗi thì gửi record sang orders-dlt. */
+    @Bean
+    DefaultErrorHandler errorHandler(KafkaTemplate<String, String> template) {
+        ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(2);
+        backOff.setInitialInterval(1_000);
+        backOff.setMultiplier(2.0);
+        DefaultErrorHandler handler = new DefaultErrorHandler(new DeadLetterPublishingRecoverer(template), backOff);
+        handler.setRetryListeners(new RetryListener() {
+            @Override
+            public void failedDelivery(ConsumerRecord<?, ?> record, Exception ex, int deliveryAttempt) {
+                log.warn("{}-{}@{} failed, attempt {}: {}", record.topic(), record.partition(), record.offset(),
+                        deliveryAttempt, ex.getCause() != null ? ex.getCause().getMessage() : ex.getMessage());
+            }
+
+            @Override
+            public void recovered(ConsumerRecord<?, ?> record, Exception ex) {
+                log.warn("{}-{}@{} sent to orders-dlt", record.topic(), record.partition(), record.offset());
+            }
+        });
+        return handler;
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Những điểm chính:
+
+- `acks=all` và `enable.idempotence=true` ghi rõ thành cấu hình, dù đó đã là mặc định, để người đọc sau không phải đoán.
+- `concurrency=3` tạo ba consumer trong group `inventory`, bằng số partition. `auto-offset-reset=earliest`: group mới chưa có offset thì đọc từ đầu topic.
+- `OrderController` gửi rồi chờ kết quả tối đa 5 giây bằng `.get(...)`, để trả về partition và offset cho bạn quan sát. Code thật thường không chặn thread như vậy mà xử lý kết quả qua callback của `CompletableFuture`.
+- `InventoryListener` dùng `SET processed:order:<id> 1 NX EX 86400` (qua `setIfAbsent`) để bỏ qua đơn đã xử lý. Xử lý lỗi thì xoá dấu, để lần thử lại được chạy.
+- `KafkaConfig`: `StringJacksonJsonMessageConverter` đổi chuỗi JSON thành `OrderPlaced`; `DefaultErrorHandler` thử lại 2 lần (chờ 1 s rồi 2 s) rồi gửi sang `orders-dlt`; `RetryListener` ghi log mỗi lần lỗi và lúc gửi sang DLT. Spring Boot tự nối converter và error handler vào listener container; bean `NewTopic` được `KafkaAdmin` tạo topic lúc khởi động.
+
+Cách đánh dấu trước khi xử lý này chỉ an toàn với exception. Nếu tiến trình chết sau `setIfAbsent` mà trước khi `reserve` xong, dấu vẫn còn và lần giao lại bị bỏ qua: đơn mất. Trên production, ghi dấu và kết quả trong cùng một transaction database (bảng `processed_messages` có unique constraint), hoặc ghi dấu "đang xử lý" với TTL ngắn rồi đổi thành "xong" sau khi xử lý; TTL của dấu phải dài hơn khoảng thời gian có thể đọc lại topic.
+
+### 5. Chạy ứng dụng
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j16/shop && mvn -q package -DskipTests && java -jar target/shop-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+Sau `Started ShopApplication`, tab 1 in vài dòng `partitions assigned`. Ba consumer vào group gần như cùng lúc nên có thể thấy một lần chia lại; cuối cùng mỗi thread `ntainer#0-0-C-1`, `#0-1`, `#0-2` giữ một partition. Lần đầu chạy còn có vài dòng `JoinGroup failed: This is not the correct coordinator`: Kafka đang tạo topic nội bộ `__consumer_offsets`, consumer tự thử lại sau đó.
+
+### 6. Gửi đơn và xem partition
+
+Ở tab 2, khai báo hàm `order` để gửi đơn ngắn gọn (hàm chỉ sống trong tab này), rồi gửi bốn đơn của ba khách:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j16/shop
+order() {
+  curl -s -H 'Content-Type: application/json' \
+    -d "{\"orderId\":\"$1\",\"customerId\":\"$2\",\"productId\":$3,\"quantity\":1}" \
+    localhost:20160/orders; echo
+}
+order o-1 an 1; order o-2 binh 1; order o-3 an 1; order o-4 chi 1
+```
+
+</Terminal>
+
+<Predict question="Đơn o-1 và o-3 cùng của khách an. Chúng vào partition nào?">
+
+```text
+{"orderId":"o-1","partition":2,"offset":0}
+{"orderId":"o-2","partition":1,"offset":0}
+{"orderId":"o-3","partition":2,"offset":1}
+{"orderId":"o-4","partition":0,"offset":0}
+```
+
+Cả hai vào partition 2, offset 0 rồi 1. Partition được chọn bằng hàm băm murmur2 của key chia lấy dư cho số partition, nên kết quả trên máy bạn giống hệt. Đổi số partition của topic thì ánh xạ key sang partition đổi theo, và thứ tự theo khách bị phá vỡ trong giai đoạn chuyển tiếp: lý do nên chọn số partition đủ dư từ đầu.
+
+</Predict>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+grep -E 'InventoryListener|idempotent' app.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+01:24:33.277 INFO  [io-20160-exec-2] KafkaProducer: [Producer clientId=shop-producer-1] Instantiated an idempotent producer.
+01:24:33.426 INFO  [ntainer#0-2-C-1] InventoryListener: order o-1 from orders-2@0
+01:24:33.442 INFO  [ntainer#0-1-C-1] InventoryListener: order o-2 from orders-1@0
+01:24:33.447 INFO  [ntainer#0-2-C-1] InventoryListener: order o-1 reserved 1 x product 1
+01:24:33.447 INFO  [ntainer#0-1-C-1] InventoryListener: order o-2 reserved 1 x product 1
+01:24:33.461 INFO  [ntainer#0-2-C-1] InventoryListener: order o-3 from orders-2@1
+01:24:33.462 INFO  [ntainer#0-2-C-1] InventoryListener: order o-3 reserved 1 x product 1
+01:24:33.480 INFO  [ntainer#0-0-C-1] InventoryListener: order o-4 from orders-0@0
+01:24:33.481 INFO  [ntainer#0-0-C-1] InventoryListener: order o-4 reserved 1 x product 1
+```
+
+</Expected>
+
+Giờ trên máy bạn khác. Producer tự báo là idempotent. Ba thread xử lý song song ba partition, nhưng `o-1` luôn xong trước `o-3` vì cùng partition 2 và cùng một thread.
+
+### 7. Xem consumer group
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec masteva-j16-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:20163 \
+  --describe --group inventory
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+GROUP           TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID                                               HOST            CLIENT-ID
+inventory       orders          0          1               1               0               consumer-inventory-1-781f3cd4-9108-4288-a100-a607b1b9ce21 /192.168.65.1   consumer-inventory-1
+inventory       orders          2          2               2               0               consumer-inventory-3-dcb1be35-6b07-4c32-811c-549cc757b2a5 /192.168.65.1   consumer-inventory-3
+inventory       orders          1          1               1               0               consumer-inventory-2-f29c32a2-cb85-48a7-ae7b-d56ed6be1108 /192.168.65.1   consumer-inventory-2
+```
+
+</Expected>
+
+`CURRENT-OFFSET` là offset tiếp theo group sẽ đọc, tức đã xử lý xong mọi thứ trước nó. `LAG` bằng 0 ở cả ba partition. `CONSUMER-ID` và thứ tự dòng khác trên máy bạn.
+
+<Check id="j16.2.lab-partitions">Gửi được đơn có key, dự đoán đúng các đơn cùng khách vào cùng partition, và đọc được offset, lag của group bằng `kafka-consumer-groups.sh`.</Check>
+
+### 8. Message trùng
+
+Gửi lại đúng đơn `o-1`, như khi client không nhận được phản hồi và bấm lại:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+order o-1 an 1; sleep 1; grep 'o-1 ' app.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"orderId":"o-1","partition":2,"offset":2}
+01:24:33.426 INFO  [ntainer#0-2-C-1] InventoryListener: order o-1 from orders-2@0
+01:24:33.447 INFO  [ntainer#0-2-C-1] InventoryListener: order o-1 reserved 1 x product 1
+01:24:37.078 INFO  [ntainer#0-2-C-1] InventoryListener: order o-1 from orders-2@2
+01:24:37.081 INFO  [ntainer#0-2-C-1] InventoryListener: order o-1 already processed, skip
+```
+
+</Expected>
+
+Kafka nhận một record mới (offset 2): idempotent producer không biết đây là "cùng một đơn", vì với nó đây là một lần gửi mới. Consumer thấy key `processed:order:o-1` đã có trong Redis và bỏ qua, hàng không bị giữ hai lần.
+
+### 9. Lỗi tạm thời: retry có backoff
+
+Sản phẩm 99 giả lập kho trả lời chậm: hai lần gọi đầu lỗi, lần ba thành công.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+order o-5 dung 99; sleep 5; grep -E 'o-5|KafkaConfig' app.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"orderId":"o-5","partition":1,"offset":1}
+01:24:38.113 INFO  [ntainer#0-1-C-1] InventoryListener: order o-5 from orders-1@1
+01:24:38.119 WARN  [ntainer#0-1-C-1] KafkaConfig: orders-1@1 failed, attempt 1: warehouse timeout
+01:24:39.159 INFO  [ntainer#0-1-C-1] InventoryListener: order o-5 from orders-1@1
+01:24:39.163 WARN  [ntainer#0-1-C-1] KafkaConfig: orders-1@1 failed, attempt 2: warehouse timeout
+01:24:41.263 INFO  [ntainer#0-1-C-1] InventoryListener: order o-5 from orders-1@1
+01:24:41.266 INFO  [ntainer#0-1-C-1] InventoryListener: order o-5 reserved 1 x product 99
+```
+
+</Expected>
+
+Cùng record `orders-1@1` được giao ba lần, cách nhau khoảng 1 giây rồi 2 giây. Trong ba giây đó, mọi message khác của partition 1 phải chờ: đó là cái giá của retry blocking.
+
+### 10. Lỗi vĩnh viễn và message hỏng
+
+Sản phẩm 404 không tồn tại, thử bao nhiêu lần cũng lỗi:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+order o-6 dung 404; sleep 5; grep -E 'o-6|orders-1@2' app.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"orderId":"o-6","partition":1,"offset":2}
+01:24:43.149 INFO  [ntainer#0-1-C-1] InventoryListener: order o-6 from orders-1@2
+01:24:43.151 WARN  [ntainer#0-1-C-1] KafkaConfig: orders-1@2 failed, attempt 1: unknown product 404
+01:24:44.196 INFO  [ntainer#0-1-C-1] InventoryListener: order o-6 from orders-1@2
+01:24:44.198 WARN  [ntainer#0-1-C-1] KafkaConfig: orders-1@2 failed, attempt 2: unknown product 404
+01:24:46.275 INFO  [ntainer#0-1-C-1] InventoryListener: order o-6 from orders-1@2
+01:24:46.278 WARN  [ntainer#0-1-C-1] KafkaConfig: orders-1@2 failed, attempt 3: unknown product 404
+01:24:46.810 WARN  [ntainer#0-1-C-1] KafkaConfig: orders-1@2 sent to orders-dlt
+```
+
+</Expected>
+
+Giờ gửi một message không phải JSON thẳng vào topic bằng `kafka-console-producer.sh`, như một service khác gửi nhầm định dạng. `parse.key=true` và `key.separator=:` tách `dung` thành key, phần sau dấu `:` đầu tiên thành value.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+echo 'dung:not-json' | docker exec -i masteva-j16-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:20163 --topic orders \
+  --reader-property parse.key=true --reader-property key.separator=:
+sleep 2; grep 'orders-1@3' app.log
+```
+
+</Terminal>
+
+<Predict question="Message not-json có được thử lại 3 lần như o-6 không?">
+
+```text
+01:24:49.209 WARN  [ntainer#0-1-C-1] KafkaConfig: orders-1@3 failed, attempt 1: Failed to convert from JSON
+01:24:49.733 WARN  [ntainer#0-1-C-1] KafkaConfig: orders-1@3 sent to orders-dlt
+```
+
+Không. Message không chuyển được thành `OrderPlaced`, listener chưa hề được gọi, và lỗi là `ConversionException`, nằm trong danh sách exception không thử lại của `DefaultErrorHandler`. Nó đi thẳng sang DLT sau lần đầu. Khoảng nửa giây giữa hai dòng là lúc recoverer kiểm tra partition của `orders-dlt` và gửi record sang đó; producer đã có từ bước 6.
+
+</Predict>
+
+Đọc DLT: lần đầu in key và value, lần sau lọc header chứa tên exception gốc.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec masteva-j16-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:20163 \
+  --topic orders-dlt --from-beginning --max-messages 2 \
+  --formatter-property print.key=true 2>/dev/null
+docker exec masteva-j16-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:20163 \
+  --topic orders-dlt --from-beginning --max-messages 2 \
+  --formatter-property print.headers=true 2>/dev/null | grep -o 'kafka_dlt-exception-cause-fqcn:[^,]*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+dung	{"orderId":"o-6","customerId":"dung","productId":404,"quantity":1}
+dung	not-json
+kafka_dlt-exception-cause-fqcn:java.lang.IllegalStateException
+kafka_dlt-exception-cause-fqcn:org.springframework.kafka.support.converter.ConversionException
+```
+
+</Expected>
+
+`DeadLetterPublishingRecoverer` giữ nguyên key và value, thêm các header `kafka_dlt-*`: topic, partition, offset gốc, group, exception và stack trace. Đủ để người vận hành biết vì sao message hỏng và gửi lại sau khi sửa. Hai record cùng nằm ở partition 1 của `orders-dlt` vì recoverer giữ nguyên số partition gốc.
+
+<Check id="j16.2.lab-retry-dlt">Quan sát được retry có backoff cứu một lỗi tạm thời, lỗi vĩnh viễn vào DLT sau khi hết lượt thử, message hỏng vào DLT ngay, và đọc được header lý do trong DLT.</Check>
+
+### 11. Lag khi consumer dừng
+
+Bấm Ctrl+C ở tab 1. Gửi ba đơn của khách `eve` thẳng vào topic trong lúc không có consumer nào, rồi xem group:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for i in 7 8 9; do
+  echo "eve:{\"orderId\":\"o-$i\",\"customerId\":\"eve\",\"productId\":1,\"quantity\":1}"
+done | docker exec -i masteva-j16-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:20163 --topic orders \
+  --reader-property parse.key=true --reader-property key.separator=:
+docker exec masteva-j16-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:20163 \
+  --describe --group inventory
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Consumer group 'inventory' has no active members.
+
+GROUP           TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG             CONSUMER-ID     HOST            CLIENT-ID
+inventory       orders          0          1               1               0               -               -               -
+inventory       orders          1          4               4               0               -               -               -
+inventory       orders          2          3               6               3               -               -               -
+```
+
+</Expected>
+
+Partition 2 có lag 3: ba đơn của `eve` đang chờ. Message không mất khi consumer dừng; group nhớ offset và đọc tiếp khi quay lại. Chạy lại ứng dụng ở tab 1, lần này không cần build:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+java -jar target/shop-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+Đợi `Started ShopApplication` và vài giây cho group ổn định, rồi ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+grep -E 'o-[789] reserved' app.log
+docker exec masteva-j16-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:20163 \
+  --describe --group inventory | awk 'NF {print $1, $2, $3, $4, $5, $6}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+01:25:02.598 INFO  [ntainer#0-2-C-1] InventoryListener: order o-7 reserved 1 x product 1
+01:25:02.599 INFO  [ntainer#0-2-C-1] InventoryListener: order o-8 reserved 1 x product 1
+01:25:02.601 INFO  [ntainer#0-2-C-1] InventoryListener: order o-9 reserved 1 x product 1
+GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG
+inventory orders 2 6 6 0
+inventory orders 1 4 4 0
+inventory orders 0 1 1 0
+```
+
+</Expected>
+
+`awk` chỉ giữ sáu cột đầu cho dễ đọc. Lag về 0. Trên production, lag theo từng partition là chỉ số đầu tiên cần cảnh báo cho mọi consumer, cùng với số message trong DLT.
+
+<Check id="j16.2.lab-lag">Tạo được lag bằng cách dừng consumer, đọc lag theo partition, và thấy consumer đọc tiếp từ offset đã lưu khi chạy lại.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Ứng dụng log liên tục `Connection to node -1 (localhost/127.0.0.1:20163) could not be established`: Kafka chưa chạy hoặc chưa khởi động xong. Kiểm tra bằng `docker logs masteva-j16-kafka`.
+- `POST /orders` treo vài giây rồi trả `500`: producer không gửi được tới broker, thường do Kafka chưa chạy hoặc `KAFKA_ADVERTISED_LISTENERS` sai. Xem exception trong log ở tab 1.
+- `Error while executing topic command : Topic 'orders' already exists.`: bạn đã tạo topic ở lần chạy trước, bỏ qua được.
+- Listener không nhận gì dù đã gửi: kiểm tra `spring.kafka.consumer.group-id`, và nhớ group đã có offset thì `auto-offset-reset` không còn tác dụng.
+- `release version 25 not supported` khi build: đặt lại `JAVA_HOME` như phần Chuẩn bị.
+
+</Callout>
+
+### Dọn dẹp
+
+Bấm Ctrl+C ở tab 1. Giữ nguyên project và hai container: J16.3 chạy hai instance của ứng dụng này, cả hai đều kết nối Kafka và Redis. Nếu nghỉ giữa chừng, `docker stop masteva-j16-redis masteva-j16-kafka` dừng hai container mà không mất dữ liệu.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Topic có 3 partition. Tăng concurrency lên 10 thì nhanh gấp ba không?">
+
+Không. Mỗi partition chỉ giao cho một consumer trong group, nên 7 consumer thừa ngồi không. Muốn song song hơn phải tăng số partition, mà tăng partition làm đổi ánh xạ key sang partition. Vì vậy số partition nên chọn dư từ đầu theo lưu lượng dự kiến. J16.3 chạy hai instance, mỗi instance 3 consumer, và bạn sẽ thấy 3 trong 6 consumer không có partition nào.
+
+</Reveal>
+
+<Reveal title="Nếu dùng JacksonJsonDeserializer của Kafka thay cho message converter, message not-json gây ra chuyện gì?">
+
+Lỗi xảy ra trong `poll()`, trước khi Spring có record để đưa cho error handler. Không bọc trong `ErrorHandlingDeserializer`, consumer có thể kẹt ở đúng offset đó và log lỗi liên tục, partition dừng hẳn. Đây là sự cố poison pill kinh điển. Cách lab làm (deserializer `String`, converter chuyển JSON ở tầng listener) hoặc bọc bằng `ErrorHandlingDeserializer` đều đưa lỗi về error handler, nơi nó được xếp loại không thử lại và chuyển sang DLT.
+
+</Reveal>
+
+<Reveal title="Service lưu đơn vào database rồi gửi Kafka. Database commit xong thì service chết. Chuyện gì xảy ra?">
+
+Đơn có trong database nhưng sự kiện không bao giờ được gửi: inventory không giữ hàng. Đảo thứ tự (gửi Kafka trước) thì gặp chiều ngược lại: sự kiện có mà đơn bị rollback. Ghi database và gửi Kafka không nằm trong cùng một transaction. Cách sửa chuẩn là **transactional outbox**: ghi sự kiện vào bảng `outbox` trong cùng transaction với đơn, rồi một tiến trình khác đọc bảng đó và gửi Kafka. Lộ trình Microservices, chặng M5, đi sâu vào mẫu này.
+
+</Reveal>
+
+<Reveal title="Kafka quảng cáo exactly-once. Sao consumer vẫn phải idempotent?">
+
+Exactly-once của Kafka (idempotent producer cộng transaction và consumer đọc `read_committed`) đảm bảo cho chuỗi "đọc từ Kafka, xử lý, ghi lại vào Kafka". Khi kết quả là một lần ghi vào database, gọi API thanh toán hay gửi email, Kafka không kiểm soát được hệ thống bên ngoài đó. Offset vẫn có thể chưa lưu khi việc bên ngoài đã xong, nên vẫn cần dấu "đã xử lý" ở phía hệ thống đó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết cấu hình listener, error handler hoặc giải thích một dòng log rebalance. AI hay dùng tên DLT `orders.DLT` của Spring Kafka cũ (bản 4 là `orders-dlt`), `JsonSerializer` và `JsonDeserializer` của Jackson 2 (đã deprecated, bản mới là `JacksonJson...`), cấu hình ZooKeeper đã bị bỏ từ Kafka 4, hoặc bật `enable-auto-commit`. Kiểm tra lại bằng `kafka-topics.sh --list`, `kafka-consumer-groups.sh --describe` và đọc thẳng DLT như bước 10.
+
+</Callout>
+
+<Callout kind="link">
+
+Dùng Micrometer như J15 để đưa consumer lag và số message DLT lên dashboard và cảnh báo. J16.3 chạy nhiều instance và thấy consumer group chia partition. J17 đóng gói ứng dụng thành image, khi đó `bootstrap-servers` đổi theo môi trường. Lộ trình Microservices, chặng M5, đi tiếp với outbox, saga và thiết kế sự kiện giữa nhiều service.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j16.2.mastery-delivery">Giải thích được vì sao Kafka với Spring mặc định là at-least-once, và tự viết được một consumer idempotent cho một nghiệp vụ cụ thể.</Check>
+
+<Check id="j16.2.mastery-error-design">Thiết kế được xử lý lỗi cho một consumer: exception nào thử lại, backoff bao lâu, DLT tên gì và bao nhiêu partition, theo dõi lag và DLT thế nào.</Check>
+
+</Mastery>

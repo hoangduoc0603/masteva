@@ -1,0 +1,637 @@
+---
+title: Executor, CompletableFuture và collection đồng thời
+description: Dựng ThreadPoolExecutor có hàng đợi giới hạn và chính sách từ chối, gọi ba service song song bằng CompletableFuture với xử lý lỗi và timeout, rồi đếm lượt xem bằng ConcurrentHashMap mà không mất số.
+id: j14.2
+step: j14
+prerequisites: [j14.1]
+topics: [j14.executor-thread-pool, j14.completablefuture, j14.collection-dong-thoi]
+status: verified
+verified:
+  date: 2026-10-03
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+---
+
+<Goal>
+
+Thôi tự tạo thread bằng tay: giao việc cho executor có giới hạn rõ ràng, ghép các lời gọi bất đồng bộ bằng `CompletableFuture`, và chia sẻ dữ liệu qua collection đồng thời. Học xong bài này, bạn giải thích được:
+
+- Vì sao `Executors.newFixedThreadPool(10)` có thể làm service hết bộ nhớ khi tải tăng, và pool có hàng đợi giới hạn từ chối việc ra sao.
+- Vì sao trang thanh toán gọi ba service mất 900 ms khi gọi lần lượt nhưng chỉ 400 ms khi gọi song song, và lỗi của một service đi đâu.
+- Vì sao dùng `ConcurrentHashMap` mà bộ đếm vẫn mất số.
+
+</Goal>
+
+<Knowledge>
+
+### Executor tách "giao việc" khỏi "quản lý thread"
+
+Tạo một platform thread cho mỗi việc thì tốn (J14.1) và không có giới hạn: 10.000 request cùng lúc là 10.000 thread. **Executor** giải quyết bằng cách giữ một nhóm thread dùng lại (thread pool) và một hàng đợi việc. Code nghiệp vụ chỉ gọi `submit(task)`, không quan tâm thread nào chạy.
+
+`ThreadPoolExecutor` quyết định số phận một task mới theo đúng thứ tự sau:
+
+```text
+execute(task)
+   |
+   |-- số thread < corePoolSize ?  ---- có --> tạo thread mới chạy task
+   |
+   |-- hàng đợi còn chỗ ?          ---- có --> đưa vào hàng đợi
+   |
+   |-- số thread < maximumPoolSize ? -- có --> tạo thêm thread (ngoài core)
+   |
+   '-- còn lại ----------------------------> RejectedExecutionHandler
+                                             AbortPolicy:      ném RejectedExecutionException
+                                             CallerRunsPolicy: thread gửi việc tự chạy task
+                                             DiscardPolicy:    lặng lẽ bỏ (nguy hiểm)
+```
+
+Điều hay gây bất ngờ: pool chỉ tạo thêm thread **sau khi hàng đợi đã đầy**. Với hàng đợi không giới hạn, `maximumPoolSize` không bao giờ được dùng tới.
+
+| Factory | Thực chất | Rủi ro |
+|---|---|---|
+| `Executors.newFixedThreadPool(n)` | n thread, `LinkedBlockingQueue` **không giới hạn** | Tải vượt khả năng thì hàng đợi phình mãi: độ trễ tăng, cuối cùng `OutOfMemoryError` |
+| `Executors.newCachedThreadPool()` | Không giới hạn số thread, không hàng đợi | Tải tăng vọt là hàng nghìn thread |
+| `new ThreadPoolExecutor(core, max, ..., new ArrayBlockingQueue<>(cap), ..., policy)` | Mọi giới hạn đều rõ ràng | Phải tự chọn con số và chính sách |
+| `Executors.newVirtualThreadPerTaskExecutor()` | Một virtual thread cho mỗi task | Học ở J14.3 |
+
+Tắt executor đúng cách: `shutdown()` ngừng nhận việc mới nhưng chạy nốt việc đã nhận; `awaitTermination(timeout)` chờ; quá hạn thì `shutdownNow()` để interrupt các thread còn chạy. Từ Java 19, `ExecutorService` là `AutoCloseable`: `try (executor) { ... }` gọi `close()`, tức `shutdown()` rồi chờ mọi việc xong.
+
+### Chọn kích thước pool
+
+- **Việc dùng CPU** (nén ảnh, tính toán): khoảng số nhân, `Runtime.getRuntime().availableProcessors()`. Thêm thread chỉ làm chúng tranh nhau CPU.
+- **Việc chờ I/O** (gọi HTTP, database): nhiều hơn số nhân, vì phần lớn thời gian thread chỉ ngồi chờ. Công thức thường dùng, theo sách *Java Concurrency in Practice* của Brian Goetz: số thread ≈ số nhân × (1 + thời gian chờ / thời gian tính). Ví dụ 10 nhân, mỗi request chờ database 90 ms và tính 10 ms: 10 × (1 + 9) = 100 thread.
+
+Con số từ công thức chỉ là điểm khởi đầu. Giới hạn thật thường nằm ở chỗ khác: pool kết nối database (J12) chỉ có 10 kết nối thì 100 thread cũng chỉ có 10 thread làm việc, 90 thread còn lại xếp hàng chờ kết nối.
+
+<Callout kind="production">
+
+Một service dùng `newFixedThreadPool(20)` để gửi email xác nhận đơn. Nhà cung cấp email chậm đi từ 200 ms lên 10 giây trong một giờ cao điểm. Hàng đợi không giới hạn tích lại hơn một triệu task, heap đầy, service chết kéo theo cả luồng đặt hàng. Pool có hàng đợi giới hạn sẽ từ chối sớm: bạn đếm được số lần từ chối, đặt cảnh báo, và chuyển việc gửi email sang message queue (J16) thay vì giữ trong bộ nhớ.
+
+</Callout>
+
+<Check id="j14.2.pool-anatomy">Kể được thứ tự `ThreadPoolExecutor` xử lý một task mới (core, hàng đợi, max, từ chối) và vì sao `newFixedThreadPool` nguy hiểm khi tải vượt khả năng.</Check>
+
+### CompletableFuture: ghép các bước bất đồng bộ
+
+`CompletableFuture<T>` là một kết quả kiểu `T` sẽ có trong tương lai, kèm khả năng nối thêm bước xử lý khi nó có. Trang thanh toán cần giá, tồn kho và phí giao hàng từ ba service; ba lời gọi không phụ thuộc nhau nên chạy song song được:
+
+```text
+supplyAsync(price, io)     ----300 ms---->\
+supplyAsync(stock, io)     --200 ms-->     >-- allOf --> thenApply(new Quote(...))   tổng ~400 ms
+supplyAsync(shipping, io)  -----400 ms---->/
+
+supplyAsync(customerCity) --100--> thenCompose(city -> shipping(city)) --400--> \
+supplyAsync(price)        ----300 ms---------------------------------------------> thenCombine(Long::sum)   ~500 ms
+```
+
+| Method | Dùng khi | Tương tự với Stream (J6) |
+|---|---|---|
+| `thenApply(f)` | Biến đổi kết quả bằng hàm thường | `map` |
+| `thenCompose(f)` | Bước sau là một lời gọi bất đồng bộ khác, cần kết quả bước trước | `flatMap` |
+| `thenCombine(other, f)` | Gộp hai future độc lập | |
+| `allOf(...)`, `anyOf(...)` | Chờ tất cả, hoặc chờ cái đầu tiên | |
+| `exceptionally(f)` | Lỗi thì trả giá trị thay thế | |
+| `handle(f)`, `whenComplete(f)` | Nhận cả kết quả lẫn lỗi; `whenComplete` chỉ quan sát, không đổi kết quả | |
+| `orTimeout(t)`, `completeOnTimeout(v, t)` | Quá hạn thì lỗi `TimeoutException`, hoặc lấy giá trị mặc định | |
+
+Ba quy tắc khi dùng trên server:
+
+1. **Luôn truyền executor riêng cho việc I/O.** `supplyAsync(task)` không có executor chạy trên `ForkJoinPool.commonPool()`, pool dùng chung cả JVM có số thread bằng số nhân trừ một. Vài lời gọi HTTP chậm là đủ chiếm hết pool, và mọi parallel stream, mọi `CompletableFuture` khác trong ứng dụng phải chờ.
+2. **Lỗi được gói lại.** Trong chuỗi, exception của một bước được gói trong `CompletionException`; `join()` ném `CompletionException`, `get()` ném `ExecutionException` kiểu checked. Muốn biết lỗi gốc, đọc `getCause()`.
+3. **Timeout của future không dừng việc bên dưới.** `orTimeout` làm future hoàn tất bằng lỗi, nhưng task vẫn chạy tiếp trên thread của executor tới khi xong. `cancel(true)` của `CompletableFuture` cũng không interrupt thread. Muốn lời gọi HTTP thật sự dừng, đặt timeout ở chính client HTTP (J9.3).
+
+<Check id="j14.2.cf-compose">Chọn đúng giữa `thenApply`, `thenCompose`, `thenCombine`, `allOf` cho một luồng gọi service, và giải thích vì sao phải truyền executor riêng cho việc I/O.</Check>
+
+### Collection đồng thời
+
+`HashMap` và `ArrayList` không an toàn khi nhiều thread cùng ghi. Hậu quả không chỉ là sai số: khi hai thread cùng làm `HashMap` mở rộng bảng băm, cấu trúc bên trong có thể hỏng, mất phần tử, nhân đôi khoá, hoặc ném `ConcurrentModificationException` ở chỗ không hề có vòng lặp nào.
+
+| Lớp | Cơ chế | Dùng khi |
+|---|---|---|
+| `ConcurrentHashMap` | Khoá theo từng ô của bảng băm, đọc gần như không khoá | Map dùng chung: cache, bộ đếm theo khoá |
+| `Collections.synchronizedMap(map)` | Một khoá cho cả map | Code cũ; duyệt phần tử vẫn phải tự `synchronized` |
+| `CopyOnWriteArrayList` | Mỗi lần ghi chép ra mảng mới | Đọc rất nhiều, ghi rất ít: danh sách listener, cấu hình |
+| `ArrayBlockingQueue` | Mảng cố định, `put` chờ khi đầy, `take` chờ khi rỗng | Producer-consumer có giới hạn, tạo backpressure |
+| `LinkedBlockingQueue` | Danh sách liên kết, mặc định không giới hạn | Như trên nhưng phải truyền sức chứa vào constructor |
+| `ConcurrentLinkedQueue` | Không khoá, không chặn | Hàng đợi không cần chờ |
+
+Một collection đồng thời chỉ làm **từng thao tác** thành nguyên tử. Hai thao tác liền nhau vẫn có thể bị chen vào giữa: `if (!map.containsKey(k)) map.put(k, v)` là check-then-act như ở J14.1. Dùng thao tác ghép sẵn có: `putIfAbsent`, `computeIfAbsent`, `compute`, `merge`. Hàm truyền vào các thao tác này phải ngắn và không được sửa chính map đó, vì nó chạy khi đang giữ khoá của ô.
+
+<Check id="j14.2.concurrent-collections">Chọn được collection phù hợp cho cache dùng chung, danh sách listener và hàng đợi producer-consumer, và viết lại một đoạn check-then-act bằng `computeIfAbsent` hoặc `merge`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [ExecutorService (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ExecutorService.html): phần "Usage Examples" có đoạn tắt executor hai bước `shutdown`, `shutdownNow` nên chép vào dự án.
+- [ThreadPoolExecutor (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html): mục "Queuing" và "Rejected tasks" mô tả đúng sơ đồ trong bài.
+- [CompletableFuture (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/CompletableFuture.html): đoạn đầu trang nói rõ executor mặc định và cách `cancel` hoạt động.
+- [ConcurrentHashMap (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html): đọc mô tả của `computeIfAbsent` về việc hàm phải ngắn, và vì sao `size()` chỉ là ước lượng khi đang có ghi.
+- [Task Execution and Scheduling (Spring Boot)](https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html): executor Spring Boot tự cấu hình cho `@Async` và các thuộc tính `spring.task.execution.pool.*`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm J14.1, có `~/masteva-j14/src`. JDK 25. Mọi lệnh chạy giống nhau trên Mac và Linux. Như bài trước, thời gian `ms` thay đổi theo máy và giữa các lần chạy.
+
+### 1. Pool có giới hạn và chính sách từ chối
+
+Pool xử lý đơn hàng: 2 thread core, tối đa 4, hàng đợi 2 chỗ. Gửi 8 đơn liền nhau, mỗi đơn mất 300 ms.
+
+<Terminal where="mac" title="Tạo src/PoolDemo.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/PoolDemo.java <<'EOF'
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.RejectedExecutionHandler;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+public class PoolDemo {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("CPU cores=" + Runtime.getRuntime().availableProcessors()
+                + ", commonPool parallelism=" + ForkJoinPool.getCommonPoolParallelism());
+
+        boolean callerRuns = args.length > 0 && args[0].equals("caller-runs");
+        RejectedExecutionHandler policy = callerRuns
+                ? new ThreadPoolExecutor.CallerRunsPolicy()
+                : new ThreadPoolExecutor.AbortPolicy();
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                2, 4,                                  // core, max
+                30, TimeUnit.SECONDS,                  // thread ngoài core rảnh 30 giây thì bị huỷ
+                new ArrayBlockingQueue<>(2),           // hàng đợi có giới hạn
+                Thread.ofPlatform().name("order-", 1).factory(),
+                policy);
+
+        for (int i = 1; i <= 8; i++) {
+            int id = i;
+            try {
+                pool.execute(() -> handle(id));
+                System.out.printf("gửi đơn %d: threads=%d, queue=%d%n",
+                        id, pool.getPoolSize(), pool.getQueue().size());
+            } catch (RejectedExecutionException e) {
+                System.out.printf("gửi đơn %d: BỊ TỪ CHỐI%n", id);
+            }
+        }
+
+        pool.shutdown();
+        if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
+            pool.shutdownNow();
+        }
+        System.out.println("đã xử lý " + pool.getCompletedTaskCount() + " đơn trên pool");
+    }
+
+    static void handle(int id) {
+        String who = Thread.currentThread().getName();
+        if (who.equals("main")) {
+            System.out.printf("  đơn %d chạy trên main (caller runs)%n", id);
+        }
+        try {
+            Thread.sleep(300);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out PoolDemo
+```
+
+</Terminal>
+
+<Predict question="Đơn nào bị từ chối, và đơn thứ 3 có được một thread mới không?">
+
+```text
+CPU cores=10, commonPool parallelism=9
+gửi đơn 1: threads=1, queue=0
+gửi đơn 2: threads=2, queue=0
+gửi đơn 3: threads=2, queue=1
+gửi đơn 4: threads=2, queue=2
+gửi đơn 5: threads=3, queue=2
+gửi đơn 6: threads=4, queue=2
+gửi đơn 7: BỊ TỪ CHỐI
+gửi đơn 8: BỊ TỪ CHỐI
+đã xử lý 6 đơn trên pool
+```
+
+Đơn 3 và 4 vào hàng đợi, không có thread mới: pool chỉ vượt core khi hàng đợi đầy. Đơn 5 và 6 mới làm pool lên 3 rồi 4 thread. Đơn 7, 8 gặp pool đã đủ 4 thread và hàng đợi đầy, nên `AbortPolicy` ném `RejectedExecutionException`. Dòng đầu tiên phụ thuộc số nhân của máy bạn; các dòng còn lại giống nhau trên mọi máy.
+
+</Predict>
+
+Giờ đổi sang `CallerRunsPolicy`:
+
+<Terminal where="mac">
+
+```bash
+java -cp out PoolDemo caller-runs
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CPU cores=10, commonPool parallelism=9
+gửi đơn 1: threads=1, queue=0
+gửi đơn 2: threads=2, queue=0
+gửi đơn 3: threads=2, queue=1
+gửi đơn 4: threads=2, queue=2
+gửi đơn 5: threads=3, queue=2
+gửi đơn 6: threads=4, queue=2
+  đơn 7 chạy trên main (caller runs)
+gửi đơn 7: threads=4, queue=0
+gửi đơn 8: threads=4, queue=1
+đã xử lý 7 đơn trên pool
+```
+
+</Expected>
+
+Không đơn nào bị mất. Đơn 7 chạy ngay trên thread `main` nên `main` bận 300 ms, không gửi thêm được gì; trong lúc đó pool xử lý bớt hàng đợi, đơn 8 vào được. Cột `queue` của hai dòng đơn 7 và 8 thay đổi giữa các lần chạy (máy kiểm chứng từng in `queue=1` rồi `queue=2`), vì `main` chạy xong đơn 7 gần như cùng lúc các thread của pool xong đợt đầu. Đó là **backpressure** (áp lực ngược): bên gửi bị làm chậm lại bằng đúng tốc độ của bên xử lý. Trên server, cái giá là thread nhận request bị chiếm, nên độ trễ tăng thay vì lỗi.
+
+<Check id="j14.2.lab-rejection">Dự đoán đúng đơn nào vào hàng đợi, đơn nào tạo thread mới, đơn nào bị từ chối, và giải thích `CallerRunsPolicy` tạo backpressure ra sao.</Check>
+
+### 2. Trang thanh toán với CompletableFuture
+
+Ba service giả lập bằng `sleep`: giá 300 ms, tồn kho 200 ms, phí giao hàng 400 ms. Giao tới "Côn Đảo" thì service giao hàng báo lỗi.
+
+<Terminal where="mac" title="Tạo src/Checkout.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/Checkout.java <<'EOF'
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
+
+public class Checkout {
+    record Quote(long price, int stock, long shipping) {
+        long total() { return price + shipping; }
+    }
+
+    // Giả lập ba service ở xa. sleep đóng vai thời gian chờ mạng.
+    static long price(String sku) { pause(300); return 250_000; }
+    static int stock(String sku) { pause(200); return 7; }
+    static long shipping(String city) {
+        pause(400);
+        if (city.equals("Côn Đảo")) {
+            throw new IllegalStateException("không giao tới " + city);
+        }
+        return 30_000;
+    }
+    static String customerCity(String customerId) { pause(100); return "Đà Nẵng"; }
+
+    public static void main(String[] args) {
+        ExecutorService io = Executors.newFixedThreadPool(8, Thread.ofPlatform().name("io-", 1).factory());
+        try {
+            long t0 = System.nanoTime();
+            Quote q = new Quote(price("SKU-1"), stock("SKU-1"), shipping("Hà Nội"));
+            print("1. tuần tự", q.total(), t0);
+
+            t0 = System.nanoTime();
+            CompletableFuture<Long> p = CompletableFuture.supplyAsync(() -> price("SKU-1"), io);
+            CompletableFuture<Integer> s = CompletableFuture.supplyAsync(() -> stock("SKU-1"), io);
+            CompletableFuture<Long> sh = CompletableFuture.supplyAsync(() -> shipping("Hà Nội"), io);
+            Quote q2 = CompletableFuture.allOf(p, s, sh)
+                    .thenApply(v -> new Quote(p.join(), s.join(), sh.join()))
+                    .join();
+            print("2. song song, allOf", q2.total(), t0);
+
+            t0 = System.nanoTime();
+            long total = CompletableFuture.supplyAsync(() -> customerCity("C-42"), io)
+                    .thenCompose(city -> CompletableFuture.supplyAsync(() -> shipping(city), io))
+                    .thenCombine(CompletableFuture.supplyAsync(() -> price("SKU-1"), io), Long::sum)
+                    .join();
+            print("3. thenCompose + thenCombine", total, t0);
+
+            t0 = System.nanoTime();
+            long fee = CompletableFuture.supplyAsync(() -> shipping("Côn Đảo"), io)
+                    .exceptionally(ex -> {
+                        System.out.println("   lỗi: " + ex);
+                        return 50_000L;
+                    })
+                    .join();
+            print("4. exceptionally, phí mặc định", fee, t0);
+
+            t0 = System.nanoTime();
+            String outcome;
+            try {
+                CompletableFuture.supplyAsync(() -> shipping("Hà Nội"), io)
+                        .orTimeout(150, TimeUnit.MILLISECONDS)
+                        .join();
+                outcome = "kịp";
+            } catch (CompletionException e) {
+                outcome = e.getClass().getSimpleName() + " <- " + e.getCause().getClass().getSimpleName();
+            }
+            print("5. orTimeout 150 ms", outcome, t0);
+
+            t0 = System.nanoTime();
+            long fee2 = CompletableFuture.supplyAsync(() -> shipping("Hà Nội"), io)
+                    .completeOnTimeout(50_000L, 150, TimeUnit.MILLISECONDS)
+                    .join();
+            print("6. completeOnTimeout", fee2, t0);
+
+            t0 = System.nanoTime();
+            CompletableFuture<?>[] calls = new CompletableFuture<?>[18];
+            for (int i = 0; i < calls.length; i++) {
+                calls[i] = CompletableFuture.supplyAsync(() -> shipping("Hà Nội"));   // không truyền executor
+            }
+            CompletableFuture.allOf(calls).join();
+            print("7. 18 lời gọi trên commonPool", "parallelism=" + ForkJoinPool.getCommonPoolParallelism(), t0);
+        } finally {
+            io.shutdown();
+        }
+    }
+
+    static void print(String label, Object result, long t0) {
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        System.out.printf("%-30s ~%4d ms  %s%n", label, Math.round(ms / 100.0) * 100, result);
+    }
+
+    static void pause(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("bị interrupt", e);
+        }
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out Checkout
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1. tuần tự                     ~ 900 ms  280000
+2. song song, allOf            ~ 400 ms  280000
+3. thenCompose + thenCombine   ~ 500 ms  280000
+   lỗi: java.util.concurrent.CompletionException: java.lang.IllegalStateException: không giao tới Côn Đảo
+4. exceptionally, phí mặc định ~ 400 ms  50000
+5. orTimeout 150 ms            ~ 200 ms  CompletionException <- TimeoutException
+6. completeOnTimeout           ~ 200 ms  50000
+7. 18 lời gọi trên commonPool  ~ 800 ms  parallelism=9
+```
+
+</Expected>
+
+Thời gian được làm tròn tới 100 ms để dễ so. Đọc từng dòng:
+
+1. Tuần tự: 300 + 200 + 400 = 900 ms.
+2. Song song: bằng lời gọi chậm nhất, 400 ms.
+3. `thenCompose` phải đợi biết thành phố (100 ms) rồi mới gọi phí giao hàng (400 ms); giá chạy song song với cả chuỗi đó. Tổng là 500 ms, không phải 800 ms.
+4. Lỗi gốc `IllegalStateException` tới `exceptionally` trong vỏ `CompletionException`. Hàm trả phí mặc định 50.000, chuỗi tiếp tục bình thường.
+5. `join()` ném `CompletionException` có cause là `TimeoutException`, sau khoảng 150 ms. Lời gọi `shipping` vẫn chạy nốt 400 ms trên thread `io-`.
+6. `completeOnTimeout` không ném lỗi mà trả giá trị dự phòng.
+7. Không truyền executor: 18 lời gọi chạy trên `commonPool` 9 thread, nên chạy thành hai đợt, 2 × 400 = 800 ms. Máy 8 nhân có `parallelism=7`, cần ba đợt, khoảng 1.200 ms. Số thread của pool này gắn với số nhân CPU chứ không gắn với lượng I/O bạn cần chờ.
+
+<Check id="j14.2.lab-checkout">Chạy được `Checkout`, giải thích được thời gian của dòng 2, 3, 7 và chỉ ra lỗi gốc nằm ở đâu khi nó đi qua `exceptionally` và `join()`.</Check>
+
+### 3. Đếm lượt xem sản phẩm
+
+8 thread, mỗi thread ghi 200.000 lượt xem rải đều trên 1.000 sản phẩm. Kết quả đúng: 1.000 sản phẩm, 1.600.000 lượt. Bốn cách ghi được thử lần lượt. Để output gọn, chương trình đếm số thread chết vì exception thay vì in stack trace; code thật thì đừng nuốt exception như vậy.
+
+<Terminal where="mac" title="Tạo src/ViewCounter.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/ViewCounter.java <<'EOF'
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
+
+public class ViewCounter {
+    static final int THREADS = 8;
+    static final int VIEWS_PER_THREAD = 200_000;
+    static final int PRODUCTS = 1_000;
+
+    public static void main(String[] args) throws InterruptedException {
+        System.out.printf("đúng phải là: products=%d views=%,d%n", PRODUCTS, (long) THREADS * VIEWS_PER_THREAD);
+        Map<String, Integer> hashMap = new HashMap<>();
+        run("HashMap.merge", () -> hashMap.size(),
+                sku -> hashMap.merge(sku, 1, Integer::sum),
+                () -> hashMap.values().stream().mapToLong(Integer::longValue).sum());
+
+        ConcurrentMap<String, Integer> chm = new ConcurrentHashMap<>();
+        run("CHM.merge", () -> chm.size(),
+                sku -> chm.merge(sku, 1, Integer::sum),
+                () -> chm.values().stream().mapToLong(Integer::longValue).sum());
+
+        ConcurrentMap<String, LongAdder> racy = new ConcurrentHashMap<>();
+        run("CHM check-then-put", () -> racy.size(),
+                sku -> {
+                    if (!racy.containsKey(sku)) {
+                        racy.put(sku, new LongAdder());
+                    }
+                    racy.get(sku).increment();
+                },
+                () -> racy.values().stream().mapToLong(LongAdder::sum).sum());
+
+        ConcurrentMap<String, LongAdder> adders = new ConcurrentHashMap<>();
+        run("CHM.computeIfAbsent", () -> adders.size(),
+                sku -> adders.computeIfAbsent(sku, k -> new LongAdder()).increment(),
+                () -> adders.values().stream().mapToLong(LongAdder::sum).sum());
+    }
+
+    interface Recorder { void record(String sku); }
+    interface Reader { long read(); }
+
+    static void run(String name, Reader size, Recorder recorder, Reader total) throws InterruptedException {
+        Thread[] threads = new Thread[THREADS];
+        AtomicInteger died = new AtomicInteger();
+        for (int i = 0; i < THREADS; i++) {
+            threads[i] = Thread.ofPlatform().start(() -> {
+                try {
+                    for (int j = 0; j < VIEWS_PER_THREAD; j++) {
+                        recorder.record("SKU-" + (j % PRODUCTS));
+                    }
+                } catch (RuntimeException e) {
+                    died.incrementAndGet();
+                }
+            });
+        }
+        for (Thread t : threads) {
+            t.join();
+        }
+        System.out.printf("%-20s products=%d views=%,d threads chết=%d%n",
+                name, size.read(), total.read(), died.get());
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out ViewCounter
+```
+
+</Terminal>
+
+<Predict question="Dòng CHM check-then-put dùng ConcurrentHashMap và LongAdder, cả hai đều an toàn cho nhiều thread. Nó có ra đúng 1.600.000 không?">
+
+```text
+đúng phải là: products=1000 views=1,600,000
+HashMap.merge        products=1012 views=200,031 threads chết=7
+CHM.merge            products=1000 views=1,600,000 threads chết=0
+CHM check-then-put   products=1000 views=1,599,967 threads chết=0
+CHM.computeIfAbsent  products=1000 views=1,600,000 threads chết=0
+```
+
+Không, thiếu vài chục lượt. Hai thread cùng thấy `containsKey` là `false`, cùng `put` một `LongAdder` mới; adder của thread đến trước bị thay thế cùng với các lần cộng đã vào nó. Mỗi thao tác đều an toàn, nhưng chuỗi "kiểm tra rồi ghi" thì không. `computeIfAbsent` làm cả chuỗi trong một thao tác nguyên tử.
+
+</Predict>
+
+Số liệu dòng `HashMap` và `check-then-put` đổi sau mỗi lần chạy. Ở ba lần chạy trên máy kiểm chứng, `HashMap` luôn có 7 trên 8 thread chết vì `ConcurrentModificationException`, và có lần ra hơn 1.700 "sản phẩm" từ 1.000 mã: bảng băm hỏng tới mức một khoá xuất hiện hai lần. Trên máy khác, `HashMap` có thể không ném exception mà chỉ ra số sai; cả hai đều là lỗi.
+
+<Check id="j14.2.lab-concurrent-map">Tái hiện được việc `HashMap` hỏng và check-then-put mất số, rồi sửa bằng `merge` hoặc `computeIfAbsent`.</Check>
+
+### 4. Producer-consumer với BlockingQueue
+
+Một thread nhận 20 đơn và đưa vào `ArrayBlockingQueue` 5 chỗ; 2 consumer lấy ra, mỗi đơn xử lý 50 ms. Khi hết đơn, producer gửi một "viên thuốc độc" (poison pill) cho mỗi consumer để báo dừng.
+
+<Terminal where="mac" title="Tạo src/OrderQueue.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/OrderQueue.java <<'EOF'
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class OrderQueue {
+    record Order(int id) {}
+
+    static final Order POISON = new Order(-1);
+
+    public static void main(String[] args) throws InterruptedException {
+        BlockingQueue<Order> queue = new ArrayBlockingQueue<>(5);
+        AtomicInteger processed = new AtomicInteger();
+        int consumers = 2;
+
+        Thread[] workers = new Thread[consumers];
+        for (int i = 0; i < consumers; i++) {
+            workers[i] = Thread.ofPlatform().name("consumer-" + (i + 1)).start(() -> {
+                try {
+                    while (true) {
+                        Order order = queue.take();
+                        if (order == POISON) {
+                            return;
+                        }
+                        Thread.sleep(50);
+                        processed.incrementAndGet();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+
+        long t0 = System.nanoTime();
+        long maxWaitMs = 0;
+        for (int id = 1; id <= 20; id++) {
+            long before = System.nanoTime();
+            queue.put(new Order(id));
+            maxWaitMs = Math.max(maxWaitMs, (System.nanoTime() - before) / 1_000_000);
+        }
+        long produceMs = (System.nanoTime() - t0) / 1_000_000;
+        for (int i = 0; i < consumers; i++) {
+            queue.put(POISON);
+        }
+        for (Thread w : workers) {
+            w.join();
+        }
+        System.out.printf("producer gửi 20 đơn trong ~%d ms, lần put chờ lâu nhất ~%d ms%n",
+                Math.round(produceMs / 100.0) * 100, Math.round(maxWaitMs / 10.0) * 10);
+        System.out.println("consumer đã xử lý " + processed.get() + " đơn");
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out OrderQueue
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+producer gửi 20 đơn trong ~400 ms, lần put chờ lâu nhất ~60 ms
+consumer đã xử lý 20 đơn
+```
+
+</Expected>
+
+Producer có thể đưa 20 đơn vào trong vài micro giây, nhưng mất khoảng 400 ms: `put` chặn mỗi khi hàng đợi đủ 5 đơn, và chỉ chạy tiếp khi một consumer lấy bớt ra. 2 consumer xử lý 40 đơn mỗi giây, nên producer bị kéo về đúng tốc độ đó. Con số `ms` thay đổi theo máy; số đơn đã xử lý luôn là 20.
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Chương trình in xong nhưng không thoát: executor chưa được `shutdown()`. Thread của `newFixedThreadPool` không phải daemon, nên JVM chờ chúng mãi. Bấm Ctrl+C và kiểm tra khối `finally`.
+- `PoolDemo` in `threads=3` ngay ở đơn 3: bạn đã đổi hàng đợi sang `SynchronousQueue` (không có chỗ chứa), nên pool tạo thread ngay khi hết thread rảnh. Cột `queue` luôn bằng 0, đơn 4 đưa pool lên 4 thread, và từ đơn 5 trở đi đều bị từ chối. Đổi sang `LinkedBlockingQueue` không giới hạn thì ngược lại: pool đứng yên ở 2 thread, hàng đợi dài mãi (`queue=6` ở đơn 8) và không đơn nào bị từ chối.
+- Dòng 7 của `Checkout` ra `~400 ms`: máy bạn có từ 19 nhân trở lên, `commonPool` đủ thread cho cả 18 lời gọi trong một đợt.
+- `OrderQueue` treo: số poison pill ít hơn số consumer, một consumer chờ `take()` mãi.
+
+</Callout>
+
+### 5. Dọn dẹp
+
+Không có tiến trình nào chạy nền. Giữ `~/masteva-j14`, bài J14.3 dùng tiếp.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Spring Boot dùng executor nào cho @Async, và có cần lo không?">
+
+Khi không có bean `Executor` nào, Spring Boot tự tạo một `ThreadPoolTaskExecutor` có 8 thread core, cấu hình qua `spring.task.execution.pool.*`. Hàng đợi mặc định của nó không giới hạn, nên nếu `@Async` gửi email hay gọi API chậm, bạn gặp đúng sự cố trong callout Trên production. Đặt `queue-capacity`, `max-size` và theo dõi số task bị từ chối. Khi bật virtual thread (`spring.threads.virtual.enabled=true`), Spring Boot dùng `SimpleAsyncTaskExecutor` trên virtual thread và bỏ qua các thuộc tính pool.
+
+</Reveal>
+
+<Reveal title="Lời gọi bị timeout vẫn chạy tiếp thì có hại gì?">
+
+Mỗi lời gọi "bị bỏ rơi" vẫn giữ một thread và một kết nối tới service chậm. Khi service đó chậm kéo dài, các lời gọi bị bỏ rơi tích lại, chiếm hết pool, và request mới cũng bị timeout dù service của bạn chẳng làm gì sai. Vì vậy timeout phải nằm ở tầng thấp nhất có thể (client HTTP, driver database), còn `orTimeout` chỉ là lớp bảo vệ cho người gọi. Chặng M9 của roadmap Microservices bàn về bulkhead và circuit breaker cho tình huống này.
+
+</Reveal>
+
+<Reveal title="Vì sao ConcurrentHashMap không cho khoá hoặc giá trị null?">
+
+Với map dùng chung, `get(k)` trả `null` có hai nghĩa: không có khoá, hoặc khoá có giá trị `null`. Trong một thread bạn phân biệt bằng `containsKey`, nhưng giữa hai lời gọi đó thread khác có thể đã đổi map, lại là check-then-act. Cấm `null` làm `null` chỉ còn một nghĩa: không có. `HashMap` cho phép `null` vì nó không được thiết kế cho nhiều thread.
+
+</Reveal>
+
+<Reveal title="Đã có CompletableFuture, sao còn cần virtual thread?">
+
+`CompletableFuture` giúp chạy song song mà không giữ thread trong lúc chờ, nhưng code thành chuỗi lambda: stack trace khó đọc, `try/catch` và vòng lặp phải viết lại bằng `exceptionally`, `thenCompose`. Virtual thread (J14.3) cho viết code chặn bình thường, từ trên xuống, mà chi phí mỗi thread rất nhỏ. Hai cách không loại trừ nhau: `CompletableFuture` vẫn hợp để gộp kết quả của vài lời gọi song song, và có thể chạy trên executor virtual thread.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết `ThreadPoolExecutor` với tham số cụ thể, hoặc chuyển một chuỗi gọi service tuần tự sang `CompletableFuture`. AI rất hay dùng `Executors.newFixedThreadPool` hoặc `supplyAsync` không truyền executor, nuốt lỗi bằng `exceptionally(ex -> null)`, và quên `shutdown()`. Kiểm tra lại: tìm mọi `supplyAsync`, `runAsync` không có tham số thứ hai, mọi hàng đợi không có sức chứa, và chạy thử một kịch bản lỗi như dòng 4, 5 của lab.
+
+</Callout>
+
+<Callout kind="link">
+
+J9.3 đã dùng `HttpClient.sendAsync`, trả về đúng loại `CompletableFuture` này; timeout của client ở đó là thứ thật sự dừng lời gọi. J12 giới thiệu pool kết nối database, giới hạn thực tế cho kích thước pool thread. J14.3 thay pool bằng virtual thread cho việc chờ I/O. J15 đưa số task bị từ chối và độ dài hàng đợi thành metric. J16 thay hàng đợi trong bộ nhớ bằng message queue khi việc không được phép mất.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j14.2.mastery-size-pool">Thiết kế được một executor cho việc I/O cụ thể: số thread có lý do, hàng đợi có giới hạn, chính sách từ chối, cách tắt, và nói được giới hạn thật nằm ở đâu.</Check>
+
+<Check id="j14.2.mastery-async-errors">Viết được một chuỗi `CompletableFuture` gọi ba service, có executor riêng, timeout, giá trị dự phòng, và giải thích lỗi đi qua chuỗi đó ra sao.</Check>
+
+</Mastery>

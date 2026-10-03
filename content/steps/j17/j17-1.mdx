@@ -1,0 +1,572 @@
+---
+title: Fat JAR, layered JAR và Dockerfile
+description: Mổ xẻ executable JAR của Spring Boot, tách nó thành các layer theo tần suất thay đổi, rồi viết Dockerfile multi-stage chạy bằng user thường và tận dụng được layer cache.
+id: j17.1
+step: j17
+prerequisites: [j16]
+topics: [j17.fat-jar-layered-jar, j17.container-image]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    docker: 29.8.0
+    eclipse-temurin: 25.0.4.1 (image 25-jre)
+---
+
+<Goal>
+
+Hiểu bên trong file JAR mà Spring Boot tạo ra, tách nó thành các layer và đóng gói thành container image bằng một Dockerfile đủ tốt cho production: multi-stage, base JRE, user không phải root, cache tốt. Học xong bài này, bạn giải thích được:
+
+- Vì sao `java -jar app.jar` chạy được, còn `java -cp app.jar <MainClass>` báo `ClassNotFoundException` với chính class đó.
+- Vì sao sửa một dòng code mà CI vẫn đẩy lại 20 MB lên registry, và layered JAR giảm con số đó xuống vài chục KB như thế nào.
+- Vì sao image nên chạy bằng user thường, và `java` phải là PID 1.
+
+</Goal>
+
+<Knowledge>
+
+### Executable fat JAR
+
+JAR thường chỉ chứa class của chính bạn; dependency phải nằm trên classpath lúc chạy. Spring Boot Maven plugin tạo **fat JAR** (còn gọi là uber JAR): một file chứa cả code của bạn lẫn mọi dependency, chạy được bằng `java -jar`. Bên trong nó có cấu trúc riêng:
+
+```text
+catalog-0.0.1-SNAPSHOT.jar
+├── META-INF/MANIFEST.MF          Main-Class: ...JarLauncher, Start-Class: ...CatalogApplication
+├── org/springframework/boot/loader/   launcher: đọc được JAR lồng trong JAR
+└── BOOT-INF/
+    ├── classes/                  class và resource của bạn
+    ├── lib/                      42 JAR dependency, để nguyên dạng JAR
+    ├── classpath.idx             thứ tự classpath
+    └── layers.idx                file nào thuộc layer nào
+```
+
+Classloader của JDK không đọc được một JAR nằm bên trong JAR khác, và chỉ tìm class ở gốc file. Vì vậy Spring Boot đặt một **launcher** nhỏ ở gốc:
+
+```text
+java -jar app.jar
+   |  JVM đọc MANIFEST.MF, gọi Main-Class
+   v
+JarLauncher (org/springframework/boot/loader/launch)
+   |  đọc classpath.idx, mở từng JAR trong BOOT-INF/lib bằng NestedJarFile
+   |  tạo classloader gồm BOOT-INF/classes + BOOT-INF/lib/*.jar
+   v
+Start-Class: dev.masteva.catalog.CatalogApplication.main()
+```
+
+| Mục trong JAR | Vai trò | Thay đổi khi nào |
+|---|---|---|
+| `BOOT-INF/lib/` | Dependency: Spring, Tomcat, Jackson | Khi nâng phiên bản dependency |
+| `org/springframework/boot/loader/` | Launcher | Khi nâng Spring Boot |
+| `BOOT-INF/classes/` | Code và cấu hình của bạn | Mỗi commit |
+
+<Check id="j17.1.fat-jar-anatomy">Giải thích được vai trò của `Main-Class`, `Start-Class`, `BOOT-INF/classes`, `BOOT-INF/lib` và vì sao fat JAR cần launcher riêng.</Check>
+
+### Layered JAR
+
+Container image là chồng các **layer** (lớp file chỉ đọc). Docker và registry nhận diện layer bằng hash nội dung: layer nào không đổi thì không build lại, không đẩy lại, node không tải lại. Nếu Dockerfile chỉ `COPY app.jar`, cả 21 MB nằm trong một layer, và mỗi commit đổi hash của cả layer đó.
+
+**Layered JAR** ghi sẵn trong `BOOT-INF/layers.idx` cách chia file thành bốn layer, xếp từ ít đổi tới hay đổi:
+
+| Layer | Nội dung | Kích thước trong lab |
+|---|---|---|
+| `dependencies` | JAR dependency có phiên bản cố định | 21 MB |
+| `spring-boot-loader` | Launcher | 0, vì lab giải nén không kèm launcher |
+| `snapshot-dependencies` | Dependency `-SNAPSHOT`, đổi thường xuyên hơn | 0 |
+| `application` | Code và resource của bạn | 8 KB |
+
+Công cụ **jarmode tools** chạy ngay từ JAR: `java -Djarmode=tools -jar app.jar list-layers` liệt kê layer, `extract --layers` giải nén mỗi layer ra một thư mục. Không có `--launcher`, `extract` tạo một JAR nhỏ cùng tên với JAR gốc (trong Dockerfile là `application.jar`) cùng thư mục `lib/`, manifest dùng `Class-Path` trỏ vào `lib/`. JVM tự nạp classpath đó, không cần launcher, nên khởi động nhanh hơn một chút so với đọc JAR lồng nhau. Cách giải nén này cũng là điều kiện cho CDS và AOT cache trong tài liệu "Efficient Deployments".
+
+<Check id="j17.1.layers">Kể được bốn layer mặc định, thứ tự của chúng và vì sao thứ tự đó quyết định hiệu quả của cache.</Check>
+
+### Dockerfile multi-stage
+
+```text
+stage builder (eclipse-temurin:25-jre)        stage cuối (eclipse-temurin:25-jre)
+  COPY target/*.jar application.jar             useradd app
+  java -Djarmode=tools ... extract    ------>   COPY dependencies/            21.9 MB, hầu như không đổi
+                                                COPY spring-boot-loader/
+                                                COPY snapshot-dependencies/
+                                                COPY application/             16 KB, đổi mỗi commit
+                                                USER app
+                                                ENTRYPOINT ["java","-jar","application.jar"]
+```
+
+- **Multi-stage:** stage `builder` chỉ để giải nén; image cuối không chứa file JAR gốc hay thư mục tạm.
+- **Base JRE, không phải JDK:** image chạy không cần `javac`. Eclipse Temurin có cả hai biến thể; bản JRE nhỏ hơn và ít công cụ cho kẻ tấn công dùng lại.
+- **User thường:** mặc định container chạy bằng `root`. Nếu ứng dụng bị khai thác lỗ hổng thực thi mã, kẻ tấn công có quyền root trong container. `USER app` giới hạn điều đó.
+- **ENTRYPOINT dạng exec** (mảng JSON): `java` là PID 1 và nhận `SIGTERM` trực tiếp khi `docker stop`. Dạng shell (`ENTRYPOINT java -jar ...`) chạy qua `/bin/sh -c`: tuỳ shell, `sh` có thể giữ PID 1 và không chuyển `SIGTERM` (lỗi "dừng mất 10 giây, exit 137" ở bài D1.1), và mọi tham số sau tên image bị bỏ qua.
+- **`.dockerignore`:** chỉ gửi `target/*.jar` cho Docker, không gửi `src`, `.git` hay `target/classes`.
+
+<Callout kind="production">
+
+Một service deploy 30 lần mỗi ngày, chạy 12 pod. Với `COPY app.jar` một khối, mỗi lần deploy registry nhận 21 MB và mỗi node kéo lại 21 MB, kể cả khi commit chỉ sửa một câu log. Chuyển sang layered, phần thay đổi giảm còn khoảng 16 KB; layer dependency chỉ đổi khi ai đó nâng phiên bản thư viện. Ngoài băng thông, thời gian rollout cũng ngắn lại vì pod mới khởi động ngay khi layer nhỏ tải xong.
+
+</Callout>
+
+<Check id="j17.1.dockerfile-rules">Giải thích được bốn quyết định trong Dockerfile: multi-stage, base JRE, `USER` không phải root, `ENTRYPOINT` dạng exec.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [The Executable Jar Format](https://docs.spring.io/spring-boot/specification/executable-jar/index.html): cấu trúc bên trong và cách launcher nạp JAR lồng nhau; đọc phần "Nested JARs" và "Launching Executable Jars".
+- [Packaging Executable Archives](https://docs.spring.io/spring-boot/maven-plugin/packaging.html): phần "Layered Jar or War" để tự định nghĩa layer, ví dụ tách thư viện nội bộ công ty ra layer riêng.
+- [Efficient Deployments](https://docs.spring.io/spring-boot/reference/packaging/efficient.html): giải nén JAR, CDS và AOT cache để khởi động nhanh hơn.
+- [Dockerfiles (Spring Boot)](https://docs.spring.io/spring-boot/reference/packaging/container-images/dockerfiles.html): Dockerfile mẫu của Spring Boot, bài này dựa trên nó và đổi base sang Temurin.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25 và Maven 3.9 như ở J7, Docker Desktop (hoặc Docker Engine trên Linux) đang chạy, máy có mạng để tạo project và tải image. Ứng dụng dùng cổng **20170**; cổng đó phải đang trống. Lệnh giống nhau trên Mac và Linux, trừ `/usr/libexec/java_home` chỉ có trên macOS. Mở **hai tab Terminal** cho bước 2.
+
+Ở mỗi tab mới, trỏ Maven về JDK 25 như J7.1 rồi kiểm tra cả Maven và Docker:
+
+<Terminal where="mac">
+
+```bash
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+mvn -v
+docker version --format 'client {{.Client.Version}}, server {{.Server.Version}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Apache Maven 3.9.9 (8e8579a9e76f7d015ee5ec7bfcdc97d260186937)
+Maven home: /opt/homebrew/Cellar/maven/3.9.9/libexec
+Java version: 25.0.3, vendor: Oracle Corporation, runtime: /Library/Java/JavaVirtualMachines/jdk-25.jdk/Contents/Home
+...
+client 29.8.0, server 29.8.0
+```
+
+</Expected>
+
+Maven chạy trên JDK 25 in thêm vài dòng `WARNING:` về `restricted method` hay `sun.misc.Unsafe`; các khối kết quả trong bài đã lược chúng. Nếu dòng `server` báo lỗi `Cannot connect to the Docker daemon`, hãy mở Docker Desktop trước.
+
+### 1. Tạo ứng dụng catalog
+
+Một service danh mục sản phẩm nhỏ, dùng tiếp ở cả ba bài của chặng:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-j17 && cd ~/masteva-j17
+curl -s https://start.spring.io/starter.tgz \
+  -d type=maven-project -d language=java -d bootVersion=4.1.1 -d javaVersion=25 \
+  -d groupId=dev.masteva -d artifactId=catalog -d baseDir=catalog \
+  -d packageName=dev.masteva.catalog -d dependencies=web,actuator | tar -xzf -
+cd catalog && echo 'server.port=20170' >> src/main/resources/application.properties
+cat > src/main/java/dev/masteva/catalog/ProductController.java <<'EOF'
+package dev.masteva.catalog;
+
+import java.util.List;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProductController {
+
+    record Product(String sku, String name, long price) {
+    }
+
+    private static final List<Product> PRODUCTS = List.of(
+            new Product("SKU-1", "Bàn phím cơ", 1_250_000),
+            new Product("SKU-2", "Chuột không dây", 450_000));
+
+    @GetMapping("/api/products")
+    List<Product> products() {
+        return PRODUCTS;
+    }
+}
+EOF
+mvn -q -DskipTests package && ls -lh target/*.jar | awk '{print $5, $9}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+21M target/catalog-0.0.1-SNAPSHOT.jar
+```
+
+</Expected>
+
+`-DskipTests` chỉ để lab nhanh; test `contextLoads` đã nói ở J11, và CI vẫn nên chạy `mvn verify` đầy đủ. Một service chỉ có hai endpoint mà JAR đã 21 MB: gần như toàn bộ là dependency.
+
+### 2. Chạy fat JAR
+
+Tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j17/catalog && java -jar target/catalog-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+Tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s localhost:20170/api/products; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"sku":"SKU-1","name":"Bàn phím cơ","price":1250000},{"sku":"SKU-2","name":"Chuột không dây","price":450000}]
+```
+
+</Expected>
+
+Log ở tab 1 có dòng `Started CatalogApplication in 1.169 seconds`; con số trên máy bạn sẽ khác. Nhấn `Ctrl+C` ở tab 1 để dừng. Các bước còn lại chạy ở tab 1.
+
+### 3. Mổ xẻ JAR
+
+<Terminal where="mac">
+
+```bash
+JAR=target/catalog-0.0.1-SNAPSHOT.jar
+jar tf $JAR | grep -E 'MANIFEST|launch/JarLauncher.class|^BOOT-INF/[a-z.]+$|^BOOT-INF/classes/dev/.*class|^BOOT-INF/lib/(spring-webmvc|tomcat-embed-core)'
+jar tf $JAR | grep -c '^BOOT-INF/lib/.'
+unzip -p $JAR META-INF/MANIFEST.MF | grep -E 'Main-Class|Start-Class|Spring-Boot-(Classes|Lib|Layers)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+META-INF/MANIFEST.MF
+org/springframework/boot/loader/launch/JarLauncher.class
+BOOT-INF/classes/dev/masteva/catalog/CatalogApplication.class
+BOOT-INF/classes/dev/masteva/catalog/ProductController$Product.class
+BOOT-INF/classes/dev/masteva/catalog/ProductController.class
+BOOT-INF/lib/tomcat-embed-core-11.0.24.jar
+BOOT-INF/lib/spring-webmvc-7.0.9.jar
+BOOT-INF/classpath.idx
+BOOT-INF/layers.idx
+42
+Main-Class: org.springframework.boot.loader.launch.JarLauncher
+Start-Class: dev.masteva.catalog.CatalogApplication
+Spring-Boot-Classes: BOOT-INF/classes/
+Spring-Boot-Lib: BOOT-INF/lib/
+Spring-Boot-Layers-Index: BOOT-INF/layers.idx
+```
+
+</Expected>
+
+`jar tf` liệt kê mọi mục trong JAR; lệnh `grep` chỉ giữ vài mục đại diện. 42 dependency nằm nguyên dạng JAR trong `BOOT-INF/lib`. Giờ thử bỏ qua launcher, đưa JAR vào classpath như JAR thường:
+
+<Terminal where="mac">
+
+```bash
+java -cp $JAR dev.masteva.catalog.CatalogApplication
+```
+
+</Terminal>
+
+<Predict question="Class CatalogApplication có trong JAR. Lệnh trên chạy được không?">
+
+```text
+Error: Could not find or load main class dev.masteva.catalog.CatalogApplication
+Caused by: java.lang.ClassNotFoundException: dev.masteva.catalog.CatalogApplication
+```
+
+Classloader của JDK tìm `dev/masteva/catalog/CatalogApplication.class` ở gốc JAR, nhưng class nằm dưới `BOOT-INF/classes/`. Chỉ `JarLauncher` biết cấu trúc đó. Đây là lý do fat JAR luôn chạy bằng `java -jar`.
+
+</Predict>
+
+<Check id="j17.1.lab-anatomy">Liệt kê được nội dung fat JAR bằng `jar tf`, đọc `MANIFEST.MF` và giải thích vì sao `java -cp` không tìm thấy main class.</Check>
+
+### 4. Layer và jarmode tools
+
+<Terminal where="mac">
+
+```bash
+unzip -p $JAR BOOT-INF/layers.idx
+java -Djarmode=tools -jar $JAR list-layers
+java -Djarmode=tools -jar $JAR extract --layers --destination target/extracted
+du -sh target/extracted/*
+unzip -p target/extracted/application/catalog-0.0.1-SNAPSHOT.jar META-INF/MANIFEST.MF | grep -E 'Main-Class|Class-Path' | cut -c1-60
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+- "dependencies":
+  - "BOOT-INF/lib/"
+- "spring-boot-loader":
+  - "org/"
+- "snapshot-dependencies":
+- "application":
+  - "BOOT-INF/classes/"
+  - "BOOT-INF/classpath.idx"
+  - "BOOT-INF/layers.idx"
+  - "META-INF/"
+dependencies
+spring-boot-loader
+snapshot-dependencies
+application
+8.0K	target/extracted/application
+ 21M	target/extracted/dependencies
+  0B	target/extracted/snapshot-dependencies
+  0B	target/extracted/spring-boot-loader
+Main-Class: dev.masteva.catalog.CatalogApplication
+Class-Path: lib/logback-classic-1.5.38.jar lib/logback-core-
+```
+
+</Expected>
+
+Layer `application` chỉ 8 KB, `dependencies` 21 MB. `spring-boot-loader` rỗng vì lệnh không có `--launcher`: `application.jar` sau khi giải nén là JAR thường, `Main-Class` trỏ thẳng vào class của bạn và `Class-Path` liệt kê 42 file trong `lib/`. `java -Djarmode=tools -jar $JAR help extract` liệt kê mọi tuỳ chọn của `extract`.
+
+### 5. Dockerfile multi-stage
+
+<Terminal where="mac">
+
+```bash
+cat > Dockerfile <<'EOF'
+FROM eclipse-temurin:25-jre AS builder
+WORKDIR /builder
+COPY target/*.jar application.jar
+RUN java -Djarmode=tools -jar application.jar extract --layers --destination extracted
+
+FROM eclipse-temurin:25-jre
+RUN groupadd --system app && useradd --system --gid app --no-create-home app
+WORKDIR /application
+COPY --from=builder /builder/extracted/dependencies/ ./
+COPY --from=builder /builder/extracted/spring-boot-loader/ ./
+COPY --from=builder /builder/extracted/snapshot-dependencies/ ./
+COPY --from=builder /builder/extracted/application/ ./
+USER app
+EXPOSE 20170
+ENTRYPOINT ["java", "-jar", "application.jar"]
+EOF
+printf '*\n!target/*.jar\n' > .dockerignore
+docker pull eclipse-temurin:25-jre
+docker build -t masteva-j17/catalog:dockerfile .
+docker image ls masteva-j17/catalog
+docker history --format 'table {{.Size}}\t{{.CreatedBy}}' masteva-j17/catalog:dockerfile | head -9
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+IMAGE                            ID             DISK USAGE   CONTENT SIZE   EXTRA
+masteva-j17/catalog:dockerfile   9516724b6ad0        544MB          138MB
+SIZE      CREATED BY
+0B        ENTRYPOINT ["java" "-jar" "application.jar"]
+0B        EXPOSE [20170/tcp]
+0B        USER app
+16.4kB    COPY /builder/extracted/application/ ./ # bu…
+4.1kB     COPY /builder/extracted/snapshot-dependencie…
+4.1kB     COPY /builder/extracted/spring-boot-loader/ …
+21.9MB    COPY /builder/extracted/dependencies/ ./ # b…
+8.19kB    WORKDIR /application
+```
+
+</Expected>
+
+Lần đầu, `docker pull` tải base image khoảng 123 MB và `docker build` mất thêm vài giây; ID image trên máy bạn sẽ khác. Docker 29 trên máy kiểm chứng dùng containerd image store nên `docker image ls` có hai cột: **CONTENT SIZE** (138 MB) là dung lượng nén, tức thứ thật sự được đẩy lên và kéo về từ registry; **DISK USAGE** gồm cả bản nén lẫn bản đã giải nén trên đĩa. `docker history` in kích thước chưa nén của từng layer: phần của bạn chỉ khoảng 22 MB, còn lại là Ubuntu và JRE của base image.
+
+<Check id="j17.1.lab-image">Build được image bằng Dockerfile multi-stage, đọc được `docker history` và chỉ ra layer nào là dependency, layer nào là code.</Check>
+
+### 6. Chạy container
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name masteva-j17-app -p 20170:20170 masteva-j17/catalog:dockerfile
+sleep 5; curl -s localhost:20170/api/products; echo
+docker exec masteva-j17-app sh -c 'id; tr "\0" " " < /proc/1/cmdline; echo'
+time docker stop masteva-j17-app
+docker logs masteva-j17-app 2>&1 | tail -2 | cut -c1-160
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"sku":"SKU-1","name":"Bàn phím cơ","price":1250000},{"sku":"SKU-2","name":"Chuột không dây","price":450000}]
+uid=999(app) gid=999(app) groups=999(app)
+java -jar application.jar
+masteva-j17-app
+...
+2026-10-03T18:08:14.624Z  INFO 1 --- [catalog] [ionShutdownHook] o.s.boot.tomcat.GracefulShutdown         : Commencing graceful shutdown. Waiting for active requests to complete
+2026-10-03T18:08:14.638Z  INFO 1 --- [catalog] [tomcat-shutdown] o.s.boot.tomcat.GracefulShutdown         : Graceful shutdown complete
+```
+
+</Expected>
+
+Ứng dụng chạy bằng user `app` (uid 999), PID 1 là `java`, và `docker stop` xong trong chưa tới một giây: `java` nhận `SIGTERM`, Spring Boot tắt êm (graceful shutdown) rồi thoát. Khối kết quả đã lược dòng thời gian của `time`: trong zsh (mặc định trên macOS) nó có dạng `... 0.172 total`, trong bash là `real 0m0.172s`. Lệnh `sleep 5` chờ ứng dụng khởi động; nếu `curl` không in gì, chờ thêm vài giây rồi chạy lại. Trong container, `java -version` báo Temurin `25.0.4.1`, bản vá mới hơn JDK trên máy kiểm chứng: base image theo tag `25-jre` luôn trỏ tới bản vá mới nhất của Java 25.
+
+<Callout kind="danger">
+
+`docker rm` xoá vĩnh viễn container cùng log của nó. Lệnh dưới đây chỉ xoá container `masteva-j17-app` vừa tạo; image vẫn giữ lại cho bước sau.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker rm masteva-j17-app
+```
+
+</Terminal>
+
+### 7. Sửa code, build lại và xem cache
+
+Thêm một sản phẩm, build lại JAR và image. `--progress=plain` in log build dạng văn bản để `grep` được:
+
+<Terminal where="mac">
+
+```bash
+perl -0pi -e 's#(450_000\))\);#$1,\n            new Product("SKU-3", "Tai nghe", 890_000));#' src/main/java/dev/masteva/catalog/ProductController.java
+mvn -q -DskipTests package
+docker build --progress=plain -t masteva-j17/catalog:dockerfile . 2>&1 | grep -A1 -E '\[stage-1 [4-7]/7\]'
+```
+
+</Terminal>
+
+<Predict question="Bốn lệnh COPY ở stage cuối, lệnh nào được lấy từ cache?">
+
+```text
+#9 [stage-1 4/7] COPY --from=builder /builder/extracted/dependencies/ ./
+#9 CACHED
+--
+#10 [stage-1 5/7] COPY --from=builder /builder/extracted/spring-boot-loader/ ./
+#10 CACHED
+--
+#13 [stage-1 6/7] COPY --from=builder /builder/extracted/snapshot-dependencies/ ./
+#13 CACHED
+--
+#14 [stage-1 7/7] COPY --from=builder /builder/extracted/application/ ./
+#14 DONE 0.0s
+```
+
+Stage `builder` chạy lại vì JAR đổi, nhưng nội dung thư mục `dependencies` giống hệt lần trước, nên BuildKit dùng lại layer cũ. Chỉ layer `application` được tạo mới.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+docker history --format 'table {{.CreatedSince}}\t{{.Size}}\t{{.CreatedBy}}' masteva-j17/catalog:dockerfile | head -8
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CREATED                  SIZE      CREATED BY
+Less than a second ago   0B        ENTRYPOINT ["java" "-jar" "application.jar"]
+Less than a second ago   0B        EXPOSE [20170/tcp]
+Less than a second ago   0B        USER app
+Less than a second ago   16.4kB    COPY /builder/extracted/application/ ./ # bu…
+11 minutes ago           4.1kB     COPY /builder/extracted/snapshot-dependencie…
+11 minutes ago           4.1kB     COPY /builder/extracted/spring-boot-loader/ …
+11 minutes ago           21.9MB    COPY /builder/extracted/dependencies/ ./ # b…
+```
+
+</Expected>
+
+Layer 21.9 MB vẫn mang thời điểm của lần build đầu; khi push, registry chỉ nhận layer 16.4 KB mới.
+
+<Check id="j17.1.lab-cache">Chứng minh được bằng log `CACHED` và `docker history` rằng sửa code chỉ tạo lại layer `application`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Cannot connect to the Docker daemon`: Docker Desktop chưa chạy. Mở nó và chờ biểu tượng chuyển sang trạng thái running.
+- `ERROR: failed to build: failed to solve: lstat /target: no such file or directory` ở `COPY target/*.jar`: không có file nào khớp, do chưa chạy `mvn package` hoặc `.dockerignore` loại mất file JAR. BuildKit chỉ gửi các file khớp `target/*.jar`, nên khi không có JAR thì thư mục `target` cũng không có trong build context. Kiểm tra `ls target/*.jar`.
+- `target` có hơn một JAR, thường do đổi `version` trong `pom.xml` mà không `mvn clean`: BuildKit **không báo lỗi**. Nó chép lần lượt mọi JAR khớp vào cùng file `application.jar`, file đứng sau cùng theo thứ tự tên thắng, nên image có thể chứa JAR cũ (`catalog-0.0.9` đứng sau `catalog-0.0.10`). Chạy `mvn -q clean package -DskipTests` để `target` chỉ còn một JAR.
+- `UnsupportedClassVersionError ... class file version 69.0`: base image là Java 24 trở xuống (thường gặp là 17 hoặc 21) trong khi code build bằng JDK 25 (J1.1). Dùng cùng phiên bản Java cho build và runtime.
+- `Bind for 0.0.0.0:20170 failed: port is already allocated`: còn container hoặc tiến trình `java -jar` cũ giữ cổng. Xem bằng `docker ps` và `lsof -i :20170`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá vĩnh viễn thư mục `target/extracted` vừa giải nén ở bước 4. Giữ project và image `masteva-j17/catalog:dockerfile`: bài J17.2 và J17.3 dùng tiếp.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-j17/catalog && rm -rf target/extracted
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Sao không chạy luôn mvn package trong Dockerfile?">
+
+Được, bằng một stage dùng image Maven. Ưu điểm: máy build chỉ cần Docker, kết quả không phụ thuộc JDK trên máy. Nhược điểm: mỗi lần build Docker phải tải lại dependency Maven, trừ khi bạn dùng cache mount của BuildKit (`RUN --mount=type=cache,target=/root/.m2 mvn package`), và test chạy bên trong `docker build` khó đọc báo cáo hơn. Phần lớn pipeline CI chạy `mvn verify` ở một bước riêng, giữ lại JAR làm artifact, rồi Dockerfile chỉ đóng gói JAR đó như bài này. Cách đó cũng đảm bảo JAR đã qua test chính là JAR trong image.
+
+</Reveal>
+
+<Reveal title="Có nên dùng image alpine để nhỏ hơn?">
+
+Image alpine dùng thư viện C `musl` thay cho `glibc`. Temurin có phát hành bản alpine riêng cho Java 25, nhưng thư viện native của bên thứ ba (driver, nén, crypto) đôi khi chỉ được build và kiểm thử với `glibc`, và lỗi chỉ lộ ra lúc chạy. Phần nặng nhất của image là JRE (khoảng 200 MB chưa nén), không phải hệ điều hành. Muốn nhỏ hơn đáng kể, hãy dùng `jlink` tạo JRE chỉ gồm các module ứng dụng cần, hoặc base distroless; đo lại kích thước và chạy test tích hợp trên chính image đó trước khi đổi.
+
+</Reveal>
+
+<Reveal title="Tag 25-jre tự trỏ tới bản vá mới. Đó là ưu hay nhược điểm?">
+
+Ưu điểm: mỗi lần build lại, bạn nhận bản vá bảo mật của JRE và hệ điều hành. Nhược điểm: hai lần build cùng một commit có thể cho hai image khác nhau, và một bản vá có thể đổi hành vi. Nhiều đội ghim base image theo digest (`FROM eclipse-temurin:25-jre@sha256:...`) để build tái lập, rồi dùng công cụ tự mở pull request khi digest mới xuất hiện. Như vậy việc nâng base image có review và có test, thay vì xảy ra ngầm.
+
+</Reveal>
+
+<Reveal title="Ngoài layer, làm sao để container Java khởi động nhanh hơn nữa?">
+
+JAR đã giải nén là điều kiện để dùng CDS (Class Data Sharing) và AOT cache của JDK 25: bạn chạy ứng dụng một lần để "huấn luyện", JVM ghi lại class đã nạp và đã liên kết vào một file cache, và các lần khởi động sau đọc file đó thay vì làm lại. Tài liệu "Efficient Deployments" của Spring Boot có lệnh cụ thể. Đánh đổi là thêm một bước build, và file cache chỉ dùng được với đúng JVM và đúng classpath đã tạo ra nó. J18 đo thời gian khởi động và warm-up kỹ hơn.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết nháp Dockerfile hay giải thích một dòng lỗi của `docker build`. AI hay đưa cú pháp cũ: `java -Djarmode=layertools -jar app.jar extract` (Spring Boot 4 báo `Unsupported jarmode 'layertools'`; cú pháp đúng là `-Djarmode=tools` với `extract --layers`), class `org.springframework.boot.loader.JarLauncher` (từ Spring Boot 3.2 nằm ở package `launch`), base `openjdk:...` (không còn được cập nhật). AI cũng hay quên `USER`. Kiểm tra lại bằng `java -Djarmode=tools -jar app.jar help`, `docker history` và `docker exec ... id`.
+
+</Callout>
+
+<Callout kind="link">
+
+J17.2 build cùng ứng dụng bằng Jib và Buildpacks rồi so sánh với Dockerfile này. J17.3 chạy image với giới hạn bộ nhớ và CPU. D1.1 giải thích PID 1 và signal; D6 đi sâu Dockerfile, registry và quét lỗ hổng image; D7 đưa image vào pipeline CI/CD.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j17.1.mastery-explain-jar">Giải thích được cho đồng nghiệp đường đi từ `java -jar` tới `main()` của ứng dụng, và vì sao layered JAR giúp deploy nhanh hơn.</Check>
+
+<Check id="j17.1.mastery-dockerfile">Tự viết được Dockerfile multi-stage cho một ứng dụng Spring Boot: dùng layer, base JRE, user không phải root, `ENTRYPOINT` dạng exec, và kiểm chứng cache bằng `docker history`.</Check>
+
+</Mastery>

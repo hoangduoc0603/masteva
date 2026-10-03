@@ -1,0 +1,786 @@
+---
+title: Cache-aside, TTL và Spring Cache với Redis
+description: Hiểu luồng cache-aside, chọn TTL và cách xoá cache khi ghi, nhận ra cache stampede; tự làm cache-aside bằng redis-cli rồi gắn Spring Cache với Redis, đo hit và miss bằng thời gian thật.
+id: j16.1
+step: j16
+prerequisites: [j15]
+topics: [j16.cache-aside-ttl, j16.spring-cache-redis]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    docker: 29.8.0
+    redis: 8.10.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Hiểu cache đứng ở đâu giữa ứng dụng và database, đọc và ghi qua nó theo mẫu cache-aside, và cấu hình Spring Cache dùng Redis đúng cách. Học xong bài này, bạn giải thích được:
+
+- Vì sao khi sửa giá sản phẩm thì nên **xoá** key cache chứ không ghi đè giá mới vào cache.
+- Vì sao 20 request cùng lúc vào một key vừa hết hạn có thể thành 20 truy vấn database, kể cả khi đã viết `@Cacheable(sync = true)`.
+- Vì sao `@Cacheable` báo `Cannot serialize value of type ... without a serializer` dù code không sai gì.
+
+</Goal>
+
+<Knowledge>
+
+### Cache đổi độ tươi lấy tốc độ
+
+**Cache** là bản sao dữ liệu đặt ở nơi đọc nhanh hơn nguồn gốc. Trong lab, đọc một sản phẩm từ "database" mất 300 ms, đọc từ Redis mất vài mili giây. Cái giá là dữ liệu trong cache có thể **cũ** (stale) so với database trong một khoảng thời gian.
+
+Chỉ số đầu tiên cần nhìn là **hit ratio** (tỉ lệ trúng): số lần đọc thấy dữ liệu trong cache chia cho tổng số lần đọc. Cache có hit ratio 30% thì phần lớn request vẫn đi tới database, cộng thêm một lượt gọi Redis vô ích.
+
+| Nên cache | Không nên cache, hoặc cache rất ngắn |
+|---|---|
+| Đọc nhiều, ghi ít: danh mục, chi tiết sản phẩm, cấu hình | Số dư tài khoản, tồn kho dùng để quyết định bán |
+| Tính toán tốn kém, kết quả chấp nhận cũ vài phút | Dữ liệu riêng của từng request, ít khi đọc lại |
+| Gọi API bên ngoài chậm hoặc tính phí theo lượt | Dữ liệu cần nhất quán tuyệt đối ngay sau khi ghi |
+
+### Cache-aside
+
+**Cache-aside** (còn gọi là lazy loading) là mẫu phổ biến nhất: ứng dụng tự nói chuyện với cả cache và database, cache không biết database tồn tại.
+
+```text
+ĐỌC
+ app ── GET product:1 ──> Redis
+          │ có (hit)  ──> trả về ngay
+          │ không có (miss)
+          v
+ app ── SELECT ... WHERE id = 1 ──> database
+ app ── SET product:1 <json> EX 600 ──> Redis     ghi lại kèm TTL
+          └──> trả về
+
+GHI
+ app ── UPDATE products SET price = ... ──> database
+ app ── DEL product:1 ──> Redis                    lần đọc sau tự nạp bản mới
+```
+
+So với các mẫu khác:
+
+| Mẫu | Ai đọc database khi miss | Ghi đi đâu | Hay gặp ở |
+|---|---|---|---|
+| Cache-aside | Ứng dụng | Database, rồi xoá key | Redis, Memcached với ứng dụng web |
+| Read-through | Thư viện cache | Database | Cache có loader, ví dụ Caffeine `LoadingCache` |
+| Write-through | Thư viện cache | Cache và database cùng lúc | Cache phân tán có tích hợp store |
+| Write-behind | Thư viện cache | Cache trước, database sau (bất đồng bộ) | Khi chấp nhận mất dữ liệu nếu cache chết |
+
+**Vì sao xoá thay vì ghi giá mới vào cache?** Hai request sửa giá chạy song song: A ghi database giá 900, B ghi database giá 950, nhưng B ghi cache trước A. Cache giữ 900 trong khi database là 950, và sai như vậy tới hết TTL. Xoá key thì thứ tự không quan trọng: lần đọc sau luôn nạp lại từ database. Vẫn còn một khe hở nhỏ (một request đọc giá cũ từ database, chậm, rồi ghi vào cache sau khi key đã bị xoá), nên TTL luôn là lưới an toàn cuối cùng.
+
+<Check id="j16.1.cache-aside-flow">Vẽ được luồng đọc và ghi của cache-aside, và giải thích được vì sao khi ghi thì xoá key thay vì cập nhật cache.</Check>
+
+### TTL và eviction trong Redis
+
+**TTL** (time to live) là số giây còn lại trước khi key tự hết hạn. `SET key value EX 600` ghi kèm TTL 600 giây; `EXPIRE key 600` đặt TTL cho key đã có. Lệnh `TTL key` trả về số giây còn lại, `-1` nếu key không có hạn, `-2` nếu key không tồn tại. Redis xoá key hết hạn theo hai cách: khi có lệnh chạm vào key đó, và một vòng quét nền lấy mẫu ngẫu nhiên các key có TTL.
+
+Chọn TTL bằng câu hỏi nghiệp vụ "dữ liệu cũ tối đa bao lâu thì chấp nhận được", không phải bằng con số đẹp. Tên sản phẩm cũ 10 phút không sao; giá sai 10 phút trong đợt giảm giá thì có.
+
+**Eviction** là chuyện khác: Redis chạm giới hạn `maxmemory` thì phải đuổi bớt key, kể cả key chưa hết hạn. Chính sách mặc định là `noeviction`: đầy thì lệnh ghi báo lỗi `OOM`. Redis dùng làm cache nên đặt `allkeys-lru` (đuổi key ít được dùng gần đây nhất) hoặc `allkeys-lfu` (đuổi key ít được dùng nhất). Lab đặt `maxmemory 64mb` và `allkeys-lru`.
+
+<Callout kind="production">
+
+Một trang khuyến mãi ghi toàn bộ 5.000 sản phẩm vào Redis lúc 9 giờ sáng, tất cả cùng TTL 3600 giây. Đúng 10 giờ, cả 5.000 key hết hạn trong cùng một giây, mọi request đều miss và database tăng vọt lên 100% CPU. Cách sửa rẻ nhất là cộng thêm một khoảng ngẫu nhiên vào TTL (jitter), ví dụ 3600 cộng từ 0 tới 300 giây, để các key hết hạn rải rác.
+
+</Callout>
+
+<Check id="j16.1.ttl-eviction">Phân biệt được TTL với eviction, đọc được kết quả `-1`, `-2` của lệnh `TTL`, và chọn được chính sách eviction cho Redis dùng làm cache.</Check>
+
+### Cache stampede
+
+**Cache stampede** (còn gọi là thundering herd) xảy ra khi một key được đọc nhiều bị miss, và nhiều request cùng lúc thấy miss nên cùng đi đọc database cho đúng một giá trị.
+
+```text
+t=0     key product:1 hết hạn
+t=1ms   request 1..20 cùng GET product:1 -> miss
+t=2ms   20 request cùng SELECT product 1  -> database nhận 20 truy vấn giống hệt
+t=300ms 20 request cùng SET product:1     -> 19 lần ghi thừa
+```
+
+| Cách chống | Ý tưởng | Đổi lại |
+|---|---|---|
+| TTL có jitter | Không để nhiều key hết hạn cùng lúc | Không cứu được một key rất nóng |
+| Khoá theo key | Request đầu tiên `SET lock:product:1 x NX EX 5` rồi mới đọc database; request khác chờ hoặc trả bản cũ | Phải xử lý chờ, hết hạn khoá |
+| Gộp request trong một JVM | Chỉ một thread nạp, thread khác chờ kết quả | Mỗi instance vẫn nạp một lần |
+| Làm mới trước khi hết hạn | Job hoặc request nạp lại khi TTL còn ít | Phức tạp hơn, tốn thêm truy vấn |
+
+`SET ... NX` chỉ ghi khi key chưa tồn tại, nên trong nhiều tiến trình chỉ một tiến trình thắng. Đó là viên gạch của khoá phân tán: bài J16.2 dùng nó để chống xử lý trùng message, bài J16.3 dùng nó qua ShedLock để chỉ một instance chạy job.
+
+### Spring Cache abstraction
+
+Spring Cache cho phép thêm cache-aside vào một method bằng annotation, không sửa thân method. Spring bọc bean trong một **proxy**; lời gọi đi qua proxy được chặn lại để tra cache trước.
+
+| Annotation | Việc nó làm |
+|---|---|
+| `@Cacheable` | Tra cache theo key; có thì trả luôn, không thì chạy method và ghi kết quả vào cache |
+| `@CacheEvict` | Chạy method rồi xoá key (hoặc cả cache với `allEntries = true`) |
+| `@CachePut` | Luôn chạy method và ghi kết quả vào cache |
+| `@EnableCaching` | Bật cơ chế proxy cho các annotation trên; thiếu nó thì annotation bị bỏ qua |
+
+Key mặc định sinh từ tham số method; `key = "#id"` là biểu thức SpEL chọn rõ tham số `id`. Với Redis, key thật là `<tên cache>::<key>`, ví dụ `products::2`.
+
+Khi có `spring-boot-starter-data-redis` và `@EnableCaching`, Spring Boot tự tạo `RedisCacheManager`. Cấu hình mặc định của nó có ba điểm cần biết:
+
+- **Không có TTL**, trừ khi đặt `spring.cache.redis.time-to-live` hoặc cấu hình riêng cho từng cache.
+- **Serializer mặc định là Java serialization**: chỉ ghi được class `implements Serializable`, dữ liệu trong Redis là nhị phân, và đổi tên class là đọc không được bản cũ.
+- **Không khoá khi nạp**: `@Cacheable(sync = true)` chỉ yêu cầu cache "đồng bộ hoá việc nạp nếu làm được". `RedisCache` chỉ làm được khi cache writer bật khoá, và khoá đó áp cho **cả cache**, không riêng một key; với writer mặc định, cờ `sync` không chặn được stampede. Lab đo điều này bằng số truy vấn thật.
+
+<Check id="j16.1.spring-cache-proxy">Giải thích được `@Cacheable`, `@CacheEvict` làm gì qua proxy, và vì sao `RedisCacheManager` mặc định cần thêm TTL và serializer JSON.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Cache-Aside pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside): luồng đọc ghi và mục "Issues and considerations" về thời hạn và tính nhất quán.
+- [EXPIRE](https://redis.io/docs/latest/commands/expire/): cách đặt TTL và mục "How Redis expires keys".
+- [Key eviction](https://redis.io/docs/latest/develop/reference/eviction/): bảng các chính sách `maxmemory-policy` và khi nào chọn chính sách nào.
+- [Cache Abstraction](https://docs.spring.io/spring-framework/reference/integration/cache.html): các annotation, cách sinh key, thuộc tính `sync` và giới hạn của proxy.
+- [Redis Cache](https://docs.spring.io/spring-data/redis/reference/redis/redis-cache.html): cấu hình `RedisCacheManager`, TTL, serializer và cache writer có khoá.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25 và Maven 3.9 như ở J7, Spring Boot như ở J11, Docker như ở J8.3. Máy cần mạng để tải image Redis và tạo project từ start.spring.io. Ứng dụng chạy ở cổng **20160**, Redis ở cổng **20162**; hai cổng đó phải đang trống. Mở **hai tab Terminal**: tab 1 chạy ứng dụng, tab 2 gửi request. Lab của cả chặng nằm ở `~/masteva-j16`, dùng tiếp ở J16.2 và J16.3.
+
+Ở mỗi tab mới, trỏ Maven về JDK 25 như J7.1:
+
+<Terminal where="mac">
+
+```bash
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+mvn -v
+```
+
+</Terminal>
+
+Dòng `Java version:` phải là `25.0.x`. Như J9.3, Maven chạy trên JDK 25 in thêm vài dòng `WARNING:` về native access; các khối kết quả trong bài đã lược chúng.
+
+### 1. Chạy Redis
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name masteva-j16-redis -p 20162:6379 redis:8-alpine \
+  redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+```
+
+</Terminal>
+
+`--maxmemory 64mb --maxmemory-policy allkeys-lru` biến Redis thành cache có giới hạn bộ nhớ như phần Kiến thức. Container cần một hai giây để sẵn sàng; sau đó kiểm tra:
+
+<Terminal where="mac">
+
+```bash
+docker exec masteva-j16-redis redis-cli INFO server | grep redis_version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+redis_version:8.10.2
+```
+
+</Expected>
+
+Tag `8-alpine` trỏ tới bản Redis 8 mới nhất, nên số bản vá trên máy bạn có thể cao hơn.
+
+### 2. Cache-aside bằng tay với redis-cli
+
+Mở `redis-cli` bên trong container:
+
+<Terminal where="mac">
+
+```bash
+docker exec -it masteva-j16-redis redis-cli
+```
+
+</Terminal>
+
+Gõ lần lượt từng lệnh sau dấu nhắc `127.0.0.1:6379>`. Bạn đóng vai ứng dụng: đọc cache, miss thì "đọc database" (ở đây là tự gõ JSON), ghi lại kèm TTL.
+
+```text
+GET product:1
+SET product:1 '{"id":1,"name":"Mechanical Keyboard","price":1290000}' EX 30
+GET product:1
+TTL product:1
+TTL product:404
+SET product:2 '{"id":2,"name":"USB-C Hub","price":450000}'
+TTL product:2
+EXPIRE product:2 5
+```
+
+<Expected>
+
+```text
+127.0.0.1:6379> GET product:1
+(nil)
+127.0.0.1:6379> SET product:1 '{"id":1,"name":"Mechanical Keyboard","price":1290000}' EX 30
+OK
+127.0.0.1:6379> GET product:1
+"{\"id\":1,\"name\":\"Mechanical Keyboard\",\"price\":1290000}"
+127.0.0.1:6379> TTL product:1
+(integer) 30
+127.0.0.1:6379> TTL product:404
+(integer) -2
+127.0.0.1:6379> SET product:2 '{"id":2,"name":"USB-C Hub","price":450000}'
+OK
+127.0.0.1:6379> TTL product:2
+(integer) -1
+127.0.0.1:6379> EXPIRE product:2 5
+(integer) 1
+```
+
+</Expected>
+
+`TTL product:1` có thể là `29` nếu bạn gõ chậm hơn một giây. Đợi quá 5 giây rồi gõ tiếp, lần này thử viên gạch của khoá chống stampede:
+
+```text
+GET product:2
+SET lock:product:1 worker-a NX EX 5
+SET lock:product:1 worker-b NX EX 5
+DEL product:1
+exit
+```
+
+<Expected>
+
+```text
+127.0.0.1:6379> GET product:2
+(nil)
+127.0.0.1:6379> SET lock:product:1 worker-a NX EX 5
+OK
+127.0.0.1:6379> SET lock:product:1 worker-b NX EX 5
+(nil)
+127.0.0.1:6379> DEL product:1
+(integer) 1
+```
+
+</Expected>
+
+`product:2` đã tự biến mất khi hết TTL. `worker-b` nhận `(nil)` vì `worker-a` đang giữ khoá; sau 5 giây khoá tự hết hạn, kể cả khi `worker-a` chết giữa chừng. `DEL product:1` là bước "xoá cache khi ghi" của cache-aside.
+
+<Check id="j16.1.lab-redis-cli">Tự làm được một vòng cache-aside trong `redis-cli`: miss, ghi kèm `EX`, hit, đọc `TTL`, và dùng `SET ... NX EX` để chỉ một bên giành được khoá.</Check>
+
+### 3. Tạo project
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-j16 && cd ~/masteva-j16
+curl -s https://start.spring.io/starter.tgz \
+  -d type=maven-project -d language=java -d bootVersion=4.1.1 -d javaVersion=25 \
+  -d groupId=dev.masteva -d artifactId=shop -d baseDir=shop \
+  -d packageName=dev.masteva.shop -d dependencies=web,cache,data-redis,actuator | tar -xzf -
+cd shop && grep -o 'spring-boot-starter-[a-z-]*' pom.xml | sort -u
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+spring-boot-starter-actuator
+spring-boot-starter-actuator-test
+spring-boot-starter-cache
+spring-boot-starter-cache-test
+spring-boot-starter-data-redis
+spring-boot-starter-data-redis-test
+spring-boot-starter-parent
+spring-boot-starter-webmvc
+spring-boot-starter-webmvc-test
+```
+
+</Expected>
+
+`data-redis` kéo theo Spring Data Redis và driver Lettuce; `cache` kéo theo Spring Cache. Các starter `-test` là phần test đi kèm của Spring Boot 4.
+
+### 4. Repository giả lập database chậm
+
+Lab không dùng database thật (J12 đã làm việc đó) mà giả lập một bảng `products`: mỗi lần đọc chờ 300 ms và ghi log kèm số thứ tự truy vấn, để bạn đếm được cache đã chặn bao nhiêu lần đọc.
+
+<Terminal where="mac" title="Tạo cấu hình, Product, ProductRepository">
+
+```bash
+mkdir -p ~/masteva-j16/shop/src/main/java/dev/masteva/shop/catalog && cd ~/masteva-j16/shop
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=shop
+server.port=20160
+spring.data.redis.host=localhost
+spring.data.redis.port=20162
+management.endpoints.web.exposure.include=health,caches
+logging.file.name=app.log
+logging.pattern.console=%d{HH:mm:ss.SSS} %-5level [%15.15thread] %logger{0}: %msg%n
+logging.pattern.file=%d{HH:mm:ss.SSS} %-5level [%15.15thread] %logger{0}: %msg%n
+EOF
+cat > src/main/java/dev/masteva/shop/catalog/Product.java <<'EOF'
+package dev.masteva.shop.catalog;
+
+public record Product(long id, String name, long price) {
+}
+EOF
+cat > src/main/java/dev/masteva/shop/catalog/ProductRepository.java <<'EOF'
+package dev.masteva.shop.catalog;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Repository;
+
+/** Giả lập bảng products: mỗi lần đọc tốn 300 ms như một truy vấn chậm. */
+@Repository
+public class ProductRepository {
+    private static final Logger log = LoggerFactory.getLogger(ProductRepository.class);
+    private final Map<Long, Product> rows = new ConcurrentHashMap<>(Map.of(
+            1L, new Product(1, "Mechanical Keyboard", 1_290_000),
+            2L, new Product(2, "USB-C Hub", 450_000)));
+    private final AtomicInteger queries = new AtomicInteger();
+
+    public Optional<Product> findById(long id) {
+        log.info("DB query #{} product {}", queries.incrementAndGet(), id);
+        try {
+            Thread.sleep(300);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return Optional.ofNullable(rows.get(id));
+    }
+
+    public void updatePrice(long id, long price) {
+        rows.computeIfPresent(id, (k, p) -> new Product(p.id(), p.name(), price));
+    }
+
+    public int queries() {
+        return queries.get();
+    }
+
+    public void resetQueries() {
+        queries.set(0);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+`logging.file.name=app.log` ghi thêm log ra file, để tab 2 dùng `grep` đọc được log của ứng dụng đang chạy ở tab 1. Hai dòng `logging.pattern` rút gọn mỗi dòng log còn giờ, mức, thread và tên class.
+
+### 5. Service có @Cacheable
+
+<Terminal where="mac" title="Tạo ProductService, ProductController, CacheConfig">
+
+```bash
+cd ~/masteva-j16/shop
+cat > src/main/java/dev/masteva/shop/catalog/ProductService.java <<'EOF'
+package dev.masteva.shop.catalog;
+
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
+
+@Service
+public class ProductService {
+    private final ProductRepository repository;
+
+    public ProductService(ProductRepository repository) {
+        this.repository = repository;
+    }
+
+    @Cacheable(cacheNames = "products", key = "#id", sync = true)
+    public Product find(long id) {
+        return repository.findById(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+    }
+
+    @CacheEvict(cacheNames = "products", key = "#id")
+    public void updatePrice(long id, long price) {
+        repository.updatePrice(id, price);
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/shop/catalog/ProductController.java <<'EOF'
+package dev.masteva.shop.catalog;
+
+import java.util.Map;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ProductController {
+    private final ProductService service;
+    private final ProductRepository repository;
+
+    public ProductController(ProductService service, ProductRepository repository) {
+        this.service = service;
+        this.repository = repository;
+    }
+
+    @GetMapping("/products/{id}")
+    public Product product(@PathVariable long id) {
+        return service.find(id);
+    }
+
+    @PutMapping("/products/{id}/price")
+    public void price(@PathVariable long id, @RequestParam long value) {
+        service.updatePrice(id, value);
+    }
+
+    /** Số lần đã đọc "database"; gọi DELETE để đếm lại từ 0. */
+    @GetMapping("/stats")
+    public Map<String, Integer> stats() {
+        return Map.of("dbQueries", repository.queries());
+    }
+
+    @DeleteMapping("/stats")
+    public void resetStats() {
+        repository.resetQueries();
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/shop/CacheConfig.java <<'EOF'
+package dev.masteva.shop;
+
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@EnableCaching
+public class CacheConfig {
+}
+EOF
+```
+
+</Terminal>
+
+`find` đọc qua cache `products`; `updatePrice` ghi database rồi xoá đúng key đó, đúng luồng ghi của cache-aside. Endpoint `/stats` trả số lần đã đọc "database".
+
+### 6. Chạy và gọi lần đầu
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j16/shop && mvn -q package -DskipTests && java -jar target/shop-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+Khi tab 1 in `Started ShopApplication`, chuyển sang tab 2. Log có thể có một dòng `WARN` về `MacOSDnsServerAddressStreamProvider` của Netty (thư viện mạng mà Lettuce dùng); nó vô hại với lab vì Redis nằm ở `localhost`.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j16/shop
+for i in 1 2; do curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' localhost:20160/products/2; done
+grep -o 'Cannot serialize[^]]*' app.log | head -1
+```
+
+</Terminal>
+
+<Predict question="Product là record bình thường, method find chạy đúng. Hai lần gọi trả gì?">
+
+```text
+500 0.360889s
+500 0.310456s
+Cannot serialize value of type dev.masteva.shop.catalog.Product without a serializer
+```
+
+Cả hai lần đều `500` và đều tốn hơn 300 ms: method đã chạy, đọc "database" xong, rồi chết ở bước ghi vào Redis. Serializer mặc định của `RedisCacheManager` là Java serialization, chỉ nhận class `implements Serializable`. Vì không ghi được, lần thứ hai lại miss và lại đọc database. Thêm `implements Serializable` sẽ hết lỗi, nhưng dữ liệu trong Redis thành nhị phân, chỉ JVM có đúng class đó đọc được. JSON tốt hơn.
+
+</Predict>
+
+### 7. TTL và serializer JSON cho từng cache
+
+Bấm Ctrl+C ở tab 1. Thay `CacheConfig` bằng cấu hình riêng cho cache `products`:
+
+<Terminal where="mac" title="Sửa CacheConfig">
+
+```bash
+cd ~/masteva-j16/shop
+cat > src/main/java/dev/masteva/shop/CacheConfig.java <<'EOF'
+package dev.masteva.shop;
+
+import dev.masteva.shop.catalog.Product;
+import java.time.Duration;
+import org.springframework.boot.cache.autoconfigure.RedisCacheManagerBuilderCustomizer;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.serializer.JacksonJsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair;
+
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    @Bean
+    RedisCacheManagerBuilderCustomizer productsCache() {
+        RedisCacheConfiguration products = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(10))
+                .disableCachingNullValues()
+                .serializeValuesWith(SerializationPair.fromSerializer(
+                        new JacksonJsonRedisSerializer<>(Product.class)));
+        return builder -> builder.withCacheConfiguration("products", products);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `entryTtl(Duration.ofMinutes(10))`: mỗi key trong cache này sống 10 phút.
+- `disableCachingNullValues()`: không lưu giá trị `null` vào cache.
+- `JacksonJsonRedisSerializer<>(Product.class)`: ghi JSON bằng Jackson 3, đọc lại thành đúng kiểu `Product`.
+
+Chạy lại lệnh ở tab 1 (lệnh build rồi chạy như bước 6). Ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' localhost:20160/products/2; done
+docker exec masteva-j16-redis redis-cli KEYS '*'
+docker exec masteva-j16-redis redis-cli GET products::2
+docker exec masteva-j16-redis redis-cli TTL products::2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 0.377377s
+200 0.004474s
+200 0.003480s
+products::2
+{"id":2,"name":"USB-C Hub","price":450000}
+600
+```
+
+</Expected>
+
+Lần đầu miss: 300 ms của "database" cộng thời gian mở kết nối Redis. Hai lần sau hit, chỉ vài mili giây; con số trên máy bạn sẽ khác nhưng chênh lệch cỡ hai bậc độ lớn. Key là `products::2`, giá trị là JSON đọc được, TTL đúng 600 giây. Các key `product:*` từ bước 2 đã hết hạn hoặc bị xoá.
+
+<Callout kind="pitfall">
+
+`KEYS '*'` quét toàn bộ keyspace trong một lệnh và chặn Redis trong lúc quét. Dùng thoải mái trên Redis lab vài key; trên production với hàng triệu key, dùng `SCAN` để duyệt từng phần.
+
+</Callout>
+
+### 8. Xoá cache khi ghi
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -X PUT 'localhost:20160/products/2/price?value=399000'
+docker exec masteva-j16-redis redis-cli EXISTS products::2
+curl -s localhost:20160/products/2; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+{"id":2,"name":"USB-C Hub","price":399000}
+```
+
+</Expected>
+
+`@CacheEvict` đã xoá `products::2` (`EXISTS` trả `0`), nên lần đọc sau nạp giá mới từ database. Thiếu `@CacheEvict`, khách thấy giá cũ thêm tối đa 10 phút.
+
+<Check id="j16.1.lab-hit-miss">Đo được thời gian miss và hit bằng `curl -w`, tìm được key `products::2` và TTL của nó, và thấy key biến mất sau khi sửa giá.</Check>
+
+### 9. Stampede và sync = true
+
+`ProductService.find` đã có `sync = true`. Xoá key của sản phẩm 1, đặt bộ đếm về 0, rồi bắn 20 request song song:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec masteva-j16-redis redis-cli DEL products::1
+curl -s -X DELETE localhost:20160/stats
+seq 20 | xargs -P 20 -I{} curl -s -o /dev/null localhost:20160/products/1
+curl -s localhost:20160/stats; echo
+```
+
+</Terminal>
+
+<Predict question="Có sync = true, database nhận bao nhiêu truy vấn?">
+
+```text
+0
+{"dbQueries":20}
+```
+
+Hai mươi. `DEL` trả `0` vì key chưa từng có. `sync = true` chỉ là lời đề nghị: Spring gọi `cache.get(key, loader)` và để cache tự quyết cách đồng bộ. `RedisCache` với cache writer mặc định của Spring Boot không khoá gì cả, nên cả 20 thread cùng thấy miss và cùng nạp. Đây đúng là cảnh database sập lúc 10 giờ trong callout ở phần Kiến thức.
+
+</Predict>
+
+Bấm Ctrl+C ở tab 1. Bật khoá cho cache writer:
+
+<Terminal where="mac" title="Sửa CacheConfig">
+
+```bash
+cd ~/masteva-j16/shop
+cat > src/main/java/dev/masteva/shop/CacheConfig.java <<'EOF'
+package dev.masteva.shop;
+
+import dev.masteva.shop.catalog.Product;
+import java.time.Duration;
+import org.springframework.boot.cache.autoconfigure.RedisCacheManagerBuilderCustomizer;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheWriter;
+import org.springframework.data.redis.cache.RedisCacheWriter.TtlFunction;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.serializer.JacksonJsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext.SerializationPair;
+
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    @Bean
+    RedisCacheManagerBuilderCustomizer productsCache(RedisConnectionFactory connectionFactory) {
+        RedisCacheConfiguration products = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(10))
+                .disableCachingNullValues()
+                .serializeValuesWith(SerializationPair.fromSerializer(
+                        new JacksonJsonRedisSerializer<>(Product.class)));
+        // Khoá "<tên cache>~lock" trong Redis; tự hết hạn sau 5 giây nếu instance giữ khoá bị chết
+        RedisCacheWriter lockingWriter = RedisCacheWriter.create(connectionFactory,
+                writer -> writer.enableLocking(lock -> lock.lockTimeout(TtlFunction.just(Duration.ofSeconds(5)))));
+        return builder -> builder.cacheWriter(lockingWriter).withCacheConfiguration("products", products);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Chạy lại tab 1, rồi lặp lại đúng lệnh vừa rồi ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec masteva-j16-redis redis-cli DEL products::1
+curl -s -X DELETE localhost:20160/stats
+seq 20 | xargs -P 20 -I{} curl -s -o /dev/null localhost:20160/products/1
+curl -s localhost:20160/stats; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1
+{"dbQueries":1}
+```
+
+</Expected>
+
+Lần này `DEL` trả `1` vì key còn từ lần trước (trả `0` nếu bạn sửa code lâu hơn 10 phút, khi key đã hết hạn). Chỉ một truy vấn: thread đầu tiên giữ khoá `products~lock` trong Redis, 19 thread còn lại chờ, rồi đọc thấy giá trị vừa ghi. Khoá nằm trong Redis nên có hiệu lực với mọi instance, nhưng nó khoá **cả cache `products`**, không riêng một key: trong lúc một thread nạp sản phẩm 1, mọi lệnh đọc và ghi vào cache `products` ở mọi instance, kể cả lệnh đọc sẽ trúng cache, đều chờ và hỏi `EXISTS products~lock` mỗi 50 ms. `lockTimeout` 5 giây giữ cho khoá không kẹt mãi khi instance giữ khoá chết; mặc định khoá không có hạn. Nếu một lần nạp chạy lâu hơn 5 giây, thread khác sẽ giành khoá và nạp song song.
+
+<Check id="j16.1.lab-stampede">Tái hiện được stampede 20 truy vấn với `sync = true`, giảm còn 1 bằng cache writer có khoá, và nói được cái giá của khoá theo cả cache.</Check>
+
+### 10. Hit ratio từ phía Redis
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec masteva-j16-redis redis-cli INFO stats | grep -E '^keyspace_(hits|misses)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+keyspace_hits:243
+keyspace_misses:156
+```
+
+</Expected>
+
+Con số trên máy bạn sẽ khác. Hit ratio là `hits / (hits + misses)`. Cache writer có khoá kiểm tra khoá `products~lock` bằng lệnh `EXISTS`, và Redis đếm cả các lần kiểm tra đó, nên ở lab con số không phản ánh đúng hit ratio của dữ liệu; trên production, theo dõi tỉ lệ này cùng `evicted_keys` và `used_memory` (cũng trong `INFO`) qua metrics như J15.
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `docker: Error response from daemon: Conflict. The container name "/masteva-j16-redis" is already in use`: container đã có từ lần trước. Chạy `docker start masteva-j16-redis` thay cho `docker run`.
+- `Could not connect to Redis at 127.0.0.1:6379: Connection refused` ngay sau `docker run`: Redis chưa khởi động xong, đợi một giây rồi chạy lại.
+- Ứng dụng log `Unable to connect to Redis` hoặc request treo rồi `500`: Redis chưa chạy, hoặc `spring.data.redis.port` không phải `20162`.
+- `release version 25 not supported` khi build: Maven đang chạy trên JDK cũ. Đặt lại `JAVA_HOME` như phần Chuẩn bị.
+- `Web server failed to start. Port 20160 was already in use.`: ứng dụng ở lần chạy trước chưa tắt. Tìm bằng `lsof -nP -iTCP:20160 -sTCP:LISTEN`.
+- Gọi `/products/1` không thấy log `DB query` lần nào nữa dù đã sửa code: key cũ vẫn còn trong Redis tới hết TTL. Xoá bằng `docker exec masteva-j16-redis redis-cli DEL products::1`.
+
+</Callout>
+
+### Dọn dẹp
+
+Bấm Ctrl+C ở tab 1. Giữ nguyên `~/masteva-j16/shop` và container Redis: J16.2 dùng tiếp. Nếu muốn giải phóng bộ nhớ trong lúc nghỉ, `docker stop masteva-j16-redis` dừng container mà không mất gì; bài sau bắt đầu bằng `docker start`.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Thêm method findAll gọi this.find(id) trong cùng ProductService. Vì sao không có lần nào trúng cache?">
+
+Cache hoạt động nhờ proxy bọc bên ngoài bean. Controller gọi `service.find(1)` là gọi vào proxy, proxy tra cache. Còn `this.find(id)` bên trong `ProductService` gọi thẳng vào đối tượng thật, không qua proxy, nên annotation không có tác dụng. Cách sửa: đặt method cần cache ở một bean khác, hoặc gọi qua bean được inject. Lỗi này cũng gặp với `@Transactional` ở J12 vì cùng cơ chế proxy.
+
+</Reveal>
+
+<Reveal title="Kẻ xấu gọi /products/1, /products/2, ... tới hàng triệu id không tồn tại. Cache có giúp gì không?">
+
+Không. Id không tồn tại ném `404`, exception không được cache, nên mọi request đều tới database. Hiện tượng này gọi là **cache penetration**. Cách chống thường gặp: cache cả kết quả "không có" với TTL ngắn (negative caching, ví dụ 30 giây), kiểm tra id hợp lệ trước khi tra (bộ lọc Bloom, khoảng id), và rate limit theo client. Với Spring Cache, negative caching cần cho phép giá trị `null` và một serializer xử lý được nó, nên nhiều đội tự viết lớp cache-aside cho trường hợp này.
+
+</Reveal>
+
+<Reveal title="Redis chết giữa giờ cao điểm. Ứng dụng của bạn trả 500 hay vẫn chạy chậm?">
+
+Với cấu hình lab, mọi lời gọi `find` đều ném lỗi kết nối, tức là `500`: cache vốn chỉ để tăng tốc lại thành điểm chết của cả hệ thống. Spring Cache cho phép khai báo `CacheErrorHandler` để bỏ qua lỗi cache và gọi thẳng method, chấp nhận chậm hơn. Đi kèm phải có timeout kết nối ngắn (`spring.data.redis.timeout`), nếu không mỗi request vẫn chờ lâu trước khi rơi xuống database. Và database phải chịu nổi tải khi không có cache, hoặc phải có rate limit.
+
+</Reveal>
+
+<Reveal title="Khi nào nên dùng cache trong JVM như Caffeine thay vì Redis?">
+
+Cache trong JVM nhanh hơn (không qua mạng, không serialize) nhưng mỗi instance giữ bản riêng: sửa giá ở instance A, instance B vẫn giữ giá cũ tới hết TTL, và bộ nhớ heap bị chia cho cache. Redis cho mọi instance cùng một bản, xoá một lần là xong. Nhiều hệ thống dùng hai tầng: Caffeine TTL vài giây cho dữ liệu cực nóng, Redis TTL vài phút phía sau. Đổi lại là phải nghĩ kỹ cách xoá ở cả hai tầng.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết cấu hình `RedisCacheManager` hoặc giải thích một lỗi serialize. AI hay đưa `GenericJackson2JsonRedisSerializer` của Jackson 2 (đã deprecated trong Spring Data Redis 4), khẳng định `@Cacheable(sync = true)` chống được stampede trên mọi instance, hoặc dùng `KEYS` trong code production. Kiểm tra lại bằng chính lab: bắn 20 request song song và đọc `/stats`, xem key và `TTL` trong `redis-cli`.
+
+</Callout>
+
+<Callout kind="link">
+
+Khi ghép với database thật như J12, xoá cache nên chạy sau khi transaction commit. Dùng Micrometer như J15 để đưa hit ratio và độ trễ Redis lên dashboard. J16.2 dùng `SET ... NX` của Redis để consumer Kafka bỏ qua message trùng; J16.3 dùng Redis làm khoá cho job định kỳ. Lộ trình Microservices, chặng M5, đi tiếp về messaging giữa các service.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j16.1.mastery-design">Với một loại dữ liệu cho trước (giá, tồn kho, hồ sơ người dùng), chọn được có cache hay không, TTL bao lâu, xoá cache lúc nào và chống stampede bằng cách nào, kèm lý do.</Check>
+
+<Check id="j16.1.mastery-spring-cache">Tự cấu hình được Spring Cache với Redis có TTL và serializer JSON cho từng cache, và giải thích được vì sao `sync = true` một mình không đủ chống stampede với Redis.</Check>
+
+</Mastery>

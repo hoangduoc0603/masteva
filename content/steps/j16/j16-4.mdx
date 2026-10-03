@@ -1,0 +1,698 @@
+---
+title: Spring Batch, chunk, skip và restart
+description: Khi nào một job định kỳ cần Spring Batch thay vì một method @Scheduled; viết job import CSV đơn hàng theo chunk, bỏ qua dòng hỏng bằng skip policy, cài lỗi giữa file rồi restart và đọc tiến độ thật trong các bảng JobRepository bằng psql.
+id: j16.4
+step: j16
+prerequisites: [j16.3]
+topics: [j16.spring-batch]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    spring-batch: 6.0.5
+    docker: 29.8.0
+    postgresql: "18.6"
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biết khi nào việc định kỳ cần Spring Batch thay vì một method `@Scheduled` như J16.3, và viết được một job import theo chunk có skip và restart. Học xong bài này, bạn giải thích được:
+
+- Vì sao job import chết ở đơn thứ 17 chạy lại không ghi trùng 13 đơn đã nhập, cũng không bắt đầu lại từ dòng đầu.
+- Vì sao ba dòng hỏng trong file không làm hỏng cả lần import, và số dòng bị bỏ qua nằm ở cột nào trong database.
+- Vì sao chạy lại một job đã xong với cùng tham số bị từ chối, và vì sao đó là điều bạn muốn.
+
+</Goal>
+
+<Knowledge>
+
+### Khi một method @Scheduled không còn đủ
+
+Mỗi đêm, đối tác gửi file CSV vài trăm nghìn đơn hàng để nhập vào bảng `imported_orders`. Một method `@Scheduled` đọc từng dòng rồi `INSERT` chạy tốt cho tới đêm đầu tiên có sự cố: chết ở dòng 170.000 thì chạy lại từ dòng 1 và ghi trùng; một dòng sai định dạng làm hỏng cả lần chạy, hoặc bị một `catch` nuốt mất; kế toán hỏi "đêm 3/10 nhập bao nhiêu đơn" thì chỉ còn log để lục.
+
+**Spring Batch** là framework cho đúng loại việc này: xử lý một lượng dữ liệu lớn, có đầu có cuối, phải chạy lại được an toàn. Nó không phải scheduler; thứ kích hoạt job vẫn là `@Scheduled`, cron hay Kubernetes CronJob.
+
+### Job, Step và JobRepository
+
+```text
+JobOperator.start(job, tham số)
+ └─ Job "importOrdersJob"
+     └─ Step "importOrders", chunk = 5
+         ┌──────────── một transaction cho mỗi chunk ────────────┐
+         │ read 5 dòng → process từng dòng → write cả chunk một lần │
+         │ cập nhật bộ đếm và vị trí đọc vào JobRepository          │
+         └──────────────────────── commit ───────────────────────┘
+ JobRepository = các bảng batch_* trong PostgreSQL
+```
+
+| Khái niệm | Nghĩa | Trong lab |
+|---|---|---|
+| `Job` | Một công việc, gồm một hay nhiều `Step` | `importOrdersJob` |
+| `JobInstance` | Job cộng với bộ tham số định danh (identifying parameters) | `importOrdersJob` + `inputFile=orders.csv` |
+| `JobExecution` | Một lần chạy của một instance; instance có thể chạy nhiều lần tới khi xong | Lần chạy hỏng và lần restart |
+| `StepExecution` | Một lần chạy của một step, kèm bộ đếm read, write, skip, commit, rollback | Một dòng trong `batch_step_execution` |
+| `ExecutionContext` | Map trạng thái được lưu cùng mỗi commit, ví dụ vị trí đọc trong file | Khoá `orderReader.read.count` |
+| `JobRepository` | Nơi lưu tất cả những thứ trên | 6 bảng `batch_*` |
+
+Điểm quan trọng nhất: **restart áp dụng cho JobInstance**. Chạy với đúng tham số định danh của một instance đã `FAILED` là restart instance đó; chạy lại một instance đã `COMPLETED` bị từ chối; đổi tham số là một instance mới, bắt đầu từ đầu.
+
+<Check id="j16.4.instance-execution">Phân biệt được JobInstance và JobExecution, và đoán được một lần chạy với tham số cho trước là restart, bị từ chối hay là instance mới.</Check>
+
+### Chunk: vì sao restart chính xác
+
+Reader đọc từng dòng, processor kiểm tra từng dòng, writer ghi cả chunk bằng một lệnh JDBC batch. Mỗi chunk là **một transaction**, gồm cả dữ liệu ghi vào `imported_orders` lẫn vị trí đọc ghi vào `batch_step_execution_context`. Hai thứ cùng commit hoặc cùng rollback, nên vị trí đã lưu luôn khớp với dữ liệu đã ghi. Với file của lab:
+
+```text
+dòng trong file   o-01..o-05 | o-06..o-10 | o-11..o-15  | o-16..o-20
+chunk                  1     |     2      |     3       |     4
+bỏ qua                       | o-07 (đọc) | o-12 (xử lý)|
+kết quả             commit   |  commit    |  commit     | o-17 lỗi → rollback, step FAILED
+read.count đã lưu      5     |    10      |    15       | (không lưu)
+restart                                                   → đọc tiếp từ đơn thứ 16 (`o-16`)
+```
+
+Chunk nhỏ thì restart làm lại ít và transaction ngắn, nhưng nhiều commit hơn, mỗi commit thêm một lần ghi metadata. Chunk lớn ghi JDBC batch hiệu quả hơn, nhưng một lỗi làm rollback nhiều dòng. Lab dùng 5 để thấy rõ ranh giới; production thường chọn vài trăm tới vài nghìn rồi đo.
+
+### Skip và retry
+
+| Loại lỗi | Ví dụ | Cấu hình | Kết quả |
+|---|---|---|---|
+| Dữ liệu sai, chạy lại vẫn sai | `quantity` là `abc`, thiếu `customer_id` | `skip(...)` kèm `skipLimit(n)` | Bỏ dòng đó, tăng `READ_SKIP_COUNT` hoặc `PROCESS_SKIP_COUNT` |
+| Lỗi tạm thời | Deadlock, timeout mạng | `retry(...)` kèm `retryLimit(n)` | Thử lại dòng hoặc chunk đó |
+| Lỗi hạ tầng kéo dài | Dịch vụ kho sập, database đích đầy | Không skip, không retry | Rollback chunk, step `FAILED`, chờ restart |
+
+Quá `skipLimit` thì step cũng `FAILED`. Giới hạn này là cầu chì: file có 40% số dòng hỏng thì nên dừng để người xem, không nên "nhập thành công" phần còn lại.
+
+<Callout kind="production">
+
+Một job đối soát đặt `skipLimit(Integer.MAX_VALUE)` cho "khỏi phiền". Ba tháng sau, đối tác đổi thứ tự cột trong file; mọi dòng đều hỏng định dạng, đều bị skip, job vẫn báo `COMPLETED` mỗi đêm với 0 dòng được ghi. Đặt `skipLimit` theo mức chấp nhận được, ghi dòng bị bỏ qua ra bảng lỗi qua `SkipListener`, và cảnh báo khi `READ_SKIP_COUNT + PROCESS_SKIP_COUNT` vượt ngưỡng.
+
+</Callout>
+
+### Spring Batch 6 trong Spring Boot 4
+
+| Điểm | Batch 5, Boot 3 | Batch 6, Boot 4 |
+|---|---|---|
+| Starter | `spring-boot-starter-batch` có JobRepository JDBC | `spring-boot-starter-batch` dùng `ResourcelessJobRepository`, không lưu gì; lưu vào database cần `spring-boot-starter-batch-jdbc` |
+| Chạy job | `JobLauncher.run(...)` | `JobOperator.start(...)`; `JobLauncher` deprecated |
+| Step theo chunk | `chunk(5, transactionManager)` | `chunk(5)` rồi `.transactionManager(...)`, dựng `ChunkOrientedStep` mới; dạng cũ deprecated |
+| Package reader, writer | `org.springframework.batch.item...` | `org.springframework.batch.infrastructure.item...` |
+
+AI và nhiều bài viết cũ vẫn dùng cột giữa; code đó không biên dịch, hoặc biên dịch kèm cảnh báo deprecated trên Batch 6.
+
+### Batch hay @Scheduled
+
+| Tiêu chí | `@Scheduled` (J16.3) | Spring Batch |
+|---|---|---|
+| Đơn vị | Một method | Job gồm các Step, chạy theo chunk |
+| Chết giữa chừng | Chạy lại từ đầu, tự lo chuyện ghi trùng | Restart từ chunk cuối đã commit |
+| Dòng hỏng | Tự viết `try`/`catch` và đếm | `skip`, `skipLimit`, đếm sẵn trong JobRepository |
+| Lịch sử chạy | Log | Bảng `batch_*`: trạng thái, thời gian, số dòng |
+| Chạy trùng | ShedLock chặn chạy chồng | Instance đã `COMPLETED` thì từ chối; vẫn cần ShedLock nếu kích hoạt từ nhiều instance |
+| Chi phí | Gần như không | 6 bảng metadata, một starter, nhiều khái niệm mới, test phức tạp hơn |
+| Hợp với | Việc vài giây, idempotent: nhắc thanh toán, dọn cache | Import, export, đối soát hàng trăm nghìn dòng |
+
+Chọn Batch khi có ít nhất hai điều: chạy lại từ đầu tốn kém; cần bỏ qua dòng hỏng và báo lại con số; cần lịch sử chạy cho đối soát hay kiểm toán; job có nhiều bước cần chạy lại riêng từng bước. Còn lại, `@Scheduled` cộng ShedLock là đủ.
+
+Hai thứ thường đi cùng nhau: `@Scheduled` quyết định **khi nào**, Spring Batch lo **chạy cho đúng**. Đoạn dưới đây không nằm trong lab, nhưng đã được biên dịch với cùng phiên bản:
+
+```java
+private static final ZoneId VN = ZoneId.of("Asia/Ho_Chi_Minh");
+
+@Scheduled(cron = "0 0 2 * * *", zone = "Asia/Ho_Chi_Minh") // nhiều instance: thêm @SchedulerLock như J16.3
+void importYesterday() throws Exception {
+    LocalDate day = LocalDate.now(VN).minusDays(1);
+    var params = new JobParametersBuilder()
+            .addString("inputFile", "/data/orders-" + day + ".csv")
+            .toJobParameters();
+    jobOperator.start(importOrdersJob, params); // cùng ngày mà lần trước FAILED: đây là restart
+}
+```
+
+Khi kích hoạt kiểu này, đặt `spring.batch.job.enabled=false` để Spring Boot không tự chạy job lúc ứng dụng khởi động.
+
+<Check id="j16.4.batch-vs-scheduled">Với một việc định kỳ cho trước, chọn được `@Scheduled` hay Spring Batch và nêu được chi phí của lựa chọn đó.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Spring Batch Overview](https://docs.spring.io/spring-batch/reference/): bức tranh tổng quan và các tình huống Spring Batch nhắm tới.
+- [The Domain Language of Batch](https://docs.spring.io/spring-batch/reference/domain.html): đọc kỹ phần JobInstance, JobParameters và JobExecution; đây là gốc của mọi hành vi restart trong bài.
+- [Configuring Skip Logic](https://docs.spring.io/spring-batch/reference/step/chunk-oriented-processing/configuring-skip.html): `skip`, `skipLimit`, `noSkip` và cách chọn exception được bỏ qua.
+- [What's new in Spring Batch 6](https://docs.spring.io/spring-batch/reference/whatsnew.html): mục mô hình chunk mới, `JobOperator` và khả năng recover lần chạy bị kẹt.
+- [Creating a Batch Service](https://spring.io/guides/gs/batch-processing/): ví dụ import CSV vào database theo chunk, để so với lab này.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25, Maven 3.9 và Docker như các bài trước của J16; máy cần mạng để tải image `postgres:18-alpine` và tạo project từ start.spring.io. Lab là một project mới, `~/masteva-j16/batch`, độc lập với project `shop`. PostgreSQL chạy ở cổng **20320**; cổng này phải đang trống. Cả bài dùng **một tab Terminal**; nếu mở tab mới, chạy lại `export JAVA_HOME` và định nghĩa lại hàm `shopsql` ở bước 1.
+
+### 1. PostgreSQL và bảng đích
+
+Trỏ Maven về JDK 25 như J7.1, chạy PostgreSQL, định nghĩa hàm `shopsql` như J12.1, rồi tạo bảng đích. Khoá chính `order_id` sẽ tố cáo ngay nếu job ghi trùng.
+
+<Terminal where="mac">
+
+```bash
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+docker run -d --name masteva-j16opt-pg -e POSTGRES_PASSWORD=masteva -e POSTGRES_DB=shop \
+  -p 20320:5432 postgres:18-alpine
+until docker exec masteva-j16opt-pg pg_isready -h 127.0.0.1 -U postgres; do sleep 1; done
+shopsql() { docker exec -i masteva-j16opt-pg psql -U postgres -d shop "$@"; }
+shopsql <<'SQL'
+CREATE TABLE imported_orders (
+  order_id    text PRIMARY KEY,
+  customer_id text NOT NULL,
+  product_id  bigint NOT NULL,
+  quantity    int NOT NULL CHECK (quantity BETWEEN 1 AND 100)
+);
+SQL
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+127.0.0.1:5432 - accepting connections
+CREATE TABLE
+```
+
+</Expected>
+
+Dòng đầu mà `docker run` in ra là mã container, khác nhau mỗi lần nên đã lược, cùng vài dòng `127.0.0.1:5432 - no response` có thể xuất hiện khi PostgreSQL còn khởi tạo. Vòng `until` hỏi lại mỗi giây tới khi `pg_isready` thành công. `-h 127.0.0.1` buộc nó hỏi qua TCP: lúc khởi tạo, image chạy một server tạm chỉ nghe trên Unix socket, nên hỏi qua socket có thể báo sẵn sàng quá sớm.
+
+### 2. Tạo project
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-j16 && cd ~/masteva-j16
+curl -s https://start.spring.io/starter.tgz \
+  -d type=maven-project -d language=java -d bootVersion=4.1.1 -d javaVersion=25 \
+  -d groupId=dev.masteva -d artifactId=batch -d baseDir=batch \
+  -d packageName=dev.masteva.batch -d dependencies=batch-jdbc,postgresql | tar -xzf -
+cd batch && grep -o 'spring-boot-starter-[a-z-]*' pom.xml | sort -u
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+spring-boot-starter-batch-jdbc
+spring-boot-starter-batch-jdbc-test
+spring-boot-starter-parent
+```
+
+</Expected>
+
+Dependency là `batch-jdbc`, không phải `batch`: chỉ bản JDBC mới lưu JobRepository vào PostgreSQL. Project không có `web`, nên ứng dụng chạy job xong rồi thoát, không mở cổng HTTP nào.
+
+### 3. File CSV có ba dòng hỏng
+
+30 đơn hàng cùng hình dạng với sự kiện `OrderPlaced` ở J16.2, rồi cài sẵn ba lỗi dữ liệu:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j16/batch
+{
+  echo 'order_id,customer_id,product_id,quantity'
+  for i in $(seq 30); do printf 'o-%02d,cus-%d,%d,%d\n' $i $((i % 4 + 1)) $((i % 5 + 1)) $((i % 3 + 1)); done
+} > orders.csv
+perl -pi -e 's/^(o-07,.*),\d+$/$1,abc/; s/^(o-12,.*),\d+$/$1,0/; s/^o-23,[^,]*/o-23,/' orders.csv
+wc -l orders.csv && grep -nE '^o-(07|12|23),' orders.csv
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+      31 orders.csv
+8:o-07,cus-4,3,abc
+13:o-12,cus-1,3,0
+24:o-23,,4,3
+```
+
+</Expected>
+
+`o-07` hỏng định dạng (reader không đổi được `abc` thành số), `o-12` có số lượng 0, `o-23` thiếu khách hàng. Số dòng tính cả dòng tiêu đề, nên `o-07` nằm ở dòng 8.
+
+### 4. Reader, processor, writer
+
+Cấu hình, record `OrderPlaced` và processor. Dòng `perl` sửa `main` để trạng thái job thành exit code của tiến trình: cron hay Kubernetes nhờ đó biết lần chạy hỏng. Thuộc tính `lab.crash-at` là **lỗi cài sẵn** cho lab: giả lập dịch vụ kho sập khi xử lý một đơn, loại lỗi không được skip.
+
+<Terminal where="mac" title="Tạo cấu hình, OrderPlaced, OrderValidator">
+
+```bash
+cd ~/masteva-j16/batch && mkdir -p src/main/java/dev/masteva/batch/orders
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=batch
+spring.datasource.url=jdbc:postgresql://localhost:20320/shop
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+spring.batch.jdbc.initialize-schema=always
+spring.main.banner-mode=off
+logging.pattern.console=%d{HH:mm:ss.SSS} %-5level %logger{0}: %msg%n
+EOF
+perl -pi -e 's/(SpringApplication\.run\(BatchApplication\.class, args\));/System.exit(SpringApplication.exit($1));/' \
+  src/main/java/dev/masteva/batch/BatchApplication.java
+cat > src/main/java/dev/masteva/batch/orders/OrderPlaced.java <<'EOF'
+package dev.masteva.batch.orders;
+
+/** Một dòng trong file CSV, cùng hình dạng với sự kiện OrderPlaced ở J16.2. */
+public record OrderPlaced(String orderId, String customerId, long productId, int quantity) {
+}
+EOF
+cat > src/main/java/dev/masteva/batch/orders/OrderValidator.java <<'EOF'
+package dev.masteva.batch.orders;
+
+import org.springframework.batch.infrastructure.item.ItemProcessor;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+@Component
+public class OrderValidator implements ItemProcessor<OrderPlaced, OrderPlaced> {
+
+    /** Dữ liệu của dòng sai: bỏ qua dòng đó, không dừng job. */
+    public static class InvalidOrderException extends RuntimeException {
+        public InvalidOrderException(String message) {
+            super(message);
+        }
+    }
+
+    private final String crashAt;
+
+    public OrderValidator(@Value("${lab.crash-at:}") String crashAt) {
+        this.crashAt = crashAt;
+    }
+
+    @Override
+    public OrderPlaced process(OrderPlaced order) {
+        if (order.orderId().equals(crashAt)) { // lỗi cài sẵn cho lab
+            throw new IllegalStateException("inventory service unavailable at " + order.orderId());
+        }
+        if (order.customerId().isBlank()) {
+            throw new InvalidOrderException(order.orderId() + ": missing customer_id");
+        }
+        if (order.quantity() < 1 || order.quantity() > 100) {
+            throw new InvalidOrderException(order.orderId() + ": quantity " + order.quantity() + " out of 1..100");
+        }
+        return order;
+    }
+}
+EOF
+grep -n 'System.exit' src/main/java/dev/masteva/batch/BatchApplication.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10:		System.exit(SpringApplication.exit(SpringApplication.run(BatchApplication.class, args)));
+```
+
+</Expected>
+
+`spring.batch.jdbc.initialize-schema=always` tạo 6 bảng `batch_*` lúc khởi động. Mặc định là `embedded`, tức chỉ tạo với database nhúng như H2, không tạo với PostgreSQL.
+
+Cấu hình job: reader đọc CSV thành record, writer ghi bằng JDBC batch, step gắn chúng với chunk 5 và skip policy.
+
+<Terminal where="mac" title="Tạo ImportOrdersJobConfig và build">
+
+```bash
+cd ~/masteva-j16/batch
+cat > src/main/java/dev/masteva/batch/orders/ImportOrdersJobConfig.java <<'EOF'
+package dev.masteva.batch.orders;
+
+import javax.sql.DataSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.batch.core.job.Job;
+import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.listener.SkipListener;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.core.step.Step;
+import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.infrastructure.item.database.JdbcBatchItemWriter;
+import org.springframework.batch.infrastructure.item.database.builder.JdbcBatchItemWriterBuilder;
+import org.springframework.batch.infrastructure.item.file.FlatFileItemReader;
+import org.springframework.batch.infrastructure.item.file.FlatFileParseException;
+import org.springframework.batch.infrastructure.item.file.builder.FlatFileItemReaderBuilder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.jdbc.core.namedparam.SimplePropertySqlParameterSource;
+import org.springframework.transaction.PlatformTransactionManager;
+
+@Configuration
+public class ImportOrdersJobConfig {
+    private static final Logger log = LoggerFactory.getLogger(ImportOrdersJobConfig.class);
+
+    @Bean
+    @StepScope // tạo mới cho mỗi lần chạy step, để đọc được jobParameters
+    FlatFileItemReader<OrderPlaced> orderReader(@Value("#{jobParameters['inputFile']}") String inputFile) {
+        return new FlatFileItemReaderBuilder<OrderPlaced>()
+                .name("orderReader") // tiền tố của khoá lưu vị trí đọc trong ExecutionContext
+                .resource(new FileSystemResource(inputFile))
+                .linesToSkip(1)
+                .delimited().names("orderId", "customerId", "productId", "quantity")
+                .targetType(OrderPlaced.class)
+                .build();
+    }
+
+    @Bean
+    JdbcBatchItemWriter<OrderPlaced> orderWriter(DataSource dataSource) {
+        return new JdbcBatchItemWriterBuilder<OrderPlaced>()
+                .dataSource(dataSource)
+                .sql("""
+                        INSERT INTO imported_orders (order_id, customer_id, product_id, quantity)
+                        VALUES (:orderId, :customerId, :productId, :quantity)""")
+                .itemSqlParameterSourceProvider(SimplePropertySqlParameterSource::new)
+                .build();
+    }
+
+    @Bean
+    Step importOrders(JobRepository jobRepository, PlatformTransactionManager transactionManager,
+                      FlatFileItemReader<OrderPlaced> orderReader, OrderValidator orderValidator,
+                      JdbcBatchItemWriter<OrderPlaced> orderWriter) {
+        return new StepBuilder("importOrders", jobRepository)
+                .<OrderPlaced, OrderPlaced>chunk(5) // 5 dòng một transaction
+                .transactionManager(transactionManager)
+                .reader(orderReader)
+                .processor(orderValidator)
+                .writer(orderWriter)
+                .faultTolerant()
+                .skip(FlatFileParseException.class, OrderValidator.InvalidOrderException.class)
+                .skipLimit(5)
+                .skipListener(new SkipListener<OrderPlaced, OrderPlaced>() {
+                    @Override
+                    public void onSkipInRead(Throwable t) {
+                        log.warn("skip in read: {}", t.getMessage());
+                    }
+
+                    @Override
+                    public void onSkipInProcess(OrderPlaced item, Throwable t) {
+                        log.warn("skip in process: {}", t.getMessage());
+                    }
+                })
+                .build();
+    }
+
+    @Bean
+    Job importOrdersJob(JobRepository jobRepository, Step importOrders) {
+        return new JobBuilder("importOrdersJob", jobRepository).start(importOrders).build();
+    }
+}
+EOF
+mvn -q package -DskipTests && ls target/*.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+target/batch-0.0.1-SNAPSHOT.jar
+```
+
+</Expected>
+
+- `@StepScope` và `#{jobParameters['inputFile']}`: reader được tạo khi step chạy, đọc đường dẫn file từ tham số của job.
+- `.name("orderReader")`: reader lưu vị trí đọc vào ExecutionContext dưới khoá `orderReader.read.count`, dạng Java serialization mã hoá base64 trong cột `short_context`. Đây là thứ làm restart khả thi.
+- `SimplePropertySqlParameterSource`: lấy giá trị `:orderId`, `:quantity` từ accessor của record.
+- `.skip(...)` liệt kê **chính xác** các exception là lỗi dữ liệu. `IllegalStateException` không có trong danh sách, nên lỗi cài sẵn làm step dừng.
+
+Như J9.3, Maven chạy trên JDK 25 in thêm vài dòng `WARNING:` về native access; các khối kết quả đã lược chúng.
+
+### 5. Chạy lần đầu, hỏng ở o-17
+
+`--lab.crash-at=o-17` có hai dấu gạch nên là thuộc tính của Spring. `inputFile=orders.csv` không có dấu gạch nên Spring Boot đổi nó thành tham số định danh của job. Log ghi ra `run1.log` để giữ exit code của `java`; `sed` rút gọn đường dẫn thư mục home thành `~`.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j16/batch
+java -jar target/batch-0.0.1-SNAPSHOT.jar --lab.crash-at=o-17 inputFile=orders.csv > run1.log 2>&1; echo "exit=$?"
+grep -E 'skip in|status: \[' run1.log | sed "s|$HOME|~|"
+grep -m1 'Caused by: java' run1.log
+```
+
+</Terminal>
+
+<Predict question="Ba chunk đầu đã commit trước khi o-17 gây lỗi. Bảng imported_orders có bao nhiêu dòng, và đơn cuối cùng là đơn nào?">
+
+```text
+exit=5
+01:55:27.321 WARN  ImportOrdersJobConfig: skip in read: Parsing error at line: 8 in resource=[file [~/masteva-j16/batch/orders.csv]], input=[o-07,cus-4,3,abc]
+01:55:27.325 WARN  ImportOrdersJobConfig: skip in process: o-12: quantity 0 out of 1..100
+01:55:27.345 INFO  TaskExecutorJobLauncher: Job: [SimpleJob: [name=importOrdersJob]] completed with the following parameters: [{JobParameter{name='inputFile', value=orders.csv, type=class java.lang.String, identifying=true}}] and the following status: [FAILED] in 69ms
+Caused by: java.lang.IllegalStateException: inventory service unavailable at o-17
+```
+
+Bước 6 trả lời bằng số thật: 13 dòng, đơn cuối là `o-15`. Ba chunk đầu đọc 15 dòng, bỏ `o-07` và `o-12`, ghi 13 đơn. Chunk 4 (`o-16` tới `o-20`) đã đọc nhưng rollback cả chunk, kể cả `o-16` vốn hợp lệ. `exit=5` là mã Spring Boot trả về khi job `FAILED`. Giờ trong log khác trên máy bạn.
+
+</Predict>
+
+### 6. Đọc JobRepository bằng psql
+
+Lưu các truy vấn vào một file để dùng lại sau mỗi lần chạy:
+
+<Terminal where="mac">
+
+```bash
+cat > status.sql <<'EOF'
+SELECT count(*) AS imported, max(order_id) AS last_order FROM imported_orders;
+SELECT e.job_execution_id AS exec, i.job_instance_id AS inst, e.status, e.exit_code
+FROM batch_job_execution e JOIN batch_job_instance i USING (job_instance_id) ORDER BY 1;
+SELECT step_execution_id AS step, job_execution_id AS exec, status, read_count AS read,
+       write_count AS write, commit_count AS commits, rollback_count AS rollbacks,
+       read_skip_count AS read_skip, process_skip_count AS proc_skip
+FROM batch_step_execution ORDER BY 1;
+EOF
+shopsql < status.sql
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ imported | last_order 
+----------+------------
+       13 | o-15
+(1 row)
+
+ exec | inst | status | exit_code 
+------+------+--------+-----------
+    1 |    1 | FAILED | FAILED
+(1 row)
+
+ step | exec | status | read | write | commits | rollbacks | read_skip | proc_skip 
+------+------+--------+------+-------+---------+-----------+-----------+-----------
+    1 |    1 | FAILED |   19 |    13 |       3 |         1 |         1 |         1
+(1 row)
+```
+
+</Expected>
+
+- `read` 19: 14 đơn đọc được ở ba chunk đầu (15 dòng trừ `o-07` hỏng định dạng) cộng 5 đơn của chunk 4.
+- `write` 13 khớp với bảng đích; `commits` 3 và `rollbacks` 1 kể đúng câu chuyện ở sơ đồ chunk.
+- `read_skip` 1 là `o-07`, `proc_skip` 1 là `o-12`. Đây là các con số nên đưa lên dashboard và cảnh báo.
+
+<Check id="j16.4.lab-skip">Chạy được job có skip policy, và chỉ ra trong `batch_step_execution` số dòng đã đọc, đã ghi, đã bỏ qua lúc đọc và lúc xử lý.</Check>
+
+### 7. Restart
+
+Gỡ lỗi cài sẵn (bỏ `--lab.crash-at`), giữ nguyên tham số `inputFile=orders.csv`:
+
+<Terminal where="mac">
+
+```bash
+java -jar target/batch-0.0.1-SNAPSHOT.jar inputFile=orders.csv > run2.log 2>&1; echo "exit=$?"
+grep -oE 'skip in.*|status: \[[A-Z]+\]' run2.log
+shopsql < status.sql
+```
+
+</Terminal>
+
+<Predict question="Lần này step đọc bao nhiêu đơn? Có lỗi khoá chính vì ghi lại o-01 không?">
+
+```text
+exit=0
+skip in process: o-23: missing customer_id
+status: [COMPLETED]
+ imported | last_order 
+----------+------------
+       27 | o-30
+(1 row)
+
+ exec | inst |  status   | exit_code 
+------+------+-----------+-----------
+    1 |    1 | FAILED    | FAILED
+    2 |    1 | COMPLETED | COMPLETED
+(2 rows)
+
+ step | exec |  status   | read | write | commits | rollbacks | read_skip | proc_skip 
+------+------+-----------+------+-------+---------+-----------+-----------+-----------
+    1 |    1 | FAILED    |   19 |    13 |       3 |         1 |         1 |         1
+    2 |    2 | COMPLETED |   15 |    14 |       3 |         0 |         0 |         1
+(2 rows)
+```
+
+Execution 2 thuộc **cùng instance 1**: đây là restart, không phải lần chạy mới. Step 2 đọc đúng 15 đơn, `o-16` tới `o-30`: reader nhảy qua 15 dòng đã lưu trong context. Không có lỗi khoá chính, nên không đơn nào của ba chunk đầu bị ghi lại. 27 đơn bằng 30 trừ 3 dòng hỏng; tổng skip của instance là 3, cộng từ hai execution.
+
+</Predict>
+
+<Check id="j16.4.lab-restart">Cài được một lỗi giữa file, restart job, và dùng psql chứng minh lần restart thuộc cùng JobInstance, đọc tiếp từ chunk cuối đã commit và không ghi trùng.</Check>
+
+### 8. Chạy lại: bị từ chối, rồi "chạy lại từ đầu"
+
+Chạy thêm lần nữa với cùng tham số, như khi ai đó lỡ kích hoạt hai lần:
+
+<Terminal where="mac">
+
+```bash
+java -jar target/batch-0.0.1-SNAPSHOT.jar inputFile=orders.csv > run3.log 2>&1; echo "exit=$?"
+grep 'Caused by' run3.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+exit=1
+Caused by: org.springframework.batch.core.launch.JobInstanceAlreadyCompleteException: A job instance already exists and is complete for identifying parameters={JobParameter{name='inputFile', value=orders.csv, type=class java.lang.String, identifying=true}}.  If you want to run this job again, change the parameters.
+```
+
+</Expected>
+
+Instance đã `COMPLETED` nên bị chặn ngay, trước khi đọc dòng nào. Giờ làm điều một method `@Scheduled` tự viết sẽ làm sau sự cố: chạy lại từ đầu, không có trạng thái. Thêm một tham số bất kỳ là đủ tạo instance mới:
+
+<Terminal where="mac">
+
+```bash
+java -jar target/batch-0.0.1-SNAPSHOT.jar inputFile=orders.csv attempt=fresh > run4.log 2>&1; echo "exit=$?"
+grep -o 'status: \[[A-Z]*\]' run4.log; grep -m1 'Key (order_id)' run4.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+exit=5
+status: [FAILED]
+  Detail: Key (order_id)=(o-01) already exists.
+```
+
+</Expected>
+
+Instance mới đọc từ dòng 1 và vỡ khoá chính ngay chunk đầu. Không có khoá chính, bạn sẽ có thêm 27 đơn trùng một cách im lặng. Hai điều rút ra: restart chỉ đúng khi dùng **cùng** tham số định danh, và writer vẫn nên chống trùng (khoá chính, `ON CONFLICT DO NOTHING`) như consumer idempotent ở J16.2.
+
+<Check id="j16.4.lab-rerun">Giải thích được vì sao lần chạy cùng tham số bị từ chối còn lần chạy thêm `attempt=fresh` lại vỡ khoá chính, và nối điều đó với việc thiết kế tham số định danh.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `ERROR: relation "batch_job_instance" does not exist`: thiếu `spring.batch.jdbc.initialize-schema=always`, nên 6 bảng metadata chưa được tạo trên PostgreSQL.
+- Không có bảng `batch_*` nào, và lần chạy sau một lần hỏng lại đọc từ dòng đầu rồi vỡ khoá chính ở `o-01`: project dùng starter `batch` (kèm `jdbc`) thay vì `batch-jdbc`, nên JobRepository là `ResourcelessJobRepository`, không lưu gì.
+- `Path must not be null`: quên tham số `inputFile=orders.csv`, reader không biết đọc file nào.
+- Lần chạy ở bước 5 không hỏng mà `COMPLETED` luôn với 27 đơn: bạn viết `lab.crash-at=o-17` thiếu `--`, nên Spring Boot coi nó là tham số của job, processor không thấy. Xoá container như phần Dọn dẹp rồi làm lại từ bước 1.
+- `Bind for 0.0.0.0:20320 failed: port is already allocated` khi `docker run`: cổng đang bận. Đổi cổng ở cả `-p` lẫn `spring.datasource.url`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+`docker rm -f` dừng và xoá container PostgreSQL của bài này cùng toàn bộ dữ liệu: bảng `imported_orders` và lịch sử chạy trong các bảng `batch_*`. Image `postgres:18-alpine` vẫn còn.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp container">
+
+```bash
+docker rm -f masteva-j16opt-pg
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá project `batch` của bài này, gồm mã nguồn, file CSV và các file log. Project `shop` của J16.1 tới J16.3, nếu còn, không bị đụng tới.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp thư mục lab">
+
+```bash
+rm -rf ~/masteva-j16/batch
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Tiến trình bị kill -9 giữa một chunk. Restart có chạy được không?">
+
+Không ngay được. Tiến trình chết không kịp ghi `FAILED`, nên execution nằm lại ở `STARTED` trong `batch_job_execution`. Chạy lại cùng tham số thì Spring Batch thấy execution "đang chạy" và ném `JobExecutionAlreadyRunningException`, vì nó không phân biệt được tiến trình đã chết với một tiến trình ở máy khác còn sống. Dữ liệu thì an toàn: chunk dang dở chưa commit. Spring Batch 6 thêm `JobOperator.recover(jobExecution)` để đánh dấu execution kẹt thành `FAILED` và cho restart; trước bản 6, người vận hành thường phải sửa tay các bảng `batch_*`. Chỉ gọi `recover` khi chắc chắn tiến trình cũ đã chết.
+
+</Reveal>
+
+<Reveal title="Writer gửi message lên Kafka thay vì ghi vào PostgreSQL. Restart còn chính xác như lab không?">
+
+Không. Trong lab, dữ liệu và vị trí đọc nằm cùng một database, cùng một transaction: hoặc cả hai được commit, hoặc không gì cả. Kafka không tham gia transaction đó. Nếu tiến trình chết sau khi gửi message nhưng trước khi commit metadata, restart sẽ gửi lại cả chunk. Đây lại là at-least-once của J16.2: phía nhận phải idempotent, hoặc dùng mẫu outbox (ghi vào bảng trong cùng transaction, đẩy sang broker sau). Câu nên hỏi cho mọi job: writer có nằm cùng transaction với JobRepository không?
+
+</Reveal>
+
+<Reveal title="Writer ném lỗi khoá chính cho một đơn trong chunk 1.000 đơn, và lỗi đó được khai báo skip. Spring Batch biết đơn nào để bỏ?">
+
+Lệnh JDBC batch thất bại cho cả chunk, nên Spring Batch rollback rồi chuyển sang **scan**: ghi lại từng đơn, mỗi đơn một transaction, để tìm đúng đơn hỏng và skip nó. Log có dòng `Executing scan in new transaction after rollback`. Scan đúng nhưng chậm: một chunk 1.000 đơn thành 1.000 transaction. Nếu lỗi ghi xảy ra thường xuyên, hãy bắt lỗi sớm ở processor (như lab kiểm tra `quantity` trước khi ghi), hoặc giảm chunk size.
+
+</Reveal>
+
+<Reveal title="Ứng dụng chạy 3 instance, instance nào cũng có @Scheduled kích hoạt job lúc 2 giờ sáng. JobRepository có tự chặn chạy trùng không?">
+
+Một phần. Khi tạo JobExecution, Spring Batch kiểm tra execution đang chạy của cùng instance, và mặc định tạo metadata ở mức isolation `SERIALIZABLE` (`spring.batch.jdbc.isolation-level-for-create`), nên thường chỉ một instance tạo được execution, các instance kia nhận exception. Dựa vào exception để làm khoá thì mong manh và để lại log lỗi mỗi đêm. Cách gọn là ShedLock như J16.3 cho phần kích hoạt; JobRepository là lớp bảo vệ thứ hai. Khi một instance không đủ nhanh, Spring Batch có partitioning để chia file cho nhiều worker, nhưng đó là bước sau khi đã đo.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI dựng khung job: reader, processor, writer, skip policy. AI hay viết theo Batch 4 hoặc 5: `JobBuilderFactory`, `chunk(5, transactionManager)`, `JobLauncher`, package `org.springframework.batch.item`; hay chọn starter `batch` thay vì `batch-jdbc`; hay đặt `skip(Exception.class)`, skip luôn cả lỗi hạ tầng. Kiểm tra lại: build với đúng phiên bản Boot của bạn, đọc danh sách exception trong `.skip(...)`, rồi cài một lỗi và restart như bước 5 tới 7, xem `batch_step_execution` bằng psql.
+
+</Callout>
+
+<Callout kind="link">
+
+J12 dạy transaction và ràng buộc mà chunk dựa vào. J16.2 giải thích at-least-once và consumer idempotent, cùng bài toán với restart khi writer nằm ngoài database. J16.3 cung cấp `@Scheduled` và ShedLock để kích hoạt job. J15 đưa số dòng bị skip và thời gian chạy lên metrics. Lộ trình Microservices, chặng M5, dùng mẫu outbox nhắc ở phần Đào sâu.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j16.4.mastery-choose">Với một việc định kỳ cụ thể (nhắc thanh toán, import file đối tác, xuất báo cáo tháng), chọn được `@Scheduled` hay Spring Batch và bảo vệ lựa chọn bằng chi phí chạy lại, cách xử lý dòng hỏng và nhu cầu lịch sử chạy.</Check>
+
+<Check id="j16.4.mastery-design">Tự thiết kế được một job theo chunk: tham số định danh, chunk size, exception nào skip, exception nào làm job dừng, `skipLimit`, và cách writer chống trùng khi restart.</Check>
+
+</Mastery>

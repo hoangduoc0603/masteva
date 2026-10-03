@@ -1,0 +1,797 @@
+---
+title: Spring WebFlux, Quarkus và cái giá của lựa chọn khác
+description: Viết lại endpoint đơn hàng bằng Spring WebFlux, thấy event loop và điều xảy ra khi chặn nó, đo so với Spring MVC chạy virtual thread, rồi dựng cùng endpoint bằng Quarkus để đo thời gian khởi động và bộ nhớ.
+id: j11.4
+step: j11
+prerequisites: [j11.3]
+topics: [j11.spring-webflux, j11.quarkus-micronaut]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    quarkus: 3.40.1
+    curl: 8.4.0
+---
+
+<Goal>
+
+Bài tuỳ chọn này trả lời câu hỏi: khi nào nên rời Spring MVC, và rời thì mất gì. Bạn viết cùng một endpoint đơn hàng bằng Spring WebFlux, Spring MVC trên virtual thread và Quarkus, rồi đo bằng số thật. Học xong, bạn giải thích được:
+
+- Vì sao một lời gọi `Thread.sleep(200)` trong handler WebFlux kéo thông lượng từ khoảng 900 xuống 47 request mỗi giây, còn `block()` thì bị từ chối ngay.
+- Vì sao với một đối tác chậm 200 ms, WebFlux và MVC chạy virtual thread cho cùng thông lượng, và con số nào khác nhau thật.
+- Quarkus khởi động nhanh hơn và tốn ít bộ nhớ hơn Spring Boot bao nhiêu trên JVM, nhờ đâu, và đổi lại bạn mất gì.
+
+</Goal>
+
+<Knowledge>
+
+### Hai mô hình phục vụ request
+
+Spring MVC (J11.3) theo mô hình **thread-per-request**: mỗi request chiếm một thread từ đầu tới cuối, kể cả lúc chờ database hay đối tác. Spring WebFlux theo mô hình **event loop**: vài thread cố định xử lý mọi kết nối; code không bao giờ chờ, mà đăng ký "khi có dữ liệu thì làm tiếp việc này".
+
+```text
+ Spring MVC + virtual thread                     Spring WebFlux (Netty)
+ ---------------------------                     ----------------------
+ request 1 -> VT#1: đọc DB ... chờ ... trả lời   reactor-http-nio-1 ┐ nhận req 1, gửi lời gọi đối tác, nhả thread
+ request 2 -> VT#2: gọi đối tác ... chờ ...      reactor-http-nio-2 │ nhận req 2, ...
+ ...                                             ...                │ (số event loop = số nhân CPU, tối thiểu 4)
+ request N -> VT#N                               reactor-http-nio-10┘ đối tác trả lời req 1 -> ghi response
+ chờ = virtual thread unmount, carrier rảnh       chờ = không có thread nào bị giữ
+```
+
+Cả hai đều phục vụ được hàng nghìn request đang chờ I/O. Khác nhau ở chỗ ai trả giá: virtual thread để JVM lo việc nhả thread (J14.3), code vẫn viết tuần tự; event loop bắt chính code của bạn không được chặn.
+
+### Mono, Flux và quy tắc không chặn
+
+WebFlux dựa trên **Project Reactor**. Handler không trả `Order` mà trả một **publisher**, lời hứa sẽ phát ra dữ liệu:
+
+| Kiểu | Phát ra | Ví dụ trong lab |
+|---|---|---|
+| `Mono<T>` | 0 hoặc 1 phần tử, hoặc lỗi | `Mono<Order> get(id)`, rỗng thì thành `404` |
+| `Flux<T>` | 0 tới N phần tử, có thể vô hạn | `Flux<Order> list()`, stream server-sent events |
+
+Publisher **lười**: tạo `Mono` chưa làm gì cả; chỉ khi có người **subscribe** (ở đây là WebFlux, lúc ghi response) thì chuỗi `map`, `flatMap` mới chạy. `flatMap` nối một bước bất đồng bộ khác, như lời gọi `WebClient` tới đối tác.
+
+Quy tắc sống còn: **không chặn thread event loop**. Chỉ có khoảng 10 thread cho mọi kết nối; một thread ngủ 200 ms là một phần mười năng lực của cả server đứng yên. Mọi thứ trên đường đi phải non-blocking: `WebClient` thay cho `RestClient`, R2DBC thay cho JDBC, driver reactive cho Redis, Kafka. Reactor tự phát hiện một trường hợp, `block()` trên event loop, và ném lỗi; các lời gọi chặn khác như JDBC thì nó không thấy.
+
+<Callout kind="production">
+
+Một đội viết API gateway bằng WebFlux, rồi thêm một bước kiểm tra quyền gọi thư viện JDBC có sẵn. Thử một người thì nhanh. Khi tải lên, độ trễ mọi endpoint tăng vọt dù CPU chỉ 15%: 10 event loop thread đều đang chờ database, và hàng nghìn kết nối khác xếp hàng sau chúng. Thread dump cho thấy toàn bộ thread `reactor-http-nio-*` nằm trong code JDBC. Cách sửa là đưa lời gọi chặn sang `Schedulers.boundedElastic()` hoặc đổi sang driver reactive, và chạy BlockHound trong test để bắt lỗi này trước khi lên production (trên JDK 13+, JVM chạy test cần thêm `-XX:+AllowRedefinitionToAddDeleteMethods`).
+
+</Callout>
+
+<Check id="j11.4.reactive-model">Giải thích được event loop khác thread-per-request thế nào, `Mono` và `Flux` là gì, vì sao publisher lười, và vì sao một lời gọi chặn làm hỏng cả server WebFlux.</Check>
+
+### Quarkus và Micronaut: làm DI lúc build
+
+Spring nối bean **lúc chạy**: quét classpath, đọc annotation bằng reflection, tạo proxy (J11.1). Quarkus và Micronaut dời phần lớn việc đó về **lúc build**:
+
+| | Spring Boot | Quarkus | Micronaut |
+|---|---|---|---|
+| Nối bean | Lúc chạy, reflection | Lúc build: plugin Maven phân tích và sinh bytecode (ArC, theo CDI) | Lúc biên dịch: annotation processor sinh sẵn định nghĩa bean; bean được tạo khi lần đầu cần |
+| Thiếu bean lộ ra khi | Khởi động ứng dụng | `mvn package`: build hỏng với `UnsatisfiedResolutionException` | Chạy, lúc bean được cần lần đầu: `NoSuchBeanException` |
+| API web | Spring MVC, WebFlux | Jakarta REST (`@Path`, `@GET`) trên Vert.x | API riêng giống Spring (`@Controller`, `@Get`) trên Netty |
+| Chọn thread | MVC: thread-per-request; WebFlux: event loop | Theo kiểu trả về: kiểu thường chạy worker thread, `Uni`/`Multi` chạy event loop, `@RunOnVirtualThread` cho virtual thread | Event loop mặc định, `@ExecuteOn` để chuyển sang pool khác |
+| Native image | Có, qua Spring AOT | Trọng tâm thiết kế từ đầu | Trọng tâm thiết kế từ đầu |
+| Hệ sinh thái | Lớn nhất | Lớn, do Red Hat hậu thuẫn | Nhỏ hơn |
+
+Lab dùng Quarkus vì có dịch vụ sinh project gọi được bằng `curl` như start.spring.io, và có module tương thích một phần API Spring (`quarkus-spring-web`, `quarkus-spring-di`) giúp chuyển dần. Micronaut có ý tưởng gần giống: annotation processor sinh sẵn định nghĩa bean khi `javac` chạy, nên không cần quét classpath hay reflection lúc khởi động; nhưng thiếu bean vẫn chỉ lộ ra lúc chạy (`NoSuchBeanException`), vì bean mặc định được tạo khi lần đầu cần. Quarkus thì kiểm mọi điểm inject lúc `mvn package`: thiếu bean là build hỏng với `UnsatisfiedResolutionException`.
+
+Cái được: khởi động nhanh và tốn ít bộ nhớ hơn, vì công việc đã làm ở máy build. Cái mất: đội phải học API và cách gỡ lỗi mới; thư viện dựa vào reflection lúc chạy cần extension hoặc cấu hình riêng; tài liệu, câu trả lời trên mạng và người tuyển được ít hơn Spring.
+
+<Check id="j11.4.build-time-di">Giải thích được Quarkus và Micronaut khác Spring ở thời điểm nối bean, vì sao điều đó làm khởi động nhanh hơn, và nêu được hai cái giá phải trả.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Spring WebFlux Overview](https://docs.spring.io/spring-framework/reference/web/webflux/new-framework.html): đọc mục "Applicability" về khi nào chọn WebFlux thay Spring MVC, và mục "Concurrency Model".
+- [Introduction to Reactive Programming (Reactor)](https://projectreactor.io/docs/core/release/reference/reactiveProgramming.html): khái niệm publisher, subscribe và vì sao "nothing happens until you subscribe".
+- [Reactive Web Applications (Spring Boot)](https://docs.spring.io/spring-boot/reference/web/reactive.html): cấu hình WebFlux và Netty trong Spring Boot.
+- [Creating your first application (Quarkus)](https://quarkus.io/guides/getting-started): dựng ứng dụng Quarkus, chạy dev mode, đóng gói.
+- [Micronaut Core Documentation](https://docs.micronaut.io/latest/guide/): phần Inversion of Control giải thích DI lúc biên dịch.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25, Maven 3.9 và `curl` như J11.1. Bài này không cần code của J11.3; mọi thứ nằm trong thư mục mới `~/masteva-j11/alt`. Máy cần mạng để gọi start.spring.io, code.quarkus.io và tải dependency. Bốn cổng **20300** tới **20303** phải trống. Mở **ba tab Terminal**: tab 1 chạy đối tác giả lập, tab 2 chạy ứng dụng, tab 3 gửi request; ở mỗi tab chạy `export JAVA_HOME=$(/usr/libexec/java_home -v 25)` như J11.1. Các khối kết quả đã lược dòng `WARNING:` của Maven và Netty.
+
+### 1. Hai project Spring
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-j11/alt && cd ~/masteva-j11/alt
+curl -s https://start.spring.io/starter.tgz \
+  -d type=maven-project -d language=java -d bootVersion=4.1.1 -d javaVersion=25 \
+  -d groupId=dev.masteva -d artifactId=orders-flux -d baseDir=orders-flux \
+  -d packageName=dev.masteva.flux -d dependencies=webflux | tar -xzf -
+curl -s https://start.spring.io/starter.tgz \
+  -d type=maven-project -d language=java -d bootVersion=4.1.1 -d javaVersion=25 \
+  -d groupId=dev.masteva -d artifactId=orders-mvc -d baseDir=orders-mvc \
+  -d packageName=dev.masteva.mvc -d dependencies=web | tar -xzf -
+cd orders-flux && mvn dependency:tree | grep -E "reactor-netty-http:|reactor-core:|spring-webflux:|tomcat-embed-core:"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[INFO] |  |     +- io.projectreactor.netty:reactor-netty-http:jar:1.3.7:compile
+[INFO] |  |  \- io.projectreactor:reactor-core:jar:3.8.7:compile
+[INFO] |     +- org.springframework:spring-webflux:jar:7.0.9:compile
+```
+
+</Expected>
+
+Starter `webflux` kéo Reactor và Netty; không có dòng `tomcat-embed-core`. Cùng là Spring Boot, nhưng web server và mô hình thread đã khác.
+
+### 2. Đối tác chậm và công cụ đo tải
+
+`Downstream` giả lập một dịch vụ tính thuế mất 200 ms mỗi lời gọi. `Load` gửi nhiều request đồng thời và in thông lượng, độ trễ p50, p99. Cả hai chỉ dùng JDK.
+
+<Terminal where="mac" title="Tạo tools/Downstream.java và tools/Load.java">
+
+```bash
+mkdir -p ~/masteva-j11/alt/tools && cd ~/masteva-j11/alt/tools
+cat > Downstream.java <<'EOF'
+import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+import java.util.concurrent.Executors;
+
+/** Đối tác tính thuế giả lập: mỗi lời gọi mất 200 ms. */
+public class Downstream {
+    public static void main(String[] args) throws Exception {
+        // Mặc định HttpServer chỉ giữ 200 kết nối keep-alive rảnh và đóng bớt phần dư.
+        System.setProperty("sun.net.httpserver.maxIdleConnections", "1000");
+        var server = HttpServer.create(new InetSocketAddress(20302), 1000);
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.createContext("/tax", exchange -> {
+            long amount = Long.parseLong(exchange.getRequestURI().getQuery().replace("amount=", ""));
+            try { Thread.sleep(200); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            byte[] body = ("{\"tax\":" + amount / 10 + "}").getBytes();
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (var out = exchange.getResponseBody()) { out.write(body); }
+        });
+        server.start();
+        System.out.println("Downstream chạy ở cổng 20302, mỗi lời gọi chậm 200 ms");
+    }
+}
+EOF
+cat > Load.java <<'EOF'
+import java.net.URI;
+import java.net.http.*;
+import java.util.Arrays;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** java Load.java <url> <tổng số request> <số request đồng thời> */
+public class Load {
+    public static void main(String[] args) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create(args[0])).build();
+        int total = Integer.parseInt(args[1]), concurrency = Integer.parseInt(args[2]);
+        var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+        var permits = new Semaphore(concurrency);
+        var errors = new AtomicInteger();
+        long[] latencies = new long[total];
+        long start = System.nanoTime();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i < total; i++) {
+                int n = i;
+                permits.acquire();
+                executor.submit(() -> {
+                    long t = System.nanoTime();
+                    try {
+                        if (client.send(request, HttpResponse.BodyHandlers.discarding()).statusCode() != 200) errors.incrementAndGet();
+                    } catch (Exception e) {
+                        errors.incrementAndGet();
+                    } finally {
+                        latencies[n] = (System.nanoTime() - t) / 1_000_000;
+                        permits.release();
+                    }
+                });
+            }
+        }
+        double seconds = (System.nanoTime() - start) / 1e9;
+        Arrays.sort(latencies);
+        System.out.printf("%d request, %d đồng thời: %.2f s, %.0f req/s, p50 %d ms, p99 %d ms, lỗi %d%n", total, concurrency,
+                seconds, total / seconds, latencies[total / 2], latencies[total * 99 / 100], errors.get());
+    }
+}
+EOF
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j11/alt/tools && java Downstream.java
+```
+
+</Terminal>
+
+Tab 1 in `Downstream chạy ở cổng 20302, mỗi lời gọi chậm 200 ms`; để nó chạy tới cuối bài. `Load` giới hạn số request đồng thời bằng `Semaphore`, đúng cách J14.3 khuyên, thay vì một pool thread.
+
+### 3. Endpoint đơn hàng bằng WebFlux
+
+Vẫn là `@RestController`, `@GetMapping` như J11.3; khác ở kiểu trả về. `quote` lấy đơn rồi gọi đối tác bằng `WebClient`, ghi log tên thread trước và sau lời gọi. Hai endpoint cuối cố ý sai, dùng ở bước 4. Lab bỏ validation và `ProblemDetail` của J11.3 để tập trung vào mô hình thread.
+
+Ứng dụng chạy với `-Xmx256m` để ba ứng dụng trong bài có cùng giới hạn heap khi so bộ nhớ.
+
+<Terminal where="mac" title="Tab 2: tạo cấu hình, controller, rồi build và chạy">
+
+```bash
+cd ~/masteva-j11/alt/orders-flux
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=orders-flux
+server.port=20300
+partner.url=http://localhost:20302
+EOF
+cat > src/main/java/dev/masteva/flux/OrderController.java <<'EOF'
+package dev.masteva.flux;
+
+import java.net.URI;
+import java.util.Comparator;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import org.slf4j.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@RestController
+@RequestMapping("/v1/orders")
+class OrderController {
+    private static final Logger log = LoggerFactory.getLogger(OrderController.class);
+
+    record Order(long id, String customer, long amount, String currency) {}
+    record CreateOrder(String customer, long amount, String currency) {}
+    record Tax(long tax) {}
+    record Quote(long id, long amount, long tax, long total) {}
+
+    private final Map<Long, Order> orders = new ConcurrentHashMap<>();
+    private final AtomicLong nextId = new AtomicLong(1);
+    private final WebClient partner;
+
+    OrderController(@Value("${partner.url}") String partnerUrl) {
+        this.partner = WebClient.create(partnerUrl);
+    }
+
+    @PostMapping
+    Mono<ResponseEntity<Order>> create(@RequestBody Mono<CreateOrder> body) {
+        return body.map(b -> {
+            var order = new Order(nextId.getAndIncrement(), b.customer(), b.amount(), b.currency());
+            orders.put(order.id(), order);
+            return ResponseEntity.created(URI.create("/v1/orders/" + order.id())).body(order);
+        });
+    }
+
+    @GetMapping
+    Flux<Order> list() {
+        return Flux.fromIterable(orders.values()).sort(Comparator.comparingLong(Order::id));
+    }
+
+    @GetMapping("/{id}")
+    Mono<Order> get(@PathVariable long id) {
+        return find(id);
+    }
+
+    /** Gọi đối tác chậm 200 ms mà không giữ thread nào trong lúc chờ. */
+    @GetMapping("/{id}/quote")
+    Mono<Quote> quote(@PathVariable long id) {
+        log.info("quote {}: nhận request trên {}", id, Thread.currentThread().getName());
+        return find(id)
+                .flatMap(o -> partner.get().uri("/tax?amount={a}", o.amount())
+                        .retrieve().bodyToMono(Tax.class)
+                        .map(t -> new Quote(o.id(), o.amount(), t.tax(), o.amount() + t.tax())))
+                .doOnNext(q -> log.info("quote {}: có thuế trên {}", id, Thread.currentThread().getName()));
+    }
+
+    /** SAI: block() trên event loop. */
+    @GetMapping("/{id}/quote-block")
+    Quote quoteBlock(@PathVariable long id) {
+        return quote(id).block();
+    }
+
+    /** SAI: lời gọi chặn 200 ms trên event loop, như JDBC hay một HTTP client đồng bộ. */
+    @GetMapping("/{id}/quote-sleep")
+    Mono<Quote> quoteSleep(@PathVariable long id) throws InterruptedException {
+        Order o = orders.get(id);
+        Thread.sleep(200);
+        return Mono.just(new Quote(o.id(), o.amount(), o.amount() / 10, o.amount() + o.amount() / 10));
+    }
+
+    private Mono<Order> find(long id) {
+        return Mono.justOrEmpty(orders.get(id))
+                .switchIfEmpty(Mono.error(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Không có đơn hàng " + id)));
+    }
+}
+EOF
+mvn -q package -DskipTests && java -Xmx256m -jar target/orders-flux-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -i -w '\n' -X POST localhost:20300/v1/orders -H 'Content-Type: application/json' -d '{"customer":"An","amount":120000,"currency":"VND"}'
+curl -s -w '\n' -X POST localhost:20300/v1/orders -H 'Content-Type: application/json' -d '{"customer":"Bình","amount":450000,"currency":"VND"}'
+curl -s -w '\n' localhost:20300/v1/orders
+curl -s -w '\n' localhost:20300/v1/orders/42
+curl -s -w '\n' localhost:20300/v1/orders/1/quote
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HTTP/1.1 201 Created
+Location: /v1/orders/1
+Content-Type: application/json
+Content-Length: 57
+
+{"id":1,"customer":"An","amount":120000,"currency":"VND"}
+{"id":2,"customer":"Bình","amount":450000,"currency":"VND"}
+[{"id":1,"customer":"An","amount":120000,"currency":"VND"},{"id":2,"customer":"Bình","amount":450000,"currency":"VND"}]
+{"timestamp":"2026-10-03T19:03:38.499Z","path":"/v1/orders/42","status":404,"error":"Not Found","requestId":"56a5280e-5"}
+{"id":1,"amount":120000,"tax":12000,"total":132000}
+```
+
+</Expected>
+
+Từ phía client, không có gì khác J11.3; `timestamp` và `requestId` khác nhau mỗi lần. Tab 2 cho thấy phần khác:
+
+<Expected>
+
+```text
+... NettyWebServer    : Netty started on port 20300 (http)
+... OrderController   : quote 1: nhận request trên reactor-http-nio-7
+... DnsServerAddressStreamProviders  : Unable to load io.netty.resolver.dns.macos.MacOSDnsServerAddressStreamProvider, fallback to system defaults. ...
+... OrderController   : quote 1: có thuế trên reactor-http-nio-7
+```
+
+</Expected>
+
+Request chạy trên `reactor-http-nio-7`, một trong 10 event loop thread (số thread theo số nhân CPU, số thứ tự khác nhau mỗi lần). Trong 200 ms chờ đối tác, thread đó không bị giữ: nó phục vụ kết nối khác, và khi đối tác trả lời thì một event loop chạy tiếp phần `map`. Dòng `ERROR ... Dns...` chỉ có trên macOS, xem phần gỡ lỗi.
+
+<Check id="j11.4.lab-webflux">Chạy được endpoint WebFlux trả `Mono` và `Flux`, và chỉ ra trong log rằng request chạy trên thread `reactor-http-nio-*`.</Check>
+
+### 4. Chặn event loop
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -w '\n' localhost:20300/v1/orders/1/quote-block
+curl -s -w '\n' localhost:20300/v1/orders/1/quote-sleep
+```
+
+</Terminal>
+
+<Predict question="Cả hai endpoint đều chờ khoảng 200 ms rồi trả lời. Có gì khác nhau?">
+
+```text
+{"timestamp":"2026-10-03T19:03:39.321Z","path":"/v1/orders/1/quote-block","status":500,"error":"Internal Server Error","requestId":"d8d981fa-7"}
+{"id":1,"amount":120000,"tax":12000,"total":132000}
+```
+
+`block()` bị từ chối ngay; tab 2 in `java.lang.IllegalStateException: block()/blockFirst()/blockLast() are blocking, which is not supported in thread reactor-http-nio-10`. Reactor đánh dấu thread event loop là non-blocking và kiểm tra khi gọi `block()`. Còn `Thread.sleep` thì chạy "bình thường": Reactor không thể biết bạn đang chặn. Đây chính là loại lỗi nguy hiểm, vì nó chỉ lộ ra khi có tải.
+
+</Predict>
+
+Đo dưới tải: 200 request đồng thời. Chạy `quote` hai lần (lần đầu cho JIT làm nóng), rồi chạy `quote-sleep`:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-j11/alt/tools
+java Load.java http://localhost:20300/v1/orders/1/quote 4000 200
+java Load.java http://localhost:20300/v1/orders/1/quote 4000 200
+java Load.java http://localhost:20300/v1/orders/1/quote-sleep 400 200
+pid=$(pgrep -f orders-flux-0.0.1); echo "$(jcmd $pid Thread.print | grep -c '^"') platform thread, RSS $(( $(ps -o rss= -p $pid) / 1024 )) MB"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+4000 request, 200 đồng thời: 4.39 s, 911 req/s, p50 211 ms, p99 330 ms, lỗi 0
+4000 request, 200 đồng thời: 4.40 s, 909 req/s, p50 214 ms, p99 279 ms, lỗi 0
+400 request, 200 đồng thời: 8.43 s, 47 req/s, p50 3974 ms, p99 7113 ms, lỗi 0
+40 platform thread, RSS 288 MB
+```
+
+</Expected>
+
+Trần lý thuyết là 200 request chia 0,2 giây, tức 1.000 req/s; bản non-blocking đạt gần trần. Bản `quote-sleep`: 10 event loop, mỗi cái chỉ xong 5 request mỗi giây, nên khoảng 50 req/s, và request phải xếp hàng tới gần 4 giây. Toàn bộ server WebFlux chỉ dùng 40 platform thread. Con số trên máy bạn sẽ khác, nhất là khi máy đang bận; khoảng cách giữa `quote` và `quote-sleep` thì ổn định.
+
+<Check id="j11.4.lab-blocking">Tái hiện được lỗi `block()` trên event loop và việc `Thread.sleep` kéo thông lượng xuống khoảng 50 req/s, và giải thích con số đó từ số event loop thread.</Check>
+
+### 5. Cùng endpoint bằng Spring MVC và virtual thread
+
+Bấm Ctrl+C ở tab 2. Bản MVC gọi đối tác bằng `RestClient`, một lời gọi chặn bình thường, và bật virtual thread như J14.3:
+
+<Terminal where="mac" title="Tab 2: tạo cấu hình, controller, rồi build và chạy">
+
+```bash
+cd ~/masteva-j11/alt/orders-mvc
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=orders-mvc
+server.port=20301
+partner.url=http://localhost:20302
+spring.threads.virtual.enabled=true
+EOF
+cat > src/main/java/dev/masteva/mvc/OrderController.java <<'EOF'
+package dev.masteva.mvc;
+
+import java.net.URI;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import org.slf4j.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestClient;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+@RequestMapping("/v1/orders")
+class OrderController {
+    private static final Logger log = LoggerFactory.getLogger(OrderController.class);
+
+    record Order(long id, String customer, long amount, String currency) {}
+    record CreateOrder(String customer, long amount, String currency) {}
+    record Tax(long tax) {}
+    record Quote(long id, long amount, long tax, long total) {}
+
+    private final Map<Long, Order> orders = new ConcurrentHashMap<>();
+    private final AtomicLong nextId = new AtomicLong(1);
+    private final RestClient partner;
+
+    OrderController(@Value("${partner.url}") String partnerUrl) {
+        this.partner = RestClient.create(partnerUrl);
+    }
+
+    @PostMapping
+    ResponseEntity<Order> create(@RequestBody CreateOrder b) {
+        var order = new Order(nextId.getAndIncrement(), b.customer(), b.amount(), b.currency());
+        orders.put(order.id(), order);
+        return ResponseEntity.created(URI.create("/v1/orders/" + order.id())).body(order);
+    }
+
+    /** Cùng việc như bản WebFlux, viết tuần tự: thread chờ là virtual thread nên rẻ. */
+    @GetMapping("/{id}/quote")
+    Quote quote(@PathVariable long id) {
+        log.info("quote {}: nhận request trên {}", id, Thread.currentThread());
+        Order o = orders.get(id);
+        if (o == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Không có đơn hàng " + id);
+        Tax t = partner.get().uri("/tax?amount={a}", o.amount()).retrieve().body(Tax.class);
+        log.info("quote {}: có thuế trên {}", id, Thread.currentThread());
+        return new Quote(o.id(), o.amount(), t.tax(), o.amount() + t.tax());
+    }
+}
+EOF
+mvn -q package -DskipTests && java -Xmx256m -jar target/orders-mvc-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-j11/alt/tools
+curl -s -w '\n' -X POST localhost:20301/v1/orders -H 'Content-Type: application/json' -d '{"customer":"An","amount":120000,"currency":"VND"}'
+curl -s -w '\n' localhost:20301/v1/orders/1/quote
+java Load.java http://localhost:20301/v1/orders/1/quote 4000 200
+java Load.java http://localhost:20301/v1/orders/1/quote 4000 200
+pid=$(pgrep -f orders-mvc-0.0.1); echo "$(jcmd $pid Thread.print | grep -c '^"') platform thread, RSS $(( $(ps -o rss= -p $pid) / 1024 )) MB"
+jcmd $pid Thread.print | grep -c '^"HttpClient-'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":1,"customer":"An","amount":120000,"currency":"VND"}
+{"id":1,"amount":120000,"tax":12000,"total":132000}
+4000 request, 200 đồng thời: 4.57 s, 876 req/s, p50 217 ms, p99 358 ms, lỗi 0
+4000 request, 200 đồng thời: 4.43 s, 903 req/s, p50 216 ms, p99 270 ms, lỗi 0
+179 platform thread, RSS 324 MB
+125
+```
+
+</Expected>
+
+Tab 2 in `quote 1: nhận request trên VirtualThread[#53,tomcat-handler-3]/runnable@ForkJoinPool-1-worker-1`: mỗi request một virtual thread, chặn thoải mái trong `RestClient`.
+
+| Đo ở 200 request đồng thời, lần chạy thứ hai | WebFlux | MVC + virtual thread |
+|---|---|---|
+| Thông lượng | 909 req/s | 903 req/s |
+| p50 / p99 | 214 / 279 ms | 216 / 270 ms |
+| Platform thread sau tải | 40 | 179, trong đó 125 là `HttpClient-*` |
+| RSS sau tải | 288 MB | 324 MB |
+
+Thông lượng và độ trễ ngang nhau, vì cả hai đều chạm trần do đối tác 200 ms đặt ra; framework không còn là nút cổ chai. Số thread khác thật, nhưng 125 thread `HttpClient-*` không phải của Tomcat: đó là executor mặc định của `java.net.http.HttpClient` mà `RestClient` dùng bên dưới (Đào sâu có cách sửa). Lưu ý khi đọc bảng: client đo tải, đối tác và ứng dụng chạy chung một máy, chỉ một kịch bản, RSS phụ thuộc lúc GC chạy; đây là bằng chứng cho một kết luận hẹp, không phải benchmark.
+
+<Check id="j11.4.lab-compare">Đo được hai bản dưới cùng tải, giải thích vì sao thông lượng ngang nhau, và chỉ ra con số nào thật sự khác.</Check>
+
+### 6. Cùng endpoint bằng Quarkus
+
+Bấm Ctrl+C ở tab 2, rồi sinh project ở tab 2. code.quarkus.io là dịch vụ chính thức sinh project Quarkus; `e=rest-jackson` chọn Quarkus REST với Jackson, `S=io.quarkus.platform:3.40` chọn dòng phát hành, `nc=true` bỏ code mẫu.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j11/alt
+curl -s -o quarkus.zip 'https://code.quarkus.io/d?g=dev.masteva&a=orders-quarkus&e=rest-jackson&j=25&S=io.quarkus.platform:3.40&nc=true'
+unzip -q quarkus.zip
+grep -E "<quarkus.platform.version>|<artifactId>quarkus-(rest|arc|maven)" orders-quarkus/pom.xml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+        <quarkus.platform.version>3.40.1</quarkus.platform.version>
+            <artifactId>quarkus-rest-jackson</artifactId>
+            <artifactId>quarkus-arc</artifactId>
+                <artifactId>quarkus-maven-plugin</artifactId>
+```
+
+</Expected>
+
+`quarkus-arc` là DI container; `quarkus-maven-plugin` là nơi phần lớn việc nối bean diễn ra, lúc `mvn package`. Endpoint viết bằng Jakarta REST:
+
+<Terminal where="mac" title="Tab 2: tạo cấu hình, resource, rồi build và chạy">
+
+```bash
+cd ~/masteva-j11/alt/orders-quarkus
+echo 'quarkus.http.port=20303' > src/main/resources/application.properties
+mkdir -p src/main/java/dev/masteva/quarkus
+cat > src/main/java/dev/masteva/quarkus/OrderResource.java <<'EOF'
+package dev.masteva.quarkus;
+
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.Response;
+import java.net.URI;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import org.jboss.logging.Logger;
+
+@Path("/v1/orders")
+public class OrderResource {
+    private static final Logger log = Logger.getLogger(OrderResource.class);
+
+    public record Order(long id, String customer, long amount, String currency) {}
+    public record CreateOrder(String customer, long amount, String currency) {}
+
+    private final Map<Long, Order> orders = new ConcurrentHashMap<>();
+    private final AtomicLong nextId = new AtomicLong(1);
+
+    @POST
+    public Response create(CreateOrder b) {
+        var order = new Order(nextId.getAndIncrement(), b.customer(), b.amount(), b.currency());
+        orders.put(order.id(), order);
+        log.infof("tạo đơn %d trên %s", order.id(), Thread.currentThread().getName());
+        return Response.created(URI.create("/v1/orders/" + order.id())).entity(order).build();
+    }
+
+    @GET
+    @Path("/{id}")
+    public Order get(long id) {
+        Order o = orders.get(id);
+        if (o == null) throw new NotFoundException("Không có đơn hàng " + id);
+        return o;
+    }
+}
+EOF
+mvn -q package -DskipTests && java -Xmx256m -jar target/quarkus-app/quarkus-run.jar
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -i -w '\n' -X POST localhost:20303/v1/orders -H 'Content-Type: application/json' -d '{"customer":"An","amount":120000,"currency":"VND"}'
+curl -s -w '\n' localhost:20303/v1/orders/1
+curl -s -i localhost:20303/v1/orders/42
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HTTP/1.1 201 Created
+Content-Type: application/json;charset=UTF-8
+content-length: 57
+Location: http://localhost:20303/v1/orders/1
+
+{"id":1,"customer":"An","amount":120000,"currency":"VND"}
+{"id":1,"customer":"An","amount":120000,"currency":"VND"}
+HTTP/1.1 404 Not Found
+content-length: 0
+```
+
+</Expected>
+
+Tab 2 in `started in 0.420s`, danh sách `Installed features: [cdi, rest, rest-jackson, smallrye-context-propagation, vertx]` và `tạo đơn 1 trên executor-thread-1`: method trả kiểu thường nên Quarkus chạy nó trên worker thread, không phải event loop. Khác biệt nhỏ nhưng thật: `Location` là URL tuyệt đối, và `404` có body rỗng; muốn Problem Details như J11.3 thì phải viết `ExceptionMapper` riêng.
+
+### 7. Đo khởi động và bộ nhớ
+
+Bấm Ctrl+C ở tab 2. Log "Started in" của mỗi framework đo những khoảng khác nhau, nên lab tự đo từ lúc chạy lệnh `java` tới khi ứng dụng **trả lời request HTTP đầu tiên**, cùng RSS (bộ nhớ thật tiến trình đang chiếm) lúc đó.
+
+<Terminal where="mac" title="Tab 3: tạo tools/Startup.java và đo ba ứng dụng">
+
+```bash
+cd ~/masteva-j11/alt/tools
+cat > Startup.java <<'EOF'
+import java.io.*;
+import java.net.URI;
+import java.net.http.*;
+import java.util.Arrays;
+
+/** java Startup.java <url> <lệnh chạy ứng dụng...>: chạy 3 lần, đo tới khi ứng dụng trả lời request đầu tiên. */
+public class Startup {
+    public static void main(String[] args) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create(args[0])).build();
+        var client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+        for (int run = 1; run <= 3; run++) {
+            long t0 = System.nanoTime();
+            Process app = new ProcessBuilder(Arrays.asList(args).subList(1, args.length))
+                    .redirectErrorStream(true).redirectOutput(new File("startup.log")).start();
+            while (true) {
+                try {
+                    client.send(request, HttpResponse.BodyHandlers.discarding());   // status nào cũng được
+                    break;
+                } catch (IOException notYet) {
+                    if (!app.isAlive()) throw new IllegalStateException("ứng dụng đã dừng, xem startup.log");
+                    Thread.sleep(5);
+                }
+            }
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            var ps = new ProcessBuilder("ps", "-o", "rss=", "-p", "" + app.pid()).start();
+            long rssMb = Long.parseLong(new String(ps.getInputStream().readAllBytes()).trim()) / 1024;
+            System.out.printf("lần %d: trả lời request đầu tiên sau %,d ms, RSS %d MB%n", run, ms, rssMb);
+            app.destroy();
+            app.waitFor();
+        }
+    }
+}
+EOF
+A=~/masteva-j11/alt
+java Startup.java http://localhost:20301/v1/orders/1 java -Xmx256m -jar $A/orders-mvc/target/orders-mvc-0.0.1-SNAPSHOT.jar
+java Startup.java http://localhost:20300/v1/orders/1 java -Xmx256m -jar $A/orders-flux/target/orders-flux-0.0.1-SNAPSHOT.jar
+java Startup.java http://localhost:20303/v1/orders/1 java -Xmx256m -jar $A/orders-quarkus/target/quarkus-app/quarkus-run.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lần 1: trả lời request đầu tiên sau 1,243 ms, RSS 203 MB
+lần 2: trả lời request đầu tiên sau 1,240 ms, RSS 197 MB
+lần 3: trả lời request đầu tiên sau 1,253 ms, RSS 204 MB
+lần 1: trả lời request đầu tiên sau 1,330 ms, RSS 217 MB
+lần 2: trả lời request đầu tiên sau 1,347 ms, RSS 229 MB
+lần 3: trả lời request đầu tiên sau 1,341 ms, RSS 205 MB
+lần 1: trả lời request đầu tiên sau 490 ms, RSS 126 MB
+lần 2: trả lời request đầu tiên sau 471 ms, RSS 124 MB
+lần 3: trả lời request đầu tiên sau 475 ms, RSS 126 MB
+```
+
+</Expected>
+
+Ba khối lần lượt là MVC, WebFlux, Quarkus; `404` cho đơn 1 vẫn tính là đã trả lời. Lấy trung vị: Spring Boot khoảng 1,2 tới 1,3 giây và 200 tới 220 MB; Quarkus khoảng 0,48 giây và 126 MB, tức nhanh gần ba lần và ít hơn khoảng 80 MB. Khi máy đang bận việc khác, một lần đo có thể vọt lên vài giây; chạy lại và nhìn trung vị. Quarkus còn có **native mode** (`mvn package -Dnative`, cần GraalVM hoặc Mandrel) cho khởi động tính bằng chục mili giây; bài này không build nó, J17.4 nói về native image.
+
+<Check id="j11.4.lab-startup">Tự đo được thời gian tới request đầu tiên và RSS của ba ứng dụng, và nói được con số đó có ý nghĩa với kiểu triển khai nào.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Address already in use` ở cổng 20300 tới 20303: ứng dụng của bước trước chưa dừng. Bấm Ctrl+C ở tab 2, hoặc tìm bằng `lsof -nP -iTCP:20300 -sTCP:LISTEN`.
+- `WebClientRequestException: Connection refused` khi gọi `quote`: tab 1 chưa chạy `Downstream`.
+- Log WebFlux có `ERROR ... Unable to load io.netty.resolver.dns.macos.MacOSDnsServerAddressStreamProvider`: Netty thiếu thư viện native đọc cấu hình DNS của macOS nên dùng mặc định của hệ thống. Lab chỉ gọi `localhost` nên không ảnh hưởng; thông báo nêu đúng dependency cần thêm nếu bạn phát triển trên Mac và gọi tên miền thật. Trên Linux không có dòng này.
+- `Load` báo `lỗi` khác 0 và log có `ConnectException: Connection reset by peer` khi bạn tăng lên vài trăm request đồng thời: macOS giới hạn hàng đợi kết nối mới ở 128 (`sysctl kern.ipc.somaxconn`), nên một loạt kết nối mở cùng lúc bị từ chối. Đó là giới hạn của máy đo, không phải của framework; giữ mức 200 như bài.
+- `WebClientRequestException: Connection reset` hay `PrematureCloseException` dưới tải: đối tác đóng kết nối keep-alive mà pool của `WebClient` vẫn giữ. Lab gặp lỗi này khi `Downstream` dùng giới hạn mặc định 200 kết nối rảnh; vì vậy nó đặt `maxIdleConnections`.
+- `release version 25 not supported`: Maven đang chạy JDK cũ; đặt lại `JAVA_HOME` như phần Chuẩn bị.
+
+</Callout>
+
+### 8. Dọn dẹp
+
+Bấm Ctrl+C ở tab 1 và tab 2 nếu còn chạy.
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá vĩnh viễn thư mục `~/masteva-j11/alt` với ba project và công cụ đo của bài này. Các dependency đã tải vẫn nằm trong `~/.m2`.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+rm -rf ~/masteva-j11/alt
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Thông lượng ngang nhau, vậy khi nào WebFlux thật sự đáng?">
+
+Khi việc chính là giữ rất nhiều kết nối sống lâu và đẩy dữ liệu theo dòng: API gateway, server-sent events, WebSocket, proxy streaming file lớn, nơi `Flux` với backpressure (người nhận báo mình nhận được bao nhiêu) là mô hình tự nhiên. Ở đó, chi phí mỗi kết nối và việc kiểm soát luồng dữ liệu quan trọng hơn sự dễ đọc. Với service CRUD gọi database và vài đối tác, MVC trên virtual thread cho cùng thông lượng như lab đã đo, giữ được code tuần tự, stack trace đọc được, `ThreadLocal` (MDC của log, security context) chạy như cũ, và dùng được JDBC. Nếu đội đã có sẵn code WebFlux chạy tốt thì cũng không cần viết lại.
+
+</Reveal>
+
+<Reveal title="Bắt buộc phải gọi một thư viện chặn trong WebFlux thì làm sao?">
+
+Bọc nó và chuyển sang scheduler dành cho việc chặn: `Mono.fromCallable(() -> jdbcRepo.find(id)).subscribeOn(Schedulers.boundedElastic())`. `boundedElastic` là pool có giới hạn số thread và hàng đợi, nên nó cũng là chỗ tải bị dồn lại; nếu phần lớn request đều cần nó, bạn đang trả giá của WebFlux mà không được lợi gì. Để không lọt lời gọi chặn lên event loop, thêm BlockHound (một Java agent của dự án Reactor) vào test: nó ném lỗi khi phát hiện `Thread.sleep` hay I/O chặn trên thread non-blocking, bắt được cả trường hợp `quote-sleep` mà Reactor không tự thấy. Trên JDK 13+, JVM chạy test cần thêm `-XX:+AllowRedefinitionToAddDeleteMethods`; bài này chưa chạy BlockHound.
+
+</Reveal>
+
+<Reveal title="125 thread HttpClient-* trong bản MVC từ đâu ra?">
+
+`RestClient.create()` dùng `java.net.http.HttpClient` của JDK khi không có thư viện HTTP nào khác trên classpath. HttpClient đó mặc định có executor riêng là một cached thread pool gồm platform thread, dùng để hoàn tất các bước bất đồng bộ bên trong; dưới tải nó nở ra hàng trăm thread dù Tomcat đã chạy virtual thread. Truyền vào một HttpClient dùng virtual thread: `RestClient.builder().baseUrl(url).requestFactory(new JdkClientHttpRequestFactory(HttpClient.newBuilder().executor(Executors.newVirtualThreadPerTaskExecutor()).build())).build()`. Khi thử cách này với cùng hai lượt tải, số platform thread sau tải giảm từ khoảng 180 xuống 54, thông lượng không đổi. Bài học chung: bật virtual thread rồi vẫn phải xem thread dump (J14.3) để biết thư viện nào tự tạo pool.
+
+</Reveal>
+
+<Reveal title="WebClient có giới hạn số kết nối tới đối tác không?">
+
+Có. `WebClient.create()` dùng pool kết nối chung của Reactor Netty; kiểm bằng `HttpResources.get().maxConnections()` trong jshell với classpath của project cho ra 500. Vượt quá 500 lời gọi đồng thời tới đối tác thì phần dư phải chờ kết nối rảnh, và độ trễ tăng theo. Theo mặc định của Reactor Netty, số lời gọi chờ kết nối có giới hạn (gấp đôi số kết nối tối đa, tức 1.000) và mỗi lời gọi chờ có timeout 45 giây; vượt nữa thì lỗi ngay. Giới hạn này là điều tốt: nó bảo vệ đối tác. Nhưng nó phải được chọn có chủ ý qua `ConnectionProvider`, cùng với thời gian giữ kết nối rảnh ngắn hơn timeout keep-alive của đối tác, để tránh lỗi `Connection reset` như phần gỡ lỗi. MVC trên virtual thread cần giới hạn tương tự bằng `Semaphore` hoặc pool của HTTP client.
+
+</Reveal>
+
+<Reveal title="Quarkus nhanh hơn 0,8 giây, có đáng đổi framework không?">
+
+Với service chạy liên tục nhiều ngày trên Kubernetes, 0,8 giây lúc khởi động gần như không đáng kể, còn 80 MB mỗi pod chỉ đáng khi bạn chạy hàng trăm pod. Nó đáng khi khởi động nằm trên đường đi của người dùng: serverless scale từ 0, job ngắn chạy theo lịch, CLI, hoặc khi bộ nhớ là chi phí chính. Trước khi đổi, hãy đo trên ứng dụng thật của bạn với đủ dependency (database, security), vì khoảng cách trong lab đến từ một endpoint rỗng. Trong hệ Spring cũng có các hướng rút ngắn khởi động mà không đổi framework: Spring AOT với native image (J17.4), hoặc AOT cache của JDK. Đổi framework là quyết định về con người và hệ sinh thái nhiều hơn là về con số.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI chuyển một endpoint MVC sang WebFlux hay Quarkus, hoặc giải thích một chuỗi operator Reactor dài. AI hay gọi `block()` hoặc dùng `RestTemplate` và JDBC bên trong handler reactive, viết `subscribe()` thủ công trong controller (làm request chạy hai lần hoặc mất lỗi), và đưa ra số benchmark "WebFlux nhanh gấp N lần" không có điều kiện đo. Với Quarkus, AI hay trộn API Spring vào code Jakarta REST, hoặc dùng tên extension cũ như `quarkus-resteasy-reactive-jackson`. Kiểm tra bằng log tên thread như bước 3, bằng BlockHound trong test, và bằng phép đo của chính bạn như bước 5 và 7.
+
+</Callout>
+
+<Callout kind="link">
+
+J9.3 đã so `HttpClient.send` với `sendAsync`, nền của hai cách gọi đối tác ở đây. J11.3 là bản MVC đầy đủ có validation và Problem Details. J14.3 giải thích virtual thread, pinning và vì sao không gom chúng vào pool. J15 thêm metrics để thấy số thread, độ trễ p99 trên production thay vì bằng `jcmd`. J17.4 build native image và đo lại khởi động, bộ nhớ.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j11.4.mastery-choose">Với một service cụ thể (CRUD, gateway, streaming, job ngắn), chọn được giữa MVC trên virtual thread, WebFlux và Quarkus, và bảo vệ lựa chọn bằng số đo cùng cái giá phải trả.</Check>
+
+<Check id="j11.4.mastery-review-blocking">Đọc một handler WebFlux và chỉ ra được lời gọi chặn trên event loop, rồi sửa nó bằng client non-blocking hoặc `Schedulers.boundedElastic()`.</Check>
+
+</Mastery>

@@ -1,0 +1,725 @@
+---
+title: JWT, OAuth2 resource server, CORS và CSRF
+description: Cho API nhận access token từ Keycloak, hiểu Spring kiểm tra chữ ký, issuer, audience ra sao, cân nhắc session với JWT, và quan sát CORS, CSRF bằng request curl thật.
+id: j13.2
+step: j13
+prerequisites: [j13.1]
+topics: [j13.session-jwt, j13.oauth2-oidc-resource-server, j13.cors-csrf]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    spring-security: 7.1.1
+    docker: 29.8.0
+    keycloak: 26.8.0
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biến API của J13.1 thành một **OAuth2 resource server**: nó không giữ mật khẩu nữa mà tin vào access token do Keycloak ký. Song song, giữ một trang nội bộ dùng session để thấy hai mô hình cạnh nhau. Học xong bài này, bạn giải thích được:
+
+- Vì sao một token hợp lệ, ký đúng, vẫn bị API từ chối với `The aud claim is not valid`.
+- Vì sao người dùng đã đăng xuất mà access token của họ vẫn gọi được API thêm vài phút.
+- Vì sao trình duyệt chặn frontend gọi API nhưng `curl` thì không, và vì sao API chỉ nhận bearer token được tắt CSRF còn trang dùng cookie thì không.
+
+</Goal>
+
+<Knowledge>
+
+### Session và JWT
+
+Sau khi đăng nhập, mỗi request tiếp theo phải chứng minh "tôi là người vừa đăng nhập". Có hai cách chính:
+
+| | Session | JWT (JSON Web Token) |
+|---|---|---|
+| Trạng thái nằm ở | Server: bộ nhớ, Redis, database | Trong chính token, client giữ |
+| Client gửi gì | Cookie `JSESSIONID`, một chuỗi ngẫu nhiên vô nghĩa | Header `Authorization: Bearer eyJ...` |
+| Server kiểm tra bằng | Tra session id trong kho | Kiểm chữ ký bằng khoá công khai, đọc claim |
+| Thu hồi ngay | Dễ: xoá session | Khó: token còn hạn là còn dùng được |
+| Scale nhiều instance | Cần kho session chung hoặc sticky session | Mỗi instance tự kiểm, không cần chia sẻ gì |
+| Hợp với | Web app server-rendered, BFF | API gọi từ SPA, mobile, service khác |
+
+Một JWT gồm ba phần base64url nối bằng dấu chấm: `header.payload.signature`. Header ghi thuật toán ký (`alg`, ví dụ `RS256`) và mã khoá (`kid`). Payload chứa **claim**:
+
+| Claim | Ý nghĩa | Resource server phải |
+|---|---|---|
+| `iss` | Ai phát hành | So khớp với issuer tin cậy |
+| `sub` | Token nói về ai | Dùng làm danh tính ổn định |
+| `aud` | Token dành cho API nào | Kiểm tra có tên API của mình |
+| `exp`, `iat`, `nbf` | Hết hạn, phát hành, có hiệu lực từ | Từ chối token hết hạn |
+| `scope`, `roles` | Quyền | Ánh xạ thành `GrantedAuthority` |
+
+Payload chỉ được **ký**, không được **mã hoá**: ai cầm token cũng đọc được nội dung. Đừng để dữ liệu nhạy cảm trong claim.
+
+Vì không thu hồi được ngay, access token nên sống ngắn (5 tới 15 phút) và đi kèm **refresh token** sống lâu hơn. Refresh token chỉ gửi tới authorization server, và server đó kiểm tra session mỗi lần đổi token, nên đăng xuất sẽ chặn được ở lần làm mới kế tiếp. Trong trình duyệt, token để ở `localStorage` thì bất kỳ đoạn script XSS nào cũng đọc được; nhiều đội chọn mẫu **BFF** (backend for frontend): server của frontend giữ token, trình duyệt chỉ có cookie session `HttpOnly`.
+
+<Check id="j13.2.session-vs-jwt">So sánh được session với JWT về nơi giữ trạng thái, cách thu hồi và cách scale, và nói được vì sao access token nên sống ngắn.</Check>
+
+### OAuth2, OIDC và vai trò resource server
+
+**OAuth 2.0** là khung cấp quyền: thay vì đưa mật khẩu cho mọi ứng dụng, người dùng đăng nhập ở một **authorization server** (Keycloak, Auth0, Okta, Entra ID) và ứng dụng nhận về **access token** để gọi API thay mặt họ. **OpenID Connect (OIDC)** xây trên OAuth2, thêm **ID token** cho việc đăng nhập, endpoint `userinfo` và trang khám phá `/.well-known/openid-configuration`.
+
+```text
+ client (SPA, mobile, job)         authorization server (Keycloak)        resource server (orders API)
+        |                                   |                                       |
+        |-- 1. xin token (grant) ---------->|                                       |
+        |<-- 2. access token (JWT ký RS256)-|                                       |
+        |                                   |<-- 0. lúc khởi động hoặc lần đầu:     |
+        |                                   |       tải discovery và JWKS (khoá     |
+        |                                   |       công khai), rồi cache ----------|
+        |-- 3. GET /api/me  Authorization: Bearer <token> ------------------------->|
+        |                                   |       4. kiểm chữ ký bằng khoá đã     |
+        |                                   |          cache, iss, exp, aud;        |
+        |                                   |          không gọi Keycloak           |
+        |<-- 5. 200 hoặc 401/403 ---------------------------------------------------|
+```
+
+| Grant type | Ai dùng | Ghi chú |
+|---|---|---|
+| Authorization code + PKCE | Ứng dụng có người dùng: web, SPA, mobile | Mặc định cho mọi ứng dụng mới |
+| Client credentials | Service gọi service, job chạy nền | Không có người dùng; token mang danh tính của client |
+| Refresh token | Client đã có refresh token | Lấy access token mới mà không đăng nhập lại |
+| Password (resource owner) | Không nên dùng | Client thấy mật khẩu; bị loại khỏi OAuth 2.1. Lab này chỉ dùng để lấy token bằng `curl` |
+
+API của bạn là **resource server**: nó không cấp token, không giữ mật khẩu. Nó chỉ kiểm tra token. Với Spring Boot, một dòng `issuer-uri` đủ để Spring tự tìm JWKS, kiểm chữ ký và `iss`, `exp`. Phần còn lại bạn phải tự khai báo: `audiences` để chỉ nhận token dành cho mình, và claim nào chứa quyền.
+
+<Callout kind="production">
+
+Một nhân viên nghỉ việc, quản trị viên khoá tài khoản trong Keycloak lúc 9:00. Access token cấp lúc 8:55 có hạn 1 giờ, nên tới 9:55 người đó vẫn gọi được API nội bộ. Không có lỗi nào ở đây: resource server kiểm token bằng khoá công khai và không hỏi lại Keycloak. Cách giảm rủi ro là giữ access token ngắn (bài này dùng 5 phút), và với thao tác nhạy cảm như chuyển tiền, gọi thêm endpoint introspection của authorization server để hỏi token còn hiệu lực không.
+
+</Callout>
+
+<Check id="j13.2.resource-server">Kể được bốn vai trò của OAuth2, chọn đúng grant type cho SPA và cho service nền, liệt kê được những gì resource server kiểm tra trên một JWT, và nói được request `/api/me`, `/web/notes` đi qua filter chain nào của lab.</Check>
+
+### CORS: trình duyệt hỏi trước khi gửi
+
+**Same-origin policy** (chính sách cùng nguồn) của trình duyệt chặn script ở `https://app.masteva.test` đọc response từ `http://localhost:20131`, vì khác **origin** (scheme, host, port). **CORS** (Cross-Origin Resource Sharing) là cách server nói "origin này được phép".
+
+- Request "phức tạp" (có header `Authorization`, method `PUT`, `DELETE`, `Content-Type: application/json`) khiến trình duyệt gửi **preflight** trước: `OPTIONS` kèm `Origin`, `Access-Control-Request-Method`, `Access-Control-Request-Headers`.
+- Server trả `Access-Control-Allow-Origin` và các header liên quan nếu cho phép. Không có header đó, trình duyệt không gửi request thật, hoặc không cho script đọc response.
+- `Access-Control-Max-Age` cho trình duyệt cache kết quả preflight, bớt một vòng request.
+
+CORS do **trình duyệt** thực thi để bảo vệ **người dùng**. Nó không bảo vệ API của bạn: `curl`, Postman, service khác không gửi preflight và không quan tâm header CORS. Đừng coi danh sách origin là một lớp xác thực. Và không bao giờ dùng `*` cùng với `allowCredentials`.
+
+### CSRF: lợi dụng thứ trình duyệt tự gửi
+
+**CSRF** (Cross-Site Request Forgery, giả mạo request liên trang): người dùng đang đăng nhập `admin.masteva.test` bằng cookie, rồi mở một trang độc hại. Trang đó có một form ẩn tự gửi `POST https://admin.masteva.test/web/notes`. Trình duyệt tự đính kèm cookie session, server tưởng chính người dùng gửi.
+
+Cách chống của Spring là **synchronizer token**: server sinh một CSRF token gắn với session, trang thật nhúng token vào form hoặc header, request thay đổi dữ liệu phải kèm token. Trang độc hại không đọc được token (same-origin policy chặn), nên không giả được. Từ Spring Security 6, token gửi ra được trộn XOR với chuỗi ngẫu nhiên mỗi lần, để chống tấn công BREACH; vì vậy mỗi lần đọc bạn thấy một chuỗi khác.
+
+| API của bạn xác thực bằng | Trình duyệt tự đính kèm? | CSRF |
+|---|---|---|
+| Cookie session | Có | Bật |
+| HTTP Basic trong trình duyệt | Có, sau lần đầu | Bật |
+| `Authorization: Bearer` do code JavaScript tự thêm | Không | Tắt được |
+
+Cookie `SameSite=Lax` chặn phần lớn CSRF từ site khác. Lax làm mặc định khi cookie không ghi thuộc tính này là hành vi của các trình duyệt nhân Chromium (Chrome, Edge), không phải của mọi trình duyệt. Nên coi nó là lớp bảo vệ thêm, không thay cho CSRF token, và nó không chặn được trang độc hại trên một subdomain cùng site.
+
+<Check id="j13.2.cors-csrf">Giải thích được CORS bảo vệ ai và không bảo vệ ai, CSRF lợi dụng điều gì, và khi nào được tắt CSRF.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [OAuth 2.0 Resource Server JWT](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html): cấu hình `issuer-uri`, kiểm tra audience và ánh xạ authority.
+- [RFC 8725: JSON Web Token Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725.html): đọc mục 2 về các kiểu tấn công (`alg: none`, nhầm thuật toán, nhầm audience).
+- [Session Management Cheat Sheet (OWASP)](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html): thuộc tính cookie an toàn, thời hạn và huỷ session.
+- [Cross-Origin Resource Sharing (CORS) (MDN)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS): preflight request và các header CORS.
+- [Cross Site Request Forgery (CSRF) (Spring Security)](https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html): cách Spring chống CSRF, mục "When to use CSRF protection".
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm J13.1, có `~/masteva-j13/orders`, `cp.txt` và ứng dụng đã dừng. Docker đang chạy (J8.3) và còn khoảng 800 MB bộ nhớ cho Keycloak. Cổng **20130** (Keycloak) và **20131** (ứng dụng) phải trống. Hai tab Terminal như J13.1, mỗi tab đã `export JAVA_HOME=$(/usr/libexec/java_home -v 25)`.
+
+### 1. Chạy Keycloak với một realm có sẵn
+
+Realm là một không gian user, client và cấu hình riêng trong Keycloak. File dưới đây tạo realm `masteva` có ba user, hai client, và hai **protocol mapper**: một thêm `orders-api` vào `aud`, một chép realm role ra claim `roles`.
+
+<Terminal where="mac" title="Tạo ~/masteva-j13/keycloak/masteva-realm.json">
+
+```bash
+mkdir -p ~/masteva-j13/keycloak && cd ~/masteva-j13/keycloak
+cat > masteva-realm.json <<'EOF'
+{
+  "realm": "masteva",
+  "enabled": true,
+  "accessTokenLifespan": 300,
+  "roles": { "realm": [ { "name": "USER" }, { "name": "ADMIN" } ] },
+  "clients": [
+    {
+      "clientId": "orders-cli",
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "aud-orders-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.custom.audience": "orders-api", "access.token.claim": "true" }
+        },
+        {
+          "name": "roles-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": { "claim.name": "roles", "multivalued": "true", "jsonType.label": "String", "access.token.claim": "true" }
+        }
+      ]
+    },
+    {
+      "clientId": "reporting-job",
+      "secret": "reporting-job-secret",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": true
+    }
+  ],
+  "users": [
+    { "username": "alice", "enabled": true, "email": "alice@masteva.test", "emailVerified": true,
+      "firstName": "Alice", "lastName": "Nguyen", "realmRoles": ["USER"],
+      "credentials": [ { "type": "password", "value": "alice-pass" } ] },
+    { "username": "bob", "enabled": true, "email": "bob@masteva.test", "emailVerified": true,
+      "firstName": "Bob", "lastName": "Tran", "realmRoles": ["USER"],
+      "credentials": [ { "type": "password", "value": "bob-pass" } ] },
+    { "username": "admin", "enabled": true, "email": "admin@masteva.test", "emailVerified": true,
+      "firstName": "Admin", "lastName": "Le", "realmRoles": ["USER", "ADMIN"],
+      "credentials": [ { "type": "password", "value": "admin-pass" } ] }
+  ]
+}
+EOF
+docker run -d --name masteva-j13-kc -p 20130:8080 -m 768m \
+  -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+  -v "$PWD/masteva-realm.json:/opt/keycloak/data/import/masteva-realm.json:ro" \
+  quay.io/keycloak/keycloak:26.8.0 start-dev --import-realm
+```
+
+</Terminal>
+
+- `start-dev` chạy chế độ phát triển: HTTP thường, database file bên trong container. Không dùng cho production.
+- `--import-realm` đọc file trong `/opt/keycloak/data/import` lúc khởi động. Mật khẩu viết trơn trong file là chấp nhận được cho lab, không bao giờ cho môi trường thật.
+- `-m 768m` giới hạn bộ nhớ của container; Keycloak dùng khoảng 550 tới 600 MB.
+- `client_secret` của `reporting-job` cũng nằm trong file; bài J13.3 bàn chuyện secret.
+
+Lần đầu Docker tải image, chiếm khoảng 750 MB trên đĩa. Chờ Keycloak sẵn sàng (thường 15 tới 30 giây), rồi đọc trang khám phá OIDC:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+until curl -sf -o /dev/null localhost:20130/realms/masteva/.well-known/openid-configuration; do sleep 2; done
+KC=http://localhost:20130/realms/masteva
+curl -s $KC/.well-known/openid-configuration | tr ',' '\n' | grep -E '^\{?"(issuer|token_endpoint|jwks_uri)"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"issuer":"http://localhost:20130/realms/masteva"
+"token_endpoint":"http://localhost:20130/realms/masteva/protocol/openid-connect/token"
+"jwks_uri":"http://localhost:20130/realms/masteva/protocol/openid-connect/certs"
+```
+
+</Expected>
+
+Vòng `until` chờ tới khi trang trả 200. Nếu nó chạy quá một phút, bấm `Ctrl+C` và xem `docker logs masteva-j13-kc`. Ba URL này là thứ Spring sẽ tự đọc từ `issuer-uri`.
+
+### 2. Lấy token và đọc bên trong
+
+Lấy access token cho alice bằng password grant, rồi giải mã header và payload. `JwtPeek` chỉ đọc, không kiểm chữ ký; nó dùng Jackson có sẵn trong `cp.txt` của J13.1.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j13
+cat > JwtPeek.java <<'EOF'
+import java.util.Base64;
+import tools.jackson.databind.SerializationFeature;
+import tools.jackson.databind.json.JsonMapper;
+
+/** In header và payload của một JWT. Không kiểm tra chữ ký: chỉ để đọc. */
+public class JwtPeek {
+    public static void main(String[] args) {
+        String[] parts = args[0].split("\\.");
+        JsonMapper json = JsonMapper.builder().enable(SerializationFeature.INDENT_OUTPUT).build();
+        for (int i = 0; i < 2; i++) {
+            String decoded = new String(Base64.getUrlDecoder().decode(parts[i]));
+            System.out.println(json.writeValueAsString(json.readTree(decoded)));
+        }
+    }
+}
+EOF
+token() {
+  curl -s $KC/protocol/openid-connect/token -d grant_type=password -d client_id=orders-cli \
+    -d username=$1 -d password=$1-pass | sed -E 's/.*"access_token":"([^"]+)".*/\1/'
+}
+TOKEN=$(token alice)
+java -cp "$(cat cp.txt)" JwtPeek.java "$TOKEN"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{
+  "alg" : "RS256",
+  "typ" : "JWT",
+  "kid" : "sWQ-iNpCdmhnTHnImTLe-TwOKn4cjqpmuY9MfYg0FII"
+}
+{
+  "exp" : 1791051202,
+  "iat" : 1791050902,
+  "jti" : "onrtro:c0a5f269-e164-bd3c-23f2-2f5114c6d2d7",
+  "iss" : "http://localhost:20130/realms/masteva",
+  "aud" : "orders-api",
+  "sub" : "cf6146b4-00a1-4100-81d6-824b7628d9f4",
+  "typ" : "Bearer",
+  "azp" : "orders-cli",
+  "sid" : "JUWWuI1W-EYiCxJ3VHWl5oH2",
+  "acr" : "1",
+  "realm_access" : {
+    "roles" : [ "USER" ]
+  },
+  "scope" : "profile email",
+  "email_verified" : true,
+  "roles" : [ "USER" ],
+  "name" : "Alice Nguyen",
+  "preferred_username" : "alice",
+  "given_name" : "Alice",
+  "family_name" : "Nguyen",
+  "email" : "alice@masteva.test"
+}
+```
+
+</Expected>
+
+`kid`, `sub`, `jti`, `sid`, thời gian và thứ tự trong `scope` khác trên máy bạn. `exp - iat = 300`: token sống đúng 5 phút như `accessTokenLifespan`. Nếu một bước sau báo token hết hạn, chạy lại `TOKEN=$(token alice)`. `aud` và `roles` đến từ hai mapper. `azp` (authorized party) là client đã xin token. Không có ID token vì request không xin scope `openid`; thêm `-d scope=openid` thì response có thêm `id_token` của OIDC.
+
+### 3. Biến API thành resource server
+
+Thêm starter resource server, rồi viết lại `SecurityConfig` với **hai** filter chain: chuỗi cho `/api/**` chỉ nhận bearer token, chuỗi còn lại cho trang nội bộ dùng form login và session.
+
+<Terminal where="mac" title="Sửa pom.xml, SecurityConfig, thêm NotesController">
+
+```bash
+cd ~/masteva-j13/orders
+perl -0pi -e 's#(\t<dependencies>\n)#$1\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-starter-security-oauth2-resource-server</artifactId>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-starter-security-oauth2-resource-server-test</artifactId>\n\t\t\t<scope>test</scope>\n\t\t</dependency>\n#' pom.xml
+P=src/main/java/dev/masteva/orders
+cat > $P/security/SecurityConfig.java <<'EOF'
+package dev.masteva.orders.security;
+
+import java.time.Duration;
+import java.util.List;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.factory.PasswordEncoderFactories;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.provisioning.InMemoryUserDetailsManager;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    /** Chuỗi 1: API cho SPA, mobile, service khác. Chỉ nhận bearer token, không session, không cookie. */
+    @Bean
+    @Order(1)
+    SecurityFilterChain api(HttpSecurity http) {
+        http
+            .securityMatcher("/api/**")
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/public/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated())
+            .oauth2ResourceServer(rs -> rs.jwt(Customizer.withDefaults()))
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .csrf(csrf -> csrf.disable())
+            .cors(Customizer.withDefaults());
+        return http.build();
+    }
+
+    /** Chuỗi 2: trang nội bộ dùng form login, session cookie và CSRF token. */
+    @Bean
+    @Order(2)
+    SecurityFilterChain web(HttpSecurity http) {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/actuator/health", "/error").permitAll()
+                .requestMatchers("/web/**").authenticated()
+                .anyRequest().denyAll())
+            .formLogin(Customizer.withDefaults());
+        return http.build();
+    }
+
+    @Bean
+    CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration cors = new CorsConfiguration();
+        cors.setAllowedOrigins(List.of("https://app.masteva.test"));
+        cors.setAllowedMethods(List.of("GET", "POST"));
+        cors.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+        cors.setMaxAge(Duration.ofMinutes(10));
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/api/**", cors);
+        return source;
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+    }
+
+    /** User cho trang nội bộ ở chuỗi 2. API ở chuỗi 1 không dùng bean này. */
+    @Bean
+    UserDetailsService users(PasswordEncoder encoder) {
+        return new InMemoryUserDetailsManager(
+            User.withUsername("admin").password(encoder.encode("admin-pass")).roles("USER", "ADMIN").build());
+    }
+}
+EOF
+cat > $P/web/NotesController.java <<'EOF'
+package dev.masteva.orders.web;
+
+import java.util.Map;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.web.csrf.CsrfToken;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+/** Trang nội bộ giả lập: đăng nhập bằng form, gửi ghi chú bằng POST. */
+@RestController
+public class NotesController {
+
+    @GetMapping("/web/csrf")
+    public Map<String, String> csrf(CsrfToken token) {
+        return Map.of("header", token.getHeaderName(), "token", token.getToken());
+    }
+
+    @PostMapping("/web/notes")
+    public Map<String, String> add(@RequestParam String text, Authentication auth) {
+        return Map.of("saved", text, "by", auth.getName());
+    }
+}
+EOF
+cat >> src/main/resources/application.properties <<'EOF'
+spring.security.oauth2.resourceserver.jwt.issuer-uri=http://localhost:20130/realms/masteva
+spring.security.oauth2.resourceserver.jwt.audiences=orders-api
+spring.security.oauth2.resourceserver.jwt.authorities-claim-name=roles
+spring.security.oauth2.resourceserver.jwt.authority-prefix=ROLE_
+spring.security.oauth2.resourceserver.jwt.principal-claim-name=preferred_username
+EOF
+```
+
+</Terminal>
+
+Năm dòng cấu hình làm toàn bộ việc kiểm token:
+
+| Thuộc tính | Tác dụng |
+|---|---|
+| `issuer-uri` | Tìm JWKS qua trang khám phá, kiểm `iss` và chữ ký |
+| `audiences` | Chỉ nhận token có `orders-api` trong `aud` |
+| `authorities-claim-name`, `authority-prefix` | Claim `roles: [USER]` thành authority `ROLE_USER`, nên `hasRole` của J13.1 vẫn dùng được |
+| `principal-claim-name` | `getName()` trả `preferred_username` thay cho `sub` dạng UUID |
+
+`@Order(1)` đặt chuỗi API trước; `securityMatcher("/api/**")` nói chuỗi đó chỉ nhận request bắt đầu bằng `/api/`. Mọi request khác rơi xuống chuỗi 2. Chạy ở tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j13/orders && mvn -q spring-boot:run
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Will secure Or [PathPattern [/api/**]] with filters: DisableEncodeUrlFilter, WebAsyncManagerIntegrationFilter, SecurityContextHolderFilter, HeaderWriterFilter, CorsFilter, LogoutFilter, OAuth2ProtectedResourceMetadataFilter, BearerTokenAuthenticationFilter, RequestCacheAwareFilter, SecurityContextHolderAwareRequestFilter, AnonymousAuthenticationFilter, SessionManagementFilter, ExceptionTranslationFilter, AuthorizationFilter
+Will secure any request with filters: DisableEncodeUrlFilter, WebAsyncManagerIntegrationFilter, SecurityContextHolderFilter, HeaderWriterFilter, CorsFilter, CsrfFilter, LogoutFilter, UsernamePasswordAuthenticationFilter, DefaultResourcesFilter, DefaultLoginPageGeneratingFilter, DefaultLogoutPageGeneratingFilter, RequestCacheAwareFilter, SecurityContextHolderAwareRequestFilter, AnonymousAuthenticationFilter, ExceptionTranslationFilter, AuthorizationFilter
+```
+
+</Expected>
+
+Hai chuỗi, hai danh sách. Chuỗi API có `BearerTokenAuthenticationFilter` và không có `CsrfFilter`; chuỗi web có form login và `CsrfFilter`. `OAuth2ProtectedResourceMetadataFilter` phục vụ trang `/.well-known/oauth-protected-resource` (RFC 9728) để client biết API này nhận token từ đâu.
+
+### 4. Gọi API bằng token
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+B=localhost:20131
+curl -s -H "Authorization: Bearer $TOKEN" $B/api/me; echo
+curl -i -s $B/api/me | grep -iE '^(HTTP|WWW|Set-Cookie)'
+curl -i -s -H "Authorization: Bearer $TOKEN" $B/api/admin/stats | grep -iE '^(HTTP|WWW)'
+curl -s -H "Authorization: Bearer $TOKEN" $B/api/users/alice/profile; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"authorities":["FACTOR_BEARER","ROLE_USER"],"name":"alice"}
+HTTP/1.1 401 
+WWW-Authenticate: Bearer resource_metadata="http://localhost:20131/.well-known/oauth-protected-resource"
+HTTP/1.1 403 
+WWW-Authenticate: Bearer error="insufficient_scope", error_description="The request requires higher privileges than provided by the access token.", error_uri="https://tools.ietf.org/html/rfc6750#section-3.1"
+{"username":"alice","tier":"silver"}
+```
+
+</Expected>
+
+Controller và `@PreAuthorize` của J13.1 không đổi một dòng mà vẫn chạy đúng, vì chúng chỉ làm việc với `Authentication`, không quan tâm nó đến từ Basic hay JWT. Request 401 không còn header `Set-Cookie`: chuỗi API là `STATELESS`, không tạo session. Ứng dụng không hề có mật khẩu của alice.
+
+### 5. Token giả, `alg: none` và sai audience
+
+Thử ba cách lừa API. Hàm `b64url` mã hoá base64url như JWT yêu cầu.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j13
+b64url() { base64 | tr '+/' '-_' | tr -d '=\n'; }
+FAKE=$(printf '%s' '{"iss":"http://localhost:20130/realms/masteva","aud":"orders-api","exp":4102444800,"preferred_username":"alice","roles":["ADMIN"]}' | b64url)
+HEAD=$(echo "$TOKEN" | cut -d. -f1); SIG=$(echo "$TOKEN" | cut -d. -f3)
+curl -s -o /dev/null -w '%header{www-authenticate}\n' -H "Authorization: Bearer $HEAD.$FAKE.$SIG" $B/api/admin/stats
+NONE=$(printf '%s' '{"alg":"none","typ":"JWT"}' | b64url)
+curl -s -o /dev/null -w '%header{www-authenticate}\n' -H "Authorization: Bearer $NONE.$FAKE." $B/api/admin/stats
+JOB=$(curl -s $KC/protocol/openid-connect/token -d grant_type=client_credentials \
+  -d client_id=reporting-job -d client_secret=reporting-job-secret | sed -E 's/.*"access_token":"([^"]+)".*/\1/')
+java -cp "$(cat cp.txt)" JwtPeek.java "$JOB" | grep -E '"(aud|azp)"'
+curl -s -o /dev/null -w '%header{www-authenticate}\n' -H "Authorization: Bearer $JOB" $B/api/me
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Bearer error="invalid_token", error_description="An error occurred while attempting to decode the Jwt: Signed JWT rejected: Invalid signature", error_uri="https://tools.ietf.org/html/rfc6750#section-3.1", resource_metadata="http://localhost:20131/.well-known/oauth-protected-resource"
+Bearer error="invalid_token", error_description="Unsupported algorithm of none", error_uri="https://tools.ietf.org/html/rfc6750#section-3.1", resource_metadata="http://localhost:20131/.well-known/oauth-protected-resource"
+  "aud" : "account",
+  "azp" : "reporting-job",
+Bearer error="invalid_token", error_description="An error occurred while attempting to decode the Jwt: The aud claim is not valid", error_uri="https://tools.ietf.org/html/rfc6750#section-3.1", resource_metadata="http://localhost:20131/.well-known/oauth-protected-resource"
+```
+
+</Expected>
+
+- **Sửa payload, giữ chữ ký cũ:** chữ ký tính trên header và payload gốc, nên payload đổi là chữ ký sai.
+- **`alg: none`:** tấn công kinh điển với thư viện JWT đời đầu, vốn tin vào `alg` trong header. Spring từ chối mọi JWT không ký (`alg: none`) ngay khi phân tích token; với token có ký, nó chỉ nhận thuật toán trong `jws-algorithms` (mặc định `RS256`), nên cũng chặn được kiểu nhầm thuật toán.
+- **Sai audience:** token của `reporting-job` hợp lệ, ký đúng, cùng issuer, nhưng dành cho `account`. Thiếu dòng `audiences`, API sẽ nhận nó, và mọi client trong realm, kể cả client của một đội khác, đều gọi được API của bạn.
+
+<Check id="j13.2.lab-bad-tokens">Tái hiện được ba lỗi `invalid_token` (sai chữ ký, `alg: none`, sai audience) và giải thích vì sao mỗi cái bị từ chối.</Check>
+
+### 6. Đăng xuất mà token vẫn sống
+
+Lấy cả access token lẫn refresh token cho bob, gọi API, đăng xuất bob ở Keycloak, rồi thử lại:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+RESP=$(curl -s $KC/protocol/openid-connect/token -d grant_type=password -d client_id=orders-cli -d username=bob -d password=bob-pass)
+AT=$(echo "$RESP" | sed -E 's/.*"access_token":"([^"]+)".*/\1/')
+RT=$(echo "$RESP" | sed -E 's/.*"refresh_token":"([^"]+)".*/\1/')
+curl -s -H "Authorization: Bearer $AT" $B/api/me; echo
+curl -s -o /dev/null -w 'logout: %{http_code}\n' $KC/protocol/openid-connect/logout -d client_id=orders-cli -d refresh_token=$RT
+curl -s $KC/protocol/openid-connect/token -d grant_type=refresh_token -d client_id=orders-cli -d refresh_token=$RT; echo
+curl -s $KC/protocol/openid-connect/token/introspect -u reporting-job:reporting-job-secret -d token=$AT; echo
+curl -s -H "Authorization: Bearer $AT" $B/api/me; echo
+```
+
+</Terminal>
+
+<Predict question="Sau khi đăng xuất, refresh token, introspection và API mỗi bên trả lời thế nào?">
+
+```text
+{"authorities":["FACTOR_BEARER","ROLE_USER"],"name":"bob"}
+logout: 204
+{"error":"invalid_grant","error_description":"Session not active"}
+{"active":false}
+{"authorities":["FACTOR_BEARER","ROLE_USER"],"name":"bob"}
+```
+
+Keycloak đã huỷ session: refresh token bị từ chối, introspection nói token không còn hiệu lực. Nhưng API vẫn trả 200, vì nó kiểm token bằng khoá công khai đã cache và không hỏi Keycloak. Token của bob sống tới `exp`, tối đa 5 phút. Đây là cái giá của mô hình không trạng thái; phần Kiến thức đã nêu cách giảm rủi ro.
+
+</Predict>
+
+<Check id="j13.2.lab-revocation">Chứng minh được bằng lệnh rằng access token vẫn dùng được sau khi đăng xuất, và giải thích vì sao introspection lại trả `active:false`.</Check>
+
+### 7. CORS: preflight bằng curl
+
+Giả làm trình duyệt bằng cách tự gửi header `Origin` và preflight `OPTIONS`:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+preflight() {
+  curl -s -o /dev/null -X OPTIONS $B/api/me -H "Origin: $1" \
+    -H 'Access-Control-Request-Method: GET' -H 'Access-Control-Request-Headers: authorization' \
+    -w '%{http_code} allow-origin=%header{access-control-allow-origin} allow-headers=%header{access-control-allow-headers} max-age=%header{access-control-max-age}\n'
+}
+preflight https://app.masteva.test
+preflight https://evil.example
+curl -s -H 'Origin: https://evil.example' $B/api/public/ping; echo
+curl -s $B/api/public/ping; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 allow-origin=https://app.masteva.test allow-headers=authorization max-age=600
+403 allow-origin= allow-headers= max-age=
+Invalid CORS request
+{"status":"ok"}
+```
+
+</Expected>
+
+Origin trong danh sách nhận đủ header và được trình duyệt cache 600 giây. Origin lạ nhận 403 không kèm header CORS. Spring còn chặn luôn request thật có `Origin` lạ (`Invalid CORS request`), nhưng request **không có** `Origin`, như của `curl` hay một service khác, đi qua bình thường. CORS chỉ có tác dụng khi bên gọi là trình duyệt.
+
+### 8. CSRF với trang dùng session
+
+Đóng vai trình duyệt đăng nhập trang nội bộ. `-c` và `-b` cho `curl` lưu và gửi cookie qua file `jar.txt`, như trình duyệt giữ cookie.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j13
+curl -s -c jar.txt -b jar.txt $B/login > login.html
+grep -o 'name="_csrf"[^>]*' login.html
+LOGIN_CSRF=$(sed -nE 's/.*name="_csrf" type="hidden" value="([^"]+)".*/\1/p' login.html)
+grep JSESSIONID jar.txt | cut -f6,7
+curl -s -o /dev/null -w '%{http_code}\n' -c jar.txt -b jar.txt $B/login -d username=admin -d password=admin-pass
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' -c jar.txt -b jar.txt $B/login \
+  -d username=admin -d password=admin-pass -d _csrf=$LOGIN_CSRF
+grep JSESSIONID jar.txt | cut -f6,7
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+name="_csrf" type="hidden" value="bYrax7o7yAej0ncb1TEa4D4UdlQb8YX1uZOZW-Qs47_TqX3jVOjs9I0I8DaOsRJ64hwu0A8hWzYrlLPY2qD4aIYU1dvknE_a" /
+JSESSIONID	2AFE93479D5D933D6EBA87A701447649
+403
+302 http://localhost:20131/
+JSESSIONID	B14C006A79B62B8064454E43F978FA58
+```
+
+</Expected>
+
+Giá trị token và session id khác trên máy bạn. Đúng mật khẩu mà thiếu `_csrf` vẫn 403, kể cả ở chính form đăng nhập: không có lớp này, một trang độc hại có thể đăng nhập nạn nhân vào tài khoản của kẻ tấn công (login CSRF). Sau khi đăng nhập, `JSESSIONID` **đổi giá trị**: Spring cấp session mới để chống **session fixation**, kiểu tấn công cài sẵn một session id cho nạn nhân rồi chờ họ đăng nhập. Chuyển hướng về `/` rồi bị `denyAll` chặn là bình thường; trang nội bộ trong lab chỉ có `/web/**`.
+
+Giờ gửi một ghi chú, lần đầu không có token, lần sau có:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -b jar.txt $B/web/notes -d text=hello
+curl -s -b jar.txt $B/web/csrf; echo
+curl -s -b jar.txt $B/web/csrf; echo
+T=$(curl -s -b jar.txt $B/web/csrf | sed -E 's/.*"token":"([^"]+)".*/\1/')
+curl -s -b jar.txt -H "X-CSRF-TOKEN: $T" $B/web/notes -d text=hello; echo
+```
+
+</Terminal>
+
+<Predict question="Hai lần đọc /web/csrf trong cùng session cho ra cùng token hay khác?">
+
+```text
+403
+{"token":"8IO6X4l3tydSmC-O513Mq3CRyiC3nZF8MAq9jU4DrABMRZJcwrCKZrpD0x9_rR7tgXD4mhKo50HR-fVRVTyKvXYzmmEucvc_","header":"X-CSRF-TOKEN"}
+{"token":"vkyOhAUDR9glOmbrzh5c2F-poD0pV6_nhH7eBOLFNZdG6GPPjH--vTY3I-AID1eIqDNo6T2QjVxPM8vK4UjpNNr1A_Yk3was","header":"X-CSRF-TOKEN"}
+{"by":"admin","saved":"hello"}
+```
+
+Khác nhau, nhưng cả hai đều hợp lệ. Token gốc trong session không đổi; mỗi lần gửi ra, Spring trộn nó với một chuỗi ngẫu nhiên mới (XOR) và gửi kèm chuỗi đó. Kẻ tấn công không đọc được bất kỳ bản nào vì same-origin policy, nên form ẩn trên trang của họ không thể kèm token. Cookie session có `HttpOnly`, nên script trên trang cũng không đọc được nó.
+
+</Predict>
+
+<Check id="j13.2.lab-csrf">Dùng `curl` với cookie jar tái hiện được: đăng nhập cần `_csrf`, session id đổi sau đăng nhập, POST thiếu token bị 403 và có token thì thành công.</Check>
+
+### Khi gặp lỗi
+
+- Vòng `until` ở bước 1 không dừng: Keycloak chưa lên hoặc container đã thoát. Xem `docker ps -a --filter name=masteva-j13-kc` và `docker logs masteva-j13-kc`. Exit code 137 nghĩa là bị giết vì thiếu bộ nhớ; tăng `-m` hoặc bộ nhớ của Docker Desktop.
+- `docker: Error response from daemon: Conflict. The container name "/masteva-j13-kc" is already in use`: container cũ còn đó. Nếu nó đang dừng, `docker start masteva-j13-kc`.
+- `{"error":"invalid_grant","error_description":"Account is not fully set up"}` khi lấy token: user thiếu email, họ hoặc tên mà Keycloak 26 yêu cầu. Kiểm tra lại file realm.
+- API trả 401 với `Jwt expired at ...`: token quá 5 phút. Chạy lại `TOKEN=$(token alice)`.
+- API trả 401 với `The iss claim is not valid`: bạn lấy token qua một host khác, ví dụ `127.0.0.1:20130` thay vì `localhost:20130`. Keycloak ghi `iss` theo host bạn gọi; phải khớp từng ký tự với `issuer-uri`.
+- Ứng dụng trả 500 cho mọi request có token, log có `Unable to resolve the Configuration with the provided Issuer`: ứng dụng không tới được Keycloak lúc kiểm token đầu tiên. Bài J13.3 xem kỹ trường hợp này.
+
+### Dọn dẹp
+
+Bấm `Ctrl+C` ở tab 1 để dừng ứng dụng. **Giữ Keycloak chạy** nếu học tiếp J13.3 ngay. Nếu nghỉ, dừng nó bằng `docker stop masteva-j13-kc` và bật lại bằng `docker start masteva-j13-kc`; realm, user và khoá ký vẫn còn. Bài J13.3 xoá container ở cuối. File `jar.txt`, `login.html` có thể để lại.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nếu không có Keycloak, có tự ký JWT được không?">
+
+Được. Spring Security có `NimbusJwtEncoder` để ký token bằng khoá RSA của bạn, và resource server kiểm bằng `public-key-location` hoặc `jwk-set-uri`. Cách này hợp với test hoặc hệ thống rất nhỏ. Khi đó bạn tự gánh mọi việc của một authorization server: trang đăng nhập, quên mật khẩu, MFA, xoay vòng khoá ký, thu hồi, đăng nhập bằng Google. Nhóm dự án Spring có Spring Authorization Server cho trường hợp phải tự dựng; còn lại, Keycloak hay một dịch vụ có sẵn thường rẻ hơn về lâu dài.
+
+</Reveal>
+
+<Reveal title="Keycloak xoay khoá ký thì API có phải khởi động lại không?">
+
+Không. Mỗi token mang `kid` trong header. Khi gặp một `kid` chưa có trong cache, Spring tải lại JWKS từ `jwks_uri` rồi kiểm tiếp. Authorization server thường công bố khoá mới trước khi dùng, và giữ khoá cũ trong JWKS cho tới khi token ký bằng nó hết hạn, nên quá trình xoay vòng không làm rơi request nào.
+
+</Reveal>
+
+<Reveal title="Vì sao dùng preferred_username làm tên lại cần cẩn thận?">
+
+`sub` là định danh ổn định do Keycloak cấp, không bao giờ đổi. `preferred_username` dễ đọc hơn nhưng có thể đổi nếu realm cho phép người dùng sửa username (realm `masteva` không cho, đây là mặc định). Nếu bạn lưu chủ sở hữu dữ liệu theo username rồi một người đổi username trùng với người cũ, dữ liệu của người cũ lộ sang người mới. Với hệ thống thật, lưu `sub` làm khoá; username chỉ để hiển thị.
+
+</Reveal>
+
+<Reveal title="SPA nên giữ access token ở đâu?">
+
+Trong bộ nhớ JavaScript thì mất khi tải lại trang; trong `localStorage` thì script XSS đọc được; trong cookie thường thì quay lại bài toán CSRF. Hướng dẫn hiện tại của IETF cho ứng dụng trình duyệt (bản nháp "OAuth 2.0 for Browser-Based Applications") nghiêng về mẫu BFF: một server nhỏ cùng origin với SPA làm OAuth client, giữ token ở server, và trình duyệt chỉ có cookie session `HttpOnly`, `Secure`, `SameSite`. Khi đó bật lại CSRF cho các route của BFF.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một JWT, viết cấu hình CORS, hoặc đọc một lỗi `invalid_token`. AI hay khuyên `allowedOrigins("*")` kèm `allowCredentials(true)` (Spring sẽ báo lỗi), hay tắt CSRF cho cả ứng dụng dùng session, hay bỏ qua kiểm tra audience, và thường dán JWT thật vào câu hỏi. Đừng dán token còn hạn vào bất kỳ công cụ nào; dùng `JwtPeek` của bài này. Kiểm tra lại cấu hình bằng các lệnh ở bước 5, 7 và 8.
+
+</Callout>
+
+<Callout kind="link">
+
+J10 giải thích header HTTP và mã trạng thái mà bài này dựa vào. J13.3 dùng token từ Keycloak để tìm một lỗi phân quyền theo dữ liệu, và bàn chuyện secret như `client_secret`. J15 dựng log và metric mà bạn có thể dùng để giám sát lỗi xác thực. Roadmap Microservices quay lại chủ đề này với API gateway và token giữa các service.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j13.2.mastery-resource-server">Tự cấu hình được một Spring Boot resource server với `issuer-uri`, kiểm tra audience và ánh xạ role, và chứng minh nó từ chối token sai chữ ký, `alg: none`, sai audience.</Check>
+
+<Check id="j13.2.mastery-tradeoffs">Chọn được giữa session và JWT cho một kiến trúc cụ thể (web server-rendered, SPA, mobile, service nội bộ), kèm cấu hình CORS và CSRF phù hợp, và giải thích được rủi ro thu hồi token.</Check>
+
+</Mastery>

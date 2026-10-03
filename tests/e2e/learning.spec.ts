@@ -124,8 +124,8 @@ test('khung chi tiết: nút Tiếp, Trước chuyển chủ đề và giữ foc
 });
 
 test('khung chi tiết chưa có bài vẫn có hướng đi tiếp', async ({ page }) => {
-  await page.goto('/vi/roadmaps/java#j11.ioc-dependency-injection');
-  const panel = page.locator('[data-panel="j11.ioc-dependency-injection"]');
+  await page.goto('/vi/roadmaps/devops#d2.mo-hinh-tcp-ip');
+  const panel = page.locator('[data-panel="d2.mo-hinh-tcp-ip"]');
   await expect(panel.locator('.rm-empty')).toBeVisible();
   await expect(panel.locator('a[rel="next"]')).toBeVisible();
 
@@ -207,7 +207,7 @@ test('"Tôi đã biết" thu gọn cấp và đổi nút Học tiếp', async ({
   await page.goto('/vi/roadmaps/java');
   await page.getByRole('group', { name: 'Tôi đã biết' }).getByRole('button', { name: 'Nền tảng', exact: true }).click();
   await expect(page.locator('[data-level="foundation"]')).toHaveAttribute('data-known', '');
-  await expect(page.getByTestId('continue')).toHaveAttribute('href', '#j11.ioc-dependency-injection');
+  await expect(page.getByTestId('continue')).toHaveAttribute('href', '/vi/learn/j11/j11-1');
   // Link trỏ vào cấp đã thu gọn mở cấp đó ra.
   await page.goto('/vi/roadmaps/java#step-j5');
   await expect(page.locator('#step-j5')).toBeInViewport();

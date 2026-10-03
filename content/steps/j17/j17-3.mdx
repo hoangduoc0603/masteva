@@ -1,0 +1,543 @@
+---
+title: Cấu hình 12-factor và JVM trong container
+description: Chạy một image duy nhất ở nhiều môi trường bằng biến môi trường, tham số và file secret; hiểu JVM đọc giới hạn bộ nhớ, CPU của container ra sao, tái hiện OutOfMemoryError và OOMKilled, và đặt tham số JVM cho đúng.
+id: j17.3
+step: j17
+prerequisites: [j17.1]
+topics: [j17.cau-hinh-theo-12-factor, j17.jvm-container-bo-nho-cpu]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    docker: 29.8.0
+    eclipse-temurin: 25.0.4.1 (image 25-jre)
+---
+
+<Goal>
+
+Cấu hình ứng dụng từ bên ngoài image theo 12-factor, và cho JVM chạy đúng trong giới hạn bộ nhớ, CPU của container. Học xong bài này, bạn giải thích được:
+
+- Vì sao container được cấp 512 MB mà heap chỉ có khoảng 128 MB.
+- Vì sao `OutOfMemoryError` để lại stack trace còn OOMKilled (exit 137) thì không để lại dòng log nào.
+- Vì sao giới hạn 1 CPU làm JVM chọn Serial GC và `ForkJoinPool.commonPool()` chỉ còn 1 thread.
+
+</Goal>
+
+<Knowledge>
+
+### Một image, nhiều môi trường
+
+Nguyên tắc **Config** của 12-factor: thứ khác nhau giữa các môi trường (URL database, region, secret) nằm ngoài mã và ngoài artifact. Cùng một image chạy ở dev, staging, production; chỉ cấu hình bơm vào lúc chạy là khác. Nếu build riêng image cho production, bạn deploy một thứ chưa từng được test.
+
+J11.2 đã dạy thứ tự ưu tiên của Spring Boot. Trong container, ba nguồn hay dùng nhất, cộng giá trị mặc định trong JAR, từ mạnh tới yếu:
+
+| Nguồn | Cách đưa vào container | Hợp với |
+|---|---|---|
+| Tham số dòng lệnh `--app.region=hn` | Viết sau tên image trong `docker run`, hoặc `args` của pod | Ghi đè tạm thời khi gỡ lỗi |
+| Biến môi trường `APP_REGION=hcm` | `docker run -e`, `env` hoặc `envFrom: configMapRef` của pod | Cấu hình thường, không bí mật |
+| File trong thư mục, đọc bằng `configtree` | `docker run -v`, Secret mount thành volume | Secret: mật khẩu, API key |
+| `application.properties` trong JAR | Đóng gói sẵn | Giá trị mặc định hợp lý |
+
+Biến môi trường được ánh xạ theo relaxed binding: `APP_REGION` thành `app.region`, `APP_APIKEY` thành `app.api-key` (bỏ dấu `-`, đổi `.` thành `_`, viết hoa). **configtree** đọc một cây thư mục: file `/run/secrets/app/api-key` thành thuộc tính `app.api-key`, nội dung file là giá trị. Đây đúng là hình dạng Kubernetes tạo ra khi mount một Secret thành volume:
+
+```text
+Secret "catalog-secret" (key: api-key)
+   |  volumeMounts: mountPath /run/secrets/app
+   v
+/run/secrets/app/api-key          spring.config.import=optional:configtree:/run/secrets/
+   v
+app.api-key = "sk-test-123"       @ConfigurationProperties("app") record AppProperties(..., String apiKey)
+```
+
+Secret qua file an toàn hơn qua biến môi trường: biến môi trường hiện ra trong `docker inspect`, trong `/proc/<pid>/environ`, được tiến trình con kế thừa, và hay lọt vào log khi ai đó in toàn bộ môi trường để gỡ lỗi.
+
+<Check id="j17.3.twelve-factor">Giải thích được vì sao cùng một image phải chạy được ở mọi môi trường, và chọn được nguồn cấu hình phù hợp cho giá trị thường và cho secret.</Check>
+
+### JVM đọc giới hạn của container
+
+`docker run --memory=512m --cpus=1` (hay `limits` của pod) không tạo máy ảo. Kernel Linux giới hạn tiến trình bằng **cgroup** (control group), ghi trong các file như `/sys/fs/cgroup/memory.max` và `/sys/fs/cgroup/cpu.max`. JVM trên Linux mặc định bật `-XX:+UseContainerSupport`: lúc khởi động nó đọc các file đó thay vì RAM và số CPU của cả máy, rồi chọn tham số theo **ergonomics** (quy tắc tự chọn giá trị mặc định):
+
+| Giới hạn container | JVM suy ra | Kết quả trong lab |
+|---|---|---|
+| `memory.max` | Heap tối đa = `MaxRAMPercentage` (mặc định 25%) nhân giới hạn | 512 MB cho heap 128 MB |
+| `cpu.max` (quota chia period) | `availableProcessors()` | `--cpus=1` cho 1 |
+| Dưới 2 CPU hoặc dưới 1792 MB | Không phải "server class": chọn **Serial GC** thay vì G1 | 1 CPU, hay 4 CPU với 512 MB, đều ra Serial |
+| Số CPU | `ParallelGCThreads`, số thread JIT, `commonPool` bằng số CPU trừ 1 (ít nhất 1) | 4 CPU cho `commonPool` 3 |
+
+Từ JDK 19, JVM chỉ dựa vào CPU **limit** (quota), không dựa vào CPU request. Pod chỉ đặt `requests.cpu` mà không đặt limit sẽ thấy toàn bộ CPU của node.
+
+### Ngân sách bộ nhớ: heap không phải tất cả
+
+```text
+giới hạn container 512 MB
+├── heap                    MaxRAMPercentage x giới hạn; -Xmx nếu đặt tay
+├── metaspace               metadata của class: ứng dụng Spring nhỏ cũng nạp hàng nghìn class
+├── code cache              mã máy do JIT sinh ra
+├── thread stack            tối đa 1 MB mỗi thread (dự trữ; phần thật sự dùng thường nhỏ hơn):
+│                           Tomcat 200 thread, GC, JIT
+├── direct buffer, NIO      Netty, client HTTP, driver
+└── GC, JIT, malloc của libc
+```
+
+Heap chỉ là một phần. Đặt `-Xmx` bằng đúng giới hạn container nghĩa là phần còn lại không có chỗ. Ngược lại, giữ mặc định 25% thì lãng phí ba phần tư bộ nhớ đã trả tiền. Mức hay dùng cho service web là `-XX:MaxRAMPercentage` từ 60 tới 75, rồi đo bộ nhớ thật dưới tải (`docker stats`, metric của Kubernetes) để chỉnh. Memory calculator của Buildpacks ở J17.2 chính là làm phép cộng này một cách bảo thủ.
+
+### Hai kiểu "hết bộ nhớ"
+
+| | `java.lang.OutOfMemoryError` | OOMKilled |
+|---|---|---|
+| Ai phát hiện | JVM: heap đầy sau khi GC | Kernel: tổng bộ nhớ tiến trình vượt `memory.max` |
+| Tiến trình | Vẫn sống; request đó lỗi 500 | Bị `SIGKILL`, exit code 137 = 128 + 9 (D1.1) |
+| Dấu vết | Stack trace trong log, heap dump nếu bật | Không có dòng log nào; chỉ `OOMKilled: true` trong `docker inspect` hay trạng thái pod |
+| Nguyên nhân hay gặp | Heap quá nhỏ, rò rỉ bộ nhớ | `-Xmx` cộng phần ngoài heap lớn hơn giới hạn container |
+
+<Callout kind="production">
+
+Một service chạy ổn trên VM 4 GB với `-Xmx3g`. Lên Kubernetes với `limits.memory: 2Gi`, cấu hình JVM được chép nguyên. Lúc ít tải, heap chưa phình nên không sao. Tới giờ cao điểm, heap vượt 2 GB, kernel giết container, pod khởi động lại với exit code 137. Log ứng dụng dừng ở một dòng INFO bình thường; đội trực mất hàng giờ tìm "lỗi trong code". Dấu hiệu nhận ra ngay là `Last State: Terminated, Reason: OOMKilled` trong `kubectl describe pod`. Sửa bằng cách bỏ `-Xmx` cố định, dùng `-XX:MaxRAMPercentage=75` để heap luôn tỷ lệ với limit.
+
+</Callout>
+
+<Check id="j17.3.jvm-ergonomics">Giải thích được JVM lấy giới hạn bộ nhớ, CPU từ đâu, và các giới hạn đó quyết định heap tối đa, GC, số thread của `commonPool` ra sao.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [The Twelve-Factor App: Config](https://12factor.net/config): ngắn, đọc cả trang; chú ý phép thử "mở mã nguồn ngay bây giờ có lộ secret nào không".
+- [Externalized Configuration](https://docs.spring.io/spring-boot/reference/features/external-config.html): phần "Using Configuration Trees" cho `configtree` và phần "Binding From Environment Variables" cho quy tắc đặt tên biến.
+- [The java Command](https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html): tìm `MaxRAMPercentage`, `ActiveProcessorCount`, `UseContainerSupport`.
+- [Ergonomics](https://docs.oracle.com/en/java/javase/25/gctuning/ergonomics.html): điều kiện "server-class machine" và kích thước heap mặc định.
+- [Resource Management for Pods and Containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/): `requests`, `limits` và chuyện gì xảy ra khi container vượt giới hạn bộ nhớ.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài J17.1 (J17.2 không bắt buộc): `~/masteva-j17/catalog` có `Dockerfile`. Docker đang chạy, cổng **20170** trống. Docker Desktop cần được cấp ít nhất 3 GB RAM và 4 CPU (Settings, Resources) cho bước 8. Mở Terminal mới thì chạy lại `export JAVA_HOME=$(/usr/libexec/java_home -v 25)` và `cd ~/masteva-j17/catalog`.
+
+### 1. Thêm cấu hình và endpoint quan sát JVM
+
+`AppProperties` gom cấu hình `app.*`. `RuntimeController` có hai endpoint: `/api/runtime` trả cấu hình và những gì JVM thấy; `/api/report?mb=N` giả lập xuất báo cáo bằng cách nạp N MB dữ liệu vào heap.
+
+<Terminal where="mac">
+
+```bash
+cat > src/main/java/dev/masteva/catalog/AppProperties.java <<'EOF'
+package dev.masteva.catalog;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+@ConfigurationProperties("app")
+public record AppProperties(String region, String greeting, String apiKey) {
+}
+EOF
+cat > src/main/java/dev/masteva/catalog/RuntimeController.java <<'EOF'
+package dev.masteva.catalog;
+
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.ForkJoinPool;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class RuntimeController {
+
+    record RuntimeInfo(String region, String greeting, boolean apiKeySet, long maxHeapMb,
+            int cpus, int commonPool, List<String> gc) {
+    }
+
+    record ReportResult(int loadedMb) {
+    }
+
+    private final AppProperties props;
+
+    RuntimeController(AppProperties props) {
+        this.props = props;
+    }
+
+    @GetMapping("/api/runtime")
+    RuntimeInfo runtime() {
+        Runtime rt = Runtime.getRuntime();
+        List<String> gc = ManagementFactory.getGarbageCollectorMXBeans().stream()
+                .map(GarbageCollectorMXBean::getName)
+                .toList();
+        boolean apiKeySet = props.apiKey() != null && !props.apiKey().isBlank();
+        return new RuntimeInfo(props.region(), props.greeting(), apiKeySet,
+                rt.maxMemory() / 1024 / 1024, rt.availableProcessors(),
+                ForkJoinPool.getCommonPoolParallelism(), gc);
+    }
+
+    // Giả lập xuất báo cáo bằng cách nạp toàn bộ dữ liệu vào bộ nhớ, mỗi phần 1 MB.
+    @GetMapping("/api/report")
+    ReportResult report(@RequestParam int mb) {
+        List<byte[]> rows = new ArrayList<>();
+        for (int i = 0; i < mb; i++) {
+            byte[] chunk = new byte[1024 * 1024];
+            Arrays.fill(chunk, (byte) 1);
+            rows.add(chunk);
+        }
+        return new ReportResult(rows.size());
+    }
+}
+EOF
+perl -0pi -e 's#(import org.springframework.boot.autoconfigure.SpringBootApplication;)#$1\nimport org.springframework.boot.context.properties.ConfigurationPropertiesScan;#; s#(\@SpringBootApplication\n)#$1\@ConfigurationPropertiesScan\n#' src/main/java/dev/masteva/catalog/CatalogApplication.java
+cat >> src/main/resources/application.properties <<'EOF'
+app.region=local
+app.greeting=Xin chao
+spring.config.import=optional:configtree:/run/secrets/
+EOF
+mvn -q -DskipTests package && docker build -q -t masteva-j17/catalog:dockerfile .
+```
+
+</Terminal>
+
+Lệnh `perl` thêm `@ConfigurationPropertiesScan` vào `CatalogApplication` để Spring tìm record `AppProperties`; bạn cũng có thể sửa bằng IDE. `Arrays.fill` ghi vào từng byte để hệ điều hành thật sự cấp trang nhớ, giống dữ liệu báo cáo thật. Tiền tố `optional:` giúp ứng dụng vẫn khởi động khi không có thư mục `/run/secrets`, ví dụ lúc chạy trên máy bạn.
+
+Hàm `wait_app` dưới đây chờ tới khi `/actuator/health` trả lời, tối đa 30 giây. Định nghĩa nó một lần trong Terminal đang dùng:
+
+<Terminal where="mac">
+
+```bash
+wait_app() { for i in {1..30}; do curl -sf localhost:20170/actuator/health >/dev/null && return 0; sleep 1; done; echo "app chưa sẵn sàng"; return 1; }
+```
+
+</Terminal>
+
+### 2. Cấu hình qua biến môi trường
+
+<Callout kind="danger">
+
+Các bước 2 tới 8 kết thúc bằng việc xoá container vừa tạo (`docker rm -f`, `docker rm` hoặc `--rm`), xoá vĩnh viễn container đó cùng log của nó; image vẫn giữ.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name masteva-j17-app -p 20170:20170 --memory=512m --cpus=1 \
+  -e APP_REGION=hcm -e APP_GREETING="Xin chào từ container" masteva-j17/catalog:dockerfile
+wait_app && curl -s localhost:20170/api/runtime; echo
+docker rm -f masteva-j17-app
+```
+
+</Terminal>
+
+<Predict question="Container có 512 MB và 1 CPU. maxHeapMb, cpus, gc là bao nhiêu?">
+
+```text
+{"region":"hcm","greeting":"Xin chào từ container","apiKeySet":false,"maxHeapMb":123,"cpus":1,"commonPool":1,"gc":["Copy","MarkSweepCompact"]}
+```
+
+`region` và `greeting` đến từ biến môi trường, thắng `application.properties` trong JAR. Heap tối đa là 25% của 512 MB, tức 128 MB; `Runtime.maxMemory()` báo 123 vì Serial GC luôn để trống một vùng survivor nhỏ và không tính nó. `Copy` và `MarkSweepCompact` là hai bộ thu của **Serial GC**: với 1 CPU, JVM không coi đây là máy "server class" nên không chọn G1.
+
+</Predict>
+
+### 3. Secret qua file và tham số dòng lệnh
+
+Tạo file secret, loại nó khỏi Git, rồi mount vào `/run/secrets` chỉ đọc. Lần này có cả biến môi trường `APP_REGION` lẫn tham số `--app.region` sau tên image:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p secrets/app && printf 'sk-test-123' > secrets/app/api-key && echo 'secrets/' >> .gitignore
+docker run -d --name masteva-j17-app -p 20170:20170 --memory=512m --cpus=1 \
+  -e APP_REGION=hcm -v "$PWD/secrets:/run/secrets:ro" masteva-j17/catalog:dockerfile --app.region=hn
+wait_app && curl -s localhost:20170/api/runtime; echo
+docker inspect -f '{{json .Config.Env}}' masteva-j17-app
+docker rm -f masteva-j17-app
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"region":"hn","greeting":"Xin chao","apiKeySet":true,"maxHeapMb":123,"cpus":1,"commonPool":1,"gc":["Copy","MarkSweepCompact"]}
+["APP_REGION=hcm","PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","JAVA_HOME=/opt/java/openjdk","LANG=en_US.UTF-8","LANGUAGE=en_US:en","LC_ALL=en_US.UTF-8","JAVA_VERSION=jdk-25.0.4.1+1"]
+```
+
+</Expected>
+
+Tham số dòng lệnh `hn` thắng biến môi trường `hcm`. `apiKeySet` là `true`: configtree đã đọc file. Ứng dụng không bao giờ in giá trị secret, chỉ báo có hay không. `docker inspect` cho thấy ai có quyền đọc Docker đều thấy mọi biến môi trường, còn nội dung secret không xuất hiện ở đó.
+
+<Check id="j17.3.lab-config">Chạy được cùng một image với cấu hình khác nhau qua `-e`, tham số dòng lệnh và file secret đọc bằng `configtree`, rồi chỉ ra nguồn nào thắng.</Check>
+
+### 4. Xem JVM thấy gì
+
+Hỏi thẳng JVM trong base image, với cùng giới hạn:
+
+<Terminal where="mac">
+
+```bash
+F=' (MaxHeapSize|MaxRAMPercentage|UseSerialGC|UseG1GC|ActiveProcessorCount|ParallelGCThreads) '
+docker run --rm --memory=512m --cpus=1 eclipse-temurin:25-jre java -XX:+PrintFlagsFinal -version | grep -E "$F"
+docker run --rm --memory=512m --cpus=1 eclipse-temurin:25-jre java -Xlog:os+container=trace -version | grep -E 'cgroups v2|quota/period|Memory Limit is' | sed 's/^\[[0-9.]*s\]//' | sort -u
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+openjdk version "25.0.4.1" 2026-08-18 LTS
+...
+      int ActiveProcessorCount                     = -1                                        {product} {default}
+   size_t MaxHeapSize                              = 134217728                                 {product} {ergonomic}
+   double MaxRAMPercentage                         = 25.000000                                 {product} {default}
+     uint ParallelGCThreads                        = 0                                         {product} {default}
+     bool UseG1GC                                  = false                                     {product} {default}
+     bool UseSerialGC                              = true                                      {product} {ergonomic}
+...
+[debug][os,container] Detected cgroups v2 unified hierarchy
+[trace][os,container] CPU Quota count based on quota/period: 1
+[trace][os,container] Memory Limit is: 536870912
+```
+
+</Expected>
+
+`-XX:+PrintFlagsFinal` in mọi tham số và nguồn gốc của chúng: `{ergonomic}` là JVM tự chọn theo môi trường, `{default}` là giá trị mặc định, `{command line}` là bạn đặt. `MaxHeapSize` 134217728 byte đúng bằng 128 MB. `ActiveProcessorCount = -1` nghĩa là chưa đặt tay, JVM tự đếm. `-Xlog:os+container=trace` cho thấy JVM đọc cgroup v2, tính quota 100000 chia period 100000 ra 1 CPU, và đọc giới hạn 536870912 byte (512 MB). Ba dòng `openjdk version` do `-version` in ra.
+
+### 5. OutOfMemoryError trong heap
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name masteva-j17-app -p 20170:20170 --memory=512m --cpus=1 masteva-j17/catalog:dockerfile
+wait_app && curl -s -w ' http=%{http_code}\n' 'localhost:20170/api/report?mb=200'
+docker logs masteva-j17-app 2>&1 | grep -m1 -o 'Handler dispatch failed: java.lang.OutOfMemoryError: Java heap space'
+curl -s -w ' http=%{http_code}\n' 'localhost:20170/api/report?mb=50'
+docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' masteva-j17-app
+docker rm -f masteva-j17-app
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"timestamp":"2026-10-03T18:20:38.215Z","status":500,"error":"Internal Server Error","path":"/api/report"} http=500
+Handler dispatch failed: java.lang.OutOfMemoryError: Java heap space
+{"loadedMb":50} http=200
+masteva-j17-app 276.2MiB / 512MiB
+masteva-j17-app
+```
+
+</Expected>
+
+Log có đủ stack trace; lệnh `grep -o` chỉ lấy phần tên lỗi. 200 MB không vừa heap 123 MB: JVM ném `OutOfMemoryError`, request đó nhận 500, nhưng tiến trình vẫn sống và request 50 MB ngay sau đó thành công. Sau hai request, container dùng khoảng 276 MB trên 512 MB: bộ nhớ có thừa, chỉ là heap không được phép dùng.
+
+### 6. Cho heap dùng 75% giới hạn
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name masteva-j17-app -p 20170:20170 --memory=512m --cpus=1 \
+  -e JAVA_TOOL_OPTIONS='-XX:MaxRAMPercentage=75' masteva-j17/catalog:dockerfile
+wait_app && curl -s localhost:20170/api/runtime; echo
+curl -s -w ' http=%{http_code}\n' 'localhost:20170/api/report?mb=200'
+docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' masteva-j17-app
+docker rm -f masteva-j17-app
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"region":"local","greeting":"Xin chao","apiKeySet":false,"maxHeapMb":371,"cpus":1,"commonPool":1,"gc":["Copy","MarkSweepCompact"]}
+{"loadedMb":200} http=200
+masteva-j17-app 374.2MiB / 512MiB
+masteva-j17-app
+```
+
+</Expected>
+
+`JAVA_TOOL_OPTIONS` là biến môi trường mà mọi JVM đọc và ghép vào tham số dòng lệnh; JVM in dòng `Picked up JAVA_TOOL_OPTIONS: ...` vào log để bạn biết. Nhờ nó, bạn chỉnh JVM mà không sửa `ENTRYPOINT` hay build lại image. MaxHeapSize giờ là 384 MB (`maxMemory` báo 371 vì vùng survivor), request 200 MB thành công, và container dùng khoảng 374 MB trên 512 MB.
+
+<Callout kind="pitfall">
+
+374 MB đo lúc heap chưa đầy. Khi heap dùng hết 384 MB, phần ngoài heap của một ứng dụng Spring (metaspace khoảng 80 MB, code cache, stack) đẩy tổng sát 512 MB. Với container nhỏ hơn 1 GB, nên bắt đầu ở 60 tới 65% hoặc tăng limit, rồi đo dưới tải.
+
+</Callout>
+
+<Check id="j17.3.lab-heap">Tái hiện được `OutOfMemoryError` với heap mặc định và sửa bằng `-XX:MaxRAMPercentage` qua `JAVA_TOOL_OPTIONS`, không build lại image.</Check>
+
+### 7. OOMKilled
+
+Giờ làm sai theo kiểu hay gặp: đặt `-Xmx1g` cố định trong container 512 MB.
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name masteva-j17-oom -p 20170:20170 --memory=512m --memory-swap=512m --cpus=1 \
+  -e JAVA_TOOL_OPTIONS='-Xmx1g' masteva-j17/catalog:dockerfile
+wait_app && curl -sS 'localhost:20170/api/report?mb=600'; echo
+sleep 1
+docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} oomkilled={{.State.OOMKilled}}' masteva-j17-oom
+docker logs masteva-j17-oom 2>&1 | grep -c OutOfMemoryError
+```
+
+</Terminal>
+
+<Predict question="Heap được phép 1 GB, container chỉ có 512 MB. Request 600 MB nhận được gì?">
+
+```text
+curl: (52) Empty reply from server
+
+status=exited exit=137 oomkilled=true
+0
+```
+
+JVM tin rằng nó có 1 GB heap nên cứ cấp phát. Khi tổng bộ nhớ của tiến trình chạm 512 MB, kernel gửi `SIGKILL`: không có `OutOfMemoryError`, không shutdown hook, không dòng log nào (đếm được 0). Kết nối bị cắt giữa chừng nên `curl` nhận phản hồi rỗng. Exit code 137 = 128 + 9, đúng như bài D1.1.
+
+</Predict>
+
+`--memory-swap=512m` tắt swap cho container. Docker Desktop có swap, và nếu không có cờ này container được dùng thêm 512 MB swap: request vẫn thành công nhưng chậm, che mất vấn đề. Node Kubernetes mặc định không dùng swap, nên cờ này cho kết quả giống production hơn.
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá container `masteva-j17-oom` đã dừng, cùng log của nó.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker rm masteva-j17-oom
+```
+
+</Terminal>
+
+<Check id="j17.3.lab-oomkilled">Tái hiện được OOMKilled, đọc được `exit=137` và `OOMKilled=true` trong `docker inspect`, và phân biệt nó với `OutOfMemoryError`.</Check>
+
+### 8. CPU, GC và common pool
+
+<Terminal where="mac">
+
+```bash
+cpu_run() {
+  docker run -d --name masteva-j17-cpu -p 20170:20170 --memory=2g "$@" masteva-j17/catalog:dockerfile >/dev/null
+  wait_app && curl -s localhost:20170/api/runtime; echo
+  docker rm -f masteva-j17-cpu >/dev/null
+}
+cpu_run --cpus=4
+cpu_run --cpus=1
+cpu_run --cpus=1 -e JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"region":"local","greeting":"Xin chao","apiKeySet":false,"maxHeapMb":512,"cpus":4,"commonPool":3,"gc":["G1 Young Generation","G1 Concurrent GC","G1 Old Generation"]}
+{"region":"local","greeting":"Xin chao","apiKeySet":false,"maxHeapMb":494,"cpus":1,"commonPool":1,"gc":["Copy","MarkSweepCompact"]}
+{"region":"local","greeting":"Xin chao","apiKeySet":false,"maxHeapMb":512,"cpus":2,"commonPool":1,"gc":["G1 Young Generation","G1 Concurrent GC","G1 Old Generation"]}
+```
+
+</Expected>
+
+| Giới hạn | `cpus` | `commonPool` | GC |
+|---|---|---|---|
+| 4 CPU, 2 GB | 4 | 3 | G1 |
+| 1 CPU, 2 GB | 1 | 1 | Serial |
+| 1 CPU, 2 GB, `ActiveProcessorCount=2` | 2 | 1 | G1 |
+
+Cùng 2 GB, chỉ đổi CPU limit là JVM đổi GC. Với 1 CPU, Serial GC dừng toàn bộ ứng dụng trong mỗi lần thu gom, và `parallelStream()` hay `CompletableFuture.supplyAsync()` không có `Executor` riêng chỉ còn 1 thread. `-XX:ActiveProcessorCount=2` bảo JVM coi như có 2 CPU: nó chọn G1 và chạy 2 thread GC song song. Quota vẫn là 1 CPU, nên hai thread đó chia nhau 1 CPU; đây là cách sửa ergonomics, không phải cách có thêm CPU. Nếu chỉ cần G1, đặt thẳng `-XX:+UseG1GC` rõ ràng hơn.
+
+<Check id="j17.3.lab-cpu">Chỉ ra được bằng số liệu CPU limit ảnh hưởng tới GC và `commonPool` thế nào, và dùng được `-XX:ActiveProcessorCount`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Biến môi trường không có tác dụng: sai tên (viết hoa, `.` thành `_`), hoặc bạn đổi biến mà không tạo lại container. Biến môi trường chỉ được đọc lúc tạo container; `docker restart` không đổi chúng.
+- Viết `app.greeting=Xin chào` trong `application.properties` thì nhận `Xin chÃ o`: Spring Boot đọc file `.properties` theo ISO-8859-1. Dùng ký tự ASCII, escape Unicode (`\u00e0` cho `à`), hoặc `application.yaml` (UTF-8).
+- `apiKeySet` vẫn `false`: đường dẫn mount sai. File phải nằm ở `/run/secrets/app/api-key` bên trong container; kiểm tra bằng `docker exec masteva-j17-app ls -R /run/secrets`.
+- `app chưa sẵn sàng`: container đã chết. Xem `docker logs` và `docker inspect` như bước 7. Với bước 8, Docker Desktop có thể được cấp quá ít RAM.
+- Bước 8 in `range of CPUs is from 0.01 to 2.00, as there are only 2 CPUs available` (con số theo máy bạn) rồi `app chưa sẵn sàng`: Docker Desktop được cấp ít hơn 4 CPU nên `--cpus=4` bị từ chối, container không được tạo. Tăng CPU trong Settings, Resources.
+- Bước 7 không bị kill mà thành công: thiếu `--memory-swap=512m`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá vĩnh viễn thư mục `secrets` và image `masteva-j17/catalog:dockerfile`. Các container đã được xoá ở từng bước; `docker ps -a --filter name=masteva-j17` chỉ còn dòng tiêu đề.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+docker ps -a --filter name=masteva-j17
+cd ~/masteva-j17/catalog && rm -rf secrets && docker image rm masteva-j17/catalog:dockerfile
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Muốn xoá hẳn project của chặng J17 thì chạy `rm -rf ~/masteva-j17`. Lệnh này xoá vĩnh viễn toàn bộ mã nguồn; chỉ chạy khi chắc không cần nữa. Base image `eclipse-temurin:25-jre` có thể giữ lại cho các chặng sau.
+
+</Callout>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Có nên đặt -Xms bằng -Xmx trong container?">
+
+Đặt `-Xms` (heap ban đầu) bằng heap tối đa, hoặc `-XX:InitialRAMPercentage` bằng `MaxRAMPercentage`, làm JVM commit toàn bộ heap ngay từ đầu và không trả lại cho hệ điều hành. Trang nhớ chỉ thật sự chiếm RAM khi được ghi; thêm `-XX:+AlwaysPreTouch` thì JVM ghi trước toàn bộ heap lúc khởi động, nên thiếu bộ nhớ lộ ra ngay thay vì lúc cao điểm. Ưu điểm: không tốn thời gian nới heap lúc tải tăng. Nhược điểm: sau khi chạy một lúc, container giữ gần mức tối đa kể cả khi rảnh (với `AlwaysPreTouch` là ngay từ đầu, và khởi động chậm hơn), nên trên cụm chật, ít pod xếp được vào một node hơn. Service tải ổn định, quan trọng về độ trễ thường chọn đặt bằng nhau; job ít chạy thì không.
+
+</Reveal>
+
+<Reveal title="Có nên đặt CPU limit cho pod Java?">
+
+Đây là tranh luận còn mở. CPU limit làm kernel **throttle** (tạm dừng) container khi dùng hết quota trong mỗi chu kỳ 100 ms, gây những khoảng trễ khó giải thích; JIT và GC lúc khởi động hay chạm limit. Bỏ limit, chỉ đặt request, thì không bị throttle, nhưng JVM thấy toàn bộ CPU của node và tạo quá nhiều thread GC, JIT. Cách hay dùng: đặt request đúng nhu cầu, và nếu bỏ limit thì đặt `-XX:ActiveProcessorCount` bằng request để ergonomics hợp lý. Đo throttling bằng metric `container_cpu_cfs_throttled_periods_total` trước khi quyết định.
+
+</Reveal>
+
+<Reveal title="OutOfMemoryError xong ứng dụng vẫn sống. Như vậy tốt hay xấu?">
+
+Sau `OutOfMemoryError`, một thread bất kỳ có thể đã chết giữa chừng, cache có thể dở dang; ứng dụng "sống" nhưng có thể đã hỏng. Nhiều đội thêm `-XX:+ExitOnOutOfMemoryError` để JVM thoát ngay, và để Kubernetes khởi động lại pod sạch. Image Buildpacks ở J17.2 bật sẵn cờ này. Kèm `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps` ghi vào một volume, bạn vẫn có heap dump để tìm nguyên nhân (J18).
+
+</Reveal>
+
+<Reveal title="GraalVM native image có giải quyết chuyện bộ nhớ và khởi động không?">
+
+GraalVM native image biên dịch AOT (trước khi chạy) toàn bộ ứng dụng thành một file thực thi gốc, không cần JVM. Theo tài liệu GraalVM và Spring Boot, đổi lại bạn được khởi động trong khoảng chục tới trăm mili giây và bộ nhớ thấp hơn đáng kể, hợp với CLI, serverless, scale từ 0. Cái giá: build mất vài phút và vài GB RAM; giả định "closed world" nên reflection, proxy, resource phải được khai báo (Spring AOT sinh phần lớn, thư viện ngoài có thể thiếu); không có JIT nên service chạy lâu thường đạt throughput đỉnh thấp hơn JVM; công cụ chẩn đoán như JFR, heap dump bị hạn chế hơn. Bài này không cài GraalVM; nếu thử, hãy đo cả thời gian build, RSS và throughput dưới tải thật trước khi đổi.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI tính ngân sách bộ nhớ cho một container, hoặc giải thích output của `-XX:+PrintFlagsFinal`. AI hay khuyên `-XX:+UseCGroupMemoryLimitForHeap`, cờ thử nghiệm của JDK 8 và 9 đã bị xoá (JDK 25 báo `Unrecognized VM option` và không khởi động), quên rằng `-Xmx` cố định ghi đè `MaxRAMPercentage`, và hay nói JVM "không biết mình chạy trong container". Kiểm tra lại bằng `java -XX:+PrintFlagsFinal -version` và `-Xlog:os+container=trace` chạy trong chính image và giới hạn của bạn.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.1 giải thích exit code 137 và `SIGKILL`. J11.2 đi sâu thứ tự ưu tiên cấu hình và relaxed binding. J14 dùng `commonPool` và executor. J18 đi sâu heap, GC, heap dump. D11 dùng `requests`, `limits`, ConfigMap và Secret trên Kubernetes thật.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j17.3.mastery-budget">Tự chọn được giới hạn bộ nhớ, CPU và tham số JVM cho một service Java trong container, và giải thích được ngân sách bộ nhớ ngoài heap.</Check>
+
+<Check id="j17.3.mastery-diagnose">Nhìn trạng thái một container hay pod Java đã chết là phân biệt được `OutOfMemoryError` với OOMKilled, và nói được bước sửa cho từng loại.</Check>
+
+</Mastery>

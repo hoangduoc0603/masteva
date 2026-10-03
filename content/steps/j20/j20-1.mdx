@@ -1,0 +1,642 @@
+---
+title: System design, ước lượng tải và ADR
+description: Thiết kế dịch vụ lệnh chuyển tiền cho Neobank mini thành một design doc có số liệu, tính QPS, dung lượng và số kết nối bằng jshell, kiểm định luật Little bằng load test với virtual thread, rồi chốt quyết định bằng một ADR theo mẫu Nygard.
+id: j20.1
+step: j20
+prerequisites: [j19]
+topics: [j20.system-design-trade-off, j20.uoc-luong-tai-dung-luong, j20.adr]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    git: 2.39.3
+---
+
+<Goal>
+
+Đi từ một yêu cầu mơ hồ, "làm phần chuyển tiền cho [Neobank mini](/vi/projects/neobank)", tới một design doc có yêu cầu phi chức năng, phép ước lượng, các phương án kèm trade-off, số đo từ load test và một ADR ghi lại quyết định. Học xong bài này, bạn giải thích được:
+
+- Vì sao 400 nghìn người dùng mỗi ngày chỉ ra khoảng 93 lệnh ghi mỗi giây lúc đỉnh, và vì sao con số đó là lý do chưa cần tách microservice.
+- Vì sao một service chạy êm ở 150 request mỗi giây nhưng thêm 33% tải thì độ trễ trung bình tăng hơn 10 lần.
+- Vì sao một ADR đã chấp nhận thì không sửa nội dung, mà viết ADR mới thay thế nó.
+
+</Goal>
+
+<Knowledge>
+
+### System design là chọn trade-off có chủ đích
+
+**System design** là chọn cấu trúc hệ thống: chia thành phần nào, lưu dữ liệu ở đâu, gọi nhau thế nào, để đáp ứng cả **yêu cầu chức năng** (hệ thống làm gì) lẫn **yêu cầu phi chức năng** (làm tốt tới mức nào: độ trễ, khả dụng, nhất quán, chi phí). Không có thiết kế tốt nhất; chỉ có thiết kế hợp với yêu cầu và ràng buộc hiện tại.
+
+```text
+ yêu cầu chức năng ─┐
+ SLO, ràng buộc ────┼─> ước lượng tải ─> 2-3 phương án ─> chọn, ghi ADR ─> build ─> đo
+ (đội, ngân sách)   ┘         ^                                                   │
+                              └───────── số đo khác giả định thì quay lại ────────┘
+```
+
+| Trade-off | Bên này | Bên kia | Câu hỏi để chọn |
+|---|---|---|---|
+| Nhất quán và khả dụng | Một transaction ACID, từ chối khi DB lỗi | Eventual consistency, vẫn nhận request | Sai số dư một giây có chấp nhận được không? |
+| Đơn giản và linh hoạt | Một ứng dụng, một database | Nhiều service, scale độc lập | Có phần nào thật sự cần scale hay deploy riêng? |
+| Độ trễ và chi phí | Cache, replica, máy lớn | Ít thành phần, rẻ | SLO đòi bao nhiêu mili giây? |
+| Tự xây và dùng dịch vụ có sẵn | Kiểm soát hoàn toàn | Ra mắt nhanh, trả tiền thuê | Đây có phải lợi thế cạnh tranh không? |
+
+Ở cấp Senior, kỹ năng chính là đưa ra vài phương án, nói rõ mỗi cái được gì mất gì, và chọn **phương án đơn giản nhất đủ đáp ứng yêu cầu**. Thiết kế "để sau này scale" khi chưa có số liệu thường mua độ phức tạp thật để đổi lấy lợi ích giả định. J19.3 đã dựng modular monolith; bài này dùng số liệu để quyết định có nên tách nó hay không.
+
+<Check id="j20.1.trade-off-table">Viết được một bảng trade-off cho ít nhất hai phương án theo các tiêu chí nhất quán, độ trễ, chi phí vận hành và khả năng đảo ngược.</Check>
+
+### Ước lượng back-of-the-envelope
+
+**Back-of-the-envelope** là phép tính nhanh, làm tròn, để biết bậc độ lớn: hệ thống cần 10, 1 000 hay 100 000 request mỗi giây. Sai 20% không sao; sai 100 lần thì thiết kế sai.
+
+| Đại lượng | Công thức |
+|---|---|
+| DAU (daily active users) | số người dùng × tỉ lệ hoạt động mỗi ngày |
+| QPS trung bình | DAU × số hành động mỗi người / 86 400 giây |
+| QPS đỉnh | QPS trung bình × hệ số đỉnh (thường 2 tới 10; ngân hàng có ngày trả lương) |
+| Dung lượng mỗi năm | số bản ghi mỗi ngày × byte mỗi bản ghi × 365 |
+| Băng thông | QPS × kích thước response |
+
+Quy tắc: ghi mọi giả định thành biến có tên, để người review cãi được từng con số và bạn sửa một chỗ là tính lại hết. Đó là lý do bài này viết phép tính thành file `.jsh` thay vì bấm máy tính.
+
+### Định luật Little và hàng đợi
+
+**Định luật Little:** trong một hệ thống ổn định, số việc đang nằm trong hệ thống bằng tốc độ đến nhân thời gian mỗi việc ở lại:
+
+```text
+ L = λ × W
+ L: số request đang xử lý (hoặc số kết nối DB đang bận)
+ λ: số request mỗi giây
+ W: thời gian mỗi request ở trong hệ thống
+```
+
+Nó đúng cho mọi hệ thống ổn định, không cần biết bên trong: pool kết nối (J12.3), thread pool (J14.2), số request đang bay giữa hai service. Từ đó suy ra **công suất** của một tài nguyên có `c` chỗ, mỗi việc giữ chỗ `S` giây: tối đa `c / S` việc mỗi giây. Pool 4 kết nối, mỗi transaction 20 ms, thì trần là 200 transaction mỗi giây.
+
+Gần trần, độ trễ không tăng đều mà tăng vọt. Với **mức sử dụng** `ρ = λ / công suất`:
+
+```text
+ ρ (mức sử dụng)     0.5     0.7     0.8     0.9     0.95    ≥ 1
+ thời gian chờ        ~1×S    ~2×S    ~4×S    ~9×S    ~19×S   tăng mãi theo thời gian
+```
+
+Bảng trên theo mô hình hàng đợi đơn giản nhất (M/M/1); hệ thống thật khác về con số nhưng giống về hình dạng. Vì vậy ta chừa **headroom** (khoảng dư): thiết kế để lúc đỉnh vẫn chỉ dùng khoảng 50 tới 70% công suất.
+
+Khi load test, phân biệt hai kiểu sinh tải:
+
+| Mô hình | Cách gửi | Thấy được gì | Bẫy |
+|---|---|---|---|
+| **Closed** | N client, gửi xong mới gửi tiếp | Throughput tối đa | Server chậm thì client tự gửi chậm lại, độ trễ trông "ổn" (coordinated omission) |
+| **Open** | R request mỗi giây, không chờ ai | Hành vi khi quá tải, giống người dùng thật | Vượt trần thì hàng đợi dài mãi, phải có giới hạn thời gian chạy |
+
+<Callout kind="production">
+
+Ngày 25 hằng tháng, lương về lúc 9 giờ sáng và hàng trăm nghìn người mở app chuyển tiền cùng lúc. Một service được đo "chịu được 160 req/s" và đang chạy 120 req/s ngày thường, tức `ρ = 0,75`. Lúc đỉnh tải lên 200 req/s: `ρ > 1`, hàng đợi trong pool kết nối dài ra mỗi giây, request chờ quá `connectionTimeout` và trả 500, client retry làm tải còn cao hơn. Ước lượng hệ số đỉnh và chừa headroom từ lúc thiết kế rẻ hơn nhiều so với tăng máy lúc 9 giờ 05.
+
+</Callout>
+
+<Check id="j20.1.little-law">Dùng được định luật Little để suy ra số kết nối DB cần từ QPS và thời gian transaction, và giải thích vì sao độ trễ tăng vọt khi mức sử dụng gần 1.</Check>
+
+### Design doc và ADR
+
+| | Design doc | ADR |
+|---|---|---|
+| Trả lời | Ta sẽ xây cái gì, thế nào | Ta đã quyết định gì, vì sao |
+| Độ dài | Vài trang | Một tới hai trang |
+| Vòng đời | Sửa nhiều lần khi review, rồi ít đọc lại | Chấp nhận rồi thì không sửa nội dung |
+| Nằm ở đâu | Repo hoặc wiki | Repo, cạnh mã nguồn, thư mục `docs/adr` |
+
+**ADR (Architecture Decision Record)** do Michael Nygard đề xuất năm 2011: mỗi quyết định kiến trúc quan trọng là một file ngắn, đánh số tăng dần, gồm năm phần. Danh sách dưới đây theo thứ tự của mẫu adr-tools, đặt Status ngay sau Title (bài gốc của Nygard xếp Title, Context, Decision, Status, Consequences):
+
+- **Title:** số thứ tự và một cụm danh từ ngắn nêu quyết định.
+- **Status:** Proposed, Accepted, Deprecated hoặc Superseded by ADR khác.
+- **Context:** các lực tác động: yêu cầu, số liệu, ràng buộc đội và công nghệ. Viết trung lập, chưa nói chọn gì.
+- **Decision:** "Chúng ta sẽ ...", câu chủ động.
+- **Consequences:** hệ quả cả tốt lẫn xấu, và điều kiện để xem lại.
+
+Viết ADR cho quyết định **khó đảo ngược**: chọn database, ranh giới service, giao thức giữa các đội. Quyết định thay đổi thì viết ADR mới, đặt ADR cũ sang `Superseded by ADR-000N`. Người vào đội sau hai năm đọc chuỗi ADR là hiểu vì sao hệ thống có hình dạng như hôm nay, kể cả những quyết định đã bị thay.
+
+<Check id="j20.1.adr-structure">Kể được năm phần của một ADR theo Nygard và giải thích vì sao ADR đã chấp nhận không bị sửa mà được thay bằng ADR mới.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html): sáu trụ cột và danh sách câu hỏi; dùng phần Reliability và Performance Efficiency làm checklist khi review design doc.
+- [Handling Overload (Google SRE Book)](https://sre.google/sre-book/handling-overload/): vì sao đo công suất theo tài nguyên thay vì số request, và cách từ chối tải khi quá trần.
+- [Service Level Objectives (Google SRE Book)](https://sre.google/sre-book/service-level-objectives/): cách đặt SLO làm đầu vào cho ước lượng.
+- [Documenting Architecture Decisions](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions): bài gốc của Nygard, ngắn, đọc hết.
+- [Architectural Decision Records (ADRs)](https://adr.github.io/): các mẫu ADR khác (MADR, Y-statement) khi đội cần nhiều cấu trúc hơn.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25 và Git đã cấu hình tên, email (J1.3). Bài này không dùng Maven. Lab là repo `~/masteva-j20`, dùng tiếp ở J20.2 và J20.3. Load test dùng cổng `20200` trên `127.0.0.1`, cần hai tab Terminal. Mọi lệnh chạy giống nhau trên Mac và Linux.
+
+### 1. Repo và phần yêu cầu của design doc
+
+Một design doc tốt bắt đầu bằng yêu cầu, chưa nói giải pháp:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-j20/docs/design ~/masteva-j20/docs/adr ~/masteva-j20/capacity && cd ~/masteva-j20
+git init -q -b main
+cat > docs/design/payment-orders.md <<'EOF'
+# Design doc: dịch vụ lệnh chuyển tiền (Neobank mini)
+
+Trạng thái: đang review. Ngày: 2026-10-04.
+
+## 1. Bối cảnh
+
+Khách hàng chuyển tiền giữa các tài khoản trong Neobank. Ứng dụng hiện là
+một modular monolith Spring Boot (J19.3); module `ledger` giữ sổ cái kép.
+
+## 2. Yêu cầu chức năng
+
+- Tạo lệnh chuyển tiền: tài khoản nguồn, đích, số tiền (VND, kiểu long), Idempotency-Key.
+- Xem trạng thái một lệnh và lịch sử lệnh của một tài khoản.
+- Từ chối lệnh vượt số dư khả dụng.
+
+## 3. Yêu cầu phi chức năng
+
+| Thuộc tính | Mục tiêu |
+|---|---|
+| Đúng đắn | Một Idempotency-Key trừ tiền tối đa một lần; tổng bút toán luôn bằng 0 |
+| Độ trễ | p99 tạo lệnh dưới 300 ms lúc đỉnh |
+| Khả dụng | 99,9% mỗi tháng, tức tối đa khoảng 43 phút lỗi |
+| Lưu trữ | Giữ lịch sử 5 năm |
+
+## 4. Ước lượng
+
+Phép tính và giả định: `capacity/capacity.jsh`.
+
+## 5. Phương án
+
+Xem ADR-0001.
+
+## 6. Rủi ro, câu hỏi mở
+
+- Hệ số đỉnh 10 là giả định; cần số liệu ngày trả lương thật.
+EOF
+```
+
+</Terminal>
+
+"Tổng bút toán luôn bằng 0" là bất biến của sổ cái kép: mỗi lệnh ghi một bút toán âm ở tài khoản nguồn và một bút toán dương ở tài khoản đích. 99,9% của 30 ngày là 43,2 phút. Viết SLO thành con số ngay từ đầu, vì ước lượng và load test sẽ đối chiếu với chúng.
+
+### 2. Ước lượng trong jshell
+
+<Terminal where="mac" title="~/masteva-j20">
+
+```bash
+cat > capacity/capacity.jsh <<'EOF'
+// Giả định: sửa ở đây, chạy lại, xem kết quả đổi theo
+long users = 2_000_000;          // khách hàng đã mở tài khoản
+double dauRatio = 0.20;          // tỉ lệ hoạt động mỗi ngày
+double writesPerUser = 2;        // lệnh chuyển tiền mỗi người mỗi ngày
+double readsPerUser = 15;        // lượt xem số dư, lịch sử
+double peakFactor = 10;          // giờ trả lương so với trung bình
+long bytesPerOrder = 1_600;      // lệnh + 2 bút toán + index
+double writeTxSeconds = 0.015;   // thời gian giữ kết nối khi ghi
+double readTxSeconds = 0.004;    // thời gian giữ kết nối khi đọc
+int instances = 3;
+
+double dau = users * dauRatio;
+double writeQps = dau * writesPerUser / 86_400;
+double readQps = dau * readsPerUser / 86_400;
+double peakWrite = writeQps * peakFactor;
+double peakRead = readQps * peakFactor;
+double gbPerYear = dau * writesPerUser * 365 * bytesPerOrder / 1e9;
+double busyConnections = peakWrite * writeTxSeconds + peakRead * readTxSeconds;
+long poolPerInstance = (long) Math.ceil(busyConnections * 2 / instances);
+
+System.out.printf("DAU               %,.0f%n", dau);
+System.out.printf("QPS ghi  tb/đỉnh  %.1f / %.1f%n", writeQps, peakWrite);
+System.out.printf("QPS đọc  tb/đỉnh  %.1f / %.1f%n", readQps, peakRead);
+System.out.printf("Lưu trữ mỗi năm   %.0f GB%n", gbPerYear);
+System.out.printf("Kết nối bận (L)   %.2f%n", busyConnections);
+System.out.printf("Pool mỗi instance %d (x2 headroom, %d instance)%n", poolPerInstance, instances);
+/exit
+EOF
+jshell -q capacity/capacity.jsh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+DAU               400,000
+QPS ghi  tb/đỉnh  9.3 / 92.6
+QPS đọc  tb/đỉnh  69.4 / 694.4
+Lưu trữ mỗi năm   467 GB
+Kết nối bận (L)   4.17
+Pool mỗi instance 3 (x2 headroom, 3 instance)
+```
+
+</Expected>
+
+`jshell` nhận một file script như đầu vào; `/exit` ở cuối để nó thoát thay vì chờ bạn gõ tiếp. `printf` định dạng số theo locale của máy: với locale tiếng Việt bạn sẽ thấy `400.000` và `9,3`.
+
+Đọc kết quả như một Senior:
+
+- **93 lệnh ghi mỗi giây lúc đỉnh** là tải nhỏ với một PostgreSQL. Tải không phải lý do để tách service.
+- **Kết nối bận 4,17** là `L` của định luật Little: `92,6 × 0,015 + 694,4 × 0,004`. Nhân đôi cho headroom và chia cho 3 instance ra pool 3 mỗi instance, tổng 9 kết nối, khớp điểm bắt đầu khoảng 10 kết nối cho database 4 nhân ở J12.3.
+- **467 GB mỗi năm**, giữ 5 năm là hơn 2 TB. Đây mới là rủi ro thật: bảng lớn cần partition theo tháng và kế hoạch lưu trữ.
+
+<Predict question="Đổi peakFactor từ 10 thành 20. Số nào đổi, số nào giữ nguyên?">
+
+<Terminal where="mac" title="~/masteva-j20">
+
+```bash
+perl -pi -e 's/peakFactor = 10;/peakFactor = 20;/' capacity/capacity.jsh && jshell -q capacity/capacity.jsh | tail -3
+perl -pi -e 's/peakFactor = 20;/peakFactor = 10;/' capacity/capacity.jsh
+```
+
+</Terminal>
+
+```text
+Lưu trữ mỗi năm   467 GB
+Kết nối bận (L)   8.33
+Pool mỗi instance 6 (x2 headroom, 3 instance)
+```
+
+Dung lượng không đổi, vì đỉnh chỉ dồn cùng số lệnh vào ít giờ hơn. Số kết nối và pool tăng gấp đôi. Giả định nào làm kết quả thay đổi nhiều nhất là giả định cần kiểm bằng số liệu thật trước; ở đây là hệ số đỉnh. Lệnh thứ hai trả file về giá trị 10.
+
+</Predict>
+
+<Check id="j20.1.lab-capacity">Chạy được `capacity.jsh`, đọc được QPS đỉnh, dung lượng mỗi năm và số kết nối bận, và chỉ ra giả định nào ảnh hưởng mạnh nhất.</Check>
+
+### 3. Một service giả và một máy sinh tải
+
+Ước lượng dùng định luật Little; bây giờ kiểm nó bằng số đo. `OrderStub` giả lập `POST /orders` với một "pool" 4 kết nối DB (một `Semaphore` công bằng), mỗi request giữ một kết nối 20 ms. Theo công thức `c / S`, trần là `4 / 0,020 = 200` req/s. `LoadGen` sinh tải bằng virtual thread (J14.3): mỗi request một virtual thread, nên một máy sinh tải nhỏ vẫn giữ được hàng trăm request đang chờ.
+
+<Terminal where="mac" title="~/masteva-j20">
+
+```bash
+mkdir -p loadtest
+cat > loadtest/OrderStub.java <<'EOF'
+import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+import java.time.Duration;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+
+/** Giả lập POST /orders: mỗi request giữ 1 trong 4 "kết nối DB" trong 20 ms. */
+public class OrderStub {
+    static final int POOL_SIZE = 4;
+    static final Duration SERVICE_TIME = Duration.ofMillis(20);
+
+    public static void main(String[] args) throws Exception {
+        var pool = new Semaphore(POOL_SIZE, true);
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 20200), 0);
+        server.createContext("/orders", exchange -> {
+            try {
+                pool.acquire();
+                try {
+                    Thread.sleep(SERVICE_TIME);
+                } finally {
+                    pool.release();
+                }
+                exchange.sendResponseHeaders(201, -1);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                exchange.sendResponseHeaders(503, -1);
+            } finally {
+                exchange.close();
+            }
+        });
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.start();
+        System.out.printf("OrderStub on :20200, pool=%d, service=%d ms%n",
+                POOL_SIZE, SERVICE_TIME.toMillis());
+    }
+}
+EOF
+cat > loadtest/LoadGen.java <<'EOF'
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Executors;
+
+/**
+ * closed N S: N client, mỗi client gửi xong mới gửi tiếp, chạy S giây.
+ * open R S:   R request mỗi giây đều đặn, không chờ phản hồi, chạy S giây.
+ */
+public class LoadGen {
+    static final HttpClient CLIENT = HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1).build();
+    static final HttpRequest REQUEST = HttpRequest
+            .newBuilder(URI.create("http://127.0.0.1:20200/orders"))
+            .POST(HttpRequest.BodyPublishers.noBody()).build();
+    static final List<Long> latenciesMicros = Collections.synchronizedList(new ArrayList<>());
+
+    public static void main(String[] args) throws Exception {
+        String mode = args[0];
+        int value = Integer.parseInt(args[1]);
+        long end = System.nanoTime() + Duration.ofSeconds(Long.parseLong(args[2])).toNanos();
+        long start = System.nanoTime();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            if (mode.equals("closed")) {
+                for (int i = 0; i < value; i++) {
+                    executor.submit(() -> {
+                        while (System.nanoTime() < end) call();
+                    });
+                }
+            } else {
+                long interval = 1_000_000_000L / value;
+                for (long next = start; next < end; next += interval) {
+                    long wait = next - System.nanoTime();
+                    if (wait > 0) Thread.sleep(Duration.ofNanos(wait));
+                    executor.submit(LoadGen::call);
+                }
+            }
+        }
+        double seconds = (System.nanoTime() - start) / 1e9;
+        List<Long> sorted = new ArrayList<>(latenciesMicros);
+        Collections.sort(sorted);
+        double avgMs = sorted.stream().mapToLong(Long::longValue).average().orElse(0) / 1000;
+        System.out.printf("%s %d: %d req trong %.1f s, X=%.0f req/s, W tb=%.1f ms, p99=%.1f ms%n",
+                mode, value, sorted.size(), seconds, sorted.size() / seconds, avgMs,
+                sorted.get((int) (sorted.size() * 0.99)) / 1000.0);
+    }
+
+    static void call() {
+        long t0 = System.nanoTime();
+        try {
+            var response = CLIENT.send(REQUEST, HttpResponse.BodyHandlers.discarding());
+            if (response.statusCode() == 201) {
+                latenciesMicros.add((System.nanoTime() - t0) / 1000);
+            }
+        } catch (Exception e) {
+            System.err.println("lỗi: " + e);
+        }
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `try (var executor = ...)`: từ Java 21, `ExecutorService` là `AutoCloseable`; `close()` chờ mọi task xong, nên số đo in ra sau khi request cuối cùng trả về.
+- Ở chế độ `open`, vòng lặp gửi theo lịch cố định, không chờ phản hồi. Đó là cách người dùng thật đến: họ không biết server đang chậm.
+- Đây là máy sinh tải tối giản để hiểu cơ chế. Load test thật dùng công cụ chuyên dụng như Gatling hay k6, có warm-up và báo cáo phân bố độ trễ.
+
+### 4. Đo throughput và kiểm định luật Little
+
+Tab 1, chạy service giả và để nó chạy:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j20 && java loadtest/OrderStub.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+OrderStub on :20200, pool=4, service=20 ms
+```
+
+</Expected>
+
+Tab 2, thử một request rồi chạy closed load với 2, 4 và 16 client, mỗi lần 5 giây:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j20 && curl -s -i -X POST http://127.0.0.1:20200/orders | head -1
+for c in 2 4 16; do java loadtest/LoadGen.java closed $c 5; done
+```
+
+</Terminal>
+
+<Predict question="Với 16 client, throughput X và độ trễ trung bình W là bao nhiêu, nếu trần là 200 req/s?">
+
+Pool chỉ có 4 chỗ, nên 16 client không làm throughput vượt trần: X dừng quanh trần. Theo định luật Little, `W = L / X = 16 / 200 = 80 ms`: mỗi request mất 20 ms xử lý và khoảng 60 ms xếp hàng chờ kết nối.
+
+</Predict>
+
+<Expected>
+
+```text
+HTTP/1.1 201 Created
+closed 2: 366 req trong 5.0 s, X=73 req/s, W tb=27.4 ms, p99=37.8 ms
+closed 4: 744 req trong 5.0 s, X=149 req/s, W tb=26.9 ms, p99=38.6 ms
+closed 16: 824 req trong 5.1 s, X=162 req/s, W tb=98.0 ms, p99=105.4 ms
+```
+
+</Expected>
+
+Số đo khác nhau mỗi lần chạy và mỗi máy, nhưng hình dạng giống nhau. Kiểm định luật Little trên chính số đo: `16 / 162 = 0,099 s`, khớp `W = 98 ms`; `2 / 73 = 0,027 s`, khớp `27,4 ms`. Định luật đúng.
+
+Dự đoán trần 200 thì sai: trần đo được khoảng 160. Tính ngược từ số đo, mỗi request chiếm một chỗ trong pool khoảng `S = 4 / 160 = 25 ms`, không phải 20 ms. Phần chênh đến từ những thứ mô hình bỏ qua: `Thread.sleep` ngủ lố khoảng 4 tới 5 ms, và việc trao chỗ cho request đang chờ cũng tốn thời gian lập lịch. Đây là bài học quan trọng nhất của phần này: công thức đúng, nhưng tham số phải lấy từ số đo, không lấy từ mong muốn. Với service thật, `S` là thời gian giữ kết nối, đọc từ metric `hikaricp.connections.usage` (J12.3).
+
+<Check id="j20.1.lab-little-verified">Chạy được load test closed, kiểm được `W ≈ L / X` trên số đo của mình, và giải thích vì sao trần đo được thấp hơn trần tính từ 20 ms.</Check>
+
+### 5. Vượt trần với tải open
+
+Tab 2, gửi đều 120, 150 rồi 200 request mỗi giây:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for r in 120 150 200; do java loadtest/LoadGen.java open $r 5; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+open 120: 600 req trong 5.0 s, X=120 req/s, W tb=22.0 ms, p99=33.8 ms
+open 150: 750 req trong 5.0 s, X=149 req/s, W tb=22.2 ms, p99=43.7 ms
+open 200: 1000 req trong 6.1 s, X=163 req/s, W tb=591.4 ms, p99=1149.6 ms
+```
+
+</Expected>
+
+Ở 120 và 150 req/s (ρ khoảng 0,75 và 0,94), độ trễ trung bình gần bằng thời gian xử lý; p99 bắt đầu tăng ở 150. Con số này tốt hơn bảng M/M/1 ở phần Kiến thức vì máy sinh tải gửi đều tăm tắp, thời gian xử lý gần như cố định và pool có 4 chỗ chứ không phải 1; người dùng thật đến theo từng đợt, nên hàng đợi hình thành sớm hơn. Ở 200 req/s, tải vượt trần: mỗi giây có khoảng 40 request không được phục vụ kịp, hàng đợi dài dần, độ trễ trung bình tăng hơn 10 lần và lần chạy kéo dài thêm vì phải xả hàng đợi. Chạy 60 giây thay vì 5 thì độ trễ còn tăng nữa; hệ thống không tự hồi phục cho tới khi tải giảm.
+
+Dừng service ở tab 1 bằng Ctrl+C.
+
+### 6. Ghi số đo vào design doc
+
+Thay các con số dưới đây bằng số đo của bạn ở bước 4 và 5:
+
+<Terminal where="mac" title="~/masteva-j20">
+
+```bash
+cat >> docs/design/payment-orders.md <<'EOF'
+
+## 7. Kiểm chứng bằng load test
+
+Service giả, pool 4, S đo được khoảng 25 ms: trần khoảng 160 req/s.
+Open 150 req/s: W tb 22 ms. Open 200 req/s: W tb 591 ms, p99 1150 ms, hàng đợi tăng mãi.
+Kết luận: định luật Little khớp số đo; đặt cảnh báo khi ρ của pool vượt 0,7;
+dùng S đo từ hikaricp.connections.usage thay cho giả định 15 ms khi có service thật.
+EOF
+tail -4 docs/design/payment-orders.md
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Service giả, pool 4, S đo được khoảng 25 ms: trần khoảng 160 req/s.
+Open 150 req/s: W tb 22 ms. Open 200 req/s: W tb 591 ms, p99 1150 ms, hàng đợi tăng mãi.
+Kết luận: định luật Little khớp số đo; đặt cảnh báo khi ρ của pool vượt 0,7;
+dùng S đo từ hikaricp.connections.usage thay cho giả định 15 ms khi có service thật.
+```
+
+</Expected>
+
+### 7. Viết ADR và commit
+
+Quyết định khó đảo ngược nhất trong design doc là ranh giới: lệnh chuyển tiền nằm trong monolith hay thành service riêng. Ghi nó thành ADR-0001:
+
+<Terminal where="mac" title="~/masteva-j20">
+
+```bash
+cat > docs/adr/0001-lenh-chuyen-tien-la-module-trong-monolith.md <<'EOF'
+# 1. Module lệnh chuyển tiền trong monolith
+
+Ngày: 2026-10-04
+
+## Status
+
+Accepted
+
+## Context
+
+Neobank cần tạo lệnh chuyển tiền và ghi bút toán sổ cái kép cho mỗi lệnh.
+Ước lượng (capacity/capacity.jsh): đỉnh khoảng 93 lệnh ghi/s và 694 lượt đọc/s,
+cần khoảng 4 kết nối DB bận. Một PostgreSQL 4 nhân đáp ứng được mức này.
+Đội có 4 lập trình viên, chưa ai có kinh nghiệm vận hành message broker.
+
+## Các phương án đã xét
+
+| Tiêu chí | A. Module trong monolith | B. Service riêng, DB riêng, saga | C. Service riêng, chung DB |
+|---|---|---|---|
+| Nhất quán lệnh và bút toán | Một transaction ACID | Eventual, cần bù trừ khi lỗi | Một transaction, hai service cùng sửa một schema |
+| Độ trễ tạo lệnh | Một lần gọi DB | Thêm gọi mạng và broker | Một lần gọi DB |
+| Chi phí vận hành | Một ứng dụng | Hai ứng dụng, broker, tracing | Hai ứng dụng |
+| Scale độc lập | Không | Có | Có, nhưng DB vẫn chung |
+| Đảo ngược | Tách sau được nhờ ranh giới module | Gộp lại tốn công | Dễ thành distributed monolith |
+
+## Decision
+
+Chúng ta sẽ xây `payments` thành một module Spring Modulith (phương án A), gọi `ledger`
+qua API đã công bố và ghi lệnh cùng bút toán trong một transaction PostgreSQL.
+
+## Consequences
+
+- Không có giao dịch phân tán; kiểm tra đúng đắn bằng integration test.
+- Không scale riêng được phần đọc lịch sử; nếu đọc quá tải, thêm read replica trước khi tách service.
+- Xem lại khi tải ghi đỉnh vượt 1 000 lệnh/s, hoặc khi một đội khác cần deploy `payments` độc lập.
+EOF
+grep '^## ' docs/adr/0001-*.md
+perl -pi -e 's/^Xem ADR-0001\.$/Ba phương án và lý do chọn: docs\/adr\/0001-lenh-chuyen-tien-la-module-trong-monolith.md./' docs/design/payment-orders.md
+git add . && git commit -q -m "Design doc lệnh chuyển tiền, ước lượng, load test và ADR-0001"
+git log --oneline --stat | head -8
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+## Status
+## Context
+## Các phương án đã xét
+## Decision
+## Consequences
+00c195c Design doc lệnh chuyển tiền, ước lượng, load test và ADR-0001
+ capacity/capacity.jsh                              | 27 +++++++++
+ ...01-lenh-chuyen-tien-la-module-trong-monolith.md | 35 ++++++++++++
+ docs/design/payment-orders.md                      | 42 ++++++++++++++
+ loadtest/LoadGen.java                              | 64 ++++++++++++++++++++++
+ loadtest/OrderStub.java                            | 36 ++++++++++++
+ 5 files changed, 204 insertions(+)
+```
+
+</Expected>
+
+Mã commit trên máy bạn sẽ khác. Lệnh `grep` là một kiểm tra nhỏ: ADR có đủ các phần sau tiêu đề. Đội lớn hay đưa kiểm tra kiểu này vào CI. Mục "Các phương án đã xét" vượt ra ngoài mẫu năm phần của Nygard; nó mượn cách của MADR, tách bảng so sánh khỏi Context để Context giữ được giọng trung lập.
+
+Context có số liệu và ràng buộc đội, nhưng chưa nói chọn gì; bảng trade-off cho thấy A thua ở tiêu chí scale độc lập, và Consequences ghi thẳng điều đó cùng ngưỡng để xem lại. Một ADR chỉ liệt kê ưu điểm của phương án được chọn là ADR viết để thuyết phục, không phải để ghi lại.
+
+<Check id="j20.1.lab-adr">Viết được một ADR theo mẫu Nygard có bảng trade-off, hệ quả xấu và điều kiện xem lại, commit cùng design doc.</Check>
+
+### Khi gặp lỗi
+
+- `BindException: Address already in use`: còn một `OrderStub` chạy ở tab khác. Tìm bằng `lsof -i :20200` rồi dừng tiến trình đó.
+- `lỗi: java.net.ConnectException`: tab 1 chưa chạy, hoặc bạn đổi URL sang `localhost`. Service chỉ nghe `127.0.0.1`; `localhost` có thể phân giải sang IPv6 `::1` trước.
+- `IndexOutOfBoundsException` ở dòng `printf` của `LoadGen`: không request nào thành công, nên danh sách độ trễ rỗng. Xem các dòng `lỗi:` phía trên.
+- Số đo chênh nhiều giữa các lần chạy: tắt bớt ứng dụng nặng, chạy lại vài lần và nhìn xu hướng thay vì một con số.
+
+### Dọn dẹp
+
+Dừng `OrderStub` ở tab 1 nếu còn chạy. Giữ `~/masteva-j20`: J20.2 dùng tiếp repo này.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không tính trực tiếp số máy chủ ứng dụng từ QPS?">
+
+Vì nút cổ chai hiếm khi là CPU của ứng dụng. Với 787 req/s lúc đỉnh và mỗi request khoảng 50 ms, chỉ có khoảng 40 request đang xử lý cùng lúc; với virtual thread, con số đó không tốn bao nhiêu. Thứ giới hạn là tài nguyên dùng chung: kết nối database, khoá dòng, giới hạn của API đối tác. SRE Book khuyên đo công suất theo tài nguyên thật sự cạn. Số instance thường quyết định bởi khả dụng (ít nhất 2 hoặc 3 để chịu được một máy chết và deploy cuốn chiếu) nhiều hơn bởi tải.
+
+</Reveal>
+
+<Reveal title="Closed load test cho p99 rất đẹp. Có tin được không?">
+
+Không hẳn. Khi server chậm, mỗi client closed chờ lâu hơn nên gửi ít hơn: tải tự giảm đúng lúc server gặp khó, và những request "đáng lẽ đã được gửi" không bao giờ được đo. Hiện tượng này gọi là coordinated omission. Ở bước 4, 16 client closed chỉ thấy p99 105 ms; ở bước 5, tải open 200 req/s thấy p99 1 150 ms và tăng tiếp. Đo SLO độ trễ bằng tải open với tốc độ cố định, hoặc dùng công cụ có bù coordinated omission.
+
+</Reveal>
+
+<Reveal title="Khi nào cần ADR, khi nào chỉ cần một dòng trong pull request?">
+
+Hỏi: quyết định này có khó đảo ngược không, và sáu tháng nữa có ai hỏi "vì sao lại thế này" không? Chọn database, ranh giới module, định dạng sự kiện công khai, chiến lược idempotency: cần ADR. Đổi tên biến, chọn thư viện test trong một module: mô tả trong pull request là đủ. Viết ADR cho mọi thứ làm thư mục ADR thành nhiễu, và người ta thôi đọc.
+
+</Reveal>
+
+<Reveal title="Phương án A có giới hạn rõ. Khi nào nên đảo quyết định?">
+
+ADR-0001 đã ghi ngưỡng: tải ghi vượt 1 000 lệnh/s, hoặc một đội khác cần deploy độc lập. Khi một điều kiện xảy ra, viết ADR-0005 "Service riêng cho payments", ghi Context mới với số đo thật, và đổi Status của ADR-0001 thành `Superseded by ADR-0005`. Nội dung ADR-0001 giữ nguyên: nó vẫn đúng với bối cảnh lúc viết. Nhờ ranh giới module đã được Spring Modulith kiểm (J19.3), việc tách là di chuyển code có ranh giới sẵn, không phải gỡ một búi phụ thuộc.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI liệt kê phương án và các tiêu chí trade-off bạn có thể bỏ sót, rà design doc như một reviewer khó tính, hoặc dịch giả định thành file `.jsh`. AI hay chọn kiến trúc "chuẩn sách" (microservices, Kafka, CQRS) mà không hỏi tải và quy mô đội, hay đưa con số tuyệt đối như "PostgreSQL chịu được 10 000 TPS" không kèm điều kiện, và hay quên hệ số đỉnh. Kiểm lại bằng cách yêu cầu AI ghi mọi giả định thành biến, chạy file trong jshell, và so con số quan trọng với load test của chính bạn.
+
+</Callout>
+
+<Callout kind="link">
+
+Định luật Little và kích thước pool đến từ J12.3; virtual thread của máy sinh tải từ J14.3; modular monolith và Spring Modulith từ J19.3. J20.2 viết thêm một ADR cho chính sách nâng cấp phiên bản, và roadmap Microservices (M1) bàn lúc nào tách service thật sự đáng giá. Dự án [Neobank mini](/vi/projects/neobank) là nơi áp dụng: mốc sổ cái kép và tài khoản nên bắt đầu bằng một design doc và ADR như bài này.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j20.1.mastery-estimate">Tự ước lượng được QPS đỉnh, dung lượng mỗi năm và kích thước pool cho một tính năng mới từ giả định ghi thành biến, rồi kiểm tham số quan trọng nhất bằng load test.</Check>
+
+<Check id="j20.1.mastery-decide">Đưa ra được hai tới ba phương án cho một quyết định kiến trúc, so sánh bằng bảng trade-off, chọn phương án đơn giản nhất đủ dùng và ghi lại bằng một ADR có điều kiện xem lại.</Check>
+
+</Mastery>

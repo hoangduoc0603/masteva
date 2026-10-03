@@ -1,0 +1,792 @@
+---
+title: Thiết kế bảng, index và transaction trên PostgreSQL
+description: Thiết kế bảng có ràng buộc để database tự giữ dữ liệu đúng, đọc EXPLAIN ANALYZE để biến một truy vấn quét cả bảng thành Index Scan, và dùng hai phiên psql để tận mắt thấy các mức isolation khác nhau thế nào.
+id: j12.1
+step: j12
+prerequisites: [j11]
+topics: [j12.sql-thiet-ke-bang, j12.index-execution-plan, j12.transaction-muc-isolation]
+status: verified
+verified:
+  date: 2026-10-03
+  os: macOS 14.4.1
+  tools:
+    docker: 29.8.0
+    postgresql: "18.6"
+---
+
+<Goal>
+
+Thiết kế được một schema bán hàng có khoá, ràng buộc và kiểu dữ liệu đúng; đọc được execution plan để tìm và sửa truy vấn chậm; và chọn mức isolation dựa trên hiện tượng bạn đã tự tạo ra bằng hai phiên psql. Học xong bài này, bạn giải thích được:
+
+- Vì sao khoá ngoại `orders.customer_id` không làm truy vấn "đơn của khách 4242" nhanh hơn chút nào.
+- Vì sao có index trên `email` mà `WHERE lower(email) = ...` vẫn quét cả bảng.
+- Vì sao hai người cùng mua món cuối cùng mà kho chỉ trừ một, dù mỗi câu `UPDATE` đều chạy thành công.
+
+</Goal>
+
+<Knowledge>
+
+### Thiết kế bảng để database tự giữ dữ liệu đúng
+
+Lab của chặng J12 là cửa hàng quen thuộc: khách hàng, sản phẩm, đơn hàng và dòng hàng.
+
+```text
+customers 1 ───< orders 1 ───< order_items >─── 1 products
+   id (PK)        id (PK)        id (PK)             id (PK)
+   email UNIQUE   customer_id FK order_id FK         sku UNIQUE
+                  status CHECK   product_id FK       price CHECK > 0
+                                 quantity CHECK > 0  stock CHECK >= 0
+                                 unit_price
+```
+
+Code Java có thể có lỗi, có thể có hai service cùng ghi vào một bảng, có người sửa tay bằng psql. **Ràng buộc** (constraint) là luật mà database kiểm tra ở mọi lần ghi, bất kể ai ghi:
+
+| Ràng buộc | Chặn được gì | Ví dụ trong lab |
+|---|---|---|
+| `PRIMARY KEY` | Hai dòng cùng khoá, khoá rỗng | `id BIGINT GENERATED ALWAYS AS IDENTITY` |
+| `NOT NULL` | Thiếu dữ liệu bắt buộc | Đơn hàng không có khách |
+| `UNIQUE` | Trùng giá trị nghiệp vụ | Hai tài khoản cùng `email` |
+| `CHECK` | Giá trị vô lý | `price > 0`, `status IN ('NEW', 'PAID', ...)` |
+| `FOREIGN KEY` | Tham chiếu tới dòng không tồn tại | Đơn của khách id 999 không có thật |
+
+Chọn kiểu dữ liệu cũng là một quyết định thiết kế:
+
+- **Tiền:** `BIGINT` theo đơn vị nhỏ nhất (đồng) hoặc `NUMERIC`, không bao giờ `REAL`/`DOUBLE PRECISION`, vì số thực nhị phân không biểu diễn chính xác 0,1.
+- **Thời điểm:** `TIMESTAMPTZ`, lưu một thời điểm tuyệt đối theo UTC (bài J9.2). `TIMESTAMP` không có múi giờ chỉ hợp với "giờ trên lịch", như giờ mở cửa.
+- **Chuỗi:** trong PostgreSQL, `TEXT` và `VARCHAR(n)` lưu giống nhau. Giới hạn độ dài là luật nghiệp vụ; nếu cần, viết bằng `CHECK`.
+- **Khoá chính:** `BIGINT` identity gọn và nhanh. `UUID` hợp khi id phải sinh ở client hoặc không được đoán được.
+
+**Chuẩn hoá** (normalization) tới 3NF nghĩa là mỗi sự thật nằm ở đúng một chỗ: email nằm ở `customers`, không chép sang `orders`; tổng tiền đơn hàng tính từ `order_items`, không lưu thêm cột `total` để rồi lệch với các dòng hàng. `order_items.unit_price` trông như bản sao của `products.price` nhưng không phải: nó là giá **tại lúc mua**, một sự thật khác. Khi giá sản phẩm đổi, hoá đơn cũ không được đổi theo. **Phi chuẩn hoá** (lưu dữ liệu tính sẵn để đọc nhanh) chỉ nên làm khi đã đo được truy vấn chậm, và phải có cách giữ hai nơi khớp nhau.
+
+### Index B-tree và thứ tự cột
+
+Không có index, tìm "các đơn của khách 4242" nghĩa là đọc **mọi** dòng của `orders` rồi lọc: **Seq Scan**. **Index** là một cấu trúc riêng, mặc định là **B-tree** (cây cân bằng), giữ các giá trị đã sắp xếp kèm vị trí dòng trong bảng:
+
+```text
+                 [ 20000 | 40000 ]                       nút gốc
+                /        |        \
+     [.. 4242 ..]   [.. 25000 ..]   [.. 45000 ..]        nút lá: giá trị đã sắp xếp
+          |                                              + vị trí dòng (trang, offset)
+          v
+  bảng orders: trang 1187 dòng 12, trang 3020 dòng 4, ...
+```
+
+Tìm một giá trị chỉ đi qua vài nút thay vì cả bảng. Cái giá: index chiếm đĩa, và **mỗi** `INSERT`, `UPDATE` cột được index, `DELETE` phải sửa cả index. Bảng ghi nhiều không nên có index "phòng khi cần".
+
+**PostgreSQL không tự tạo index cho khoá ngoại.** Nó chỉ tự tạo index cho `PRIMARY KEY` và `UNIQUE`. Cột `orders.customer_id` có `REFERENCES customers (id)` nhưng không có index nào.
+
+**Index nhiều cột** sắp xếp theo cột đầu, rồi tới cột thứ hai trong cùng giá trị cột đầu, giống danh bạ xếp theo họ rồi tới tên. Index `(customer_id, created_at DESC)` vì vậy phục vụ tốt:
+
+| Truy vấn | Dùng index? |
+|---|---|
+| `WHERE customer_id = ?` | Có |
+| `WHERE customer_id = ? ORDER BY created_at DESC LIMIT 5` | Có, đọc đúng 5 dòng đầu, không cần sắp xếp |
+| `WHERE created_at >= ?` (không có `customer_id`) | Thường không: các ngày nằm rải rác dưới mọi khách |
+
+PostgreSQL 18 có thêm **skip scan**, cho phép dùng index nhiều cột khi thiếu điều kiện ở cột đầu, nhưng chỉ có lợi khi cột đầu có ít giá trị khác nhau. Với 50.000 khách, bạn sẽ thấy planner vẫn chọn Seq Scan.
+
+Index trên `email` không giúp được `WHERE lower(email) = ?`, vì index lưu `email`, không lưu `lower(email)`. Cách sửa là **index trên biểu thức** `(lower(email))`, hoặc chuẩn hoá email thành chữ thường ngay khi ghi.
+
+### Đọc EXPLAIN ANALYZE
+
+`EXPLAIN` in **execution plan** (kế hoạch thực thi) mà planner chọn; `EXPLAIN ANALYZE` chạy thật truy vấn rồi in thêm số đo thật. Plan là một cây, đọc từ nút trong cùng ra ngoài:
+
+| Thành phần | Ý nghĩa |
+|---|---|
+| `Seq Scan` | Đọc cả bảng |
+| `Index Scan` | Tìm trong index rồi đọc dòng tương ứng trong bảng |
+| `Bitmap Heap Scan` | Gom vị trí từ index rồi đọc bảng theo thứ tự trang, hợp khi khớp nhiều dòng |
+| `Gather`, `Parallel ...` | Nhiều worker cùng quét |
+| `cost=0.42..23.84` | Chi phí ước lượng (đơn vị tương đối) để ra dòng đầu và dòng cuối |
+| `rows=6` trong ngoặc đầu | Số dòng planner **ước lượng** |
+| `actual ... rows=5.00` | Số dòng **thật** |
+| `Buffers: shared hit=8 read=3` | Số trang 8 KB lấy được từ bộ đệm của PostgreSQL (hit) và phải lấy từ hệ điều hành hoặc đĩa (read) |
+
+Hai dấu hiệu cần tìm trong một truy vấn chậm: `Seq Scan` kèm `Rows Removed by Filter` rất lớn so với số dòng trả về, và số dòng **ước lượng lệch xa số dòng thật**. Planner chọn cách join và thứ tự join dựa trên ước lượng; ước lượng sai thì kế hoạch sai. Ước lượng dựa trên thống kê mà `ANALYZE` thu thập (autovacuum chạy nó định kỳ).
+
+<Callout kind="production">
+
+Trang "Đơn hàng của tôi" chạy nhanh suốt năm đầu. Sang năm thứ hai, bảng `orders` có 40 triệu dòng và trang này mất 3 giây, CPU database lên 90% giờ cao điểm. `EXPLAIN ANALYZE` cho thấy `Parallel Seq Scan on orders`, `Rows Removed by Filter: 13333320` để trả về 12 dòng. Lý do: đội đã khai báo khoá ngoại và tin rằng "có khoá ngoại là có index". Một index `(customer_id, created_at DESC)` đưa truy vấn xuống dưới 1 ms. Trên bảng lớn đang chạy, tạo index bằng `CREATE INDEX CONCURRENTLY` để không khoá các thao tác ghi.
+
+</Callout>
+
+<Check id="j12.1.index-explain">Đọc được một plan và chỉ ra nút quét, số dòng ước lượng, số dòng thật; giải thích được quy tắc thứ tự cột của index nhiều cột.</Check>
+
+### Transaction, MVCC và mức isolation
+
+**Transaction** gom nhiều câu lệnh thành một đơn vị, theo bốn tính chất **ACID**: Atomicity (hoặc tất cả, hoặc không gì cả), Consistency (ràng buộc luôn đúng sau commit), Isolation (các transaction đồng thời không thấy trạng thái dở dang của nhau), Durability (đã commit thì không mất kể cả khi mất điện). Trong psql, mỗi câu lệnh đứng riêng là một transaction tự commit; `BEGIN` mở một transaction dài tới `COMMIT` hoặc `ROLLBACK`.
+
+PostgreSQL thực hiện isolation bằng **MVCC** (Multi-Version Concurrency Control): `UPDATE` không ghi đè mà tạo phiên bản mới của dòng, và mỗi câu lệnh đọc theo một **snapshot**, tức danh sách transaction đã commit tại thời điểm chụp. Người đọc không chặn người ghi, người ghi không chặn người đọc; chỉ hai người cùng **ghi** một dòng mới phải chờ nhau.
+
+```text
+Read Committed:  mỗi CÂU LỆNH chụp snapshot mới
+  A: BEGIN ── SELECT (thấy 100) ──────────────── SELECT (thấy 70) ── COMMIT
+  B:                    UPDATE stock-30, COMMIT
+
+Repeatable Read: cả TRANSACTION dùng snapshot chụp ở câu lệnh đầu tiên
+  A: BEGIN ── SELECT (thấy 70) ───────────────── SELECT (vẫn 70) ── UPDATE -> lỗi
+  B:                    UPDATE stock-30, COMMIT
+```
+
+Chuẩn SQL định nghĩa các mức isolation qua những **hiện tượng** (anomaly) chúng cho phép. Bảng dưới là hành vi thật của PostgreSQL, chặt hơn mức tối thiểu chuẩn yêu cầu:
+
+| Hiện tượng | Read Committed (mặc định) | Repeatable Read | Serializable |
+|---|---|---|---|
+| Dirty read: đọc dữ liệu chưa commit | Không | Không | Không |
+| Non-repeatable read: đọc lại một dòng thấy giá trị khác | **Có** | Không | Không |
+| Phantom read: chạy lại truy vấn thấy thêm dòng mới | **Có** | Không | Không |
+| Lost update: đọc, tính ở ứng dụng, ghi đè | **Có** | Không, báo lỗi | Không, báo lỗi |
+| Write skew: hai bên đọc chung, ghi hai dòng khác nhau | **Có** | **Có** | Không, báo lỗi |
+
+`READ UNCOMMITTED` trong PostgreSQL chạy y hệt Read Committed. Ở Repeatable Read và Serializable, PostgreSQL không chờ mà **huỷ** transaction đến sau với lỗi `could not serialize access`; ứng dụng phải chạy lại cả transaction. Mức càng cao thì càng ít hiện tượng, nhưng càng nhiều lần phải retry.
+
+<Callout kind="production">
+
+Một service kho làm theo ba bước: `SELECT stock`, tính `stock - 1` trong Java, rồi `UPDATE products SET stock = ?`. Ở Read Committed, hai request đồng thời cùng đọc 40, cùng ghi 39: bán hai món, kho trừ một. Không có lỗi nào trong log. Bạn sẽ tạo lại chính lỗi này bằng psql ở bước 9, rồi sửa nó trong Spring ở bài J12.3.
+
+</Callout>
+
+<Check id="j12.1.isolation-levels">Kể được các hiện tượng mà Read Committed, Repeatable Read và Serializable của PostgreSQL cho phép, và vì sao mức cao hơn đòi hỏi ứng dụng phải retry.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [PostgreSQL: Constraints](https://www.postgresql.org/docs/current/ddl-constraints.html): đọc mục 5.5.5 Foreign Keys, đặc biệt đoạn gần cuối nói vì sao nên tự tạo index cho cột tham chiếu.
+- [PostgreSQL: Indexes](https://www.postgresql.org/docs/current/indexes.html): đọc 11.3 Multicolumn Indexes và 11.7 Indexes on Expressions.
+- [PostgreSQL: Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html): mục 14.1.2 EXPLAIN ANALYZE giải thích `actual time`, `loops` và cách so ước lượng với thực tế.
+- [PostgreSQL: Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html): bảng 13.1 và ví dụ cho từng mức; đọc kỹ phần Serializable để hiểu write skew.
+- [PostgreSQL: The SQL Language](https://www.postgresql.org/docs/current/tutorial-sql.html): ôn JOIN và hàm gộp nếu cần.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker Desktop đang chạy (bài J8.3). Image `postgres:18-alpine` khoảng 120 MB sẽ được tải nếu máy chưa có. Lab dùng cổng **20120** trên máy để bài J12.2 kết nối từ Java; nếu cổng này bận, đổi số ở cả `-p` và các bài sau. Mọi lệnh chạy trong Terminal trên Mac; trên Linux giống hệt.
+
+### 1. Khởi động PostgreSQL
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name masteva-j12-pg -e POSTGRES_PASSWORD=masteva -e POSTGRES_DB=shop \
+  -p 20120:5432 postgres:18-alpine
+sleep 3; docker exec masteva-j12-pg pg_isready -U postgres
+docker ps --filter name=masteva-j12 --format '{{.Names}}  {{.Status}}  {{.Ports}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/var/run/postgresql:5432 - accepting connections
+masteva-j12-pg  Up 3 seconds  0.0.0.0:20120->5432/tcp, [::]:20120->5432/tcp
+```
+
+</Expected>
+
+Dòng đầu tiên mà `docker run` in ra là mã container, khác nhau mỗi lần nên đã lược; thời gian ở cột trạng thái cũng khác. Container này chạy suốt cả chặng J12. Định nghĩa một hàm shell để gọi psql bên trong container cho gọn:
+
+<Terminal where="mac">
+
+```bash
+shopsql() { docker exec -i masteva-j12-pg psql -U postgres -d shop "$@"; }
+```
+
+</Terminal>
+
+Hàm chỉ sống trong cửa sổ Terminal hiện tại; mở tab mới thì định nghĩa lại. `-i` cho phép đưa file SQL vào qua `<`.
+
+### 2. Tạo bảng
+
+<Terminal where="mac" title="Tạo ~/masteva-j12/sql/01-schema.sql">
+
+```bash
+mkdir -p ~/masteva-j12/sql && cd ~/masteva-j12
+cat > sql/01-schema.sql <<'EOF'
+CREATE TABLE customers (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email      TEXT NOT NULL UNIQUE,
+    full_name  TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE products (
+    id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku   TEXT NOT NULL UNIQUE,
+    name  TEXT NOT NULL,
+    price BIGINT NOT NULL CHECK (price > 0),
+    stock INTEGER NOT NULL CHECK (stock >= 0)
+);
+
+CREATE TABLE orders (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id BIGINT NOT NULL REFERENCES customers (id),
+    status      TEXT NOT NULL CHECK (status IN ('NEW', 'PAID', 'SHIPPED', 'CANCELLED')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_items (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id   BIGINT NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
+    product_id BIGINT NOT NULL REFERENCES products (id),
+    quantity   INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price BIGINT NOT NULL CHECK (unit_price > 0),
+    UNIQUE (order_id, product_id)
+);
+EOF
+shopsql < sql/01-schema.sql
+shopsql -c '\d orders'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+                                    Table "public.orders"
+   Column    |           Type           | Collation | Nullable |           Default
+-------------+--------------------------+-----------+----------+------------------------------
+ id          | bigint                   |           | not null | generated always as identity
+ customer_id | bigint                   |           | not null |
+ status      | text                     |           | not null |
+ created_at  | timestamp with time zone |           | not null | now()
+Indexes:
+    "orders_pkey" PRIMARY KEY, btree (id)
+Check constraints:
+    "orders_status_check" CHECK (status = ANY (ARRAY['NEW'::text, 'PAID'::text, 'SHIPPED'::text, 'CANCELLED'::text]))
+Foreign-key constraints:
+    "orders_customer_id_fkey" FOREIGN KEY (customer_id) REFERENCES customers(id)
+Referenced by:
+    TABLE "order_items" CONSTRAINT "order_items_order_id_fkey" FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+```
+
+</Expected>
+
+Mục `Indexes` chỉ có `orders_pkey`. Khoá ngoại `orders_customer_id_fkey` nằm ở mục khác và không kèm index nào. `GENERATED ALWAYS AS IDENTITY` là cách chuẩn SQL để sinh id tăng dần; `ALWAYS` từ chối câu `INSERT` tự ghi id, tránh lệch với bộ đếm.
+
+### 3. Sinh dữ liệu đủ lớn để đo
+
+Execution plan trên bảng vài dòng không nói lên gì. `generate_series` sinh 50.000 khách, 2.000 sản phẩm, 300.000 đơn và 600.000 dòng hàng bằng công thức cố định, nên số liệu trên máy bạn giống hệt bài:
+
+<Terminal where="mac" title="Tạo sql/02-data.sql và nạp">
+
+```bash
+cd ~/masteva-j12
+cat > sql/02-data.sql <<'EOF'
+INSERT INTO customers (email, full_name, created_at)
+SELECT 'user' || g || '@example.com', 'Khách hàng ' || g,
+       timestamptz '2025-01-01' + g * interval '10 minutes'
+FROM generate_series(1, 50000) AS g;
+
+INSERT INTO products (sku, name, price, stock)
+SELECT 'SKU-' || lpad(g::text, 4, '0'), 'Sản phẩm ' || g, (10 + g % 90) * 10000, 100
+FROM generate_series(1, 2000) AS g;
+
+INSERT INTO orders (customer_id, status, created_at)
+SELECT 1 + (g::bigint * 7919) % 50000,
+       (ARRAY['NEW', 'PAID', 'PAID', 'SHIPPED', 'SHIPPED',
+              'SHIPPED', 'SHIPPED', 'SHIPPED', 'SHIPPED', 'CANCELLED'])[1 + g % 10],
+       timestamptz '2026-01-01' + (g % 270) * interval '1 day' + (g % 86400) * interval '1 second'
+FROM generate_series(1, 300000) AS g;
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+SELECT o.id, p.id, 1 + (o.id + p.id) % 3, p.price
+FROM orders AS o
+JOIN products AS p
+  ON p.id IN (1 + (o.id * 31) % 2000, 1 + ((o.id * 31) % 2000 + 1 + o.id % 7) % 2000);
+
+ANALYZE;
+EOF
+shopsql < sql/02-data.sql
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+INSERT 0 50000
+INSERT 0 2000
+INSERT 0 300000
+INSERT 0 600000
+ANALYZE
+```
+
+</Expected>
+
+Lệnh mất vài giây. `g::bigint` cần thiết vì `300000 * 7919` vượt giới hạn của `integer`; thiếu nó, PostgreSQL báo `integer out of range`. `ANALYZE` cuối file cập nhật thống kê để planner ước lượng đúng ngay.
+
+### 4. Để database chặn dữ liệu sai
+
+<Terminal where="mac">
+
+```bash
+shopsql -c "INSERT INTO products (sku, name, price, stock) VALUES ('SKU-X', 'Hàng lỗi', 0, 5)"
+shopsql -c "INSERT INTO orders (customer_id, status) VALUES (999999, 'NEW')"
+shopsql -c "INSERT INTO orders (customer_id, status) VALUES (1, 'DONE')"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ERROR:  new row for relation "products" violates check constraint "products_price_check"
+DETAIL:  Failing row contains (2001, SKU-X, Hàng lỗi, 0, 5).
+ERROR:  insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
+DETAIL:  Key (customer_id)=(999999) is not present in table "customers".
+ERROR:  new row for relation "orders" violates check constraint "orders_status_check"
+DETAIL:  Failing row contains (300002, 1, DONE, 2026-10-03 17:45:19.530961+00).
+```
+
+</Expected>
+
+Thời điểm ở dòng cuối là lúc bạn chạy. Để ý id: `2001` và `300002`. Hai lần chèn đơn hỏng đã lấy mất id `300001` và `300002`: bộ đếm identity không quay lại khi câu lệnh lỗi hay transaction rollback, nên id có lỗ hổng là bình thường. Đừng dùng id để đếm số dòng hay suy ra thứ tự nghiệp vụ.
+
+<Check id="j12.1.lab-constraints">Tạo được schema có `CHECK`, `UNIQUE`, khoá ngoại, đọc được tên ràng buộc trong thông báo lỗi khi chèn dữ liệu sai, và giải thích được vì sao tiền không dùng số thực và `unit_price` không vi phạm chuẩn hoá.</Check>
+
+### 5. Một truy vấn báo cáo: JOIN và GROUP BY
+
+Năm sản phẩm có doanh thu cao nhất trong tháng 9/2026, chỉ tính đơn đã thanh toán hoặc đã giao:
+
+<Terminal where="mac">
+
+```bash
+shopsql <<'EOF'
+SELECT p.sku, sum(i.quantity) AS sold, sum(i.quantity * i.unit_price) AS revenue
+FROM order_items AS i
+JOIN orders AS o ON o.id = i.order_id
+JOIN products AS p ON p.id = i.product_id
+WHERE o.status IN ('PAID', 'SHIPPED')
+  AND o.created_at >= '2026-09-01' AND o.created_at < '2026-10-01'
+GROUP BY p.id
+ORDER BY revenue DESC, p.sku
+LIMIT 5;
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   sku    | sold | revenue
+----------+------+----------
+ SKU-1079 |   70 | 69300000
+ SKU-1889 |   70 | 69300000
+ SKU-0629 |   69 | 68310000
+ SKU-0719 |   69 | 68310000
+ SKU-1529 |   69 | 68310000
+(5 rows)
+```
+
+</Expected>
+
+- `GROUP BY p.id` mà vẫn chọn được `p.sku`: `id` là khoá chính, nên mọi cột khác của `products` phụ thuộc vào nó. PostgreSQL chấp nhận điều này.
+- Doanh thu tính từ `unit_price`, giá lúc mua, không phải `products.price` hiện tại.
+- `ORDER BY revenue DESC, p.sku`: thiếu cột thứ hai, hai sản phẩm cùng doanh thu có thể đổi chỗ giữa các lần chạy. Phân trang trên kết quả không ổn định sẽ làm mất hoặc lặp dòng.
+- Khoảng thời gian viết `>= đầu tháng AND < đầu tháng sau`, không dùng `BETWEEN ... '2026-09-30'`, vì cách đó bỏ sót mọi đơn sau 00:00 ngày 30.
+
+### 6. Từ Seq Scan tới Index Scan
+
+<Terminal where="mac">
+
+```bash
+shopsql <<'EOF'
+EXPLAIN ANALYZE
+SELECT id, status, created_at FROM orders
+WHERE customer_id = 4242
+ORDER BY created_at DESC
+LIMIT 5;
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+                                                            QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=5445.56..5445.57 rows=5 width=23) (actual time=8.935..10.658 rows=5.00 loops=1)
+   Buffers: shared hit=2242
+   ->  Sort  (cost=5445.56..5445.57 rows=6 width=23) (actual time=8.934..10.656 rows=5.00 loops=1)
+         Sort Key: created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=2242
+         ->  Gather  (cost=1000.00..5445.48 rows=6 width=23) (actual time=1.278..10.626 rows=6.00 loops=1)
+               Workers Planned: 1
+               Workers Launched: 1
+               Buffers: shared hit=2239
+               ->  Parallel Seq Scan on orders  (cost=0.00..4444.88 rows=4 width=23) (actual time=2.357..7.103 rows=3.00 loops=2)
+                     Filter: (customer_id = 4242)
+                     Rows Removed by Filter: 149997
+                     Buffers: shared hit=2239
+ Planning:
+   Buffers: shared hit=91
+ Planning Time: 0.397 ms
+ Execution Time: 10.698 ms
+```
+
+</Expected>
+
+Thời gian trên máy bạn sẽ khác; số dòng và số trang thì giống. Đọc từ trong ra: hai tiến trình (`loops=2`) cùng quét bảng, mỗi tiến trình bỏ 149.997 dòng để giữ khoảng 3 dòng; tổng cộng 2.239 trang 8 KB, tức cả bảng, để lấy 6 đơn. Từ PostgreSQL 18, `EXPLAIN ANALYZE` tự in `Buffers` và số dòng có phần thập phân (`rows=5.00`, là trung bình mỗi vòng lặp). Giờ thêm index theo đúng hình dạng truy vấn: lọc theo `customer_id`, sắp xếp theo `created_at` giảm dần.
+
+<Terminal where="mac">
+
+```bash
+shopsql <<'EOF'
+CREATE INDEX orders_customer_created_idx ON orders (customer_id, created_at DESC);
+EXPLAIN ANALYZE
+SELECT id, status, created_at FROM orders
+WHERE customer_id = 4242
+ORDER BY created_at DESC
+LIMIT 5;
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CREATE INDEX
+                                                                  QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..23.84 rows=5 width=23) (actual time=0.038..0.044 rows=5.00 loops=1)
+   Buffers: shared hit=8 read=3
+   ->  Index Scan using orders_customer_created_idx on orders  (cost=0.42..28.53 rows=6 width=23) (actual time=0.037..0.042 rows=5.00 loops=1)
+         Index Cond: (customer_id = 4242)
+         Index Searches: 1
+         Buffers: shared hit=8 read=3
+ Planning:
+   Buffers: shared hit=77 read=1
+ Planning Time: 0.473 ms
+ Execution Time: 0.059 ms
+```
+
+</Expected>
+
+Nút `Sort` biến mất vì index đã trả dòng theo đúng thứ tự `created_at DESC`; `Limit` dừng sau 5 dòng. Số trang giảm từ 2.239 xuống 11, thời gian giảm hơn trăm lần. Với 40 triệu dòng, Seq Scan tăng theo kích thước bảng, còn Index Scan gần như không đổi.
+
+### 7. Thứ tự cột trong index
+
+<Terminal where="mac">
+
+```bash
+shopsql <<'EOF'
+EXPLAIN (ANALYZE, BUFFERS OFF)
+SELECT count(*) FROM orders WHERE created_at >= '2026-09-01';
+SELECT relname, pg_size_pretty(pg_relation_size(oid)) AS size
+FROM pg_class WHERE relname IN ('orders', 'orders_pkey', 'orders_customer_created_idx')
+ORDER BY relname;
+EOF
+```
+
+</Terminal>
+
+<Predict question="Index orders_customer_created_idx có created_at. Planner có dùng nó cho truy vấn này không?">
+
+```text
+ Finalize Aggregate  (cost=5489.17..5489.18 rows=1 width=8) (actual time=9.076..10.374 rows=1.00 loops=1)
+   ->  Gather  (cost=5488.95..5489.16 rows=2 width=8) (actual time=8.971..10.370 rows=2.00 loops=1)
+         Workers Planned: 1
+         Workers Launched: 1
+         ->  Partial Aggregate  (cost=4488.95..4488.96 rows=1 width=8) (actual time=6.930..6.930 rows=1.00 loops=2)
+               ->  Parallel Seq Scan on orders  (cost=0.00..4444.88 rows=17629 width=0) (actual time=0.020..6.262 rows=14998.50 loops=2)
+                     Filter: (created_at >= '2026-09-01 00:00:00+00'::timestamp with time zone)
+                     Rows Removed by Filter: 135002
+...
+           relname           |  size
+-----------------------------+---------
+ orders                      | 17 MB
+ orders_customer_created_idx | 9256 kB
+ orders_pkey                 | 6600 kB
+```
+
+Không. (Số ước lượng `rows=17629` có thể lệch một chút trên máy bạn, vì `ANALYZE` đọc một mẫu ngẫu nhiên của bảng.) Trong index, `created_at` chỉ được sắp xếp **bên trong từng khách**; các đơn từ tháng 9 nằm rải rác dưới 50.000 nhánh khách khác nhau. Muốn lọc nhanh theo ngày cần index khác bắt đầu bằng `created_at`. Bảng thứ hai cho thấy cái giá: hai index đã chiếm 15 MB, gần bằng chính bảng 17 MB, và mỗi lần chèn một đơn PostgreSQL phải cập nhật cả hai.
+
+</Predict>
+
+<Check id="j12.1.lab-index-plan">Đọc được plan trước và sau khi tạo index nhiều cột, chỉ ra vì sao nút `Sort` biến mất và vì sao index đó không giúp truy vấn chỉ lọc theo `created_at`.</Check>
+
+### 8. Hàm trên cột và ước lượng sai
+
+<Terminal where="mac">
+
+```bash
+shopsql <<'EOF'
+EXPLAIN (ANALYZE, BUFFERS OFF)
+SELECT id, full_name FROM customers WHERE lower(email) = 'user4242@example.com';
+CREATE INDEX customers_lower_email_idx ON customers (lower(email));
+ANALYZE customers;
+EXPLAIN (ANALYZE, BUFFERS OFF)
+SELECT id, full_name FROM customers WHERE lower(email) = 'user4242@example.com';
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+                                                 QUERY PLAN
+-------------------------------------------------------------------------------------------------------------
+ Seq Scan on customers  (cost=0.00..1308.00 rows=250 width=26) (actual time=1.226..13.810 rows=1.00 loops=1)
+   Filter: (lower(email) = 'user4242@example.com'::text)
+   Rows Removed by Filter: 49999
+ Planning Time: 0.324 ms
+ Execution Time: 13.841 ms
+
+CREATE INDEX
+ANALYZE
+                                                               QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using customers_lower_email_idx on customers  (cost=0.41..8.43 rows=1 width=26) (actual time=0.043..0.043 rows=1.00 loops=1)
+   Index Cond: (lower(email) = 'user4242@example.com'::text)
+   Index Searches: 1
+ Planning Time: 0.116 ms
+ Execution Time: 0.061 ms
+```
+
+</Expected>
+
+Plan đầu có hai vấn đề. Index `customers_email_key` (do `UNIQUE` tạo) không được dùng, vì nó lưu `email` chứ không lưu `lower(email)`. Và planner ước lượng `rows=250` trong khi thật chỉ có 1: nó không có thống kê cho biểu thức `lower(email)` nên dùng tỷ lệ mặc định 0,5% của 50.000 dòng. Trong một truy vấn có join, ước lượng gấp 250 lần như vậy đủ làm planner chọn sai cách join. Index trên biểu thức sửa cả hai: `ANALYZE` thu thập thống kê cho biểu thức của index, và ước lượng thành `rows=1`.
+
+<Check id="j12.1.lab-expression-index">Giải thích được vì sao `lower(email)` không dùng index trên `email`, nhận ra ước lượng lệch trong plan, và sửa bằng index trên biểu thức.</Check>
+
+### 9. Hai phiên psql, ba hiện tượng
+
+Mở **hai tab Terminal** mới, gọi là tab A và tab B, và mở psql tương tác ở mỗi tab:
+
+<Terminal where="mac" title="Tab A và tab B">
+
+```bash
+docker exec -it masteva-j12-pg psql -U postgres -d shop
+```
+
+</Terminal>
+
+Gõ từng câu lệnh theo **đúng thứ tự** trong bảng, chuyển tab sau mỗi dòng. Khi đang trong transaction, dấu nhắc đổi từ `shop=#` thành `shop=*#`. Sản phẩm id 1 đang có `stock = 100`.
+
+**Thí nghiệm 1, Read Committed:**
+
+| Bước | Tab A | Tab B |
+|---|---|---|
+| 1 | `BEGIN;` | |
+| 2 | `SELECT stock FROM products WHERE id = 1;` | |
+| 3 | | `UPDATE products SET stock = stock - 30 WHERE id = 1;` |
+| 4 | `SELECT stock FROM products WHERE id = 1;` | |
+| 5 | `COMMIT;` | |
+
+<Expected>
+
+```text
+-- Tab A
+BEGIN
+ stock
+-------
+   100
+(1 row)
+
+ stock
+-------
+    70
+(1 row)
+
+COMMIT
+-- Tab B
+UPDATE 1
+```
+
+</Expected>
+
+Trong **cùng một transaction**, tab A đọc hai lần và thấy hai giá trị: **non-repeatable read**. Read Committed chụp snapshot mới cho mỗi câu lệnh, nên câu thứ hai thấy thay đổi tab B vừa commit (câu `UPDATE` đứng riêng tự commit).
+
+**Thí nghiệm 2, Repeatable Read:**
+
+| Bước | Tab A | Tab B |
+|---|---|---|
+| 1 | `BEGIN ISOLATION LEVEL REPEATABLE READ;` | |
+| 2 | `SELECT stock FROM products WHERE id = 1;` | |
+| 3 | | `UPDATE products SET stock = stock - 30 WHERE id = 1;` |
+| 4 | `SELECT stock FROM products WHERE id = 1;` | |
+| 5 | `UPDATE products SET stock = stock - 1 WHERE id = 1;` | |
+| 6 | `ROLLBACK;` | |
+
+<Predict question="Ở bước 4 tab A thấy 70 hay 40? Bước 5 có chạy được không?">
+
+```text
+-- Tab A
+BEGIN
+ stock
+-------
+    70
+(1 row)
+
+ stock
+-------
+    70
+(1 row)
+
+ERROR:  could not serialize access due to concurrent update
+ROLLBACK
+-- Tab B
+UPDATE 1
+```
+
+Tab A vẫn thấy 70: Repeatable Read giữ snapshot chụp ở câu `SELECT` đầu tiên cho tới hết transaction. Nhưng khi tab A định **ghi** vào dòng mà transaction khác đã sửa sau snapshot đó, PostgreSQL không thể vừa giữ snapshot vừa không làm mất thay đổi của tab B, nên huỷ tab A. Sau lỗi, mọi lệnh khác bị từ chối cho tới `ROLLBACK` (gõ `COMMIT` cũng chỉ nhận về `ROLLBACK`). Trong ứng dụng, cách xử lý đúng là chạy lại toàn bộ transaction từ đầu. Kho bây giờ là 40.
+
+</Predict>
+
+**Thí nghiệm 3, lost update ở Read Committed:** giả lập ứng dụng đọc tồn kho, tự tính trong code, rồi ghi con số đã tính.
+
+| Bước | Tab A | Tab B |
+|---|---|---|
+| 1 | `BEGIN;` | |
+| 2 | | `BEGIN;` |
+| 3 | `SELECT stock FROM products WHERE id = 1;` | |
+| 4 | | `SELECT stock FROM products WHERE id = 1;` |
+| 5 | `UPDATE products SET stock = 39 WHERE id = 1;` | |
+| 6 | | `UPDATE products SET stock = 39 WHERE id = 1;` |
+
+Câu `UPDATE` ở tab B **treo**, không trả về. Ở tab Terminal ban đầu (đã định nghĩa `shopsql`), xem ai đang chờ ai:
+
+<Terminal where="mac" title="Tab ban đầu">
+
+```bash
+shopsql -c "SELECT pid, state, wait_event_type, wait_event, left(query, 45) AS query
+FROM pg_stat_activity WHERE datname = 'shop' AND pid <> pg_backend_pid() ORDER BY pid"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ pid |        state        | wait_event_type |  wait_event   |                    query
+-----+---------------------+-----------------+---------------+----------------------------------------------
+ 209 | active              | Lock            | transactionid | UPDATE products SET stock = 39 WHERE id = 1;
+ 210 | idle in transaction | Client          | ClientRead    | UPDATE products SET stock = 39 WHERE id = 1;
+```
+
+</Expected>
+
+Số `pid` và thứ tự hai dòng khác trên máy bạn. Phiên của tab A `idle in transaction`: đã sửa dòng, giữ khoá dòng, và đang chờ bạn gõ tiếp. Phiên của tab B `active` nhưng chờ `Lock`: hai người không được cùng ghi một dòng. Giờ hoàn tất:
+
+| Bước | Tab A | Tab B |
+|---|---|---|
+| 7 | `COMMIT;` | (câu `UPDATE` trả về `UPDATE 1`) |
+| 8 | | `COMMIT;` |
+| 9 | | `SELECT stock FROM products WHERE id = 1;` |
+
+<Expected>
+
+```text
+-- Tab A
+BEGIN
+ stock
+-------
+    40
+(1 row)
+
+UPDATE 1
+COMMIT
+-- Tab B
+BEGIN
+ stock
+-------
+    40
+(1 row)
+
+UPDATE 1
+COMMIT
+ stock
+-------
+    39
+(1 row)
+```
+
+</Expected>
+
+Hai giao dịch bán hàng đều thành công, kho chỉ giảm 1: **lost update**. Khoá dòng chỉ bắt tab B chờ, không bắt nó đọc lại. Có ba cách sửa, và bạn sẽ gặp lại cả ba trong Spring ở bài J12.3:
+
+- Để database tính: `UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock >= 1`. Sau khi chờ khoá, Read Committed đọc lại phiên bản mới nhất của dòng trước khi trừ.
+- Khoá bi quan: đọc bằng `SELECT ... FOR UPDATE`, bên thứ hai phải chờ ngay từ lúc đọc.
+- Khoá lạc quan: thêm cột `version`, ghi kèm `WHERE version = ?` và báo xung đột khi không dòng nào khớp.
+
+Lặp lại thí nghiệm 3 với `BEGIN ISOLATION LEVEL REPEATABLE READ;` ở cả hai tab: tab B nhận lỗi `could not serialize access due to concurrent update` thay vì ghi đè, và câu `COMMIT` sau đó chỉ trả về `ROLLBACK`. Gõ `\q` để thoát psql ở tab A và tab B.
+
+<Check id="j12.1.lab-isolation">Tự tạo được non-repeatable read và lost update bằng hai phiên psql, đọc được `pg_stat_activity` để thấy phiên nào đang chờ khoá.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Bind for 0.0.0.0:20120 failed: port is already allocated`: cổng 20120 đang bận. Chọn cổng khác và dùng cùng số đó ở J12.2.
+- `Conflict. The container name "/masteva-j12-pg" is already in use`: container đã có từ lần trước. Nếu nó đang dừng, chạy `docker start masteva-j12-pg`; nếu muốn làm lại từ đầu, xem phần dọn dẹp ở cuối bài J12.3.
+- `ERROR: relation "orders" already exists` khi chạy lại `01-schema.sql`: bảng đã có. Bỏ qua bước 2, hoặc xoá và tạo lại database theo phần dọn dẹp.
+- Tab B không treo ở thí nghiệm 3: tab A chưa chạy `BEGIN` hoặc đã `COMMIT` sớm. Mỗi lệnh phải đúng thứ tự trong bảng.
+- `psql: error: connection to server ... failed` ngay sau `docker run`: PostgreSQL chưa khởi động xong. Chờ thêm vài giây rồi chạy lại `pg_isready`.
+
+</Callout>
+
+### Dọn dẹp
+
+Giữ container `masteva-j12-pg` và thư mục `~/masteva-j12`: bài J12.2 dùng tiếp. Nếu khởi động lại máy, container sẽ dừng; chạy `docker start masteva-j12-pg` để bật lại, dữ liệu vẫn còn vì container chưa bị xoá. Lệnh xoá container nằm ở cuối bài J12.3.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao PostgreSQL không tự tạo index cho khoá ngoại, trong khi MySQL (InnoDB) thì có?">
+
+Vì không phải khoá ngoại nào cũng cần, và index nào cũng có giá khi ghi. Một bảng log tham chiếu tới `users` có thể chỉ được ghi, không bao giờ truy vấn theo `user_id` hay xoá user. Nhưng có hai trường hợp gần như luôn cần index: khi bạn truy vấn hay join theo cột đó, và khi xoá hoặc sửa dòng ở bảng cha, vì PostgreSQL phải tìm các dòng con để kiểm tra hay `CASCADE`. Không có index, mỗi lần xoá một khách là một lần quét cả bảng `orders`. Bài J12.2 thêm index cho `order_items.product_id` vì lý do này.
+
+</Reveal>
+
+<Reveal title="Repeatable Read đã chặn lost update, sao còn cần Serializable?">
+
+Vì **write skew**: hai transaction cùng đọc một tập dữ liệu, rồi mỗi bên ghi một dòng **khác nhau**. Ví dụ quy định "luôn có ít nhất một bác sĩ trực": hai bác sĩ cùng đọc thấy có 2 người trực, mỗi người tự xin nghỉ bằng cách sửa dòng của chính mình. Không dòng nào bị sửa hai lần nên Repeatable Read không phát hiện được, và kết quả là 0 người trực. Serializable (SSI trong PostgreSQL) theo dõi phụ thuộc đọc và ghi giữa các transaction, và huỷ một bên với lỗi `could not serialize access due to read/write dependencies`. Cái giá là nhiều lỗi phải retry hơn; nhiều hệ thống chọn Read Committed kèm khoá tường minh cho đúng chỗ cần.
+
+</Reveal>
+
+<Reveal title="Khi nào nên dùng partial index hoặc index bao phủ (INCLUDE)?">
+
+**Partial index** chỉ index các dòng thoả điều kiện, ví dụ `CREATE INDEX ... ON orders (created_at) WHERE status = 'NEW'` cho màn hình "đơn chờ xử lý": index nhỏ, chỉ chứa 10% số dòng, và truy vấn phải có đúng điều kiện `status = 'NEW'` mới dùng được. **Index bao phủ** `(customer_id, created_at DESC) INCLUDE (status)` lưu thêm `status` trong lá, cho phép **Index Only Scan**, không cần đọc bảng. Cả hai đều là tối ưu sau khi đã có plan cụ thể; đừng tạo trước khi đo.
+
+</Reveal>
+
+<Reveal title="Vì sao 'idle in transaction' là dấu hiệu xấu trên production?">
+
+Một phiên `idle in transaction` đang giữ transaction mở mà không làm gì, thường do code mở transaction rồi gọi HTTP sang hệ thống khác, hoặc quên commit. Nó giữ khoá dòng (như tab A ở thí nghiệm 3, làm người khác treo), giữ một kết nối của pool, và chặn VACUUM dọn các phiên bản dòng cũ, làm bảng phình dần. PostgreSQL có tham số `idle_in_transaction_session_timeout` để tự cắt các phiên như vậy; bài J12.3 cho thấy cùng vấn đề nhìn từ phía connection pool.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI đề xuất index cho một truy vấn chậm, kèm theo chính output `EXPLAIN (ANALYZE, BUFFERS)` và định nghĩa bảng, hoặc giải thích một plan dài. AI hay đề xuất index cho từng cột riêng lẻ thay vì một index nhiều cột đúng thứ tự, hay quên rằng hàm trên cột làm mất index, và hay nói sai mức isolation mặc định (PostgreSQL là Read Committed, MySQL InnoDB là Repeatable Read). Kiểm tra bằng cách tạo index rồi chạy lại `EXPLAIN ANALYZE` trên dữ liệu đủ lớn, và đọc bảng 13.1 của tài liệu PostgreSQL.
+
+</Callout>
+
+<Callout kind="link">
+
+J8.3 đã dùng PostgreSQL thật qua Testcontainers. J12.2 đưa schema này vào Flyway và truy cập nó từ Spring bằng JDBC và JPA; J12.3 sửa lost update bằng `@Version` và `SELECT ... FOR UPDATE`. J18 quay lại EXPLAIN khi tối ưu hiệu năng toàn hệ thống.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j12.1.mastery-slow-query">Tự tìm được nguyên nhân một truy vấn chậm bằng `EXPLAIN ANALYZE` và sửa bằng index đúng thứ tự cột hoặc index trên biểu thức, có số đo trước và sau.</Check>
+
+<Check id="j12.1.mastery-isolation">Giải thích được cho đồng đội lost update xảy ra thế nào ở Read Committed, và chọn được giữa câu `UPDATE` nguyên tử, mức isolation cao hơn hay khoá tường minh.</Check>
+
+</Mastery>

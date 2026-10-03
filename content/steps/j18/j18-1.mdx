@@ -1,0 +1,658 @@
+---
+title: Bộ nhớ JVM, class loading và chọn GC
+description: Đọc được bộ nhớ của một process Java theo từng vùng, tự tái hiện bốn loại OutOfMemoryError, theo dõi JVM nạp lớp, và so sánh G1 với ZGC bằng GC log trên cùng một workload.
+id: j18.1
+step: j18
+prerequisites: [j17]
+topics: [j18.heap-stack-metaspace, j18.class-loading, j18.gc-g1-zgc-cach-chon]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+---
+
+<Goal>
+
+Hiểu process JVM dùng bộ nhớ vào những vùng nào, JVM nạp một lớp ra sao, và hai GC chính G1, ZGC khác nhau thế nào. Học xong bài này, bạn giải thích được:
+
+- Vì sao container đặt `-Xmx512m` vẫn bị kill vì vượt giới hạn 600 MB.
+- `OutOfMemoryError: Java heap space`, `Metaspace` và `Cannot reserve ... direct buffer memory` khác nhau thế nào, và mỗi loại phải sửa ở đâu.
+- Vì sao `NoClassDefFoundError` xuất hiện giữa lúc ứng dụng đang chạy, không phải lúc khởi động.
+- Khi nào đổi từ G1 sang ZGC, và vì sao ZGC báo pause dưới 1 ms mà request vẫn chậm.
+
+</Goal>
+
+<Knowledge>
+
+### Bản đồ bộ nhớ của một process JVM
+
+`-Xmx` chỉ giới hạn **heap**. Process JVM còn nhiều vùng khác, phần lớn nằm ngoài heap, trong **native memory** (bộ nhớ do hệ điều hành cấp trực tiếp, không do GC quản lý):
+
+```text
+ Process java (RSS mà container, ps, top nhìn thấy)
+ +---------------------------------------------------------------+
+ | Heap (-Xmx)          object của bạn, do GC quản lý            |
+ |   G1: chia thành region; young (eden, survivor) và old         |
+ +---------------------------------------------------------------+
+ | Thread stack (-Xss)  mỗi thread một stack, chứa frame method  |
+ | Metaspace            metadata của lớp: method, field, bytecode |
+ | Code cache           mã máy do JIT sinh ra (bài J18.2)         |
+ | GC                   cấu trúc nội bộ của GC: card table, ...   |
+ | Direct buffer        ByteBuffer.allocateDirect, Netty, NIO     |
+ | Thư viện native, malloc của JVM, ...                           |
+ +---------------------------------------------------------------+
+```
+
+| Vùng | Chứa gì | Giới hạn bằng | Khi đầy |
+|---|---|---|---|
+| Heap | Object, mảng | `-Xmx` | `OutOfMemoryError: Java heap space` |
+| Thread stack | Frame của từng lời gọi method: biến cục bộ, tham số | `-Xss` cho mỗi thread | `StackOverflowError` |
+| Metaspace | Metadata của mỗi lớp đã nạp | `-XX:MaxMetaspaceSize`, mặc định không giới hạn | `OutOfMemoryError: Metaspace` |
+| Direct buffer | Vùng đệm I/O ngoài heap | `-XX:MaxDirectMemorySize`, mặc định bằng `-Xmx` | `OutOfMemoryError: Cannot reserve ... bytes of direct buffer memory` |
+
+Vì vậy bộ nhớ thật của process luôn lớn hơn `-Xmx`. Muốn biết lớn hơn bao nhiêu, bật **NMT (Native Memory Tracking)** bằng `-XX:NativeMemoryTracking=summary` rồi hỏi bằng `jcmd <pid> VM.native_memory summary`. Bạn sẽ làm trong phần thực hành.
+
+<Callout kind="production">
+
+Pod giới hạn 600 MiB, JVM chạy `-Xmx512m`, 200 thread. Heap chưa đầy nhưng pod chết với exit code 137 (bị kernel kill vì vượt memory limit, xem bài D1.1). Thủ phạm là phần ngoài heap: metaspace, code cache, stack của 200 thread và direct buffer của thư viện HTTP. Quy tắc thực tế: để heap chiếm khoảng 60 tới 75% giới hạn container (bài J17.3 đặt bằng `-XX:MaxRAMPercentage` và tái hiện OOMKilled), rồi đo phần còn lại bằng NMT thay vì đoán.
+
+</Callout>
+
+<Check id="j18.1.memory-areas">Kể được bốn vùng heap, thread stack, metaspace, direct buffer, mỗi vùng chứa gì, giới hạn bằng cờ nào và báo lỗi gì khi đầy.</Check>
+
+### Class loading: từ file .class tới lớp dùng được
+
+JVM không nạp mọi lớp lúc khởi động. Nó nạp **lười (lazy)**: lần đầu code thật sự dùng tới lớp nào thì mới nạp lớp đó. Mỗi lớp đi qua ba bước, theo JVMS chương 5:
+
+```text
+ loading          linking                                 initialization
+ tìm bytes   ->   verify (bytecode hợp lệ?)          ->   chạy static initializer,
+ tạo Class        prepare (cấp chỗ cho static field)      gán giá trị static
+                  resolve (nối tham chiếu tới lớp khác)
+```
+
+Ai tìm bytes? Một **class loader**. JDK có ba loader xếp thành chuỗi cha con, và loader luôn hỏi cha trước khi tự tìm (**parent delegation**, uỷ quyền cho cha):
+
+```text
+ bootstrap        java.base: String, List, ...          (in ra là null)
+     ^ cha
+ platform         java.sql, java.net.http, ...
+     ^ cha
+ application      classpath của bạn: -cp out, file JAR
+```
+
+Một lớp được xác định bởi **tên và loader đã định nghĩa nó**. Hai loader nạp cùng file `Plugin.class` cho ra hai lớp khác nhau, mỗi lớp chiếm metaspace riêng. Đó là gốc của **rò rỉ class loader**: app server hay plugin system tạo loader mới mỗi lần redeploy, nhưng một tham chiếu cũ còn giữ loader cũ, nên metaspace tăng mãi.
+
+| Lỗi | Nghĩa | Thường do |
+|---|---|---|
+| `ClassNotFoundException` | Code hỏi tên lớp một cách tường minh (`Class.forName`, `loadClass`) và không loader nào tìm thấy | Thiếu JAR, sai tên lớp trong cấu hình |
+| `NoClassDefFoundError` | Lớp có lúc biên dịch nhưng lúc chạy không nạp được | JAR khác phiên bản giữa build và runtime, dependency bị loại khỏi fat JAR, static initializer ném exception |
+
+**CDS (Class Data Sharing)** lưu sẵn các lớp của JDK đã được parse vào một file archive, nên JVM nạp chúng nhanh hơn. Log class loading ghi nguồn của các lớp này là `shared objects file`. AppCDS (từ JDK 10) đã archive được cả lớp của ứng dụng; từ JDK 24, **AOT cache** (JEP 483) đi xa hơn: lưu lớp ở trạng thái đã nạp và đã liên kết; bài J18.2 dùng nó để rút ngắn warm-up.
+
+<Check id="j18.1.class-loading">Giải thích được parent delegation và phân biệt được `ClassNotFoundException` với `NoClassDefFoundError`.</Check>
+
+### GC: G1 và ZGC
+
+Hầu hết object chết trẻ: một request tạo DTO, chuỗi, list, rồi bỏ đi. GC thế hệ (generational) dựa vào đó: dọn vùng young thường xuyên và rẻ, chỉ thỉnh thoảng mới dọn vùng old. Mỗi lần dọn, GC có thể cần **pause**: dừng mọi thread của ứng dụng (stop-the-world).
+
+| | G1 | ZGC |
+|---|---|---|
+| Mặc định | Có, từ JDK 9 | Bật bằng `-XX:+UseZGC` |
+| Cách làm | Chia heap thành region; pause để sao chép object sống ra region khác | Làm gần như mọi việc song song với ứng dụng, kể cả di chuyển object |
+| Pause | Mục tiêu `-XX:MaxGCPauseMillis`, mặc định 200 ms; thường vài ms tới vài chục ms | Dưới 1 ms, gần như không phụ thuộc kích thước heap |
+| Cái giá | Pause tăng theo lượng object sống phải sao chép | Cần CPU cho các thread GC chạy song song, và cần heap dư; heap thiếu thì thread ứng dụng bị **allocation stall** (phải đứng chờ GC) |
+| Chế độ | Generational | Chỉ còn generational từ JDK 24 |
+
+Ngoài ra còn Serial GC (một thread, hợp container rất nhỏ) và Parallel GC (tối đa throughput, chấp nhận pause dài, hợp batch job).
+
+**Chọn thế nào:** giữ G1 cho đa số service. Cân nhắc ZGC khi yêu cầu độ trễ p99 nhỏ hơn pause mà G1 đạt được, hoặc heap rất lớn (hàng chục GB trở lên), và bạn có CPU, bộ nhớ dư. Dù chọn gì, quyết định dựa trên **GC log** của workload thật, không dựa trên benchmark của người khác.
+
+<Callout kind="pitfall">
+
+Đừng chỉnh tham số GC trước khi đọc log. Phần lớn sự cố "GC chậm" thật ra là heap quá nhỏ so với lượng object sống, hoặc code tạo rác quá nhiều. Chỉnh `-XX:G1NewSizePercent` hay số thread GC khi chưa có số đo thường làm mọi thứ tệ hơn.
+
+</Callout>
+
+<Check id="j18.1.gc-choice">Nêu được khi nào giữ G1, khi nào cân nhắc ZGC, và cái giá phải trả của ZGC.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [JVMS Chapter 2: The Structure of the Java Virtual Machine](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-2.html): mục 2.5 Run-Time Data Areas, định nghĩa chính xác heap, stack, method area.
+- [JVMS Chapter 5: Loading, Linking, and Initializing](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-5.html): từng bước nạp lớp và khi nào JVM ném lỗi nào.
+- [Troubleshoot Memory Leaks](https://docs.oracle.com/en/java/javase/25/troubleshoot/troubleshooting-memory-leaks.html): phần "Understand the OutOfMemoryError Exception" giải thích từng thông điệp OOM, và phần Native Memory Tracking.
+- [Available Collectors](https://docs.oracle.com/en/java/javase/25/gctuning/available-collectors.html): hướng dẫn chính thức chọn Serial, Parallel, G1 hay ZGC.
+- [The Z Garbage Collector](https://docs.oracle.com/en/java/javase/25/gctuning/z-garbage-collector1.html): đặt kích thước heap cho ZGC, vì sao ZGC cần heap dư.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25 (bài J1.1). Bài này chỉ dùng `java`, `javac` và `jcmd`, không cần Maven. Lab của cả chặng J18 nằm trong `~/masteva-j18`; bài này dùng thư mục con `mem`. Mọi lệnh chạy giống nhau trên Mac và Linux. Con số trong Expected (thời gian, số lần GC, độ sâu stack) lấy từ máy kiểm chứng, một MacBook chip M 10 nhân, 16 GB RAM; máy bạn sẽ ra số khác, còn xu hướng thì giống.
+
+### 1. JVM tự chọn gì khi bạn không đặt cờ
+
+<Terminal where="mac">
+
+```bash
+java -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E ' (UseG1GC|UseZGC|MaxHeapSize|MaxMetaspaceSize|ThreadStackSize|MaxGCPauseMillis) '
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    uintx MaxGCPauseMillis                         = 200                                       {product} {default}
+   size_t MaxHeapSize                              = 4294967296                                {product} {ergonomic}
+   size_t MaxMetaspaceSize                         = 18446744073709551615                      {product} {default}
+     intx ThreadStackSize                          = 2048                                   {pd product} {default}
+     bool UseG1GC                                  = true                                      {product} {ergonomic}
+     bool UseZGC                                   = false                                     {product} {default}
+```
+
+</Expected>
+
+- `MaxHeapSize` là 4 GB, tức một phần tư RAM 16 GB của máy. Nhãn `{ergonomic}` nghĩa là JVM tự tính theo phần cứng.
+- `MaxMetaspaceSize` là số lớn nhất của kiểu 64 bit: không giới hạn. Rò rỉ metaspace sẽ ăn dần bộ nhớ của máy thay vì báo lỗi sớm.
+- `ThreadStackSize` tính bằng KB và khác nhau theo nền tảng; đây là macOS trên chip ARM.
+
+### 2. Chương trình tái hiện lỗi bộ nhớ
+
+`OomLab` có sáu chế độ, mỗi chế độ làm đầy một vùng hoặc minh hoạ class loading. Danh sách `keep` giữ tham chiếu để GC không thu hồi được, giống một cache quên giới hạn. Khi bắt được `OutOfMemoryError`, chương trình xoá `keep` trước để còn bộ nhớ mà in thông báo.
+
+<Terminal where="mac" title="Tạo mem/src">
+
+```bash
+mkdir -p ~/masteva-j18/mem/src && cd ~/masteva-j18/mem
+cat > src/Plugin.java <<'EOF'
+public class Plugin {
+    public String name() {
+        return "pricing-plugin v1";
+    }
+}
+EOF
+cat > src/OomLab.java <<'EOF'
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+
+public class OomLab {
+    // Giữ tham chiếu để GC không thu hồi được: đây là "rò rỉ" có chủ đích.
+    static final List<Object> keep = new ArrayList<>();
+    static int depth = 0;
+
+    public static void main(String[] args) throws Exception {
+        try {
+            switch (args.length == 0 ? "" : args[0]) {
+                case "loaders" -> loaders();
+                case "plugin" -> System.out.println(new Plugin().name());
+                case "heap" -> heap();
+                case "stack" -> stack();
+                case "meta" -> meta();
+                case "direct" -> direct();
+                default -> System.out.println("Dùng: loaders | plugin | heap | stack | meta | direct");
+            }
+        } catch (OutOfMemoryError e) {
+            int kept = keep.size();
+            keep.clear(); // nhả tham chiếu để còn bộ nhớ mà in thông báo
+            System.out.println(e + " (đã giữ " + kept + " phần tử)");
+        }
+    }
+
+    static void loaders() {
+        System.out.println("String     -> " + String.class.getClassLoader());
+        System.out.println("java.sql   -> " + java.sql.Connection.class.getClassLoader());
+        System.out.println("OomLab     -> " + OomLab.class.getClassLoader());
+        var app = OomLab.class.getClassLoader();
+        System.out.println("parent     -> " + app.getParent());
+    }
+
+    static void heap() {
+        // Cache không giới hạn: mỗi phần tử 1 MB, không bao giờ bị xoá.
+        while (true) {
+            keep.add(new byte[1024 * 1024]);
+        }
+    }
+
+    static void stack() {
+        try {
+            recurse();
+        } catch (StackOverflowError e) {
+            System.out.println("StackOverflowError ở độ sâu " + depth);
+        }
+    }
+
+    static void recurse() {
+        depth++;
+        recurse();
+    }
+
+    static void meta() throws Exception {
+        byte[] bytes;
+        try (var in = OomLab.class.getResourceAsStream("Plugin.class")) {
+            bytes = in.readAllBytes();
+        }
+        while (true) {
+            // Mỗi loader mới định nghĩa một bản Plugin riêng trong metaspace.
+            var loader = new PluginLoader(bytes);
+            keep.add(loader.loadClass("Plugin"));
+        }
+    }
+
+    static void direct() {
+        while (true) {
+            // Buffer 1 MB nằm ngoài heap, trong bộ nhớ native.
+            keep.add(ByteBuffer.allocateDirect(1024 * 1024));
+        }
+    }
+
+    static final class PluginLoader extends ClassLoader {
+        private final byte[] bytes;
+
+        PluginLoader(byte[] bytes) {
+            super(null); // cha là bootstrap, nên Plugin không được tìm thấy ở cha
+            this.bytes = bytes;
+        }
+
+        @Override
+        protected Class<?> findClass(String name) throws ClassNotFoundException {
+            if (name.equals("Plugin")) {
+                return defineClass(name, bytes, 0, bytes.length);
+            }
+            throw new ClassNotFoundException(name);
+        }
+    }
+}
+EOF
+javac -d out src/*.java && ls out
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+OomLab$PluginLoader.class
+OomLab.class
+Plugin.class
+```
+
+</Expected>
+
+### 3. Ba class loader
+
+<Terminal where="mac">
+
+```bash
+java -cp out OomLab loaders
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+String     -> null
+java.sql   -> jdk.internal.loader.ClassLoaders$PlatformClassLoader@58644d46
+OomLab     -> jdk.internal.loader.ClassLoaders$AppClassLoader@7a8c5397
+parent     -> jdk.internal.loader.ClassLoaders$PlatformClassLoader@58644d46
+```
+
+</Expected>
+
+`String` do bootstrap loader nạp, và bootstrap không có object Java nào đại diện nên in ra `null`. Cha của application loader chính là platform loader: cùng mã băm `@58644d46` ở dòng 2 và dòng 4. Mã băm trên máy bạn sẽ khác.
+
+### 4. Xem JVM nạp lớp với -Xlog:class+load
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/mem
+java -Xlog:class+load -cp out OomLab plugin > classload.txt
+wc -l < classload.txt
+grep -c 'shared objects file' classload.txt
+grep -v -e 'shared objects file' -e 'jrt:/' classload.txt | sed "s|$HOME|~|"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+     423
+418
+[0.016s][info][class,load] OomLab source: file:~/masteva-j18/mem/out/
+[0.016s][info][class,load] Plugin source: file:~/masteva-j18/mem/out/
+pricing-plugin v1
+```
+
+</Expected>
+
+Để in ra `pricing-plugin v1`, JVM nạp khoảng 420 lớp. Gần như tất cả lấy từ `shared objects file`, tức archive CDS đi kèm JDK. Chỉ `OomLab` và `Plugin` đến từ thư mục `out` của bạn. Lệnh `sed` chỉ đổi đường dẫn home thành `~` cho gọn.
+
+<Predict question="Chạy lại với -Xshare:off (tắt CDS). Bao nhiêu lớp sẽ được đọc từ jrt:/, tức file modules của JDK?">
+
+<Terminal where="mac">
+
+```bash
+java -Xshare:off -Xlog:class+load -cp out OomLab plugin | grep -c 'jrt:/'
+```
+
+</Terminal>
+
+```text
+435
+```
+
+Không còn archive, JVM phải đọc và parse từng lớp của JDK từ file `modules`. Đó là phần việc CDS, và sau này AOT cache, làm sẵn từ trước để khởi động nhanh hơn.
+
+</Predict>
+
+
+### 5. Lazy loading và NoClassDefFoundError
+
+Giả lập lỗi đóng gói: file `Plugin.class` không có mặt lúc chạy.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/mem
+mv out/Plugin.class out/Plugin.class.bak
+java -cp out OomLab loaders | head -1
+java -cp out OomLab plugin
+mv out/Plugin.class.bak out/Plugin.class
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+String     -> null
+Exception in thread "main" java.lang.NoClassDefFoundError: Plugin
+	at OomLab.main(OomLab.java:14)
+Caused by: java.lang.ClassNotFoundException: Plugin
+	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:580)
+	at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:490)
+	... 1 more
+```
+
+</Expected>
+
+Chế độ `loaders` vẫn chạy bình thường dù `OomLab` có tham chiếu tới `Plugin`: JVM chưa cần `Plugin` nên chưa nạp. Chỉ khi nhánh `plugin` chạy tới `new Plugin()`, JVM mới đi tìm và thất bại. Lỗi bên ngoài là `NoClassDefFoundError` (lớp có lúc biên dịch), nguyên nhân bên trong là `ClassNotFoundException` của loader. Trên production, đó là lý do một service khởi động khoẻ mạnh rồi mới gãy khi request đầu tiên đi vào một nhánh code hiếm dùng.
+
+### 6. Bốn loại lỗi bộ nhớ
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/mem
+java -Xmx64m -cp out OomLab heap
+java -XX:MaxMetaspaceSize=32m -cp out OomLab meta
+java -XX:MaxDirectMemorySize=64m -cp out OomLab direct
+java -cp out OomLab stack
+java -Xss256k -cp out OomLab stack
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+java.lang.OutOfMemoryError: Java heap space (đã giữ 31 phần tử)
+java.lang.OutOfMemoryError: Metaspace (đã giữ 5391 phần tử)
+java.lang.OutOfMemoryError: Cannot reserve 1048576 bytes of direct buffer memory (allocated: 67108864, limit: 67108864) (đã giữ 64 phần tử)
+StackOverflowError ở độ sâu 43963
+StackOverflowError ở độ sâu 1478
+```
+
+</Expected>
+
+| Lỗi | Vùng | Sửa ở đâu |
+|---|---|---|
+| `Java heap space` | Heap | Tìm cái gì giữ object (bài J18.3), sau đó mới tính tăng `-Xmx` |
+| `Metaspace` | Metaspace | Tìm nơi tạo class loader hay lớp động liên tục (proxy, script engine, redeploy) |
+| `Cannot reserve ... direct buffer memory` | Direct buffer | Kiểm tra buffer có được trả lại không, đặt `-XX:MaxDirectMemorySize` có chủ đích |
+| `StackOverflowError` | Stack của một thread | Gần như luôn là đệ quy không dừng; tăng `-Xss` chỉ hợp với đệ quy sâu có chủ đích |
+
+Độ sâu stack thay đổi một chút giữa các lần chạy, vì JIT biên dịch `recurse` ở thời điểm khác nhau và frame đã biên dịch có kích thước khác frame thông dịch. Với `-Xss256k`, stack nhỏ hơn 8 lần nhưng độ sâu giảm khoảng 30 lần: stack tràn sau khoảng 1.500 lời gọi, trước khi JIT kịp biên dịch `recurse`, nên mọi frame là frame thông dịch, lớn hơn frame đã biên dịch. Chạy thêm `java -Xint -cp out OomLab stack` và `java -Xint -Xss256k -cp out OomLab stack` để so trên cùng loại frame: máy kiểm chứng được 20593 và 1478, vẫn chênh khoảng 14 lần chứ không phải 8, vì mỗi stack dành sẵn khoảng 110 KB cố định cho vùng bảo vệ (guard zone) mà JVM dùng để phát hiện tràn stack.
+
+<Predict question="Heap 64 MB, mỗi phần tử 1 MB. Vì sao chỉ giữ được 31 phần tử chứ không phải khoảng 60?">
+
+G1 chia heap 64 MB thành region 1 MB. Object lớn hơn hoặc bằng nửa region là **humongous object** và được cấp nguyên các region liền nhau. Mảng `byte[1048576]` cộng header lớn hơn 1 MB một chút, nên chiếm trọn 2 region: 31 phần tử là khoảng 62 MB. Thử `java -Xmx64m -XX:+UseParallelGC -cp out OomLab heap`, máy kiểm chứng giữ được 56 phần tử. Trên production, nhiều mảng lớn cỡ region (buffer, cache dạng mảng) làm G1 tốn heap hơn bạn tính; `-Xlog:gc` sẽ ghi `G1 Humongous Allocation`.
+
+</Predict>
+
+<Check id="j18.1.lab-oom-kinds">Tự tái hiện được bốn loại lỗi bộ nhớ và nói được mỗi loại phải sửa ở đâu.</Check>
+
+### 7. Workload để so sánh GC
+
+`GcLoad` giả lập một service giữ 150.000 phiên đăng nhập trong bộ nhớ. Mỗi request tạo một phiên mới, 0,5 tới 1,3 KB, thay cho phiên cũ nhất. Lượng object sống luôn khoảng 130 MB, còn tổng lượng cấp phát là hàng chục GB.
+
+<Terminal where="mac" title="Tạo GcLoad.java và pauses.awk">
+
+```bash
+cd ~/masteva-j18/mem
+cat > src/GcLoad.java <<'EOF'
+public class GcLoad {
+    public static void main(String[] args) {
+        int live = args.length > 0 ? Integer.parseInt(args[0]) : 150_000; // số phiên đang hoạt động
+        long requests = 30_000_000; // tổng số request giả lập
+        byte[][] sessions = new byte[live][];
+        long start = System.nanoTime();
+        long checksum = 0;
+        for (long i = 0; i < requests; i++) {
+            // Mỗi request tạo một phiên mới (0,5 tới 1,3 KB) thay cho một phiên cũ.
+            byte[] session = new byte[512 + (int) (i % 7) * 128];
+            session[0] = (byte) i;
+            sessions[(int) (i % live)] = session;
+            checksum += sessions[(int) ((i * 31) % live)] == null ? 0 : 1;
+        }
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("requests=" + requests + " time=" + ms + "ms checksum=" + checksum);
+    }
+}
+EOF
+cat > pauses.awk <<'EOF'
+# Cộng mọi dòng "Pause ... <số>ms" trong GC log của G1 hoặc ZGC.
+/Pause.* [0-9.]+ms$/ { v = $NF; sub("ms", "", v); n++; total += v; if (v + 0 > max) max = v + 0 }
+END { printf "%s: pauses=%d total=%.1fms max=%.3fms\n", FILENAME, n, total, max }
+EOF
+javac -d out src/GcLoad.java
+```
+
+</Terminal>
+
+### 8. Bộ nhớ thật của process, đo bằng NMT
+
+Chạy `GcLoad` với NMT, rồi hỏi nó bằng `jcmd` khi đang chạy. `$!` là PID của lệnh vừa chạy nền.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/mem
+java -XX:NativeMemoryTracking=summary -Xmx512m -cp out GcLoad & sleep 1; jcmd $! VM.native_memory summary scale=MB | grep -E '^Total|^- +(Java Heap|Class|Thread|Code|GC) '; wait
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Total: reserved=1979MB, committed=599MB
+-                 Java Heap (reserved=512MB, committed=512MB)
+-                     Class (reserved=1024MB, committed=0MB)
+-                    Thread (reserved=54MB, committed=0MB)
+-                      Code (reserved=244MB, committed=7MB)
+-                        GC (reserved=61MB, committed=61MB)
+requests=30000000 time=4627ms checksum=29925015
+```
+
+</Expected>
+
+- **reserved** là vùng địa chỉ JVM giữ chỗ; **committed** là bộ nhớ đã thật sự cấp. Con số cần so với giới hạn container là committed.
+- Heap 512 MB nhưng tổng committed là 599 MB. Riêng GC đã dùng 61 MB cho cấu trúc nội bộ. Service thật có thêm hàng nghìn lớp trong metaspace và hàng trăm thread, phần chênh còn lớn hơn.
+- NMT tốn thêm một ít CPU và bộ nhớ; bật khi cần điều tra, hoặc ở mức `summary` trên một instance.
+
+<Check id="j18.1.lab-nmt">Đo được bộ nhớ committed của một process bằng NMT và giải thích vì sao nó lớn hơn `-Xmx`.</Check>
+
+### 9. G1 và ZGC trên cùng workload
+
+Bật GC log đầy đủ bằng `-Xlog:gc*`, ghi ra file. Đặt cờ trong dấu nháy, vì zsh coi `*` là ký tự đại diện tên file.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/mem
+java -Xmx512m -XX:+UseG1GC '-Xlog:gc*:file=g1.log' -cp out GcLoad
+java -Xmx512m -XX:+UseZGC '-Xlog:gc*:file=zgc.log' -cp out GcLoad
+awk -f pauses.awk g1.log; awk -f pauses.awk zgc.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+requests=30000000 time=4680ms checksum=29925015
+requests=30000000 time=3179ms checksum=29925015
+g1.log: pauses=839 total=1953.2ms max=19.717ms
+zgc.log: pauses=514 total=3.1ms max=0.028ms
+```
+
+</Expected>
+
+Xem vài dòng log để biết mỗi GC ghi gì:
+
+<Terminal where="mac">
+
+```bash
+grep -m2 -E 'Pause Young .*ms$' g1.log; grep -m3 -E 'Pause .*ms$' zgc.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[0.034s][info][gc          ] GC(0) Pause Young (Normal) (G1 Evacuation Pause) 49M->50M(258M) 6.213ms
+[0.052s][info][gc          ] GC(1) Pause Young (Normal) (G1 Evacuation Pause) 118M->120M(258M) 8.233ms
+[0.043s][info][gc,phases   ] GC(0) Y: Pause Mark Start (Major) 0.010ms
+[0.045s][info][gc,phases   ] GC(0) Y: Pause Mark End 0.006ms
+[0.046s][info][gc,phases   ] GC(0) Y: Pause Relocate Start 0.002ms
+```
+
+</Expected>
+
+- Dòng G1 đọc là: young GC số 0, heap từ 49 MB lên 50 MB trên tổng 258 MB, pause 6,2 ms. Heap không giảm vì phần lớn phiên vẫn còn sống.
+- ZGC chỉ dừng ứng dụng ở ba điểm ngắn mỗi chu kỳ (Mark Start, Mark End, Relocate Start); đánh dấu và di chuyển object chạy song song.
+- Trên workload này, G1 dừng ứng dụng tổng cộng khoảng 2 giây, max 20 ms; ZGC tổng cộng khoảng 3 ms. Lý do: lượng phiên sống (khoảng 130 MB) và tốc độ cấp phát cao làm 512 MB trở nên chật với G1. Log có khoảng 100 lần `Evacuation Failure` (young GC không còn chỗ trống để chép object sống sang) và khoảng 50 lần `Pause Full (G1 Compaction Pause)`, tức Full GC dọn và nén toàn bộ heap, ngoài các dòng `Pause Young (Mixed)`. Đếm bằng `grep -c 'Pause Full (G1 Compaction Pause) .*ms$' g1.log`. Thử `-Xmx1g`: không còn Full GC, tổng pause của G1 giảm xuống khoảng 1,2 giây.
+
+Đừng rút ra "ZGC luôn nhanh hơn". Chạy lại với `GcLoad 10000` (lượng object sống nhỏ): trên máy kiểm chứng, hai GC có thời gian gần bằng nhau và G1 chỉ còn khoảng 150 ms pause trong cả lượt chạy. Kết quả phụ thuộc workload.
+
+<Predict question="Giữ ZGC nhưng giảm heap xuống 256 MB, gần sát lượng object sống. Pause của ZGC có tăng không? Request có chậm hơn không?">
+
+<Terminal where="mac">
+
+```bash
+java -Xmx256m -XX:+UseZGC '-Xlog:gc*:file=zgc-256m.log' -cp out GcLoad
+awk -f pauses.awk zgc-256m.log
+grep -c 'Allocation Stall (' zgc-256m.log; grep -m1 'Allocation Stall (' zgc-256m.log
+```
+
+</Terminal>
+
+```text
+requests=30000000 time=7491ms checksum=29925015
+zgc-256m.log: pauses=5163 total=22.3ms max=0.224ms
+498
+[0.071s][info][gc          ] Allocation Stall (main) 0.663ms
+```
+
+Pause vẫn dưới 0,3 ms, nhưng thời gian chạy tăng từ khoảng 3,2 giây lên 7,5 giây. Thread `main` bị **allocation stall** 498 lần: nó muốn cấp phát nhưng heap đã hết, phải đứng chờ ZGC dọn xong. Stall không phải pause nên không có trong thống kê pause. Với ZGC, theo dõi cả dòng `Allocation Stall`, và cho ZGC heap dư rộng hơn G1.
+
+</Predict>
+
+<Check id="j18.1.lab-gc-compare">Chạy được cùng workload với G1 và ZGC, đọc GC log, so sánh tổng pause, pause lớn nhất và allocation stall.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `zsh: no matches found: -Xlog:gc*:file=g1.log`: zsh hiểu `*` là ký tự đại diện. Đặt cả cờ trong dấu nháy đơn như trong bài.
+- `Native memory tracking is not enabled`: process không được khởi động với `-XX:NativeMemoryTracking=summary`. NMT phải bật từ lúc khởi động, không bật thêm bằng `jcmd` được.
+- `jcmd` báo `Could not find any processes` hoặc không thấy PID: `GcLoad` đã chạy xong trước khi `jcmd` kịp hỏi. Máy nhanh hơn thì bỏ `sleep 1` hoặc đổi thành `sleep 0.5`.
+- `OomLab meta` báo `NullPointerException` thay vì OOM: bạn chạy bằng `java src/OomLab.java`, nên không có file `Plugin.class` để đọc. Chạy từ thư mục `out` như trong bài.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá các file log của bài. Giữ lại `src` và `out`, bài J18.3 nhắc lại `OomLab`.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-j18/mem && rm -f g1.log zgc.log zgc-256m.log classload.txt
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao MaxMetaspaceSize mặc định không giới hạn lại nguy hiểm trong container?">
+
+Metaspace nằm trong native memory. Không có giới hạn, một rò rỉ class loader không làm JVM ném `OutOfMemoryError: Metaspace` để bạn thấy stack trace; nó làm process phình dần cho tới khi kernel kill container với exit code 137, không để lại dấu vết trong log Java. Đặt `-XX:MaxMetaspaceSize` cao hơn mức dùng bình thường vài lần (đo bằng NMT, dòng `Class`) biến sự cố âm thầm thành lỗi rõ ràng.
+
+</Reveal>
+
+<Reveal title="Hai lớp cùng tên Plugin, do hai loader khác nhau nạp, có gán cho nhau được không?">
+
+Không. Lớp được xác định bởi cặp (tên, loader định nghĩa). Ép object `Plugin` của loader A sang `Plugin` của loader B ném `ClassCastException`; với `Class.cast`, thông điệp là `Cannot cast Plugin to Plugin`, nhìn rất khó hiểu nếu bạn không biết về loader. Lỗi này hay gặp ở app server, plugin system, hoặc khi Spring Boot DevTools nạp lại code của bạn bằng một loader riêng.
+
+</Reveal>
+
+<Reveal title="ZGC pause rất nhỏ, vậy sao không dùng ZGC cho mọi service?">
+
+ZGC làm việc song song với ứng dụng, nên nó lấy CPU của ứng dụng: khi máy đã chạy gần 100% CPU, các thread GC và thread ứng dụng tranh nhau, và GC chậm lại dẫn tới allocation stall. ZGC cũng cần heap dư để kịp dọn trước khi heap đầy. G1 với pause vài ms đã đủ cho phần lớn API có SLO hàng trăm ms. Chọn ZGC khi số đo cho thấy pause G1 là nguyên nhân vượt SLO, và bạn có CPU, bộ nhớ để trả cho nó.
+
+</Reveal>
+
+<Reveal title="Vì sao service hay tạo proxy hoặc lambda vẫn không rò metaspace?">
+
+Lớp sinh động như lambda (hidden class) và proxy được nạp vào metaspace, nhưng chúng được thu hồi khi loader của chúng không còn được tham chiếu, và GC thực hiện **class unloading**. Rò rỉ chỉ xảy ra khi có thứ còn giữ loader: một static field, một thread còn chạy, một `ThreadLocal`. Bước 6 cố ý giữ mọi `Class` trong `keep`, nên không lớp nào được thu hồi.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một GC log lạ, hoặc viết lệnh `awk` tổng hợp log như `pauses.awk`. AI hay đưa cờ cũ: `-XX:+UseConcMarkSweepGC` (đã xoá), `-XX:+PrintGCDetails` (thay bằng `-Xlog:gc*` từ JDK 9), `-XX:-ZGenerational` (bỏ từ JDK 24). Kiểm tra mọi cờ bằng `java <cờ> -version` trước khi đưa vào production. Trên JDK 25, cờ đã xoá làm JVM không khởi động (`Unrecognized VM option`), còn cờ đã bỏ chỉ in cảnh báo `Ignoring option ZGenerational` hoặc `is deprecated`, rất dễ lọt qua nếu không đọc log khởi động.
+
+</Callout>
+
+<Callout kind="link">
+
+Chặng J17 (JVM trong container) đặt heap theo giới hạn container bằng `-XX:MaxRAMPercentage`; bài D1.1 giải thích exit code 137. J15 đưa số đo JVM, gồm GC pause, lên dashboard qua Micrometer. J18.2 đi tiếp vào code cache và JIT. J18.3 bắt rò rỉ heap thật bằng JFR, class histogram và heap dump.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j18.1.mastery-oom-diagnosis">Nhìn một thông điệp `OutOfMemoryError` hoặc `StackOverflowError`, nói được vùng nhớ nào đầy và bước điều tra đầu tiên.</Check>
+
+<Check id="j18.1.mastery-gc-decision">Đọc được GC log của G1 và ZGC, và đề xuất giữ hay đổi GC dựa trên số đo pause, allocation stall và lượng object sống.</Check>
+
+</Mastery>

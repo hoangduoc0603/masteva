@@ -1,0 +1,581 @@
+---
+title: Metric với Micrometer và tracing với OpenTelemetry
+description: Đếm và đo thời gian bằng Micrometer, đọc metric qua /actuator/metrics và /actuator/prometheus mà không làm bùng nổ cardinality; bật tracing OpenTelemetry, gửi span sang Jaeger và đi từ trace id trong log tới trace của request.
+id: j15.2
+step: j15
+prerequisites: [j15.1]
+topics: [j15.micrometer-metric, j15.opentelemetry-tracing]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    curl: 8.4.0
+    docker: 29.8.0
+    jaeger: 2.21.0
+---
+
+<Goal>
+
+Thêm hai tín hiệu còn lại vào service đơn hàng: metric để biết hệ thống đang khoẻ hay ốm, và trace để biết một request chậm ở bước nào. Học xong bài này, bạn giải thích được:
+
+- Vì sao thêm tag `userId` vào một counter có thể làm Prometheus hết bộ nhớ.
+- Vì sao không lấy trung bình p99 của 5 instance để ra p99 của cả service.
+- Một request đi qua hai endpoint, mỗi bên ghi log riêng: làm sao biết hai dòng log đó thuộc cùng một request, và bước nào chiếm nhiều thời gian nhất.
+
+</Goal>
+
+<Knowledge>
+
+### Ba tín hiệu: log, metric, trace
+
+| Tín hiệu | Trả lời câu hỏi | Chi phí | Ví dụ |
+|---|---|---|---|
+| Log (J15.1) | Chuyện gì đã xảy ra với **một** request cụ thể? | Tăng theo số request | `order found id=42` |
+| Metric | Hệ thống **tổng thể** đang thế nào? | Gần như cố định, theo số chuỗi số liệu | 31 đơn mỗi phút, p95 là 150 ms |
+| Trace | Request này đi qua đâu, **chậm ở bước nào**? | Tăng theo số request được lấy mẫu | `POST /orders` 150 ms, trong đó gọi kho 107 ms |
+
+Cách dùng thường gặp: metric báo động (tỉ lệ lỗi tăng), trace chỉ ra bước có vấn đề, log cho chi tiết của bước đó. Ba tín hiệu nối với nhau qua trace id.
+
+### Micrometer: SLF4J của metric
+
+**Micrometer** là facade cho metric, giống vai trò của SLF4J với log: code ghi số liệu vào một `MeterRegistry`, còn registry cụ thể quyết định xuất đi đâu và định dạng gì.
+
+```text
+code: counter.increment(), timer.record(...)
+        |
+        v
+MeterRegistry (Micrometer)  -- Spring Boot tự thêm metric JVM, HTTP, Tomcat, connection pool
+        |
+        +--> PrometheusMeterRegistry --> GET /actuator/prometheus  <-- Prometheus kéo về (pull) mỗi 15-30 s
+        |
+        +--> OtlpMeterRegistry -------> đẩy (push) tới OTel Collector     (lab tắt nhánh này)
+```
+
+| Loại meter | Đo cái gì | Ví dụ |
+|---|---|---|
+| `Counter` | Số lần, chỉ tăng | Số đơn đã đặt, số lần thanh toán lỗi |
+| `Gauge` | Giá trị tại một thời điểm, lên xuống được | Số phần tử trong hàng đợi, số kết nối đang mở |
+| `Timer` | Số lần và thời gian của một việc, kèm max và percentile | Thời gian gọi dịch vụ kho |
+| `DistributionSummary` | Như `Timer` nhưng cho đại lượng không phải thời gian | Kích thước body, số món trong một đơn |
+| `LongTaskTimer` | Việc đang chạy dài bao lâu, đang có mấy việc | Job xuất báo cáo đang chạy |
+
+Counter chỉ tăng, kể cả khi bạn muốn biết "mỗi phút bao nhiêu": Prometheus tính tốc độ bằng `rate()` từ counter, và tự xử lý chuyện counter về 0 khi ứng dụng khởi động lại. Đừng tự tính tốc độ trong ứng dụng.
+
+<Check id="j15.2.meter-types">Chọn được loại meter đúng cho: số đơn bị từ chối, độ dài hàng đợi email, thời gian gọi cổng thanh toán, số món trong một đơn.</Check>
+
+### Tag và cardinality
+
+Mỗi tổ hợp giá trị tag khác nhau là một **chuỗi số liệu** (time series) riêng mà hệ thống giám sát phải lưu. Số chuỗi gọi là **cardinality**.
+
+| Metric | Tag | Số chuỗi |
+|---|---|---|
+| `orders.placed` | `channel` (web, mobile, other) | 3 |
+| `orders.placed` | `channel`, `region` (5 vùng) | 15 |
+| `orders.placed` | `userId` (1 triệu khách) | 1.000.000, mỗi instance |
+
+Quy tắc: tag chỉ nhận giá trị trong một tập nhỏ, biết trước. Giá trị đến từ người dùng (kênh, mã nước, user agent) phải được chuẩn hoá về một danh sách cố định, giá trị lạ gom về `other`. Mã đơn, mã khách, email thuộc về log và trace, không thuộc về metric. Spring Boot tuân theo quy tắc này cho metric HTTP: tag `uri` là mẫu `/orders/{id}`, không phải `/orders/42`.
+
+<Callout kind="production">
+
+Một đội thêm tag `path` lấy nguyên đường dẫn request vào metric HTTP tự viết. Bot quét lỗ hổng gọi hàng trăm nghìn đường dẫn ngẫu nhiên trong một đêm; mỗi đường dẫn thành một chuỗi mới. Prometheus dùng hết bộ nhớ và khởi động lại liên tục, toàn bộ cảnh báo của công ty tắt theo. Sửa bằng cách dùng mẫu route làm tag, và đặt giới hạn số chuỗi bằng `MeterFilter` hoặc `sample_limit` phía Prometheus.
+
+</Callout>
+
+<Check id="j15.2.cardinality">Tính được số chuỗi số liệu của một metric từ số giá trị của từng tag, và giải thích được vì sao mã khách không được làm tag.</Check>
+
+### Percentile và histogram
+
+Trung bình che mất request chậm: 99 request 50 ms và 1 request 5 giây có trung bình 99,5 ms. **Percentile** p95 là giá trị mà 95% request nhanh hơn. Micrometer có hai cách:
+
+| Cách | Cấu hình | Ưu điểm | Nhược điểm |
+|---|---|---|---|
+| Percentile tính sẵn ở client | `publishPercentiles(0.5, 0.95, 0.99)` | Đọc ngay, không cần truy vấn | Mỗi instance tính riêng; **không gộp được** giữa các instance |
+| Histogram | `publishPercentileHistogram()` | Prometheus gộp bucket của mọi instance rồi tính bằng `histogram_quantile` (D12) | Thêm vài chục chuỗi cho mỗi tổ hợp tag |
+
+Lấy trung bình p99 của 5 instance không cho ra p99 của service: phép toán đó không có ý nghĩa thống kê. Service chạy nhiều instance thì dùng histogram. Lab dùng percentile ở client vì chỉ có một instance và kết quả đọc được ngay.
+
+### Distributed tracing
+
+Một **trace** là toàn bộ hành trình của một request. Nó gồm nhiều **span**, mỗi span là một đoạn việc có tên, thời điểm bắt đầu, thời lượng và span cha. Trong lab, `POST /orders` gọi `GET /inventory/{sku}` qua HTTP thật, dù hai endpoint nằm chung một ứng dụng:
+
+```text
+trace fd13...25b6
+|
++-- span A  "http post /orders"            server, 150 ms     (span gốc, không có cha)
+     |
+     +-- span B  "http get"                 client, 107 ms     (RestClient gọi đi, cha là A)
+          |
+          |   header:  traceparent: 00-fd13...25b6-7379de2c4b25ef28-03
+          |                            trace id    span id của B    cờ
+          v
+          +-- span C  "http get /inventory/{sku}"  server, 74 ms   (cha là B)
+```
+
+Ngữ cảnh đi qua mạng nhờ header **`traceparent`** theo chuẩn W3C Trace Context: phiên bản `00`, trace id 32 ký tự hex, span id của bên gọi 16 ký tự hex, và cờ. Bit `01` của cờ nghĩa là trace này được lấy mẫu; bit `02` (Trace Context Level 2) báo trace id được sinh ngẫu nhiên.
+
+Spring Boot nối các mảnh như sau: Spring MVC và `RestClient` tạo **observation** (Micrometer Observation API); Micrometer Tracing biến observation thành span của **OpenTelemetry**; exporter gửi span qua **OTLP** (OpenTelemetry Protocol) tới một backend như Jaeger. Starter `spring-boot-starter-opentelemetry` mang theo cả chuỗi này. Trace id và span id được đặt vào MDC, nên mỗi dòng log có thêm `[traceId-spanId]`.
+
+| Cấu hình | Mặc định | Lab đặt |
+|---|---|---|
+| `management.tracing.sampling.probability` | `0.1`, tức chỉ 10% trace được giữ | `1.0` để thấy mọi request |
+| `management.opentelemetry.tracing.export.otlp.endpoint` | không đặt | `http://localhost:20152/v1/traces` |
+
+<Callout kind="pitfall">
+
+Trace chỉ truyền qua HTTP khi client được tạo từ **builder do Spring Boot cấu hình**: `RestClient.Builder`, `WebClient.Builder`, `RestTemplateBuilder` được inject. `RestClient.create()` hay `new RestTemplate()` không có observation, nên service bên kia bắt đầu một trace mới và chuỗi bị đứt. Trong Spring Boot 4, `RestClient.Builder` nằm ở module riêng: thiếu `spring-boot-starter-restclient` thì ứng dụng không khởi động, báo `required a bean of type 'org.springframework.web.client.RestClient$Builder'`.
+
+</Callout>
+
+<Check id="j15.2.trace-model">Giải thích được trace, span, span cha, và đọc được từng phần của một header `traceparent`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Concepts (Micrometer)](https://docs.micrometer.io/micrometer/reference/concepts.html): đọc các mục Counters, Timers và "Histograms and percentiles" để hiểu vì sao percentile ở client không gộp được.
+- [Metrics (Spring Boot)](https://docs.spring.io/spring-boot/reference/actuator/metrics.html): danh sách metric có sẵn (JVM, HTTP, Tomcat, connection pool) và cấu hình `management.metrics.distribution.*` cho cả ứng dụng.
+- [Traces (OpenTelemetry)](https://opentelemetry.io/docs/concepts/signals/traces/): trace, span, span context, span kind và context propagation.
+- [Tracing (Spring Boot)](https://docs.spring.io/spring-boot/reference/actuator/tracing.html): lấy mẫu, mẫu correlation id trong log, phần "Propagating Traces" và cách tạo span riêng bằng `Observation`.
+- [Trace Context (W3C)](https://www.w3.org/TR/trace-context/): định dạng chính xác của `traceparent` và `tracestate`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm J15.1, có `~/masteva-j15/orders`. Docker đang chạy như ở J8 (`docker version` in được phần `Server`). Bài dùng ba cổng: **20150** cho ứng dụng, **20151** cho giao diện Jaeger, **20152** cho cổng nhận OTLP của Jaeger. Hai tab Terminal như J15.1, mỗi tab đã `export JAVA_HOME=$(/usr/libexec/java_home -v 25)`. Máy cần mạng để tải dependency và image Jaeger (khoảng 55 MB).
+
+### 1. Thêm dependency
+
+Lấy lại `pom.xml` từ start.spring.io với bộ dependency mới, thay cho việc sửa tay:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j15/orders
+curl -s https://start.spring.io/pom.xml \
+  -d type=maven-project -d language=java -d bootVersion=4.1.1 -d javaVersion=25 \
+  -d groupId=dev.masteva -d artifactId=orders -d packageName=dev.masteva.orders \
+  -d dependencies=web,actuator,prometheus,opentelemetry,spring-restclient -o pom.xml
+grep -E "<artifactId>(spring-boot-starter-[a-z]+|micrometer-registry-prometheus)</artifactId>" pom.xml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+		<artifactId>spring-boot-starter-parent</artifactId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+			<artifactId>spring-boot-starter-opentelemetry</artifactId>
+			<artifactId>spring-boot-starter-restclient</artifactId>
+			<artifactId>spring-boot-starter-webmvc</artifactId>
+			<artifactId>micrometer-registry-prometheus</artifactId>
+```
+
+</Expected>
+
+`micrometer-registry-prometheus` thêm endpoint `/actuator/prometheus`. `spring-boot-starter-opentelemetry` mang Micrometer Tracing, OpenTelemetry SDK và exporter OTLP. `spring-boot-starter-restclient` cung cấp `RestClient.Builder` đã gắn observation.
+
+### 2. Endpoint kho, đơn hàng có metric
+
+<Terminal where="mac" title="Sửa cấu hình, tạo InventoryController, viết lại OrderController">
+
+```bash
+cd ~/masteva-j15/orders
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=orders
+server.port=20150
+logging.level.dev.masteva.orders=INFO
+logging.pattern.level=%5p [%X{requestId:-}]
+management.endpoints.web.exposure.include=health,loggers,metrics,prometheus
+inventory.base-url=http://localhost:20150
+management.tracing.sampling.probability=1.0
+management.opentelemetry.tracing.export.otlp.endpoint=http://localhost:20152/v1/traces
+management.otlp.metrics.export.enabled=false
+EOF
+cat > src/main/java/dev/masteva/orders/InventoryController.java <<'EOF'
+package dev.masteva.orders;
+
+import java.util.concurrent.ThreadLocalRandom;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class InventoryController {
+    private static final Logger log = LoggerFactory.getLogger(InventoryController.class);
+
+    public record Stock(String sku, int available) {}
+
+    @GetMapping("/inventory/{sku}")
+    Stock check(@PathVariable String sku,
+                @RequestHeader(name = "traceparent", required = false) String traceparent)
+            throws InterruptedException {
+        Thread.sleep(ThreadLocalRandom.current().nextInt(20, 150));
+        log.info("stock checked sku={} traceparent={}", sku, traceparent);
+        return new Stock(sku, sku.startsWith("BOOK") ? 5 : 0);
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/orders/OrderController.java <<'EOF'
+package dev.masteva.orders;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.client.RestClient;
+
+@RestController
+public class OrderController {
+    private static final Logger log = LoggerFactory.getLogger(OrderController.class);
+    private static final Set<String> CHANNELS = Set.of("web", "mobile");
+
+    record Order(long id, String sku, int quantity) {}
+    record NewOrder(String sku, int quantity, String channel) {}
+
+    private final RestClient inventory;
+    private final MeterRegistry registry;
+    private final Timer inventoryLookup;
+
+    OrderController(RestClient.Builder builder, MeterRegistry registry,
+                    @Value("${inventory.base-url}") String inventoryUrl) {
+        this.inventory = builder.baseUrl(inventoryUrl).build();
+        this.registry = registry;
+        this.inventoryLookup = Timer.builder("inventory.lookup")
+                .description("Time spent asking inventory for stock")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry);
+    }
+
+    @GetMapping("/orders/{id}")
+    ResponseEntity<Order> find(@PathVariable long id) {
+        log.debug("looking up order id={}", id);
+        if (id <= 0) {
+            log.warn("rejected order id={}", id);
+            return ResponseEntity.badRequest().build();
+        }
+        Order order = new Order(id, "BOOK-" + id, 2);
+        log.atInfo().addKeyValue("orderId", id).addKeyValue("sku", order.sku())
+                .log("order found id={} sku={}", id, order.sku());
+        return ResponseEntity.ok(order);
+    }
+
+    @PostMapping("/orders")
+    ResponseEntity<Order> create(@RequestBody NewOrder request) {
+        InventoryController.Stock stock = inventoryLookup.record(() -> inventory.get()
+                .uri("/inventory/{sku}", request.sku())
+                .retrieve()
+                .body(InventoryController.Stock.class));
+        String channel = CHANNELS.contains(request.channel()) ? request.channel() : "other";
+        if (stock == null || stock.available() < request.quantity()) {
+            registry.counter("orders.rejected", "reason", "out_of_stock").increment();
+            log.warn("out of stock sku={} wanted={}", request.sku(), request.quantity());
+            return ResponseEntity.status(HttpStatus.CONFLICT).build();
+        }
+        registry.counter("orders.placed", "channel", channel).increment();
+        Order order = new Order(ThreadLocalRandom.current().nextLong(1000, 10_000),
+                request.sku(), request.quantity());
+        log.info("order placed id={} sku={} channel={}", order.id(), order.sku(), channel);
+        return ResponseEntity.status(HttpStatus.CREATED).body(order);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `InventoryController` giả lập dịch vụ kho: chờ ngẫu nhiên 20 tới 150 ms, trả tồn kho 5 cho mã bắt đầu bằng `BOOK`, 0 cho mã khác. Nó in header `traceparent` nhận được để bạn thấy ngữ cảnh đi qua mạng.
+- `OrderController` dựng `RestClient` từ builder được inject, và gọi kho qua HTTP thật tới `inventory.base-url`. Trên thực tế đây là một service khác; đổi URL là đủ.
+- Timer `inventory.lookup` tạo một lần trong constructor. Counter lấy qua `registry.counter(tên, tag...)`: Micrometer trả lại đúng meter đã có nếu tên và tag trùng.
+- `channel` từ client được chuẩn hoá về `web`, `mobile` hoặc `other` trước khi làm tag.
+- `management.otlp.metrics.export.enabled=false` tắt nhánh đẩy metric qua OTLP mà starter OpenTelemetry bật sẵn; lab lấy metric qua Prometheus, còn Jaeger chỉ nhận trace.
+
+### 3. Chạy Jaeger
+
+Jaeger là backend lưu và hiển thị trace. Image `jaegertracing/jaeger` bản 2 gói mọi thành phần trong một container và nhận OTLP trực tiếp.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker run -d --name masteva-j15-jaeger -p 20151:16686 -p 20152:4318 jaegertracing/jaeger:2.21.0
+docker ps --filter name=masteva-j15 --format '{{.Names}} {{.Status}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+6eabfc113fa5bf933210651c4ec1c42409292420f6c237238a05a42ca14b4ae6
+masteva-j15-jaeger Up Less than a second
+```
+
+</Expected>
+
+Dòng đầu là mã container, khác trên máy bạn. Cổng 16686 của container là giao diện web, 4318 là cổng nhận OTLP qua HTTP; cả hai được ánh xạ ra cổng của lab.
+
+### 4. Chạy ứng dụng và đặt một đơn
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j15/orders && mvn -q package -DskipTests && java -jar target/orders-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -X POST localhost:20150/orders -H 'Content-Type: application/json' -H 'X-Request-Id: req-3001' \
+  -d '{"sku":"BOOK-1","quantity":2,"channel":"web"}'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":1037,"sku":"BOOK-1","quantity":2}
+```
+
+</Expected>
+
+Mã đơn là số ngẫu nhiên. Tab 1 in hai dòng mới (đã cắt bớt khoảng trắng):
+
+<Predict question="Hai dòng log của request này giống và khác nhau ở đâu?">
+
+```text
+2026-10-04T01:01:27.336+07:00  INFO [782c3243] 78400 --- [orders] [io-20150-exec-3] [fd13cd21b34e9e62f18ce33d76c325b6-a5a95a2a788d1a1e] dev.masteva.orders.InventoryController   : stock checked sku=BOOK-1 traceparent=00-fd13cd21b34e9e62f18ce33d76c325b6-7379de2c4b25ef28-03
+2026-10-04T01:01:27.352+07:00  INFO [req-3001] 78400 --- [orders] [io-20150-exec-2] [fd13cd21b34e9e62f18ce33d76c325b6-7173dab1eea10cb9] dev.masteva.orders.OrderController       : order placed id=1037 sku=BOOK-1 channel=web
+```
+
+**Giống:** cùng trace id `fd13...25b6`. Trace id đi theo request qua HTTP nhờ header `traceparent`, mà dòng của kho in ra nguyên văn.
+
+**Khác:** request id. Dòng của đơn mang `req-3001`, dòng của kho mang một mã tự sinh: `RestClient` không gửi header `X-Request-Id`, nên với `RequestIdFilter` đây là một request mới không có mã. Đây là lý do tracing tồn tại: không cần mỗi đội tự nhớ chuyền mã của mình qua mọi lời gọi.
+
+Span id cũng khác: `7173...0cb9` là span của `POST /orders`, `a5a9...1a1e` là span của `GET /inventory`. Giá trị `7379...ef28` trong `traceparent` là span thứ ba, span client của `RestClient`, cha của span kho.
+
+</Predict>
+
+<Check id="j15.2.lab-log-trace">Chỉ ra được trong log hai dòng cùng trace id nhưng khác request id, và giải thích vì sao.</Check>
+
+### 5. Xem trace trong Jaeger
+
+Mở `http://localhost:20151` trên trình duyệt, chọn service `orders`, bấm **Find Traces**, rồi mở trace `orders: http post /orders`. Bạn thấy ba thanh lồng nhau như sơ đồ ở phần Kiến thức. Cùng dữ liệu đó lấy được bằng API của Jaeger; thay giá trị `TRACE` bằng trace id trong log của bạn:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+TRACE=fd13cd21b34e9e62f18ce33d76c325b6
+curl -s localhost:20151/api/traces/$TRACE | grep -o '"operationName":"[^"]*"\|"duration":[0-9]*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+"operationName":"http get"
+"duration":106625
+"operationName":"http get /inventory/{sku}"
+"duration":74200
+"operationName":"http post /orders"
+"duration":150016
+```
+
+</Expected>
+
+`duration` tính bằng micro giây; con số và thứ tự các span trên máy bạn sẽ khác. Đọc từ trong ra: kho tự xử lý 74 ms, nhưng lời gọi từ phía đơn hàng mất 107 ms; 33 ms chênh lệch là mạng, tạo kết nối và chuyển đổi JSON. Cả request mất 150 ms. Trace cho câu trả lời "chậm ở đâu" mà log và metric không cho.
+
+<Check id="j15.2.lab-trace">Tìm được trace của một request trong Jaeger từ trace id trong log, và chỉ ra span nào chiếm nhiều thời gian nhất.</Check>
+
+### 6. Tạo tải và đọc metric
+
+Đặt 30 đơn, cứ đơn thứ ba từ kênh `mobile`; thêm một đơn từ kênh lạ và một đơn hết hàng:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for i in {1..30}; do
+  ch=$([ $((i % 3)) -eq 0 ] && echo mobile || echo web)
+  curl -s -o /dev/null -X POST localhost:20150/orders -H 'Content-Type: application/json' \
+    -d "{\"sku\":\"BOOK-$i\",\"quantity\":1,\"channel\":\"$ch\"}"
+done
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:20150/orders -H 'Content-Type: application/json' \
+  -d '{"sku":"BOOK-99","quantity":1,"channel":"tiktok"}'
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:20150/orders -H 'Content-Type: application/json' \
+  -d '{"sku":"PEN-1","quantity":1,"channel":"web"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+201
+409
+```
+
+</Expected>
+
+Hỏi Actuator về counter, rồi lọc theo một tag:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s localhost:20150/actuator/metrics/orders.placed; echo
+curl -s 'localhost:20150/actuator/metrics/orders.placed?tag=channel:mobile'; echo
+```
+
+</Terminal>
+
+<Predict question="Tag channel có những giá trị nào, và tổng là bao nhiêu?">
+
+```text
+{"availableTags":[{"tag":"channel","values":["mobile","web","other"]}],"measurements":[{"statistic":"COUNT","value":32.0}],"name":"orders.placed"}
+{"availableTags":[],"measurements":[{"statistic":"COUNT","value":10.0}],"name":"orders.placed"}
+```
+
+Ba giá trị: `web`, `mobile` và `other`; không có `tiktok`. Tổng 32: 30 đơn trong vòng lặp, đơn `tiktok` tính vào `other`, cộng đơn `req-3001` ở bước 4. Đơn `PEN-1` bị từ chối nên nằm ở `orders.rejected`. Thứ tự các giá trị trong `values` có thể khác.
+
+</Predict>
+
+Giờ xem đúng thứ Prometheus sẽ kéo về:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s localhost:20150/actuator/prometheus | grep -E '^(orders_|inventory_lookup)'
+curl -s localhost:20150/actuator/prometheus | grep -E '^http_server_requests_seconds_count.*(orders|inventory)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+inventory_lookup_seconds{quantile="0.5"} 0.095420416
+inventory_lookup_seconds{quantile="0.95"} 0.149946368
+inventory_lookup_seconds{quantile="0.99"} 0.158334976
+inventory_lookup_seconds_count 33
+inventory_lookup_seconds_sum 2.927456958
+inventory_lookup_seconds_max 0.154379584
+orders_placed_total{channel="mobile"} 10.0
+orders_placed_total{channel="other"} 1.0
+orders_placed_total{channel="web"} 21.0
+orders_rejected_total{reason="out_of_stock"} 1.0
+http_server_requests_seconds_count{error="none",exception="none",method="GET",outcome="SUCCESS",status="200",uri="/inventory/{sku}"} 33
+http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="CLIENT_ERROR",status="409",uri="/orders"} 1
+http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="201",uri="/orders"} 32
+```
+
+</Expected>
+
+Các con số thời gian khác trên máy bạn. Đọc kết quả:
+
+- Tên đổi theo quy ước Prometheus: dấu chấm thành gạch dưới, timer có đơn vị `_seconds`, counter có hậu tố `_total`.
+- `inventory_lookup_seconds{quantile=...}` là percentile tính sẵn trong ứng dụng, xấp xỉ theo bucket, nên p99 có thể lớn hơn `max` một chút; cả hai đều tính trên cửa sổ gần nhất (mặc định 2 phút).
+- Metric HTTP có sẵn, không viết dòng code nào. Tag `uri` là mẫu `/inventory/{sku}`: 33 mã hàng khác nhau vẫn chỉ là một chuỗi.
+
+<Check id="j15.2.lab-metrics">Đọc được counter có tag qua `/actuator/metrics` và `/actuator/prometheus`, giải thích được vì sao kênh `tiktok` không thành một giá trị tag riêng.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Ứng dụng không khởi động, báo `required a bean of type 'org.springframework.web.client.RestClient$Builder'`: `pom.xml` thiếu `spring-boot-starter-restclient`. Chạy lại bước 1.
+- Log không có phần `[traceId-spanId]`: `pom.xml` chưa có `spring-boot-starter-opentelemetry`, hoặc bạn chưa build lại sau bước 1.
+- Jaeger không có service `orders`: kiểm tra container còn chạy (`docker ps`), cổng trong `management.opentelemetry.tracing.export.otlp.endpoint` là 20152 và có `/v1/traces`. Span được gửi theo lô vài giây một lần; chờ 5 giây rồi tải lại.
+- `docker: ... port is already allocated`: cổng 20151 hoặc 20152 đang bị chiếm. Xem bằng `lsof -nP -iTCP:20151 -sTCP:LISTEN`.
+- Đặt tên counter là `orders.created`: Prometheus in ra `orders_total`, mất chữ `created`. Thư viện Prometheus dành hậu tố `_created` cho mốc thời gian tạo counter theo chuẩn OpenMetrics; tránh đặt tên metric kết thúc bằng `created`.
+
+</Callout>
+
+### Dọn dẹp
+
+Bấm **Ctrl+C** ở tab 1 để dừng ứng dụng.
+
+<Callout kind="danger">
+
+Lệnh dưới đây dừng và xoá container Jaeger, mọi trace trong đó mất theo (bản này lưu trace trong bộ nhớ). Image vẫn giữ lại để chạy lại nhanh.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker rm -f masteva-j15-jaeger
+```
+
+</Terminal>
+
+Giữ `~/masteva-j15/orders` cho J15.3. Cấu hình tracing vẫn còn; khi không có Jaeger, span bị bỏ đi mà ứng dụng vẫn chạy bình thường, chỉ thêm một dòng lỗi của exporter (xem phần Đào sâu).
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Lấy mẫu 10% thì request lỗi có trace không?">
+
+Có thể không. Mặc định Spring Boot quyết định lấy mẫu ở span đầu tiên (head-based sampling), trước khi biết request sẽ lỗi hay chậm. Với 10%, 9 trên 10 request lỗi không có trace. Có hai hướng. Tăng tỉ lệ lấy mẫu, trả giá bằng dung lượng lưu trữ. Hoặc lấy mẫu ở OpenTelemetry Collector sau khi trace đã xong (tail-based sampling): giữ mọi trace có lỗi hoặc chậm hơn ngưỡng, chỉ giữ một phần trace bình thường. Service vẫn phải gửi 100% span tới Collector, nhưng backend chỉ lưu phần đáng giữ. D12 dựng Collector.
+
+</Reveal>
+
+<Reveal title="Jaeger chết thì ứng dụng có sao không?">
+
+Không, và đó vừa là điểm tốt vừa là điểm nguy hiểm. Exporter gom span theo lô trong một hàng đợi có giới hạn và gửi ở thread riêng; gửi lỗi thì lô đó bị bỏ. Khi kiểm chứng bài này với Jaeger đã dừng, request vẫn trả `201` trong khoảng 0,4 giây. Log chỉ có một dòng `ERROR ... HttpExporter : Failed to export spans` kèm `ConnectException`, xuất hiện khoảng 10 giây sau khi ứng dụng khởi động; trong lần chạy khoảng 30 giây ở J15.3, đó là dòng lỗi duy nhất dù nhiều lô span đã bị bỏ. Một dòng lỗi giữa hàng nghìn dòng log rất dễ bị bỏ qua, nên bạn có thể mất trace nhiều ngày mà không ai biết. Cách phòng: gửi tới một Collector chạy cạnh ứng dụng (sidecar hoặc agent trên node) thay vì gửi thẳng tới backend xa, và cảnh báo trên metric của chính Collector khi nó nhận hoặc gửi được ít span bất thường.
+
+</Reveal>
+
+<Reveal title="Muốn biết hàm tính phí vận chuyển chiếm bao lâu trong trace thì làm sao?">
+
+Span HTTP và database có sẵn; đoạn code nghiệp vụ thì phải tự đánh dấu. Cách của Spring Boot là tạo một `Observation`: `Observation.createNotStarted("shipping.fee", observationRegistry).lowCardinalityKeyValue("carrier", "ghn").observe(() -> ...)`. Một observation sinh ra cả span trong trace lẫn timer `shipping.fee` trong metric. Tag "low cardinality" vào cả hai; tag "high cardinality" (mã đơn chẳng hạn) chỉ vào span, không vào metric. Đây là cùng quy tắc cardinality ở trên, được API bắt buộc bạn chọn.
+
+</Reveal>
+
+<Reveal title="Metric HTTP có sẵn rồi, sao còn tự viết timer inventory.lookup?">
+
+`RestClient` đã sinh metric `http.client.requests` cho mỗi lời gọi, gồm cả gọi kho. Timer tự viết có ý nghĩa khi bạn muốn đo đúng một thao tác nghiệp vụ, độc lập với cách nó được thực hiện: hôm nay gọi HTTP, mai đọc cache, tên metric và dashboard không đổi. Nó cũng là chỗ bật `publishPercentiles` hay histogram cho riêng thao tác đó mà không bật cho mọi lời gọi HTTP. Đừng tạo metric trùng chỉ vì có thể; mỗi chuỗi số liệu đều tốn tiền lưu.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI gợi ý metric nên có cho một luồng nghiệp vụ, viết code Micrometer, hay giải thích một trace. AI hay đưa tên property của Spring Boot 3 (`management.otlp.tracing.endpoint`, `management.zipkin.*`) trong khi Boot 4 dùng `management.opentelemetry.tracing.export.otlp.endpoint`; hay thêm tag có giá trị không giới hạn; và hay dùng `RestClient.create()` làm đứt trace. Kiểm tra tên property trong trang Common Application Properties của đúng phiên bản Boot, đếm số chuỗi trong `/actuator/prometheus`, và xem service bên kia có cùng trace id không.
+
+</Callout>
+
+<Callout kind="link">
+
+J15.1 dựng MDC và log JSON mà trace id được thêm vào. J15.3 dùng Actuator cho health check. J16 đo consumer Kafka bằng chính các meter này. D12 dựng Prometheus, Grafana và OpenTelemetry Collector để thu những gì bài này xuất ra, và dạy phương pháp RED, USE để chọn metric cần cảnh báo.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j15.2.mastery-metrics-design">Thiết kế được bộ metric cho một luồng nghiệp vụ: chọn loại meter, đặt tên, chọn tag có cardinality thấp, và quyết định giữa percentile ở client với histogram.</Check>
+
+<Check id="j15.2.mastery-trace-debug">Từ một request chậm, đi được từ log tới trace và chỉ ra bước chậm; giải thích được vì sao trace bị đứt khi client HTTP không được tạo từ builder của Spring Boot.</Check>
+
+</Mastery>

@@ -1,0 +1,632 @@
+---
+title: JFR, async-profiler và rò rỉ bộ nhớ
+description: Ghi JFR recording và đọc nó bằng lệnh jfr, profile CPU bằng async-profiler để tìm hot path, rồi bắt một rò rỉ heap bằng class histogram, heap dump và đường giữ object tới GC root.
+id: j18.3
+step: j18
+prerequisites: [j18.2]
+topics: [j18.jfr-jdk-mission-control, j18.profiling-async-profiler, j18.heap-dump-ro-ri]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    async-profiler: "4.5"
+---
+
+<Goal>
+
+Chẩn đoán một service đang chạy mà không sửa code hay khởi động lại nó: CPU tiêu vào đâu, ai cấp phát nhiều nhất, và cái gì đang giữ bộ nhớ không cho GC thu hồi. Học xong bài này, bạn giải thích được:
+
+- Vì sao một dòng `key.matches(regex)` vô hại có thể chiếm gần nửa CPU của service.
+- Phân biệt rò rỉ bộ nhớ thật với heap chỉ đơn giản là quá nhỏ, chỉ bằng hai lần chạy `jcmd`.
+- Vì sao file `.jfr` và heap dump phải được xử lý như dữ liệu nhạy cảm.
+
+</Goal>
+
+<Knowledge>
+
+### Profiler lấy mẫu và safepoint bias
+
+Profiler kiểu **sampling** (lấy mẫu) dừng lại vài trăm lần mỗi giây, ghi stack trace của các thread đang chạy, rồi đếm: method nào xuất hiện trong nhiều mẫu nhất thì tốn nhiều CPU nhất. Chi phí thấp nên dùng được trên production.
+
+Nhiều profiler cũ chỉ lấy được stack khi thread dừng ở **safepoint**, những điểm JVM cho phép dừng thread an toàn (cuối vòng lặp, lời gọi method). Kết quả bị **safepoint bias**: mẫu dồn vào các điểm đó thay vì nơi CPU thật sự tiêu tốn. JFR và async-profiler đều tránh được safepoint bias: chúng ghi lại vị trí thật của thread lúc lấy mẫu. (Từ JDK 25, JFR đi stack ở safepoint kế tiếp nhưng vẫn dựa vào vị trí đã ghi, JEP 518.)
+
+### JDK Flight Recorder (JFR)
+
+**JFR** có sẵn trong JDK, ghi **sự kiện (event)** của JVM và ứng dụng vào bộ đệm vòng trong bộ nhớ, rồi đổ ra file `.jfr`: mẫu CPU, mẫu cấp phát, GC, lock, I/O, deoptimization, và mẫu object sống lâu (dùng để tìm rò rỉ).
+
+```text
+ JVM đang chạy                                     file svc.jfr
+ +-----------------------------+   kết thúc,       +----------------------+
+ | event: ExecutionSample, GC, | -- JFR.dump ----> | jfr summary / view / |
+ | ObjectAllocationSample, ... |   hoặc hết        | print (dòng lệnh)    |
+ | bộ đệm vòng, overhead thấp  |   duration        | JDK Mission Control  |
+ +-----------------------------+                   | (giao diện đồ hoạ)   |
+                                                   +----------------------+
+```
+
+| Việc | Cách làm |
+|---|---|
+| Ghi từ lúc khởi động | `java -XX:StartFlightRecording=duration=30s,filename=svc.jfr,settings=profile ...` |
+| Ghi trên process đang chạy | `jcmd <pid> JFR.start`, rồi `JFR.dump`, `JFR.stop` |
+| Xem tổng quan | `jfr summary svc.jfr`: số event mỗi loại |
+| Xem bảng phân tích | `jfr view hot-methods svc.jfr`, `allocation-by-class`, `gc-pauses`, `memory-leaks-by-site`, ... |
+| Xem event thô | `jfr print --events <loại> svc.jfr` |
+| Phân tích trực quan | JDK Mission Control (JMC): ứng dụng giao diện, tải riêng, mở file `.jfr` |
+
+Cấu hình `default` có overhead rất thấp, hợp để bật thường trực; `profile` lấy mẫu dày hơn, hợp cho một lần điều tra. JMC hiển thị đúng những event mà lệnh `jfr` đọc được; bài này dùng lệnh `jfr` để mọi bước đều chạy được trong Terminal và kiểm chứng được.
+
+
+### async-profiler và flame graph
+
+**async-profiler** là profiler mã nguồn mở cho HotSpot, gắn vào process đang chạy bằng lệnh `asprof`. Nó có các chế độ `cpu`, `alloc` (ai cấp phát), `lock` (ai chờ lock), `wall` (thời gian thực, kể cả lúc ngủ hay chờ I/O), và thấy được cả frame native và frame của chính JVM như GC, JIT. Dự án phát triển trước hết cho Linux; bản macOS chạy được các chế độ `cpu` và `alloc` mà bài này dùng.
+
+Kết quả hay xem nhất là **flame graph**:
+
+```text
+ |----- Pattern.compile ------|                       |-- Formatter.format --|
+ |------- String.matches -----|------ Matcher... ---| |------ String.format -|
+ |------------ OrderService.valid ------------------| |-- OrderService.cacheKey --|
+ |-------------------------------- OrderService.main ---------------------------------|
+```
+
+- Mỗi ô là một method; ô bên trên là method được ô bên dưới gọi.
+- **Bề rộng** của ô là tỉ lệ mẫu có method đó trong stack, tức phần CPU nó và những gì nó gọi đã tiêu. Trục ngang không phải thời gian.
+- Tìm ô rộng ở gần đỉnh: đó là nơi CPU thật sự tiêu. Ô rộng ở đáy chỉ là điểm vào.
+
+JFR cũng lấy mẫu CPU, nhưng chỉ lấy stack Java: hoạt động của chính JVM như GC, JIT không xuất hiện trong bảng hot method của nó. Từ JDK 25, JFR có thêm chế độ CPU-time profiling thử nghiệm, chỉ trên Linux; bài này không dùng tới.
+
+<Check id="j18.3.flame-graph">Đọc được flame graph: bề rộng nghĩa là gì, trục dọc nghĩa là gì, và tìm điểm nóng ở đâu.</Check>
+
+### Rò rỉ bộ nhớ hay heap quá nhỏ
+
+Java có GC nhưng vẫn rò rỉ: object không còn cần nữa vẫn được một tham chiếu nào đó giữ, nên GC không được phép thu hồi. Thủ phạm hay gặp: static `Map` làm cache không giới hạn, listener đăng ký mà không huỷ, `ThreadLocal` trong thread pool.
+
+| Dấu hiệu | Rò rỉ | Heap quá nhỏ |
+|---|---|---|
+| Heap sau mỗi lần GC (lượng object sống) | Tăng dần theo thời gian, không bao giờ về mức cũ | Cao nhưng ổn định |
+| Hai class histogram cách nhau vài chục giây | Vài lớp tăng đều, cùng tốc độ | Gần như không đổi |
+| Tăng `-Xmx` | Chỉ lùi thời điểm OOM | Hết lỗi |
+
+Ba công cụ, từ nhẹ tới nặng:
+
+1. `jcmd <pid> GC.class_histogram`: đếm object còn sống theo lớp. Nhẹ, nhưng chạy một full GC trước khi đếm.
+2. JFR với `path-to-gc-roots=true`: mẫu object sống lâu kèm chuỗi tham chiếu giữ nó, tới tận **GC root** (điểm gốc GC luôn coi là sống: static field, biến cục bộ của thread đang chạy).
+3. **Heap dump** `jcmd <pid> GC.heap_dump`: ảnh chụp toàn bộ heap ra file `.hprof`, mở bằng Eclipse MAT để xem **dominator tree** (object nào giữ nhiều bộ nhớ nhất) và đường tới GC root. JVM dừng trong lúc ghi, file lớn cỡ phần heap đang dùng.
+
+<Callout kind="production">
+
+Heap dump chứa mọi thứ trong heap: token, mật khẩu đang xử lý, dữ liệu cá nhân của khách hàng. File `.jfr` ghi cả biến môi trường của process, nơi nhiều team để secret. Không gửi hai loại file này qua chat hay đính vào ticket công khai. Với JFR, `jfr scrub --exclude-events InitialEnvironmentVariable` tạo bản đã lọc; với heap dump, phân tích ngay trên máy được phép truy cập dữ liệu production.
+
+</Callout>
+
+<Check id="j18.3.leak-vs-small-heap">Phân biệt được rò rỉ bộ nhớ với heap quá nhỏ dựa trên số liệu, và kể được ba công cụ theo thứ tự từ nhẹ tới nặng.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [JDK Flight Recorder trên dev.java](https://dev.java/learn/jvm/monitoring-troubleshooting/jfr/): các cách bật recording, hai cấu hình `default` và `profile`.
+- [The jfr Command](https://docs.oracle.com/en/java/javase/25/docs/specs/man/jfr.html): đủ các lệnh con `print`, `summary`, `view`, `scrub` và tuỳ chọn của chúng.
+- [async-profiler: Getting Started](https://github.com/async-profiler/async-profiler/blob/master/docs/GettingStarted.md): gắn `asprof` vào process và các định dạng đầu ra; trang Profiling Modes cùng thư mục giải thích từng chế độ.
+- [Troubleshoot Memory Leaks](https://docs.oracle.com/en/java/javase/25/troubleshoot/troubleshooting-memory-leaks.html): quy trình chẩn đoán rò rỉ, `HeapDumpOnOutOfMemoryError` và cách tìm đường tới GC root.
+- [Memory Analyzer (MAT)](https://eclipse.dev/mat/): công cụ mở heap dump, đọc phần dominator tree và báo cáo Leak Suspects.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài J18.2, có JDK 25. Bài cần hai tab Terminal: tab 1 chạy service, tab 2 chẩn đoán nó. Thư mục lab là `~/masteva-j18/svc`. Con số trên máy bạn sẽ khác máy kiểm chứng; điều cần thấy là lớp nào, method nào đứng đầu.
+
+### 1. Tải async-profiler
+
+Bản phát hành chính thức là file nén trên GitHub, giải nén là dùng được, không cần cài. Bài dùng bản 4.5 cho macOS; trên Linux, đổi tên file thành `async-profiler-4.5-linux-x64.tar.gz` (hoặc `-linux-arm64`) và giải nén bằng `tar xzf`.
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+mkdir -p ~/masteva-j18/tools && cd ~/masteva-j18/tools
+curl -sSLO https://github.com/async-profiler/async-profiler/releases/download/v4.5/async-profiler-4.5-macos.zip
+unzip -q async-profiler-4.5-macos.zip && async-profiler-4.5-macos/bin/asprof --version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Async-profiler 4.5 built on Jul 13 2026
+```
+
+</Expected>
+
+### 2. Service có vấn đề
+
+`OrderService` giả lập service xử lý đơn hàng: mỗi lô 2.000 đơn, mỗi đơn tạo một cache key bằng `String.format` và kiểm tra key bằng `String.matches`. Cứ 100 đơn thì ghi một bản audit vào một `HashMap` static. Code có hai vấn đề cố ý; bạn sẽ tìm ra chúng bằng công cụ, không phải bằng cách đọc code.
+
+<Terminal where="mac" title="Tab 1: svc/src/OrderService.java">
+
+```bash
+mkdir -p ~/masteva-j18/svc/src && cd ~/masteva-j18/svc
+cat > src/OrderService.java <<'EOF'
+import java.util.HashMap;
+import java.util.Map;
+
+public class OrderService {
+    record Order(long id, String region, long amount) {
+    }
+
+    record AuditEntry(long orderId, String key, byte[] payload) {
+    }
+
+    // Audit giữ mọi đơn đã ghi và không bao giờ xoá.
+    static final Map<Long, AuditEntry> AUDIT = new HashMap<>();
+
+    static String cacheKey(Order order) {
+        return String.format("order:%d:%s:%d", order.id(), order.region(), order.amount());
+    }
+
+    static boolean valid(String key) {
+        return key.matches("order:\\d+:[a-z]+:\\d+");
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        int seconds = Integer.parseInt(args[0]);
+        long deadline = System.nanoTime() + seconds * 1_000_000_000L;
+        String[] regions = {"hn", "hcm", "dn"};
+        long id = 0;
+        long ok = 0;
+        while (System.nanoTime() < deadline) {
+            for (int i = 0; i < 2_000; i++) { // một lô 2.000 đơn
+                id++;
+                Order order = new Order(id, regions[(int) (id % 3)], 10_000 + id % 5_000);
+                String key = cacheKey(order);
+                if (valid(key)) {
+                    ok++;
+                }
+                if (id % 100 == 0) { // ghi audit cho 1/100 số đơn
+                    AUDIT.put(id, new AuditEntry(id, key, new byte[200]));
+                }
+            }
+            Thread.sleep(5); // chờ lô tiếp theo
+        }
+        System.out.println("processed=" + id + " ok=" + ok + " audit=" + AUDIT.size());
+    }
+}
+EOF
+javac -d out src/OrderService.java
+```
+
+</Terminal>
+
+### 3. Chạy service với JFR
+
+Service chạy 180 giây. JFR ghi 30 giây đầu với cấu hình `profile`, kèm `path-to-gc-roots=true` để lưu đường giữ object; hết 30 giây, recording tự ghi ra `svc.jfr` còn service vẫn chạy tiếp.
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j18/svc
+java -Xmx256m -XX:StartFlightRecording=duration=30s,filename=svc.jfr,settings=profile,path-to-gc-roots=true -cp out OrderService 180 | sed "s|$HOME|~|"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[0.228s][info][jfr,startup] Started recording 1. The result will be written to:
+[0.228s][info][jfr,startup] 
+[0.228s][info][jfr,startup] ~/masteva-j18/svc/svc.jfr
+```
+
+</Expected>
+
+`sed` chỉ rút gọn đường dẫn home thành `~`. Để tab 1 chạy; các bước 4 tới 6 làm ở tab 2 trong lúc service còn chạy.
+
+### 4. Profile CPU bằng async-profiler
+
+`jcmd -l` liệt kê các JVM đang chạy dưới user của bạn; lấy PID của `OrderService` vào biến.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j18/svc
+PID=$(jcmd -l | awk '/OrderService/ {print $1}'); echo $PID
+AP=~/masteva-j18/tools/async-profiler-4.5-macos/bin/asprof
+$AP -d 10 -o flat=6 $PID
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+64482
+Profiling for 10 seconds
+Done
+--- Execution profile ---
+Total samples       : 303
+
+          ns  percent  samples  top
+  ----------  -------  -------  ---
+   250000000    8.25%       25  __psynch_cvwait
+   240000000    7.92%       24  java.util.regex.Pattern$BmpCharPropertyGreedy.match
+   190000000    6.27%       19  java.util.regex.Pattern.sequence
+   170000000    5.61%       17  __semwait_signal
+   130000000    4.29%       13  java.lang.AbstractStringBuilder.needsNewBuffer
+   130000000    4.29%       13  java.util.Formatter$Conversion.isValid
+```
+
+</Expected>
+
+PID trên máy bạn sẽ khác. `flat` liệt kê method ở **đỉnh** stack, nơi CPU đang chạy. Regex và `Formatter` đứng đầu, nhưng chưa nói được code nào của bạn gọi chúng. `__psynch_cvwait` và `__semwait_signal` là hàm native của macOS mà thread dùng khi chờ hoặc ngủ (như `Thread.sleep`). Trên macOS, chế độ `cpu` dùng itimer nên có thể ghi cả mẫu ở hàm chờ; JFR thì không có các dòng này. Để gom theo method của bạn, xuất dạng **collapsed** (mỗi dòng một stack đầy đủ kèm số mẫu) rồi cộng:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+$AP -d 10 -o collapsed -f $PWD/cpu.txt $PID
+awk '{n=$NF; t+=n} /OrderService.valid/ {v+=n} /OrderService.cacheKey/ {k+=n} END {printf "total=%d valid=%.0f%% cacheKey=%.0f%%\n", t, 100*v/t, 100*k/t}' cpu.txt
+$AP -d 10 -f $PWD/cpu.html $PID && open cpu.html
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Profiling for 10 seconds
+Done
+total=362 valid=48% cacheKey=27%
+Profiling for 10 seconds
+Done
+```
+
+</Expected>
+
+Gần một nửa số mẫu CPU nằm trong `valid`, hơn một phần tư trong `cacheKey`. `open` mở flame graph trong trình duyệt: hai tháp rộng nhất trên `OrderService.main` là `valid` và `cacheKey`, và phần lớn tháp `valid` là `Pattern.compile` (trên máy kiểm chứng, 115 trong 175 mẫu của `valid`, đếm từ `cpu.txt` bằng cùng cách `awk`). Lý do: `String.matches` biên dịch lại regex ở mỗi lần gọi. Trên Linux, thay `open` bằng cách mở file `cpu.html` trong trình duyệt.
+
+<Check id="j18.3.lab-async-profiler">Gắn được async-profiler vào process đang chạy, xuất được flame graph và chỉ ra method của mình chiếm bao nhiêu phần trăm CPU.</Check>
+
+### 5. So sánh hai class histogram
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+jcmd $PID GC.class_histogram > h1.txt; sleep 15; jcmd $PID GC.class_histogram > h2.txt
+head -8 h2.txt
+awk 'FNR==NR && $1 ~ /:$/ {a[$4]=$2; next} $1 ~ /:$/ {d=$2-a[$4]; if (d>10000) printf "%-28s %+d\n", $4, d}' h1.txt h2.txt
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+64482:
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:        268885       33186256  [B (java.base@25.0.3)
+   2:        127944        4094208  java.util.HashMap$Node (java.base@25.0.3)
+   3:        125380        4012160  OrderService$AuditEntry
+   4:        142516        3420384  java.lang.String (java.base@25.0.3)
+   5:        125816        3019584  java.lang.Long (java.base@25.0.3)
+[B                           +78680
+java.util.HashMap$Node       +37379
+OrderService$AuditEntry      +39340
+java.lang.String             +39340
+java.lang.Long               +39340
+```
+
+</Expected>
+
+`[B` là tên JVM của `byte[]`. Lệnh `awk` ghép hai file theo tên lớp và in lớp nào tăng hơn 10.000 object. Năm lớp tăng gần như cùng một nhịp, khoảng 2.600 object mỗi giây, `byte[]` gấp đôi các lớp còn lại: dấu hiệu của một cấu trúc dữ liệu mà mỗi phần tử gồm một `HashMap$Node`, một khoá `Long`, một `AuditEntry` và hai mảng byte (payload và nội dung của chuỗi key). Histogram chỉ đếm object còn sống sau full GC, nên đây không phải rác chưa kịp dọn.
+
+<Predict question="Nếu đây chỉ là heap quá nhỏ chứ không phải rò rỉ, hai histogram sẽ trông thế nào?">
+
+Gần như giống nhau: số object sống dao động quanh một mức, không có lớp nào tăng đều theo thời gian. Vì vậy hai histogram cách nhau một khoảng là phép thử rẻ nhất để quyết định có nên đi tìm rò rỉ hay chỉ cần tăng heap.
+
+</Predict>
+
+### 6. Heap dump
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+jcmd $PID GC.heap_dump $PWD/svc.hprof | sed "s|$HOME|~|"
+ls -l svc.hprof | awk '{print $1, $5}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+64482:
+Dumping heap to ~/masteva-j18/svc/svc.hprof ...
+Heap dump file created [65211138 bytes in 0.086 secs]
+-rw------- 65211138
+```
+
+</Expected>
+
+- Đường dẫn nên là đường dẫn tuyệt đối: `jcmd` gửi lệnh cho JVM đích, và JVM đó ghi file theo thư mục làm việc của nó, không phải của tab 2.
+- Quyền `-rw-------`: chỉ chủ file đọc được. JVM tạo file như vậy vì heap dump chứa dữ liệu nhạy cảm.
+- Mở `svc.hprof` bằng Eclipse MAT (ứng dụng giao diện, tải từ eclipse.dev/mat), báo cáo Leak Suspects sẽ chỉ vào `HashMap` của `OrderService.AUDIT`. Bước tiếp theo cho bạn cùng kết luận đó ngay trên dòng lệnh, từ file JFR.
+
+<Check id="j18.3.lab-heap-dump">Lấy được class histogram hai lần, chỉ ra lớp đang rò rỉ, và tạo được heap dump bằng `jcmd`.</Check>
+
+### 7. Đọc file JFR
+
+Sau 30 giây kể từ lúc khởi động, file `svc.jfr` đã có. Vẫn ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+jfr summary svc.jfr | grep -E 'Duration|ExecutionSample|ObjectAllocationSample|OldObjectSample'
+jfr view --width 110 hot-methods svc.jfr | head -9
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Duration: 30 s
+ jdk.ObjectAllocationSample               8595        130029
+ jdk.ExecutionSample                       489          5362
+ jdk.OldObjectSample                         4           141
+
+                                      Java Methods that Execute the Most
+
+Method                                                                                        Samples Percent
+--------------------------------------------------------------------------------------------- ------- -------
+java.util.regex.Pattern$BmpCharPropertyGreedy.match(Matcher, int, CharSequence)                    68  13.91%
+java.util.regex.Pattern.sequence(Pattern$Node)                                                     42   8.59%
+java.util.regex.Pattern$BnM.optimize(Pattern$Node)                                                 38   7.77%
+java.util.Formatter$Conversion.isValid(char)                                                       30   6.13%
+```
+
+</Expected>
+
+`hot-methods` của JFR cho cùng bức tranh với async-profiler: regex và định dạng chuỗi. Bây giờ tìm ai giữ bộ nhớ:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+jfr view --width 110 memory-leaks-by-site svc.jfr
+jfr print --events OldObjectSample svc.jfr | grep -m1 -B3 'AUDIT : '
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+
+                                        Memory Leak Candidates by Site
+
+Alloc. Time Application Method                                                          Object Age Heap Usage
+----------- --------------------------------------------------------------------------- ---------- ----------
+00:48:39    N/A                                                                             30.0 s     1.6 MB
+00:48:59    OrderService.main(String[])                                                     10.3 s    24.0 MB
+  object =  [
+    java.util.HashMap$Node[131072]
+    table : java.util.HashMap Size: 75580
+    AUDIT : java.lang.Class Class Name: OrderService
+```
+
+</Expected>
+
+`memory-leaks-by-site` nói các object sống lâu được cấp phát trong `OrderService.main` đang chiếm 24 MB; dòng `N/A` là bộ đệm nội bộ của JFR. `jfr print` cho chuỗi tham chiếu, đọc từ dưới lên: lớp `OrderService` có static field `AUDIT`, là một `HashMap` đang có hơn 75.000 phần tử, và nó giữ mảng bảng `HashMap$Node[131072]`. Đó chính là đường tới GC root mà MAT vẽ thành cây.
+
+JFR chỉ lấy mẫu một số object nên mỗi lần chạy có thể khác. Ở một lần chạy khác trên máy kiểm chứng, mẫu là một `byte[200]` và chuỗi dài hơn: `byte[200]` là `payload` của `AuditEntry`, entry là `value` của một `HashMap$Node`, node nằm trong `table` của `HashMap` có field `AUDIT`. Dù mẫu là object nào, chuỗi đều kết thúc ở `AUDIT`. JMC hiển thị cùng event `OldObjectSample` này dưới dạng cây trong giao diện; ở đây ta đọc thẳng bằng `jfr print`.
+
+<Check id="j18.3.lab-jfr-leak">Đọc được file JFR bằng `jfr summary`, `jfr view` và `jfr print`, tìm ra hot method và chuỗi tham chiếu giữ object rò rỉ.</Check>
+
+Quay lại tab 1, bấm Ctrl+C để dừng service nếu nó chưa tự kết thúc.
+
+### 8. Khi rò rỉ chạy tới cùng
+
+Trên production, bạn thường không kịp chụp heap trước khi OOM. Đặt sẵn cờ để JVM tự ghi heap dump lúc OOM. Heap nhỏ 32 MB để không phải chờ lâu; lệnh mất dưới một phút.
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j18/svc
+java -Xmx32m -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=oom.hprof -cp out OrderService 300
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+java.lang.OutOfMemoryError: Java heap space
+Dumping heap to oom.hprof ...
+Heap dump file created [40968951 bytes in 0.054 secs]
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+	at java.base/java.util.Formatter.format(Formatter.java:2750)
+	at java.base/java.util.Formatter.format(Formatter.java:2698)
+	at java.base/java.lang.String.format(String.java:4455)
+	at OrderService.cacheKey(OrderService.java:15)
+	at OrderService.main(OrderService.java:32)
+```
+
+</Expected>
+
+Stack trace chỉ vào `cacheKey`, nhưng đó chỉ là nơi tình cờ cấp phát đúng lúc heap đầy, không phải thủ phạm: thủ phạm là thứ giữ bộ nhớ, và bạn đã thấy nó ở bước 5 tới 7. Ở vài lần chạy khác trên máy kiểm chứng, thay cho stack trace là dòng `Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler`, điều bài J18.1 phải phòng bằng cách xoá `keep` trước khi in: heap đầy tới mức chính đoạn code in lỗi cũng không cấp phát được. Trong container, thêm `-XX:+ExitOnOutOfMemoryError` để JVM thoát ngay sau OOM cho orchestrator khởi động lại, thay vì để một process nửa sống nửa chết tiếp tục nhận request.
+
+### 9. Sửa và kiểm chứng lại
+
+Ba thay đổi: biên dịch regex một lần thành hằng `Pattern`, nối chuỗi thay cho `String.format`, và giới hạn audit ở 10.000 bản mới nhất bằng `LinkedHashMap.removeEldestEntry`.
+
+<Terminal where="mac" title="Tab 1: sửa OrderService.java">
+
+```bash
+cd ~/masteva-j18/svc
+cat > src/OrderService.java <<'EOF'
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+public class OrderService {
+    record Order(long id, String region, long amount) {
+    }
+
+    record AuditEntry(long orderId, String key, byte[] payload) {
+    }
+
+    static final int AUDIT_LIMIT = 10_000;
+
+    // Chỉ giữ 10.000 bản audit mới nhất; bản cũ nhất bị loại khi thêm bản mới.
+    static final Map<Long, AuditEntry> AUDIT = new LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Long, AuditEntry> eldest) {
+            return size() > AUDIT_LIMIT;
+        }
+    };
+
+    // Biên dịch regex một lần, dùng lại cho mọi lần kiểm tra.
+    static final Pattern KEY = Pattern.compile("order:\\d+:[a-z]+:\\d+");
+
+    static String cacheKey(Order order) {
+        return "order:" + order.id() + ":" + order.region() + ":" + order.amount();
+    }
+
+    static boolean valid(String key) {
+        return KEY.matcher(key).matches();
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        int seconds = Integer.parseInt(args[0]);
+        long deadline = System.nanoTime() + seconds * 1_000_000_000L;
+        String[] regions = {"hn", "hcm", "dn"};
+        long id = 0;
+        long ok = 0;
+        while (System.nanoTime() < deadline) {
+            for (int i = 0; i < 2_000; i++) { // một lô 2.000 đơn
+                id++;
+                Order order = new Order(id, regions[(int) (id % 3)], 10_000 + id % 5_000);
+                String key = cacheKey(order);
+                if (valid(key)) {
+                    ok++;
+                }
+                if (id % 100 == 0) { // ghi audit cho 1/100 số đơn
+                    AUDIT.put(id, new AuditEntry(id, key, new byte[200]));
+                }
+            }
+            Thread.sleep(5); // chờ lô tiếp theo
+        }
+        System.out.println("processed=" + id + " ok=" + ok + " audit=" + AUDIT.size());
+    }
+}
+EOF
+javac -d out src/OrderService.java
+java -Xmx256m -XX:StartFlightRecording=filename=fixed.jfr,settings=profile -cp out OrderService 30 2>/dev/null
+jfr summary fixed.jfr | grep -E 'ExecutionSample'; jfr view gc-pauses fixed.jfr | grep -E 'Total|Number'
+jfr summary svc.jfr | grep -E 'ExecutionSample'; jfr view gc-pauses svc.jfr | grep -E 'Total|Number'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[0.178s][info][jfr,startup] Started recording 1. No limit specified, using maxsize=250MB as default.
+[0.178s][info][jfr,startup] 
+[0.178s][info][jfr,startup] Use jcmd 69990 JFR.dump name=1 to copy recording data to file.
+processed=9112000 ok=9112000 audit=10000
+ jdk.ExecutionSample                       244          2439
+Total Pause Time: 43.0 ms
+Number of Pauses: 13
+ jdk.ExecutionSample                       489          5362
+Total Pause Time: 231 ms
+Number of Pauses: 124
+```
+
+</Expected>
+
+Ba dòng `jfr,startup` in ra stdout nên `2>/dev/null` không ẩn được. So với 30 giây đầu của bản cũ: số mẫu CPU giảm một nửa (244 so với 489), số lần GC từ 124 xuống 13, và audit dừng ở 10.000 phần tử. Số đơn chỉ tăng ít vì vòng lặp chủ yếu bị giới hạn bởi `Thread.sleep`; trên service thật, CPU giảm nghĩa là cùng số máy chịu được nhiều traffic hơn.
+
+<Check id="j18.3.lab-fix-verify">Sửa được hot path và rò rỉ, rồi chứng minh bản sửa có tác dụng bằng số liệu JFR trước và sau.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `jcmd -l` không thấy `OrderService`: service ở tab 1 đã kết thúc, hoặc chạy dưới user khác. `jcmd` và `asprof` chỉ gắn được vào JVM cùng user.
+- `Unable to create .../svc.hprof: File exists`: `GC.heap_dump` không ghi đè file cũ. Xoá file cũ, đặt tên khác, hoặc thêm `-overwrite`.
+- `Native memory tracking is not enabled`, hay các lệnh `jcmd` khác báo tính năng chưa bật: một số tính năng phải bật bằng cờ lúc khởi động, như bài J18.1.
+- `jfr view` báo bảng rỗng: recording quá ngắn, hoặc cấu hình `default` không có event mà view cần. Ghi lại với `settings=profile`; với view về rò rỉ, thêm `path-to-gc-roots=true`.
+
+</Callout>
+
+### Dọn dẹp
+
+Lab của chặng J18 kết thúc ở đây. Kiểm tra không còn service nào chạy: `jcmd -l | grep OrderService` không in gì.
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá vĩnh viễn toàn bộ lab J18: mã nguồn, project JMH, async-profiler đã tải, file JFR và hai heap dump (khoảng 200 MB). Chỉ chạy khi không cần nữa. Thư viện Maven nằm trong `~/.m2`, không bị xoá.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+rm -rf ~/masteva-j18
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao JFR nói int[] và boolean[] chiếm hơn 90% áp lực cấp phát, trong khi code chỉ tạo byte[] và String?">
+
+Chạy `jfr view allocation-by-class svc.jfr`: trên máy kiểm chứng, `int[]` chiếm khoảng 74%, `boolean[]` khoảng 20%. `jfr view allocation-by-site svc.jfr` chỉ ra nơi cấp phát: `Pattern$BnM.optimize` và `Pattern$BitClass.<init>`, hai bước bên trong `Pattern.compile`. Áp lực cấp phát do thư viện gây ra trên đường gọi của bạn vẫn là của bạn. Với `fixed.jfr`, `Matcher` lên đầu bảng và `boolean[]` biến mất; bảng này tính theo tỉ lệ, còn tổng lượng cấp phát giảm thể hiện ở số lần GC, từ 124 xuống 13.
+
+</Reveal>
+
+<Reveal title="async-profiler và JFR cho cùng câu trả lời, vậy dùng cái nào?">
+
+JFR có sẵn trong mọi JDK, bật được từ đầu và để chạy thường trực, ghi nhiều loại event ngoài CPU. Hợp làm công cụ mặc định trên production. async-profiler thấy cả frame native và frame của JVM (GC, JIT, `malloc`), có chế độ `wall` cho thread đang chờ, và xuất flame graph ngay. Hợp khi JFR chỉ ra vấn đề nằm ngoài code Java, hoặc khi cần profile chính xác trên Linux. Cách làm hay gặp: JFR luôn bật, async-profiler cho lần điều tra sâu.
+
+</Reveal>
+
+<Reveal title="Lấy heap dump trên production có an toàn không?">
+
+Không miễn phí. JVM dừng mọi thread trong lúc ghi; ở bài này 65 MB mất chưa tới 0,1 giây trên SSD, nhưng heap 16 GB có thể dừng hàng chục giây và health check fail, khiến orchestrator kill pod giữa chừng. Đĩa phải đủ chỗ cho cả file. Cách an toàn hơn: rút instance khỏi load balancer trước, hoặc dựa vào `HeapDumpOnOutOfMemoryError` với `HeapDumpPath` trỏ tới volume đủ lớn. Bắt đầu bằng class histogram, chỉ lấy heap dump khi histogram chưa đủ.
+
+</Reveal>
+
+<Reveal title="Vì sao rò rỉ thật thường đến từ cache, không phải từ code quên giải phóng?">
+
+Java không có `free`, nên rò rỉ luôn là một tham chiếu còn sống ngoài ý muốn. Cache tự viết bằng `HashMap` static là nơi dễ nhất để điều đó xảy ra: lúc viết, dữ liệu nhỏ; sau sáu tháng, số key tăng theo số khách hàng. Mọi cache cần trả lời ba câu: giới hạn bao nhiêu phần tử, hết hạn khi nào, ai xoá. Thư viện như Caffeine hay Redis với TTL (J16) trả lời sẵn cả ba.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Đưa cho AI output của `jfr view hot-methods`, flame graph dạng collapsed hoặc hai histogram, rồi nhờ nó đặt giả thuyết. AI hay kết luận vội "tăng `-Xmx`" khi thấy OOM, hoặc đổ cho method ở đỉnh flame graph (thường là code thư viện) mà không lần xuống code của bạn. Kiểm tra mọi giả thuyết bằng số liệu: rò rỉ phải thấy lớp tăng đều giữa hai histogram; hot path phải giảm số mẫu CPU sau khi sửa.
+
+</Callout>
+
+<Callout kind="link">
+
+J18.1 giải thích các vùng nhớ và loại OOM; J18.2 dùng JMH để đo riêng đoạn code mà profiler chỉ ra. J15 đưa metric JVM lên dashboard, nơi bạn thấy heap sau GC tăng dần trước khi phải lấy heap dump. J16 thay cache tự viết bằng cache có TTL.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j18.3.mastery-diagnose-cpu">Tự chẩn đoán được một service đang chạy tốn CPU vào đâu bằng JFR hoặc async-profiler, và chỉ ra dòng code của mình gây ra.</Check>
+
+<Check id="j18.3.mastery-diagnose-leak">Tự chứng minh được một rò rỉ bộ nhớ bằng hai histogram, tìm được đường tới GC root bằng JFR hoặc heap dump, và kiểm chứng bản sửa bằng số liệu.</Check>
+
+</Mastery>

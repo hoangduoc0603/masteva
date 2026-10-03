@@ -1,0 +1,635 @@
+---
+title: JIT, warm-up và benchmark với JMH
+description: Thấy tận mắt interpreter, C1, C2 và deoptimization trong log của JVM, rút ngắn warm-up bằng AOT cache của JDK 25, rồi viết microbenchmark đúng với JMH và nhận ra lỗi dead code elimination.
+id: j18.2
+step: j18
+prerequisites: [j18.1]
+topics: [j18.jit-warm-up, j18.benchmark-jmh]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+---
+
+<Goal>
+
+Hiểu HotSpot biến bytecode thành mã máy theo từng tầng ra sao, vì sao service mới khởi động chậm, và đo hiệu năng một đoạn code mà không bị JIT đánh lừa. Học xong bài này, bạn giải thích được:
+
+- Vì sao vài trăm request đầu sau mỗi lần deploy có độ trễ cao gấp nhiều lần bình thường.
+- Vì sao một method đang chạy nhanh bỗng chậm lại khi gặp một kiểu dữ liệu mới.
+- Vì sao một benchmark báo một phép tính phức tạp chỉ tốn 0,5 ns.
+
+</Goal>
+
+<Knowledge>
+
+### Từ interpreter tới C2: tiered compilation
+
+Bài J1.1 nói JIT dịch đoạn code chạy nhiều thành mã máy. Cụ thể, HotSpot có hai trình biên dịch JIT và dùng chúng theo **tầng (tier)**:
+
+| Tier | Ai chạy | Đặc điểm |
+|---|---|---|
+| 0 | Interpreter | Chạy từng lệnh bytecode, chậm, đồng thời đếm số lần gọi |
+| 1 | C1 | Biên dịch nhanh, mã tối ưu vừa phải, không thu profile; cho method quá đơn giản |
+| 2 | C1 | Chỉ đếm lượt gọi và vòng lặp; dùng khi C2 đang quá tải |
+| 3 | C1 | Như tier 1 nhưng chèn code thu **profile** đầy đủ: nhánh nào hay chạy, object thuộc kiểu gì |
+| 4 | C2 | Biên dịch chậm, tối ưu mạnh dựa trên profile: inline, bỏ nhánh không bao giờ chạy, vector hoá vòng lặp |
+
+```text
+ method mới   tier 0 interpreter      gọi đủ nhiều     tier 3 C1 + profile
+ -----------> đếm lượt gọi       -----------------> thu kiểu, nhánh
+                                                        |  profile đủ
+                                                        v
+          uncommon trap                              tier 4 C2
+ tier 0 <------------------------------------------ mã máy theo giả định
+ (deoptimization: bỏ mã C2, quay lại interpreter,    "discount luôn là Percent"
+  thu profile mới, biên dịch lại)
+```
+
+C2 tối ưu dựa trên **giả định** rút ra từ profile. Nếu tới giờ `discount.apply` chỉ gặp `Percent`, C2 inline thẳng code của `Percent.apply` và đặt một **uncommon trap** cho trường hợp khác. Khi một `Fixed` xuất hiện, trap kích hoạt: JVM bỏ mã C2 đó (**deoptimization**), chạy tiếp bằng interpreter, rồi biên dịch lại với profile mới.
+
+**OSR (On-Stack Replacement)** xử lý một vòng lặp dài đang chạy trong interpreter: JVM biên dịch riêng thân vòng lặp và nhảy sang mã mới giữa chừng, không chờ method được gọi lần sau.
+
+<Check id="j18.2.tiers">Kể được các tier 0, 3, 4 và giải thích được deoptimization xảy ra khi nào.</Check>
+
+### Warm-up trên production
+
+Mỗi lần khởi động, JVM bắt đầu lại từ interpreter. Service Spring Boot có hàng chục nghìn method; phải qua hàng nghìn request, các đường code nóng mới lên tới C2. Trong khoảng đó, độ trễ cao hơn bình thường nhiều lần và CPU tăng vọt vì các thread biên dịch cũng chạy.
+
+| Cách giảm warm-up | Ý tưởng | Lưu ý |
+|---|---|---|
+| Gửi traffic giả trước khi báo ready | Chạy các API chính vài nghìn lần rồi mới bật readiness probe (J15) | Traffic giả phải giống traffic thật |
+| Rolling deploy chậm | Mỗi lần chỉ thay một phần instance | Không rút ngắn warm-up, chỉ giảm tác động |
+| AOT cache (JDK 24, 25) | Một lần chạy huấn luyện ghi lớp đã nạp, đã liên kết và profile method ra file; lần sau JVM dùng lại | Classpath phải là file JAR, giống hệt giữa hai lần chạy; profile chỉ tốt bằng lần huấn luyện |
+
+AOT cache gom ba JEP: JEP 483 (nạp và liên kết lớp trước), JEP 514 (tạo cache bằng một cờ `-XX:AOTCacheOutput`), JEP 515 (lưu profile method để JIT biên dịch sớm hơn). Phần thực hành dùng cả ba.
+
+<Callout kind="production">
+
+Một team deploy service thanh toán lúc 10 giờ sáng. Readiness probe chỉ kiểm tra `/actuator/health`, nên instance mới nhận ngay 1/3 traffic. p99 tăng từ 80 ms lên 1,2 giây trong khoảng hai phút rồi tự hết, đủ để vài client timeout và retry, làm tải còn tăng thêm. Không có gì sai trong code; đó là warm-up. Cách sửa của họ: chạy một bộ request mẫu nội bộ trước khi bật readiness, và đo p99 riêng cho vài phút đầu sau deploy.
+
+</Callout>
+
+<Check id="j18.2.warm-up">Giải thích được vì sao service chậm sau khi khởi động và nêu được hai cách giảm warm-up.</Check>
+
+### Microbenchmark và vì sao cần JMH
+
+Muốn so sánh hai cách viết, bạn có thể bọc code trong vòng lặp và đo bằng `System.nanoTime()`. Cách đó sai theo nhiều kiểu, vì chính những tối ưu của C2 ở trên:
+
+| Bẫy | Chuyện gì xảy ra |
+|---|---|
+| Không warm-up | Đo lẫn thời gian chạy interpreter và thời gian biên dịch |
+| **Dead code elimination** (DCE) | Kết quả không được dùng, C2 xoá luôn phép tính; bạn đo một vòng lặp rỗng |
+| **Constant folding** | Đầu vào là hằng số, C2 tính sẵn kết quả lúc biên dịch |
+| Chỉ chạy một JVM | Thứ tự biên dịch và bố trí bộ nhớ của một lần chạy có thể khác hẳn lần sau |
+
+**JMH (Java Microbenchmark Harness)** là harness của OpenJDK xử lý các bẫy này. Bạn viết method gắn `@Benchmark`, JMH sinh code đo quanh nó: chạy warm-up, chạy đo nhiều vòng, chạy trong JVM con riêng (**fork**), tính sai số.
+
+| Annotation, lớp | Vai trò |
+|---|---|
+| `@Benchmark` | Method cần đo |
+| `@State(Scope.Thread)` | Lớp giữ dữ liệu đầu vào; field của nó không bị coi là hằng số |
+| `@Warmup`, `@Measurement` | Số vòng và thời lượng mỗi vòng warm-up, đo thật |
+| `@Fork` | Số JVM con chạy benchmark |
+| `@BenchmarkMode`, `@OutputTimeUnit` | Đo thời gian trung bình mỗi lần gọi, đơn vị ns |
+| `Blackhole` | "Tiêu thụ" một giá trị để C2 không xoá được phép tính tạo ra nó |
+
+Trả giá trị về từ method `@Benchmark` có tác dụng giống `Blackhole`: JMH tự tiêu thụ giá trị trả về.
+
+<Callout kind="pitfall">
+
+Microbenchmark chỉ trả lời câu hỏi rất hẹp: đoạn code này, với dữ liệu này, trên JVM này. Đừng benchmark trước khi profile (bài J18.3) chỉ ra đoạn đó thật sự nóng. Tối ưu một method chiếm 0,5% thời gian CPU không làm service nhanh hơn, dù JMH báo nó nhanh gấp đôi.
+
+</Callout>
+
+<Check id="j18.2.jmh-traps">Giải thích được dead code elimination và constant folding làm hỏng benchmark thế nào, và JMH chống lại chúng ra sao.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Java HotSpot Virtual Machine Performance Enhancements](https://docs.oracle.com/en/java/javase/25/vm/java-hotspot-virtual-machine-performance-enhancements.html): phần tiered compilation và các tối ưu C2 thực hiện.
+- [JEP 515: Ahead-of-Time Method Profiling](https://openjdk.org/jeps/515): phần "Description" giải thích profile được lưu và dùng lại thế nào.
+- [JEP 514: Ahead-of-Time Command-Line Ergonomics](https://openjdk.org/jeps/514): tạo AOT cache bằng một lệnh và các giới hạn về classpath.
+- [JMH](https://github.com/openjdk/jmh): README, phần tạo project và chạy benchmark từ dòng lệnh.
+- [JMH Samples](https://github.com/openjdk/jmh/tree/master/jmh-samples/src/main/java/org/openjdk/jmh/samples): đọc `JMHSample_08_DeadCode` và `JMHSample_10_ConstantFold`, hai bẫy bạn sẽ gặp trong lab.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài J18.1, có JDK 25 và Maven 3.9 (bài J7.1). Bài này dùng hai thư mục con: `~/masteva-j18/jit` cho JIT và AOT cache, `~/masteva-j18/bench` cho project JMH. Con số thời gian trên máy bạn sẽ khác; điều cần thấy là xu hướng và tỉ lệ.
+
+Maven phải chạy trên JDK 25. Như bài J7.1, kiểm tra dòng `Java version`:
+
+<Terminal where="mac">
+
+```bash
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+mvn -v 2>/dev/null | grep -E 'Apache Maven|Java version'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Apache Maven 3.9.9 (8e8579a9e76f7d015ee5ec7bfcdc97d260186937)
+Java version: 25.0.3, vendor: Oracle Corporation, runtime: /Library/Java/JavaVirtualMachines/jdk-25.jdk/Contents/Home
+```
+
+</Expected>
+
+Maven 3.9.9 trên JDK 25 in thêm vài dòng `WARNING:` về `System::load` và `sun.misc.Unsafe` của thư viện bên trong Maven; `2>/dev/null` ẩn chúng đi. Chúng không ảnh hưởng tới project.
+
+### 1. Một method nóng
+
+`WarmUp` tính tổng tiền của giỏ 10.000 món sau giảm giá, 10 lần mỗi lô, 20 lô, và in thời gian từng lô. Cuối chương trình, một đơn hiếm gặp dùng kiểu giảm giá thứ hai, `Fixed`.
+
+<Terminal where="mac" title="Tạo jit/src/WarmUp.java">
+
+```bash
+mkdir -p ~/masteva-j18/jit/src && cd ~/masteva-j18/jit
+cat > src/WarmUp.java <<'EOF'
+public class WarmUp {
+    interface Discount {
+        long apply(long price);
+    }
+
+    record Percent(int percent) implements Discount {
+        public long apply(long price) {
+            return price * (100 - percent) / 100;
+        }
+    }
+
+    record Fixed(long amount) implements Discount {
+        public long apply(long price) {
+            return Math.max(0, price - amount);
+        }
+    }
+
+    // Tổng tiền một giỏ hàng sau giảm giá: method "nóng" của bài.
+    static long total(long[] prices, Discount discount) {
+        long sum = 0;
+        for (long price : prices) {
+            sum += discount.apply(price);
+        }
+        return sum;
+    }
+
+    public static void main(String[] args) {
+        boolean percentOnly = args.length > 0 && args[0].equals("percent-only");
+        long[] prices = new long[10_000];
+        for (int i = 0; i < prices.length; i++) {
+            prices[i] = 10_000 + i * 7L;
+        }
+        Discount percent = new Percent(10);
+        long checksum = 0;
+        for (int batch = 1; batch <= 20; batch++) {
+            long start = System.nanoTime();
+            for (int i = 0; i < 10; i++) {
+                checksum += total(prices, percent);
+            }
+            long micros = (System.nanoTime() - start) / 1_000;
+            System.out.printf("batch %2d: %,5d µs%s", batch, micros, batch % 4 == 0 ? "\n" : "   ");
+        }
+        if (!percentOnly) {
+            // Một đơn hiếm gặp dùng kiểu giảm giá thứ hai: giả định của JIT sai.
+            checksum += total(prices, new Fixed(5_000));
+        }
+        System.out.println("checksum=" + checksum);
+    }
+}
+EOF
+javac -d out src/WarmUp.java && java -cp out WarmUp
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+batch  1: 1,556 µs   batch  2:   293 µs   batch  3:   282 µs   batch  4:   278 µs
+batch  5:   282 µs   batch  6:   285 µs   batch  7:   461 µs   batch  8:   484 µs
+batch  9:   464 µs   batch 10:    59 µs   batch 11:    59 µs   batch 12:    59 µs
+batch 13:    58 µs   batch 14:    58 µs   batch 15:    61 µs   batch 16:    60 µs
+batch 17:    60 µs   batch 18:    60 µs   batch 19:    60 µs   batch 20:    60 µs
+checksum=81392765000
+```
+
+</Expected>
+
+Cùng một việc, lô đầu mất 1,5 ms, các lô cuối khoảng 60 µs: chậm gấp 25 lần. Lô nào bắt đầu đạt 60 µs thay đổi một chút giữa các lần chạy. Thời gian nhìn chung giảm theo bậc; có thể có vài lô chậm lên trong lúc chuyển tầng.
+
+### 2. Tắt bớt từng tầng
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/jit
+java -Xint -cp out WarmUp | head -1
+java -XX:TieredStopAtLevel=1 -cp out WarmUp | head -1
+```
+
+</Terminal>
+
+<Predict question="-Xint chỉ dùng interpreter; TieredStopAtLevel=1 chỉ dùng C1 không thu profile. Lô 2 của mỗi cách nhanh hay chậm hơn lô 2 ở bước 1?">
+
+```text
+batch  1: 4,095 µs   batch  2: 3,670 µs   batch  3: 3,553 µs   batch  4: 3,536 µs
+batch  1: 1,504 µs   batch  2:    95 µs   batch  3:    91 µs   batch  4:    92 µs
+```
+
+Interpreter không bao giờ nhanh lên: mọi lô khoảng 3,5 ms. Điều bất ngờ là C1 không profile (khoảng 92 µs) nhanh hơn lô 2 tới 9 của bước 1 (khoảng 280 tới 450 µs). Lý do: ở bước 1, các lô đó chạy mã tier 3, có code thu profile chèn vào mỗi lần gọi. Tier 3 là khoản đầu tư: chậm hơn một lúc để C2 có profile mà tối ưu, và mã C2 cuối cùng (60 µs) nhanh nhất. `-XX:TieredStopAtLevel=1` vì vậy đôi khi được dùng cho công cụ dòng lệnh chạy ngắn, không bao giờ cho service chạy lâu.
+
+</Predict>
+
+### 3. Đọc log của JIT
+
+`-XX:+PrintCompilation` in mỗi lần biên dịch ra stdout, lẫn với output của chương trình. Cùng thông tin đó có trong unified logging với tag `jit+compilation`, ghi được ra file riêng:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/jit
+java -Xlog:jit+compilation=debug:file=jit.log -cp out WarmUp > /dev/null
+grep 'WarmUp' jit.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[0.017s][info][jit,compilation]   16       3       WarmUp$Percent::apply (15 bytes)
+[0.017s][info][jit,compilation]   17       4       WarmUp$Percent::apply (15 bytes)
+[0.017s][info][jit,compilation]   16       3       WarmUp$Percent::apply (15 bytes)   made not entrant: not used
+[0.018s][info][jit,compilation]   18 %     3       WarmUp::total @ 13 (46 bytes)
+[0.018s][info][jit,compilation]   19       3       WarmUp::total (46 bytes)
+[0.034s][info][jit,compilation]  102 %     4       WarmUp::total @ 13 (46 bytes)
+[0.036s][info][jit,compilation]   18 %     3       WarmUp::total @ 13 (46 bytes)   made not entrant: OSR invalidation of lower level
+[0.037s][info][jit,compilation]  108       4       WarmUp::total (46 bytes)
+[0.038s][info][jit,compilation]   19       3       WarmUp::total (46 bytes)   made not entrant: not used
+[0.040s][info][jit,compilation]  108       4       WarmUp::total (46 bytes)   made not entrant: uncommon trap
+[0.040s][info][jit,compilation]  125       3       WarmUp$Fixed::apply (11 bytes)
+[0.040s][info][jit,compilation]  126       4       WarmUp::total (46 bytes)
+[0.040s][info][jit,compilation]  102 %     4       WarmUp::total @ 13 (46 bytes)   made not entrant: uncommon trap
+```
+
+</Expected>
+
+Mỗi dòng có: mã lần biên dịch, dấu `%` nếu là OSR, tier, tên method, `@ 13` là vị trí bytecode của vòng lặp được OSR. Mã biên dịch và thời điểm khác nhau giữa các lần chạy.
+
+- `total @ 13` lên tier 3 rồi tier 4 bằng OSR: vòng lặp `for` bên trong chạy đủ lâu để JVM thay mã giữa chừng.
+- `made not entrant: not used`: mã tier 3 cũ bị bỏ vì đã có mã tier 4 thay thế.
+- Khi `Fixed` xuất hiện, mã C2 của `total` bị bỏ với lý do `uncommon trap`. Đó là deoptimization. JVM biên dịch lại `total` (mã 126) với profile biết cả hai kiểu. Có lần chạy còn thêm một dòng `blocked` ở cuối cho lần biên dịch này, vì chương trình kết thúc ngay sau đó.
+
+<Check id="j18.2.lab-jit-log">Đọc được log biên dịch JIT, chỉ ra OSR, tier 4 và dòng deoptimization do uncommon trap.</Check>
+
+### 4. Rút ngắn warm-up bằng AOT cache
+
+AOT cache chỉ nhận classpath gồm file JAR, nên trước hết đóng gói `out` thành JAR. Lần chạy có `-XX:AOTCacheOutput` là **lần chạy huấn luyện**: chương trình chạy như thường, khi thoát thì JVM ghi cache.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/jit
+jar --create --file warmup.jar -C out .
+java -XX:AOTCacheOutput=warmup.aot -cp warmup.jar WarmUp > /dev/null
+java -XX:AOTCache=warmup.aot -cp warmup.jar WarmUp
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Picked up JAVA_TOOL_OPTIONS: -Djava.class.path=warmup.jar -XX:AOTCacheOutput=warmup.aot -XX:AOTConfiguration=warmup.aot.config -XX:AOTMode=create
+batch  1:   588 µs   batch  2:   420 µs   batch  3:   406 µs   batch  4:   395 µs
+batch  5:   561 µs   batch  6:   504 µs   batch  7:   123 µs   batch  8:   122 µs
+batch  9:   122 µs   batch 10:   122 µs   batch 11:   122 µs   batch 12:   121 µs
+batch 13:   121 µs   batch 14:   121 µs   batch 15:   121 µs   batch 16:   122 µs
+batch 17:   121 µs   batch 18:   121 µs   batch 19:   121 µs   batch 20:   122 µs
+checksum=81392765000
+```
+
+</Expected>
+
+Dòng `Picked up JAVA_TOOL_OPTIONS` in ra lúc tạo cache: JEP 514 khởi động thêm một JVM con để ghi cache và truyền tham số cho nó qua biến này. JVM con còn in ra stdout (đã bị `> /dev/null` ẩn đi) dòng `AOTCache creation is complete: warmup.aot 11632640 bytes`: cache nặng khoảng 11 MB, vì chứa cả các lớp của JDK mà chương trình dùng.
+
+<Predict question="Lô 1 nhanh hơn hẳn (khoảng 600 µs so với 1.500 µs) và ổn định sớm hơn. Nhưng mức ổn định là khoảng 122 µs, chậm gấp đôi 60 µs ở bước 1. Vì sao cache lại làm mã cuối cùng chậm hơn?">
+
+Vì profile được ghi từ lần huấn luyện, và lần huấn luyện có đơn `Fixed` ở cuối. Profile trong cache nói `discount.apply` gặp hai kiểu, nên C2 biên dịch `total` cho cả hai kiểu ngay từ đầu, không inline gọn được như khi chỉ có `Percent`. Ở bước 3 thì ngược lại: C2 biên dịch khi mới thấy `Percent`, rồi mới deoptimize ở cuối.
+
+Huấn luyện lại với một lần chạy chỉ có `Percent`:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/jit
+java -XX:AOTCacheOutput=warmup.aot -cp warmup.jar WarmUp percent-only > /dev/null 2>&1
+java -XX:AOTCache=warmup.aot -cp warmup.jar WarmUp
+```
+
+</Terminal>
+
+```text
+batch  1:   556 µs   batch  2:    61 µs   batch  3:    60 µs   batch  4:    61 µs
+batch  5:    61 µs   batch  6:    60 µs   batch  7:    60 µs   batch  8:    60 µs
+batch  9:    60 µs   batch 10:    60 µs   batch 11:    59 µs   batch 12:    58 µs
+batch 13:    58 µs   batch 14:    58 µs   batch 15:    58 µs   batch 16:    58 µs
+batch 17:    58 µs   batch 18:    60 µs   batch 19:    60 µs   batch 20:    60 µs
+checksum=81392765000
+```
+
+Mức ổn định trở về khoảng 60 µs. Lô đầu tiên đạt mức đó thay đổi nhiều giữa các lần chạy: trên máy kiểm chứng, đang chạy nhiều việc khác cùng lúc, có lần từ lô 2, có lần tới lô 16; không có cache thì khoảng lô 10. Còn với cache bị "nhiễm" `Fixed`, mọi lần chạy đều dừng ở khoảng 122 tới 126 µs. Bài học cho production: lần huấn luyện phải giống traffic thật. Huấn luyện bằng một kịch bản lạ, cache có thể làm service chậm hơn ở trạng thái ổn định, chứ không chỉ "không giúp được gì".
+
+</Predict>
+
+<Check id="j18.2.lab-aot-cache">Tạo và dùng được AOT cache, và giải thích được vì sao lần chạy huấn luyện phải giống traffic thật.</Check>
+
+### 5. Project JMH
+
+Archetype chính thức của JMH 1.37 (`jmh-java-benchmark-archetype`) sinh pom nhắm Java 8 và khai báo bộ sinh code như một dependency `provided`. Project sinh từ archetype đó, build bằng JDK 25, vẫn build thành công nhưng chạy thì báo lỗi `BenchmarkList` (xem phần gỡ lỗi), nên ta viết pom tay. Bộ sinh code của JMH là một **annotation processor**; từ JDK 23, `javac` không tự chạy processor tìm thấy trên classpath nữa, nên phải khai báo trong `annotationProcessorPaths`. Plugin shade gói mọi thứ vào `benchmarks.jar` chạy được.
+
+<Terminal where="mac" title="Tạo bench/pom.xml">
+
+```bash
+mkdir -p ~/masteva-j18/bench/src/main/java/dev/masteva/bench && cd ~/masteva-j18/bench
+cat > pom.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>dev.masteva</groupId>
+  <artifactId>bench</artifactId>
+  <version>1.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>25</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <jmh.version>1.37</jmh.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-core</artifactId>
+      <version>${jmh.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.15.0</version>
+        <configuration>
+          <!-- Từ JDK 23, javac không tự chạy annotation processor trên classpath. -->
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.openjdk.jmh</groupId>
+              <artifactId>jmh-generator-annprocess</artifactId>
+              <version>${jmh.version}</version>
+            </path>
+          </annotationProcessorPaths>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.2</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <finalName>benchmarks</finalName>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>org.openjdk.jmh.Main</mainClass>
+                </transformer>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+EOF
+```
+
+</Terminal>
+
+Code cần đo: số dư một khoản vay sau 12 tháng, lãi 1,5% mỗi tháng cộng một khoản phí. Chỉ có phép tính, không đọc ghi gì bên ngoài, đúng loại code mà C2 có quyền xoá nếu kết quả không được dùng.
+
+<Terminal where="mac" title="Tạo Loan.java và LoanBench.java">
+
+```bash
+cd ~/masteva-j18/bench
+cat > src/main/java/dev/masteva/bench/Loan.java <<'EOF'
+package dev.masteva.bench;
+
+public final class Loan {
+    private Loan() {
+    }
+
+    // Số dư sau 12 tháng, lãi 1,5%/tháng cộng phí: chỉ có phép tính, không có tác dụng phụ.
+    public static double balanceAfterYear(double principal) {
+        double balance = principal;
+        for (int month = 0; month < 12; month++) {
+            balance = balance * 1.015 + Math.sqrt(balance) / 100;
+        }
+        return balance;
+    }
+}
+EOF
+cat > src/main/java/dev/masteva/bench/LoanBench.java <<'EOF'
+package dev.masteva.bench;
+
+import java.util.concurrent.TimeUnit;
+import org.openjdk.jmh.annotations.Benchmark;
+import org.openjdk.jmh.annotations.BenchmarkMode;
+import org.openjdk.jmh.annotations.Fork;
+import org.openjdk.jmh.annotations.Measurement;
+import org.openjdk.jmh.annotations.Mode;
+import org.openjdk.jmh.annotations.OutputTimeUnit;
+import org.openjdk.jmh.annotations.Scope;
+import org.openjdk.jmh.annotations.State;
+import org.openjdk.jmh.annotations.Warmup;
+import org.openjdk.jmh.infra.Blackhole;
+
+@State(Scope.Thread)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
+@Warmup(iterations = 3, time = 1)
+@Measurement(iterations = 5, time = 1)
+@Fork(1)
+public class LoanBench {
+    // Field của @State, không phải hằng số, để JIT không tính trước được.
+    double principal = 1_250_000;
+
+    @Benchmark
+    public void baseline() {
+        // Không làm gì: chi phí tối thiểu của một lần gọi.
+    }
+
+    @Benchmark
+    public void wrong() {
+        Loan.balanceAfterYear(principal); // kết quả bị bỏ đi
+    }
+
+    @Benchmark
+    public double constant() {
+        return Loan.balanceAfterYear(1_250_000); // đầu vào là hằng số
+    }
+
+    @Benchmark
+    public double returned() {
+        return Loan.balanceAfterYear(principal);
+    }
+
+    @Benchmark
+    public void blackhole(Blackhole bh) {
+        bh.consume(Loan.balanceAfterYear(principal));
+    }
+}
+EOF
+mvn -q package 2>/dev/null; ls target/*.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+target/bench-1.0.jar
+target/benchmarks.jar
+```
+
+</Expected>
+
+Lần đầu, Maven tải JMH và plugin shade về `~/.m2`, mất thêm chút thời gian.
+
+### 6. Chạy benchmark
+
+Mỗi benchmark chạy 3 vòng warm-up và 5 vòng đo, mỗi vòng 1 giây, trong một JVM con. Năm benchmark mất khoảng 40 giây.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-j18/bench
+java -jar target/benchmarks.jar LoanBench 2>&1 | tail -6
+```
+
+</Terminal>
+
+<Predict question="Hai trong năm benchmark (ngoài baseline) cho ra con số gần như bằng baseline. Là hai cái nào?">
+
+```text
+Benchmark            Mode  Cnt   Score   Error  Units
+LoanBench.baseline   avgt    5   0.580 ± 0.029  ns/op
+LoanBench.blackhole  avgt    5  26.802 ± 3.540  ns/op
+LoanBench.constant   avgt    5   0.592 ± 0.157  ns/op
+LoanBench.returned   avgt    5  25.943 ± 0.574  ns/op
+LoanBench.wrong      avgt    5   0.600 ± 0.064  ns/op
+```
+
+- `wrong` bằng baseline: kết quả bị bỏ đi, C2 xoá cả vòng lặp 12 tháng. Đây là dead code elimination; benchmark đo... không gì cả.
+- `constant` cũng bằng baseline: đầu vào là hằng số, C2 tính sẵn kết quả lúc biên dịch (constant folding) và chỉ trả về một số cố định.
+- `returned` và `blackhole` cho con số thật, khoảng 25 ns: giá trị được tiêu thụ và đầu vào đọc từ field của `@State`.
+
+Cột **Score** là thời gian trung bình mỗi lần gọi. **Error** là nửa khoảng tin cậy 99,9%: `25.943 ± 0.574` nghĩa là giá trị thật rất có thể nằm trong khoảng 25,4 tới 26,5 ns. `blackhole` có Error lớn hơn (± 3,5): các vòng đo của nó dao động nhiều hơn, thường do máy đang bận việc khác; khoảng của nó (23,3 tới 30,3) chồng lên khoảng của `returned`, nên không kết luận được cái nào nhanh hơn.
+
+</Predict>
+
+Trước bảng kết quả, JMH in một đoạn `NOTE: Current JVM experimentally supports Compiler Blackholes`: trên JDK mới, JMH nhờ chính C2 giữ lại giá trị đưa vào `Blackhole`, nên `Blackhole` gần như không tốn thêm chi phí. Đó là lý do `blackhole` và `returned` gần bằng nhau.
+
+<Check id="j18.2.lab-jmh-dce">Viết và chạy được một benchmark JMH, chỉ ra benchmark nào bị dead code elimination hoặc constant folding và sửa được bằng giá trị trả về hoặc `Blackhole`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `RuntimeException: ERROR: Unable to find the resource: /META-INF/BenchmarkList` khi chạy `benchmarks.jar`: annotation processor của JMH không chạy, nên không có benchmark nào được sinh. Thường do pom khai báo `jmh-generator-annprocess` như dependency `provided` (kiểu archetype 1.37) thay vì trong `annotationProcessorPaths`. Với JDK 25, cả project từ archetype lẫn pom của bài bỏ `annotationProcessorPaths` đều build thành công, chỉ lúc chạy mới báo lỗi này.
+- `Error: non-empty directory 'out'` và `Cannot have non-empty directory in paths` khi tạo AOT cache: classpath có thư mục. Đóng gói thành JAR như bước 4.
+- `An error has occurred while processing the AOT cache` khi chạy với `-XX:AOTCache`: file cache không có, hoặc tạo với classpath, phiên bản JDK khác lần chạy này. JVM vẫn chạy tiếp, chỉ không dùng cache; đọc stderr lúc khởi động để biết cache có được dùng không.
+- `release version 25 not supported` khi `mvn package`: Maven chạy trên JDK cũ. Đặt lại `JAVA_HOME` như phần chuẩn bị.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá AOT cache (11 MB), log JIT, file JAR và thư mục `target` của project JMH. Mã nguồn được giữ lại.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-j18 && rm -f jit/warmup.aot jit/warmup.jar jit/jit.log && rm -rf bench/target
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không đơn giản là bỏ interpreter, biên dịch hết bằng C2 ngay từ đầu?">
+
+C2 cần profile để tối ưu tốt: biết nhánh nào không bao giờ chạy, call site nào chỉ gặp một kiểu. Biên dịch trước khi có profile buộc C2 phải giả định mọi khả năng, mã sinh ra chậm hơn. Biên dịch C2 cũng tốn CPU và thời gian; làm cho mọi method, kể cả method chỉ chạy một lần lúc khởi động, sẽ làm khởi động chậm đi. Tiered compilation là cách trả chi phí biên dịch chỉ cho code đáng trả. GraalVM native image (phần Đào sâu của bài J17.3) chọn hướng ngược lại: biên dịch hết trước, đổi lấy khởi động nhanh và chấp nhận mất tối ưu dựa trên profile (trừ khi dùng PGO của Oracle GraalVM).
+
+</Reveal>
+
+<Reveal title="Deoptimization liên tục có thể làm service chậm không?">
+
+Có. Nếu một call site lúc gặp kiểu này, lúc gặp kiểu khác theo từng đợt traffic, JVM có thể biên dịch, deoptimize, biên dịch lại nhiều lần; trong lúc đó CPU tăng và độ trễ dao động. Thường thì nó ổn định sau vài vòng, vì lần biên dịch sau dùng profile đã thấy cả kiểu mới, như mã 126 ở bước 3. JFR có sự kiện `jdk.Deoptimization` và view `deoptimizations-by-reason` để thấy điều này (bài J18.3).
+
+</Reveal>
+
+<Reveal title="Có nên đặt @Fork(0) để benchmark chạy nhanh hơn?">
+
+Không cho kết quả bạn định tin. Không fork, benchmark chạy chung JVM với code của JMH và các benchmark trước nó: profile của call site đã bị "nhiễm" nhiều kiểu, giống hệt tình huống AOT cache ở bước 4. Mỗi benchmark nên có JVM riêng. Khi cần so sánh nghiêm túc, tăng `@Fork` lên 2 hoặc 3 để thấy độ lệch giữa các JVM.
+
+</Reveal>
+
+<Reveal title="JMH báo cách A nhanh hơn cách B 10 ns. Đưa vào service có nhanh hơn không?">
+
+Chưa chắc. Benchmark chạy code trong vòng lặp nóng, dữ liệu nằm sẵn trong CPU cache, một kiểu dữ liệu duy nhất. Service thật gọi code đó lẫn với hàng nghìn đoạn khác, dữ liệu lạnh hơn, profile lẫn nhiều kiểu. Hãy hỏi: đoạn code này chiếm bao nhiêu phần trăm CPU trong profile của service? 10 ns nhân với số lần gọi mỗi giây là bao nhiêu? Nếu tổng là vài phần nghìn CPU, đừng đổi code chỉ vì benchmark.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết khung benchmark JMH hoặc giải thích một dòng log JIT. AI rất hay viết benchmark có kiểu `wrong` hoặc `constant` ở trên: gọi method mà không trả kết quả, hoặc truyền hằng số vào. Nó cũng hay đưa pom từ archetype cũ thiếu `annotationProcessorPaths`. Kiểm tra lại bằng cách luôn có benchmark `baseline` rỗng: benchmark nào có con số gần baseline gần như chắc chắn đang đo sai.
+
+</Callout>
+
+<Callout kind="link">
+
+J1.1 giới thiệu JIT ở mức một dòng; bài này là phần sâu. J15 dùng readiness probe, nơi đặt bước warm-up trước khi nhận traffic. Chặng J17 có chủ đề tuỳ chọn so sánh JVM với GraalVM native image, một lựa chọn khác để tránh warm-up. J18.3 dùng profiler để tìm đoạn code đáng benchmark.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j18.2.mastery-warm-up">Giải thích được cho đồng đội vì sao service chậm sau deploy, và đề xuất được cách warm-up hoặc AOT cache kèm điều kiện để nó có hiệu quả.</Check>
+
+<Check id="j18.2.mastery-benchmark">Tự viết được benchmark JMH đúng cho một đoạn code, có baseline, đọc được Score và Error, và nhận ra kết quả bị dead code elimination.</Check>
+
+</Mastery>

@@ -1,0 +1,676 @@
+---
+title: Khoá lạc quan, khoá bi quan và kích thước connection pool
+description: Tạo lost update thật trong Spring bằng 20 request đồng thời, sửa bằng @Version kèm retry và bằng SELECT FOR UPDATE, rồi làm cạn HikariCP để thấy timeout của pool và sửa tận gốc bằng cách rút việc chậm ra khỏi transaction.
+id: j12.3
+step: j12
+prerequisites: [j12.2]
+topics: [j12.khoa-lac-quan-bi-quan, j12.connection-pool, j12.transaction-muc-isolation]
+status: verified
+verified:
+  date: 2026-10-03
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    docker: 29.8.0
+    postgresql: "18.6"
+---
+
+<Goal>
+
+Chọn được giữa khoá lạc quan và khoá bi quan cho một dòng dữ liệu bị tranh chấp, viết retry đúng chỗ, dùng `@Transactional` không rơi vào bẫy, và chỉnh connection pool dựa trên số đo. Học xong bài này, bạn giải thích được:
+
+- Vì sao 20 request "giữ hàng" đều trả 200 mà kho chỉ giảm 2.
+- Vì sao vòng retry đặt trong chính class có `@Transactional` không retry được gì, thậm chí làm mất dữ liệu mà không báo lỗi.
+- Vì sao một lệnh gọi API chậm 100 ms bên trong transaction làm service trả lỗi 500 hàng loạt với `Connection is not available, request timed out`.
+
+</Goal>
+
+<Knowledge>
+
+### Lost update trong JPA
+
+Bài J12.1 đã tạo lost update bằng hai phiên psql. Trong JPA, nó xảy ra mà bạn không viết một câu SQL nào:
+
+```text
+ request 1 (transaction T1)               request 2 (transaction T2)
+ findById(1) -> stock = 100               findById(1) -> stock = 100
+ product.reserve(1) -> stock = 99         product.reserve(1) -> stock = 99
+ commit: UPDATE products SET stock=99     commit: UPDATE products SET stock=99
+         WHERE id=1                               WHERE id=1      (ghi đè T1)
+```
+
+Dirty checking (bài J12.2) sinh `UPDATE` với **giá trị tuyệt đối** đã tính trong Java, không phải `stock = stock - 1`. Ở Read Committed, T2 chờ khoá dòng của T1 rồi ghi đè. Có ba cách chặn:
+
+| Cách | Cơ chế | Hợp khi | Cái giá |
+|---|---|---|---|
+| `UPDATE ... SET stock = stock - ? WHERE stock >= ?` | Database tính trên giá trị mới nhất | Thay đổi đơn giản trên một cột | Logic nghiệp vụ nằm trong SQL |
+| Khoá lạc quan `@Version` | Ghi kèm `WHERE version = ?`; 0 dòng khớp thì báo xung đột | Tranh chấp thấp: hiếm khi hai người sửa cùng lúc | Bên thua nhận lỗi, phải retry hoặc báo người dùng |
+| Khoá bi quan `SELECT ... FOR UPDATE` | Khoá dòng ngay lúc đọc; bên khác chờ | Tranh chấp cao trên ít dòng "nóng" | Giữ khoá và kết nối lâu hơn; có thể deadlock |
+
+### Khoá lạc quan với @Version
+
+Thêm một cột số `version` và đánh dấu field bằng `@Version`. Hibernate tự tăng nó ở mỗi lần cập nhật và đưa giá trị cũ vào điều kiện:
+
+```sql
+update products set name=?,price=?,sku=?,stock=?,version=? where id=? and version=?
+```
+
+Nếu transaction khác đã tăng `version` trước, câu `UPDATE` khớp 0 dòng. Hibernate hiểu đó là xung đột và ném `OptimisticLockException`; Spring bọc nó thành `ObjectOptimisticLockingFailureException`. Không ai phải chờ khoá, nên "lạc quan": cược rằng xung đột hiếm.
+
+Retry đúng cách là chạy lại **cả transaction**: đọc lại dòng với version mới, tính lại, ghi lại. Vì vậy vòng retry phải nằm **ngoài** method `@Transactional`, ở một bean khác gọi vào. Hết số lần thử thì trả `409 Conflict` để client quyết định.
+
+`@Version` còn giải quyết xung đột kéo dài nhiều request: form "sửa sản phẩm" gửi kèm `version` đã đọc, và lần lưu bị từ chối nếu ai đó đã sửa trong lúc bạn đang gõ. Đó chính là cơ chế `ETag` và `If-Match` của HTTP.
+
+### Khoá bi quan
+
+`@Lock(LockModeType.PESSIMISTIC_WRITE)` trên method repository làm Hibernate thêm mệnh đề khoá vào câu `SELECT`. Trên PostgreSQL, Hibernate 7 sinh `for no key update`, một mức khoá dòng nhẹ hơn `for update` một chút: vẫn chặn mọi transaction khác sửa hay khoá dòng đó, nhưng không chặn việc chèn dòng con tham chiếu tới nó qua khoá ngoại. Transaction thứ hai gọi cùng method sẽ **chờ** ở câu `SELECT` tới khi transaction đầu commit, rồi đọc giá trị mới.
+
+Hai rủi ro cần nhớ:
+
+- **Chờ vô hạn:** mặc định PostgreSQL chờ khoá không giới hạn. Đặt giới hạn bằng hint `jakarta.persistence.lock.timeout` (mili giây) hoặc `SET lock_timeout` để request thất bại nhanh thay vì treo.
+- **Deadlock:** T1 khoá sản phẩm A rồi chờ B, T2 khoá B rồi chờ A. PostgreSQL phát hiện và huỷ một bên với `deadlock detected`. Phòng bằng cách luôn khoá theo cùng một thứ tự, ví dụ sắp xếp id trước khi khoá.
+
+<Check id="j12.3.locking-choice">So sánh được câu `UPDATE` nguyên tử, khoá lạc quan và khoá bi quan theo cơ chế, mức tranh chấp phù hợp và cái giá của mỗi cách.</Check>
+
+### @Transactional làm gì, và các bẫy của nó
+
+Spring không sửa code của bạn. Nó tạo một **proxy** bọc bean; lời gọi từ bean khác đi qua proxy, proxy mở transaction rồi mới gọi vào method thật:
+
+```text
+ ProductController ---> [proxy của StockService] ---> StockService.reserve()
+                         1. lấy kết nối từ HikariCP
+                         2. BEGIN (tắt auto-commit)
+                         3. gọi method thật
+                         4. method trả về bình thường -> flush, COMMIT
+                            RuntimeException hoặc Error -> ROLLBACK
+                         5. trả kết nối về pool
+
+ StockService.selfCall() ---> this.reserve()    gọi thẳng, KHÔNG qua proxy:
+                                                 không có transaction nào được mở
+```
+
+| Thuộc tính | Mặc định | Cần biết |
+|---|---|---|
+| `propagation` | `REQUIRED`: dùng transaction đang có, chưa có thì mở mới | `REQUIRES_NEW` tạm treo transaction ngoài và mở transaction riêng (dùng cho ghi log kiểm toán phải còn lại dù nghiệp vụ rollback); nó cần **thêm một kết nối** từ pool |
+| `rollbackFor` | Chỉ rollback với `RuntimeException` và `Error` | Exception **checked** (như `IOException`, `InterruptedException`) làm transaction **commit**. Thêm `rollbackFor = Exception.class` nếu muốn khác. Từ Spring 6.2, `@EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)` đổi mặc định này cho cả ứng dụng |
+| `readOnly` | `false` | `true` báo Hibernate bỏ dirty checking và bỏ flush; driver có thể chuyển kết nối sang chế độ chỉ đọc |
+| `isolation` | Mức mặc định của database | `Isolation.REPEATABLE_READ` hay `SERIALIZABLE` đổi mức cho riêng transaction này (bài J12.1) |
+| `timeout` | Không giới hạn | Số giây tối đa; quá hạn thì rollback |
+
+Ngoài ra, proxy CGLIB (mặc định của Spring Boot) chặn được method `public`, `protected` và package-private (từ Spring 6.0), nhưng không chặn method `private`, và chỉ chặn lời gọi đi qua proxy. Gọi `this.method()` trong cùng class (**self-invocation**) bỏ qua proxy, nên mọi annotation trên method đó không có tác dụng.
+
+<Check id="j12.3.transactional-rules">Giải thích được bằng sơ đồ proxy vì sao self-invocation bỏ qua `@Transactional`, exception checked có làm rollback không, và `REQUIRES_NEW` tốn thêm gì.</Check>
+
+### Kích thước connection pool và timeout
+
+Pool là một hàng đợi: thread nào cần kết nối mà pool hết thì chờ, tối đa `connectionTimeout`, rồi nhận `SQLTransientConnectionException`. Số kết nối cần dùng phụ thuộc **thời gian giữ kết nối** nhiều hơn là số request:
+
+```text
+ kết nối cần ≈ số transaction mỗi giây × thời gian giữ kết nối mỗi transaction
+   200 req/s × 0,005 s (5 ms, chỉ truy vấn)          =  1 kết nối
+   200 req/s × 0,105 s (thêm 100 ms gọi API bên ngoài) = 21 kết nối  -> pool 10 không đủ
+```
+
+Đây là định luật Little: muốn ít kết nối, giữ transaction ngắn. Tài liệu "About Pool Sizing" của HikariCP gợi ý một điểm bắt đầu cho pool **của cả database server**: khoảng gấp đôi số nhân CPU của server database, cộng số ổ đĩa. Database 4 nhân bắt đầu ở khoảng 10 kết nối, chia cho mọi instance của service, rồi đo và chỉnh. Pool lớn hơn không làm database nhanh hơn: các tiến trình PostgreSQL tranh nhau CPU, khoá và bộ nhớ.
+
+| Tham số HikariCP | Mặc định | Gợi ý |
+|---|---|---|
+| `maximumPoolSize` | 10 | Tính theo công thức trên; nhân số instance phải nhỏ hơn `max_connections` của PostgreSQL (mặc định 100), chừa chỗ cho migration và người vận hành |
+| `minimumIdle` | bằng `maximumPoolSize` | Giữ mặc định: pool cố định, không mở kết nối mới đúng lúc tải tăng |
+| `connectionTimeout` | 30 giây | Giảm xuống 1 tới 5 giây để request thất bại nhanh thay vì xếp hàng 30 giây |
+| `maxLifetime` | 30 phút | Đặt ngắn hơn vài giây so với giới hạn tuổi kết nối của database hoặc hạ tầng; firewall cắt kết nối nhàn rỗi thì dùng `keepaliveTime` |
+
+Metric cần theo dõi (Actuator xuất sẵn): `hikaricp.connections.pending` (số thread đang chờ, lớn hơn 0 kéo dài là pool đang thắt cổ chai), `hikaricp.connections.timeout` (số lần chờ quá hạn), `hikaricp.connections.usage` (thời gian giữ kết nối).
+
+<Callout kind="production">
+
+Service đặt hàng gọi cổng thanh toán **bên trong** method `@Transactional`. Bình thường cổng trả lời trong 150 ms và pool 10 kết nối dư sức. Một tối, cổng thanh toán chậm lên 3 giây. Mỗi request giữ kết nối 3 giây, pool cạn trong chưa tới một giây, mọi request khác, kể cả trang xem sản phẩm không liên quan gì tới thanh toán, chờ 30 giây rồi trả 500. Tăng pool lên 50 chỉ dời điểm sập. Cách sửa thật là gọi thanh toán **ngoài** transaction, giảm `connectionTimeout`, và có timeout ngắn cho chính lời gọi HTTP (bài J9.3).
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [Hibernate: Optimistic and pessimistic locking](https://docs.hibernate.org/orm/current/introduction/html_single/#optimistic-and-pessimistic-locking): `@Version` và các `LockMode`.
+- [Locking (Spring Data JPA)](https://docs.spring.io/spring-data/jpa/reference/jpa/locking.html): khai báo `@Lock` trên method repository.
+- [PostgreSQL: Explicit Locking](https://www.postgresql.org/docs/current/explicit-locking.html): mục 13.3.2 Row-Level Locks, bảng xung đột giữa `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`.
+- [Using @Transactional](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html): bảng thuộc tính, quy tắc rollback và ghi chú về self-invocation.
+- [About Pool Sizing (HikariCP)](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing): vì sao pool nhỏ thường nhanh hơn, và công thức điểm bắt đầu.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài J12.2; container `masteva-j12-pg` đang chạy, project ở `~/masteva-j12/shop`. Hai tab Terminal như bài trước: tab 1 chạy ứng dụng (`JAVA_HOME` trỏ tới JDK 25), tab 2 gửi request. Ở tab 2, định nghĩa lại `shopsql`:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql() { docker exec -i masteva-j12-pg psql -U postgres -d shop "$@"; }
+```
+
+</Terminal>
+
+Bài dùng `xargs -P 20` để bắn 20 request `curl` cùng lúc. Số liệu tranh chấp phụ thuộc thời điểm, nên kết quả trên máy bạn có thể lệch vài đơn vị so với bài; điều cần thấy là hình dạng của kết quả.
+
+### 1. Endpoint giữ hàng, và lost update thật
+
+Dừng ứng dụng nếu nó đang chạy. Thêm method nghiệp vụ vào `Product`, một service giữ hàng và một controller:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+P=src/main/java/vn/masteva/shop
+perl -0pi -e 's/(    public int getStock\(\) \{ return stock; \}\n)/$1\n    public void reserve(int quantity) {\n        if (quantity > stock) {\n            throw new IllegalStateException("not enough stock for " + sku);\n        }\n        stock -= quantity;\n    }\n/' $P/Product.java
+cat > $P/ProductRepository.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProductRepository extends JpaRepository<Product, Long> {
+}
+EOF
+cat > $P/StockService.java <<'EOF'
+package vn.masteva.shop;
+
+import java.time.Duration;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class StockService {
+    private final ProductRepository products;
+
+    public StockService(ProductRepository products) {
+        this.products = products;
+    }
+
+    @Transactional
+    public int reserve(long productId, int quantity) throws InterruptedException {
+        Product product = products.findById(productId).orElseThrow();
+        Thread.sleep(Duration.ofMillis(100)); // giả lập việc chậm: gọi dịch vụ chống gian lận
+        product.reserve(quantity);
+        return product.getStock();
+    }
+}
+EOF
+cat > $P/ProductController.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProductController {
+    private final StockService stock;
+    private final ProductRepository products;
+
+    public ProductController(StockService stock, ProductRepository products) {
+        this.stock = stock;
+        this.products = products;
+    }
+
+    public record StockView(long id, String sku, int stock) {
+    }
+
+    @GetMapping("/products/{id}")
+    public StockView get(@PathVariable long id) {
+        Product p = products.findById(id).orElseThrow();
+        return new StockView(p.getId(), p.getSku(), p.getStock());
+    }
+
+    @PostMapping("/products/{id}/reserve")
+    public int reserve(@PathVariable long id, @RequestParam int quantity) throws InterruptedException {
+        return stock.reserve(id, quantity);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+`reserve` không gọi `save()`: sản phẩm là entity managed, nên dirty checking tự ghi `stock` mới khi commit. `Thread.sleep` giả lập một việc chậm 100 ms, như gọi dịch vụ chống gian lận. Nó làm cửa sổ tranh chấp đủ rộng để lần nào bạn cũng thấy lỗi; trên production, cửa sổ hẹp hơn nhưng lỗi vẫn xảy ra, chỉ hiếm hơn và khó tái hiện hơn.
+
+Chạy `./mvnw spring-boot:run` ở tab 1. Ở tab 2, bắn 20 request giữ 1 cuốn "Sách Java" cùng lúc:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+curl -s localhost:20121/products/1; echo
+: > logs/shop.log
+seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST 'localhost:20121/products/1/reserve?quantity=1' | sort | uniq -c
+curl -s localhost:20121/products/1; echo
+grep 'org.hibernate.SQL' logs/shop.log | sed 's/^.*org.hibernate.SQL *: //' | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":1,"sku":"BOOK-JAVA","stock":100}
+  20 200
+{"id":1,"sku":"BOOK-JAVA","stock":98}
+  21 select p1_0.id,p1_0.name,p1_0.price,p1_0.sku,p1_0.stock from products p1_0 where p1_0.id=?
+  20 update products set name=?,price=?,sku=?,stock=? where id=?
+```
+
+</Expected>
+
+Hai mươi lần giữ hàng thành công, kho chỉ giảm 2 (trên máy bạn có thể là 1 tới vài đơn vị). 20 câu `UPDATE` đều chạy, nhưng mỗi câu ghi một con số tuyệt đối đã tính từ giá trị đọc được trước đó. Câu `select` thứ 21 là của lệnh `GET` cuối. Để ý thêm: Hibernate cập nhật **mọi cột**, kể cả `name` và `price` không đổi.
+
+<Check id="j12.3.lab-lost-update">Tái hiện được lost update bằng request đồng thời vào một method `@Transactional`, và chỉ ra trong log SQL vì sao không câu nào báo lỗi.</Check>
+
+### 2. Khoá lạc quan: @Version
+
+Dừng ứng dụng. Thêm cột `version` bằng migration mới, đánh dấu field `@Version`, và trả `409` khi xung đột:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+P=src/main/java/vn/masteva/shop
+cat > src/main/resources/db/migration/V4__product_version.sql <<'EOF'
+ALTER TABLE products ADD COLUMN version BIGINT NOT NULL DEFAULT 0;
+EOF
+perl -0pi -e 's/    private int stock;\n/    private int stock;\n\n    \@Version\n    private long version;\n/; s/import jakarta.persistence.Table;/import jakarta.persistence.Table;\nimport jakarta.persistence.Version;/' $P/Product.java
+perl -0pi -e 's/(    \@PostMapping)/    \@ExceptionHandler(ObjectOptimisticLockingFailureException.class)\n    public ProblemDetail conflict(ObjectOptimisticLockingFailureException e) {\n        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, "stock changed concurrently, retry");\n    }\n\n$1/; s/(import org.springframework.web.bind.annotation.GetMapping;)/import org.springframework.http.HttpStatus;\nimport org.springframework.http.ProblemDetail;\nimport org.springframework.orm.ObjectOptimisticLockingFailureException;\nimport org.springframework.web.bind.annotation.ExceptionHandler;\n$1/' $P/ProductController.java
+sed -n '/private int stock/,/private long version/p' $P/Product.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    private int stock;
+
+    @Version
+    private long version;
+```
+
+</Expected>
+
+`DEFAULT 0` cho các dòng đã có một version ban đầu. `ProblemDetail` trả lỗi theo RFC 9457 như bài J10.3 và J11. Chạy lại ứng dụng ở tab 1 (log có `Migrating schema "public" to version "4 - product version"`), rồi đặt lại kho về 100 và bắn lại 20 request:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+shopsql -d shopapp -c 'UPDATE products SET stock = 100 WHERE id = 1'
+: > logs/shop.log
+seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST 'localhost:20121/products/1/reserve?quantity=1' | sort | uniq -c
+curl -s localhost:20121/products/1; echo
+grep 'org.hibernate.SQL' logs/shop.log | sed 's/^.*org.hibernate.SQL *: //' | sort | uniq -c
+```
+
+</Terminal>
+
+<Predict question="Bao nhiêu request thành công, và kho còn bao nhiêu?">
+
+```text
+UPDATE 1
+   2 200
+  18 409
+{"id":1,"sku":"BOOK-JAVA","stock":98}
+  21 select p1_0.id,p1_0.name,p1_0.price,p1_0.sku,p1_0.stock,p1_0.version from products p1_0 where p1_0.id=?
+  20 update products set name=?,price=?,sku=?,stock=?,version=? where id=? and version=?
+```
+
+Kho giảm đúng bằng số request thành công: dữ liệu đã nhất quán. Nhưng chỉ 2 trên 20 người giữ được hàng, dù kho còn 98. Pool có 10 kết nối, nên request chạy thành từng đợt khoảng 10; trong mỗi đợt, mọi transaction đọc cùng `version`, người commit đầu thắng, chín người còn lại khớp 0 dòng. Khoá lạc quan đúng, nhưng với một dòng bị tranh chấp dữ dội như thế này, nó tạo ra rất nhiều lỗi.
+
+</Predict>
+
+Xem một xung đột tận mắt: hai request song song.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -X POST 'localhost:20121/products/1/reserve?quantity=1' & curl -s -X POST 'localhost:20121/products/1/reserve?quantity=1'; wait; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+97{"detail":"stock changed concurrently, retry","instance":"/products/1/reserve","status":409,"title":"Conflict"}
+```
+
+</Expected>
+
+Một request trả số tồn kho mới, request kia nhận `409` dạng `application/problem+json`. Thứ tự hai phần có thể đảo ngược.
+
+<Check id="j12.3.lab-version-conflict">Thêm được `@Version` bằng migration, thấy điều kiện `and version=?` trong SQL, và trả `409 Conflict` khi gặp `ObjectOptimisticLockingFailureException`.</Check>
+
+### 3. Retry ngoài transaction
+
+Dừng ứng dụng. Cho controller thử lại tối đa 3 lần. Mỗi lần gọi `stock.reserve(...)` đi qua proxy, nên là một transaction mới, đọc lại `version` mới:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+perl -0pi -e 's/        return stock.reserve\(id, quantity\);\n/        for (int attempt = 1; ; attempt++) {\n            try {\n                return stock.reserve(id, quantity);\n            } catch (ObjectOptimisticLockingFailureException e) {\n                if (attempt == 3) {\n                    throw e;\n                }\n            }\n        }\n/' src/main/java/vn/masteva/shop/ProductController.java
+sed -n '/@PostMapping/,/^    }$/p' src/main/java/vn/masteva/shop/ProductController.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    @PostMapping("/products/{id}/reserve")
+    public int reserve(@PathVariable long id, @RequestParam int quantity) throws InterruptedException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return stock.reserve(id, quantity);
+            } catch (ObjectOptimisticLockingFailureException e) {
+                if (attempt == 3) {
+                    throw e;
+                }
+            }
+        }
+    }
+```
+
+</Expected>
+
+Chạy lại ứng dụng, rồi:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -d shopapp -c 'UPDATE products SET stock = 100 WHERE id = 1'
+seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST 'localhost:20121/products/1/reserve?quantity=1' | sort | uniq -c
+curl -s localhost:20121/products/1; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+UPDATE 1
+   6 200
+  14 409
+{"id":1,"sku":"BOOK-JAVA","stock":94}
+```
+
+</Expected>
+
+Retry tăng số người thành công từ 2 lên khoảng 6, và kho vẫn khớp. Với 20 người cùng giành một dòng, phải retry rất nhiều lần mới đủ; mỗi lần retry lại tốn thêm một transaction. Đó là tín hiệu nên dùng khoá bi quan cho dòng này.
+
+<Predict question="Nếu dời vòng retry vào trong StockService, thành một method public gọi this.reserve(...), chuyện gì xảy ra?">
+
+Lời gọi `this.reserve(...)` không đi qua proxy (self-invocation), nên không có transaction nào bao quanh nó. `findById` chạy trong transaction riêng của repository rồi đóng ngay; sản phẩm trả về đã **detached**. `product.reserve(5)` đổi field trong bộ nhớ, method trả về số mới, nhưng không có gì được ghi xuống database và cũng không có exception nào. Bài này đã thử đúng kịch bản đó trên sản phẩm 2: API trả `95`, còn `GET /products/2` vẫn báo `100`. Vòng retry vì thế cũng không bao giờ thấy `ObjectOptimisticLockingFailureException`.
+
+</Predict>
+
+### 4. Khoá bi quan: SELECT ... FOR UPDATE
+
+Dừng ứng dụng. Thêm method repository có `@Lock`, một method service dùng nó, và một endpoint mới:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/ProductRepository.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.LockModeType;
+import java.util.Optional;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+
+public interface ProductRepository extends JpaRepository<Product, Long> {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select p from Product p where p.id = :id")
+    Optional<Product> findByIdForUpdate(long id);
+}
+EOF
+perl -0pi -e 's/(        return product.getStock\(\);\n    \}\n)/$1\n    \@Transactional\n    public int reserveLocked(long productId, int quantity) throws InterruptedException {\n        Product product = products.findByIdForUpdate(productId).orElseThrow();\n        Thread.sleep(Duration.ofMillis(100));\n        product.reserve(quantity);\n        return product.getStock();\n    }\n/' $P/StockService.java
+perl -0pi -e 's/(\n\}\n)$/\n\n    \@PostMapping("\/products\/{id}\/reserve-locked")\n    public int reserveLocked(\@PathVariable long id, \@RequestParam int quantity) throws InterruptedException {\n        return stock.reserveLocked(id, quantity);\n    }\n}\n/' $P/ProductController.java
+```
+
+</Terminal>
+
+Chạy lại ứng dụng, rồi bắn 20 request vào endpoint mới, có đo thời gian:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+shopsql -d shopapp -c 'UPDATE products SET stock = 100 WHERE id = 1'
+: > logs/shop.log
+time (seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST 'localhost:20121/products/1/reserve-locked?quantity=1' | sort | uniq -c)
+curl -s localhost:20121/products/1; echo
+grep 'org.hibernate.SQL' logs/shop.log | sed 's/^.*org.hibernate.SQL *: //' | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+UPDATE 1
+  20 200
+( seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST )  0.05s user 0.08s system 5% cpu 2.388 total
+{"id":1,"sku":"BOOK-JAVA","stock":80}
+   1 select p1_0.id,p1_0.name,p1_0.price,p1_0.sku,p1_0.stock,p1_0.version from products p1_0 where p1_0.id=?
+  20 select p1_0.id,p1_0.name,p1_0.price,p1_0.sku,p1_0.stock,p1_0.version from products p1_0 where p1_0.id=? for no key update of p1_0
+  20 update products set name=?,price=?,sku=?,stock=?,version=? where id=? and version=?
+```
+
+</Expected>
+
+Dòng `time` có định dạng của zsh; bash in `real`, `user`, `sys` trên ba dòng. Cả 20 request thành công, kho giảm đúng 20. Cái giá nằm ở thời gian: khoảng 2,4 giây, vì 20 transaction lần lượt chờ nhau, mỗi transaction giữ khoá 100 ms. `@Version` vẫn ở đó và vẫn được kiểm tra, nhưng không bao giờ xung đột vì không ai đọc được dòng này khi người khác đang giữ khoá.
+
+<Check id="j12.3.lab-pessimistic">Dùng được `@Lock(PESSIMISTIC_WRITE)`, thấy `for no key update` trong SQL, và giải thích được vì sao mọi request thành công nhưng tổng thời gian tăng.</Check>
+
+### 5. Làm cạn connection pool
+
+Mỗi request đang chờ khoá ở bước 4 vẫn **giữ một kết nối**. Thu nhỏ pool để thấy điều đó, đặt timeout ngắn, và mở endpoint metric của Actuator. Dừng ứng dụng, rồi:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+cat >> src/main/resources/application.properties <<'EOF'
+spring.datasource.hikari.maximum-pool-size=3
+spring.datasource.hikari.connection-timeout=500
+management.endpoints.web.exposure.include=health,metrics
+EOF
+```
+
+</Terminal>
+
+Chạy lại ứng dụng ở tab 1, rồi:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+shopsql -d shopapp -c 'UPDATE products SET stock = 100 WHERE id = 1'
+: > logs/shop.log
+seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST 'localhost:20121/products/1/reserve-locked?quantity=1' | sort | uniq -c
+grep -m1 'Connection is not available' logs/shop.log | sed 's/^.*\] //'
+grep -m1 'Request processing failed' logs/shop.log | sed 's/^.*exception \[//'
+curl -s localhost:20121/actuator/metrics/hikaricp.connections.timeout; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+UPDATE 1
+   7 200
+  13 500
+org.hibernate.orm.jdbc.error             : HikariPool-1 - Connection is not available, request timed out after 501ms (total=3, active=3, idle=0, waiting=12)
+Request processing failed: org.springframework.transaction.CannotCreateTransactionException: Could not open JPA EntityManager for transaction] with root cause
+{"availableTags":[{"tag":"pool","values":["HikariPool-1"]}],"description":"Connection timeout total count","measurements":[{"statistic":"COUNT","value":13.0}],"name":"hikaricp.connections.timeout"}
+```
+
+</Expected>
+
+Đọc dòng lỗi của HikariCP: `total=3, active=3, idle=0` là cả ba kết nối đang được giữ, `waiting=12` là số thread khác còn đang xếp hàng lúc lỗi này xảy ra. Khoá bi quan bắt các transaction đi lần lượt, mỗi lượt 100 ms, và transaction đang chờ khoá vẫn giữ kết nối của nó; vì vậy ba kết nối chỉ hoàn thành khoảng 10 transaction mỗi giây. Request nào chờ pool quá 500 ms thì bị loại, nên chỉ khoảng 6, 7 request đầu kịp chạy. Request thất bại ngay ở bước mở transaction, trước khi chạy câu SQL nào. Metric `hikaricp.connections.timeout` bằng đúng số request lỗi 500: đây là con số nên có cảnh báo trên production. Tỷ lệ thành công và thất bại trên máy bạn có thể lệch một hai request.
+
+<Check id="j12.3.lab-pool-timeout">Làm cạn được pool, đọc được `total`, `active`, `idle`, `waiting` trong thông báo lỗi của HikariCP, và xem được metric `hikaricp.connections.timeout`.</Check>
+
+### 6. Sửa tận gốc: việc chậm ra khỏi transaction
+
+Tăng pool chỉ là chữa triệu chứng. Thời gian giữ kết nối mới là nguyên nhân: 100 ms "gọi dịch vụ chống gian lận" không cần database. Dừng ứng dụng, chuyển `Thread.sleep` từ `StockService.reserveLocked` sang controller, **trước** lời gọi service:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+P=src/main/java/vn/masteva/shop
+perl -0pi -e 's/(findByIdForUpdate\(productId\).orElseThrow\(\);\n)        Thread.sleep\(Duration.ofMillis\(100\)\);\n/$1/; s/(public int reserveLocked\(long productId, int quantity\)) throws InterruptedException/$1/' $P/StockService.java
+perl -0pi -e 's/        return stock.reserveLocked\(id, quantity\);/        Thread.sleep(Duration.ofMillis(100)); \/\/ việc chậm, giờ nằm ngoài transaction\n        return stock.reserveLocked(id, quantity);/; s/(import org.springframework.http.HttpStatus;)/import java.time.Duration;\n$1/' $P/ProductController.java
+sed -n '/public int reserveLocked/,/^    }/p' $P/StockService.java $P/ProductController.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    public int reserveLocked(long productId, int quantity) {
+        Product product = products.findByIdForUpdate(productId).orElseThrow();
+        product.reserve(quantity);
+        return product.getStock();
+    }
+    public int reserveLocked(@PathVariable long id, @RequestParam int quantity) throws InterruptedException {
+        Thread.sleep(Duration.ofMillis(100)); // việc chậm, giờ nằm ngoài transaction
+        return stock.reserveLocked(id, quantity);
+    }
+```
+
+</Expected>
+
+Chạy lại ứng dụng, vẫn với pool 3 kết nối và timeout 500 ms:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -d shopapp -c 'UPDATE products SET stock = 100 WHERE id = 1'
+time (seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST 'localhost:20121/products/1/reserve-locked?quantity=1' | sort | uniq -c)
+curl -s localhost:20121/products/1; echo
+curl -s localhost:20121/actuator/metrics/hikaricp.connections.timeout; echo
+shopsql -c 'SHOW max_connections'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+UPDATE 1
+  20 200
+( seq 20 | xargs -P 20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST )  0.05s user 0.08s system 38% cpu 0.332 total
+{"id":1,"sku":"BOOK-JAVA","stock":80}
+{"availableTags":[{"tag":"pool","values":["HikariPool-1"]}],"description":"Connection timeout total count","measurements":[{"statistic":"COUNT","value":0.0}],"name":"hikaricp.connections.timeout"}
+ max_connections
+-----------------
+ 100
+(1 row)
+```
+
+</Expected>
+
+Cùng 3 kết nối, cùng khoá bi quan: cả 20 request thành công trong khoảng 0,3 giây thay vì 2,4 giây, không lần nào chờ pool quá hạn. Transaction giờ chỉ còn vài mili giây đọc, khoá và ghi. `max_connections = 100` là trần của cả database server: 4 instance mỗi instance pool 10 là 40, còn chỗ cho migration, công cụ giám sát và người vận hành.
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Mọi request ở bước 1 trả `500` với `not enough stock`: kho đã về 0 sau nhiều lần thử. Chạy lại câu `UPDATE products SET stock = 100`.
+- Bước 2 không có `409` nào, kho vẫn lệch: ứng dụng chưa được khởi động lại sau khi thêm `@Version`, hoặc thiếu migration V4. Log khởi động phải có `version "4 - product version"`.
+- `Schema validation: missing column [version] in table [products]`: đã thêm field `@Version` nhưng file `V4__product_version.sql` sai tên hoặc sai thư mục.
+- Có mã `000` hoặc tổng số đếm ít hơn 20: một số `curl` lỗi kết nối; giảm `-P 20` xuống `-P 10`.
+- `hikaricp.connections.timeout` báo `404`: thiếu dòng `management.endpoints.web.exposure.include` hoặc chưa khởi động lại.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Chặng J12 kết thúc ở đây, nên xoá container và thư mục lab.
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá vĩnh viễn container `masteva-j12-pg` cùng **mọi dữ liệu** trong cả hai database `shop` và `shopapp`, rồi xoá thư mục `~/masteva-j12` gồm mã nguồn ứng dụng. Chỉ chạy khi chắc không cần nữa. Image `postgres:18-alpine` vẫn được giữ lại.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+docker rm -f masteva-j12-pg
+rm -rf ~/masteva-j12
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao bước 2 chỉ có 2 request thành công, mà không phải đúng 1 hay đúng 10?">
+
+Vì pool 10 kết nối chia 20 request thành hai đợt. Trong đợt đầu, khoảng 10 transaction cùng đọc `version = 0` gần như cùng lúc, cùng ngủ 100 ms, rồi cùng cố ghi: người đầu tiên tới được câu `UPDATE` thắng, những người còn lại chờ khoá dòng của nó, rồi khớp 0 dòng. Đợt hai đọc `version = 1` sau khi đợt một xong, và lặp lại. Thay đổi kích thước pool hay thời gian ngủ, con số này đổi theo. Đây là lý do khoá lạc quan được mô tả là hợp với tranh chấp **thấp**: khi tranh chấp cao, phần lớn công việc bị vứt đi.
+
+</Reveal>
+
+<Reveal title="Spring có @Retryable, sao không dùng thay vòng for?">
+
+Có. Spring Framework 7 đưa `@Retryable` vào chính framework, trong module `spring-context` (bật bằng `@EnableResilientMethods`), và thư viện Spring Retry có annotation cùng tên từ trước. Chúng đều là proxy, nên vẫn chịu đúng các luật ở bài này: phải gọi từ bean khác, và proxy retry phải nằm **ngoài** proxy transaction, nếu không mỗi lần thử lại chạy trong cùng một transaction đã hỏng. Đặt `@Retryable` và `@Transactional` trên hai bean khác nhau là cách rõ ràng nhất. Nhớ thêm độ trễ có jitter giữa các lần thử, nếu không các bên xung đột lại đâm vào nhau đúng cùng lúc.
+
+</Reveal>
+
+<Reveal title="Method reserve khai báo throws InterruptedException. Đó có phải một cái bẫy?">
+
+Có. `InterruptedException` là exception checked, nên nếu nó bay ra khỏi method `@Transactional`, Spring **commit** chứ không rollback. Ở đây nó chỉ xảy ra khi thread bị ngắt trong lúc ngủ, trước khi đổi gì, nên vô hại. Nhưng mẫu chung rất nguy hiểm: một method ghi ba bảng, ném `IOException` ở bước giữa, và hai bảng đầu được commit. Hoặc khai báo `@Transactional(rollbackFor = Exception.class)`, hoặc bọc exception checked thành exception runtime trước khi ra khỏi method.
+
+</Reveal>
+
+<Reveal title="Khoá bi quan trên nhiều dòng thì phòng deadlock thế nào?">
+
+Giỏ hàng có sách Java và cốc; một giỏ khác có cốc và sách Java. Nếu mỗi request khoá sản phẩm theo thứ tự trong giỏ, T1 giữ sách chờ cốc, T2 giữ cốc chờ sách: PostgreSQL phát hiện vòng chờ sau `deadlock_timeout` (mặc định 1 giây) và huỷ một bên với `ERROR: deadlock detected`. Cách phòng: sắp xếp id rồi khoá theo thứ tự đó, hoặc khoá cả nhóm trong một câu `SELECT ... WHERE id IN (...) ORDER BY id FOR NO KEY UPDATE`. Vẫn phải có retry cho trường hợp còn sót, vì deadlock cũng là một lỗi tạm thời.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI phân tích một log `ObjectOptimisticLockingFailureException` hay `Connection is not available`, hoặc ước lượng kích thước pool từ số request và thời gian truy vấn. AI hay đề xuất tăng `maximumPoolSize` lên 50 hay 100 mà không hỏi thời gian giữ kết nối, hay đặt vòng retry ngay trong method `@Transactional`, và hay quên rằng exception checked không làm rollback. Kiểm tra lại bằng cách chạy chính kịch bản `xargs -P` như bài này và đọc metric `hikaricp.connections.timeout`, `pending` trước và sau thay đổi.
+
+</Callout>
+
+<Callout kind="link">
+
+J10.2 dùng `Idempotency-Key` để retry an toàn ở tầng HTTP; bài này retry ở tầng transaction. J14 đưa thao tác giữ hàng sang xử lý bất đồng bộ qua hàng đợi. J15 đặt cảnh báo trên metric HikariCP và tracing cho truy vấn chậm. J18 đo hiệu năng dưới tải thật thay cho `xargs`.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j12.3.mastery-locking">Chọn được khoá lạc quan hay bi quan cho một tình huống tranh chấp cụ thể, cài đặt được bằng `@Version` hoặc `@Lock`, và đặt retry đúng chỗ ngoài transaction.</Check>
+
+<Check id="j12.3.mastery-pool">Ước lượng được kích thước connection pool từ thời gian giữ kết nối, giải thích được vì sao pool lớn hơn không làm database nhanh hơn, và tìm được nguyên nhân pool cạn từ log và metric.</Check>
+
+</Mastery>

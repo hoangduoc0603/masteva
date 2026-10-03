@@ -15,6 +15,7 @@ Cập nhật lần cuối: 03/10/2026. File này giúp một session mới biế
 | **Khung chi tiết chủ đề** | Sửa P0 của critique: tóm tắt, tài liệu chính thức, trạng thái trống có hướng đi, nút Trước/Tiếp, chip "Bài", "Học tiếp" vào thẳng bài khi có. Nội dung 67 chủ đề cấp Nền tảng Java (J1–J10), link kiểm 200 ngày 03/10/2026. `pnpm verify` xanh: 69 unit, 39 E2E | `design/topic-drawer.html`, `design/components/TopicDrawer.md` |
 | **Luồng Java dùng thử được** | Nội dung 145 chủ đề Java (J1–J20: tóm tắt và tài liệu chính thức, link kiểm 200 ngày 03/10/2026); 3 bài J1 (J1.1 JDK/javac/jshell và J1.3 Git, Javadoc đã kiểm chứng trên macOS 14.4.1, Java 25.0.3, Git 2.39.3; J1.2 IDE và debugger còn nháp vì có bước chỉ làm trên IDE); giao diện bài học theo Night Lab (`src/app/lesson.css`); hoàn thiện trang roadmap sau critique (một màu "đã xong", thanh Học tiếp mobile chỉ hiện khi cần, vùng chạm 44px, khung chi tiết đọc được bằng trình đọc màn hình, mở cấp thu gọn khi link trỏ vào); sửa lỗi tiến độ (nhập file, quota, `__proto__`); `format()` tách khỏi `messages.ts` (JS giảm ~11 KB gzip mỗi trang). `pnpm verify` xanh: 75 unit, 47 E2E | `content/steps/j1/`, `design/components/` |
 | **Cấp Nền tảng Java đủ bài** | 25 bài cho J2–J10 (mỗi chặng 2–3 bài, lab chạy thật bằng JDK 25.0.3, Maven 3.9.9, Docker 29.8 cho Testcontainers; tất cả đã kiểm chứng); ba reviewer độc lập soát kiến thức, đã sửa mọi lỗi (JEP 513, `strip`, HashMap treeify, quy tắc version plugin Maven, Testcontainers với Docker 29, bản nháp Idempotency-Key đã hết hạn…). D1.1 kiểm chứng trong VM Lima. Khung chi tiết tải nội dung từ `topics.json` (ADR-008): HTML trang Java 147 → 30 KB gzip. `pnpm verify` xanh: 76 unit, 47 E2E | `content/steps/j2…j10/`, `docs/architecture.md` ADR-008 |
+| **Roadmap Java hoàn chỉnh** | 63 bài cho J1–J20, phủ mọi chủ đề chính và cả 7 chủ đề tuỳ chọn (JPMS, WebFlux/Quarkus, jOOQ/MongoDB, Spring Batch, GraalVM native image); tất cả đã kiểm chứng bằng lab chạy thật (Spring Boot 4.1.1, PostgreSQL 18, Keycloak, Jaeger, Redis, Kafka, Testcontainers, Jib, Buildpacks, GraalVM). Mỗi chặng qua một reviewer độc lập và một vòng sửa. Chuẩn nội dung thêm quy tắc cho bước làm trên giao diện (kiểm bằng công cụ dòng lệnh tương đương). `pnpm verify` xanh: 76 unit, 47 E2E | `content/steps/j1…j20/` |
 | Công cụ cho Claude Code | Đã cài cho project: plugin Impeccable, frontend-design, Superpowers; skill web-design-guidelines, vercel-react-best-practices | `.claude/settings.json`, `.claude/skills/` |
 
 ## Quyết định đã chốt
@@ -37,10 +38,10 @@ Repo local, nhánh mặc định `master`. Ngày 03/10/2026 có 3 commit; commit
 
 ## Bước tiếp theo
 
-1. **Người dùng thử luồng Java cấp Nền tảng** (J1–J10, 28 bài) trên bản build, ghi lại chỗ vướng.
-2. **Bài cho cấp Middle (J11–J17) và Senior (J18–J20)** theo cùng quy trình: mỗi chặng một agent viết và chạy lab thật, rồi reviewer soát kiến thức. Cần Spring Boot, PostgreSQL, Kafka, Redis qua Docker.
-3. **J1.2** còn nháp: cần cách kiểm chứng bước làm trên IDE.
-4. **Sau khi luồng Java chuẩn:** nội dung chủ đề và bài cho DevOps, Microservices; đề cương hai dự án; trang `/setup`.
+1. **Người dùng học thử roadmap Java** (63 bài) và ghi lại chỗ vướng; ưu tiên sửa nội dung theo phản hồi thật.
+2. **Roadmap DevOps** theo đúng quy trình Java: tóm tắt và tài liệu cho chủ đề, bài cho từng chặng (lab trên VM Lima, Docker, Kubernetes local), review và sửa. Sau đó Microservices.
+3. **Đề cương hai dự án** (Neobank, Hub hội thoại) và trang `/setup` chuẩn bị môi trường.
+4. Kết nối GitHub và Cloudflare Pages khi người dùng sẵn sàng.
 
 ## Vấn đề đã biết
 
@@ -53,6 +54,8 @@ Repo local, nhánh mặc định `master`. Ngày 03/10/2026 có 3 commit; commit
 - Tên chặng, tên chủ đề và mô tả roadmap chỉ có tiếng Việt (`meta.json`, `content/roadmaps/*.json`); cần đọc `meta.en.json` khi có bản tiếng Anh.
 - Chủ đề DevOps, Microservices chưa có `summary` và `resources`; khung chi tiết hiện trạng thái trống kèm nút Trước/Tiếp.
 - `src/app/tokens.css` và `src/app/roadmap.css` là bản chép của `design/`; `src/app/lesson.css` chuyển thể từ `design/components.css`. Sửa `design/` thì cập nhật lại.
+- Bài Java dài 450–1050 dòng (lab đầy đủ trong heredoc); HTML bài nặng nhất khoảng 67 KB gzip, trong ngân sách. Một số mốc phiên bản (Spring Boot 4.1.1, JDK 25, Jackson 3.2, Kafka 4.3…) sẽ cũ dần; `verified` ghi ngày và phiên bản để biết khi nào cần rà lại.
+- Lab J12.4 cần biến `GLIBC_TUNABLES` vì kernel VM của Docker Desktop (7.0.12) xung đột với MongoDB 8/9; bỏ được khi Docker Desktop lên kernel 7.0.14.
 - Header CSP trong `public/_headers` chưa được kiểm thử trên Cloudflare Pages.
 - Lighthouse CI chưa cài.
 

@@ -1,0 +1,598 @@
+---
+title: GraalVM native image
+description: Biên dịch một ứng dụng Spring Boot thành file thực thi gốc bằng GraalVM, đo thời gian khởi động, bộ nhớ, kích thước và thời gian build so với JVM và AOT cache, rồi va vào giới hạn closed world và sửa bằng RuntimeHints.
+id: j17.4
+step: j17
+prerequisites: [j17.3]
+topics: [j17.graalvm-native-image]
+status: verified
+verified:
+  date: 2026-10-04
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.9
+    spring-boot: 4.1.1
+    graalvm: GraalVM CE 25.4.4.1.1 (JDK 25.0.4.1.1)
+    native-build-tools: 1.1.8
+---
+
+<Goal>
+
+Biết khi nào nên đóng gói một ứng dụng Java thành **native image** thay vì chạy trên JVM, và trả giá gì cho lựa chọn đó. Bạn tự build, tự đo, rồi tự làm hỏng ứng dụng theo đúng những cách native image hay hỏng. Học xong bài này, bạn giải thích được:
+
+- Vì sao cùng một service khởi động mất 1 giây trên JVM nhưng chưa tới 0,1 giây khi là native, và vì sao với cờ build mặc định điều đó không làm nó xử lý nhanh hơn khi đã chạy lâu (cờ `-O3` thì khác).
+- Vì sao code chạy tốt trên JVM lại ném `ClassNotFoundException` trong native image, dù class nằm ngay trong project.
+- Vì sao bật một property lúc chạy không tạo ra bean như trên JVM.
+
+</Goal>
+
+<Knowledge>
+
+### Native image là gì
+
+Trên JVM, file JAR chứa bytecode. Lúc chạy, HotSpot nạp class, kiểm tra, thông dịch rồi mới dần biên dịch phần nóng bằng JIT (J18.2 sẽ đi sâu). **Native image** làm hết việc đó **trước khi chạy** (AOT, ahead-of-time): công cụ `native-image` của GraalVM phân tích toàn bộ ứng dụng lúc build và sinh ra một file thực thi của hệ điều hành, chạy được mà không cần cài JRE.
+
+```text
+ mvn -Pnative native:compile
+   |
+   |  1. Spring AOT (goal process-aot): refresh ApplicationContext ở chế độ AOT
+   |     lúc build (chỉ tạo bean definition, chưa tạo bean), sinh code Java
+   |     đăng ký bean thay cho reflection, và file hint (reflection, resource, proxy)
+   v
+ target/classes + target/spring-aot + các JAR dependency
+   |
+   |  2. native-image: phân tích từ main(), giữ class, method, field "tới được",
+   |     bỏ toàn bộ phần còn lại
+   |  3. chụp các object tạo lúc build vào image heap
+   |  4. biên dịch AOT toàn bộ bằng Graal compiler, liên kết bằng trình biên dịch C
+   v
+ target/catalog-native    file thực thi (Mach-O trên macOS, ELF trên Linux)
+                          = mã máy + image heap + Substrate VM
+```
+
+**Substrate VM** là runtime thu gọn đi kèm file thực thi: GC, thread, xử lý exception. Nó không có JIT và không có trình thông dịch bytecode. Vì thế native image khởi động gần như tức thì: không phải nạp class, không có giai đoạn thông dịch, bean Spring đã được sinh sẵn thành code. Cái giá là mọi thứ phải được biết **lúc build**.
+
+<Check id="j17.4.native-pipeline">Kể được bốn bước từ `mvn -Pnative native:compile` tới file thực thi, và giải thích được vì sao native image khởi động nhanh.</Check>
+
+### Giả định closed world
+
+Để biết cái gì "tới được", `native-image` giả định **closed world** (thế giới đóng): mọi code sẽ chạy đều đã có mặt lúc build, và đường đi tới nó thấy được qua phân tích tĩnh. Những gì Java vẫn quyết định lúc chạy thì phân tích tĩnh không thấy:
+
+| Tính năng | Trên JVM | Trong native image | Cách xử lý |
+|---|---|---|---|
+| Reflection với tên động (`Class.forName(tênTừCấuHình)`) | Tìm class lúc chạy | Class không đăng ký thì như không tồn tại | Đăng ký bằng `RuntimeHints` hoặc `@RegisterReflection` |
+| Resource (`getResource("x.json")`) | Đọc từ classpath | Chỉ file đã khai báo mới được nhúng | `hints.resources()` |
+| JDK dynamic proxy | Tạo lúc chạy | Bộ interface phải khai báo trước | `hints.proxies()` |
+| Nạp class mới (plugin JAR, sinh bytecode lúc chạy) | Được | Không làm được | Không có cách; mọi plugin phải có lúc build |
+| Bean theo `@ConditionalOnProperty`, `@Profile` | Quyết định lúc khởi động | Chốt lúc build | Đặt property lúc build, hoặc đừng dùng điều kiện cho thứ đổi theo môi trường |
+
+Bạn không phải tự khai báo phần lớn những thứ này. **Spring AOT** chạy lúc build, sinh code tạo bean thay cho reflection và ghi hint cho controller, Jackson, `@ConfigurationProperties`. Với thư viện ngoài, plugin Maven của GraalVM tải **GraalVM Reachability Metadata Repository**, kho metadata do cộng đồng duy trì cho logback, Tomcat, Jackson. Phần còn lại là code của chính bạn dùng reflection theo cách không ai đoán trước được, và đó là chỗ bạn phải viết hint.
+
+<Check id="j17.4.closed-world">Giải thích được closed world, kể được ba thứ native image không tự thấy, và cách khai báo từng thứ.</Check>
+
+### Đánh đổi: khi nào chọn native
+
+JDK 25 còn một cách khác rút ngắn khởi động, J18.2 sẽ đi sâu: **AOT cache**. Chạy ứng dụng một lần để JVM ghi class đã nạp, đã liên kết và profile method vào một file; các lần sau đọc lại file đó. Ba lựa chọn đặt cạnh nhau (con số đo trong lab của bài này, trên Mac M1 Pro):
+
+| | JVM thường | JVM + Spring AOT + AOT cache | Native image |
+|---|---|---|---|
+| Thời gian build | Vài giây (`package`) | Thêm vài giây giải nén và chạy huấn luyện | 1 tới 1,5 phút, đỉnh 2,8 tới 3,5 GB RAM trên máy 16 GB |
+| Artifact | JAR 19 MB, cần JRE | JAR và cache 50 MB, cần đúng JDK đã tạo cache | File 65 MB cho đúng một hệ điều hành và kiến trúc CPU |
+| Khởi động | Khoảng 1 giây | Khoảng 0,25 giây | 0,03 tới 0,07 giây |
+| RSS sau 500 request | 150 tới 230 MB | 150 tới 185 MB | 64 MB |
+| Mã chạy lâu, nặng CPU | Nhanh nhất nhờ JIT | Như JVM thường | Với cờ mặc định, chậm hơn JVM sau warm-up khoảng 20% trong lab; `-O3` cho native vượt lên ở bước 8 |
+| GC | G1 mặc định, nhiều lựa chọn | Như JVM thường | Serial GC; G1 chỉ có ở Oracle GraalVM trên Linux |
+| Chẩn đoán | JFR, jcmd, heap dump đầy đủ | Như JVM thường | Phải bật lúc build bằng `--enable-monitoring`, một phần còn experimental |
+| Đổi hành vi lúc chạy | Tự do | Tập bean bị khoá lúc build | Tập bean và class bị khoá lúc build |
+
+Chọn native khi khởi động và bộ nhớ quyết định chi phí: CLI, function serverless, service scale từ 0, sidecar chạy hàng trăm bản. Giữ JVM khi service chạy lâu với tải đều: throughput đỉnh, công cụ chẩn đoán và vòng build nhanh đáng giá hơn vài trăm mili giây khởi động. AOT cache nằm giữa: không đổi gì trong code, lấy lại phần lớn thời gian khởi động, nhưng không giảm bộ nhớ.
+
+<Callout kind="production">
+
+Một đội chuyển service tính giá sang native image để giảm bộ nhớ trên Kubernetes. Thời gian CI tăng từ 2 lên 9 phút. Hai tuần sau, một nhánh code hiếm khi chạy, dùng thư viện đọc file cấu hình bằng reflection, ném `ClassNotFoundException` trên production: test chỉ chạy trên JVM nên không bắt được. Bài học của họ: nếu ship native, chạy test trong native (`mvn -PnativeTest test`), và đo lại throughput dưới tải thật trước khi quyết định. Service đó cuối cùng quay về JVM với AOT cache; còn các job batch chạy 30 giây mỗi lần thì giữ native.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [Native Image](https://www.graalvm.org/latest/reference-manual/native-image/): cách build bằng Maven hoặc trực tiếp bằng `native-image`; đọc thêm phần "Native Image and Third-Party Libraries" về metadata của thư viện.
+- [Introducing GraalVM Native Images](https://docs.spring.io/spring-boot/reference/packaging/native-image/introducing-graalvm-native-images.html): khác biệt với JVM, các file Spring AOT sinh ra, và giới hạn về profile, `@ConditionalOnProperty`.
+- [Ahead of Time Optimizations (Spring Framework)](https://docs.spring.io/spring-framework/reference/core/aot.html): phần "Runtime Hints" mô tả `RuntimeHintsRegistrar`, `@ImportRuntimeHints`, `@RegisterReflection` và cách test hint.
+- [Reachability Metadata](https://www.graalvm.org/latest/reference-manual/native-image/metadata/): định dạng `reachability-metadata.json` và những gì cần khai báo.
+- [AOT Cache (Spring Boot)](https://docs.spring.io/spring-boot/reference/packaging/aot-cache.html): lệnh tạo và dùng AOT cache với JAR đã giải nén.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Mac chip Apple Silicon (bản tải trong bài là `macos-aarch64`). Mac Intel không còn bản GraalVM 25 hiện hành (macOS x64 dừng hỗ trợ sau 25.0.1); hãy làm lab trong VM Linux. Linux dùng `linux-x64` hoặc `linux-aarch64`. Cần thêm JDK 25 và Maven 3.9 như J7.1, Xcode Command Line Tools (`xcode-select -p` in ra một đường dẫn), khoảng 2 GB đĩa trống và 4 GB RAM rảnh cho lúc build. Ứng dụng dùng cổng **20330**; cổng đó phải trống. Bài J17.1 tới J17.3 không bắt buộc: lab dùng một project mới, `~/masteva-j17/catalog-native`.
+
+### 1. Tải GraalVM vào thư mục lab
+
+Bài không cài GraalVM vào hệ thống: chỉ tải và giải nén vào `~/masteva-j17/tools`, xoá thư mục là gỡ xong. Bản dùng ở đây là **GraalVM Community 25.4.4.1.1**, bản mới nhất ngày kiểm chứng, giấy phép GPLv2 kèm Classpath Exception. Nếu mở tab mới, chạy lại hai dòng `export` và khối hàm ở bước 3.
+
+<Terminal where="mac">
+
+```bash
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+export GRAALVM_HOME=~/masteva-j17/tools/graalvm-community-25.4.4.1.1+1.1/Contents/Home
+mkdir -p ~/masteva-j17/tools && cd ~/masteva-j17/tools
+GRAAL=graalvm-community-jdk-25i4-25.0.4.1.1_macos-aarch64_bin.tar.gz
+URL=https://github.com/graalvm/graalvm-ce-builds/releases/download/graal-25.4.4.1.1
+curl -fsSLO $URL/$GRAAL
+echo "$(curl -fsSL $URL/$GRAAL.sha256)  $GRAAL" | shasum -a 256 -c
+tar -xzf $GRAAL && rm $GRAAL
+$GRAALVM_HOME/bin/native-image --version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+graalvm-community-jdk-25i4-25.0.4.1.1_macos-aarch64_bin.tar.gz: OK
+native-image 25.0.4.1.1 2026-08-18
+GraalVM Runtime Environment GraalVM CE 25.4.4.1.1+1.1 (build 25.0.4.1.1+1-jvmci-25.4-b23)
+Substrate VM GraalVM CE 25.4.4.1.1+1.1 (build 25.0.4.1.1+1, serial gc, compressed references)
+```
+
+</Expected>
+
+File nén khoảng 340 MB, giải nén ra 630 MB. Dòng `OK` nghĩa là file tải về khớp checksum trang phát hành công bố. Dòng cuối nói sẵn một điều quan trọng: bản Community chỉ có **serial gc**.
+
+Vì sao đặt `GRAALVM_HOME` mà không đổi `JAVA_HOME`? Maven và các bài khác vẫn chạy trên JDK 25 quen thuộc; plugin `native-maven-plugin` tìm `native-image` trong `GRAALVM_HOME` trước, rồi mới tới `JAVA_HOME`. Nhờ vậy lệnh `java` trong các phép đo bên dưới vẫn là HotSpot, so sánh mới công bằng.
+
+<Callout kind="production">
+
+Bản 25.0 ra tháng 9/2025; từ 25.1 (30/6/2026), GraalVM chuyển sang bản innovation hằng tháng (25.1, 25.2, 25.3, 25.4) cho cả hai bản phân phối. **Oracle GraalVM** (giấy phép GraalVM Free Terms and Conditions, miễn phí cả trên production) có thêm dòng LTS 25.0 nhận bản vá bảo mật theo quý, cùng G1 GC và PGO cho native image. **GraalVM Community** (mã nguồn mở) chỉ có các bản tính năng; bản 25.0.x cuối cùng trên GitHub là 25.0.2, tháng 1/2026. Dù chọn bản nào, hãy ghim đúng một phiên bản trong CI và nâng có kiểm soát, như base image ở J17.1.
+
+</Callout>
+
+### 2. Tạo ứng dụng
+
+Dependency `native` của start.spring.io thêm `native-maven-plugin` vào `pom.xml`; profile `native` có sẵn trong `spring-boot-starter-parent`. Ngoài `/api/products` quen thuộc từ J17.1, ứng dụng có hai chỗ cố ý "động": `/api/prices` nạp chính sách giảm giá theo **tên class đọc từ cấu hình**, và `AuditLog` chỉ được tạo khi `app.audit.enabled=true`.
+
+<Terminal where="mac" title="Tạo project và code">
+
+```bash
+cd ~/masteva-j17
+curl -s https://start.spring.io/starter.tgz \
+  -d type=maven-project -d language=java -d bootVersion=4.1.1 -d javaVersion=25 \
+  -d groupId=dev.masteva -d artifactId=catalog-native -d baseDir=catalog-native \
+  -d packageName=dev.masteva.catalog -d dependencies=web,native | tar -xzf -
+cd catalog-native
+PKG=src/main/java/dev/masteva/catalog
+cat >> src/main/resources/application.properties <<'EOF'
+server.port=20330
+app.discount-policy=dev.masteva.catalog.HolidayDiscount
+EOF
+cat > $PKG/ProductController.java <<'EOF'
+package dev.masteva.catalog;
+
+import java.util.List;
+import java.util.function.LongUnaryOperator;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProductController {
+
+    record Product(String sku, String name, long price) {
+    }
+
+    private static final List<Product> PRODUCTS = List.of(
+            new Product("SKU-1", "Bàn phím cơ", 1_250_000),
+            new Product("SKU-2", "Chuột không dây", 450_000));
+
+    private final String policyClass;
+
+    ProductController(@Value("${app.discount-policy}") String policyClass) {
+        this.policyClass = policyClass;
+    }
+
+    @GetMapping("/api/products")
+    List<Product> products() {
+        return PRODUCTS;
+    }
+
+    // Tên class đến từ cấu hình: kiểu "plugin" hay gặp, và là reflection thật sự.
+    @GetMapping("/api/prices")
+    List<Product> prices() throws ReflectiveOperationException {
+        var policy = (LongUnaryOperator) Class.forName(policyClass).getDeclaredConstructor().newInstance();
+        return PRODUCTS.stream()
+                .map(p -> new Product(p.sku(), p.name(), policy.applyAsLong(p.price())))
+                .toList();
+    }
+}
+EOF
+cat > $PKG/HolidayDiscount.java <<'EOF'
+package dev.masteva.catalog;
+
+import java.util.function.LongUnaryOperator;
+
+public class HolidayDiscount implements LongUnaryOperator {
+    @Override
+    public long applyAsLong(long price) {
+        return price * 90 / 100;
+    }
+}
+EOF
+cat > $PKG/AuditLog.java <<'EOF'
+package dev.masteva.catalog;
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Component;
+
+@Component
+@ConditionalOnProperty(name = "app.audit.enabled", havingValue = "true")
+class AuditLog {
+    AuditLog() {
+        System.out.println(">>> AuditLog: đang bật");
+    }
+}
+EOF
+```
+
+</Terminal>
+
+### 3. Build JAR và đo trên JVM
+
+Ba hàm shell dưới đây dùng cho mọi phép đo: `app_start` chạy ứng dụng ở nền và chờ tới khi `/api/products` trả lời; `app_stop` dừng nó; `measure` in dòng `Started` của Spring Boot, gửi 500 request rồi đọc **RSS** (resident set size, bộ nhớ thật tiến trình đang chiếm) bằng `ps`. Nếu mở tab mới, chạy lại hai dòng `export` và khối hàm ở bước 3.
+
+<Terminal where="mac">
+
+```bash
+app_start() {
+  "$@" > app.log 2>&1 & APP=$!
+  for i in {1..300}; do curl -sf localhost:20330/api/products >/dev/null && return 0; sleep 0.05; done
+  echo "app không lên được, xem app.log"; return 1
+}
+app_stop() { kill $APP; wait $APP 2>/dev/null; return 0; }
+measure() {
+  app_start "$@" || return 1
+  grep -o 'Started .* in .*)' app.log
+  for i in {1..500}; do curl -s localhost:20330/api/products >/dev/null; done
+  echo "RSS sau 500 request: $(( $(ps -o rss= -p $APP) / 1024 )) MB"
+  app_stop
+}
+time mvn -q -DskipTests package
+ls -lh target/*.jar | awk '{print $5, $9}'
+measure java -jar target/catalog-native-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mvn -q -DskipTests package  5.89s user 0.29s system 306% cpu 2.012 total
+19M target/catalog-native-0.0.1-SNAPSHOT.jar
+Started CatalogNativeApplication in 0.847 seconds (process running for 1.073)
+RSS sau 500 request: 212 MB
+```
+
+</Expected>
+
+Dòng `time` có dạng của zsh (mặc định trên macOS); bash in `real 0m2.012s`. Lần build đầu lâu hơn vì Maven tải dependency. Maven chạy trên JDK 25 in thêm vài dòng `WARNING:` về `restricted method` và `sun.misc.Unsafe`, còn shell tương tác có thể in `[1] 12345` hay `terminated` khi chạy và dừng tiến trình nền; các khối kết quả đã lược chúng. Con số trên máy bạn sẽ khác. RSS của JVM dao động mạnh giữa các lần chạy (150 tới 230 MB trên máy kiểm chứng) vì heap tối đa mặc định là 1/4 RAM máy (J17.3), JVM không vội thu gom.
+
+### 4. Build và chạy native image
+
+<Terminal where="mac">
+
+```bash
+time mvn -Pnative -DskipTests native:compile > native-build.log 2>&1
+grep -E '^\[[268]/8\]|found reachable|registered for reflection|Peak RSS|Finished generating' native-build.log
+ls -lh target/catalog-native | awk '{print $5, $9}'
+file target/catalog-native
+measure ./target/catalog-native
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mvn -Pnative -DskipTests native:compile > native-build.log 2>&1  489.07s user 11.73s system 664% cpu 1:15.39 total
+[2/8] Performing analysis...  [******]                                                                 (19.1s @ 1.63GiB)
+   18,762 types,  27,776 fields, and  87,953 methods found reachable
+    1,403 types,     629 fields, and   4,440 methods registered for reflection
+[6/8] Compiling methods...    [*****]                                                                  (25.1s @ 1.81GiB)
+[8/8] Creating image...       [**]                                                                      (4.2s @ 2.67GiB)
+                       6.8s (9.5% of total time) in 1602 GCs | Peak RSS: 3.55GiB | CPU load: 6.84
+Finished generating 'catalog-native' in 1m 10s.
+65M target/catalog-native
+target/catalog-native: Mach-O 64-bit executable arm64
+Started CatalogNativeApplication in 0.047 seconds (process running for 0.071)
+RSS sau 500 request: 64 MB
+```
+
+</Expected>
+
+Trước khi `native-image` chạy, Maven chạy goal `process-aot` (log Spring Boot khởi động **lúc build**) và tải kho reachability metadata (các dòng `[graalvm reachability metadata repository for ...]` trong log). Log có 8 bước; bước 2 là phân tích closed world: 18.762 kiểu tới được, 1.403 kiểu được đăng ký cho reflection, phần lớn nhờ Spring AOT và kho metadata. Bước 6 biên dịch AOT mọi method tới được. Tổng cộng khoảng 1 phút 15 giây, 8 phút CPU (`user`); `package` chỉ mất vài giây. Trên máy 16 GB, builder được dùng khoảng 70% RAM nên đỉnh lên 2,8 tới 3,5 GB; với ít RAM hơn nó vẫn chạy nhưng GC nhiều hơn, chậm hơn. Trên runner nhỏ, giới hạn bằng `-J-Xmx` trong `<buildArgs>` để không bị OOMKilled. Các dòng `Warning: Using a deprecated option` trong log là vô hại.
+
+Kết quả: khởi động nhanh hơn gần 20 lần, RSS bằng khoảng 1/3, và không cần JRE: `otool -L target/catalog-native` chỉ liệt kê thư viện hệ thống của macOS. Các file `lib*.dylib` cạnh nó trong `target` là thư viện AWT do JDK kèm theo; ứng dụng không dùng AWT nên không cần chúng.
+
+<Check id="j17.4.lab-measure">Build được cùng một ứng dụng thành JAR và native image, đo được thời gian build, kích thước, thời gian khởi động và RSS của cả hai.</Check>
+
+### 5. So với AOT cache trên JVM
+
+Goal `process-aot` vừa chạy cũng thêm code Spring AOT vào JAR; trên JVM, bật nó bằng `-Dspring.aot.enabled=true`. Cộng thêm AOT cache (J17.1 đã nhắc, J18.2 đo kỹ): như tài liệu Spring Boot yêu cầu, cache chỉ có tác dụng với JAR đã giải nén (J17.1), và `spring.context.exit=onRefresh` cho lần chạy huấn luyện thoát ngay khi context sẵn sàng.
+
+<Terminal where="mac">
+
+```bash
+java -Djarmode=tools -jar target/catalog-native-0.0.1-SNAPSHOT.jar extract --destination target/jvm
+cd target/jvm
+time java -XX:AOTCacheOutput=app.aot -Dspring.aot.enabled=true -Dspring.context.exit=onRefresh \
+  -jar catalog-native-0.0.1-SNAPSHOT.jar > training.log 2>&1
+grep 'creation is complete' training.log
+measure java -XX:AOTCache=app.aot -Dspring.aot.enabled=true -jar catalog-native-0.0.1-SNAPSHOT.jar
+cd ../..
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+... 2.974 total
+AOTCache creation is complete: app.aot 50692096 bytes
+Started CatalogNativeApplication in 0.228 seconds (process running for 0.316)
+RSS sau 500 request: 178 MB
+```
+
+</Expected>
+
+Dòng `time` đã lược còn tổng thời gian: lần chạy huấn luyện mất khoảng 3 giây. Không đổi một dòng code của bạn, khởi động còn khoảng 0,25 giây; nhưng RSS vẫn ở mức JVM, và cache 50 MB chỉ dùng được với đúng JDK và đúng JAR đã tạo ra nó. Trên máy kiểm chứng, chỉ dùng cache mà không bật Spring AOT cho khoảng 0,33 giây. Bảng ở phần Kiến thức tổng hợp ba cách từ chính các bước này. Còn câu hỏi "khi đã chạy, native có xử lý nhanh hơn không" thì bước 8 trả lời; riêng với endpoint nhỏ như `/api/products`, đo bằng `ab` trên máy kiểm chứng thấy hai bên ngang nhau, vì thời gian nằm ở HTTP chứ không ở code.
+
+### 6. Reflection: chạy trên JVM, hỏng trong native
+
+<Terminal where="mac">
+
+```bash
+app_start java -jar target/catalog-native-0.0.1-SNAPSHOT.jar
+curl -s localhost:20330/api/prices; echo
+app_stop
+app_start ./target/catalog-native
+curl -s localhost:20330/api/prices; echo
+app_stop
+grep -m1 '^java.lang.ClassNotFoundException' app.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"sku":"SKU-1","name":"Bàn phím cơ","price":1125000},{"sku":"SKU-2","name":"Chuột không dây","price":405000}]
+{"timestamp":"2026-10-03T19:08:41.217Z","status":500,"error":"Internal Server Error","path":"/api/prices"}
+java.lang.ClassNotFoundException: dev.masteva.catalog.HolidayDiscount
+```
+
+</Expected>
+
+`HolidayDiscount` nằm ngay trong project, nhưng không chỗ nào trong code gọi `new HolidayDiscount()`. Tên của nó chỉ có trong `application.properties`, thứ phân tích tĩnh không đọc. Với `native-image`, class đó không tới được nên không có trong file thực thi. Lỗi không xuất hiện lúc build hay lúc khởi động, chỉ khi đúng request đó tới.
+
+Sửa bằng một `RuntimeHintsRegistrar`: Spring gọi nó trong `process-aot` và ghi kết quả vào `reachability-metadata.json`.
+
+<Terminal where="mac">
+
+```bash
+PKG=src/main/java/dev/masteva/catalog
+cat > $PKG/CatalogRuntimeHints.java <<'EOF'
+package dev.masteva.catalog;
+
+import org.springframework.aot.hint.MemberCategory;
+import org.springframework.aot.hint.RuntimeHints;
+import org.springframework.aot.hint.RuntimeHintsRegistrar;
+
+class CatalogRuntimeHints implements RuntimeHintsRegistrar {
+    @Override
+    public void registerHints(RuntimeHints hints, ClassLoader classLoader) {
+        // Mọi policy có thể được cấu hình phải được liệt kê ở đây, lúc build.
+        hints.reflection().registerType(HolidayDiscount.class,
+                MemberCategory.INVOKE_PUBLIC_CONSTRUCTORS);
+    }
+}
+EOF
+perl -0pi -e 's#(import org.springframework.boot.autoconfigure.SpringBootApplication;)#$1\nimport org.springframework.context.annotation.ImportRuntimeHints;#; s#(\@SpringBootApplication\n)#$1\@ImportRuntimeHints(CatalogRuntimeHints.class)\n#' $PKG/CatalogNativeApplication.java
+time mvn -Pnative -DskipTests native:compile > native-build.log 2>&1
+grep -A2 '"dev.masteva.catalog.HolidayDiscount"' target/spring-aot/main/resources/META-INF/native-image/dev.masteva/catalog-native/reachability-metadata.json
+app_start ./target/catalog-native
+curl -s localhost:20330/api/prices; echo
+app_stop
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mvn -Pnative -DskipTests native:compile > native-build.log 2>&1  493.62s user 11.33s system 690% cpu 1:13.09 total
+      "type": "dev.masteva.catalog.HolidayDiscount",
+      "allPublicConstructors": true
+    },
+[{"sku":"SKU-1","name":"Bàn phím cơ","price":1125000},{"sku":"SKU-2","name":"Chuột không dây","price":405000}]
+```
+
+</Expected>
+
+Lệnh `perl` thêm `@ImportRuntimeHints(CatalogRuntimeHints.class)` vào `CatalogNativeApplication`; bạn cũng có thể sửa bằng IDE. Để ý cái giá: sửa một dòng hint là thêm hơn một phút build. Và hint chỉ cứu được class đã biết lúc build: nếu vận hành đổi `app.discount-policy` sang một class chưa đăng ký, hay muốn thả một JAR policy mới vào lúc chạy, native image không làm được.
+
+<Check id="j17.4.lab-runtime-hints">Tái hiện được `ClassNotFoundException` chỉ xảy ra trong native image, sửa bằng `RuntimeHintsRegistrar` và tìm được hint trong `reachability-metadata.json`.</Check>
+
+### 7. Bean bị chốt lúc build
+
+Chạy cả ba cách với cùng tham số `--app.audit.enabled=true`:
+
+<Terminal where="mac">
+
+```bash
+JAR=target/catalog-native-0.0.1-SNAPSHOT.jar
+app_start java -jar $JAR --app.audit.enabled=true; app_stop; grep AuditLog app.log || echo "(không có AuditLog)"
+app_start ./target/catalog-native --app.audit.enabled=true; app_stop; grep AuditLog app.log || echo "(không có AuditLog)"
+app_start java -Dspring.aot.enabled=true -jar $JAR --app.audit.enabled=true; app_stop; grep AuditLog app.log || echo "(không có AuditLog)"
+ls target/spring-aot/main/sources/dev/masteva/catalog/ | paste -sd ' ' -
+```
+
+</Terminal>
+
+<Predict question="Tham số giống hệt nhau. Dòng nào in ra AuditLog?">
+
+```text
+>>> AuditLog: đang bật
+(không có AuditLog)
+(không có AuditLog)
+CatalogNativeApplication__ApplicationContextInitializer.java CatalogNativeApplication__BeanDefinitions.java CatalogNativeApplication__BeanFactoryRegistrations.java ProductController__BeanDefinitions.java
+```
+
+Chỉ JVM thường. Lúc build, `process-aot` đánh giá `@ConditionalOnProperty` với cấu hình lúc đó (`app.audit.enabled` chưa đặt), loại `AuditLog` và chỉ sinh code cho các bean còn lại: không có `AuditLog__BeanDefinitions.java`. Native image dùng đúng danh sách đó; property lúc chạy không thêm được bean. Dòng thứ ba hữu ích hằng ngày: JVM có bật Spring AOT tái hiện lỗi của native trong 1 giây, thay vì chờ hơn một phút build.
+
+</Predict>
+
+Điều này áp dụng cho mọi bean bật tắt theo môi trường: `@Profile("prod")`, `management.*.enabled`, feature flag dạng `@ConditionalOnProperty`. Giá trị đọc lúc chạy qua `@Value` hay `@ConfigurationProperties` (như URL database ở J17.3) vẫn đổi được bình thường; chỉ **tập bean** bị khoá. Vì lý do đó, bật Spring AOT trên JVM ở production cũng là một bước đệm hay dùng: nhanh hơn một chút, và lộ sớm chỗ không tương thích trước khi chuyển hẳn sang native.
+
+<Check id="j17.4.lab-build-time-beans">Chứng minh được bằng lab rằng `@ConditionalOnProperty` bị đánh giá lúc build, và dùng được `-Dspring.aot.enabled=true` để tái hiện lỗi của native trên JVM.</Check>
+
+### 8. JIT và AOT trên một tác vụ nặng CPU
+
+Không cần Spring để dùng `native-image`. `PriceStats` chạy 10 lô, mỗi lô gom doanh thu của 1 triệu đơn hàng theo SKU, rồi in thời gian từng lô. Biến `sink` cộng dồn doanh thu của mọi lô và được in ra cuối cùng, để trình biên dịch không thể coi vòng lặp là vô dụng mà bỏ đi; hai bản phải in cùng một tổng kiểm tra:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-j17/bench && cd ~/masteva-j17/bench
+cat > PriceStats.java <<'EOF'
+import java.util.HashMap;
+import java.util.Random;
+
+public class PriceStats {
+    public static void main(String[] args) {
+        Random rnd = new Random(42);
+        StringBuilder out = new StringBuilder("ms mỗi lô:");
+        long sink = 0;
+        for (int round = 1; round <= 10; round++) {
+            long start = System.nanoTime();
+            var revenue = new HashMap<String, Long>();
+            for (int i = 0; i < 1_000_000; i++) {
+                long amount = (1 + rnd.nextInt(5)) * (10_000L + rnd.nextInt(90_000));
+                revenue.merge("SKU-" + rnd.nextInt(1_000), amount, Long::sum);
+            }
+            for (long v : revenue.values()) sink += v;
+            out.append(' ').append((System.nanoTime() - start) / 1_000_000);
+        }
+        System.out.println(out);
+        System.out.println("tổng kiểm tra: " + sink);
+    }
+}
+EOF
+javac -d out PriceStats.java
+$GRAALVM_HOME/bin/native-image -cp out PriceStats price-stats > build.log 2>&1
+./price-stats > /dev/null
+time java -cp out PriceStats
+time ./price-stats
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ms mỗi lô: 81 67 61 61 61 59 59 60 58 59
+tổng kiểm tra: 1650076452222
+java -cp out PriceStats  0.69s user 0.03s system 108% cpu 0.658 total
+ms mỗi lô: 80 76 75 74 76 75 76 75 76 75
+tổng kiểm tra: 1650076452222
+./price-stats  0.76s user 0.01s system 99% cpu 0.768 total
+```
+
+</Expected>
+
+Build `price-stats` mất khoảng 20 giây. Dòng `./price-stats > /dev/null` chạy thử một lần trước khi đo, vì trên macOS lần chạy đầu của một file thực thi vừa build chậm hơn do hệ điều hành quét nó. Native image ổn định ở khoảng 75 ms từ lô 2 vì không có gì để warm-up. JVM chậm ở lô đầu vì còn thông dịch và JIT chưa biên dịch xong (J18.2 đo kỹ warm-up), rồi C2 đưa nó xuống khoảng 60 ms, nhanh hơn native khoảng 20%. Với 10 lô, JVM xong trước cả về tổng thời gian: 0,66 so với 0,77 giây. Native thắng phần khởi động, JVM thắng phần chạy; chương trình chạy càng lâu thì JVM càng vượt lên. Con số thay đổi theo đoạn code: một phiên bản khác của benchmark này, tạo record cho từng đơn hàng, cho JVM nhanh hơn khoảng 1,7 lần. Với cờ mặc định, native chỉ thắng khi chương trình ngắn tới mức khởi động chiếm phần lớn, như một lệnh CLI.
+
+Cờ build cũng là một phần của kết quả. `native-image` mặc định dùng `-O2`; bản Community có `-O3` (tối ưu nhiều nhất) và `-march=native` (dùng mọi tập lệnh của CPU đang build, file chỉ chạy trên CPU cùng loại). Trên máy kiểm chứng, build lại bằng `$GRAALVM_HOME/bin/native-image -O3 -cp out PriceStats price-stats-o3` cho khoảng 46 ms mỗi lô, tổng 0,47 giây, nhanh hơn cả JVM; `-march=native` thì không đổi gì ở benchmark này. Vậy khoảng cách ở trên một phần do cờ mặc định, và mọi so sánh JIT với AOT phải ghi rõ cờ build. Oracle GraalVM còn có PGO (profile-guided optimization, tối ưu theo profile thu từ lần chạy thật); bản Community thì không.
+
+<Check id="j17.4.lab-jit-vs-aot">Đo được và giải thích được vì sao cùng một tác vụ nặng CPU chạy nhanh hơn trên JVM sau warm-up so với native image build bằng cờ mặc định.</Check>
+
+### 9. Còn container image thì sao?
+
+Lệnh `file` ở bước 4 đã trả lời: `Mach-O 64-bit executable arm64` chỉ chạy trên macOS chip Apple. Container Linux cần file ELF build **trên Linux**, đúng kiến trúc CPU của server; GraalVM không biên dịch chéo sang hệ điều hành khác. Có hai đường: `mvn -Pnative spring-boot:build-image` để Buildpacks build native image trong một container Linux, hoặc Dockerfile multi-stage với stage build dùng image `ghcr.io/graalvm/native-image-community:25i4-25.0.4.1.1` (ghim đúng bản đã dùng ở bước 1; thẻ `:25` vẫn trỏ về 25.0.2 cũ) và stage cuối là một base nhỏ. Lưu ý đường Buildpacks không dùng GraalVM bạn vừa tải: theo tài liệu Paketo, buildpack Java Native Image mặc định dùng Liberica Native Image Kit của BellSoft. Bài không chạy bước này: build native trong container cần Docker VM có vài GB RAM rảnh (đỉnh ở bước 4 là 2,8 tới 3,5 GB; ít hơn thì vẫn chạy nhưng chậm hơn), và chạy lâu hơn nhiều trên Mac. Trong CI, hãy build trên runner Linux cùng kiến trúc với cụm.
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `native-image is not installed in your JAVA_HOME`: chưa đặt `GRAALVM_HOME` trong tab Terminal hiện tại. Chạy lại hai dòng `export` ở bước 1.
+- macOS báo không mở được `native-image` vì "developer cannot be verified": bạn tải bằng trình duyệt nên file bị gắn cờ quarantine. Tải bằng `curl` như bước 1, hoặc gỡ cờ bằng `xattr -r -d com.apple.quarantine ~/masteva-j17/tools/graalvm-community-25.4.4.1.1+1.1`.
+- Build dừng ở bước liên kết với lỗi `xcrun` hay không tìm thấy `cc`: thiếu Xcode Command Line Tools; `native-image` cần trình biên dịch C của hệ thống để liên kết file thực thi.
+- Build chậm bất thường, máy dùng swap nhiều, hoặc (trên Linux, trong container CI) bị dừng với `Killed` và exit code 137: thiếu RAM. Trên máy 16 GB, builder được dùng khoảng 70% RAM nên đỉnh lên 2,8 tới 3,5 GB; với ít RAM hơn nó vẫn chạy nhưng GC nhiều hơn, chậm hơn. Trên runner nhỏ, giới hạn bằng `-J-Xmx` trong `<buildArgs>` để không bị OOMKilled, hoặc đóng bớt ứng dụng.
+- `ClassNotFoundException`, `NoSuchMethodException` hay `MissingReflectionRegistrationError` chỉ xảy ra trong native: thiếu hint như bước 6. Chạy trên JVM với `-Dspring.aot.enabled=true` để thu hẹp, rồi thêm hint hoặc metadata.
+- `app không lên được`: cổng 20330 đang bận (`lsof -i :20330`), hoặc ứng dụng chết lúc khởi động; đọc `app.log`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+`mvn clean` xoá vĩnh viễn thư mục `target` (file thực thi 65 MB, JAR, AOT cache, code Spring AOT sinh ra); `rm -rf ~/masteva-j17/bench` xoá vĩnh viễn project benchmark. Mã nguồn `catalog-native` vẫn giữ. GraalVM chiếm khoảng 630 MB; khi không cần nữa, `rm -rf ~/masteva-j17/tools` xoá vĩnh viễn nó, và không còn gì khác trên hệ thống phải gỡ.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-j17/catalog-native && mvn -q clean
+rm -rf ~/masteva-j17/bench
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Thư viện ngoài thiếu metadata thì tìm hint bằng cách nào?">
+
+Chạy ứng dụng trên JVM với **tracing agent** của GraalVM: `java -agentlib:native-image-agent=config-output-dir=src/main/resources/META-INF/native-image -jar app.jar`. Agent ghi lại mọi lời gọi reflection, resource, proxy thật sự xảy ra rồi xuất ra `reachability-metadata.json`. Giới hạn của nó nằm ngay trong cách hoạt động: chỉ những đường code đã chạy mới được ghi. Nhánh lỗi, nhánh hiếm gặp như bước 6 sẽ thiếu nếu bạn không chạy tới. Vì vậy agent thường được chạy cùng bộ test, và metadata sinh ra phải được review như code, trước khi đóng góp ngược lên kho reachability metadata.
+
+</Reveal>
+
+<Reveal title="Làm sao biết hint của mình đúng mà không phải build native mỗi lần?">
+
+Spring có `RuntimeHintsPredicates` để kiểm tra hint bằng unit test thường trên JVM: tạo `RuntimeHints`, gọi `new CatalogRuntimeHints().registerHints(hints, getClass().getClassLoader())`, rồi assert `RuntimeHintsPredicates.reflection().onType(HolidayDiscount.class)` khớp. Test chạy trong mili giây và bắt được việc ai đó xoá hay đổi tên class. Nó không thay được việc chạy test trong native (`mvn -PnativeTest test`), vì không biết code nào khác cần hint; nhưng nó giữ cho các hint đã biết không âm thầm hỏng.
+
+</Reveal>
+
+<Reveal title="Native image trong container giới hạn 256 MB thì heap tính thế nào?">
+
+Với Serial GC, nếu không đặt gì, heap tối đa của native image là 80% bộ nhớ vật lý mà nó thấy (khác 25% của JVM ở J17.3). Trong container 256 MB, như vậy chỉ còn khoảng 50 MB cho mọi thứ khác (stack thread, metaspace của image, bộ đệm mạng), nên hãy đặt `-Xmx`. File thực thi nhận tham số heap lúc chạy như JVM: `./catalog-native -Xmx128m`. Image heap đã có sẵn trong file, nên ứng dụng cần ít heap hơn JVM cho cùng việc. Nhưng Serial GC dừng toàn bộ ứng dụng mỗi lần thu gom, chỉ dùng một thread; với heap lớn và nhiều request đồng thời, pause dài hơn G1. Đó là một lý do Oracle GraalVM có G1 cho native image trên Linux.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một lỗi build của `native-image`, hoặc viết nháp `RuntimeHintsRegistrar` cho một thư viện. AI hay đưa thông tin cũ: dependency `spring-native` và annotation `@NativeHint` (thuộc dự án Spring Native thử nghiệm, đã bị thay bằng Spring AOT từ Spring Boot 3), các file `reflect-config.json`, `resource-config.json` riêng lẻ (GraalVM hiện khuyến nghị một file `reachability-metadata.json`; file cũ vẫn đọc được nhưng AI hay sinh định dạng cũ), cờ `--no-fallback` (bản 25 báo không còn tác dụng), và khuyên `--initialize-at-build-time` cho cả package, dễ gây lỗi khó hiểu. AI cũng hay khẳng định "native luôn nhanh hơn". Kiểm tra lại bằng `-Dspring.aot.enabled=true` trên JVM, đọc `reachability-metadata.json` trong `target/spring-aot`, và đo như bước 4 và 8 trên chính ứng dụng của bạn.
+
+</Callout>
+
+<Callout kind="link">
+
+J17.1 giải nén JAR, điều kiện của AOT cache. J17.3 nói về giới hạn bộ nhớ trong container; native image cần ít hơn nhưng vẫn phải đặt giới hạn. J18.2 đi sâu JIT, warm-up và AOT cache của JDK. D6 xây image cho nhiều kiến trúc CPU; D7 đưa bước build native lên runner CI.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j17.4.mastery-decide">Với một service cụ thể, chọn được giữa JVM, JVM với AOT cache và native image, và bảo vệ lựa chọn đó bằng số đo khởi động, RSS, throughput và thời gian build.</Check>
+
+<Check id="j17.4.mastery-hints">Tự đưa được một ứng dụng Spring Boot dùng reflection lên native image: tìm chỗ thiếu bằng `-Dspring.aot.enabled=true` hoặc test native, viết `RuntimeHintsRegistrar`, và nói được những gì closed world không cho phép.</Check>
+
+</Mastery>

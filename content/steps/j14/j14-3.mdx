@@ -1,0 +1,733 @@
+---
+title: Virtual thread, structured concurrency và tìm deadlock
+description: Đo virtual thread so với pool platform thread cho việc chờ I/O và việc dùng CPU, thấy pinning của JDK 21 biến mất ở JDK 25, thử StructuredTaskScope ở chế độ preview, rồi tạo một deadlock thật và tìm nó bằng jcmd Thread.print và jstack.
+id: j14.3
+step: j14
+prerequisites: [j14.2]
+topics: [j14.virtual-thread, j14.structured-concurrency, j14.deadlock-cach-tim]
+status: verified
+verified:
+  date: 2026-10-03
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    java-21: 21.0.3
+---
+
+<Goal>
+
+Biết khi nào virtual thread giúp được và khi nào không, dùng thử structured concurrency mà hiểu rõ nó vẫn là preview, và tự tìm ra một deadlock trong một JVM đang treo. Học xong bài này, bạn giải thích được:
+
+- Vì sao 10.000 lời gọi chờ I/O mất 5 giây trên pool 200 thread nhưng chỉ khoảng 0,15 giây với virtual thread, còn việc dùng CPU thì không nhanh hơn chút nào.
+- Vì sao cùng một đoạn `synchronized` chậm gấp 10 lần trên JDK 21 so với JDK 25 khi chạy trong virtual thread.
+- Một service "treo" mà CPU gần 0%: lấy thread dump thế nào, đọc chỗ nào để biết thread nào giữ khoá nào.
+
+</Goal>
+
+<Knowledge>
+
+### Virtual thread
+
+**Virtual thread** (chính thức từ Java 21, JEP 444) là thread do JVM quản lý thay vì hệ điều hành. Nó vẫn là `java.lang.Thread`, có stack, có `ThreadLocal`, chạy code chặn bình thường. Khác biệt nằm ở cách chạy:
+
+```text
+ virtual thread:  VT1   VT2   VT3   VT4 ... VT10000      (hàng nghìn, mỗi cái vài trăm byte tới vài KB stack trên heap)
+                   |     |                                 mount: chép stack lên carrier để chạy
+                   v     v                                 unmount: khi chặn (sleep, đọc socket, lock),
+ carrier thread:  [ForkJoinPool-1-worker-1] [worker-2] ... [worker-N]   N = số nhân CPU
+                   |                         |
+ OS thread:       thread hệ điều hành       thread hệ điều hành
+```
+
+Khi virtual thread gặp thao tác chặn như `Thread.sleep`, đọc socket, chờ `ReentrantLock` hay `BlockingQueue`, JVM **unmount** nó khỏi carrier thread và cho virtual thread khác chạy. Khi dữ liệu về, nó được mount lại, có thể trên một carrier khác. Một carrier phục vụ được rất nhiều virtual thread đang chờ I/O.
+
+| | Platform thread | Virtual thread |
+|---|---|---|
+| Ánh xạ | 1:1 với thread hệ điều hành | M:N lên vài carrier thread |
+| Tạo ra | Đắt, nên gom vào pool | Rẻ, tạo mới cho mỗi task, **không gom pool** |
+| Số lượng thực tế | Vài trăm tới vài nghìn | Hàng triệu |
+| Hợp với | Việc dùng CPU, số lượng ít | Nhiều việc chờ I/O đồng thời |
+| Giới hạn đồng thời | Kích thước pool | Tự đặt bằng `Semaphore` nếu cần |
+
+Virtual thread làm **tăng thông lượng** (số việc xử lý cùng lúc) chứ không làm từng việc nhanh hơn. Việc dùng CPU vẫn bị giới hạn bởi số nhân. Và giới hạn bây giờ chuyển xuống tài nguyên phía sau: 10.000 virtual thread cùng gọi database với pool 10 kết nối thì 9.990 thread chờ kết nối. Muốn giới hạn số lời gọi tới một hệ thống chậm, dùng `Semaphore`, không dùng pool thread.
+
+**Pinning** (ghim) là khi virtual thread chặn nhưng không unmount được, giữ luôn carrier. Trên JDK 21 tới 23, chặn bên trong `synchronized` gây pinning, nên lời khuyên khi đó là đổi `synchronized` sang `ReentrantLock`. Từ JDK 24 (JEP 491), `synchronized` và `Object.wait()` không còn ghim. Các trường hợp còn ghim trên JDK 25: chặn khi đang ở trong code native (method `native` hoặc hàm ngoại gọi ngược vào Java), và chặn trong lúc nạp hay khởi tạo class. JFR vẫn có sự kiện `jdk.VirtualThreadPinned` cho các trường hợp này; thuộc tính `-Djdk.tracePinnedThreads` của JDK 21 đã bị bỏ.
+
+Trong Spring Boot 3.2 trở lên, `spring.threads.virtual.enabled=true` cho Tomcat xử lý mỗi request trên một virtual thread thay vì pool mặc định 200 thread. Bài J9.3 đã hỏi nên dùng `HttpClient.sendAsync` hay `send`: với virtual thread, `send` đồng bộ chạy trên mỗi request một thread là đủ rẻ, và code đọc từ trên xuống; `sendAsync` vẫn hữu ích khi cần gộp kết quả của vài lời gọi song song.
+
+<Callout kind="production">
+
+Một đội bật virtual thread cho service đặt hàng để chịu tải khuyến mãi. Thông lượng tăng, nhưng database bắt đầu báo hết kết nối và độ trễ p99 tăng vọt: trước đây pool 200 thread của Tomcat vô tình giới hạn số truy vấn đồng thời, giờ giới hạn đó biến mất. Cách sửa là đặt lại giới hạn ở đúng chỗ: kích thước pool kết nối và timeout chờ kết nối (J12), `Semaphore` quanh lời gọi tới đối tác chậm, và đo lại bằng tải thật thay vì tin vào con số trong bài đo.
+
+</Callout>
+
+<Check id="j14.3.virtual-thread-model">Giải thích được mount, unmount, carrier thread, vì sao không gom virtual thread vào pool, và pinning còn xảy ra ở đâu trên JDK 25.</Check>
+
+### Structured concurrency, vẫn là preview
+
+Với executor, một task con có thể sống lâu hơn method đã tạo ra nó: method lỗi và trả về, nhưng task con vẫn chạy, không ai huỷ. **Structured concurrency** gắn vòng đời các task con vào một khối code: khối kết thúc thì mọi task con đã kết thúc.
+
+```text
+try (var scope = StructuredTaskScope.open()) {      mở scope
+    fork(price)  ---- 1.000 ms ----------x  bị huỷ (interrupt)
+    fork(stock)  -- 100 ms --> lỗi  -----'  scope huỷ các nhánh còn lại
+    scope.join()                             ném FailedException sau ~100 ms
+}                                            close(): chắc chắn không còn task con nào chạy
+```
+
+**Trạng thái, kiểm tra ngày 03/10/2026:**
+
+| JDK | JEP | Trạng thái | Thay đổi đáng chú ý |
+|---|---|---|---|
+| 21 tới 24 | 453, 462, 480, 499 | Preview | API cũ, tạo scope bằng constructor như `ShutdownOnFailure` |
+| 25 | 505 | Preview lần 5 | `StructuredTaskScope.open()`, `Joiner`; `join()` ném `StructuredTaskScope.FailedException` |
+| 26 | 525 | Preview lần 6 | `allSuccessfulOrThrow()` trả list; đổi tên `anySuccessfulResultOrThrow` thành `anySuccessfulOrThrow` |
+| 27 | 533 | Preview lần 7 | Thêm tham số kiểu thứ ba cho exception; `join()` mặc định ném `ExecutionException`; bỏ `FailedException`, `awaitAll()` |
+
+Bài này chạy trên JDK 25. Theo Javadoc của JDK 27 và JEP 533, code của lab **không biên dịch được trên JDK 27** vì `FailedException` đã bị bỏ; điều này chưa được chạy thử trên máy kiểm chứng, vốn không có JDK 27. API còn đổi qua mỗi phiên bản, nên đừng dùng nó trong code production. Hiểu ý tưởng ngay bây giờ vẫn có ích: cùng một cấu trúc (mở scope, fork, join, huỷ khi lỗi) bạn viết được bằng executor và `CompletableFuture` ở J14.2, chỉ dài hơn và dễ sót việc huỷ.
+
+Code dùng preview phải biên dịch và chạy với `--enable-preview`. File `.class` sinh ra mang minor version `65535` và chỉ chạy được trên đúng JDK feature release đã biên dịch nó.
+
+<Check id="j14.3.structured-concurrency-status">Nói được structured concurrency giải quyết vấn đề gì, trạng thái preview của nó trên JDK 25 và 27, và vì sao chưa nên dùng trên production.</Check>
+
+### Deadlock
+
+**Deadlock** xảy ra khi các thread chờ khoá của nhau theo một vòng tròn. Cần đủ bốn điều kiện cùng lúc: khoá độc quyền, giữ khoá này trong khi chờ khoá khác, không ai bị cướp khoá, và có vòng chờ. Phá một điều kiện là hết deadlock.
+
+```text
+transfer-A-to-B: giữ khoá A ----chờ khoá B---->\
+                      ^                         \
+                      |                          v
+                 chờ khoá A <---- giữ khoá B : transfer-B-to-A
+```
+
+| Cách phòng | Phá điều kiện nào | Ghi chú |
+|---|---|---|
+| Thứ tự lấy khoá cố định, ví dụ theo id tài khoản | Vòng chờ | Đơn giản, hiệu quả nhất khi biết trước các khoá |
+| `tryLock(timeout)`, không được thì nhả hết và thử lại | Không cướp được khoá (tự nhả) | Cần thêm thời gian chờ ngẫu nhiên để hai bên không thử lại cùng nhịp |
+| Không gọi code lạ (callback, listener, service khác) khi đang giữ khoá | Giữ và chờ | Code lạ có thể lấy khoá bạn không biết |
+| Giảm số khoá, dùng atomic hoặc collection đồng thời | Khoá độc quyền | |
+
+JVM tự phát hiện được vòng chờ giữa các monitor (`synchronized`) và các khoá trong `java.util.concurrent.locks`. Bạn lấy kết quả bằng **thread dump**: `jcmd <pid> Thread.print`, hoặc `jstack <pid>` (công cụ cũ hơn, cùng nội dung). Từ trong code, `ThreadMXBean.findDeadlockedThreads()` trả về id các thread đang deadlock. JVM **không** phát hiện được: deadlock với khoá dòng trong database, task chờ một task khác trong cùng một pool đã đầy (thread starvation deadlock), và vòng chờ qua mạng giữa hai service.
+
+<Check id="j14.3.deadlock-conditions">Kể được bốn điều kiện của deadlock, hai cách phòng, và những loại deadlock mà thread dump không tự báo được.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [JEP 444: Virtual Threads](https://openjdk.org/jeps/444): đọc mục "Do not pool virtual threads" và "Use semaphores to limit concurrency".
+- [JEP 491: Synchronize Virtual Threads without Pinning](https://openjdk.org/jeps/491): danh sách các trường hợp còn pinning sau JDK 24.
+- [JEP 533: Structured Concurrency (Seventh Preview)](https://openjdk.org/jeps/533): API mới nhất ở JDK 27 và khác biệt so với JDK 25, 26.
+- [Structured Concurrency (Java SE 25)](https://docs.oracle.com/en/java/javase/25/core/structured-concurrency.html): ví dụ `StructuredTaskScope` và các `Joiner` đúng với JDK 25 của lab.
+- [Troubleshoot Process Hangs and Loops](https://docs.oracle.com/en/java/javase/25/troubleshoot/troubleshoot-process-hangs-loops.html): cách đọc thread dump khi JVM báo và không báo deadlock.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm J14.2, có `~/masteva-j14/src`. JDK 25; bước 2 có phần tuỳ chọn cần thêm JDK 21. Bước 4 cần hai tab Terminal. `jcmd` và `jstack` có sẵn trong JDK, không có trong image chỉ có JRE. Thời gian `ms` thay đổi theo máy; máy kiểm chứng là Apple M1 Pro 10 nhân.
+
+### 1. Virtual thread với việc chờ I/O và việc dùng CPU
+
+10.000 task, mỗi task `sleep(100)` đóng vai một lời gọi database. Pool 200 platform thread bằng đúng mặc định của Tomcat. Sau đó 200 task tính toán thuần CPU.
+
+<Terminal where="mac" title="Tạo src/VirtualDemo.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/VirtualDemo.java <<'EOF'
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.stream.IntStream;
+
+public class VirtualDemo {
+    public static void main(String[] args) throws InterruptedException {
+        Thread.ofVirtual().start(() -> System.out.println("virtual: " + Thread.currentThread())).join();
+
+        int tasks = 10_000;
+        time("I/O, pool 200 platform", tasks, Executors.newFixedThreadPool(200), VirtualDemo::io);
+        time("I/O, virtual mỗi task", tasks, Executors.newVirtualThreadPerTaskExecutor(), VirtualDemo::io);
+
+        int cores = Runtime.getRuntime().availableProcessors();
+        time("CPU, pool " + cores + " platform", 200, Executors.newFixedThreadPool(cores), VirtualDemo::cpu);
+        time("CPU, virtual mỗi task", 200, Executors.newVirtualThreadPerTaskExecutor(), VirtualDemo::cpu);
+    }
+
+    static void time(String label, int tasks, ExecutorService executor, Runnable work) {
+        long t0 = System.nanoTime();
+        try (executor) {   // close() chờ mọi task xong
+            IntStream.range(0, tasks).forEach(i -> executor.submit(work));
+        }
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        System.out.printf("%-26s %,6d task  %,6d ms%n", label, tasks, ms);
+    }
+
+    static void io() {
+        try {
+            Thread.sleep(100);   // đóng vai một lời gọi database hay HTTP mất 100 ms
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static long sink;
+
+    static void cpu() {
+        long x = 0;
+        for (int i = 0; i < 20_000_000; i++) {
+            x += i % 7;
+        }
+        sink += x;
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out VirtualDemo
+```
+
+</Terminal>
+
+<Predict question="Hai dòng I/O khác nhau khoảng bao nhiêu lần? Hai dòng CPU thì sao?">
+
+```text
+virtual: VirtualThread[#26]/runnable@ForkJoinPool-1-worker-1
+I/O, pool 200 platform     10,000 task   5,236 ms
+I/O, virtual mỗi task      10,000 task     145 ms
+CPU, pool 10 platform         200 task     467 ms
+CPU, virtual mỗi task         200 task     452 ms
+```
+
+I/O khác nhau khoảng 35 lần. Pool 200 thread chạy 10.000 task thành 50 đợt, mỗi đợt 100 ms, nên mất khoảng 5 giây. Virtual thread cho cả 10.000 task cùng chờ, tổng thời gian gần bằng một lần chờ cộng chi phí tạo task. Việc dùng CPU thì ngang nhau: 10 carrier thread cũng chỉ có 10 nhân để chạy.
+
+</Predict>
+
+Dòng đầu cho thấy một virtual thread đang mount trên carrier `ForkJoinPool-1-worker-1`; số `#26` và tên worker khác nhau giữa các lần chạy. Dòng `CPU, pool 10 platform` lấy số nhân của máy bạn. Tỉ lệ giữa hai dòng I/O phụ thuộc máy, nhưng khoảng cách hàng chục lần là ổn định.
+
+**Đừng mang con số này đi đâu:** `sleep` không tốn tài nguyên gì phía sau. Lời gọi database thật cần kết nối, và database có giới hạn riêng, như callout Trên production ở trên.
+
+<Check id="j14.3.lab-virtual-throughput">Chạy được `VirtualDemo`, giải thích vì sao pool 200 thread mất khoảng 5 giây và vì sao việc dùng CPU không nhanh hơn với virtual thread.</Check>
+
+### 2. Pinning: JDK 21 và JDK 25
+
+100 virtual thread, mỗi cái giữ một khoá riêng (không ai tranh khoá) và `sleep(100)` bên trong `synchronized`.
+
+<Terminal where="mac" title="Tạo src/Pinning.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/Pinning.java <<'EOF'
+import java.util.concurrent.Executors;
+
+public class Pinning {
+    public static void main(String[] args) {
+        int tasks = 100;
+        long t0 = System.nanoTime();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i < tasks; i++) {
+                Object lock = new Object();   // mỗi task một khoá riêng: không ai tranh khoá
+                executor.submit(() -> {
+                    synchronized (lock) {
+                        sleep(100);           // blocking khi đang giữ monitor
+                    }
+                });
+            }
+        }
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        System.out.printf("Java %s: %d virtual thread, mỗi cái sleep 100 ms trong synchronized: %,d ms%n",
+                Runtime.version().feature(), tasks, ms);
+    }
+
+    static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out Pinning
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Java 25: 100 virtual thread, mỗi cái sleep 100 ms trong synchronized: 110 ms
+```
+
+</Expected>
+
+Trên JDK 25, virtual thread unmount ngay cả khi đang giữ monitor, nên 100 lần `sleep` diễn ra cùng lúc; tổng thời gian chỉ nhỉnh hơn 100 ms một chút, con số cụ thể đổi giữa các lần chạy. Nếu máy bạn có JDK 21 (trên Mac, `/usr/libexec/java_home -V` liệt kê các JDK đã cài), chạy cùng file nguồn trên JDK 21 kèm thuộc tính in ra chỗ bị ghim:
+
+<Terminal where="mac" title="Tuỳ chọn, cần JDK 21">
+
+```bash
+"$(/usr/libexec/java_home -v 21)/bin/java" -Djdk.tracePinnedThreads=short src/Pinning.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Thread[#96,ForkJoinPool-1-worker-5,5,CarrierThreads]
+    Pinning.lambda$main$0(Pinning.java:12) <== monitors:1
+Java 21: 100 virtual thread, mỗi cái sleep 100 ms trong synchronized: 1,053 ms
+```
+
+</Expected>
+
+JDK 21 ghim mỗi virtual thread vào carrier trong suốt 100 ms. Chỉ có 10 carrier (bằng số nhân), nên 100 task chạy thành 10 đợt, khoảng 1 giây. JDK 21 chỉ in chỗ bị ghim một lần cho mỗi stack trace khác nhau. Trên máy có số nhân khác, thời gian JDK 21 là khoảng `100 / số nhân × 100 ms`. Chạy file nguồn trực tiếp (`java src/Pinning.java`) để JDK 21 tự biên dịch, vì file `.class` trong `out` được biên dịch cho Java 25.
+
+### 3. Structured concurrency với --enable-preview
+
+Code preview nằm riêng trong thư mục `preview`, để lệnh `javac -d out src/*.java` của các bước khác không cần cờ preview.
+
+<Terminal where="mac" title="Tạo preview/StructuredCheckout.java">
+
+```bash
+mkdir -p ~/masteva-j14/preview && cd ~/masteva-j14
+cat > preview/StructuredCheckout.java <<'EOF'
+import java.util.concurrent.StructuredTaskScope;
+import java.util.concurrent.StructuredTaskScope.Subtask;
+
+public class StructuredCheckout {
+    record Quote(long price, int stock) {}
+
+    static long price(String sku) throws InterruptedException {
+        try {
+            Thread.sleep(1_000);
+            return 250_000;
+        } catch (InterruptedException e) {
+            System.out.println("price: bị huỷ sau khi stock lỗi");
+            throw e;
+        }
+    }
+
+    static int stock(String sku) throws InterruptedException {
+        Thread.sleep(100);
+        if (sku.equals("SKU-HET")) {
+            throw new IllegalStateException("kho không phản hồi");
+        }
+        return 7;
+    }
+
+    static Quote quote(String sku) throws InterruptedException {
+        try (var scope = StructuredTaskScope.open()) {
+            Subtask<Long> price = scope.fork(() -> price(sku));
+            Subtask<Integer> stock = scope.fork(() -> stock(sku));
+            scope.join();   // chờ cả hai; một nhánh lỗi thì huỷ nhánh kia và ném FailedException
+            return new Quote(price.get(), stock.get());
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        for (String sku : new String[] {"SKU-1", "SKU-HET"}) {
+            long t0 = System.nanoTime();
+            try {
+                System.out.println(sku + ": " + quote(sku));
+            } catch (StructuredTaskScope.FailedException e) {
+                System.out.println(sku + ": lỗi " + e.getCause());
+            }
+            System.out.printf("%s: ~%d ms%n", sku, Math.round((System.nanoTime() - t0) / 1e8) * 100);
+        }
+    }
+}
+EOF
+java preview/StructuredCheckout.java 2>&1 | head -4
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+preview/StructuredCheckout.java:1: error: StructuredTaskScope is a preview API and is disabled by default.
+import java.util.concurrent.StructuredTaskScope;
+                           ^
+  (use --enable-preview to enable preview APIs)
+```
+
+</Expected>
+
+Không có cờ, trình biên dịch từ chối ngay ở dòng `import`. Chạy lại với cờ:
+
+<Terminal where="mac">
+
+```bash
+java --enable-preview preview/StructuredCheckout.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+SKU-1: Quote[price=250000, stock=7]
+SKU-1: ~1000 ms
+price: bị huỷ sau khi stock lỗi
+SKU-HET: lỗi java.lang.IllegalStateException: kho không phản hồi
+SKU-HET: ~100 ms
+```
+
+</Expected>
+
+Với `SKU-HET`, nhánh `stock` lỗi sau 100 ms; scope interrupt nhánh `price` đang ngủ, `join()` ném `FailedException` mang lỗi gốc, và toàn bộ chỉ mất khoảng 100 ms thay vì 1.000 ms. Sau khối `try`, không còn nhánh nào chạy. Với `CompletableFuture` ở J14.2, bạn phải tự viết việc huỷ nhánh còn lại; và như J14.2 đã thấy, huỷ một `CompletableFuture` không interrupt thread của nó.
+
+Biên dịch thành file `.class` thì sao?
+
+<Terminal where="mac">
+
+```bash
+javac --release 25 --enable-preview -d out-preview preview/StructuredCheckout.java
+javap -v out-preview/StructuredCheckout.class | grep -E 'minor|major'
+java -cp out-preview StructuredCheckout
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Note: preview/StructuredCheckout.java uses preview features of Java SE 25.
+Note: Recompile with -Xlint:preview for details.
+  minor version: 65535
+  major version: 69
+Error: LinkageError occurred while loading main class StructuredCheckout
+	java.lang.UnsupportedClassVersionError: Preview features are not enabled for StructuredCheckout (class file version 69.65535). Try running with '--enable-preview'
+```
+
+</Expected>
+
+File `.class` bị đánh dấu là preview của đúng Java 25. Nó không chạy nếu thiếu cờ, không chạy trên JDK 26 hay 27 kể cả có cờ. Một thư viện dùng preview buộc mọi người dùng nó phải chạy đúng JDK đó: lý do thứ hai để tránh preview trong code production.
+
+<Check id="j14.3.lab-structured-cancel">Chạy được `StructuredCheckout` với `--enable-preview`, chỉ ra nhánh nào bị huỷ và vì sao lần lỗi chỉ mất khoảng 100 ms.</Check>
+
+### 4. Tạo một deadlock và tìm nó
+
+Hai lệnh chuyển tiền chạy cùng lúc theo hai chiều ngược nhau, mỗi lệnh khoá tài khoản nguồn trước rồi tới tài khoản đích. Chương trình có thêm một thread `deadlock-watchdog` dùng `ThreadMXBean` để tự phát hiện, và hai chế độ đã sửa: `ordered` và `trylock`.
+
+<Terminal where="mac" title="Tạo src/Deadlock.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/Deadlock.java <<'EOF'
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class Deadlock {
+    static final class Account {
+        final String id;
+        long balance;
+        final ReentrantLock lock = new ReentrantLock();
+
+        Account(String id, long balance) {
+            this.id = id;
+            this.balance = balance;
+        }
+    }
+
+    // Cách 1: khoá theo thứ tự tham số. Hai chiều chuyển ngược nhau là đủ để kẹt.
+    static void transferNaive(Account from, Account to, long amount) {
+        synchronized (from) {
+            pause(50);
+            synchronized (to) {
+                from.balance -= amount;
+                to.balance += amount;
+            }
+        }
+    }
+
+    // Cách 2: luôn khoá tài khoản có id nhỏ hơn trước. Không có vòng chờ.
+    static void transferOrdered(Account from, Account to, long amount) {
+        Account first = from.id.compareTo(to.id) < 0 ? from : to;
+        Account second = first == from ? to : from;
+        synchronized (first) {
+            pause(50);
+            synchronized (second) {
+                from.balance -= amount;
+                to.balance += amount;
+            }
+        }
+    }
+
+    // Cách 3: tryLock có timeout. Không lấy được khoá thứ hai thì nhả khoá đầu và thử lại.
+    static void transferTryLock(Account from, Account to, long amount) throws InterruptedException {
+        while (true) {
+            if (from.lock.tryLock(100, TimeUnit.MILLISECONDS)) {
+                try {
+                    pause(50);
+                    if (to.lock.tryLock(100, TimeUnit.MILLISECONDS)) {
+                        try {
+                            from.balance -= amount;
+                            to.balance += amount;
+                            return;
+                        } finally {
+                            to.lock.unlock();
+                        }
+                    }
+                } finally {
+                    from.lock.unlock();
+                }
+            }
+            System.out.println(Thread.currentThread().getName() + ": không lấy được khoá, thử lại");
+            pause((long) (Math.random() * 100));
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        String mode = args.length > 0 ? args[0] : "naive";
+        Account a = new Account("A", 1_000_000);
+        Account b = new Account("B", 1_000_000);
+        System.out.println("PID " + ProcessHandle.current().pid() + ", mode=" + mode);
+
+        Thread t1 = Thread.ofPlatform().name("transfer-A-to-B").start(() -> transfer(mode, a, b, 100_000));
+        Thread t2 = Thread.ofPlatform().name("transfer-B-to-A").start(() -> transfer(mode, b, a, 200_000));
+        startWatchdog();
+        t1.join();
+        t2.join();
+        System.out.println("xong: A=" + a.balance + ", B=" + b.balance);
+    }
+
+    static void transfer(String mode, Account from, Account to, long amount) {
+        try {
+            switch (mode) {
+                case "ordered" -> transferOrdered(from, to, amount);
+                case "trylock" -> transferTryLock(from, to, amount);
+                default -> transferNaive(from, to, amount);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // Tự phát hiện deadlock từ trong ứng dụng, giống điều jcmd Thread.print làm từ bên ngoài.
+    static void startWatchdog() {
+        Thread.ofPlatform().name("deadlock-watchdog").daemon().start(() -> {
+            ThreadMXBean mx = ManagementFactory.getThreadMXBean();
+            while (true) {
+                pause(1_000);
+                long[] ids = mx.findDeadlockedThreads();
+                if (ids != null) {
+                    for (ThreadInfo info : mx.getThreadInfo(ids)) {
+                        System.out.println("watchdog: " + info.getThreadName()
+                                + " chờ " + info.getLockName() + " do " + info.getLockOwnerName() + " giữ");
+                    }
+                    return;
+                }
+            }
+        });
+    }
+
+    static void pause(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+EOF
+javac -d out src/*.java
+```
+
+</Terminal>
+
+Ở **tab 1**, chạy chế độ mặc định. Chương trình sẽ treo, đó là điều ta muốn:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j14 && java -cp out Deadlock
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PID 41171, mode=naive
+watchdog: transfer-A-to-B chờ Deadlock$Account@75550228 do transfer-B-to-A giữ
+watchdog: transfer-B-to-A chờ Deadlock$Account@32fbccd1 do transfer-A-to-B giữ
+```
+
+</Expected>
+
+PID và mã sau `@` khác trên máy bạn. Mở **tab 2** và lấy thread dump. `jcmd` nhận PID hoặc tên main class:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+jcmd Deadlock Thread.print | grep -A 22 'Found one Java-level deadlock'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Found one Java-level deadlock:
+=============================
+"transfer-A-to-B":
+  waiting to lock monitor 0x0000000141f63f30 (object 0x000000070fe1b318, a Deadlock$Account),
+  which is held by "transfer-B-to-A"
+
+"transfer-B-to-A":
+  waiting to lock monitor 0x0000000131e170d0 (object 0x000000070fe1b1a0, a Deadlock$Account),
+  which is held by "transfer-A-to-B"
+
+Java stack information for the threads listed above:
+===================================================
+"transfer-A-to-B":
+	at Deadlock.transferNaive(Deadlock.java:24)
+	- waiting to lock <0x000000070fe1b318> (a Deadlock$Account)
+	- locked <0x000000070fe1b1a0> (a Deadlock$Account)
+	at Deadlock.transfer(Deadlock.java:86)
+	at Deadlock.lambda$main$0(Deadlock.java:73)
+	at Deadlock$$Lambda/0x0000000401040430.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25.0.3/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25.0.3/Thread.java:1474)
+"transfer-B-to-A":
+	at Deadlock.transferNaive(Deadlock.java:24)
+```
+
+</Expected>
+
+Cách đọc: tìm dòng `- locked` (khoá thread này đang giữ) và `- waiting to lock` (khoá nó đang chờ), so địa chỉ object giữa các thread để thấy vòng. `Deadlock.java:24` là dòng `synchronized (to)` bên trong `synchronized (from)`. Địa chỉ trên máy bạn sẽ khác. Đây là lý do phải đặt tên thread: `transfer-A-to-B` cho biết ngay chuyện gì đang diễn ra, `Thread-0` thì không.
+
+`jstack` cho cùng thông tin. Xem trạng thái của một thread; dấu ` #` trong mẫu grep để chỉ khớp dòng tiêu đề của thread, không khớp phần báo deadlock ở trên:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+PID=$(jcmd | awk '$2 == "Deadlock" {print $1}')
+jstack $PID | grep -A 4 '^"transfer-A-to-B" #'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+"transfer-A-to-B" #25 [26115] prio=5 os_prio=31 cpu=0.15ms elapsed=3.56s tid=0x0000000142017000 nid=26115 waiting for monitor entry  [0x000000016dbf6000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Deadlock.transferNaive(Deadlock.java:24)
+	- waiting to lock <0x000000070fe1b318> (a Deadlock$Account)
+	- locked <0x000000070fe1b1a0> (a Deadlock$Account)
+```
+
+</Expected>
+
+`BLOCKED (on object monitor)` và `cpu=0.15ms`: thread không làm gì, chỉ chờ. Đó là dấu hiệu của deadlock, khác với vòng lặp vô hạn (thread `RUNNABLE`, CPU tăng mãi). Các số `#25`, `cpu`, `elapsed`, `tid` khác trên máy bạn.
+
+Quay lại **tab 1**, bấm **Ctrl+C** để dừng chương trình. Rồi chạy hai bản đã sửa:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+java -cp out Deadlock ordered
+java -cp out Deadlock trylock
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PID 40912, mode=ordered
+xong: A=1100000, B=900000
+PID 40945, mode=trylock
+transfer-B-to-A: không lấy được khoá, thử lại
+xong: A=1100000, B=900000
+```
+
+</Expected>
+
+`ordered` luôn khoá tài khoản `A` trước, nên không có vòng chờ. Với `trylock`, một hoặc cả hai thread không lấy được khoá thứ hai trong 100 ms, nhả khoá đầu, chờ ngẫu nhiên rồi thử lại; số dòng "thử lại" và tên thread thay đổi giữa các lần chạy. Kết quả cuối luôn là A tăng 100.000, B giảm 100.000.
+
+<Check id="j14.3.lab-thread-dump">Tự tạo được deadlock, lấy thread dump bằng `jcmd ... Thread.print` hoặc `jstack`, chỉ ra thread nào giữ khoá nào, và sửa bằng thứ tự khoá cố định.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `cannot find symbol ... ofVirtual()` hoặc `newVirtualThreadPerTaskExecutor()`: JDK cũ hơn 21.
+- `StructuredCheckout` báo `cannot find symbol ... open()` dù đã có `--enable-preview`: bạn đang chạy JDK 21 tới 24, nơi API khác (dùng constructor). Kiểm tra `java -version`. Trên JDK 27 lỗi sẽ ở `FailedException`.
+- `jcmd Deadlock Thread.print` báo không tìm thấy tiến trình: chương trình ở tab 1 đã dừng, hoặc bạn chạy nó theo cách khác `java -cp out Deadlock` nên tên hiện trong danh sách `jcmd` khác đi. Chạy `jcmd` không tham số để xem danh sách, hoặc dùng PID in ở dòng đầu: `jcmd <PID> Thread.print`.
+- `jcmd` báo lỗi kết nối khi chạy trong container: `jcmd` phải chạy cùng user với JVM. Trong Kubernetes, dùng `kubectl exec <pod> -- jcmd 1 Thread.print` với image có JDK; image JRE thì gửi `kill -3 1` để JVM in thread dump ra stdout (J17).
+- Chạy `Deadlock` mà không treo: hai thread không gặp nhau đúng lúc. Rất hiếm vì có `pause(50)` giữa hai lần khoá; chạy lại.
+
+</Callout>
+
+### 5. Dọn dẹp
+
+Tab 1 phải không còn chương trình nào chạy: `jcmd | grep Deadlock` không in gì. Đây là bài cuối của chặng; nếu muốn xoá toàn bộ lab:
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá vĩnh viễn thư mục `~/masteva-j14` với mọi file nguồn của ba bài J14. Bỏ qua nếu muốn giữ lại để ôn.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+rm -rf ~/masteva-j14
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Thread dump của service dùng virtual thread không thấy request nào đang chạy. Chúng đi đâu?">
+
+`jcmd <pid> Thread.print` chỉ in platform thread, gồm cả carrier; virtual thread đang chờ I/O không nằm trên carrier nào nên không xuất hiện. Dùng `jcmd <pid> Thread.dump_to_file -format=json /tmp/threads.json`: file này liệt kê cả virtual thread, nhóm theo executor hoặc scope tạo ra chúng. Trên máy kiểm chứng, một chương trình có ba virtual thread đang ngủ cho 0 dòng trong `Thread.print` và đủ 3 trong file JSON.
+
+</Reveal>
+
+<Reveal title="Có nên dùng ThreadLocal để cache object đắt (như SimpleDateFormat) trên virtual thread?">
+
+Không. Cache trong `ThreadLocal` có lợi vì platform thread trong pool sống lâu và được dùng lại. Virtual thread được tạo mới cho mỗi task, nên mỗi task tạo một object mới, rồi giữ nó tới khi thread kết thúc; một triệu virtual thread là một triệu bản. Dùng object bất biến và thread-safe như `DateTimeFormatter`, hoặc một pool object riêng. `ThreadLocal` để truyền ngữ cảnh ngắn (request id cho log, như MDC ở J15) thì vẫn ổn.
+
+</Reveal>
+
+<Reveal title="Task trong pool chờ một task khác cùng pool: vì sao treo mà thread dump không báo deadlock?">
+
+Pool 4 thread, mỗi task `submit` thêm một task con rồi `get()` kết quả. Khi 4 task cha chiếm đủ 4 thread, task con nằm trong hàng đợi mãi, task cha chờ mãi. Không thread nào giữ khoá của thread nào, chúng chỉ ở `WAITING` trên `FutureTask.get`, nên JVM không thấy vòng khoá. Dấu hiệu trong thread dump: mọi thread của pool cùng chờ ở một chỗ. Sửa bằng cách không chờ task con trong cùng pool: dùng pool riêng, `thenCompose`, hoặc virtual thread.
+
+</Reveal>
+
+<Reveal title="Vì sao service treo trên production thường không phải deadlock khoá Java?">
+
+Phần lớn "treo" là chờ bên ngoài: lời gọi HTTP không có timeout, pool kết nối database cạn, khoá dòng trong database (J12). Thread dump vẫn là công cụ đầu tiên: lấy ba bản cách nhau vài giây. Thread `RUNNABLE` trong `SocketInputStream.read` ở cả ba bản là chờ mạng; `TIMED_WAITING` trong `HikariPool.getConnection` là cạn kết nối; `BLOCKED` thành vòng là deadlock. So các bản với nhau để thấy cái gì đứng yên.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI đọc một thread dump dài: dán phần liên quan và hỏi thread nào giữ khoá nào, nhóm thread nào cùng chờ một chỗ. AI hay khẳng định virtual thread làm mọi thứ nhanh hơn, vẫn khuyên đổi `synchronized` sang `ReentrantLock` vì pinning dù bạn đã ở JDK 24 trở lên, và viết code `StructuredTaskScope` theo API của một bản preview khác (`ShutdownOnFailure` của JDK 21, hay `ExecutionException` của JDK 27). Kiểm tra lại: hỏi rõ JDK nào, biên dịch thử với đúng JDK đó, và đo trên tải giống thật.
+
+</Callout>
+
+<Callout kind="link">
+
+J9.3 đặt câu hỏi `send` hay `sendAsync`; bài này trả lời bằng virtual thread. J12 cấu hình pool kết nối, giới hạn thật khi bật virtual thread. J15 lấy thread dump qua Actuator (`/actuator/threaddump`) và tắt ứng dụng gọn bằng cách tôn trọng interrupt. J17 chọn image có JDK hay JRE, quyết định bạn có `jcmd` trong container hay không. J18 dùng JFR để thấy sự kiện `jdk.VirtualThreadPinned` và tranh khoá.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j14.3.mastery-when-virtual">Quyết định được một service có nên bật virtual thread hay không, và nêu được giới hạn nào phải đặt lại (pool kết nối, `Semaphore`) khi bật.</Check>
+
+<Check id="j14.3.mastery-find-deadlock">Với một JVM đang treo, lấy được thread dump, phân biệt được deadlock khoá, chờ I/O và cạn pool, rồi đề xuất cách sửa.</Check>
+
+</Mastery>

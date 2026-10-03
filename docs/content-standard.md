@@ -99,7 +99,7 @@ Một bài đi qua ba trạng thái:
 | **Đã kiểm chứng** | Mọi lệnh và code đã chạy thành công trên môi trường ghi trong metadata; kiến thức đã được rà lại với nguồn chính thức | Nhãn "Đã kiểm chứng ngày …, với phiên bản …" |
 | **Cần cập nhật** | Công cụ ra phiên bản mới làm thay đổi kết quả, hoặc có lỗi được báo | Nhãn cảnh báo và mô tả phần có thể đã cũ |
 
-**Ngoại lệ khi kiểm chứng** (người dùng chấp nhận ngày 03/10/2026): lệnh cài đặt làm thay đổi hệ thống (`brew install`, trình cài gói) và lệnh dọn dẹp cuối bài (`rm -rf` thư mục lab) không bắt buộc chạy thật, miễn là lệnh cài đã được kiểm bằng chế độ thử (ví dụ `--dry-run`) và lệnh dọn dẹp chỉ xoá thứ bài vừa tạo. Bước chỉ làm được trên giao diện (IDE) không thuộc ngoại lệ này.
+**Ngoại lệ khi kiểm chứng** (người dùng chấp nhận ngày 03/10/2026): lệnh cài đặt làm thay đổi hệ thống (`brew install`, trình cài gói) và lệnh dọn dẹp cuối bài (`rm -rf` thư mục lab) không bắt buộc chạy thật, miễn là lệnh cài đã được kiểm bằng chế độ thử (ví dụ `--dry-run`) và lệnh dọn dẹp chỉ xoá thứ bài vừa tạo. Bước chỉ làm được trên giao diện (IDE, JDK Mission Control) được chấp nhận khi điều nó khẳng định đã được kiểm bằng công cụ dòng lệnh tương đương, ví dụ `jdb` thay cho debugger của IDE, `jfr print` thay cho JMC (người dùng chấp nhận ngày 04/10/2026).
 
 **Metadata bắt buộc của mỗi bài:**
 - Mã bài (ví dụ `d1.1`), roadmap, bước.

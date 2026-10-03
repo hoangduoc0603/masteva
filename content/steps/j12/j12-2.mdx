@@ -1,0 +1,966 @@
+---
+title: JDBC, JPA, Spring Data và Flyway, và cách bắt lỗi N+1
+description: Đưa schema vào migration Flyway, truy cập PostgreSQL từ Spring Boot qua HikariCP bằng JdbcClient và JPA, hiểu persistence context và lazy loading, rồi tìm lỗi N+1 trong log SQL và sửa bằng @EntityGraph.
+id: j12.2
+step: j12
+prerequisites: [j12.1]
+topics: [j12.jdbc, j12.jpa-hibernate, j12.fetch-n-1-lazy-loading, j12.spring-data-jpa, j12.flyway-liquibase, j12.connection-pool]
+status: verified
+verified:
+  date: 2026-10-03
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    flyway: 12.4.0
+    docker: 29.8.0
+    postgresql: "18.6"
+---
+
+<Goal>
+
+Dựng một service Spring Boot đọc ghi PostgreSQL bằng cả JDBC lẫn JPA, với schema do Flyway quản lý, và nhìn vào log SQL để biết mỗi dòng Java sinh ra bao nhiêu câu truy vấn. Học xong bài này, bạn giải thích được:
+
+- Vì sao một endpoint trả 7 đơn hàng lại chạy 17 câu SQL, và sửa thế nào để còn 1.
+- Vì sao `LazyInitializationException: ... (no session)` xuất hiện khi bạn gọi `order.getItems()` trong controller.
+- Vì sao sửa một file migration đã chạy làm ứng dụng không khởi động được nữa.
+
+</Goal>
+
+<Knowledge>
+
+### Các tầng truy cập database trong Java
+
+```text
+ OrderQueryService, ReportController                     code của bạn
+        |                                    |
+ OrderRepository (Spring Data JPA)           |            interface, Spring sinh phần cài đặt
+        |                                    |
+ EntityManager (JPA) <- Hibernate            JdbcClient    Hibernate sinh SQL từ entity;
+   persistence context, dirty checking       (Spring JDBC) JdbcClient chạy SQL bạn viết
+        |                                    |
+        +--------------- JDBC ---------------+            java.sql: Connection, PreparedStatement, ResultSet
+                          |
+                 HikariCP (DataSource)                    pool giữ sẵn kết nối
+                          |
+                 pgJDBC driver --- TCP ---> PostgreSQL :20120 / shopapp
+```
+
+Mọi tầng phía trên cuối cùng đều gọi **JDBC** (Java Database Connectivity), API chuẩn trong gói `java.sql`. Bài J8.3 đã dùng JDBC trực tiếp qua `DriverManager`. Ở đây bạn chọn tầng phù hợp với từng việc:
+
+| Cách | Bạn viết | Hợp với | Cái giá |
+|---|---|---|---|
+| JDBC thuần | SQL, map `ResultSet` bằng tay, đóng tài nguyên | Thư viện, công cụ nhỏ | Nhiều code lặp, dễ quên đóng kết nối |
+| `JdbcClient` (Spring) | SQL; Spring map sang record và đóng tài nguyên | Báo cáo, truy vấn phức tạp, cập nhật hàng loạt | Tự viết mọi câu SQL |
+| JPA + Spring Data | Entity và interface repository | Nghiệp vụ CRUD trên đồ thị đối tượng | Phải hiểu SQL nào được sinh ra |
+
+### JDBC và transaction thủ công
+
+Mặc định một `Connection` JDBC ở chế độ **auto-commit**: mỗi câu lệnh tự commit. Muốn hai câu lệnh cùng thành công hoặc cùng huỷ, bạn tắt auto-commit và tự commit hay rollback:
+
+```java
+try (Connection c = dataSource.getConnection()) {
+    c.setAutoCommit(false);
+    try (PreparedStatement take = c.prepareStatement(
+                 "UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?");
+         PreparedStatement line = c.prepareStatement(
+                 "INSERT INTO order_items (order_id, product_id, quantity, unit_price) "
+                         + "SELECT ?, id, ?, price FROM products WHERE id = ?")) {
+        take.setInt(1, quantity);
+        take.setLong(2, productId);
+        take.setInt(3, quantity);
+        if (take.executeUpdate() == 0) {
+            throw new IllegalStateException("not enough stock");
+        }
+        line.setLong(1, orderId);
+        line.setInt(2, quantity);
+        line.setLong(3, productId);
+        line.executeUpdate();
+        c.commit();
+    } catch (SQLException | RuntimeException e) {
+        c.rollback();
+        throw e;
+    }
+}
+```
+
+- Dấu `?` của `PreparedStatement` gửi giá trị tách khỏi câu SQL, nên chuỗi `'; DROP TABLE orders; --` chỉ là một giá trị, không thành lệnh: đây là cách chặn **SQL injection**. Không bao giờ ghép giá trị người dùng vào chuỗi SQL.
+- `try (...)` đóng `PreparedStatement` rồi `Connection`. Với pool, `close()` không cắt kết nối mà **trả nó về pool**; quên đóng là pool cạn dần.
+- `@Transactional` của Spring làm đúng những việc trên cho bạn: lấy kết nối, tắt auto-commit, commit khi method kết thúc bình thường, rollback khi có `RuntimeException`.
+
+### Connection pool
+
+Mở một kết nối PostgreSQL gồm bắt tay TCP, xác thực, và PostgreSQL tạo hẳn một tiến trình mới cho kết nối đó: tốn vài mili giây tới hàng chục mili giây, lâu hơn nhiều so với một truy vấn đơn giản. **Connection pool** mở sẵn một số kết nối và cho mượn. Spring Boot dùng **HikariCP** mặc định, với `maximumPoolSize = 10` và `minimumIdle` bằng chính số đó, nên ứng dụng giữ 10 kết nối ngay khi khởi động. Bài J12.3 chỉnh kích thước và timeout của pool.
+
+<Check id="j12.2.layers">Kể được đường đi từ repository Spring Data xuống tới PostgreSQL qua Hibernate, JDBC và HikariCP, và chọn được giữa JDBC, `JdbcClient` và JPA cho một việc cụ thể.</Check>
+
+### JPA, Hibernate và persistence context
+
+**Jakarta Persistence (JPA)** là đặc tả ánh xạ class Java sang bảng; **Hibernate** là bản cài đặt Spring Boot dùng. Một **entity** là class có `@Entity` và `@Id`. Spring Boot cấu hình Hibernate đổi tên kiểu camelCase sang snake_case, nên field `fullName` khớp cột `full_name` mà không cần `@Column`.
+
+Mỗi transaction có một **persistence context**: một bản đồ "id → đối tượng entity" mà Hibernate quản lý. Entity đi qua các trạng thái:
+
+```text
+ new Product()  --persist()-->  MANAGED  --hết transaction-->  DETACHED
+  (transient)                   |  findById() trả về đối tượng managed
+                                |  đổi field -> lúc commit, Hibernate so với
+                                |  ảnh chụp ban đầu và tự sinh UPDATE (dirty checking)
+                                |  đọc cùng id hai lần -> cùng một đối tượng, một câu SQL
+```
+
+- **Dirty checking:** bạn không gọi `save()` để cập nhật. Đổi field của entity managed, Hibernate tự sinh `UPDATE` khi flush trước commit. Bài J12.3 dựa vào điều này.
+- **Detached:** sau khi transaction đóng, entity vẫn còn trong bộ nhớ nhưng Hibernate không quản lý nữa. Đổi field không ghi xuống database; truy cập quan hệ chưa tải thì lỗi.
+
+### Lazy loading và N+1
+
+Quan hệ có hai cách tải (fetch): **EAGER** tải ngay cùng entity, **LAZY** chỉ tải khi code chạm tới. Với quan hệ lazy, Hibernate đặt vào field một **proxy** hoặc một collection rỗng chưa khởi tạo; lần đầu bạn gọi `getEmail()` hay duyệt `getItems()`, nó chạy một câu `SELECT`.
+
+| Annotation | Mặc định của JPA | Nên đặt |
+|---|---|---|
+| `@ManyToOne`, `@OneToOne` | EAGER | `fetch = FetchType.LAZY`, rồi tải có chủ đích khi cần |
+| `@OneToMany`, `@ManyToMany` | LAZY | Giữ LAZY |
+
+Lazy có hai cái bẫy:
+
+- **`LazyInitializationException`:** chạm vào quan hệ lazy khi persistence context đã đóng. Spring Boot mặc định bật **open-in-view**, giữ persistence context mở tới hết request HTTP để che lỗi này, đổi lại kết nối database bị giữ trong lúc render JSON và truy vấn lazy chạy rải rác ngoài tầng service. Bài này tắt nó bằng `spring.jpa.open-in-view=false`, nên mọi việc đọc dữ liệu phải nằm trong một method `@Transactional`.
+- **N+1:** một câu lấy N đơn hàng, rồi mỗi đơn thêm một câu lấy khách, một câu lấy dòng hàng. Code Java trông vô hại; log SQL thì không.
+
+| Cách sửa | Viết thế nào | Ghi chú |
+|---|---|---|
+| `join fetch` trong JPQL | `@Query("select o from PurchaseOrder o join fetch o.customer ...")` | `join fetch` là inner join: đơn không có dòng hàng sẽ biến mất |
+| `@EntityGraph` | `@EntityGraph(attributePaths = {"customer", "items", "items.product"})` | Dùng left join; giữ được derived query |
+| Batch fetching | `spring.jpa.properties.hibernate.default_batch_fetch_size=50` | Gom N câu thành vài câu `where id in (...)`; sửa toàn cục |
+| DTO projection | `select new ...View(o.id, c.email) from ...` | Chỉ lấy cột cần; không có entity để sửa |
+
+Hibernate gộp các dòng trùng của đơn hàng do join với collection, nên không cần `distinct`. Đừng fetch hai collection kiểu `List` trong cùng một truy vấn: Hibernate báo `MultipleBagFetchException`, vì tích Descartes của hai collection làm số dòng nhân lên.
+
+### Spring Data JPA
+
+Bạn khai báo interface, Spring sinh phần cài đặt lúc khởi động:
+
+| Cách | Ví dụ | Dùng khi |
+|---|---|---|
+| Derived query | `findByStatusOrderByCreatedAtDesc(String status)` | Điều kiện đơn giản; tên method chính là truy vấn |
+| `@Query` | JPQL hoặc `nativeQuery = true` | Join, điều kiện phức tạp, `join fetch` |
+| `Pageable` | `Page<PurchaseOrder> findByStatus(String s, Pageable p)` | Phân trang; Spring chạy thêm một câu `count(*)` |
+| Projection | `List<OrderSummary> findByStatus(...)` với `OrderSummary` là interface hoặc record | Chỉ cần vài cột |
+
+Phần giữa `find` và `By` là tự do, nên `findWithDetailsByStatus...` vẫn là derived query theo `status`; "WithDetails" chỉ để bạn phân biệt nó với method không có entity graph.
+
+<Check id="j12.2.jpa-model">Giải thích được persistence context, trạng thái managed và detached, dirty checking, và vì sao `@ManyToOne` nên đặt LAZY.</Check>
+
+### Migration với Flyway
+
+Schema là code: nó phải có version, được review, và chạy giống nhau trên máy dev, CI và production. Lab chọn **Flyway**, ghi migration bằng SQL thuần:
+
+- File `src/main/resources/db/migration/V<số>__<mô tả>.sql`, ví dụ `V1__schema.sql`. Hai dấu gạch dưới tách số version và mô tả.
+- Khi ứng dụng khởi động, Flyway đọc bảng `flyway_schema_history`, chạy theo thứ tự các migration chưa chạy, và ghi lại version, thời gian, **checksum** của từng file.
+- Migration đã chạy là **bất biến**. Sửa nó, checksum lệch và Flyway từ chối khởi động. Muốn đổi gì, viết migration mới.
+- `spring.jpa.hibernate.ddl-auto=validate`: Hibernate chỉ kiểm tra entity khớp schema, không tự tạo hay sửa bảng. Flyway là nguồn sự thật của schema.
+
+| | Flyway | Liquibase |
+|---|---|---|
+| Viết migration bằng | SQL (có thể Java) | Changelog XML, YAML, JSON hoặc SQL |
+| Rollback | Viết migration mới để đảo ngược | Changeset có thể khai báo rollback |
+| Hợp với | Team đọc SQL thoải mái, một loại database | Nhiều loại database, cần rollback có cấu trúc |
+
+<Callout kind="production">
+
+Một lập trình viên phát hiện giá trong `V2__seed.sql` sai, sửa thẳng file đó và merge. CI xanh vì database của CI tạo mới mỗi lần. Lúc deploy, mọi instance production chết ngay khi khởi động với `Migration checksum mismatch for migration version 2`, vì production đã chạy bản V2 cũ từ tháng trước. Bạn sẽ gặp đúng lỗi này ở bước 8; cách sửa đúng là trả file về như cũ và viết `V3`.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [A Short Guide to Hibernate 7](https://docs.hibernate.org/orm/current/introduction/html_single/): đọc "Persistence contexts", "Association fetching" và "Join fetch" để hiểu Hibernate sinh SQL thế nào.
+- [JPA Query Methods (Spring Data JPA)](https://docs.spring.io/spring-data/jpa/reference/jpa/query-methods.html): quy tắc đặt tên derived query, `@Query`, và mục "Configuring Fetch- and LoadGraphs".
+- [Using the JDBC Core Classes (Spring Framework)](https://docs.spring.io/spring-framework/reference/data-access/jdbc/core.html): mục `JdbcClient` với tham số đặt tên và map sang record.
+- [Flyway: Migrations](https://documentation.red-gate.com/flyway/flyway-concepts/migrations): quy ước đặt tên versioned migration và bảng lịch sử.
+- [HikariCP](https://github.com/brettwooldridge/HikariCP): bảng cấu hình, đọc `maximumPoolSize`, `minimumIdle`, `connectionTimeout`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài J12.1, container `masteva-j12-pg` đang chạy (`docker start masteva-j12-pg` nếu nó đã dừng). JDK 25, `curl` và `unzip`. Mở **hai tab Terminal**: tab 1 chạy ứng dụng, tab 2 gửi request và chạy psql. Ứng dụng nghe ở cổng **20121**. Ở tab 2, định nghĩa lại hàm từ bài J12.1:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql() { docker exec -i masteva-j12-pg psql -U postgres -d shop "$@"; }
+```
+
+</Terminal>
+
+### 1. Database riêng cho ứng dụng
+
+Database `shop` của bài J12.1 đã có bảng tạo tay. Ứng dụng dùng database mới `shopapp` để Flyway tạo schema từ đầu:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c 'CREATE DATABASE shopapp'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CREATE DATABASE
+```
+
+</Expected>
+
+`psql` nhận tham số `-d` cuối cùng, nên từ đây `shopsql -d shopapp ...` làm việc với database mới.
+
+### 2. Tạo project từ start.spring.io
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=shop \
+  -d name=shop -d packageName=vn.masteva.shop \
+  -d dependencies=web,data-jpa,flyway,postgresql,actuator -o shop.zip
+unzip -q shop.zip -d shop && cd shop
+grep -E '<artifactId>(spring-boot-starter|flyway|postgresql)' pom.xml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+		<artifactId>spring-boot-starter-parent</artifactId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+			<artifactId>spring-boot-starter-data-jpa</artifactId>
+			<artifactId>spring-boot-starter-flyway</artifactId>
+			<artifactId>spring-boot-starter-webmvc</artifactId>
+			<artifactId>flyway-database-postgresql</artifactId>
+			<artifactId>postgresql</artifactId>
+			<artifactId>spring-boot-starter-actuator-test</artifactId>
+			<artifactId>spring-boot-starter-data-jpa-test</artifactId>
+			<artifactId>spring-boot-starter-flyway-test</artifactId>
+			<artifactId>spring-boot-starter-webmvc-test</artifactId>
+```
+
+</Expected>
+
+- `spring-boot-starter-data-jpa` kéo theo Hibernate, Spring Data JPA, Spring JDBC và HikariCP.
+- Từ Spring Boot 4, Flyway có starter riêng `spring-boot-starter-flyway`. Flyway 10 trở lên tách hỗ trợ từng database ra module riêng, nên cần thêm `flyway-database-postgresql`; thiếu nó, ứng dụng báo `Unsupported Database: PostgreSQL 18.6`.
+- Project có sẵn Maven Wrapper (bài J7.3): `./mvnw` tải Maven 3.9.16 ở lần chạy đầu.
+
+### 3. Cấu hình và migration
+
+<Terminal where="mac" title="Tab 2: cấu hình, V1 và V2">
+
+```bash
+cd ~/masteva-j12/shop
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=shop
+server.port=20121
+
+spring.datasource.url=jdbc:postgresql://localhost:20120/shopapp
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+logging.level.org.hibernate.SQL=debug
+logging.file.name=logs/shop.log
+EOF
+cp ../sql/01-schema.sql src/main/resources/db/migration/V1__schema.sql
+cat >> src/main/resources/db/migration/V1__schema.sql <<'EOF'
+
+CREATE INDEX orders_customer_created_idx ON orders (customer_id, created_at DESC);
+CREATE INDEX order_items_product_idx ON order_items (product_id);
+EOF
+cat > src/main/resources/db/migration/V2__seed.sql <<'EOF'
+INSERT INTO customers (email, full_name) VALUES
+    ('an@example.com', 'Nguyễn An'),
+    ('binh@example.com', 'Trần Bình'),
+    ('chi@example.com', 'Lê Chi'),
+    ('dung@example.com', 'Phạm Dũng'),
+    ('em@example.com', 'Võ Em');
+
+INSERT INTO products (sku, name, price, stock) VALUES
+    ('BOOK-JAVA', 'Sách Java', 250000, 100),
+    ('BOOK-SQL', 'Sách SQL', 180000, 100),
+    ('MUG', 'Cốc Masteva', 90000, 100),
+    ('SHIRT', 'Áo thun', 150000, 100);
+
+INSERT INTO orders (customer_id, status, created_at)
+SELECT 1 + g % 5, CASE WHEN g % 3 = 0 THEN 'NEW' ELSE 'PAID' END,
+       timestamptz '2026-09-01' + g * interval '1 hour'
+FROM generate_series(1, 10) AS g;
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+SELECT o.id, p.id, 1 + (o.id + p.id) % 2, p.price
+FROM orders AS o
+JOIN products AS p ON p.id IN (1 + o.id % 4, 1 + (o.id + 1) % 4);
+EOF
+```
+
+</Terminal>
+
+- `V1__schema.sql` chính là file đã chạy tay ở J12.1, cộng hai index: index cho truy vấn "đơn của khách" và index cho khoá ngoại `order_items.product_id` (Đào sâu của J12.1 giải thích vì sao). `order_items.order_id` không cần thêm, vì `UNIQUE (order_id, product_id)` đã tạo index bắt đầu bằng cột đó.
+- `V2__seed.sql` tạo 10 đơn, 7 đơn `PAID`, mỗi đơn 2 dòng hàng.
+- `logging.level.org.hibernate.SQL=debug` in mọi câu SQL Hibernate gửi đi; `logging.file.name` ghi thêm log ra file để tab 2 đếm được.
+- Mật khẩu ghi thẳng trong file chỉ chấp nhận được cho lab trên máy bạn. Bài J13 chuyển nó sang biến môi trường và secret.
+
+### 4. Entity, repository và endpoint đầu tiên
+
+<Terminal where="mac" title="Tab 2: tạo entity, repository, controller">
+
+```bash
+cd ~/masteva-j12/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/Customer.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import java.time.Instant;
+
+@Entity
+@Table(name = "customers")
+public class Customer {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String email;
+    private String fullName;
+    private Instant createdAt;
+
+    protected Customer() {
+    }
+
+    public Long getId() { return id; }
+    public String getEmail() { return email; }
+    public String getFullName() { return fullName; }
+}
+EOF
+cat > $P/Product.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+
+@Entity
+@Table(name = "products")
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String sku;
+    private String name;
+    private long price;
+    private int stock;
+
+    protected Product() {
+    }
+
+    public Long getId() { return id; }
+    public String getSku() { return sku; }
+    public long getPrice() { return price; }
+    public int getStock() { return stock; }
+}
+EOF
+cat > $P/PurchaseOrder.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.OrderBy;
+import jakarta.persistence.Table;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+
+@Entity
+@Table(name = "orders")
+public class PurchaseOrder {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    private Customer customer;
+
+    private String status;
+    private Instant createdAt;
+
+    @OneToMany(mappedBy = "order")
+    @OrderBy("id")
+    private List<OrderItem> items = new ArrayList<>();
+
+    protected PurchaseOrder() {
+    }
+
+    public Long getId() { return id; }
+    public Customer getCustomer() { return customer; }
+    public String getStatus() { return status; }
+    public List<OrderItem> getItems() { return items; }
+}
+EOF
+cat > $P/OrderItem.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.Table;
+
+@Entity
+@Table(name = "order_items")
+public class OrderItem {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    private PurchaseOrder order;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    private Product product;
+
+    private int quantity;
+    private long unitPrice;
+
+    protected OrderItem() {
+    }
+
+    public Product getProduct() { return product; }
+    public int getQuantity() { return quantity; }
+}
+EOF
+cat > $P/OrderRepository.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface OrderRepository extends JpaRepository<PurchaseOrder, Long> {
+
+    List<PurchaseOrder> findByStatusOrderByCreatedAtDesc(String status);
+}
+EOF
+cat > $P/OrderView.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+
+public record OrderView(Long id, String customer, String status, List<Line> items) {
+
+    public record Line(String sku, int quantity) {
+    }
+
+    static OrderView from(PurchaseOrder o) {
+        List<Line> lines = o.getItems().stream()
+                .map(i -> new Line(i.getProduct().getSku(), i.getQuantity()))
+                .toList();
+        return new OrderView(o.getId(), o.getCustomer().getEmail(), o.getStatus(), lines);
+    }
+}
+EOF
+cat > $P/OrderController.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class OrderController {
+    private final OrderRepository orders;
+
+    public OrderController(OrderRepository orders) {
+        this.orders = orders;
+    }
+
+    @GetMapping("/orders")
+    public List<OrderView> list(@RequestParam String status) {
+        return orders.findByStatusOrderByCreatedAtDesc(status).stream()
+                .map(OrderView::from)
+                .toList();
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- Class đơn hàng tên `PurchaseOrder` thay vì `Order`, vì `ORDER` là từ khoá trong cả SQL lẫn JPQL. `@Table(name = "orders")` nối nó với bảng.
+- Field `customer` có `@ManyToOne` nên Hibernate tìm cột `customer_id`; `order` tìm `order_id`.
+- `@OneToMany(mappedBy = "order")` nói rằng khoá ngoại nằm ở phía `OrderItem.order`; bảng `orders` không có cột nào cho `items`. `@OrderBy("id")` giữ thứ tự dòng hàng ổn định.
+- Constructor `protected` không tham số là yêu cầu của JPA: Hibernate tạo đối tượng rồi gán field.
+- `OrderView` là DTO trả ra JSON. Không trả entity thẳng ra API: Jackson sẽ đi theo mọi quan hệ lazy và lộ cấu trúc bảng.
+
+### 5. Chạy ứng dụng
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-j12/shop
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw spring-boot:run
+```
+
+</Terminal>
+
+Lần đầu, wrapper tải Maven và các thư viện, mất một lúc. Các dòng quan trọng trong log, đã bỏ phần thời gian, PID và tên thread ở đầu mỗi dòng; mã sau `PgConnection@` và các con số thời gian khác nhau mỗi lần chạy:
+
+<Expected>
+
+```text
+com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Starting...
+com.zaxxer.hikari.pool.HikariPool        : HikariPool-1 - Added connection org.postgresql.jdbc.PgConnection@20256a0b
+com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Start completed.
+org.flywaydb.core.FlywayExecutor         : Database: jdbc:postgresql://localhost:20120/shopapp (PostgreSQL 18.6)
+o.f.c.i.s.JdbcTableSchemaHistory         : Schema history table "public"."flyway_schema_history" does not exist yet
+o.f.core.internal.command.DbValidate     : Successfully validated 2 migrations (execution time 00:00.012s)
+o.f.c.i.s.JdbcTableSchemaHistory         : Creating Schema History table "public"."flyway_schema_history" ...
+o.f.core.internal.command.DbMigrate      : Current version of schema "public": << Empty Schema >>
+o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "1 - schema"
+o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "2 - seed"
+o.f.core.internal.command.DbMigrate      : Successfully applied 2 migrations to schema "public", now at version v2 (execution time 00:00.031s)
+org.hibernate.orm.core                   : HHH000001: Hibernate ORM core version 7.4.5.Final
+...
+o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 20121 (http) with context path '/'
+vn.masteva.shop.ShopApplication          : Started ShopApplication in 3.071 seconds (process running for 3.27)
+```
+
+</Expected>
+
+Thứ tự là có chủ đích: pool mở trước, Flyway chạy migration bằng kết nối của pool, rồi Hibernate mới khởi động và kiểm tra (`validate`) entity với schema vừa tạo. Ở tab 2, xem Flyway đã ghi gì và pool đang giữ bao nhiêu kết nối:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -d shopapp -c 'SELECT version, description, script, checksum, success FROM flyway_schema_history'
+shopsql -c "SELECT application_name, state, count(*) FROM pg_stat_activity WHERE datname = 'shopapp' GROUP BY 1, 2"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ version | description |     script     |  checksum   | success
+---------+-------------+----------------+-------------+---------
+ 1       | schema      | V1__schema.sql | -1224126891 | t
+ 2       | seed        | V2__seed.sql   |  -895225747 | t
+(2 rows)
+
+    application_name    | state | count
+------------------------+-------+-------
+ PostgreSQL JDBC Driver | idle  |    10
+(1 row)
+```
+
+</Expected>
+
+Checksum giống hệt trên máy bạn nếu file migration giống từng byte. Mười kết nối `idle`: HikariCP mở đủ `minimumIdle = 10` dù chưa có request nào.
+
+<Check id="j12.2.lab-flyway-pool">Chạy được ứng dụng với Flyway tạo schema, đọc được `flyway_schema_history`, và đếm được số kết nối HikariCP mở sẵn bằng `pg_stat_activity`.</Check>
+
+### 6. Lazy loading ngoài transaction
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s 'localhost:20121/orders?status=PAID'; echo
+```
+
+</Terminal>
+
+<Predict question="Controller gọi repository rồi duyệt o.getItems() và o.getCustomer().getEmail(). Kết quả là gì?">
+
+```text
+{"timestamp":"2026-10-03T17:27:08.446Z","status":500,"error":"Internal Server Error","path":"/orders"}
+```
+
+Trong tab 1:
+
+```text
+org.hibernate.SQL                        : select po1_0.id,po1_0.created_at,po1_0.customer_id,po1_0.status from orders po1_0 where po1_0.status=? order by po1_0.created_at desc
+o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed: org.hibernate.LazyInitializationException: Cannot lazily initialize collection of role 'vn.masteva.shop.PurchaseOrder.items' with key '10' (no session)] with root cause
+```
+
+Câu SQL đầu tiên chỉ lấy cột của `orders`; `customer_id` là một con số, `items` chưa được tải. Method của repository dùng một persistence context chỉ sống trong chính lời gọi đó (không có transaction nào bao ngoài), và nó đóng ngay khi method trả về. Khi controller chạm `getItems()` của đơn 10, persistence context đã đóng: `(no session)`. Với open-in-view mặc định của Spring Boot, request này sẽ chạy được, và lỗi N+1 ở bước sau sẽ nằm ẩn trong controller.
+
+</Predict>
+
+<Check id="j12.2.lab-lazy">Giải thích được vì sao `LazyInitializationException` xảy ra khi tắt open-in-view, và vì sao bật lại open-in-view không phải cách sửa.</Check>
+
+### 7. Đưa việc đọc vào transaction, và thấy N+1
+
+Dừng ứng dụng ở tab 1 bằng **Ctrl+C**. Ở tab 2, thêm một service đọc dữ liệu trong `@Transactional(readOnly = true)` và cho controller gọi nó:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/OrderQueryService.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OrderQueryService {
+    private final OrderRepository orders;
+
+    public OrderQueryService(OrderRepository orders) {
+        this.orders = orders;
+    }
+
+    @Transactional(readOnly = true)
+    public List<OrderView> byStatus(String status) {
+        return orders.findByStatusOrderByCreatedAtDesc(status).stream()
+                .map(OrderView::from)
+                .toList();
+    }
+}
+EOF
+cat > $P/OrderController.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class OrderController {
+    private final OrderQueryService queries;
+
+    public OrderController(OrderQueryService queries) {
+        this.queries = queries;
+    }
+
+    @GetMapping("/orders")
+    public List<OrderView> list(@RequestParam String status) {
+        return queries.byStatus(status);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Chạy lại `./mvnw spring-boot:run` ở tab 1. Khi thấy `Started ShopApplication`, ở tab 2 xoá trắng file log rồi gọi API và đếm số câu SQL:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+: > logs/shop.log
+curl -s 'localhost:20121/orders?status=PAID'; echo
+grep -c 'org.hibernate.SQL' logs/shop.log
+grep 'org.hibernate.SQL' logs/shop.log | sed 's/^.*org.hibernate.SQL *: //' | cut -c1-60 | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"id":10,"customer":"an@example.com","status":"PAID","items":[{"sku":"MUG","quantity":2},{"sku":"SHIRT","quantity":1}]},{"id":8,"customer":"dung@example.com","status":"PAID","items":[{"sku":"BOOK-JAVA","quantity":2},{"sku":"BOOK-SQL","quantity":1}]},{"id":7,"customer":"chi@example.com","status":"PAID","items":[{"sku":"BOOK-JAVA","quantity":1},{"sku":"SHIRT","quantity":2}]},{"id":5,"customer":"an@example.com","status":"PAID","items":[{"sku":"BOOK-SQL","quantity":2},{"sku":"MUG","quantity":1}]},{"id":4,"customer":"em@example.com","status":"PAID","items":[{"sku":"BOOK-JAVA","quantity":2},{"sku":"BOOK-SQL","quantity":1}]},{"id":2,"customer":"chi@example.com","status":"PAID","items":[{"sku":"MUG","quantity":2},{"sku":"SHIRT","quantity":1}]},{"id":1,"customer":"binh@example.com","status":"PAID","items":[{"sku":"BOOK-SQL","quantity":2},{"sku":"MUG","quantity":1}]}]
+17
+   5 select c1_0.id,c1_0.created_at,c1_0.email,c1_0.full_name fro
+   7 select i1_0.order_id,i1_0.id,i1_0.product_id,i1_0.quantity,i
+   4 select p1_0.id,p1_0.name,p1_0.price,p1_0.sku,p1_0.stock from
+   1 select po1_0.id,po1_0.created_at,po1_0.customer_id,po1_0.sta
+```
+
+</Expected>
+
+Lệnh `: > logs/shop.log` làm rỗng file; logback ghi tiếp vào file ở chế độ append nên vẫn ghi đúng. 17 câu SQL cho 7 đơn:
+
+- 1 câu lấy danh sách đơn.
+- 7 câu lấy dòng hàng, mỗi đơn một câu: đây là phần "N" của N+1.
+- 5 câu lấy khách và 4 câu lấy sản phẩm, chứ không phải 7 và 14: persistence context nhớ khách `an@example.com` đã tải ở đơn 10, nên đơn 5 dùng lại mà không truy vấn.
+
+Với trang 50 đơn trên production, con số là vài trăm câu SQL, mỗi câu một lượt đi về qua mạng.
+
+<Check id="j12.2.lab-n-plus-one">Đếm được số câu SQL một endpoint sinh ra từ log Hibernate, và giải thích từng nhóm câu trong 17 câu đó.</Check>
+
+### 8. Sửa bằng @EntityGraph
+
+Dừng ứng dụng (Ctrl+C ở tab 1). Thêm một method có entity graph và cho service dùng nó:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/OrderRepository.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import org.springframework.data.jpa.repository.EntityGraph;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface OrderRepository extends JpaRepository<PurchaseOrder, Long> {
+
+    List<PurchaseOrder> findByStatusOrderByCreatedAtDesc(String status);
+
+    @EntityGraph(attributePaths = {"customer", "items", "items.product"})
+    List<PurchaseOrder> findWithDetailsByStatusOrderByCreatedAtDesc(String status);
+}
+EOF
+perl -pi -e 's/findByStatusOrderByCreatedAtDesc\(status\)/findWithDetailsByStatusOrderByCreatedAtDesc(status)/' $P/OrderQueryService.java
+```
+
+</Terminal>
+
+Chạy lại ứng dụng ở tab 1, rồi ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+: > logs/shop.log
+curl -s 'localhost:20121/orders?status=PAID' | cut -c1-120
+grep -c 'org.hibernate.SQL' logs/shop.log
+grep 'org.hibernate.SQL' logs/shop.log | sed 's/^.*org.hibernate.SQL *: //'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"id":10,"customer":"an@example.com","status":"PAID","items":[{"sku":"MUG","quantity":2},{"sku":"SHIRT","quantity":1}]},{"
+1
+select po1_0.id,po1_0.created_at,po1_0.customer_id,c1_0.id,c1_0.created_at,c1_0.email,c1_0.full_name,i1_0.order_id,i1_0.id,i1_0.product_id,p1_0.id,p1_0.name,p1_0.price,p1_0.sku,p1_0.stock,i1_0.quantity,i1_0.unit_price,po1_0.status from orders po1_0 join customers c1_0 on c1_0.id=po1_0.customer_id left join order_items i1_0 on po1_0.id=i1_0.order_id left join products p1_0 on p1_0.id=i1_0.product_id where po1_0.status=? order by po1_0.created_at desc,i1_0.id
+```
+
+</Expected>
+
+Cùng JSON, một câu SQL. `customer` dùng `join` thường vì quan hệ khai báo `optional = false`; `items` dùng `left join` để đơn không có dòng hàng vẫn xuất hiện. Câu SQL trả 14 dòng (7 đơn, mỗi đơn 2 dòng hàng), và Hibernate gộp lại thành 7 đối tượng `PurchaseOrder`. Cùng kết quả viết bằng JPQL, thay entity graph:
+
+```java
+@Query("""
+        select o from PurchaseOrder o
+        join fetch o.customer
+        join fetch o.items i
+        join fetch i.product
+        where o.status = :status
+        order by o.createdAt desc
+        """)
+List<PurchaseOrder> fetchByStatus(String status);
+```
+
+Câu này cũng sinh một SQL, nhưng `join fetch o.items` là inner join: đơn chưa có dòng hàng nào sẽ biến mất khỏi kết quả. Viết `left join fetch` nếu điều đó không chấp nhận được.
+
+### 9. Báo cáo bằng JdbcClient, và một migration bị sửa
+
+Báo cáo doanh thu là SQL thuần với `GROUP BY`; đưa nó qua entity chỉ tốn công. Dừng ứng dụng, rồi thêm controller dùng `JdbcClient`, bean Spring Boot tự tạo từ `DataSource`. Đồng thời, giả sử bạn muốn đổi giá cốc thành 95.000 và làm theo cách sai: sửa thẳng `V2__seed.sql`.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+cat > src/main/java/vn/masteva/shop/ReportController.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ReportController {
+    private final JdbcClient jdbc;
+
+    public ReportController(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    public record TopProduct(String sku, long sold, long revenue) {
+    }
+
+    @GetMapping("/reports/top-products")
+    public List<TopProduct> topProducts(@RequestParam(defaultValue = "3") int limit) {
+        return jdbc.sql("""
+                SELECT p.sku, sum(i.quantity) AS sold, sum(i.quantity * i.unit_price) AS revenue
+                FROM order_items i
+                JOIN orders o ON o.id = i.order_id
+                JOIN products p ON p.id = i.product_id
+                WHERE o.status = 'PAID'
+                GROUP BY p.id
+                ORDER BY revenue DESC, p.sku
+                LIMIT :limit
+                """)
+                .param("limit", limit)
+                .query(TopProduct.class)
+                .list();
+    }
+}
+EOF
+perl -pi -e "s/'MUG', 'Cốc Masteva', 90000/'MUG', 'Cốc Masteva', 95000/" src/main/resources/db/migration/V2__seed.sql
+```
+
+</Terminal>
+
+Chạy lại `./mvnw spring-boot:run` ở tab 1.
+
+<Predict question="Ứng dụng có khởi động không?">
+
+Không. Tab 1 in một stack trace dài, Maven báo `BUILD FAILURE` và quay về dấu nhắc. Phần quan trọng:
+
+```text
+Validate failed: Migrations have failed validation
+Migration checksum mismatch for migration version 2
+-> Applied to database : -895225747
+-> Resolved locally    : -34449375
+Either revert the changes to the migration, or run repair to update the schema history.
+```
+
+Flyway tính lại checksum của `V2__seed.sql` và so với giá trị đã lưu trong `flyway_schema_history`. Hai số khác nhau nghĩa là database đang chạy một bản V2 khác với bản trong code, và Flyway không đoán bản nào đúng. `repair` chỉ ghi đè checksum mới vào bảng lịch sử, không chạy lại file; database vẫn có giá 90.000. Đó là lý do không dùng `repair` để "chữa" kiểu lỗi này.
+
+</Predict>
+
+Sửa đúng cách: trả V2 về nguyên trạng và viết migration mới.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-j12/shop
+perl -pi -e "s/'MUG', 'Cốc Masteva', 95000/'MUG', 'Cốc Masteva', 90000/" src/main/resources/db/migration/V2__seed.sql
+cat > src/main/resources/db/migration/V3__mug_price.sql <<'EOF'
+UPDATE products SET price = 95000 WHERE sku = 'MUG';
+EOF
+```
+
+</Terminal>
+
+Chạy lại ứng dụng ở tab 1. Log Flyway lần này:
+
+<Expected>
+
+```text
+o.f.core.internal.command.DbValidate     : Successfully validated 3 migrations (execution time 00:00.018s)
+o.f.core.internal.command.DbMigrate      : Current version of schema "public": 2
+o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "3 - mug price"
+o.f.core.internal.command.DbMigrate      : Successfully applied 1 migration to schema "public", now at version v3 (execution time 00:00.007s)
+```
+
+</Expected>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s 'localhost:20121/reports/top-products'; echo
+curl -s 'localhost:20121/reports/top-products?limit=1'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"sku":"BOOK-JAVA","sold":5,"revenue":1250000},{"sku":"BOOK-SQL","sold":6,"revenue":1080000},{"sku":"SHIRT","sold":4,"revenue":600000}]
+[{"sku":"BOOK-JAVA","sold":5,"revenue":1250000}]
+```
+
+</Expected>
+
+- `:limit` là tham số đặt tên; `JdbcClient` chuyển nó thành `?` của `PreparedStatement`. `limit` khai báo kiểu `int`, nên `limit=1; DROP TABLE orders` bị Spring từ chối với lỗi 400 trước khi tới SQL; kể cả khi tham số là chuỗi, `?` của `PreparedStatement` vẫn giữ nó là một giá trị, không thành lệnh.
+- `.query(TopProduct.class)` map cột `sku`, `sold`, `revenue` vào component cùng tên của record.
+- Giá cốc vừa đổi thành 95.000 nhưng doanh thu không đổi: báo cáo cộng `unit_price`, giá tại lúc mua. Đây là quyết định thiết kế ở bài J12.1 đang làm đúng việc của nó.
+
+<Check id="j12.2.lab-migration">Gặp và sửa được lỗi checksum của Flyway bằng cách trả file cũ về và viết migration mới, và viết được một truy vấn báo cáo bằng `JdbcClient` với tham số đặt tên.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Connection to localhost:20120 refused`: container chưa chạy. `docker start masteva-j12-pg` rồi chạy lại.
+- `Schema validation: missing column [full_name] in table [customers]` hoặc báo sai kiểu cột: entity không khớp schema. Với `ddl-auto=validate`, sửa entity hoặc viết migration mới, đừng đổi sang `update`.
+- `Unsupported Database: PostgreSQL 18.6`: thiếu dependency `flyway-database-postgresql`.
+- `Web server failed to start. Port 20121 was already in use`: một lần chạy trước chưa tắt. Tìm bằng `lsof -i :20121` rồi dừng tiến trình đó.
+- `release version 25 not supported`: `./mvnw` đang chạy trên JDK cũ. Đặt `JAVA_HOME` như bước 5.
+- `grep -c` in `0`: bạn đã xoá log sau khi gọi API, hoặc ứng dụng thiếu `logging.file.name`. Thứ tự đúng là xoá log, gọi API, rồi đếm.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Giữ nguyên container, database `shopapp` và project `~/masteva-j12/shop`: bài J12.3 thêm khoá và chỉnh connection pool trên chính project này.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao Spring Boot bật open-in-view mặc định, và vì sao nên tắt?">
+
+Open-in-view (OSIV) giữ persistence context mở suốt request HTTP, nên code ở controller và lúc Jackson ghi JSON vẫn tải được quan hệ lazy. Nó giúp người mới không gặp `LazyInitializationException`, vì vậy Spring Boot bật nó và in cảnh báo `spring.jpa.open-in-view is enabled by default` lúc khởi động. Cái giá: kết nối database bị giữ suốt request kể cả lúc gọi dịch vụ khác, và truy vấn lazy chạy rải rác ở tầng web nên N+1 khó thấy. Tắt nó buộc tầng service quyết định rõ cần tải những gì.
+
+</Reveal>
+
+<Reveal title="Phân trang (Pageable) cùng với fetch một collection thì sao?">
+
+`LIMIT 20` trên câu SQL join với `order_items` sẽ cắt theo **dòng** của kết quả join, không theo đơn hàng, nên đơn cuối có thể chỉ còn một nửa số dòng hàng. Hibernate 6 xử lý bằng cách tải hết rồi cắt trong bộ nhớ, kèm cảnh báo `HHH90003004`, rất tệ với bảng lớn. Hibernate 7.4 trong lab này đẩy `offset ... fetch first ... rows only` vào một subquery trên `orders` rồi mới join dòng hàng. Dù phiên bản nào, cách an toàn là hai bước: lấy một trang id đơn hàng, rồi tải chi tiết bằng `where o.id in (...)` với entity graph.
+
+</Reveal>
+
+<Reveal title="Khi nào chọn JdbcClient hoặc jOOQ thay vì JPA?">
+
+JPA mạnh khi bạn tải một đồ thị đối tượng, sửa nó, và để dirty checking ghi lại. Báo cáo, cập nhật hàng loạt (`UPDATE ... WHERE`), window function, `ON CONFLICT`: viết SQL trực tiếp rõ ràng và nhanh hơn. `JdbcClient` đủ cho vài truy vấn như vậy. **jOOQ** (chủ đề tuỳ chọn của chặng) sinh code Java từ schema và cho viết SQL bằng DSL được kiểm tra lúc biên dịch: đổi tên cột là code không biên dịch được, thay vì lỗi lúc chạy. Một service có thể dùng cả JPA lẫn `JdbcClient` trên cùng `DataSource` và cùng transaction.
+
+</Reveal>
+
+<Reveal title="Đọc log SQL bằng mắt không ổn trên CI. Làm sao chặn N+1 tự động?">
+
+Đếm số câu SQL trong integration test. Hibernate có `Statistics` (bật bằng `hibernate.generate_statistics=true`), cho số câu đã chạy qua `getPrepareStatementCount()`; một test gọi endpoint rồi assert số câu không vượt ngưỡng sẽ đỏ ngay khi ai đó thêm một quan hệ lazy vào DTO. Kết hợp với Testcontainers (bài J8.3) để chạy trên PostgreSQL thật. Trên production, theo dõi số truy vấn mỗi request qua tracing (J15) thay vì bật log SQL ở mức debug.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết entity và repository từ một schema có sẵn, hoặc chuyển một truy vấn SQL sang JPQL. AI hay để `@ManyToOne` ở EAGER mặc định, hay dùng `javax.persistence` thay vì `jakarta.persistence`, hay bật `ddl-auto=update` "cho tiện", và hay "sửa" `LazyInitializationException` bằng cách bật open-in-view hoặc đổi sang EAGER, hai cách làm N+1 nặng hơn. Kiểm tra bằng log SQL: đếm số câu trước và sau thay đổi, như bước 7 và 8.
+
+</Callout>
+
+<Callout kind="link">
+
+J11 đã dựng REST controller và xử lý lỗi; bài này nối chúng với database. J12.3 dùng dirty checking và transaction của bài này để tạo rồi sửa lost update, và chỉnh HikariCP. J13 chuyển mật khẩu database ra khỏi `application.properties`. J15 đo truy vấn chậm và pool qua metric và tracing.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j12.2.mastery-n-plus-one">Tự tìm được N+1 trong một endpoint bằng log SQL và sửa bằng `@EntityGraph`, `join fetch` hoặc batch fetching, có số câu SQL trước và sau.</Check>
+
+<Check id="j12.2.mastery-migration">Tự viết được migration Flyway cho một thay đổi schema hoặc dữ liệu, và giải thích được cho đồng đội vì sao không sửa migration đã chạy.</Check>
+
+</Mastery>

@@ -1,0 +1,525 @@
+---
+title: Thread, race condition, khoá và Java Memory Model
+description: Theo dõi vòng đời của một thread, tự tái hiện lost update rồi sửa bằng synchronized, ReentrantLock và atomic; thấy một vòng lặp không bao giờ dừng vì thiếu volatile và hiểu vì sao.
+id: j14.1
+step: j14
+prerequisites: [j13]
+topics: [j14.thread-vong-doi, j14.synchronized-lock-atomic, j14.java-memory-model-volatile]
+status: verified
+verified:
+  date: 2026-10-03
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+---
+
+<Goal>
+
+Hiểu một thread Java sống và chờ như thế nào, vì sao hai thread cùng sửa một biến làm mất dữ liệu, và Java Memory Model quy định khi nào một thread thấy được giá trị do thread khác ghi. Học xong bài này, bạn giải thích được:
+
+- Vì sao bộ đếm lượt xem `count++` chạy trên 8 thread chỉ ra khoảng một phần sáu tới hai phần năm con số đúng, và sửa bằng công cụ nào thì rẻ nhất.
+- Vì sao một vòng lặp `while (running)` không dừng dù thread khác đã đặt `running = false`, và vì sao thêm `volatile` hay chạy với `-Xint` lại làm nó dừng.
+- Vì sao bắt `InterruptedException` rồi bỏ qua làm ứng dụng không tắt được gọn.
+
+</Goal>
+
+<Knowledge>
+
+### Thread và vòng đời của nó
+
+Một **thread** là một luồng thực thi có stack riêng, chạy chung heap với mọi thread khác trong JVM. Thread "thường" của Java, gọi là **platform thread**, ánh xạ 1:1 vào một thread của hệ điều hành: mỗi thread giữ sẵn một vùng stack (mặc định 1 MB bộ nhớ ảo trên Linux x64, 2 MB trên Mac chip Apple; xem bằng `java -XX:+PrintFlagsFinal -version | grep ThreadStackSize`, chỉnh bằng `-Xss`), và tạo hay huỷ nó cần gọi tới hệ điều hành. Vì vậy một JVM thường chỉ chạy vài trăm tới vài nghìn platform thread. Bài J14.3 giới thiệu **virtual thread**, loại nhẹ hơn nhiều.
+
+```text
+              start()                       chạy xong run() hoặc ném exception
+   NEW ---------------> RUNNABLE ----------------------------------------> TERMINATED
+
+   Ba nhánh chờ, mỗi nhánh rời RUNNABLE rồi quay về RUNNABLE:
+
+               vào: chờ vào khối synchronized đang bị thread khác giữ
+   RUNNABLE ------------------------------------------------------> BLOCKED
+            <------------------------------------------------------
+               ra: lấy được monitor
+
+               vào: wait(), join(), LockSupport.park()
+   RUNNABLE ------------------------------------------------------> WAITING
+            <------------------------------------------------------
+               ra: thread được join chạy xong, unpark(), interrupt()
+
+               vào: sleep(ms), wait(ms), join(ms), LockSupport.parkNanos()
+   RUNNABLE ------------------------------------------------------> TIMED_WAITING
+            <------------------------------------------------------
+               ra: hết giờ, hoặc các lý do ra của WAITING
+
+   Riêng wait(): WAITING / TIMED_WAITING --notify()--> BLOCKED --lấy lại monitor--> RUNNABLE
+```
+
+Thread thoát `wait()` sau `notify()` phải qua `BLOCKED` để lấy lại monitor rồi mới `RUNNABLE`. Lý do: `wait()` chỉ gọi được khi đang giữ monitor, nó nhả monitor lúc bắt đầu chờ, và phải giành lại monitor trước khi chạy tiếp dòng lệnh sau `wait()`.
+
+| Trạng thái | Nghĩa | Gặp trong thread dump khi |
+|---|---|---|
+| `NEW` | Đã tạo object, chưa `start()` | Hiếm, thường là lỗi quên `start()` |
+| `RUNNABLE` | Đang chạy hoặc sẵn sàng chạy; JVM cũng ghi `RUNNABLE` khi thread đang chờ I/O trong code native, ví dụ đọc socket | Thread đang tính toán, hoặc đang đọc socket |
+| `BLOCKED` | Chờ vào một khối `synchronized` mà thread khác đang giữ | Tranh khoá, deadlock |
+| `WAITING` | Chờ vô thời hạn: `join()`, `wait()`, `park()` (cả `ReentrantLock.lock()`) | Thread trong pool đang rảnh chờ việc |
+| `TIMED_WAITING` | Chờ có thời hạn: `sleep`, `join(ms)`, `poll(timeout)` | Retry có backoff, chờ có timeout |
+| `TERMINATED` | `run()` đã kết thúc | Thread đã xong |
+
+Tạo thread: `new Thread(runnable, "tên").start()`, hoặc từ Java 21 dùng builder `Thread.ofPlatform().name("tên").start(runnable)`. Luôn đặt tên: tên thread xuất hiện trong log và thread dump, `Thread-7` không nói được gì. `t.join()` chờ thread `t` chạy xong; đó cũng là điểm đồng bộ, như phần Java Memory Model sẽ nói.
+
+**Interrupt** là cách lịch sự để bảo một thread dừng. `t.interrupt()` chỉ bật một cờ trên `t`. Nếu `t` đang `sleep`, `wait`, `join` hay chờ một `BlockingQueue`, method đó ném `InterruptedException` và xoá cờ. Nếu `t` đang tính toán, nó phải tự kiểm tra `Thread.currentThread().isInterrupted()`. Khi bắt `InterruptedException`, bạn chỉ có hai lựa chọn đúng: ném tiếp, hoặc dọn dẹp rồi gọi lại `Thread.currentThread().interrupt()` để code phía trên biết.
+
+<Callout kind="production">
+
+Một job đọc message viết `catch (InterruptedException e) { }` trong vòng lặp chờ. Khi Kubernetes gửi SIGTERM, executor gọi `shutdownNow()`, tức interrupt mọi thread, nhưng vòng lặp nuốt mất tín hiệu và chạy tiếp. Sau 30 giây pod bị SIGKILL (exit code 137) giữa lúc đang xử lý dở một message. Graceful shutdown ở J15 chỉ hoạt động khi code tôn trọng interrupt.
+
+</Callout>
+
+<Check id="j14.1.thread-lifecycle">Vẽ lại được sơ đồ trạng thái thread, nói được thread đang `sleep`, đang chờ `synchronized`, đang `join` ở trạng thái nào, và hai cách đúng để xử lý `InterruptedException`.</Check>
+
+### Race condition: vì sao count++ làm mất dữ liệu
+
+`count++` trông như một lệnh nhưng là ba bước: đọc giá trị, cộng 1, ghi lại. Hai thread xen kẽ ba bước đó thì một lần cộng biến mất. Đây là **lost update**, dạng phổ biến nhất của **race condition** (kết quả phụ thuộc thứ tự chạy ngẫu nhiên của các thread).
+
+| Thời điểm | Thread A | Thread B | `count` trong bộ nhớ |
+|---|---|---|---|
+| 1 | đọc 41 | | 41 |
+| 2 | | đọc 41 | 41 |
+| 3 | ghi 42 | | 42 |
+| 4 | | ghi 42 | 42, mất một lần cộng |
+
+Dạng thứ hai là **check-then-act**: `if (!map.containsKey(k)) map.put(k, v)` hay `if (stock > 0) stock--`. Giữa lúc kiểm tra và lúc ghi, thread khác có thể đã đổi trạng thái. Bán quá số hàng trong kho là một bug check-then-act.
+
+Cách sửa là biến chuỗi bước đó thành **nguyên tử** (atomic): không thread nào thấy được trạng thái nửa chừng.
+
+### synchronized, ReentrantLock, atomic
+
+| Công cụ | Cơ chế | Thêm được gì | Dùng khi |
+|---|---|---|---|
+| `synchronized` | Mỗi object có một **monitor**; chỉ một thread giữ nó tại một thời điểm. Ra khỏi khối là tự nhả, kể cả khi có exception | Đơn giản, không quên nhả được | Mặc định cho vùng găng ngắn |
+| `ReentrantLock` | Khoá tường minh trong `java.util.concurrent.locks` | `tryLock(timeout)`, `lockInterruptibly()`, nhiều `Condition`, tuỳ chọn fair | Cần chờ có giới hạn hoặc huỷ được |
+| `AtomicLong`, `AtomicReference` | **CAS** (compare-and-swap): lệnh CPU "ghi giá trị mới nếu giá trị hiện tại vẫn là X", thất bại thì thử lại | Không khoá, không chặn thread | Một biến đơn lẻ: bộ đếm, cờ, tham chiếu |
+| `LongAdder` | Chia bộ đếm thành nhiều ô, mỗi thread cộng vào ô riêng, `sum()` cộng các ô lại | Rất nhanh khi nhiều thread cùng cộng | Thống kê, metric: ghi nhiều, đọc ít |
+
+`ReentrantLock` luôn đi theo mẫu `lock()` rồi `try { ... } finally { unlock(); }`; quên `finally` là khoá bị giữ mãi khi có exception. "Reentrant" (vào lại được) nghĩa là thread đang giữ khoá có thể lấy lại chính khoá đó mà không tự chặn mình; `synchronized` cũng vậy.
+
+Quy tắc chọn: dùng công cụ đơn giản nhất mà vẫn đúng. Một biến thì atomic. Nhiều biến phải đổi cùng nhau (trừ tiền tài khoản A, cộng tài khoản B) thì cần khoá, vì atomic chỉ bảo vệ từng biến riêng lẻ. Giữ vùng găng thật ngắn: không gọi HTTP, không truy vấn database khi đang giữ khoá.
+
+<Check id="j14.1.race-condition">Giải thích được lost update và check-then-act bằng một bảng xen kẽ, và chọn được giữa `synchronized`, `ReentrantLock`, `AtomicLong`, `LongAdder` cho một tình huống cụ thể.</Check>
+
+### Java Memory Model và volatile
+
+Thiếu đồng bộ không chỉ gây lost update. Nó còn làm một thread **không bao giờ thấy** giá trị thread khác đã ghi. Nguyên nhân: trình biên dịch JIT và CPU được phép sắp xếp lại lệnh, giữ giá trị trong thanh ghi, miễn là **một thread đơn lẻ** không nhận ra khác biệt. Ví dụ JIT thấy vòng lặp `while (running) { spins++; }` không hề ghi `running`, nên nó đọc `running` một lần rồi biến vòng lặp thành `while (true)`. Với một thread, điều đó đúng; với hai thread, vòng lặp chạy mãi.
+
+**Java Memory Model** (JMM, JLS chương 17) là hợp đồng nói khi nào một lần ghi chắc chắn được thấy. Nó định nghĩa quan hệ **happens-before**: nếu hành động X happens-before Y, mọi thứ X ghi đều thấy được ở Y. Các cặp quan trọng:
+
+```text
+Thread A                                   Thread B
+x = 42;
+running = false;  (ghi volatile)  ------>  đọc running thấy false  (đọc volatile)
+                                           đọc x thấy 42, chắc chắn
+
+Các cạnh happens-before khác:
+  nhả monitor (ra khỏi synchronized)  -> lấy chính monitor đó sau này
+  t.start()                           -> mọi lệnh trong t
+  mọi lệnh trong t                    -> t.join() trả về ở thread khác
+  đặt vào BlockingQueue, ConcurrentHashMap, CompletableFuture -> lấy ra ở thread khác
+```
+
+`volatile` trên một field đảm bảo hai điều: mỗi lần đọc thấy lần ghi mới nhất, và mọi thứ ghi trước lần ghi volatile được thấy bởi thread đọc nó sau đó. `volatile` **không** làm `count++` thành nguyên tử: đọc mới nhất rồi cộng rồi ghi vẫn là ba bước. Dùng `volatile` cho cờ dừng, cho tham chiếu tới cấu hình được thay nguyên khối; dùng atomic hay khoá khi giá trị mới phụ thuộc giá trị cũ.
+
+**Publish an toàn** (safe publication) là đưa một object cho thread khác sao cho thread đó thấy object đã khởi tạo xong. Các cách an toàn: gán vào field `final` trong constructor, field `volatile` hoặc `AtomicReference`, field được bảo vệ bằng khoá, hoặc đưa qua một collection đồng thời. Gán object vào một field thường rồi để thread khác đọc thì thread đó có thể thấy object với field còn mặc định (`null`, `0`).
+
+<Callout kind="pitfall">
+
+Lời giải thích "mỗi CPU có cache riêng nên không thấy giá trị mới" chỉ đúng một phần. Cache của CPU hiện đại tự giữ đồng nhất với nhau; thủ phạm thường gặp hơn là JIT tối ưu hoá như trên. Đừng lý luận theo phần cứng. Lý luận theo happens-before: không có cạnh happens-before thì không có đảm bảo, dù trên máy bạn nó "vẫn chạy".
+
+</Callout>
+
+<Check id="j14.1.happens-before">Kể được ít nhất bốn cạnh happens-before và giải thích được vì sao `volatile` đủ cho cờ dừng nhưng không đủ cho bộ đếm.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Thread (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Thread.html): phần đầu trang so sánh platform thread và virtual thread; đọc mục `interrupt()` để biết method nào ném `InterruptedException`.
+- [Thread.State (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Thread.State.html): method nào đưa thread vào `WAITING`, method nào vào `TIMED_WAITING`.
+- [java.util.concurrent.locks (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/locks/package-summary.html): so sánh `Lock` với monitor, `ReadWriteLock` và `Condition`.
+- [java.util.concurrent.atomic (Java SE 25 API)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/atomic/package-summary.html): khi nào chọn `LongAdder` thay vì `AtomicLong`.
+- [JLS 17.4: Memory Model](https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.4): định nghĩa chính thức của happens-before, đọc mục 17.4.5; mục 17.5 nói về field `final`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25 như ở J1, `java -version` in `25`. Bài này không cần Maven: mỗi chương trình là một file Java, biên dịch bằng `javac` và chạy bằng `java`. Project của chặng nằm ở `~/masteva-j14`, dùng tiếp ở J14.2 và J14.3. Lệnh giống nhau trên Mac và Linux.
+
+**Thời gian trong bài thay đổi theo máy.** Máy kiểm chứng là Apple M1 Pro 10 nhân. Các con số `ms` trên máy bạn sẽ khác, có khi khác giữa hai lần chạy liền nhau; điều cần so là thứ tự lớn nhỏ và có mất dữ liệu hay không. Đây không phải benchmark chuẩn: đo hiệu năng đúng cách cần JMH, học ở J18.
+
+### 1. Vòng đời của thread
+
+<Terminal where="mac" title="Tạo src/ThreadStates.java">
+
+```bash
+mkdir -p ~/masteva-j14/src && cd ~/masteva-j14
+cat > src/ThreadStates.java <<'EOF'
+public class ThreadStates {
+    private static final Object LOCK = new Object();
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread sleeper = new Thread(() -> {
+            try {
+                Thread.sleep(5_000);
+                System.out.println("sleeper: ngủ đủ 5 giây");
+            } catch (InterruptedException e) {
+                System.out.println("sleeper: bị interrupt, dọn dẹp rồi dừng");
+                Thread.currentThread().interrupt();
+            }
+        }, "sleeper");
+        show(sleeper);
+        sleeper.start();
+        Thread.sleep(100);
+        show(sleeper);
+
+        Thread spinner = Thread.ofPlatform().name("spinner").start(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                Thread.onSpinWait();
+            }
+        });
+        Thread.sleep(100);
+        show(spinner);
+
+        Thread blocked;
+        synchronized (LOCK) {
+            blocked = Thread.ofPlatform().name("blocked").start(() -> {
+                synchronized (LOCK) {
+                    System.out.println("blocked: đã vào được vùng găng");
+                }
+            });
+            Thread.sleep(100);
+            show(blocked);
+        }
+        blocked.join();
+
+        Thread waiter = Thread.ofPlatform().name("waiter").start(() -> {
+            try {
+                sleeper.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        Thread.sleep(100);
+        show(waiter);
+
+        spinner.interrupt();
+        sleeper.interrupt();
+        for (Thread t : new Thread[] {spinner, sleeper, waiter}) {
+            t.join();
+        }
+        show(sleeper);
+    }
+
+    private static void show(Thread t) {
+        System.out.printf("%-8s %s%n", t.getName(), t.getState());
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out ThreadStates
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+sleeper  NEW
+sleeper  TIMED_WAITING
+spinner  RUNNABLE
+blocked  BLOCKED
+blocked: đã vào được vùng găng
+waiter   WAITING
+sleeper: bị interrupt, dọn dẹp rồi dừng
+sleeper  TERMINATED
+```
+
+</Expected>
+
+- `main` giữ `LOCK` trong khối `synchronized`, nên thread `blocked` kẹt ở `BLOCKED` cho tới khi `main` ra khỏi khối.
+- `waiter` gọi `sleeper.join()` không có thời hạn nên ở `WAITING`; `sleeper` đang `sleep(5_000)` nên ở `TIMED_WAITING`.
+- `spinner` không gọi method chặn nào, nên `interrupt()` không ném exception: nó tự kiểm tra cờ trong vòng lặp. `sleeper` thì nhận `InterruptedException` ngay, không đợi đủ 5 giây.
+
+Chương trình dùng `sleep(100)` để chờ các thread vào đúng trạng thái. Trên máy quá tải, 100 ms có thể chưa đủ và một dòng có thể in trạng thái khác; chạy lại là được. Trong code thật, đừng dùng `sleep` để đồng bộ.
+
+<Check id="j14.1.lab-thread-states">Chạy được `ThreadStates`, thấy đủ sáu trạng thái và giải thích được dòng nào ứng với method nào.</Check>
+
+### 2. Tái hiện lost update rồi sửa
+
+8 thread, mỗi thread cộng 1.000.000 lần vào cùng một bộ đếm. Kết quả đúng là 8.000.000.
+
+<Terminal where="mac" title="Tạo src/LostUpdate.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/LostUpdate.java <<'EOF'
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class LostUpdate {
+    static final int THREADS = 8;
+    static final int PER_THREAD = 1_000_000;
+
+    interface Counter {
+        void increment();
+        long get();
+    }
+
+    static class PlainCounter implements Counter {
+        private long n;
+        public void increment() { n++; }
+        public long get() { return n; }
+    }
+
+    static class SyncCounter implements Counter {
+        private long n;
+        public synchronized void increment() { n++; }
+        public synchronized long get() { return n; }
+    }
+
+    static class LockCounter implements Counter {
+        private final ReentrantLock lock = new ReentrantLock();
+        private long n;
+        public void increment() {
+            lock.lock();
+            try {
+                n++;
+            } finally {
+                lock.unlock();
+            }
+        }
+        public long get() {
+            lock.lock();
+            try {
+                return n;
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
+    static class AtomicCounter implements Counter {
+        private final AtomicLong n = new AtomicLong();
+        public void increment() { n.incrementAndGet(); }
+        public long get() { return n.get(); }
+    }
+
+    static class AdderCounter implements Counter {
+        private final LongAdder n = new LongAdder();
+        public void increment() { n.increment(); }
+        public long get() { return n.sum(); }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        run("plain", new PlainCounter());
+        run("synchronized", new SyncCounter());
+        run("ReentrantLock", new LockCounter());
+        run("AtomicLong", new AtomicCounter());
+        run("LongAdder", new AdderCounter());
+    }
+
+    static void run(String name, Counter counter) throws InterruptedException {
+        Thread[] threads = new Thread[THREADS];
+        long start = System.nanoTime();
+        for (int i = 0; i < THREADS; i++) {
+            threads[i] = Thread.ofPlatform().start(() -> {
+                for (int j = 0; j < PER_THREAD; j++) {
+                    counter.increment();
+                }
+            });
+        }
+        for (Thread t : threads) {
+            t.join();
+        }
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        long expected = (long) THREADS * PER_THREAD;
+        System.out.printf("%-13s count=%,d lost=%,d time=%d ms%n",
+                name, counter.get(), expected - counter.get(), ms);
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out LostUpdate
+```
+
+</Terminal>
+
+<Predict question="Dòng plain mất khoảng bao nhiêu lần cộng: vài chục, vài nghìn, hay vài triệu?">
+
+Vài triệu, hơn một nửa. Sáu lần chạy trên máy kiểm chứng ra `count` từ 1,3 tới 3,1 triệu. Ngoài việc xen kẽ đọc và ghi như bảng ở phần Kiến thức, JIT còn được phép giữ `n` trong thanh ghi suốt một đoạn vòng lặp rồi mới ghi ra bộ nhớ, nên mỗi lần ghi đè xoá đi rất nhiều lần cộng của thread khác. Bốn cách còn lại luôn ra đúng 8.000.000.
+
+</Predict>
+
+<Expected>
+
+```text
+plain         count=2,583,105 lost=5,416,895 time=24 ms
+synchronized  count=8,000,000 lost=0 time=1565 ms
+ReentrantLock count=8,000,000 lost=0 time=164 ms
+AtomicLong    count=8,000,000 lost=0 time=386 ms
+LongAdder     count=8,000,000 lost=0 time=22 ms
+```
+
+</Expected>
+
+Mọi con số `count` của dòng `plain` và mọi cột `time` đổi sau mỗi lần chạy. Trên máy kiểm chứng, `synchronized` dao động từ khoảng 250 tới 2.700 ms, các dòng khác ổn định hơn. Đọc kết quả cho đúng:
+
+- `plain` nhanh nhất vì nó sai. Tốc độ của code sai không có ý nghĩa.
+- 8 thread cùng tranh **một** biến hàng triệu lần là tình huống xấu nhất cho khoá và cho CAS. `LongAdder` thắng vì mỗi thread cộng vào ô riêng, gần như không tranh nhau.
+- Trong service thật, vùng găng chỉ chiếm phần rất nhỏ thời gian của một request. Chọn công cụ theo độ đúng và độ rõ của code trước; chỉ tối ưu khi profiler (J18) chỉ ra khoá là nút thắt.
+
+<Check id="j14.1.lab-lost-update">Tái hiện được lost update với bộ đếm thường, sửa được bằng ít nhất hai cách, và giải thích vì sao `LongAdder` nhanh hơn `AtomicLong` trong bài đo này.</Check>
+
+### 3. Một vòng lặp không thấy cờ dừng
+
+<Terminal where="mac" title="Tạo src/Visibility.java">
+
+```bash
+cd ~/masteva-j14
+cat > src/Visibility.java <<'EOF'
+public class Visibility {
+    static boolean running = true;
+    static volatile boolean runningVolatile = true;
+
+    public static void main(String[] args) throws InterruptedException {
+        boolean useVolatile = args.length > 0 && args[0].equals("volatile");
+        Thread worker = Thread.ofPlatform().name("worker").daemon().start(() -> {
+            long spins = 0;
+            if (useVolatile) {
+                while (runningVolatile) {
+                    spins++;
+                }
+            } else {
+                while (running) {
+                    spins++;
+                }
+            }
+            System.out.println("worker: thấy cờ đã tắt, dừng");
+        });
+        Thread.sleep(500);
+        running = false;
+        runningVolatile = false;
+        System.out.println("main: đã đặt cờ = false");
+        worker.join(2_000);
+        System.out.println(worker.isAlive()
+                ? "main: sau 2 giây worker VẪN CHẠY"
+                : "main: worker đã dừng");
+    }
+}
+EOF
+javac -d out src/*.java && java -cp out Visibility
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+main: đã đặt cờ = false
+main: sau 2 giây worker VẪN CHẠY
+```
+
+</Expected>
+
+`main` chờ 500 ms để JIT kịp biên dịch vòng lặp, rồi tắt cờ. Worker không bao giờ thấy. Worker là **daemon thread** nên JVM vẫn thoát khi `main` kết thúc; nếu không, chương trình treo mãi và bạn phải bấm Ctrl+C. Giờ chạy với cờ `volatile`, rồi chạy lại bản không `volatile` nhưng tắt JIT bằng `-Xint` (chỉ thông dịch):
+
+<Terminal where="mac">
+
+```bash
+java -cp out Visibility volatile
+java -Xint -cp out Visibility
+```
+
+</Terminal>
+
+<Predict question="Lệnh thứ hai không có volatile. Worker có dừng không?">
+
+```text
+main: đã đặt cờ = false
+worker: thấy cờ đã tắt, dừng
+main: worker đã dừng
+main: đã đặt cờ = false
+worker: thấy cờ đã tắt, dừng
+main: worker đã dừng
+```
+
+Có. Hai dòng đầu của mỗi lần chạy có thể đổi chỗ cho nhau, vì `main` và worker cùng in gần như một lúc. Trình thông dịch đọc lại `running` từ bộ nhớ ở mỗi vòng, nên nó thấy giá trị mới. Điều này cho thấy lỗi ở bước trước đến từ tối ưu hoá của JIT, không phải từ cache của CPU. Nhưng đừng coi `-Xint` là cách sửa: code không có happens-before thì **không có đảm bảo**, chạy đúng là may.
+
+</Predict>
+
+**Mức độ tái hiện, nói thật:** trên máy kiểm chứng (JDK 25, HotSpot, Apple M1), bản không `volatile` treo ở cả ba lần thử. Trên JVM khác, CPU khác, khi vòng lặp có thêm một lời gọi method hay `println`, JIT có thể không hoist (kéo ra ngoài vòng lặp) lần đọc `running`, và chương trình "tình cờ" dừng. Đó chính là lý do bug kiểu này nguy hiểm: nó qua được test trên máy bạn rồi xuất hiện trên production.
+
+<Check id="j14.1.lab-visibility">Tái hiện được vòng lặp không dừng, sửa bằng `volatile`, và giải thích được vì sao `-Xint` làm nó dừng mà vẫn không phải cách sửa.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `error: release version 25 not supported` hoặc `UnsupportedClassVersionError`: `javac` hay `java` không phải bản 25. Chạy `java -version` và `javac -version`, đặt lại `JAVA_HOME` như J1.1.
+- `error: cannot find symbol ... method ofPlatform()`: đang dùng JDK cũ hơn 21, nơi chưa có `Thread.ofPlatform()`.
+- Dòng `plain` ra đúng 8.000.000: hiếm, xảy ra khi máy chỉ có 1 hoặc 2 nhân, hoặc các thread chạy nối tiếp nhau. Tăng `PER_THREAD` lên 10.000.000 rồi chạy lại.
+- `Visibility` không có `volatile` mà vẫn dừng: JVM của bạn không hoist lần đọc. Kết luận vẫn giữ nguyên, đọc lại đoạn "Mức độ tái hiện".
+- Chương trình treo không thoát: bạn bỏ `.daemon()` khỏi worker. Bấm Ctrl+C.
+
+</Callout>
+
+### 4. Dọn dẹp
+
+Mọi chương trình đã tự kết thúc, không còn tiến trình nào chạy nền. Giữ nguyên `~/masteva-j14`, bài J14.2 dùng tiếp.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đánh dấu cả get() là synchronized có thừa không, khi n++ đã được bảo vệ?">
+
+Không thừa. `synchronized` trên `get()` không để chống ghi đè, mà để tạo cạnh happens-before: nhả monitor trong `increment()` happens-before lần lấy monitor trong `get()`. Bỏ nó đi, thread đọc có thể thấy giá trị cũ. Trong lab, `t.join()` đã tạo sẵn cạnh này nên bỏ đi vẫn ra đúng, nhưng một thread metric đọc định kỳ thì không có `join()` nào cả.
+
+</Reveal>
+
+<Reveal title="Double-checked locking cho singleton sai ở đâu nếu thiếu volatile?">
+
+`instance = new Config()` gồm cấp phát, chạy constructor, gán tham chiếu. Không có `volatile`, JMM cho phép thread khác thấy tham chiếu đã gán trong khi field bên trong vẫn là giá trị mặc định, vì lần đọc ở ngoài khối `synchronized` không có cạnh happens-before nào. Thêm `volatile` cho field `instance` thì đúng. Cách gọn hơn là holder class: `static class Holder { static final Config INSTANCE = new Config(); }`, vì JVM đảm bảo khởi tạo class chỉ chạy một lần và publish an toàn.
+
+</Reveal>
+
+<Reveal title="synchronized chậm hơn ReentrantLock trong lab, vậy có nên bỏ synchronized?">
+
+Không. Kết quả này chỉ đúng với một kiểu tải cực đoan: 8 thread tranh một khoá liên tục. Khi ít tranh chấp, hai cách gần như ngang nhau; từ JDK 24 (JEP 491), cách cài đặt monitor còn được đổi để virtual thread không bị ghim khi chờ `synchronized`. Chọn `ReentrantLock` khi cần tính năng của nó (`tryLock`, timeout, huỷ được), không phải vì một bài đo đơn lẻ.
+
+</Reveal>
+
+<Reveal title="Biến cục bộ và object không chia sẻ có cần đồng bộ không?">
+
+Không. Biến cục bộ nằm trên stack của từng thread, không thread khác nào thấy. Object chỉ một thread dùng (thread confinement), hoặc object bất biến như `record` có toàn field bất biến và `String`, thì an toàn tự nhiên. Đó là cách rẻ nhất để không bao giờ có race: đừng chia sẻ trạng thái có thể đổi. Bean `@Service` của Spring là singleton dùng chung giữa mọi request, nên field có thể đổi trong đó là chỗ race hay nấp nhất.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI rà một class xem field nào được nhiều thread đọc ghi mà không có đồng bộ, hoặc vẽ bảng xen kẽ cho một đoạn check-then-act. AI hay đề xuất `volatile` để "sửa" `count++`, thêm `synchronized` lên mọi method cho chắc, hoặc khẳng định code "thread-safe" vì dùng `ConcurrentHashMap` dù có thao tác ghép nhiều bước. Kiểm tra lại bằng cách viết một bài như `LostUpdate`: nhiều thread, nhiều vòng, so với con số đúng. Một lần chạy đúng chưa chứng minh gì; một lần sai là đủ bác bỏ.
+
+</Callout>
+
+<Callout kind="link">
+
+J6 đã cảnh báo parallel stream dùng chung `commonPool`; J14.2 dạy executor và pool riêng. J10.2 dùng `synchronized` cho idempotency trong một JVM và chỉ ra giới hạn khi có nhiều instance; J12 thay nó bằng khoá ở database. J14.3 dùng thread dump để tìm deadlock giữa các khoá học ở đây. J18 đo hiệu năng khoá bằng JMH cho đúng cách.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="j14.1.mastery-fix-race">Nhìn một đoạn code có field dùng chung, chỉ ra được race (lost update hay check-then-act) và sửa bằng công cụ đơn giản nhất còn đúng.</Check>
+
+<Check id="j14.1.mastery-volatile">Giải thích được bằng happens-before vì sao một thread không thấy giá trị mới, khi nào `volatile` đủ và khi nào phải dùng atomic hoặc khoá.</Check>
+
+</Mastery>
