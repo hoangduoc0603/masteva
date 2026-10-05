@@ -26,6 +26,7 @@ const java: RoadmapLite = {
         {
           id: 'j1',
           code: 'J1',
+          title: 'Nền tảng Java',
           topics: [
             { id: 'j1.a', title: 'A', kind: 'core', items: ['j1.1.x', 'j1.1.y'] },
             { id: 'j1.opt', title: 'Opt', kind: 'opt', items: [] },
@@ -39,6 +40,7 @@ const java: RoadmapLite = {
         {
           id: 'j11',
           code: 'J11',
+          title: 'Spring',
           topics: [
             { id: 'j11.b', title: 'B', kind: 'pick', items: [] },
             { id: 'j11.c', title: 'C', kind: 'core', items: [] },
@@ -113,7 +115,7 @@ describe('currentTopic', () => {
   const devops: RoadmapLite = {
     id: 'devops',
     title: 'DevOps',
-    levels: [{ id: 'foundation', steps: [{ id: 'd1', code: 'D1', topics: [{ id: 'd1.x', title: 'X', kind: 'core', items: ['d1.1.a', 'd1.1.b'] }] }] }],
+    levels: [{ id: 'foundation', steps: [{ id: 'd1', code: 'D1', title: 'Linux', topics: [{ id: 'd1.x', title: 'X', kind: 'core', items: ['d1.1.a', 'd1.1.b'] }] }] }],
   };
 
   it('picks the most recent topic in progress across roadmaps', () => {

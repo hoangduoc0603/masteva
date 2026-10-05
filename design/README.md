@@ -46,6 +46,7 @@ Chỉ khi người dùng thao tác, tắt khi `prefers-reduced-motion`: tick Che
 
 - Giữ khung Fumadocs (thanh bên, mục lục, tìm kiếm ⌘K); thay theme `neutral` bằng token ở đây, đặt theme mặc định là tối.
 - Roadmap: sơ đồ trục giữa (mẫu `roadmap.html`), view danh sách từ cùng HTML, khung chi tiết chủ đề.
+- Trang chủ kiêm danh mục và phần đầu trang roadmap theo bản mẫu v2 (05/10/2026): `home-v2.html`, `roadmap-v2.html` (CSS mẫu `v2.css`, đã gộp vào `roadmap.css` với tên chính thức). `home.html`, `roadmaps.html` và phần đầu của `roadmap.html` đã được thay thế.
 
 ## Component
 

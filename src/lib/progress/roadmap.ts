@@ -18,6 +18,7 @@ export interface LiteTopic {
 export interface LiteStep {
   id: string;
   code: string;
+  title: string;
   topics: LiteTopic[];
 }
 

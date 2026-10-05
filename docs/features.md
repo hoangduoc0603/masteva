@@ -15,7 +15,7 @@ Ký hiệu giai đoạn:
 
 ## 1. Luồng chính của người học
 
-1. Vào trang chủ, xem danh sách roadmap, chọn một roadmap (ví dụ "Java backend, từ nền tảng tới Senior").
+1. Vào trang chủ, xem danh sách roadmap (hoặc tìm theo tên roadmap, chủ đề), chọn một roadmap (ví dụ "Java backend, từ nền tảng tới Senior").
 2. Xem các bước theo thứ tự, biết bước nào đã xong và bước nào tiếp theo.
 3. Mở một bước, học bài theo khung 6 phần: mục tiêu, kiến thức, tài liệu, thực hành, đào sâu, dấu hiệu nắm chắc.
 4. Làm lab trên máy mình theo hướng dẫn, so kết quả với kết quả mong đợi.
@@ -27,7 +27,7 @@ Ký hiệu giai đoạn:
 
 | Mã | Yêu cầu | GĐ |
 |---|---|---|
-| FR-ROADMAP-001 | Trang danh mục hiển thị mọi roadmap, mỗi roadmap có mô tả ngắn, đối tượng phù hợp, số bước và tiến độ của người học | G0–G1 |
+| FR-ROADMAP-001 | Trang chủ là danh mục, hiển thị mọi roadmap và cho tìm roadmap, chủ đề (không phân biệt dấu); mỗi roadmap có mô tả ngắn, đối tượng phù hợp, số bước và tiến độ của người học | G0–G1 |
 | FR-ROADMAP-002 | Trang roadmap hiển thị cấp, chặng theo thứ tự và chủ đề của từng chặng; mỗi chặng có mã (ví dụ D1), tên và tiến độ | G0–G1 |
 | FR-ROADMAP-003 | Mỗi bước khai báo các bước tiên quyết; giao diện cảnh báo khi người học mở bước chưa đủ điều kiện, nhưng không chặn | G0–G1 |
 | FR-ROADMAP-004 | Mỗi roadmap là một nhánh riêng (Java, DevOps, Microservices); chủ đề chung được liên kết sang roadmap dạy đầy đủ thay vì viết lại | G0–G1 |

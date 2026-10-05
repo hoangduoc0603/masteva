@@ -19,6 +19,7 @@ export function baseOptions(lang: Language): BaseLayoutProps {
       title: <span className="font-semibold tracking-tight">{t.app.name}</span>,
       url: `/${lang}`,
     },
-    links: [{ text: t.nav.roadmaps, url: `/${lang}/roadmaps`, active: 'nested-url' }],
+    // Không có mục nav: trang chủ là nơi chọn roadmap (spec 2026-10-05 §3).
+    links: [],
   };
 }

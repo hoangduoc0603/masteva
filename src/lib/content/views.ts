@@ -1,6 +1,7 @@
 import type { Level, TopicKind, Track } from './constants';
 import type { Project, Roadmap, Topic } from './schema';
 import type { LiteTopic, RoadmapLite } from '@/lib/progress/roadmap';
+import type { CatalogIndex } from '@/lib/search/catalog';
 
 /**
  * Dựng dữ liệu cho trang từ nội dung đã kiểm tra (spec §4, §6).
@@ -292,6 +293,20 @@ export function topicDetails(view: RoadmapView): Record<string, TopicDetail> {
   return details;
 }
 
+/** Chỉ mục tìm kiếm của trang chủ: roadmap và mọi chủ đề kèm chặng (spec 2026-10-05 §4). */
+export function catalogIndex(views: RoadmapView[]): CatalogIndex {
+  return {
+    roadmaps: views.map((v) => ({ id: v.id, track: v.track, title: v.title, description: v.description })),
+    topics: views.flatMap((v) =>
+      v.levels.flatMap((l) =>
+        l.steps.flatMap((s) =>
+          s.topics.map((t) => ({ roadmapId: v.id, code: s.code, stepTitle: s.title, id: t.id, title: t.title, hasLesson: t.lessons.length > 0 })),
+        ),
+      ),
+    ),
+  };
+}
+
 export function toLite(view: RoadmapView): RoadmapLite {
   return {
     id: view.id,
@@ -301,6 +316,7 @@ export function toLite(view: RoadmapView): RoadmapLite {
       steps: level.steps.map((step) => ({
         id: step.id,
         code: step.code,
+        title: step.title,
         topics: step.topics.map((t) => ({
           id: t.id,
           title: t.title,

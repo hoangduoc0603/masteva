@@ -10,6 +10,7 @@ import { RoadmapMap } from '@/components/roadmap/roadmap-map';
 import { RoadmapToolbar } from '@/components/roadmap/roadmap-toolbar';
 import { RoadmapClient } from '@/components/roadmap/roadmap-client';
 import { ProgressTransfer } from '@/components/progress/progress-transfer';
+import { Icon } from '@/components/icons';
 
 export const dynamicParams = false;
 
@@ -33,16 +34,22 @@ export async function generateMetadata(props: PageProps<'/[lang]/roadmaps/[roadm
 export default async function RoadmapPage(props: PageProps<'/[lang]/roadmaps/[roadmap]'>) {
   const { lang, view } = await resolve(props);
   const t = getMessages(lang);
+  const lite = toLite(view);
   return (
     <main className="rm-page" id={`roadmap-${view.id}`} data-track={view.track} data-view="map">
       <header>
-        <p className="rm-kicker">{format(t.roadmap.kicker, { track: t.tracks[view.track] })}</p>
-        <h1 className="rm-title">{view.title}</h1>
+        <a className="rm-back" href={`/${lang}`}>
+          <Icon name="back" />
+          {t.roadmap.allRoadmaps}
+        </a>
+        {/* Tên ngắn như ở trang chủ; tên đầy đủ nằm ở tiêu đề tab (metadata). */}
+        <h1 className="rm-title">{t.tracks[view.track]}</h1>
         <p className="rm-desc">{view.description}</p>
         <ul className="rm-facts">
           <li>{format(t.roadmap.levels, { count: view.levels.length })}</li>
           <li>{format(t.roadmap.steps, { count: view.stepCount })}</li>
           <li>{format(t.roadmap.topics, { count: view.levels.flatMap((l) => l.steps.flatMap((s) => s.topics)).filter((tp) => tp.kind !== 'opt').length })}</li>
+          <li>{format(t.roadmap.lessonFacts, { count: view.levels.flatMap((l) => l.steps).reduce((n, s) => n + s.lessons.length, 0) })}</li>
         </ul>
         {view.recommended.length > 0 ? (
           <p className="rm-recommended">
@@ -57,9 +64,9 @@ export default async function RoadmapPage(props: PageProps<'/[lang]/roadmaps/[ro
             ))}
           </p>
         ) : null}
-        <RoadmapClient lang={lang} lite={toLite(view)} levels={view.levels.map((l) => ({ id: l.id, title: l.title }))} replacements={getReplacements()} />
+        <RoadmapClient lang={lang} lite={lite} replacements={getReplacements()} />
       </header>
-      <RoadmapToolbar />
+      <RoadmapToolbar lite={lite} levels={view.levels.map((l) => ({ id: l.id, title: l.title }))} />
       <RoadmapMap view={view} lang={lang} t={t} />
       <section className="rm-xfer" aria-labelledby="progress-transfer">
         <h2 id="progress-transfer" className="rm-xfer-t">

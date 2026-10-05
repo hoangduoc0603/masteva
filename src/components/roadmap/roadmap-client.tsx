@@ -1,6 +1,5 @@
 'use client';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { Level } from '@/lib/content/constants';
 import type { TopicDetail } from '@/lib/content/views';
 import { format } from '@/lib/format';
 import { getProgressStore } from '@/lib/progress/store';
@@ -12,27 +11,40 @@ import { useMessages } from '@/components/messages-provider';
 import { applyProgress } from './roadmap-dom';
 import { HIDE_KEY, VIEW_KEY } from './roadmap-prefs';
 import { TopicDrawer } from './topic-drawer';
+import { Icon } from '@/components/icons';
 
-/**
- * Phần tương tác của trang roadmap: nút "Học tiếp", "Tôi đã biết", view đang chọn,
- * gắn trạng thái lên sơ đồ và điều khiển khung chi tiết (spec §6.1).
- */
+/** Mã bài từ đường dẫn: `/learn/j2/j2-1` thành `J2.1`. */
+function lessonCode(path: string): string {
+  return (path.split('/').pop() ?? '').toUpperCase().replace('-', '.');
+}
+
+/** Mở hoặc thu các chặng của một cấp đã biết, đồng bộ chữ và `aria-expanded` của nút "Xem lại các chặng". */
+function setExpanded(level: Element, on: boolean) {
+  level.toggleAttribute('data-expanded', on);
+  const button = level.querySelector<HTMLElement>('[data-expand]');
+  if (!button) return;
+  button.setAttribute('aria-expanded', String(on));
+  button.textContent = (on ? button.dataset.labelClose : button.dataset.labelOpen) ?? button.textContent;
+}
+
 /** Cấp đã đánh "đã biết" bị thu gọn; mở cấp chứa phần tử ra. Trả về `true` nếu vừa mở. */
 function revealLevel(el: Element | null): boolean {
   const level = el?.closest('[data-level][data-known]:not([data-expanded])');
-  level?.setAttribute('data-expanded', '');
+  if (level) setExpanded(level, true);
   return Boolean(level);
 }
 
+/**
+ * Phần tương tác của trang roadmap: khối tiếp tục, "Tôi đã biết" theo cấp, view đang chọn,
+ * gắn trạng thái lên sơ đồ và điều khiển khung chi tiết (spec 2026-10-05 §5).
+ */
 export function RoadmapClient({
   lang,
   lite,
-  levels,
   replacements,
 }: {
   lang: string;
   lite: RoadmapLite;
-  levels: { id: Level; title: string }[];
   replacements: Record<string, string>;
 }) {
   useReplacements(replacements);
@@ -44,7 +56,6 @@ export function RoadmapClient({
   const hasNext = next !== undefined;
   const total = roadmapTally(progress, lite);
   const started = lite.levels.some((l) => l.steps.some((s) => s.topics.some((tp) => topicState(progress, tp) !== 'todo')));
-  const start = progress.start[lite.id];
   const rootId = `roadmap-${lite.id}`;
   const hashChecked = useRef(false);
   const topicIds = useMemo(() => new Set(lite.levels.flatMap((l) => l.steps.flatMap((s) => s.topics.map((tp) => tp.id)))), [lite]);
@@ -54,6 +65,8 @@ export function RoadmapClient({
   const [failed, setFailed] = useState(false);
   // Việc làm sau khi panel mới render xong: focus (nút cùng hướng hoặc tiêu đề) và đọc tên chủ đề.
   const afterRender = useRef<{ rel: string | null } | null>(null);
+  // Nút vừa bấm ("Tôi đã biết", "Hoàn tác") bị ẩn khi đổi cấp bắt đầu: focus chuyển sang nút này sau khi sơ đồ cập nhật.
+  const focusAfterApply = useRef<string | null>(null);
 
   useEffect(() => {
     if (!active || details || failed) return;
@@ -95,7 +108,7 @@ export function RoadmapClient({
   // Mobile: thanh "Học tiếp" ở đáy chỉ hiện khi nút chính đã cuộn khuất phía trên.
   useEffect(() => {
     const root = document.getElementById(rootId);
-    const cta = root?.querySelector('.rm-cta');
+    const cta = root?.querySelector('.rm-next');
     if (!root || !cta) return;
     const observer = new IntersectionObserver(([entry]) => {
       root.toggleAttribute('data-dock', !entry.isIntersecting && entry.boundingClientRect.top < 0);
@@ -111,6 +124,10 @@ export function RoadmapClient({
     const root = document.getElementById(rootId);
     if (!root) return;
     applyProgress(root, lite, progress, nextTopic(progress, lite)?.step.id, { state: t.roadmap.state, stepCount: t.roadmap.stepCount });
+    if (focusAfterApply.current) {
+      root.querySelector<HTMLElement>(focusAfterApply.current)?.focus();
+      focusAfterApply.current = null;
+    }
     // Tải thẳng URL có hash trỏ vào cấp đã thu gọn: chỉ biết cấp nào thu gọn sau khi đọc tiến độ thật
     // (lần render hydrate dùng snapshot rỗng), nên mở cấp ở đây, đúng một lần.
     if (!hashChecked.current && progress === getProgressStore().getSnapshot().progress) {
@@ -137,7 +154,7 @@ export function RoadmapClient({
         heading.tabIndex = -1;
         return heading.focus();
       }
-      root.querySelector<HTMLElement>('.rm-toolbar button')?.focus();
+      root.querySelector<HTMLElement>('.rm-lvtabs a')?.focus();
     };
     const open = (id: string): boolean => {
       if (!topicIds.has(id)) {
@@ -205,8 +222,27 @@ export function RoadmapClient({
         dialog.close();
         return;
       }
-      const level = target.closest<HTMLElement>('[data-show-level]')?.dataset.showLevel;
-      if (level) root.querySelector(`[data-level="${CSS.escape(level)}"]`)?.setAttribute('data-expanded', '');
+      const expand = target.closest<HTMLElement>('[data-expand]');
+      const expandLevel = expand?.closest('[data-level]');
+      if (expandLevel) {
+        setExpanded(expandLevel, !expandLevel.hasAttribute('data-expanded'));
+        return;
+      }
+      // Cấp bắt đầu là cấp sau cấp đã biết; hoàn tác ở cấp i đưa cấp bắt đầu về đúng cấp i (spec §5.3).
+      const knownSet = target.closest<HTMLElement>('[data-known-set]')?.dataset.knownSet;
+      const knownUndo = target.closest<HTMLElement>('[data-known-undo]')?.dataset.knownUndo;
+      const index = lite.levels.findIndex((l) => l.id === (knownSet ?? knownUndo));
+      if (index < 0) return;
+      const level = lite.levels[index].id;
+      root.querySelectorAll('[data-level][data-expanded]').forEach((el) => setExpanded(el, false));
+      if (knownSet) {
+        const known = lite.levels[index - 1]?.id;
+        focusAfterApply.current = known ? `[data-known-undo="${CSS.escape(known)}"]` : null;
+        getProgressStore().setStart(lite.id, level);
+      } else {
+        focusAfterApply.current = `[data-known-set="${CSS.escape(lite.levels[index + 1]?.id ?? level)}"]`;
+        getProgressStore().setStart(lite.id, index === 0 ? null : level);
+      }
     };
     const onClose = () => {
       if (keepHash) keepHash = false;
@@ -229,48 +265,43 @@ export function RoadmapClient({
     };
   }, [rootId, lite, topicIds]);
 
-  // Nhãn cộng dồn ("Nền tảng", "Nền tảng + Middle") để rõ là đã biết đến hết cấp nào.
-  const knownOptions = [
-    { value: null, label: t.roadmap.knownNone },
-    ...levels.slice(0, -1).map((_, i) => ({
-      value: levels[i + 1].id,
-      label: levels
-        .slice(0, i + 1)
-        .map((l) => l.title)
-        .join(' + '),
-    })),
-  ];
   const ctaLabel = next ? format(started ? t.roadmap.continueTo : t.roadmap.startAt, { title: next.topic.title }) : '';
   // Chủ đề kế tiếp đã có bài thì vào thẳng bài; chưa có thì mở khung chi tiết.
   const ctaHref = next ? (next.topic.lesson ? `/${lang}${next.topic.lesson}` : `#${next.topic.id}`) : '';
+  const state = !next ? 'done' : started ? 'learning' : 'new';
 
   return (
     <>
-      <div className="rm-actions">
-        {next ? (
-          <a className="rm-cta" href={ctaHref} data-testid="continue">
-            {ctaLabel}
-          </a>
-        ) : (
-          <p className="rm-finished">{t.roadmap.finished}</p>
-        )}
-        <p className="rm-total">{format(t.roadmap.doneCount, { done: total.done, total: total.total })}</p>
-        <div className="rm-known">
-          <span id={`${rootId}-known`}>{t.roadmap.known}</span>
-          <div className="rm-seg" role="group" aria-labelledby={`${rootId}-known`}>
-            {knownOptions.map((option) => (
-              <button
-                key={option.label}
-                type="button"
-                aria-pressed={(start ?? null) === option.value}
-                onClick={() => getProgressStore().setStart(lite.id, option.value)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
+      {/* Cấu trúc cố định: đổi trạng thái chỉ đổi chữ, nút "Vào học" giữ nguyên chỗ (spec §5.1). */}
+      <section className="rm-next" aria-labelledby={`${rootId}-next`} data-state={state}>
+        <div className="rm-next-body">
+          <p id={`${rootId}-next`} className="rm-next-k">
+            {t.roadmap.next[state]}
+          </p>
+          <p className="rm-next-t">{next ? next.topic.title : t.roadmap.finished}</p>
+          <p className="rm-next-m">
+            {next ? (
+              <>
+                <b>{next.step.code}</b> {next.step.title}
+                {next.topic.lesson ? ` · ${format(t.roadmap.lessonRef, { code: lessonCode(next.topic.lesson) })}` : null}
+              </>
+            ) : (
+              t.roadmap.finishedHint
+            )}
+          </p>
         </div>
-      </div>
+        {next ? (
+          <a className="rm-btn" href={ctaHref} data-testid="continue">
+            {t.roadmap.enter} <Icon name="arrow" />
+          </a>
+        ) : null}
+        <div className="rm-meter">
+          <span className="rm-bar" aria-hidden="true">
+            <i style={{ transform: `scaleX(${total.total ? total.done / total.total : 0})` }} />
+          </span>
+          <span>{format(t.roadmap.doneCount, { done: total.done, total: total.total })}</span>
+        </div>
+      </section>
       {next ? (
         <a className="rm-dock" href={ctaHref}>
           {ctaLabel}

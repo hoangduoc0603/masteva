@@ -43,7 +43,7 @@ Phạm vi: giai đoạn G0–G2 được thiết kế chi tiết. G3 (tài kho�
 | Nội dung | MDX, schema bằng Zod | |
 | Giao diện | Tailwind CSS (đi kèm fumadocs-ui) | |
 | Tô màu code | Shiki, chạy lúc build | |
-| Tìm kiếm | Orama, chỉ mục tĩnh | |
+| Tìm kiếm | zbsearch (bản kế thừa Orama), chỉ mục dựng trên trình duyệt từ file nội dung tĩnh (ADR-009) | |
 | Kiểm thử | Vitest (unit), Playwright (E2E), Lighthouse CI | |
 | Hosting | Cloudflare Pages (gói miễn phí) | Giới hạn 20.000 file mỗi site, 500 lần build mỗi tháng |
 | Tài khoản (G3) | Supabase Auth + Postgres + RLS | Định hướng |
@@ -153,8 +153,8 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 
 | Nhóm | Ví dụ |
 |---|---|
-| Trang chủ | `/vi/` |
-| Danh mục và chi tiết roadmap | `/vi/roadmaps`, `/vi/roadmaps/java` (sơ đồ, `#<mã chủ đề>` mở khung chi tiết); `/vi/roadmaps/senior-backend` là trang tĩnh trỏ tới ba roadmap mới |
+| Trang chủ | `/vi/` kiêm danh mục roadmap (nhóm route `(landing)`, không có nút tìm trên header), có ô tìm roadmap và chủ đề chạy trên trình duyệt (chỉ mục dựng lúc build, truyền qua props) và lối sang tìm nội dung bài (⌘K) |
+| Chi tiết roadmap | `/vi/roadmaps/java` (sơ đồ, `#<mã chủ đề>` mở khung chi tiết); `/vi/roadmaps` là trang tĩnh chuyển về `/vi/`; `/vi/roadmaps/senior-backend` là trang tĩnh trỏ tới ba roadmap mới |
 | Bài học | `/vi/learn/d1/d1-1` |
 | Dự án | `/vi/projects/neobank` |
 | Tiến độ của tôi | `/vi/progress` |
@@ -196,8 +196,8 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 
 ## 8. Tìm kiếm
 
-- **Công cụ:** Orama. Chỉ mục tĩnh, một file cho mỗi ngôn ngữ, sinh lúc build qua `staticGET` của Fumadocs.
-- **Tải chậm:** file chỉ mục chỉ được tải khi người học mở hộp tìm kiếm lần đầu, nên trang bài học không bị nặng thêm.
+- **Công cụ:** zbsearch. Lúc build, route tĩnh `src/app/[lang]/search.json/route.ts` xuất nội dung các bài (tiêu đề, đề mục, đoạn văn, đường dẫn) thành `/<lang>/search.json`; trình duyệt dựng chỉ mục từ file này (`src/lib/search/lesson-index.ts`, `lesson-client.ts`), xem ADR-009.
+- **Tải chậm:** file chỉ được tải khi người học mở hộp tìm kiếm và gõ lần đầu, mỗi ngôn ngữ một lần trong phiên, nên trang bài học không bị nặng thêm.
 - **Tokenizer tiếng Việt** (FR-SEARCH-001):
   1. Chuyển về chữ thường.
   2. Chuẩn hoá Unicode NFD rồi bỏ dấu thanh và dấu phụ.
@@ -206,8 +206,8 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 
   Nội dung và từ khoá tìm kiếm đi qua cùng tokenizer, nên "tien trinh" và "tiến trình" cho cùng kết quả.
 - **Đã kiểm chứng ở G0:** bộ tách từ mặc định (zbsearch, bản kế thừa Orama mà Fumadocs 16 dùng) chỉ bỏ được một phần dấu: "Tiến trình đồng bộ" thành `tiến`, `trinh`, `dồng`, `bộ`, nên gõ không dấu không ra kết quả. Tokenizer riêng giải quyết được và có unit test.
-- **Phía trình duyệt:** `staticClient` nhận `initDB` để tạo cơ sở dữ liệu tìm kiếm với cùng tokenizer trước khi nạp chỉ mục. Hộp tìm kiếm được tải chậm (`next/dynamic`), nên zbsearch và bộ dựng kết quả không nằm trong JavaScript ban đầu của trang.
-- **Ngân sách kích thước:** theo dõi kích thước file chỉ mục sau mỗi lần build. Với một bài (D1.1), chỉ mục nặng 109 KB, 19 KB khi gzip. Nếu vượt khoảng 2 MB gzip thì chỉ đánh chỉ mục tiêu đề, mô tả và đề mục thay cho toàn văn, hoặc chia theo roadmap.
+- **Phía trình duyệt:** `createLessonSearchClient` tạo cơ sở dữ liệu zbsearch với cùng tokenizer, nạp tài liệu rồi gom kết quả theo trang như Fumadocs. Hộp tìm kiếm được tải chậm (`next/dynamic`), nên zbsearch và bộ dựng kết quả không nằm trong JavaScript ban đầu của trang.
+- **Ngân sách kích thước:** `/vi/search.json` dưới 2 MB (E2E kiểm). Ngày 05/10/2026, với 64 bài: 1,34 MB, 387 KB gzip (bản xuất Orama cũ: 16 MB cho `vi,en`). Khi gần chạm ngân sách thì chia file theo roadmap.
 
 ## 9. Trang bài học
 
@@ -277,6 +277,7 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 | ADR-005 | Tokenizer tìm kiếm riêng cho tiếng Việt | Người Việt hay gõ không dấu; bộ tách từ mặc định có thể cắt nhầm chữ có dấu | Phải tự viết và kiểm thử | Đã chấp nhận (03/10/2026), đã kiểm chứng ở G0 |
 | ADR-006 | Nội dung chung repo với code, nằm trong `content/` | Đơn giản cho một người vận hành; tách repo sau vẫn dễ | Người đóng góp nội dung phải làm việc trong repo có code | Đã chấp nhận (03/10/2026) |
 | ADR-008 | Nội dung khung chi tiết chủ đề nằm trong file JSON tĩnh theo roadmap, tải khi mở khung | Render sẵn mọi panel làm HTML trang Java lên 147 KB gzip (ngân sách 150 KB), vì Next lặp nội dung server component trong payload RSC; tách ra còn 30 KB HTML và 43 KB JSON tải sau | Tóm tắt chủ đề không còn trong HTML (SEO kém hơn một chút); lần mở khung đầu tiên chờ một request; panel render phía trình duyệt (+1,5 KB JS) | Đã chấp nhận (04/10/2026) |
+| ADR-009 | Tìm nội dung bài: xuất file nội dung gọn theo ngôn ngữ, dựng chỉ mục zbsearch trên trình duyệt | Bản xuất Orama của Fumadocs nặng 16 MB (3,3 MB gzip) với 64 bài, sẽ vượt giới hạn 25 MiB mỗi file của Cloudflare Pages khi đủ ba roadmap; phần chữ thật chỉ khoảng 0,84 MB | Lần tìm đầu tiên tốn thêm thời gian dựng chỉ mục; tự viết phần gom kết quả (theo `searchAdvanced` của Fumadocs) | Đã chấp nhận (05/10/2026) |
 | ADR-007 | Giấy phép: CC BY-NC-SA 4.0 cho nội dung, MIT cho code mẫu trong `labs/` | Cho chia sẻ nội dung nhưng không cho dùng thương mại; code mẫu dùng tự do | CC BY-NC-SA hạn chế cả đối tác thương mại muốn dùng lại | Đã chấp nhận (03/10/2026) |
 
 ## 15. Truy vết yêu cầu tới thiết kế (G0–G1)

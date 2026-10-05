@@ -1,6 +1,6 @@
 # Tiến độ Masteva
 
-Cập nhật lần cuối: 03/10/2026. File này giúp một session mới biết dự án đang ở đâu; cập nhật mỗi khi xong một mốc.
+Cập nhật lần cuối: 05/10/2026. File này giúp một session mới biết dự án đang ở đâu; cập nhật mỗi khi xong một mốc.
 
 ## Đã xong
 
@@ -16,6 +16,7 @@ Cập nhật lần cuối: 03/10/2026. File này giúp một session mới biế
 | **Luồng Java dùng thử được** | Nội dung 145 chủ đề Java (J1–J20: tóm tắt và tài liệu chính thức, link kiểm 200 ngày 03/10/2026); 3 bài J1 (J1.1 JDK/javac/jshell và J1.3 Git, Javadoc đã kiểm chứng trên macOS 14.4.1, Java 25.0.3, Git 2.39.3; J1.2 IDE và debugger còn nháp vì có bước chỉ làm trên IDE); giao diện bài học theo Night Lab (`src/app/lesson.css`); hoàn thiện trang roadmap sau critique (một màu "đã xong", thanh Học tiếp mobile chỉ hiện khi cần, vùng chạm 44px, khung chi tiết đọc được bằng trình đọc màn hình, mở cấp thu gọn khi link trỏ vào); sửa lỗi tiến độ (nhập file, quota, `__proto__`); `format()` tách khỏi `messages.ts` (JS giảm ~11 KB gzip mỗi trang). `pnpm verify` xanh: 75 unit, 47 E2E | `content/steps/j1/`, `design/components/` |
 | **Cấp Nền tảng Java đủ bài** | 25 bài cho J2–J10 (mỗi chặng 2–3 bài, lab chạy thật bằng JDK 25.0.3, Maven 3.9.9, Docker 29.8 cho Testcontainers; tất cả đã kiểm chứng); ba reviewer độc lập soát kiến thức, đã sửa mọi lỗi (JEP 513, `strip`, HashMap treeify, quy tắc version plugin Maven, Testcontainers với Docker 29, bản nháp Idempotency-Key đã hết hạn…). D1.1 kiểm chứng trong VM Lima. Khung chi tiết tải nội dung từ `topics.json` (ADR-008): HTML trang Java 147 → 30 KB gzip. `pnpm verify` xanh: 76 unit, 47 E2E | `content/steps/j2…j10/`, `docs/architecture.md` ADR-008 |
 | **Roadmap Java hoàn chỉnh** | 63 bài cho J1–J20, phủ mọi chủ đề chính và cả 7 chủ đề tuỳ chọn (JPMS, WebFlux/Quarkus, jOOQ/MongoDB, Spring Batch, GraalVM native image); tất cả đã kiểm chứng bằng lab chạy thật (Spring Boot 4.1.1, PostgreSQL 18, Keycloak, Jaeger, Redis, Kafka, Testcontainers, Jib, Buildpacks, GraalVM). Mỗi chặng qua một reviewer độc lập và một vòng sửa. Chuẩn nội dung thêm quy tắc cho bước làm trên giao diện (kiểm bằng công cụ dòng lệnh tương đương). `pnpm verify` xanh: 76 unit, 47 E2E | `content/steps/j1…j20/` |
+| **Trang chủ và phần đầu roadmap v2** | Bỏ mục nav "Roadmap"; trang chủ kiêm danh mục, tìm roadmap và chủ đề không dấu ngay trên trình duyệt (`searchCatalog`), khối "Đang học"; `/vi/roadmaps` chuyển về trang chủ. Trang roadmap: link "Tất cả roadmap", khối tiếp tục cấu trúc cố định (nút "Vào học" không dời chỗ), "Tôi đã biết cấp này" trên đầu mỗi cấp kèm Hoàn tác, thanh cấp dính có tiến độ từng cấp và cấp đang xem, Sơ đồ/Danh sách và "Ẩn mục đã bỏ qua" (mobile gộp vào bảng nổi); bỏ "Cách đọc sơ đồ". Sau dùng thử: mỗi trang một ô tìm (trang chủ tắt nút tìm trên header, có dòng chuyển sang tìm trong bài học), tên roadmap ngắn ("Java"), bỏ chân trang giấy phép. `pnpm verify` xanh: 82 unit, 76 E2E. Chưa commit | [spec](superpowers/specs/2026-10-05-trang-chu-roadmap-ux-design.md), [plan](superpowers/plans/2026-10-05-trang-chu-roadmap-ux.md), `design/home-v2.html`, `design/roadmap-v2.html` |
 | Công cụ cho Claude Code | Đã cài cho project: plugin Impeccable, frontend-design, Superpowers; skill web-design-guidelines, vercel-react-best-practices | `.claude/settings.json`, `.claude/skills/` |
 
 ## Quyết định đã chốt
@@ -45,10 +46,12 @@ Repo local, nhánh mặc định `master`. Ngày 03/10/2026 có 3 commit; commit
 
 ## Vấn đề đã biết
 
+- HTML trang chủ 34 KB gzip (05/10/2026), phần lớn là chỉ mục tìm kiếm khoảng 380 chủ đề.
+- Tìm nội dung bài (⌘K) dùng `/<lang>/search.json`: 1,34 MB, 387 KB gzip cho 64 bài (ADR-009, thay bản xuất Orama 16 MB). Ngân sách 2 MB; gần chạm thì chia theo roadmap.
 - HTML trang roadmap Java 30 KB gzip sau khi tách nội dung khung chi tiết ra `topics.json` (43 KB gzip, tải khi mở khung; ADR-008).
 - JavaScript (gzip, đo 03/10/2026 sau khi tách `format()`): roadmap 268 KB, bài học 287 KB, trang chủ 266 KB; vẫn trên ngân sách ~260 KB, phần lớn là nền React/Next.js/Fumadocs. Cần đo bằng Lighthouse.
 - Giao diện bài học dựa vào cấu trúc nội bộ của Fumadocs/Shiki (nút sao chép, màu token); có E2E bảo vệ vị trí nút "Sao chép". Không dùng `title=` cho khối code bên trong `<Terminal>`.
-- Lỗi nhỏ còn để lại: view danh sách nháy view sơ đồ lúc tải; `data-expanded` của cấp không bị gỡ khi đổi "Tôi đã biết"; ô tích ẩn của Check nằm lệch so với ô vẽ (ảnh hưởng điều khiển bằng giọng nói); trong Terminal chỉ dòng đầu có dấu `$`; khoá `lesson.reveal` và khối `@theme --color-track-*` trong `global.css` có thể không còn dùng.
+- Lỗi nhỏ còn để lại: view danh sách nháy view sơ đồ lúc tải; ô tích ẩn của Check nằm lệch so với ô vẽ (ảnh hưởng điều khiển bằng giọng nói); trong Terminal chỉ dòng đầu có dấu `$`; khoá `lesson.reveal` và khối `@theme --color-track-*` trong `global.css` có thể không còn dùng.
 - `CLAUDE.md` có khối `nextjs-agent-rules` do `pnpm dev` của Next 16 tự chèn, đã commit theo yêu cầu "commit toàn bộ". Muốn bỏ thì xoá khối và đặt `agentRules: false` trong `next.config.mjs`, nếu không `next dev` sẽ chèn lại.
 - Critique trang roadmap 23/40 (03/10/2026): đã sửa P0, P1 và P2; nên chạy lại `/impeccable critique` để chấm điểm mới.
 - Tên chặng, tên chủ đề và mô tả roadmap chỉ có tiếng Việt (`meta.json`, `content/roadmaps/*.json`); cần đọc `meta.en.json` khi có bản tiếng Anh.

@@ -1,6 +1,7 @@
 import 'server-only';
 import { listRoadmapViews } from './manifest';
-import { toLite, type RoadmapCardData } from './views';
+import type { CatalogIndex } from '@/lib/search/catalog';
+import { catalogIndex, toLite, type RoadmapCardData } from './views';
 
 /** Dữ liệu thẻ roadmap cho trang danh mục và trang chủ. */
 export function roadmapCards(lang: string): RoadmapCardData[] {
@@ -14,4 +15,9 @@ export function roadmapCards(lang: string): RoadmapCardData[] {
     levels: view.levels.map((l) => ({ id: l.id, title: l.title })),
     lite: toLite(view),
   }));
+}
+
+/** Chỉ mục tìm kiếm roadmap và chủ đề cho trang chủ. */
+export function catalog(lang: string): CatalogIndex {
+  return catalogIndex(listRoadmapViews(lang));
 }

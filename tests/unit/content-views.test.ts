@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Topic } from '@/lib/content/schema';
-import { buildLessonContext, buildProjectView, buildRoadmapView, toLite, topicDetails, type ViewInput } from '@/lib/content/views';
+import { buildLessonContext, buildProjectView, buildRoadmapView, toLite, topicDetails, catalogIndex, type ViewInput } from '@/lib/content/views';
 
 const topic = (id: string, extra: Partial<Topic> = {}): Topic => ({ id, title: id.toUpperCase(), kind: 'core', requires: [], resources: [], ...extra });
 
@@ -123,12 +123,13 @@ describe('toLite', () => {
             {
               id: 'd1',
               code: 'D1',
+              title: 'Linux',
               topics: [
                 { id: 'd1.x', title: 'D1.X', kind: 'core', items: ['d1.1.a', 'd1.1.b'], lesson: '/learn/d1/d1-1' },
                 { id: 'd1.y', title: 'D1.Y', kind: 'opt', items: [] },
               ],
             },
-            { id: 'd2', code: 'D2', topics: [{ id: 'd2.z', title: 'D2.Z', kind: 'opt', items: [] }] },
+            { id: 'd2', code: 'D2', title: 'Mesh', topics: [{ id: 'd2.z', title: 'D2.Z', kind: 'opt', items: [] }] },
           ],
         },
       ],
@@ -166,5 +167,14 @@ describe('topicDetails', () => {
       prev: { id: 'j1.a' },
       requires: [{ id: 'j1.a', roadmapId: 'java' }],
     });
+  });
+});
+
+describe('catalogIndex', () => {
+  it('lists roadmaps and every topic with its step and lesson flag', () => {
+    const idx = catalogIndex([buildRoadmapView(input, 'devops')!]);
+    expect(idx.roadmaps).toEqual([{ id: 'devops', track: 'devops', title: 'DevOps', description: 'Mô tả' }]);
+    expect(idx.topics[0]).toEqual({ roadmapId: 'devops', code: 'D1', stepTitle: 'Linux', id: 'd1.x', title: 'D1.X', hasLesson: true });
+    expect(idx.topics.find((t) => t.id === 'd1.y')?.hasLesson).toBe(false);
   });
 });

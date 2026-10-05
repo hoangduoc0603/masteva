@@ -31,9 +31,9 @@ export default async function ProjectPage(props: PageProps<'/[lang]/projects/[pr
   const t = getMessages(lang);
   return (
     <main className="pj-page">
-      <p className="rm-kicker">{t.projects.title}</p>
-      <h1 className="rm-title">{view.title}</h1>
-      <p className="rm-desc">{view.summary}</p>
+      <p className="pj-kicker">{t.projects.title}</p>
+      <h1 className="pj-title">{view.title}</h1>
+      <p className="pj-desc">{view.summary}</p>
       <ol className="pj-milestones">
         {view.milestones.map((m) => (
           <li key={m.id} className="pj-milestone">

@@ -1,5 +1,6 @@
 import { format, type Messages } from '@/lib/messages';
 import type { RoadmapView, StepView, TopicView } from '@/lib/content/views';
+import { Icon } from '@/components/icons';
 
 /**
  * Sơ đồ "trục giữa" (spec §6.1). Render lúc build thành danh sách có thứ tự lồng nhau;
@@ -8,34 +9,64 @@ import type { RoadmapView, StepView, TopicView } from '@/lib/content/views';
 export function RoadmapMap({ view, lang, t }: { view: RoadmapView; lang: string; t: Messages }) {
   return (
     <div className="rm-map">
-      {view.levels.map((level) => (
-        <section key={level.id} className="rm-level" data-level={level.id} aria-labelledby={`level-${level.id}`}>
-          <header className="rm-level-head">
-            <p className="rm-level-k">{format(t.roadmap.levelLabel, { n: level.index })}</p>
-            <h2 id={`level-${level.id}`} className="rm-level-t">
-              {level.title}
-            </h2>
-            <p className="rm-level-goal">{level.goal}</p>
-            <div className="rm-level-progress">
-              <span className="rm-bar" aria-hidden="true">
-                <i data-bar={`level:${level.id}`} />
+      {view.levels.map((level, i) => {
+        const next = view.levels[i + 1];
+        const before = view.levels.slice(0, i).map((l) => l.title);
+        const core = level.steps.flatMap((s) => s.topics).filter((tp) => tp.kind !== 'opt').length;
+        return (
+          <section key={level.id} className="rm-level" id={`level-${level.id}`} data-level={level.id} aria-labelledby={`lt-${level.id}`}>
+            <header className="rm-lhead">
+              <span className="rm-lhead-n" aria-hidden="true">
+                {level.index}
               </span>
-              <span data-count={`level:${level.id}`} />
-            </div>
-            <p className="rm-level-known">
-              {t.roadmap.levelKnown}{' '}
-              <button type="button" data-show-level={level.id}>
-                {t.roadmap.showLevel}
-              </button>
-            </p>
-          </header>
-          <ol className="rm-rail">
-            {level.steps.map((step) => (
-              <StepCard key={step.id} step={step} lang={lang} t={t} />
-            ))}
-          </ol>
-        </section>
-      ))}
+              <div>
+                <h2 id={`lt-${level.id}`} className="rm-lhead-t">
+                  {level.title}
+                </h2>
+                <p className="rm-lhead-g">{level.goal}</p>
+              </div>
+              {/* Mô hình cấp bắt đầu: biết cấp này nghĩa là bắt đầu từ cấp sau, nên cấp cuối không có nút. */}
+              {next ? (
+                <button type="button" className="rm-known-btn" data-known-set={next.id}>
+                  <Icon name="check" />
+                  {t.roadmap.knownLevel}
+                </button>
+              ) : null}
+              <div className="rm-meter">
+                <span className="rm-bar" aria-hidden="true">
+                  <i data-bar={`level:${level.id}`} />
+                </span>
+                <span data-count={`level:${level.id}`} />
+              </div>
+              <div className="rm-known-row">
+                <Icon name="check" />
+                <span>
+                  <b>{t.roadmap.knownTitle}</b>
+                  {before.length ? format(t.roadmap.knownIncludes, { levels: before.join(', ') }) : ''}. {format(t.roadmap.knownSkipped, { count: core })}
+                </span>
+                <button
+                  type="button"
+                  className="rm-linkbtn"
+                  data-expand
+                  aria-expanded="false"
+                  data-label-open={t.roadmap.reviewSteps}
+                  data-label-close={t.roadmap.collapse}
+                >
+                  {t.roadmap.reviewSteps}
+                </button>
+                <button type="button" className="rm-linkbtn" data-known-undo={level.id}>
+                  {t.roadmap.undo}
+                </button>
+              </div>
+            </header>
+            <ol className="rm-rail">
+              {level.steps.map((step) => (
+                <StepCard key={step.id} step={step} lang={lang} t={t} />
+              ))}
+            </ol>
+          </section>
+        );
+      })}
     </div>
   );
 }
