@@ -6,7 +6,7 @@ Phần bổ sung cho `../CLAUDE.md`. Masteva là web học cho lập trình viê
 
 ## Stack riêng của project
 
-Fumadocs trên Next.js, static export (không có máy chủ), host trên Cloudflare Pages. Không dùng Supabase hay Vercel cho tới giai đoạn G3 (xem ADR-002, ADR-004).
+Fumadocs trên Next.js, static export (không có máy chủ), host tĩnh trên Cloudflare Workers (static assets, `wrangler.jsonc`, ADR-010). Không dùng Supabase hay Vercel cho tới giai đoạn G3 (xem ADR-002, ADR-004).
 
 - Không thêm tính năng cần máy chủ (route động, middleware, server action). Mọi thứ phải chạy lúc build hoặc trên trình duyệt.
 - Component phía trình duyệt không được import Zod hay các module chỉ dùng lúc build (`src/lib/content/repo.ts`, `manifest.ts`), để giữ ngân sách JavaScript.

@@ -8,7 +8,7 @@ Cập nhật lần cuối: 05/10/2026. File này giúp một session mới biế
 |---|---|---|
 | Khám phá sản phẩm | Nghiên cứu 15 đối thủ, giá trị cốt lõi, persona, tính năng theo module | [market-research.md](market-research.md), [product-vision.md](product-vision.md), [features.md](features.md) |
 | Chuẩn nội dung | Khung bài 6 phần, quy tắc viết, quy trình kiểm chứng, quy tắc dịch | [content-standard.md](content-standard.md) |
-| Kiến trúc | Fumadocs trên Next.js, static export lên Cloudflare Pages, ADR-001…007 | [framework-comparison.md](framework-comparison.md), [architecture.md](architecture.md) |
+| Kiến trúc | Fumadocs trên Next.js, static export lên Cloudflare (Workers static assets, ADR-010), ADR-001…010 | [framework-comparison.md](framework-comparison.md), [architecture.md](architecture.md) |
 | **Giai đoạn 0 (nền móng)** | Trang chủ, danh mục roadmap, roadmap 29 bước, trang bài học, tiến độ trên trình duyệt, xuất/nhập, tìm kiếm không dấu, kiểm tra nội dung và file khoá mã. Bài mẫu D1.1 (nháp). `pnpm verify` xanh: 30 unit test, 16 E2E | [README.md](../README.md) |
 | **Định hướng thiết kế** | Critique G0 (24/40); chọn hướng Night Lab sau vòng thiết kế lại bằng ui-ux-pro-max; thiết kế local trong `design/` (token, design system, trang mẫu) | [design-direction.md](design-direction.md), `design/index.html` |
 | **Tách roadmap** | 3 roadmap Java, DevOps, Microservices (58 chặng, 379 chủ đề, 3 cấp); sơ đồ trục giữa, view danh sách, khung chi tiết chủ đề (hash), "Tôi đã biết"; tiến độ v2 (trạng thái chủ đề, tự chuyển từ v1); 2 trang dự án; trang chủ, danh mục, breadcrumb và chip chủ đề trong bài; theme tối mặc định. Review toàn nhánh: sửa 3 lỗi (hash hỏng làm sập trang, nút "Chưa học", token import ra ngoài `src/`). Critique trang roadmap 23/40 (G0: 24/40); đã sửa hai lỗi P1 (thanh công cụ dính, vòng focus) và đổi màu Java (`#ff7a59` tối, `#be2f45` sáng). `pnpm verify` xanh: 68 unit test, 35 E2E | [spec](superpowers/specs/2026-10-03-tach-roadmap-design.md), [plan](superpowers/plans/2026-10-03-tach-roadmap.md) |
@@ -31,18 +31,18 @@ Cập nhật lần cuối: 05/10/2026. File này giúp một session mới biế
 
 ## Git
 
-Repo local, nhánh mặc định `master`. Ngày 03/10/2026 có 3 commit; commit mới nhất gồm tách roadmap, Night Lab, nội dung Java và bài J1. Chưa có remote. Cache của Impeccable (`hook.cache.json`, `live/`) nằm trong `.gitignore`; bản critique trong `.impeccable/critique/` được commit.
+Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva` (alias SSH `github.com-personal`). Deploy bằng Workers Builds khi push lên `master` (ADR-010). Cache của Impeccable (`hook.cache.json`, `live/`) nằm trong `.gitignore`; bản critique trong `.impeccable/critique/` được commit.
 
 ## Chưa làm, chờ quyết định của người dùng
 
-- Tạo repo GitHub, kết nối Cloudflare Pages, đăng ký tên miền.
+- Đăng ký tên miền (khi có thì gắn vào Worker `masteva`).
 
 ## Bước tiếp theo
 
 1. **Người dùng học thử roadmap Java** (63 bài) và ghi lại chỗ vướng; ưu tiên sửa nội dung theo phản hồi thật.
 2. **Roadmap DevOps** theo đúng quy trình Java: tóm tắt và tài liệu cho chủ đề, bài cho từng chặng (lab trên VM Lima, Docker, Kubernetes local), review và sửa. Sau đó Microservices.
 3. **Đề cương hai dự án** (Neobank, Hub hội thoại) và trang `/setup` chuẩn bị môi trường.
-4. Kết nối GitHub và Cloudflare Pages khi người dùng sẵn sàng.
+4. Kiểm tra bản deploy đầu tiên trên `*.workers.dev`, rồi gắn tên miền.
 
 ## Vấn đề đã biết
 
@@ -59,7 +59,7 @@ Repo local, nhánh mặc định `master`. Ngày 03/10/2026 có 3 commit; commit
 - `src/app/tokens.css` và `src/app/roadmap.css` là bản chép của `design/`; `src/app/lesson.css` chuyển thể từ `design/components.css`. Sửa `design/` thì cập nhật lại.
 - Bài Java dài 450–1050 dòng (lab đầy đủ trong heredoc); HTML bài nặng nhất khoảng 67 KB gzip, trong ngân sách. Một số mốc phiên bản (Spring Boot 4.1.1, JDK 25, Jackson 3.2, Kafka 4.3…) sẽ cũ dần; `verified` ghi ngày và phiên bản để biết khi nào cần rà lại.
 - Lab J12.4 cần biến `GLIBC_TUNABLES` vì kernel VM của Docker Desktop (7.0.12) xung đột với MongoDB 8/9; bỏ được khi Docker Desktop lên kernel 7.0.14.
-- Header CSP trong `public/_headers` chưa được kiểm thử trên Cloudflare Pages.
+- Header CSP trong `public/_headers` đã chạy đúng với `wrangler dev` (06/10/2026); cần kiểm lại trên bản deploy thật.
 - Lighthouse CI chưa cài.
 
 ## Cách làm việc với người dùng

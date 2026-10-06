@@ -16,7 +16,8 @@ export async function generateMetadata(props: PageProps<'/[lang]/roadmaps'>): Pr
 export default async function RoadmapsRedirectPage(props: PageProps<'/[lang]/roadmaps'>) {
   const { lang } = await props.params;
   if (!isLanguage(lang)) notFound();
-  const target = `/${lang}/`;
+  // Không có dấu `/` cuối: Workers phục vụ `vi.html` ở `/vi`, còn `/vi/` lại chuyển hướng thêm một bước.
+  const target = `/${lang}`;
   return (
     <>
       <script dangerouslySetInnerHTML={{ __html: `location.replace(${JSON.stringify(target)}+location.hash)` }} />

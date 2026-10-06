@@ -21,7 +21,7 @@ Phạm vi: giai đoạn G0–G2 được thiết kế chi tiết. G3 (tài kho�
 ## 2. Tổng quan hệ thống
 
 ```text
- Tác giả                     GitHub                         Cloudflare Pages            Người học
+ Tác giả                     GitHub                         Cloudflare Workers          Người học
  (MDX trong content/) ──push──▶ repo masteva ──build CI──▶ HTML/JS/JSON tĩnh ──CDN──▶ trình duyệt
                                │ kiểm tra nội dung        │ chỉ mục tìm kiếm          │ localStorage (tiến độ)
                                │ typecheck, test, build   │ manifest tiến độ          │
@@ -32,7 +32,7 @@ Phạm vi: giai đoạn G0–G2 được thiết kế chi tiết. G3 (tài kho�
 - **Không có máy chủ ứng dụng ở G0–G2.** Next.js chạy ở chế độ static export (`output: 'export'`), mọi trang được render thành file tĩnh lúc build.
 - **Nguồn sự thật của nội dung là Git.** Trang web chỉ là bản build từ repo.
 - **Nguồn sự thật của tiến độ là trình duyệt của người học** ở G0–G2, và Supabase ở G3.
-- **Hệ thống bên ngoài được tin cậy:** GitHub (lưu mã nguồn, chạy CI), Cloudflare Pages (build và phát file tĩnh), và từ G3 là Supabase.
+- **Hệ thống bên ngoài được tin cậy:** GitHub (lưu mã nguồn, chạy CI), Cloudflare Workers với static assets (Workers Builds build và phát file tĩnh, ADR-010), và từ G3 là Supabase.
 
 ## 3. Công nghệ
 
@@ -45,7 +45,7 @@ Phạm vi: giai đoạn G0–G2 được thiết kế chi tiết. G3 (tài kho�
 | Tô màu code | Shiki, chạy lúc build | |
 | Tìm kiếm | zbsearch (bản kế thừa Orama), chỉ mục dựng trên trình duyệt từ file nội dung tĩnh (ADR-009) | |
 | Kiểm thử | Vitest (unit), Playwright (E2E), Lighthouse CI | |
-| Hosting | Cloudflare Pages (gói miễn phí) | Giới hạn 20.000 file mỗi site, 500 lần build mỗi tháng |
+| Hosting | Cloudflare Workers, static assets (gói miễn phí) | Giới hạn 20.000 file mỗi bản, 25 MiB mỗi file; Workers Builds 3.000 phút build mỗi tháng, 1 build cùng lúc |
 | Tài khoản (G3) | Supabase Auth + Postgres + RLS | Định hướng |
 
 Phiên bản cụ thể của từng thư viện được ghi trong `package.json` khi khởi tạo project, không ghi cứng ở đây.
@@ -73,7 +73,7 @@ masteva/
 ├── labs/                      # code mẫu cho lab, giấy phép MIT
 ├── scripts/                   # content.ts: kiểm tra nội dung, cập nhật file khoá
 ├── tests/                     # unit và E2E
-├── public/_headers            # header bảo mật cho Cloudflare Pages
+├── public/_headers            # header bảo mật, Workers static assets đọc file này
 └── docs/
 ```
 
@@ -228,7 +228,7 @@ Chạy trên mọi pull request và trước mỗi lần deploy.
 | Mã mục | Không trùng; khớp file khoá; bản dịch không có mã lạ | Có |
 | Liên kết nội bộ | Không trỏ tới trang hoặc mục không tồn tại | Có |
 | Code | Typecheck, lint, unit test | Có |
-| Build | Static export thành công; số file dưới giới hạn của Cloudflare Pages | Có |
+| Build | Static export thành công; số file dưới giới hạn của Cloudflare Workers static assets | Có |
 | E2E | Các kịch bản ở mục 13 | Có |
 | Hiệu năng | Lighthouse CI trên trang chủ, một trang roadmap và một trang bài học | Cảnh báo khi vượt ngân sách |
 | Link ngoài | Chạy định kỳ hằng tuần, tạo issue khi có link hỏng | Không |
@@ -249,11 +249,11 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 
 ## 12. Triển khai và vận hành
 
-- **Luồng:** push lên `main` thì Cloudflare Pages build và deploy production. Mỗi pull request có một bản xem trước riêng.
-- **Rollback:** chọn lại một bản deploy cũ trên Cloudflare Pages, hoặc `git revert`.
+- **Luồng:** repo GitHub `hoangduoc0603/masteva` kết nối Workers Builds. Push lên `master` thì Cloudflare chạy `pnpm content:check && pnpm build` rồi `npx wrangler deploy`; nhánh khác tạo bản xem trước. Cấu hình ở `wrangler.jsonc` (thư mục `out/`, trang 404 là `404.html`, `html_handling: auto-trailing-slash`).
+- **Rollback:** chọn lại một phiên bản cũ của Worker trên Cloudflare, hoặc `git revert`.
 - **Sao lưu:** Git là nguồn sự thật, không có dữ liệu nào cần sao lưu riêng ở G0–G2. Từ G3, dùng cơ chế sao lưu của Supabase.
-- **Tên miền:** `masteva.com` khi đã đăng ký. Trước đó dùng tên miền `*.pages.dev` mặc định.
-- **Theo dõi giới hạn:** số file mỗi lần build và số lần build mỗi tháng. Nếu tiến gần 500 lần build, gộp thay đổi nội dung trước khi push.
+- **Tên miền:** `masteva.com` khi đã đăng ký. Trước đó dùng tên miền `*.workers.dev` mặc định.
+- **Theo dõi giới hạn:** số file mỗi lần build và số lần build mỗi tháng. Nếu tiến gần 3.000 phút build mỗi tháng, gộp thay đổi nội dung trước khi push.
 - **Chuyển sang có máy chủ khi cần:** nếu sau này cần middleware hoặc tính năng chạy phía máy chủ, bỏ `output: 'export'` và deploy cùng code lên nền tảng chạy Next.js. Không phải viết lại ứng dụng.
 
 ## 13. Kiểm thử
@@ -271,13 +271,14 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 | Mã | Quyết định | Lý do | Đánh đổi | Trạng thái |
 |---|---|---|---|---|
 | ADR-001 | Fumadocs trên Next.js | Cần giao diện tuỳ biến sâu và tính năng ứng dụng ở G3–G4; tìm kiếm tiếng Việt tuỳ chỉnh được | Nặng hơn Starlight; phải tự làm thông báo chưa dịch và khung terminal | Đã chấp nhận (03/10/2026) |
-| ADR-002 | Static export, host trên Cloudflare Pages | Chi phí 0 kể cả khi thương mại; không có máy chủ phải vận hành | Không có middleware; mọi tính năng phải chạy được ở trình duyệt hoặc lúc build | Đã chấp nhận (03/10/2026) |
+| ADR-002 | Static export, host trên Cloudflare (ban đầu là Pages, nay là Workers, xem ADR-010) | Chi phí 0 kể cả khi thương mại; không có máy chủ phải vận hành | Không có middleware; mọi tính năng phải chạy được ở trình duyệt hoặc lúc build | Đã chấp nhận (03/10/2026) |
 | ADR-003 | Mã mục tường minh, kèm file khoá | Sửa nội dung không làm mất tiến độ (BR-003); tiến độ dùng chung giữa các ngôn ngữ | Tác giả phải đặt mã cho từng mục; thêm một bước kiểm tra khi build | Đã chấp nhận (03/10/2026) |
 | ADR-004 | Tiến độ lưu trên trình duyệt ở G0–G2; Supabase cùng RLS ở G3 | Chưa cần tài khoản để có giá trị; G3 vẫn giữ được static export | Tiến độ không theo người học sang máy khác cho tới G3, trừ khi xuất/nhập file | Đã chấp nhận (03/10/2026) |
 | ADR-005 | Tokenizer tìm kiếm riêng cho tiếng Việt | Người Việt hay gõ không dấu; bộ tách từ mặc định có thể cắt nhầm chữ có dấu | Phải tự viết và kiểm thử | Đã chấp nhận (03/10/2026), đã kiểm chứng ở G0 |
 | ADR-006 | Nội dung chung repo với code, nằm trong `content/` | Đơn giản cho một người vận hành; tách repo sau vẫn dễ | Người đóng góp nội dung phải làm việc trong repo có code | Đã chấp nhận (03/10/2026) |
 | ADR-008 | Nội dung khung chi tiết chủ đề nằm trong file JSON tĩnh theo roadmap, tải khi mở khung | Render sẵn mọi panel làm HTML trang Java lên 147 KB gzip (ngân sách 150 KB), vì Next lặp nội dung server component trong payload RSC; tách ra còn 30 KB HTML và 43 KB JSON tải sau | Tóm tắt chủ đề không còn trong HTML (SEO kém hơn một chút); lần mở khung đầu tiên chờ một request; panel render phía trình duyệt (+1,5 KB JS) | Đã chấp nhận (04/10/2026) |
 | ADR-009 | Tìm nội dung bài: xuất file nội dung gọn theo ngôn ngữ, dựng chỉ mục zbsearch trên trình duyệt | Bản xuất Orama của Fumadocs nặng 16 MB (3,3 MB gzip) với 64 bài, sẽ vượt giới hạn 25 MiB mỗi file của Cloudflare Pages khi đủ ba roadmap; phần chữ thật chỉ khoảng 0,84 MB | Lần tìm đầu tiên tốn thêm thời gian dựng chỉ mục; tự viết phần gom kết quả (theo `searchAdvanced` của Fumadocs) | Đã chấp nhận (05/10/2026) |
+| ADR-010 | Host trên Cloudflare Workers (static assets) thay cho Pages | Giao diện Cloudflare đã ghi Pages là "legacy"; Workers có cùng chi phí 0 cho file tĩnh, đọc `_headers`/`_redirects`, Workers Builds có 3.000 phút build mỗi tháng | Thêm file `wrangler.jsonc`; tên Worker phải trùng tên project trên Cloudflare | Đã chấp nhận (06/10/2026) |
 | ADR-007 | Giấy phép: CC BY-NC-SA 4.0 cho nội dung, MIT cho code mẫu trong `labs/` | Cho chia sẻ nội dung nhưng không cho dùng thương mại; code mẫu dùng tự do | CC BY-NC-SA hạn chế cả đối tác thương mại muốn dùng lại | Đã chấp nhận (03/10/2026) |
 
 ## 15. Truy vết yêu cầu tới thiết kế (G0–G1)

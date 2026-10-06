@@ -55,7 +55,7 @@ Kiến trúc chi tiết: [docs/architecture.md](docs/architecture.md). Cách vi�
 
 ## Deploy
 
-Thiết kế để host tĩnh trên Cloudflare Pages (build command `pnpm build`, output `out/`). Chưa kết nối; header bảo mật nằm ở `public/_headers`.
+Host tĩnh trên Cloudflare Workers (static assets, ADR-010), cấu hình ở `wrangler.jsonc`: Workers Builds kết nối repo GitHub, mỗi lần push lên `master` chạy `pnpm content:check && pnpm build` rồi `npx wrangler deploy` (đưa thư mục `out/` lên). Biến môi trường trên Cloudflare: `NODE_VERSION=22`, `PNPM_VERSION=11.9.0`, `MASTEVA_LOCALES=vi`. Header bảo mật nằm ở `public/_headers`. Chạy thử trên máy: `pnpm build && npx wrangler dev`.
 
 ## Liên quan
 
