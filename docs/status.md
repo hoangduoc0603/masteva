@@ -41,7 +41,7 @@ Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva
 
 ## Bước tiếp theo
 
-0. **Tài khoản trên production:** người dùng thử đăng nhập Google trên https://masteva.kevin-itbk.workers.dev. Muốn mọi tài khoản Google đăng nhập được thì bấm Publish app trên Google Auth Platform (hiện ở chế độ Testing). Gói Free của Supabase tạm dừng project sau 7 ngày không có truy cập.
+0. **Tài khoản trên production:** người dùng thử đăng nhập Google trên https://masteva.kevin-itbk.workers.dev. Muốn mọi tài khoản Google đăng nhập được thì bấm Publish app trên Google Auth Platform (hiện ở chế độ Testing). Gói Free của Supabase tạm dừng project khi database ít hoạt động trong 7 ngày; workflow `supabase-keepalive.yml` gọi `public.keepalive()` mỗi ngày lúc 09:17 giờ Việt Nam (thêm 08/10/2026; lần chạy lỗi thì GitHub báo qua email). Cảnh báo duy nhất của advisors trên production là Leaked Password Protection, không áp dụng vì chỉ đăng nhập Google.
 1. **Người dùng học thử roadmap Java** (63 bài) và ghi lại chỗ vướng; ưu tiên sửa nội dung theo phản hồi thật.
 2. **Roadmap DevOps** theo đúng quy trình Java: tóm tắt và tài liệu cho chủ đề, bài cho từng chặng (lab trên VM Lima, Docker, Kubernetes local), review và sửa. Sau đó Microservices.
 3. **Đề cương hai dự án** (Neobank, Hub hội thoại) và trang `/setup` chuẩn bị môi trường.

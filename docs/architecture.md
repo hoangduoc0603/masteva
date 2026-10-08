@@ -256,6 +256,7 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 - **Luồng:** repo GitHub `hoangduoc0603/masteva` kết nối Workers Builds. Push lên `master` thì Cloudflare chạy `pnpm content:check && pnpm build` rồi `npx wrangler deploy`; nhánh khác tạo bản xem trước. Cấu hình ở `wrangler.jsonc` (thư mục `out/`, trang 404 là `404.html`, `html_handling: auto-trailing-slash`).
 - **Rollback:** chọn lại một phiên bản cũ của Worker trên Cloudflare, hoặc `git revert`.
 - **Sao lưu:** Git là nguồn sự thật, không có dữ liệu nào cần sao lưu riêng ở G0–G2. Từ G3, dùng cơ chế sao lưu của Supabase.
+- **Giữ Supabase không bị tạm dừng:** gói Free dừng project khi database ít hoạt động trong 7 ngày. Workflow `.github/workflows/supabase-keepalive.yml` gọi hàm `public.keepalive()` (`select 1`, khách gọi được) mỗi ngày bằng khoá publishable. Đây là cách làm của cộng đồng, Supabase không cam kết; lên gói Pro thì bỏ được.
 - **Tên miền:** `masteva.com` khi đã đăng ký. Trước đó dùng tên miền `*.workers.dev` mặc định.
 - **Theo dõi giới hạn:** số file mỗi lần build và số lần build mỗi tháng. Nếu tiến gần 3.000 phút build mỗi tháng, gộp thay đổi nội dung trước khi push.
 - **Chuyển sang có máy chủ khi cần:** nếu sau này cần middleware hoặc tính năng chạy phía máy chủ, bỏ `output: 'export'` và deploy cùng code lên nền tảng chạy Next.js. Không phải viết lại ứng dụng.
