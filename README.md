@@ -29,12 +29,23 @@ pnpm dev            # http://localhost:3000/vi
 | `pnpm e2e` | Build với `vi,en` rồi chạy E2E (Playwright). Lần đầu chạy `pnpm exec playwright install chromium` |
 | `pnpm verify` | Chạy tất cả các bước trên |
 
+Database tài khoản (Supabase, chỉ chạy local cho tới khi có project cloud). Cần Supabase CLI và Docker:
+
+| Lệnh | Việc |
+|---|---|
+| `supabase db start` | Chạy Postgres local (chỉ database, nhẹ hơn `supabase start`) |
+| `supabase db reset --local` | Dựng lại database từ `supabase/migrations/` |
+| `supabase test db` | Test phân quyền pgTAP trong `supabase/tests/database/` |
+| `pnpm test:db` | pgTAP rồi test adapter Supabase (`tests/db/`) với database local; cần `supabase start` |
+| `supabase db advisors --local` | Rà lỗi bảo mật và hiệu năng |
+
 Biến môi trường (đều không bắt buộc):
 
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
 | `MASTEVA_LOCALES` | `vi` | Ngôn ngữ bật lúc build, ví dụ `vi,en` |
 | `SITE_URL` | `http://localhost:3000` | URL gốc cho metadata tuyệt đối |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | trống | Bật đăng nhập Google và đồng bộ tiến độ; trống thì không có đăng nhập. Local lấy từ `supabase status -o env` vào `.env.local` (xem `.env.example`). Chỉ dùng khoá `sb_publishable_…` |
 
 ## Cấu trúc
 
@@ -47,6 +58,7 @@ src/components/ khung bài học, roadmap, tiến độ, tìm kiếm
 src/lib/        nạp và kiểm tra nội dung, tiến độ, tokenizer tiếng Việt, i18n
 scripts/        script kiểm tra nội dung
 labs/           code mẫu cho lab — MIT
+supabase/       migrations/ (nguồn sự thật của schema), tests/database/ (pgTAP), config.toml
 tests/          unit và E2E
 docs/           tài liệu sản phẩm và kiến trúc
 ```
@@ -55,7 +67,7 @@ Kiến trúc chi tiết: [docs/architecture.md](docs/architecture.md). Cách vi�
 
 ## Deploy
 
-Host tĩnh trên Cloudflare Workers (static assets, ADR-010), cấu hình ở `wrangler.jsonc`: Workers Builds kết nối repo GitHub, mỗi lần push lên `master` chạy `pnpm content:check && pnpm build` rồi `npx wrangler deploy` (đưa thư mục `out/` lên). Biến môi trường trên Cloudflare: `NODE_VERSION=22`, `PNPM_VERSION=11.9.0`, `MASTEVA_LOCALES=vi`. Header bảo mật nằm ở `public/_headers`. Chạy thử trên máy: `pnpm build && npx wrangler dev`.
+Host tĩnh trên Cloudflare Workers (static assets, ADR-010), cấu hình ở `wrangler.jsonc`: Workers Builds kết nối repo GitHub, mỗi lần push lên `master` chạy `pnpm content:check && pnpm build` rồi `npx wrangler deploy` (đưa thư mục `out/` lên). Biến môi trường trên Cloudflare: `NODE_VERSION=22`, `PNPM_VERSION=11.9.0`, `MASTEVA_LOCALES=vi`; khi có project Supabase cloud thì thêm `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`. Header bảo mật nằm ở `public/_headers`. Chạy thử trên máy: `pnpm build && npx wrangler dev`.
 
 ## Liên quan
 

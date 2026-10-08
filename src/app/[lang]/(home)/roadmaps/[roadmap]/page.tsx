@@ -10,6 +10,7 @@ import { RoadmapMap } from '@/components/roadmap/roadmap-map';
 import { RoadmapToolbar } from '@/components/roadmap/roadmap-toolbar';
 import { RoadmapClient } from '@/components/roadmap/roadmap-client';
 import { ProgressTransfer } from '@/components/progress/progress-transfer';
+import { ProgressDesc } from '@/components/progress/progress-desc';
 import { Icon } from '@/components/icons';
 
 export const dynamicParams = false;
@@ -72,7 +73,7 @@ export default async function RoadmapPage(props: PageProps<'/[lang]/roadmaps/[ro
         <h2 id="progress-transfer" className="rm-xfer-t">
           {t.progress.title}
         </h2>
-        <p className="rm-xfer-d">{t.progress.desc}</p>
+        <ProgressDesc />
         <ProgressTransfer />
       </section>
     </main>

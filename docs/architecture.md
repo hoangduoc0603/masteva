@@ -184,12 +184,15 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 - **Xuất và nhập:** file JSON v2 (nhận cả v1). Khi nhập thì **gộp**: mục lấy hợp và giữ thời điểm sớm hơn, chủ đề giữ trạng thái đặt sau cùng, cấp bắt đầu giữ bản hiện có (FR-PROGRESS-003).
 - **Hiệu năng:** tích một mục chỉ ghi `localStorage` và cập nhật giao diện ngay, không có I/O mạng.
 
-### 7.2 G3: đồng bộ theo tài khoản (định hướng)
+### 7.2 Đồng bộ theo tài khoản
+
+Đã thiết kế chi tiết (07/10/2026): [spec](superpowers/specs/2026-10-07-tai-khoan-dong-bo-tien-do-design.md), migration `supabase/migrations/*_learning_progress.sql`. Phần dưới là định hướng ban đầu, vẫn đúng.
+
 
 - **Nguồn sự thật chuyển sang Supabase.** Trình duyệt giữ bản sao để dùng khi không có mạng.
 - **Dữ liệu logic:** mỗi bản ghi gồm người dùng, mã mục và thời điểm hoàn thành. Thao tác bỏ tích được ghi lại để đồng bộ đúng giữa các máy. Cột và bảng cụ thể sẽ thiết kế ở G3.
 - **Phân quyền:** RLS chỉ cho người dùng đọc và ghi bản ghi của chính mình.
-- **Lần đăng nhập đầu:** gộp tiến độ trên máy vào tài khoản theo cách lấy hợp (FR-PROGRESS-005).
+- **Lần đăng nhập đầu:** gộp tiến độ trên máy vào tài khoản (FR-PROGRESS-005). Mục và chủ đề của khách giữ thời điểm gốc nên thao tác mới hơn trên tài khoản vẫn thắng; cấp bắt đầu của tài khoản được giữ. Xem spec 2026-10-07 §6.
 - **Xung đột:** cùng một mục thì giữ trạng thái có thời điểm mới nhất.
 - **Xoá tài khoản:** xoá toàn bộ bản ghi của người dùng (FR-ACCOUNT-002).
 - Không cần máy chủ riêng; site vẫn là static export.
@@ -242,7 +245,8 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
   - Header bảo mật đặt qua `public/_headers`: Content-Security-Policy, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`. Static export của Next.js chèn script nội tuyến để nạp dữ liệu trang, nên CSP phải cho `script-src 'unsafe-inline'`; không dùng được nonce khi không có máy chủ.
   - Không gắn công cụ theo dõi của bên thứ ba. Nếu cần thống kê truy cập thì dùng loại không cookie (ví dụ Cloudflare Web Analytics), không gửi dữ liệu cá nhân.
 - **G3:**
-  - Trình duyệt chỉ dùng anon key của Supabase; mọi quyền truy cập dựa vào RLS. `service_role` không bao giờ xuất hiện ở trình duyệt hay trong repo.
+  - Trình duyệt chỉ dùng khoá publishable (`sb_publishable_…`) của Supabase; mọi quyền truy cập dựa vào RLS. Khoá secret không bao giờ xuất hiện ở trình duyệt hay trong repo.
+  - CSP `connect-src` cho phép `https://*.supabase.co`. `supabase-js` chỉ được tải khi bấm đăng nhập hoặc khi máy đã có phiên.
   - Đăng nhập bằng GitHub hoặc Google qua Supabase Auth.
   - Tuân thủ Luật Bảo vệ dữ liệu cá nhân 2025: có chính sách quyền riêng tư, cho phép xoá tài khoản.
 - **Nội dung:** quy tắc BR-004 và BR-005 được kiểm tra khi review. Bài không hướng dẫn chạy lệnh vào hệ thống thật, và lệnh phá huỷ dữ liệu phải có cảnh báo.
@@ -260,9 +264,10 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 
 | Loại | Nội dung |
 |---|---|
-| Unit | Lưu và nạp tiến độ, nâng cấp schema, gộp khi nhập file, ánh xạ mã thay thế, tính tổng từ manifest, tokenizer tiếng Việt (có dấu, không dấu, chữ `đ`) |
+| Unit | Lưu và nạp tiến độ, nâng cấp schema, gộp khi nhập file, ánh xạ mã thay thế, tính tổng từ manifest, tokenizer tiếng Việt (có dấu, không dấu, chữ `đ`); đồng bộ tài khoản (hàng đợi, bản mới nhất thắng, gộp lần đầu, chia lô) |
+| Database (`pnpm test:db`) | pgTAP cho RLS và hàm; adapter Supabase với database local (phân trang quá 1.000 dòng, con trỏ, người khác không thấy dữ liệu) |
 | Script nội dung | File khoá: thêm mã mới, xoá mã không có thay thế (phải lỗi), mã trùng (phải lỗi) |
-| E2E (Playwright) | Mở bài, tích mục, tải lại trang vẫn còn; hai tab đồng bộ; tìm "tien trinh" ra bài D1.1; mở `/en/...` của bài chưa dịch thấy thông báo; trang `/` chuyển sang `/vi/`; xuất rồi nhập tiến độ |
+| E2E (Playwright) | Mở bài, tích mục, tải lại trang vẫn còn; hai tab đồng bộ; tìm "tien trinh" ra bài D1.1; mở `/en/...` của bài chưa dịch thấy thông báo; trang `/` chuyển sang `/vi/`; xuất rồi nhập tiến độ; tài khoản với Supabase giả lập (khách không tải supabase-js, kéo và đẩy tiến độ, đăng xuất, callback lỗi) |
 | Hiệu năng | Lighthouse CI theo ngân sách ở mục 1 |
 | Khả năng truy cập | Kiểm tra tự động bằng axe trong E2E; điều hướng bàn phím trên trang bài học |
 
@@ -273,7 +278,7 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 | ADR-001 | Fumadocs trên Next.js | Cần giao diện tuỳ biến sâu và tính năng ứng dụng ở G3–G4; tìm kiếm tiếng Việt tuỳ chỉnh được | Nặng hơn Starlight; phải tự làm thông báo chưa dịch và khung terminal | Đã chấp nhận (03/10/2026) |
 | ADR-002 | Static export, host trên Cloudflare (ban đầu là Pages, nay là Workers, xem ADR-010) | Chi phí 0 kể cả khi thương mại; không có máy chủ phải vận hành | Không có middleware; mọi tính năng phải chạy được ở trình duyệt hoặc lúc build | Đã chấp nhận (03/10/2026) |
 | ADR-003 | Mã mục tường minh, kèm file khoá | Sửa nội dung không làm mất tiến độ (BR-003); tiến độ dùng chung giữa các ngôn ngữ | Tác giả phải đặt mã cho từng mục; thêm một bước kiểm tra khi build | Đã chấp nhận (03/10/2026) |
-| ADR-004 | Tiến độ lưu trên trình duyệt ở G0–G2; Supabase cùng RLS ở G3 | Chưa cần tài khoản để có giá trị; G3 vẫn giữ được static export | Tiến độ không theo người học sang máy khác cho tới G3, trừ khi xuất/nhập file | Đã chấp nhận (03/10/2026) |
+| ADR-004 | Tiến độ lưu trên trình duyệt khi chưa đăng nhập; đăng nhập (Google) thì đồng bộ qua Supabase cùng RLS, đưa lên sớm hơn G3 theo yêu cầu ngày 07/10/2026 | Chưa cần tài khoản để có giá trị; vẫn giữ được static export | Thêm phụ thuộc Supabase và JS khi đăng nhập; khách vẫn chỉ lưu trên một máy trừ khi xuất/nhập file | Đã chấp nhận (03/10/2026), sửa 07/10/2026 |
 | ADR-005 | Tokenizer tìm kiếm riêng cho tiếng Việt | Người Việt hay gõ không dấu; bộ tách từ mặc định có thể cắt nhầm chữ có dấu | Phải tự viết và kiểm thử | Đã chấp nhận (03/10/2026), đã kiểm chứng ở G0 |
 | ADR-006 | Nội dung chung repo với code, nằm trong `content/` | Đơn giản cho một người vận hành; tách repo sau vẫn dễ | Người đóng góp nội dung phải làm việc trong repo có code | Đã chấp nhận (03/10/2026) |
 | ADR-008 | Nội dung khung chi tiết chủ đề nằm trong file JSON tĩnh theo roadmap, tải khi mở khung | Render sẵn mọi panel làm HTML trang Java lên 147 KB gzip (ngân sách 150 KB), vì Next lặp nội dung server component trong payload RSC; tách ra còn 30 KB HTML và 43 KB JSON tải sau | Tóm tắt chủ đề không còn trong HTML (SEO kém hơn một chút); lần mở khung đầu tiên chờ một request; panel render phía trình duyệt (+1,5 KB JS) | Đã chấp nhận (04/10/2026) |

@@ -1,5 +1,8 @@
 import type { Level } from '@/lib/content/constants';
+import { AUTH_STORAGE_KEY } from '@/lib/account/config';
+import { initialProgressKey, queueEarlyChanges } from './account-sync';
 import {
+  applyReplacements,
   emptyProgress,
   LEGACY_PROGRESS_STORAGE_KEY,
   mergeProgress,
@@ -20,6 +23,7 @@ import {
 export interface StorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem(key: string): void;
 }
 
 export interface ProgressSnapshot {
@@ -28,17 +32,37 @@ export interface ProgressSnapshot {
 }
 
 type Listener = () => void;
+type ChangeListener = (before: Progress, after: Progress) => void;
 
 export class ProgressStore {
   private snapshot: ProgressSnapshot;
   private readonly listeners = new Set<Listener>();
+  private readonly changeListeners = new Set<ChangeListener>();
 
   constructor(
     private readonly storage: StorageLike | null,
     private replacements: Readonly<Record<string, string>> = {},
+    private key: string = PROGRESS_STORAGE_KEY,
   ) {
     this.snapshot = this.read();
   }
+
+  /** Khoá đang lưu: tiến độ khách, hoặc bản sao của tài khoản khi đã đăng nhập. */
+  get storageKey(): string {
+    return this.key;
+  }
+
+  /** Chuyển sang khoá khác (đăng nhập, đăng xuất) và đọc lại. */
+  switchKey(key: string): void {
+    this.key = key;
+    this.reload();
+  }
+
+  /** Báo thay đổi do người học làm, để đồng bộ tài khoản xếp vào hàng đợi. */
+  onChange = (listener: ChangeListener): (() => void) => {
+    this.changeListeners.add(listener);
+    return () => this.changeListeners.delete(listener);
+  };
 
   getSnapshot = (): ProgressSnapshot => this.snapshot;
 
@@ -54,23 +78,28 @@ export class ProgressStore {
   }
 
   toggle(id: string): void {
-    this.write(toggleItem(this.snapshot.progress, id));
+    this.update(toggleItem(this.snapshot.progress, id));
   }
 
   setTopic(id: string, mark: TopicMark | null): void {
-    this.write(setTopicMark(this.snapshot.progress, id, mark));
+    this.update(setTopicMark(this.snapshot.progress, id, mark));
   }
 
   setStart(roadmapId: string, level: Level | null): void {
-    this.write(setStart(this.snapshot.progress, roadmapId, level));
+    this.update(setStart(this.snapshot.progress, roadmapId, level));
   }
 
   /** Gộp tiến độ từ file nhập. Trả về số mục và chủ đề có trong file, hoặc `null` nếu file sai. */
   importData(raw: unknown): number | null {
     const incoming = parseProgress(raw, this.replacements);
     if (!incoming) return null;
-    this.write(mergeProgress(this.snapshot.progress, incoming));
+    this.update(mergeProgress(this.snapshot.progress, incoming));
     return Object.keys(incoming.items).length + Object.keys(incoming.topics).length;
+  }
+
+  /** Ghi bản tiến độ từ server, không coi là thao tác của người học. */
+  replaceProgress(progress: Progress): void {
+    this.write(applyReplacements(progress, this.replacements));
   }
 
   exportData(): Progress {
@@ -86,8 +115,10 @@ export class ProgressStore {
   private read(): ProgressSnapshot {
     if (!this.storage) return { progress: this.snapshot?.progress ?? emptyProgress(), persistent: false };
     try {
-      const raw = this.storage.getItem(PROGRESS_STORAGE_KEY);
+      const raw = this.storage.getItem(this.key);
       if (raw) return { progress: parseProgress(JSON.parse(raw), this.replacements) ?? emptyProgress(), persistent: true };
+      // Khoá v1 chỉ là tiến độ khách; bản sao của tài khoản không nhận nó.
+      if (this.key !== PROGRESS_STORAGE_KEY) return { progress: emptyProgress(), persistent: true };
       const legacy = this.storage.getItem(LEGACY_PROGRESS_STORAGE_KEY);
       const migrated = legacy ? parseProgress(JSON.parse(legacy), this.replacements) : null;
       if (!migrated) return { progress: emptyProgress(), persistent: true };
@@ -104,11 +135,17 @@ export class ProgressStore {
     }
   }
 
+  private update(next: Progress): void {
+    const before = this.snapshot.progress;
+    this.write(next);
+    for (const listener of this.changeListeners) listener(before, next);
+  }
+
   private write(progress: Progress): void {
     let persistent = this.storage !== null;
     if (this.storage) {
       try {
-        this.storage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(progress));
+        this.storage.setItem(this.key, JSON.stringify(progress));
       } catch {
         persistent = false;
       }
@@ -122,7 +159,7 @@ export class ProgressStore {
   }
 }
 
-function browserStorage(): StorageLike | null {
+export function browserStorage(): StorageLike | null {
   try {
     const storage = window.localStorage;
     const probe = '__masteva_probe__';
@@ -134,16 +171,36 @@ function browserStorage(): StorageLike | null {
   }
 }
 
+/** Storage trong bộ nhớ, dùng khi trình duyệt chặn localStorage. */
+export function memoryStorage(): StorageLike {
+  const data = new Map<string, string>();
+  return {
+    getItem: (key) => data.get(key) ?? null,
+    setItem: (key, value) => void data.set(key, value),
+    removeItem: (key) => void data.delete(key),
+  };
+}
+
 let shared: ProgressStore | undefined;
+let releaseEarlyQueue: (() => void) | undefined;
 
 /** Kho dùng chung cho cả trang. Chỉ gọi ở trình duyệt. */
 export function getProgressStore(): ProgressStore {
   if (!shared) {
-    const store = new ProgressStore(browserStorage());
+    const storage = browserStorage();
+    // Đã đăng nhập trên máy này thì mở ngay bản sao của tài khoản, không chờ supabase-js (spec 2026-10-07 §6).
+    const store = new ProgressStore(storage, {}, storage ? initialProgressKey(storage, AUTH_STORAGE_KEY) : undefined);
+    if (storage) releaseEarlyQueue = queueEarlyChanges(store, storage);
     window.addEventListener('storage', (event) => {
-      if (event.key === PROGRESS_STORAGE_KEY) store.reload();
+      if (event.key === store.storageKey) store.reload();
     });
     shared = store;
   }
   return shared;
+}
+
+/** Ngừng xếp hàng tạm; gọi ngay trước khi `AccountSync` nhận việc, hoặc khi phiên không còn. */
+export function stopEarlyQueue(): void {
+  releaseEarlyQueue?.();
+  releaseEarlyQueue = undefined;
 }

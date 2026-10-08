@@ -13,7 +13,7 @@ import {
   toggleItem,
   type Progress,
 } from '@/lib/progress/model';
-import { ProgressStore, type StorageLike } from '@/lib/progress/store';
+import { memoryStorage, ProgressStore, type StorageLike } from '@/lib/progress/store';
 
 const T1 = '2026-10-01T00:00:00.000Z';
 const T2 = '2026-10-02T00:00:00.000Z';
@@ -109,6 +109,9 @@ class MemoryStorage implements StorageLike {
   setItem(key: string, value: string) {
     this.data.set(key, value);
   }
+  removeItem(key: string) {
+    this.data.delete(key);
+  }
 }
 
 describe('ProgressStore', () => {
@@ -158,6 +161,7 @@ describe('ProgressStore', () => {
       setItem: () => {
         throw new Error('QuotaExceededError');
       },
+      removeItem: () => {},
     };
     const store = new ProgressStore(storage);
     store.toggle('d1.1.a');
@@ -170,6 +174,7 @@ describe('ProgressStore', () => {
       setItem: () => {
         throw new Error('QuotaExceededError');
       },
+      removeItem: () => {},
     };
     expect(new ProgressStore(storage).getSnapshot()).toEqual({ progress: progress({ items: { 'd1.1.a': T1 } }), persistent: false });
   });
@@ -196,6 +201,54 @@ describe('ProgressStore', () => {
     expect(store.importData(progress({ topics: { 'j2.b': { s: 'skipped', at: T1 } } }))).toBe(1);
     expect(Object.keys(store.exportData().items).sort()).toEqual(['kept', 'new']);
     expect(store.importData({ v: 9 })).toBeNull();
+  });
+
+  it('switches to another storage key without migrating v1 there', () => {
+    const storage = new MemoryStorage();
+    storage.setItem(LEGACY_PROGRESS_STORAGE_KEY, JSON.stringify({ v: 1, items: { old: T1 } }));
+    storage.setItem('acct', JSON.stringify(progress({ items: { mine: T2 } })));
+    const store = new ProgressStore(storage);
+    store.switchKey('acct');
+    expect(store.storageKey).toBe('acct');
+    expect(store.getSnapshot().progress.items).toEqual({ mine: T2 });
+    store.switchKey('empty-acct');
+    expect(store.getSnapshot().progress.items).toEqual({});
+    expect(storage.getItem('empty-acct')).toBeNull();
+  });
+
+  it('reports learner changes with before and after, but not replacements or reloads', () => {
+    const storage = new MemoryStorage();
+    const store = new ProgressStore(storage);
+    const changes: [Progress, Progress][] = [];
+    store.onChange((before, after) => changes.push([before, after]));
+    store.toggle('a');
+    store.setTopic('t', 'done');
+    store.setStart('java', 'middle');
+    store.importData(progress({ items: { b: T1 } }));
+    store.replaceProgress(progress({ items: { c: T1 } }));
+    store.reload();
+    expect(changes).toHaveLength(4);
+    expect(changes[0][0].items).toEqual({});
+    expect(Object.keys(changes[0][1].items)).toEqual(['a']);
+  });
+
+  it('replaceProgress persists, applies replacements and notifies subscribers', () => {
+    const storage = new MemoryStorage();
+    const store = new ProgressStore(storage, { old: 'new' });
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.replaceProgress(progress({ items: { old: T1 } }));
+    expect(store.getSnapshot().progress.items).toEqual({ new: T1 });
+    expect(JSON.parse(storage.getItem(PROGRESS_STORAGE_KEY)!).items).toEqual({ new: T1 });
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('memoryStorage keeps values in memory', () => {
+    const storage = memoryStorage();
+    storage.setItem('k', 'v');
+    expect(storage.getItem('k')).toBe('v');
+    storage.removeItem('k');
+    expect(storage.getItem('k')).toBeNull();
   });
 
   it('reloads when another tab writes', () => {

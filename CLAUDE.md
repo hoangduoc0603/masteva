@@ -6,10 +6,20 @@ Phần bổ sung cho `../CLAUDE.md`. Masteva là web học cho lập trình viê
 
 ## Stack riêng của project
 
-Fumadocs trên Next.js, static export (không có máy chủ), host tĩnh trên Cloudflare Workers (static assets, `wrangler.jsonc`, ADR-010). Không dùng Supabase hay Vercel cho tới giai đoạn G3 (xem ADR-002, ADR-004).
+Fumadocs trên Next.js, static export (không có máy chủ), host tĩnh trên Cloudflare Workers (static assets, `wrangler.jsonc`, ADR-010). Không dùng Vercel; Supabase chỉ dùng cho tài khoản và đồng bộ tiến độ, gọi thẳng từ trình duyệt (ADR-002, ADR-004).
 
 - Không thêm tính năng cần máy chủ (route động, middleware, server action). Mọi thứ phải chạy lúc build hoặc trên trình duyệt.
 - Component phía trình duyệt không được import Zod hay các module chỉ dùng lúc build (`src/lib/content/repo.ts`, `manifest.ts`), để giữ ngân sách JavaScript.
+
+## Supabase
+
+Tài khoản và đồng bộ tiến độ, thiết kế ở `docs/superpowers/specs/2026-10-07-tai-khoan-dong-bo-tien-do-design.md`.
+
+- Project: chỉ có local (`supabase db start`). Chưa có `project_ref` dev hay prod.
+- Nguồn sự thật của schema là `supabase/migrations/` (tạo bằng `supabase migration new`). Không dùng Drizzle.
+- Đổi schema thì kèm test pgTAP trong `supabase/tests/database/`, chạy `pnpm test:db` (pgTAP và test adapter với database local) và `supabase db advisors --local`.
+- Hàm `security definer` đặt trong schema `private` (không lộ ra Data API), gọi qua hàm `security invoker` ở `public`.
+- Đăng nhập chỉ bằng Google. Trình duyệt chỉ dùng khoá `sb_publishable_…`; `supabase-js` chỉ tải khi đăng nhập hoặc đã có phiên.
 
 ## Dùng Superpowers có chọn lọc
 
