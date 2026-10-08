@@ -15,7 +15,9 @@ Fumadocs trên Next.js, static export (không có máy chủ), host tĩnh trên 
 
 Tài khoản và đồng bộ tiến độ, thiết kế ở `docs/superpowers/specs/2026-10-07-tai-khoan-dong-bo-tien-do-design.md`.
 
-- Project: chỉ có local (`supabase db start`). Chưa có `project_ref` dev hay prod.
+- Project: local (`supabase start`) để phát triển; production là `jnmwvzognbveagudeizr` (Singapore, đã `supabase link`). Chưa có project dev riêng.
+- Đưa lên production chỉ khi người dùng đồng ý: `supabase db push` cho migration; `supabase config diff` rồi `supabase config push` cho Auth (giá trị riêng của production nằm ở `[remotes.production]` trong `config.toml`, Google secret đọc từ `supabase/.env`).
+- URL và khoá publishable của production nằm trong `.env.production` (commit được, là giá trị công khai); `.env.local` trỏ Supabase local.
 - Nguồn sự thật của schema là `supabase/migrations/` (tạo bằng `supabase migration new`). Không dùng Drizzle.
 - Đổi schema thì kèm test pgTAP trong `supabase/tests/database/`, chạy `pnpm test:db` (pgTAP và test adapter với database local) và `supabase db advisors --local`.
 - Hàm `security definer` đặt trong schema `private` (không lộ ra Data API), gọi qua hàm `security invoker` ở `public`.

@@ -67,7 +67,7 @@ Kiến trúc chi tiết: [docs/architecture.md](docs/architecture.md). Cách vi�
 
 ## Deploy
 
-Host tĩnh trên Cloudflare Workers (static assets, ADR-010), cấu hình ở `wrangler.jsonc`: Workers Builds kết nối repo GitHub, mỗi lần push lên `master` chạy `pnpm content:check && pnpm build` rồi `npx wrangler deploy` (đưa thư mục `out/` lên). Biến môi trường trên Cloudflare: `NODE_VERSION=22`, `PNPM_VERSION=11.9.0`, `MASTEVA_LOCALES=vi`; khi có project Supabase cloud thì thêm `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`. Header bảo mật nằm ở `public/_headers`. Chạy thử trên máy: `pnpm build && npx wrangler dev`.
+Host tĩnh trên Cloudflare Workers (static assets, ADR-010), cấu hình ở `wrangler.jsonc`: Workers Builds kết nối repo GitHub, mỗi lần push lên `master` chạy `pnpm content:check && pnpm build` rồi `npx wrangler deploy` (đưa thư mục `out/` lên). Biến môi trường trên Cloudflare: `NODE_VERSION=22`, `PNPM_VERSION=11.9.0`, `MASTEVA_LOCALES=vi`. URL và khoá publishable của Supabase production nằm trong `.env.production` (Next nhúng lúc build), không cần đặt trên Cloudflare. Supabase production: project `jnmwvzognbveagudeizr` (Singapore); migration đưa lên bằng `supabase db push`, cấu hình Auth bằng `supabase config push` (phần `[remotes.production]` trong `supabase/config.toml`). Header bảo mật nằm ở `public/_headers`. Chạy thử trên máy: `pnpm build && npx wrangler dev`.
 
 ## Liên quan
 
