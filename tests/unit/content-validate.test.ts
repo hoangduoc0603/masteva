@@ -4,6 +4,7 @@ import { LESSON_SECTIONS } from '@/lib/content/constants';
 import {
   mergeLock,
   resolveReplacement,
+  validateCodeRefs,
   validateInternalLinks,
   validateLessonStructure,
   validateLock,
@@ -95,5 +96,37 @@ describe('translations and links', () => {
     expect(parseLessonFileName('d1-1.mdx')).toEqual({ slug: 'd1-1', lang: 'vi' });
     expect(parseLessonFileName('d1-1.en.mdx')).toEqual({ slug: 'd1-1', lang: 'en' });
     expect(parseLessonFileName('meta.json')).toBeNull();
+  });
+});
+
+describe('validateCodeRefs', () => {
+  const steps = new Map([
+    ['J1', 3],
+    ['SB3', 2],
+    ['M5', 0],
+  ]);
+
+  it('accepts known step and lesson codes', () => {
+    expect(validateCodeRefs('Xem J1, bài SB3.2 và chặng M5.', steps)).toEqual([]);
+  });
+
+  it('reports an unknown step code once', () => {
+    expect(validateCodeRefs('Ở J12, rồi lại J12', steps)).toEqual(['nhắc mã chặng "J12" không có trong roadmap nào']);
+  });
+
+  it('reports a lesson number beyond the lessons of the step', () => {
+    expect(validateCodeRefs('bài SB3.3', steps)).toEqual(['nhắc bài "SB3.3" nhưng chặng SB3 chỉ có 2 bài']);
+  });
+
+  it('does not check lesson numbers of a step without lessons', () => {
+    expect(validateCodeRefs('M5.4', steps)).toEqual([]);
+  });
+
+  it('ignores fenced and inline code', () => {
+    expect(validateCodeRefs('```\nJ99\n```\n`J98` và J1', steps)).toEqual([]);
+  });
+
+  it('does not match inside longer tokens', () => {
+    expect(validateCodeRefs('J2EE, JDK 25, MD5, SB30x', steps)).toEqual([]);
   });
 });

@@ -40,6 +40,8 @@ export interface LessonRef {
   title: string;
   path: string;
   items: string[];
+  /** Mã bài theo mã chặng và thứ tự trong `pages`, ví dụ `SB3.2`. */
+  code: string;
 }
 
 export interface StepRef {
@@ -164,9 +166,15 @@ function indexContent(input: ViewInput) {
   const topicStep = new Map<string, StepInput>();
   for (const step of input.steps.values()) for (const topic of step.topics) topicStep.set(topic.id, step);
 
-  const lessonRef = (l: LessonInput): LessonRef => ({ id: l.id, title: l.title, path: l.path, items: l.checkIds });
   // Theo thứ tự `pages` của chặng, không theo tên file (`d1-10` đứng sau `d1-2`).
   const pageOrder = (l: LessonInput) => input.steps.get(l.stepId)?.pages.indexOf(l.slug) ?? -1;
+  const lessonRef = (l: LessonInput): LessonRef => ({
+    id: l.id,
+    title: l.title,
+    path: l.path,
+    items: l.checkIds,
+    code: `${input.steps.get(l.stepId)?.code ?? l.stepId.toUpperCase()}.${pageOrder(l) + 1}`,
+  });
   const ordered = [...input.lessons].sort((a, b) => a.stepId.localeCompare(b.stepId) || pageOrder(a) - pageOrder(b));
   const lessonsByTopic = new Map<string, LessonRef[]>();
   for (const lesson of ordered) {
@@ -322,7 +330,7 @@ export function toLite(view: RoadmapView): RoadmapLite {
           title: t.title,
           kind: t.kind,
           items: t.items,
-          ...(t.lessons[0] ? { lesson: t.lessons[0].path } : {}),
+          ...(t.lessons[0] ? { lesson: t.lessons[0].path, lessonCode: t.lessons[0].code } : {}),
         })),
       })),
     })),

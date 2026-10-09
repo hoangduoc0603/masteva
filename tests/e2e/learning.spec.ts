@@ -27,17 +27,17 @@ test('trang / chuyển sang /vi', async ({ page }) => {
 test('trang chủ không có link Roadmap trên nav', async ({ page }) => {
   await page.goto('/vi/');
   await expect(page.getByRole('navigation').getByRole('link', { name: 'Roadmap', exact: true })).toHaveCount(0);
-  await expect(page.locator('.hm-card')).toHaveCount(3);
+  await expect(page.locator('.hm-card')).toHaveCount(4);
 });
 
-test('trang chủ: tìm kafka ra chủ đề J16 và mở đúng khung chi tiết', async ({ page }) => {
+test('trang chủ: tìm kafka ra chủ đề SB9 và mở đúng khung chi tiết', async ({ page }) => {
   await page.goto('/vi/');
   await page.getByLabel('Tìm roadmap hoặc chủ đề').fill('kafka');
-  const hit = page.getByRole('link', { name: /Kafka hoặc RabbitMQ.*Java · Cache/ });
-  await expect(hit).toHaveAttribute('href', '/vi/roadmaps/java#j16.kafka-rabbitmq');
+  const hit = page.getByRole('link', { name: /Kafka hoặc RabbitMQ.*Spring Boot · Cache/ });
+  await expect(hit).toHaveAttribute('href', '/vi/roadmaps/spring-boot#j16.kafka-rabbitmq');
   await expect(hit.locator('mark')).toHaveText('Kafka');
   await hit.click();
-  await expect(page).toHaveURL(/\/vi\/roadmaps\/java#j16\.kafka-rabbitmq$/);
+  await expect(page).toHaveURL(/\/vi\/roadmaps\/spring-boot#j16\.kafka-rabbitmq$/);
   await expect(page.getByRole('dialog').getByRole('heading', { name: 'Kafka hoặc RabbitMQ', level: 2 })).toBeVisible();
 });
 
@@ -267,11 +267,15 @@ test('đóng khung khi chủ đề bị ẩn (ẩn mục bỏ qua) không làm m
   await chip(page, 'j5.generics').click();
   await page.locator('[data-panel="j5.generics"]').getByRole('button', { name: 'Bỏ qua' }).click();
   await page.keyboard.press('Escape');
-  const focused = await page.evaluate(() => {
-    const el = document.activeElement;
-    return el !== null && el !== document.body && (el as HTMLElement).checkVisibility();
-  });
-  expect(focused).toBe(true);
+  // Focus rời chip vừa bị ẩn sang tiêu đề chặng sau một nhịp, nên chờ thay vì kiểm một lần.
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const el = document.activeElement;
+        return el !== null && el !== document.body && (el as HTMLElement).checkVisibility();
+      }),
+    )
+    .toBe(true);
 });
 
 test('nút Sao chép nằm trong thanh tiêu đề Terminal', async ({ page }) => {
@@ -314,7 +318,7 @@ test('"Tôi đã biết cấp này" thu gọn cấp, đổi nút Vào học, Ho�
   await expect(foundation).toHaveAttribute('data-known', '');
   await expect(foundation.locator('#step-j5')).toBeHidden();
   await expect(page.locator('.rm-lvtabs a', { hasText: 'Nền tảng' })).toContainText('đã biết');
-  await expect(page.getByTestId('continue')).toHaveAttribute('href', '/vi/learn/j11/j11-1');
+  await expect(page.getByTestId('continue')).toHaveAttribute('href', '/vi/learn/j14/j14-1');
   await expect(foundation.getByRole('button', { name: 'Hoàn tác' })).toBeFocused();
   await foundation.getByRole('button', { name: 'Xem lại các chặng' }).click();
   await expect(foundation.locator('#step-j5')).toBeVisible();
@@ -334,11 +338,11 @@ test('"Tôi đã biết" ở Middle tính cả Nền tảng; Hoàn tác ở Midd
   await expect(page.locator('section#level-foundation')).toHaveAttribute('data-known', '');
   await expect(page.locator('section#level-middle')).toHaveAttribute('data-known', '');
   await expect(page.locator('section#level-middle .rm-known-row')).toContainText('gồm cả Nền tảng');
-  await expect(page.getByTestId('continue')).toHaveAttribute('href', /^\/vi\/learn\/j18\//);
+  await expect(page.getByTestId('continue')).toHaveAttribute('href', /^\/vi\/learn\/j19\//);
   await page.locator('section#level-middle').getByRole('button', { name: 'Hoàn tác' }).click();
   await expect(page.locator('section#level-foundation')).toHaveAttribute('data-known', '');
   await expect(page.locator('section#level-middle')).not.toHaveAttribute('data-known', '');
-  await expect(page.getByTestId('continue')).toHaveAttribute('href', '/vi/learn/j11/j11-1');
+  await expect(page.getByTestId('continue')).toHaveAttribute('href', '/vi/learn/j14/j14-1');
 });
 
 test('thanh cấp dính khi cuộn, tab cấp theo vị trí đọc, nút chọn view có vòng focus', async ({ page }) => {
@@ -347,7 +351,7 @@ test('thanh cấp dính khi cuộn, tab cấp theo vị trí đọc, nút chọn
   const box = await page.locator('.rm-levelbar').boundingBox();
   expect(box && box.y >= 0 && box.y < 120).toBe(true);
   const tabs = page.getByRole('navigation', { name: 'Các cấp của roadmap' });
-  await page.locator('#step-j12').scrollIntoViewIfNeeded();
+  await page.locator('#step-j18').scrollIntoViewIfNeeded();
   await expect(tabs.getByRole('link', { name: /Middle/ })).toHaveAttribute('aria-current', 'true');
   await expect(tabs.getByRole('link', { name: /Nền tảng/ })).not.toHaveAttribute('aria-current', 'true');
   await openTools(page);
@@ -486,4 +490,31 @@ test('không có lỗi truy cập nghiêm trọng, sáng và tối', async ({ pa
       expect(await seriousViolations(page), `${url} (${scheme})`).toEqual([]);
     }
   }
+});
+
+test('roadmap Spring Boot có 14 chặng, SB1 có bài; Java còn 14 chặng', async ({ page }) => {
+  await page.goto('/vi/roadmaps/spring-boot');
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Spring Boot');
+  await expect(page.locator('.rm-step')).toHaveCount(14);
+  await expect(page.locator('#step-j11')).toContainText('SB1');
+  await expect(page.getByTestId('continue')).toHaveAttribute('href', '/vi/learn/j11/j11-1');
+  await expect(page.locator('.rm-next')).toContainText('bài SB1.1');
+  await page.goto('/vi/roadmaps/java');
+  await expect(page.locator('.rm-step')).toHaveCount(14);
+  await expect(page.locator('#step-j14')).toContainText('J11');
+});
+
+test('bài của chặng chuyển sang có thanh bên Spring Boot', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === 'mobile', 'Thanh bên desktop');
+  await page.goto('/vi/learn/j12/j12-1');
+  const sidebar = page.locator('#nd-sidebar');
+  await expect(sidebar.locator('.ms-step-code').first()).toHaveText('SB1');
+  await expect(sidebar.locator('.ms-step-code', { hasText: /^J/ })).toHaveCount(0);
+});
+
+test('cấp Senior của Java dẫn sang Spring Boot vì lab dùng Spring', async ({ page }) => {
+  await page.goto('/vi/roadmaps/java');
+  await expect(page.locator('section#level-senior .rm-lhead')).toContainText('Spring Boot');
+  await expect(page.locator('#step-j19 .rm-refs a[href="/vi/roadmaps/spring-boot#step-j11"]')).toHaveCount(1);
+  await expect(page.locator('#step-j20 .rm-refs a[href="/vi/roadmaps/spring-boot#step-j12"]')).toHaveCount(1);
 });

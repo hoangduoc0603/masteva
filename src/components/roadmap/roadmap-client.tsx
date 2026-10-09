@@ -13,11 +13,6 @@ import { HIDE_KEY, VIEW_KEY } from './roadmap-prefs';
 import { TopicDrawer } from './topic-drawer';
 import { Icon } from '@/components/icons';
 
-/** Mã bài từ đường dẫn: `/learn/j2/j2-1` thành `J2.1`. */
-function lessonCode(path: string): string {
-  return (path.split('/').pop() ?? '').toUpperCase().replace('-', '.');
-}
-
 /** Mở hoặc thu các chặng của một cấp đã biết, đồng bộ chữ và `aria-expanded` của nút "Xem lại các chặng". */
 function setExpanded(level: Element, on: boolean) {
   level.toggleAttribute('data-expanded', on);
@@ -283,7 +278,7 @@ export function RoadmapClient({
             {next ? (
               <>
                 <b>{next.step.code}</b> {next.step.title}
-                {next.topic.lesson ? ` · ${format(t.roadmap.lessonRef, { code: lessonCode(next.topic.lesson) })}` : null}
+                {next.topic.lessonCode ? ` · ${format(t.roadmap.lessonRef, { code: next.topic.lessonCode })}` : null}
               </>
             ) : (
               t.roadmap.finishedHint

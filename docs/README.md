@@ -10,6 +10,7 @@
 | [architecture.md](architecture.md) | **Kiến trúc đã duyệt**: tổng quan hệ thống, cấu trúc repo, mô hình nội dung, đa ngôn ngữ, tiến độ, tìm kiếm, CI, bảo mật, triển khai, kiểm thử, ADR |
 | [design-direction.md](design-direction.md) | **Định hướng thiết kế đã chốt** (Sổ tay kỹ sư): tính cách, màu, chữ, bố cục trong Fumadocs, component bài học và roadmap, thứ tự áp dụng |
 | [superpowers/specs/](superpowers/specs/), [superpowers/plans/](superpowers/plans/) | Spec và kế hoạch triển khai (tách roadmap, ngày 03/10/2026) |
+| [java-content-review.md](java-content-review.md) | Đánh giá độ đủ của roadmap Java và Spring Boot cho dự án thật, đề xuất tách roadmap Spring Boot và nội dung bổ sung (09/10/2026, đợt 1 đã làm) |
 | [framework-comparison.md](framework-comparison.md) | So sánh Astro Starlight và Fumadocs theo yêu cầu của Masteva, đã chốt Fumadocs |
 
 Thứ tự đọc đề xuất: product-vision → market-research → features → content-standard → architecture.

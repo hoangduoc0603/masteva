@@ -1,12 +1,12 @@
 # Masteva
 
-Nền tảng học dành cho lập trình viên nói chung: lộ trình đầy đủ, bài học trực quan, lab chạy trên máy thật và dự án xuyên suốt. Bắt đầu với các roadmap backend (Java, DevOps, Microservices). Tiếng Việt là ngôn ngữ mặc định, sẽ hỗ trợ đa ngôn ngữ.
+Nền tảng học dành cho lập trình viên nói chung: lộ trình đầy đủ, bài học trực quan, lab chạy trên máy thật và dự án xuyên suốt. Bắt đầu với các roadmap backend (Java, Spring Boot, DevOps, Microservices). Tiếng Việt là ngôn ngữ mặc định, sẽ hỗ trợ đa ngôn ngữ.
 
 > Học ở một nơi, từ hiểu khái niệm tới làm được trong dự án thật.
 
 ## Trạng thái
 
-Giai đoạn 0 (nền móng) và tách roadmap: ba roadmap Java, DevOps, Microservices (58 chặng, 379 chủ đề) có sơ đồ "trục giữa", khung chi tiết chủ đề, tiến độ theo chủ đề trên trình duyệt; hai trang dự án; tìm kiếm không dấu. Có một bài mẫu (D1.1); các chặng còn lại đang soạn bài. Giao diện theo hướng Night Lab, theme tối mặc định. Chưa deploy.
+Giai đoạn 0 (nền móng) và tách roadmap: bốn roadmap Java, Spring Boot, DevOps, Microservices (66 chặng, 432 chủ đề; Spring Boot tách khỏi Java ngày 09/10/2026) có sơ đồ "trục giữa", khung chi tiết chủ đề, tiến độ theo chủ đề trên trình duyệt; hai trang dự án; tìm kiếm không dấu. Có một bài mẫu (D1.1); các chặng còn lại đang soạn bài. Giao diện theo hướng Night Lab, theme tối mặc định. Chưa deploy.
 
 ## Chạy
 
@@ -50,7 +50,7 @@ Biến môi trường (đều không bắt buộc):
 ## Cấu trúc
 
 ```text
-content/        roadmaps/ (java, devops, microservices), steps/ (chặng: meta.json có topics, bài MDX), projects/, ids.lock.json — CC BY-NC-SA 4.0
+content/        roadmaps/ (java, spring-boot, devops, microservices), steps/ (chặng: meta.json có topics, bài MDX), projects/, ids.lock.json — CC BY-NC-SA 4.0
 design/         thiết kế Night Lab: tokens.css (nguồn token), roadmap.css (chép sang src/app/), trang mẫu, design system
 messages/       chữ giao diện theo ngôn ngữ
 src/app/        các trang theo /[lang]/, trang / chuyển hướng, chỉ mục tìm kiếm

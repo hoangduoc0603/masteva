@@ -159,3 +159,28 @@ export function validateGraph(graph: ContentGraph): string[] {
   }
   return errors;
 }
+
+/** Mã chặng hoặc mã bài nhắc trong văn bản: `J7`, `SB3`, `D12`, `M5`, `SB3.2`. */
+const CODE_REF = /\b(J|SB|D|M)(\d{1,2})(?:\.(\d+))?\b/g;
+
+/** Bỏ khối code (```…``` và `…`) để không bắt nhầm tên trong lệnh. */
+function stripCode(text: string): string {
+  return text.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]*`/g, '');
+}
+
+/**
+ * Văn bản chỉ được nhắc mã chặng có thật, và mã bài không vượt số bài của chặng
+ * (spec 2026-10-09 §5). `steps`: mã chặng → số bài; chặng chưa có bài thì không kiểm số bài.
+ */
+export function validateCodeRefs(text: string, steps: ReadonlyMap<string, number>): string[] {
+  const errors = new Set<string>();
+  for (const [, prefix, num, lesson] of stripCode(text).matchAll(CODE_REF)) {
+    const code = `${prefix}${num}`;
+    const count = steps.get(code);
+    if (count === undefined) errors.add(`nhắc mã chặng "${code}" không có trong roadmap nào`);
+    else if (lesson !== undefined && count > 0 && Number(lesson) > count) {
+      errors.add(`nhắc bài "${code}.${lesson}" nhưng chặng ${code} chỉ có ${count} bài`);
+    }
+  }
+  return [...errors];
+}

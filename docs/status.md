@@ -20,7 +20,14 @@ Cập nhật lần cuối: 09/10/2026. File này giúp một session mới biế
 | **Database tài khoản** | Đưa tài khoản lên sớm hơn G3: đăng nhập Google, lưu tiến độ theo tài khoản, khách vẫn lưu trên trình duyệt. Supabase local (CLI 2.120.0, Postgres 17): 3 bảng `progress_items`, `topic_marks`, `roadmap_starts` (mỗi khoá một dòng, null là tombstone, bản mới nhất thắng theo `changed_at`), RLS theo chủ sở hữu, RPC `sync_progress` và `delete_my_account`. `supabase test db` 30/30, `supabase db advisors` sạch. Chưa có code phía trình duyệt, chưa có project cloud. Chưa commit | [spec](superpowers/specs/2026-10-07-tai-khoan-dong-bo-tien-do-design.md), `supabase/` |
 | **Đăng nhập Google và đồng bộ tiến độ** | Nút Đăng nhập/menu tài khoản trên header (trên mobile nằm trong menu), OAuth Google PKCE qua trang tĩnh `/<lang>/auth/callback`, bản sao tiến độ theo tài khoản (`masteva:account:<id>:*`), gộp tiến độ khách lần đầu theo thời điểm gốc, hàng đợi đẩy lên sau 1,5 giây, kéo về theo con trỏ `synced_at` (phân trang 1.000 dòng), thử lại khi lỗi, đăng xuất hỏi lại nếu còn thay đổi chưa đồng bộ, xoá tài khoản, trang `/<lang>/privacy`. `supabase-js` 2.117.2 tải riêng (chunk 62,8 KB gzip) chỉ khi bấm đăng nhập hoặc đã có phiên. CSP `connect-src` thêm `https://*.supabase.co`. Review độc lập: sửa 5 lỗi Important (phiên tự hết hạn không xoá hàng đợi; trang đã đăng nhập mở ngay bản sao tài khoản, không chờ supabase-js; tab khách tải lại khi tab khác đăng nhập/đăng xuất; bỏ dòng server sẽ từ chối; trang quyền riêng tư đủ dữ liệu thu thập), 12 lỗi nhỏ để lại (xem Vấn đề đã biết). `pnpm verify` xanh: 126 unit, 86 E2E (10 bỏ qua); `pnpm test:db`: pgTAP 30/30, adapter 4/4. Thử Google thật trên Supabase local (08/10/2026): gộp tiến độ khách, đẩy lên khi bỏ tích, kéo về thay đổi từ "máy khác", đăng xuất, đăng nhập lại về đúng trang và lấy lại tiến độ, xoá tài khoản (user, identity, phiên, tiến độ về 0). Sửa lỗi trang callback chạy hai lần ở dev (StrictMode) làm quay về trang chủ. Production (08/10/2026): project Supabase `jnmwvzognbveagudeizr` (Singapore), migration đã `db push`, Auth đã `config push` (Google, Site URL và Redirect URLs của `masteva.kevin-itbk.workers.dev`, tắt tự đăng ký bằng email); `.env.production` chứa URL và khoá publishable | [spec](superpowers/specs/2026-10-07-tai-khoan-dong-bo-tien-do-design.md), [plan](superpowers/plans/2026-10-07-dang-nhap-dong-bo-tien-do.md) |
 | **Tinh chỉnh giao diện sau dùng thử** | Tương phản khối code, inline code, viền ở cả hai theme; trang roadmap: phần đầu hai cột (thẻ "Bắt đầu từ" bên phải), header tự ẩn khi cuộn xuống, thanh cấp 48 px, khung chi tiết chủ đề `clamp(420px, 38vw, 600px)`; thanh bên bài học: ô chọn roadmap (root folder của Fumadocs, chỉ hiện chặng của roadmap đang học), chip mã chặng và phân cấp chặng/bài, nút đăng nhập ở đáy; bỏ khối xuất/nhập tiến độ; nút sao chép Terminal dạng icon. `pnpm verify` xanh: 129 unit, 84 E2E | `src/app/roadmap.css`, `src/app/lesson.css`, `src/app/[lang]/learn/layout.tsx` |
+| **Tách roadmap Spring Boot (đợt 1)** | Roadmap mới `spring-boot` (track `spring`, màu sáng `#2e7031`, tối `#6fd27a`), 14 chặng SB1–SB14: 6 chặng chuyển từ Java giữ nguyên mã, URL và bài (j11, j12, j13, j15, j16, j17), 8 chặng khung mới (sb2, sb4, sb5, sb7, sb10, sb12, sb13, sb14) với 53 chủ đề mới, chưa có bài. Java còn 14 chặng J1–J14 (j14 thành J11 Concurrency, j18 thành J12 JVM, j19 thành J13, j20 thành J14), mô tả mới. Đổi mã hiển thị một lượt bằng script: 472 chỗ trong 72 file (bảng ánh xạ bên dưới). Mã bài hiển thị tính từ mã chặng và thứ tự bài (`LessonRef.code`, `LiteTopic.lessonCode`, ví dụ "bài SB3.2"). `content:check` thêm `validateCodeRefs`: báo lỗi khi nội dung nhắc mã chặng (J/SB/D/M) không tồn tại hoặc số bài vượt số bài của chặng, bỏ qua khối code. Tổng 4 roadmap, 66 chặng, 432 chủ đề. Unit test: 136 | [spec](superpowers/specs/2026-10-09-tach-roadmap-spring-boot-design.md), [plan](superpowers/plans/2026-10-09-tach-roadmap-spring-boot.md), [đánh giá](java-content-review.md) |
 | Công cụ cho Claude Code | Đã cài cho project: plugin Impeccable, frontend-design, Superpowers; skill web-design-guidelines, vercel-react-best-practices | `.claude/settings.json`, `.claude/skills/` |
+
+Ánh xạ mã chặng khi tách Spring Boot (09/10/2026). Mã định danh và URL (`j11`, `/vi/learn/j11/…`) không đổi, chỉ đổi mã hiển thị; tài liệu cũ trong `docs/` vẫn dùng mã cũ.
+
+| Cũ | J11 | J12 | J13 | J14 | J15 | J16 | J17 | J18 | J19 | J20 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Mới | SB1 | SB3 | SB6 | J11 | SB8 | SB9 | SB11 | J12 | J13 | J14 |
 
 ## Quyết định đã chốt
 
@@ -43,10 +50,11 @@ Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva
 ## Bước tiếp theo
 
 0. **Tài khoản trên production:** người dùng thử đăng nhập Google trên https://masteva.kevin-itbk.workers.dev. Muốn mọi tài khoản Google đăng nhập được thì bấm Publish app trên Google Auth Platform (hiện ở chế độ Testing). Gói Free của Supabase tạm dừng project khi database ít hoạt động trong 7 ngày; workflow `supabase-keepalive.yml` gọi `public.keepalive()` mỗi ngày lúc 09:17 giờ Việt Nam (thêm 08/10/2026; lần chạy lỗi thì GitHub báo qua email). Cảnh báo duy nhất của advisors trên production là Leaked Password Protection, không áp dụng vì chỉ đăng nhập Google.
-1. **Người dùng học thử roadmap Java** (63 bài) và ghi lại chỗ vướng; ưu tiên sửa nội dung theo phản hồi thật.
-2. **Roadmap DevOps** theo đúng quy trình Java: tóm tắt và tài liệu cho chủ đề, bài cho từng chặng (lab trên VM Lima, Docker, Kubernetes local), review và sửa. Sau đó Microservices.
-3. **Đề cương hai dự án** (Neobank, Hub hội thoại) và trang `/setup` chuẩn bị môi trường.
-4. Kiểm tra bản deploy đầu tiên trên `*.workers.dev`, rồi gắn tên miền.
+1. **Người dùng học thử roadmap Java và Spring Boot** (63 bài) và ghi lại chỗ vướng; ưu tiên sửa nội dung theo phản hồi thật.
+2. **Roadmap Spring Boot đợt 2:** viết bài cho SB4 Transaction, SB5 Spring Data JPA chuyên sâu, SB2 Kiểm thử với Spring, SB7 Gọi service khác (theo [java-content-review.md](java-content-review.md)), cùng quy trình lab chạy thật, review và sửa như Java.
+3. **Roadmap DevOps** theo đúng quy trình Java: tóm tắt và tài liệu cho chủ đề, bài cho từng chặng (lab trên VM Lima, Docker, Kubernetes local), review và sửa. Sau đó Microservices.
+4. **Đề cương hai dự án** (Neobank, Hub hội thoại) và trang `/setup` chuẩn bị môi trường.
+5. Kiểm tra bản deploy đầu tiên trên `*.workers.dev`, rồi gắn tên miền.
 
 ## Vấn đề đã biết
 
@@ -77,6 +85,12 @@ Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva
   - Checklist deploy cần thêm Site URL và Additional Redirect URLs (`https://<tên miền>/<lang>/auth/callback`) trong Supabase Auth.
   - `pnpm verify` để lại trong `out/` bản E2E có URL Supabase local; không chạy `wrangler deploy` từ máy ngay sau `verify`.
   - `safeReturnPath` nên so origin bằng `new URL` thay vì kiểm tiền tố.
+- Sau khi tách Spring Boot, người học đã bấm "Tôi đã biết cấp Middle" ở roadmap Java giờ được hiểu là đã biết Concurrency (J11) và JVM (J12), vì cấp Middle của Java đổi nội dung; tiến độ lưu theo cấp nên không tự chuyển sang roadmap Spring Boot.
+- Lỗi nhỏ sau tách roadmap Spring Boot (review 09/10/2026), chưa sửa:
+  - `prerequisites` trong frontmatter bài đầu chặng (j12-1, j13-1, j14-1, j15-1, j17-1, j18-1) lệch `meta.json`; hiện không hiển thị, không được kiểm.
+  - Ai đã đặt "đã biết cấp Senior" ở Java (gồm cả phần Spring cũ) không được tự đánh dấu biết ở Spring Boot.
+  - `validateCodeRefs` chưa kiểm `content/roadmaps/*.json` và bản dịch; chưa bỏ fence `~~~`; tên chip kiểu "Apple M1" chỉ qua vì M1 là chặng có thật, nên đặt trong backtick.
+  - `design/system.html`, `design/components/RoadmapMap.md` chưa có `--track-spring`.
 - Lighthouse CI chưa cài.
 
 ## Cách làm việc với người dùng

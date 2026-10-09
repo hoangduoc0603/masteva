@@ -13,6 +13,8 @@ export interface LiteTopic {
   items: string[];
   /** Đường dẫn bài đầu tiên (không có tiền tố ngôn ngữ), nếu chủ đề đã có bài. */
   lesson?: string;
+  /** Mã bài đầu tiên theo mã chặng (`SB3.2`), đi cùng `lesson`. */
+  lessonCode?: string;
 }
 
 export interface LiteStep {

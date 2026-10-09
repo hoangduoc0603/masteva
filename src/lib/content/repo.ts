@@ -17,6 +17,7 @@ import {
 } from './schema';
 import {
   mergeKeys,
+  validateCodeRefs,
   validateGraph,
   validateInternalLinks,
   validateLessonStructure,
@@ -220,6 +221,21 @@ export function checkContent(): ContentReport {
       if (!sourceIds) report('bản dịch không có bản gốc tiếng Việt');
       else validateTranslation(sourceIds, lesson.extracted.checkIds).forEach(report);
     }
+  }
+
+  // Mã chặng và mã bài nhắc trong văn bản phải tồn tại (spec 2026-10-09 §5).
+  const codeCounts = new Map([...steps.values()].map((s) => [s.code, s.pages.length]));
+  for (const lesson of parsed.filter((p) => p.file.lang === DEFAULT_LANG)) {
+    const where = path.relative(process.cwd(), lesson.file.file);
+    validateCodeRefs(lesson.file.raw, codeCounts).forEach((e) => errors.push(`${where}: ${e}`));
+  }
+  const jsonFiles = [
+    ...[...steps.keys()].map((id) => path.join(STEPS_DIR, id, 'meta.json')),
+    ...(fs.existsSync(PROJECTS_DIR) ? fs.readdirSync(PROJECTS_DIR).filter((f) => f.endsWith('.json')).map((f) => path.join(PROJECTS_DIR, f)) : []),
+  ];
+  for (const file of jsonFiles) {
+    const where = path.relative(process.cwd(), file);
+    validateCodeRefs(fs.readFileSync(file, 'utf8'), codeCounts).forEach((e) => errors.push(`${where}: ${e}`));
   }
 
   const projects = loadProjects();

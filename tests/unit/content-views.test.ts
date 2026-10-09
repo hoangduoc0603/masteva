@@ -125,7 +125,7 @@ describe('toLite', () => {
               code: 'D1',
               title: 'Linux',
               topics: [
-                { id: 'd1.x', title: 'D1.X', kind: 'core', items: ['d1.1.a', 'd1.1.b'], lesson: '/learn/d1/d1-1' },
+                { id: 'd1.x', title: 'D1.X', kind: 'core', items: ['d1.1.a', 'd1.1.b'], lesson: '/learn/d1/d1-1', lessonCode: 'D1.1' },
                 { id: 'd1.y', title: 'D1.Y', kind: 'opt', items: [] },
               ],
             },
@@ -134,6 +134,16 @@ describe('toLite', () => {
         },
       ],
     });
+  });
+
+  it('codes lessons by the step code and page order, not by the lesson path', () => {
+    const renamed: ViewInput = {
+      ...input,
+      steps: new Map([...input.steps, ['d1', { ...input.steps.get('d1')!, code: 'SB3' }]]),
+    };
+    const devops = buildRoadmapView(renamed, 'devops')!;
+    expect(devops.levels[0].steps[0].lessons[0].code).toBe('SB3.1');
+    expect(toLite(devops).levels[0].steps[0].topics[0]).toMatchObject({ lesson: '/learn/d1/d1-1', lessonCode: 'SB3.1' });
   });
 });
 
