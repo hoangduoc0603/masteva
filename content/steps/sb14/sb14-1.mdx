@@ -1,0 +1,1148 @@
+---
+title: Tự viết auto-configuration và starter cho thư viện nội bộ
+description: Đóng gói client audit của công ty thành starter Spring Boot gồm module auto-configuration và module starter, viết điều kiện để ứng dụng ghi đè được mọi bean, sinh metadata cho cấu hình, dùng ApplicationContextRunner bắt lỗi thứ tự của @ConditionalOnBean, rồi đọc báo cáo điều kiện trong một ứng dụng thật.
+id: sb14.1
+step: sb14
+prerequisites: [sb13.3]
+topics: [sb14.starter, sb14.conditional]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    micrometer: 1.17.1
+    git: 2.39.3
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biến một thư viện nội bộ thành starter: ứng dụng chỉ thêm một dependency và vài dòng cấu hình là có bean dùng được, nhưng vẫn ghi đè được mọi thứ thư viện tạo ra. Bài này đứng ở phía người viết thư viện; SB1.1 đã đứng ở phía người dùng. Học xong, bạn giải thích được:
+
+- Vì sao `@ConditionalOnBean(MeterRegistry.class)` báo "did not find any beans" dù ứng dụng có Micrometer, và vì sao cùng đoạn code đó có thể chạy đúng ở công ty khác chỉ vì tên package.
+- Vì sao `@ConfigurationProperties` trong thư viện không có gợi ý trong IDE dù đã thêm `spring-boot-configuration-processor`.
+- Vì sao tắt thư viện bằng `masteva.audit.enabled=false` lại làm ứng dụng không khởi động được.
+
+</Goal>
+
+<Knowledge>
+
+### Vì sao đóng gói thành starter
+
+Công ty có dịch vụ audit trung tâm: mọi thao tác quan trọng (huỷ đơn, đổi giá, hoàn tiền) phải được ghi lại để tra soát. Đội platform viết sẵn một client HTTP. Nếu mỗi service tự viết một class `@Configuration` để tạo client, sau một năm bạn có 30 bản sao gần giống nhau: bản đặt timeout 30 giây, bản quên đặt tên service, bản bắt lỗi nuốt mất exception. Sửa một lỗi trong client nghĩa là 30 pull request.
+
+**Starter** giải bài này: ứng dụng thêm một dependency, đặt `masteva.audit.endpoint`, và có ngay bean `AuditClient` với mặc định đúng. Ứng dụng nào cần khác thì tự khai báo bean của mình, starter lùi lại. SB1.1 đã giải thích starter và auto-configuration từ phía người dùng; bài này viết chúng.
+
+### Ba module và vai trò của từng cái
+
+```text
+ ứng dụng orders
+   └── masteva-audit-spring-boot-starter      jar rỗng, chỉ có danh sách dependency
+         ├── spring-boot-starter              lõi của Boot (logging, auto-configuration)
+         ├── masteva-audit-spring-boot        @AutoConfiguration, @ConfigurationProperties, metadata
+         │     ├── masteva-audit-client       (optional)
+         │     └── micrometer-core            (optional) đo đếm nếu ứng dụng có Micrometer
+         └── masteva-audit-client             thư viện lõi, Java thuần, không biết Spring
+```
+
+| Module | Chứa gì | Vì sao tách |
+|---|---|---|
+| `masteva-audit-client` | `AuditClient`, `HttpAuditClient`: Java thuần | Dùng được trong batch job, CLI, ứng dụng không phải Spring; test không cần context |
+| `masteva-audit-spring-boot` | Class `@AutoConfiguration`, record cấu hình, file `.imports` | Mọi dependency khai báo `optional`: module tự nó không kéo gì vào ứng dụng |
+| `masteva-audit-spring-boot-starter` | Không có class nào, chỉ có `pom.xml` | Là "ý kiến" về bộ dependency nên có: client và lõi Boot, không có Micrometer |
+
+Tài liệu Spring Boot đặt tên module auto-configuration là `acme-spring-boot` và starter là `acme-spring-boot-starter`; nhiều dự án bên thứ ba (ví dụ `mybatis-spring-boot-autoconfigure`) vẫn dùng hậu tố `-autoconfigure`, nhưng bài này theo khuyến nghị của Boot. Tài liệu đặt ra hai luật: tên module **không bắt đầu bằng** `spring-boot` (tránh trùng với module chính thức sau này), và khoá cấu hình nằm trong namespace của bạn (`masteva.*`), không nằm trong `spring.*`, `server.*`, `management.*`. Khi thư viện không có tính năng tuỳ chọn nào, gộp hai module thành một `acme-spring-boot-starter` là chấp nhận được.
+
+<Check id="sb14.1.module-layout">Giải thích được vai trò của module lõi, module auto-configuration và module starter, và vì sao dependency trong module auto-configuration được khai báo `optional`.</Check>
+
+### Auto-configuration được nạp như thế nào
+
+`@SpringBootApplication` chứa `@EnableAutoConfiguration`. Annotation này nhập một `DeferredImportSelector`: Spring xử lý **toàn bộ** cấu hình của ứng dụng (component scan, class `@Configuration` của bạn) trước, rồi mới tới nó.
+
+```text
+ 1. Xử lý cấu hình của ứng dụng: @Component, @Configuration, @Bean    -> bean definition của bạn đã có
+ 2. AutoConfigurationImportSelector
+      đọc META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports trong MỌI jar
+      lọc sớm bằng META-INF/spring-autoconfigure-metadata.properties
+        (OnClass trượt thì bỏ luôn, chưa cần nạp class)
+ 3. Sắp xếp:  tên class theo bảng chữ cái  ->  @AutoConfigureOrder  ->  before / after
+ 4. Lần lượt từng class: xét điều kiện -> khớp thì đăng ký bean definition của nó
+ 5. Tạo bean (thứ tự theo phụ thuộc giữa các bean, không theo bước 3)
+```
+
+Ba hệ quả cho người viết thư viện:
+
+- Class auto-configuration **chỉ** được nạp qua file `.imports`. Đặt nó trong package riêng, không bao giờ nằm trong vùng component scan của ứng dụng, và không tự bật `@ComponentScan`. Từ Spring Boot 3.0, `spring.factories` không còn được đọc cho auto-configuration.
+- `@AutoConfiguration` là `@Configuration(proxyBeanMethods = false)` kèm các thuộc tính `before`, `beforeName`, `after`, `afterName`.
+- Thứ tự ở bước 3 chỉ quyết định thứ tự **đăng ký** bean definition, tức thứ tự xét điều kiện. Thứ tự tạo bean do phụ thuộc giữa các bean quyết định.
+
+<Check id="sb14.1.load-order">Kể được năm bước từ `@EnableAutoConfiguration` tới lúc bean được tạo, và nói được bước nào quyết định thứ tự xét điều kiện.</Check>
+
+### Chọn điều kiện cho từng việc
+
+SB1.1 đã có bảng các điều kiện. Thư viện audit dùng bốn cái:
+
+- `@ConditionalOnClass`: cả auto-configuration chỉ chạy khi có `AuditClient`; phần đo đếm chỉ chạy khi có `MeterRegistry`.
+- `@ConditionalOnBooleanProperty`: `masteva.audit.enabled`, mặc định bật (`matchIfMissing = true`).
+- `@ConditionalOnMissingBean`: ứng dụng tự tạo `AuditClient` thì starter lùi lại.
+- `@ConditionalOnBean`: chỉ tạo bộ đếm khi đã có bean `MeterRegistry`.
+
+`@ConditionalOnClass` đặt trên class an toàn kể cả khi class được tham chiếu không có trên classpath: Spring đọc annotation bằng ASM từ bytecode, không nạp class. Đặt trên method `@Bean` thì khác: JVM nạp class chứa method trước khi xét điều kiện, và chết với `NoClassDefFoundError` nếu kiểu trả về không tồn tại. Vì vậy phần phụ thuộc thư viện tuỳ chọn luôn tách thành class cấu hình riêng có `@ConditionalOnClass` ở mức class.
+
+`@ConditionalOnBooleanProperty` có từ Spring Boot 3.5, gọn hơn `@ConditionalOnProperty(havingValue = "true")` cho khoá kiểu boolean.
+
+### Vì sao @ConditionalOnBean phụ thuộc thứ tự
+
+Điều kiện được xét ở bước 4, khi bean definition đang được đăng ký, không phải khi bean được tạo. `@ConditionalOnBean` vì vậy chỉ thấy những bean definition **đã đăng ký tới lúc đó**.
+
+```text
+ thời điểm xét điều kiện  ───────────────────────────────────────────────────────────────>
+
+ [cấu hình của ứng dụng]   [dev.masteva...MastevaAuditMetricsAutoConfiguration]   [org.springframework...SimpleMetricsExportAutoConfiguration]
+  localAudit (nếu có)        @ConditionalOnBean(MeterRegistry)                đăng ký simpleMeterRegistry
+                             -> chưa có MeterRegistry nào: TRƯỢT              (quá muộn)
+
+ có afterName = "...CompositeMeterRegistryAutoConfiguration":
+ [cấu hình của ứng dụng]   [org.springframework...metrics...]   [dev.masteva...MastevaAuditMetricsAutoConfiguration]
+                            đăng ký simpleMeterRegistry           @ConditionalOnBean(MeterRegistry) -> KHỚP
+```
+
+Hai trường hợp có kết quả ngược nhau:
+
+- `@ConditionalOnMissingBean` trong auto-configuration nhìn bean **của ứng dụng**: luôn đúng, vì cấu hình của ứng dụng được xử lý xong ở bước 1. Tài liệu Spring Boot khuyên chỉ dùng hai điều kiện bean trong class auto-configuration vì lý do này; đặt chúng trong `@Configuration` thường của ứng dụng thì kết quả phụ thuộc thứ tự quét.
+- `@ConditionalOnBean` nhìn bean **của một auto-configuration khác**: chỉ đúng khi auto-configuration kia được xét trước. Không khai báo `after`, thứ tự rơi về bảng chữ cái của tên class đầy đủ. `dev.masteva...` đứng trước `org.springframework...`, nên điều kiện trượt. Một công ty đặt package `vn.company...` thì đứng sau, và cùng đoạn code đó chạy đúng một cách tình cờ, cho tới ngày ai đó đổi tên package.
+
+Sửa bằng `@AutoConfiguration(after = ...)`, hoặc `afterName = "..."` khi không muốn module của bạn phụ thuộc lúc biên dịch vào module chứa class kia.
+
+<Check id="sb14.1.on-bean-order">Giải thích được vì sao `@ConditionalOnMissingBean` nhìn thấy bean của ứng dụng nhưng `@ConditionalOnBean` có thể không thấy bean của auto-configuration khác, và sửa được bằng `after` hoặc `afterName`.</Check>
+
+<Callout kind="production">
+
+Một starter nội bộ cho tiện đã khai báo `@Bean JsonMapper` với vài tuỳ chỉnh của đội platform, không có `@ConditionalOnMissingBean`. Mọi service thêm starter đó: `JacksonAutoConfiguration#jacksonJsonMapper` của Boot thấy đã có `JsonMapper` (đúng dòng `@ConditionalOnMissingBean (types: tools.jackson.databind.json.JsonMapper...)` bạn đã đọc ở SB1.1) và lùi lại. Từ đó mọi khoá `spring.jackson.*` trong `application.properties` của các service bị bỏ qua lặng lẽ, ngày giờ trong API của ba service đổi định dạng sau một lần nâng phiên bản starter. Starter chỉ được tạo bean mà nó sở hữu; bean đó phải có `@ConditionalOnMissingBean`; muốn tuỳ chỉnh bean của Boot thì khai báo customizer (`JsonMapperBuilderCustomizer`), không thay cả bean.
+
+</Callout>
+
+### Cấu hình và metadata
+
+SB1.2 đã dùng record `@ConfigurationProperties`. Với thư viện, thêm một việc: sinh **metadata** để IDE gợi ý khoá, hiện mô tả và cảnh báo khoá sai. Hai annotation processor làm việc này lúc biên dịch:
+
+| Processor | Sinh ra | Dùng vào việc |
+|---|---|---|
+| `spring-boot-configuration-processor` | `META-INF/spring-configuration-metadata.json` | IDE gợi ý `masteva.audit.*`, mô tả lấy từ `@param` trong Javadoc của record, giá trị mặc định lấy từ `@DefaultValue` |
+| `spring-boot-autoconfigure-processor` | `META-INF/spring-autoconfigure-metadata.properties` | Bước 2 ở trên lọc sớm theo `@ConditionalOnClass` mà không nạp class, khởi động nhanh hơn |
+
+SB1.2 nhắc cách thêm processor như một dependency scope `optional`. Từ JDK 23, `javac` không còn tự chạy annotation processor tìm thấy trên classpath, nên cách đó vẫn build xanh nhưng **không sinh file metadata nào**. Khai báo chúng trong `<annotationProcessorPaths>` của `maven-compiler-plugin` (từ 3.12.0 không cần ghi version, plugin lấy từ `dependencyManagement`).
+
+Khoá bắt buộc nên làm ứng dụng dừng ngay lúc khởi động với thông báo rõ, thay vì để client gửi tới `null` lúc nửa đêm.
+
+### Test auto-configuration bằng ApplicationContextRunner
+
+`@SpringBootTest` dựng cả ứng dụng, và bạn không có ứng dụng nào trong module thư viện. Thứ cần test là các **tổ hợp**: có hoặc không có bean của người dùng, có hoặc không có property, có hoặc không có thư viện trên classpath. `ApplicationContextRunner` dựng một context nhỏ cho mỗi tổ hợp, mất vài chục mili giây:
+
+| Phương thức | Mô phỏng |
+|---|---|
+| `withConfiguration(AutoConfigurations.of(...))` | Auto-configuration được nạp, **sắp xếp đúng như lúc chạy thật** |
+| `withUserConfiguration(...)` | Class `@Configuration` của ứng dụng, xử lý trước auto-configuration |
+| `withPropertyValues("k=v")` | Khoá trong `application.properties` |
+| `withClassLoader(new FilteredClassLoader(X.class))` | Ứng dụng không có thư viện X |
+| `run(context -> assertThat(context)...)` | `hasSingleBean`, `doesNotHaveBean`, `hasFailed` |
+
+Vì `AutoConfigurations.of` sắp xếp như lúc chạy thật, một test có cả auto-configuration của bạn và của Boot tái hiện được đúng lỗi thứ tự ở trên, trên máy nào cũng như nhau.
+
+<Check id="sb14.1.context-runner">Viết được test bằng `ApplicationContextRunner` cho bốn tình huống: mặc định, ứng dụng tự khai báo bean, tắt bằng property, thiếu thư viện trên classpath.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Creating Your Own Auto-configuration](https://docs.spring.io/spring-boot/reference/features/developing-auto-configuration.html): đọc các mục Condition Annotations (đoạn về thứ tự của bean condition), Testing your Auto-configuration và Creating Your Own Starter (đặt tên module và khoá).
+- [Generating Your Own Metadata by Using the Annotation Processor](https://docs.spring.io/spring-boot/specification/configuration-metadata/annotation-processor.html): cấu hình processor với Maven và cách Javadoc trở thành mô tả.
+- [ConditionalOnBean (Spring Boot 4.1.1 API)](https://docs.spring.io/spring-boot/api/java/org/springframework/boot/autoconfigure/condition/ConditionalOnBean.html): ghi chú ở đầu trang về việc điều kiện chỉ thấy bean definition đã xử lý tới lúc đó.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25, Maven như J7, `git`, `curl`, có mạng để tải Spring Boot từ Maven Central và tạo project từ start.spring.io. Mở **ba tab Terminal**; ở mỗi tab mới chạy `export JAVA_HOME=$(/usr/libexec/java_home -v 25)`. Tab 1 chạy dịch vụ audit giả ở cổng **9440**, tab 2 chạy ứng dụng ở cổng **8094**, tab 3 gõ lệnh. Hai cổng đó phải đang trống. Thư viện được cài vào `~/.m2` bằng `mvn install` với groupId `dev.masteva.sb14`, không đụng tới thư viện khác. Log của Spring trong bài đã bỏ phần ngày giờ, PID và tên thread ở đầu dòng. Maven chạy trên JDK 25 in thêm vài dòng `WARNING:` về `sun.misc.Unsafe` và native access; các khung kết quả đã lược chúng.
+
+### 1. Khung thư viện ba module
+
+POM cha của thư viện không kế thừa `spring-boot-starter-parent`: parent đó dành cho ứng dụng (cấu hình đóng gói jar chạy được, resource filtering). Thư viện chỉ nhập **BOM** `spring-boot-dependencies` để lấy phiên bản đã kiểm thử cùng nhau (J7.2). Để bài ngắn, POM chỉ ghim hai plugin bắt buộc phải mới: `maven-compiler-plugin` (từ 3.12.0 mới đọc được version processor từ BOM) và `maven-surefire-plugin`; thư viện thật ghim đủ mọi plugin như J7.3. `maven.compiler.release` là 17: mức Java thấp nhất Spring Boot 4 hỗ trợ, để thư viện chạy được cả ở service chưa lên Java 25.
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+mkdir -p ~/masteva-sb14/audit && cd ~/masteva-sb14/audit
+cat > pom.xml <<'EOF'
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>dev.masteva.sb14</groupId>
+  <artifactId>masteva-audit-parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+
+  <modules>
+    <module>client</module>
+    <module>autoconfigure</module>
+    <module>starter</module>
+  </modules>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <spring-boot.version>4.1.1</spring-boot.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>dev.masteva.sb14</groupId>
+        <artifactId>masteva-audit-client</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>dev.masteva.sb14</groupId>
+        <artifactId>masteva-audit-spring-boot</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.15.0</version>
+          <configuration>
+            <parameters>true</parameters>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.5.6</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>
+EOF
+mvn -q -N org.apache.maven.plugins:maven-wrapper-plugin:3.3.4:wrapper -Dmaven=3.9.16
+./mvnw -v | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Apache Maven 3.9.16 (2bdd9fddda4b155ebf8000e807eb73fd829a51d5)
+```
+
+</Expected>
+
+Maven Wrapper (J7.3) ghim Maven 3.9.16 cho thư viện, cùng bản với wrapper mà start.spring.io sinh cho ứng dụng ở bước 6.
+
+### 2. Thư viện lõi: Java thuần
+
+`HttpAuditClient` gửi một JSON nhỏ bằng `java.net.http.HttpClient` có sẵn trong JDK. Lỗi mạng không được làm hỏng nghiệp vụ: huỷ đơn vẫn thành công, sự kiện bị mất được ghi log và báo cho `AuditListener` để đo đếm. Log dùng `System.Logger` của JDK, nên thư viện không phụ thuộc SLF4J; trong ứng dụng Spring Boot, log này đi qua cầu nối JUL sang Logback.
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+C=client/src/main/java/dev/masteva/sb14/audit
+mkdir -p $C
+cat > client/pom.xml <<'EOF'
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>dev.masteva.sb14</groupId>
+    <artifactId>masteva-audit-parent</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>masteva-audit-client</artifactId>
+  <description>Client gửi sự kiện audit, không phụ thuộc Spring</description>
+</project>
+EOF
+cat > $C/AuditClient.java <<'EOF'
+package dev.masteva.sb14.audit;
+
+/** Ghi một sự kiện audit: ai (source) làm gì (action) với đối tượng nào (subject). */
+public interface AuditClient {
+    void record(String action, String subject);
+}
+EOF
+cat > $C/AuditListener.java <<'EOF'
+package dev.masteva.sb14.audit;
+
+/** Được gọi sau mỗi lần gửi, để đo đếm. Mặc định không làm gì. */
+public interface AuditListener {
+    AuditListener NONE = new AuditListener() {
+    };
+
+    default void sent(String action) {
+    }
+
+    default void failed(String action, Exception error) {
+    }
+}
+EOF
+cat > $C/HttpAuditClient.java <<'EOF'
+package dev.masteva.sb14.audit;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
+/** Gửi sự kiện tới dịch vụ audit qua HTTP. Lỗi mạng không làm hỏng nghiệp vụ: ghi log và báo listener. */
+public final class HttpAuditClient implements AuditClient {
+    private static final System.Logger LOG = System.getLogger(HttpAuditClient.class.getName());
+
+    private final HttpClient http;
+    private final URI endpoint;
+    private final String source;
+    private final Duration timeout;
+    private final AuditListener listener;
+
+    public HttpAuditClient(URI endpoint, String source, Duration timeout, AuditListener listener) {
+        this.http = HttpClient.newBuilder().connectTimeout(timeout).build();
+        this.endpoint = endpoint;
+        this.source = source;
+        this.timeout = timeout;
+        this.listener = listener;
+    }
+
+    @Override
+    public void record(String action, String subject) {
+        String json = "{\"source\":%s,\"action\":%s,\"subject\":%s}"
+                .formatted(quote(source), quote(action), quote(subject));
+        HttpRequest request = HttpRequest.newBuilder(endpoint)
+                .timeout(timeout)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .build();
+        try {
+            HttpResponse<Void> response = http.send(request, HttpResponse.BodyHandlers.discarding());
+            if (response.statusCode() >= 300) {
+                throw new IOException("audit service returned " + response.statusCode());
+            }
+            listener.sent(action);
+        } catch (IOException e) {
+            LOG.log(System.Logger.Level.WARNING, "audit event {0} lost: {1}", action, e.toString());
+            listener.failed(action, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            listener.failed(action, e);
+        }
+    }
+
+    private static String quote(String value) {
+        return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+}
+EOF
+cat > $C/LoggingAuditClient.java <<'EOF'
+package dev.masteva.sb14.audit;
+
+/** Chỉ ghi log, không gửi đi đâu. Dùng khi chạy trên máy dev hoặc trong test. */
+public final class LoggingAuditClient implements AuditClient {
+    private static final System.Logger LOG = System.getLogger("masteva.audit");
+
+    @Override
+    public void record(String action, String subject) {
+        LOG.log(System.Logger.Level.INFO, "audit {0} {1}", action, subject);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+### 3. Module auto-configuration
+
+Ba file: record cấu hình, class `@AutoConfiguration`, và file `.imports` liệt kê class đó. Client lõi và Micrometer đều là dependency `optional`: thêm module này mà thiếu client thì `@ConditionalOnClass` trượt và cả auto-configuration đứng yên.
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+A=autoconfigure/src/main/java/dev/masteva/sb14/audit/autoconfigure
+mkdir -p $A autoconfigure/src/main/resources/META-INF/spring autoconfigure/src/test/java/dev/masteva/sb14/audit/autoconfigure
+cat > autoconfigure/pom.xml <<'EOF'
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>dev.masteva.sb14</groupId>
+    <artifactId>masteva-audit-parent</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>masteva-audit-spring-boot</artifactId>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-autoconfigure</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.masteva.sb14</groupId>
+      <artifactId>masteva-audit-client</artifactId>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-core</artifactId>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-micrometer-metrics</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-configuration-processor</artifactId>
+            </path>
+            <path>
+              <groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-autoconfigure-processor</artifactId>
+            </path>
+          </annotationProcessorPaths>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+EOF
+cat > $A/AuditProperties.java <<'EOF'
+package dev.masteva.sb14.audit.autoconfigure;
+
+import java.net.URI;
+import java.time.Duration;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
+
+/**
+ * Cấu hình client audit.
+ *
+ * @param enabled bật hoặc tắt việc gửi sự kiện audit
+ * @param endpoint URL nhận sự kiện của dịch vụ audit, bắt buộc khi đang bật
+ * @param source tên hệ thống gửi sự kiện; mặc định lấy spring.application.name
+ * @param timeout thời gian chờ tối đa cho một lần gửi
+ */
+@ConfigurationProperties("masteva.audit")
+public record AuditProperties(
+        @DefaultValue("true") boolean enabled,
+        URI endpoint,
+        String source,
+        @DefaultValue("2s") Duration timeout) {
+}
+EOF
+cat > $A/MastevaAuditAutoConfiguration.java <<'EOF'
+package dev.masteva.sb14.audit.autoconfigure;
+
+import dev.masteva.sb14.audit.AuditClient;
+import dev.masteva.sb14.audit.AuditListener;
+import dev.masteva.sb14.audit.HttpAuditClient;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.core.env.Environment;
+
+@AutoConfiguration
+@ConditionalOnClass(AuditClient.class)
+@ConditionalOnBooleanProperty(name = "masteva.audit.enabled", matchIfMissing = true)
+@EnableConfigurationProperties(AuditProperties.class)
+public final class MastevaAuditAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    AuditClient auditClient(AuditProperties properties, Environment environment,
+            ObjectProvider<AuditListener> listeners) {
+        if (properties.endpoint() == null) {
+            throw new IllegalStateException("masteva.audit.endpoint is required when masteva.audit.enabled=true");
+        }
+        String source = (properties.source() != null) ? properties.source()
+                : environment.getProperty("spring.application.name", "unknown");
+        return new HttpAuditClient(properties.endpoint(), source, properties.timeout(),
+                listeners.getIfUnique(() -> AuditListener.NONE));
+    }
+}
+EOF
+echo "dev.masteva.sb14.audit.autoconfigure.MastevaAuditAutoConfiguration" \
+  > autoconfigure/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+```
+
+</Terminal>
+
+Đọc lại class auto-configuration theo thứ tự Spring xét nó:
+
+- `@ConditionalOnClass(AuditClient.class)` và `@ConditionalOnBooleanProperty` ở mức class: trượt một cái là cả class bị bỏ, kể cả `@EnableConfigurationProperties`.
+- `@ConditionalOnMissingBean` trên method: không ghi kiểu, Spring lấy kiểu trả về `AuditClient`. Ứng dụng khai báo bất kỳ bean nào kiểu `AuditClient` là đủ để starter lùi lại.
+- `ObjectProvider<AuditListener>`: listener là tuỳ chọn. `getIfUnique` trả về listener nếu có đúng một, không thì dùng `NONE`.
+- Tên class có tiền tố `Masteva`: báo cáo điều kiện in tên ngắn của class, và Actuator đã có một `AuditAutoConfiguration` của riêng nó (cho audit event của Spring Security). Trùng tên ngắn làm báo cáo rất khó đọc.
+
+### 4. Đo đếm khi ứng dụng có Micrometer, và bốn test
+
+Phần đo đếm nằm trong auto-configuration thứ hai: chỉ khi có Micrometer trên classpath **và** đã có bean `MeterRegistry`. Viết nó theo cách tự nhiên nhất, chưa khai báo thứ tự:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+A=autoconfigure/src/main/java/dev/masteva/sb14/audit/autoconfigure
+cat > $A/MicrometerAuditListener.java <<'EOF'
+package dev.masteva.sb14.audit.autoconfigure;
+
+import dev.masteva.sb14.audit.AuditListener;
+import io.micrometer.core.instrument.MeterRegistry;
+
+/** Đếm sự kiện audit theo action và kết quả: masteva.audit.events{action, result}. */
+public class MicrometerAuditListener implements AuditListener {
+    private final MeterRegistry registry;
+
+    public MicrometerAuditListener(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+    @Override
+    public void sent(String action) {
+        registry.counter("masteva.audit.events", "action", action, "result", "sent").increment();
+    }
+
+    @Override
+    public void failed(String action, Exception error) {
+        registry.counter("masteva.audit.events", "action", action, "result", "failed").increment();
+    }
+}
+EOF
+cat > $A/MastevaAuditMetricsAutoConfiguration.java <<'EOF'
+package dev.masteva.sb14.audit.autoconfigure;
+
+import dev.masteva.sb14.audit.AuditListener;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.context.annotation.Bean;
+
+@AutoConfiguration
+@ConditionalOnClass({ AuditListener.class, MeterRegistry.class })
+@ConditionalOnBean(MeterRegistry.class)
+public final class MastevaAuditMetricsAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    MicrometerAuditListener micrometerAuditListener(MeterRegistry registry) {
+        return new MicrometerAuditListener(registry);
+    }
+}
+EOF
+echo "dev.masteva.sb14.audit.autoconfigure.MastevaAuditMetricsAutoConfiguration" \
+  >> autoconfigure/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+```
+
+</Terminal>
+
+Test đầu tiên kiểm bốn tình huống của client. Test thứ hai đặt auto-configuration của bạn cạnh ba auto-configuration Micrometer của Boot, đúng như trong một ứng dụng có Actuator, và in báo cáo điều kiện bằng `ConditionEvaluationReportLoggingListener`. Endpoint trỏ tới cổng 9 trên máy, nơi không có gì lắng nghe: mỗi lần gửi thất bại ngay, kết quả không phụ thuộc mạng.
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+T=autoconfigure/src/test/java/dev/masteva/sb14/audit/autoconfigure
+cat > $T/MastevaAuditAutoConfigurationTest.java <<'EOF'
+package dev.masteva.sb14.audit.autoconfigure;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import dev.masteva.sb14.audit.AuditClient;
+import dev.masteva.sb14.audit.HttpAuditClient;
+import dev.masteva.sb14.audit.LoggingAuditClient;
+import java.time.Duration;
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+class MastevaAuditAutoConfigurationTest {
+    private final ApplicationContextRunner runner = new ApplicationContextRunner()
+            .withConfiguration(AutoConfigurations.of(MastevaAuditAutoConfiguration.class));
+
+    @Test
+    void createsHttpClientFromProperties() {
+        runner.withPropertyValues("masteva.audit.endpoint=http://localhost:9440/events")
+                .run(context -> {
+                    assertThat(context).hasSingleBean(AuditClient.class);
+                    assertThat(context).getBean(AuditClient.class).isInstanceOf(HttpAuditClient.class);
+                    assertThat(context.getBean(AuditProperties.class).timeout()).isEqualTo(Duration.ofSeconds(2));
+                });
+    }
+
+    @Test
+    void backsOffWhenApplicationDefinesItsOwnClient() {
+        runner.withUserConfiguration(LocalAuditConfig.class)
+                .run(context -> assertThat(context).getBean(AuditClient.class).isInstanceOf(LoggingAuditClient.class));
+    }
+
+    @Test
+    void canBeDisabled() {
+        runner.withPropertyValues("masteva.audit.enabled=false")
+                .run(context -> assertThat(context).doesNotHaveBean(AuditClient.class));
+    }
+
+    @Test
+    void failsFastWithoutEndpoint() {
+        runner.run(context -> assertThat(context).hasFailed().getFailure()
+                .rootCause().hasMessageContaining("masteva.audit.endpoint is required"));
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class LocalAuditConfig {
+        @Bean
+        AuditClient localAudit() {
+            return new LoggingAuditClient();
+        }
+    }
+}
+EOF
+cat > $T/MastevaAuditMetricsAutoConfigurationTest.java <<'EOF'
+package dev.masteva.sb14.audit.autoconfigure;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import dev.masteva.sb14.audit.AuditClient;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.autoconfigure.logging.ConditionEvaluationReportLoggingListener;
+import org.springframework.boot.logging.LogLevel;
+import org.springframework.boot.micrometer.metrics.autoconfigure.CompositeMeterRegistryAutoConfiguration;
+import org.springframework.boot.micrometer.metrics.autoconfigure.MetricsAutoConfiguration;
+import org.springframework.boot.micrometer.metrics.autoconfigure.export.simple.SimpleMetricsExportAutoConfiguration;
+import org.springframework.boot.test.context.FilteredClassLoader;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+
+class MastevaAuditMetricsAutoConfigurationTest {
+    // Cổng 9 không có ai nghe: mọi lần gửi thất bại ngay, không phụ thuộc mạng.
+    private final ApplicationContextRunner runner = new ApplicationContextRunner()
+            .withConfiguration(AutoConfigurations.of(MastevaAuditAutoConfiguration.class,
+                    MastevaAuditMetricsAutoConfiguration.class))
+            .withPropertyValues("masteva.audit.endpoint=http://127.0.0.1:9/events")
+            .withInitializer(ConditionEvaluationReportLoggingListener.forLogLevel(LogLevel.INFO));
+
+    @Test
+    void countsFailedEventsWhenMeterRegistryExists() {
+        runner.withConfiguration(AutoConfigurations.of(MetricsAutoConfiguration.class,
+                        SimpleMetricsExportAutoConfiguration.class, CompositeMeterRegistryAutoConfiguration.class))
+                .run(context -> {
+                    assertThat(context).hasSingleBean(MicrometerAuditListener.class);
+                    context.getBean(AuditClient.class).record("order.cancelled", "order-1");
+                    double failed = context.getBean(MeterRegistry.class).get("masteva.audit.events")
+                            .tag("result", "failed").counter().count();
+                    assertThat(failed).isEqualTo(1.0);
+                });
+    }
+
+    @Test
+    void noListenerWithoutMicrometer() {
+        runner.withClassLoader(new FilteredClassLoader(MeterRegistry.class))
+                .run(context -> {
+                    assertThat(context).hasSingleBean(AuditClient.class);
+                    assertThat(context).doesNotHaveBean(MicrometerAuditListener.class);
+                });
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Module starter chỉ có `pom.xml`. Nó kéo `spring-boot-starter` (tài liệu Boot yêu cầu mọi starter dẫn tới lõi này, để một ứng dụng chỉ có starter của bạn vẫn có logging và auto-configuration), module auto-configuration và client. Micrometer không có trong danh sách: ứng dụng nào có Actuator thì tự có.
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+mkdir -p starter
+cat > starter/pom.xml <<'EOF'
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>dev.masteva.sb14</groupId>
+    <artifactId>masteva-audit-parent</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>masteva-audit-spring-boot-starter</artifactId>
+  <description>Starter: kéo auto-configuration và client audit vào ứng dụng</description>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.masteva.sb14</groupId>
+      <artifactId>masteva-audit-spring-boot</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.masteva.sb14</groupId>
+      <artifactId>masteva-audit-client</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+EOF
+```
+
+</Terminal>
+
+<Predict question="Ứng dụng trong test thứ hai có MetricsAutoConfiguration, SimpleMetricsExportAutoConfiguration, nên chắc chắn có MeterRegistry. Test countsFailedEventsWhenMeterRegistryExists xanh hay đỏ?">
+
+Đỏ, và đỏ trên mọi máy. Chạy để xem lý do:
+
+</Predict>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+./mvnw verify > build.log 2>&1; grep -E "Tests run:.*Metrics|BUILD" build.log
+grep -m1 -B2 -A2 "ConditionalOnBean (types: io.micrometer.core.instrument.MeterRegistry" build.log
+grep -m1 -A1 "^   SimpleMetricsExportAutoConfiguration matched" build.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.445 s <<< FAILURE! -- in dev.masteva.sb14.audit.autoconfigure.MastevaAuditMetricsAutoConfigurationTest
+[INFO] BUILD FAILURE
+   MastevaAuditMetricsAutoConfiguration:
+      Did not match:
+         - @ConditionalOnBean (types: io.micrometer.core.instrument.MeterRegistry; SearchStrategy: all) did not find any beans of type io.micrometer.core.instrument.MeterRegistry (OnBeanCondition)
+      Matched:
+         - @ConditionalOnClass found required classes 'dev.masteva.sb14.audit.AuditListener', 'io.micrometer.core.instrument.MeterRegistry' (OnClassCondition)
+   SimpleMetricsExportAutoConfiguration matched:
+      - @ConditionalOnEnabledMetricsExport management.defaults.metrics.export.enabled is considered true (OnMetricsExportEnabledCondition)
+```
+
+</Expected>
+
+Mỗi test in một báo cáo; `grep -m1` lấy báo cáo đầu tiên có dòng `@ConditionalOnBean`. Báo cáo nói đủ: `@ConditionalOnClass` khớp, nhưng lúc xét `@ConditionalOnBean` chưa có bean `MeterRegistry` nào. `SimpleMetricsExportAutoConfiguration`, nơi đăng ký `simpleMeterRegistry`, được xét sau. Không có `after`, hai class được xếp theo tên đầy đủ, và `dev.masteva.sb14...` đứng trước `org.springframework.boot...`. Lỗi này tất định: thứ tự sắp xếp không phụ thuộc máy hay thời điểm.
+
+<Check id="sb14.1.lab-order-bug">Tái hiện được việc `@ConditionalOnBean` trượt trong test, và chỉ ra trong báo cáo điều kiện dòng chứng minh nguyên nhân là thứ tự.</Check>
+
+### 5. Khai báo thứ tự, cài vào ~/.m2, đọc metadata
+
+`CompositeMeterRegistryAutoConfiguration` là class Boot dùng để gom mọi `MeterRegistry` lại; mọi auto-configuration xuất metric (Simple, Prometheus, OTLP...) đều khai báo `before` nó. Đứng sau nó là chắc chắn mọi registry đã được đăng ký. Dùng `afterName` vì module của bạn không có `spring-boot-micrometer-metrics` lúc biên dịch (chỉ có ở scope test):
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+perl -pi -e 's/^\@AutoConfiguration$/\@AutoConfiguration(afterName = "org.springframework.boot.micrometer.metrics.autoconfigure.CompositeMeterRegistryAutoConfiguration")/' \
+  autoconfigure/src/main/java/dev/masteva/sb14/audit/autoconfigure/MastevaAuditMetricsAutoConfiguration.java
+./mvnw install > build.log 2>&1; grep -E "Tests run: |BUILD" build.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.498 s -- in dev.masteva.sb14.audit.autoconfigure.MastevaAuditMetricsAutoConfigurationTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.035 s -- in dev.masteva.sb14.audit.autoconfigure.MastevaAuditAutoConfigurationTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+</Expected>
+
+`install` đặt ba jar vào `~/.m2/repository/dev/masteva/sb14/`, nơi ứng dụng ở bước 6 tìm thấy chúng. Trên công ty thật, bước này là `deploy` lên kho nội bộ (Nexus, Artifactory, GitHub Packages). Giờ xem hai file metadata mà processor sinh ra:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+J=autoconfigure/target/masteva-audit-spring-boot-1.0.0.jar
+unzip -p $J META-INF/spring-configuration-metadata.json | grep -A5 '"masteva.audit.timeout"'
+unzip -p $J META-INF/spring-autoconfigure-metadata.properties | grep Metrics
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+      "name": "masteva.audit.timeout",
+      "type": "java.time.Duration",
+      "description": "thời gian chờ tối đa cho một lần gửi",
+      "sourceType": "dev.masteva.sb14.audit.autoconfigure.AuditProperties",
+      "defaultValue": "2s"
+    }
+dev.masteva.sb14.audit.autoconfigure.MastevaAuditMetricsAutoConfiguration=
+dev.masteva.sb14.audit.autoconfigure.MastevaAuditMetricsAutoConfiguration.AutoConfigureAfter=org.springframework.boot.micrometer.metrics.autoconfigure.CompositeMeterRegistryAutoConfiguration
+dev.masteva.sb14.audit.autoconfigure.MastevaAuditMetricsAutoConfiguration.ConditionalOnBean=io.micrometer.core.instrument.MeterRegistry
+dev.masteva.sb14.audit.autoconfigure.MastevaAuditMetricsAutoConfiguration.ConditionalOnClass=dev.masteva.sb14.audit.AuditListener,io.micrometer.core.instrument.MeterRegistry
+```
+
+</Expected>
+
+Mô tả lấy nguyên văn từ `@param timeout` trong Javadoc của record, giá trị mặc định lấy từ `@DefaultValue("2s")`. IntelliJ IDEA và VS Code (Spring Boot Tools) đọc file này để gợi ý khoá khi bạn gõ `masteva.` trong `application.properties`. File thứ hai cho Boot biết điều kiện class và thứ tự mà không cần nạp class.
+
+<Check id="sb14.1.lab-metadata">Cấu hình được hai annotation processor trong `annotationProcessorPaths` và chỉ ra trong jar hai file metadata chúng sinh ra.</Check>
+
+Commit thư viện và gắn tag phiên bản. SB14.2 phát hành bản kế tiếp từ đây.
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/audit
+printf 'target/\nbuild.log\n' > .gitignore
+git init -q && git add . && git commit -q -m "masteva-audit 1.0.0" && git tag v1.0.0 && git log --oneline --decorate
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+96503f6 (HEAD -> main, tag: v1.0.0) masteva-audit 1.0.0
+```
+
+</Expected>
+
+Mã commit và tên nhánh (`main` hay `master`) trên máy bạn sẽ khác. Git có thể in thêm cảnh báo `CRLF will be replaced by LF` cho `mvnw.cmd`, file chỉ dùng trên Windows; bỏ qua được.
+
+### 6. Ứng dụng dùng starter
+
+Tạo ứng dụng `orders` có Spring MVC và Actuator, thêm starter, viết một endpoint huỷ đơn có ghi audit:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=orders \
+  -d name=orders -d packageName=vn.masteva.orders \
+  -d dependencies=web,actuator -o orders.zip
+unzip -q orders.zip -d orders && cd orders
+perl -0pi -e 's#(\t<dependencies>\n)#$1\t\t<dependency>\n\t\t\t<groupId>dev.masteva.sb14</groupId>\n\t\t\t<artifactId>masteva-audit-spring-boot-starter</artifactId>\n\t\t\t<version>1.0.0</version>\n\t\t</dependency>\n#' pom.xml
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=orders
+server.port=8094
+masteva.audit.endpoint=http://127.0.0.1:9440/events
+masteva.audit.timeout=500ms
+management.endpoints.web.exposure.include=health,metrics,conditions
+EOF
+cat > src/main/java/vn/masteva/orders/OrderController.java <<'EOF'
+package vn.masteva.orders;
+
+import dev.masteva.sb14.audit.AuditClient;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+class OrderController {
+    private final AuditClient audit;
+
+    OrderController(AuditClient audit) {
+        this.audit = audit;
+    }
+
+    @PostMapping("/orders/{id}/cancel")
+    ResponseEntity<Void> cancel(@PathVariable long id) {
+        // ... huỷ đơn trong database (lược bỏ ở bài này)
+        audit.record("order.cancelled", "order-" + id);
+        return ResponseEntity.noContent().build();
+    }
+}
+EOF
+./mvnw -q package -DskipTests && ls target/*.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+target/orders-0.0.1-SNAPSHOT.jar
+```
+
+</Expected>
+
+Ứng dụng không có class `@Configuration` nào cho audit: chỉ một dependency và hai khoá `masteva.audit.*`. Timeout 500 ms là con số đội này chọn: huỷ đơn không được chậm hơn nửa giây vì dịch vụ audit.
+
+### 7. Chạy với một dịch vụ audit giả
+
+Dịch vụ audit giả là một file Java chạy thẳng bằng `java` (không cần biên dịch trước), dùng `HttpServer` có sẵn trong JDK, in ra mọi sự kiện nhận được:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb14
+cat > AuditSink.java <<'EOF'
+import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+
+/** Giả lập dịch vụ audit: in ra mọi sự kiện nhận được. */
+void main() throws Exception {
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 9440), 0);
+    server.createContext("/events", exchange -> {
+        IO.println("received " + new String(exchange.getRequestBody().readAllBytes()));
+        exchange.sendResponseHeaders(202, -1);
+        exchange.close();
+    });
+    server.start();
+    IO.println("audit sink listening on 127.0.0.1:9440");
+}
+EOF
+java AuditSink.java
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb14/orders && java -jar target/orders-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+Khi tab 2 in `Started OrdersApplication`, ở tab 3 huỷ đơn 42 rồi hỏi Actuator:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8094/orders/42/cancel
+curl -s 'localhost:8094/actuator/metrics/masteva.audit.events?tag=result:sent'; echo
+curl -s localhost:8094/actuator/conditions | grep -o '"MastevaAuditMetricsAutoConfiguration":\[[^]]*\]'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+204
+{"availableTags":[{"tag":"action","values":["order.cancelled"]}],"measurements":[{"statistic":"COUNT","value":1.0}],"name":"masteva.audit.events"}
+"MastevaAuditMetricsAutoConfiguration":[{"condition":"OnClassCondition","message":"@ConditionalOnClass found required classes 'dev.masteva.sb14.audit.AuditListener', 'io.micrometer.core.instrument.MeterRegistry'"},{"condition":"OnBeanCondition","message":"@ConditionalOnBean (types: io.micrometer.core.instrument.MeterRegistry; SearchStrategy: all) found bean 'simpleMeterRegistry'"}]
+```
+
+</Expected>
+
+Tab 1 in thêm một dòng:
+
+```text
+received {"source":"orders","action":"order.cancelled","subject":"order-42"}
+```
+
+`source` là `orders`, lấy từ `spring.application.name` vì ứng dụng không đặt `masteva.audit.source`. Trong ứng dụng thật, `MeterRegistry` có sẵn nhờ Actuator, và lần này `@ConditionalOnBean` thấy `simpleMeterRegistry` nhờ `afterName`.
+
+<Check id="sb14.1.lab-app">Dùng được starter trong một ứng dụng chỉ bằng dependency và khoá cấu hình, thấy sự kiện tới dịch vụ audit và bộ đếm `masteva.audit.events` trong Actuator.</Check>
+
+### 8. Ứng dụng ghi đè bean
+
+Trên máy dev không có dịch vụ audit. Đội `orders` muốn chỉ ghi log khi chạy với profile `local`. Họ không sửa thư viện; họ khai báo bean của mình:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/orders
+cat > src/main/java/vn/masteva/orders/LocalAuditConfig.java <<'EOF'
+package vn.masteva.orders;
+
+import dev.masteva.sb14.audit.AuditClient;
+import dev.masteva.sb14.audit.LoggingAuditClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
+
+/** Trên máy dev không có dịch vụ audit: chỉ ghi log. */
+@Configuration(proxyBeanMethods = false)
+@Profile("local")
+class LocalAuditConfig {
+    @Bean
+    AuditClient localAudit() {
+        return new LoggingAuditClient();
+    }
+}
+EOF
+./mvnw -q package -DskipTests
+```
+
+</Terminal>
+
+Bấm Ctrl+C ở tab 2, chạy lại với profile `local` và `--debug`, ghi log ra file:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb14/orders && java -jar target/orders-0.0.1-SNAPSHOT.jar --spring.profiles.active=local --debug > debug.log 2>&1
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb14/orders
+sleep 5; curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8094/orders/7/cancel
+grep -A2 "^   MastevaAuditAutoConfiguration#auditClient:" debug.log
+grep -o "masteva.audit .*" debug.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+204
+   MastevaAuditAutoConfiguration#auditClient:
+      Did not match:
+         - @ConditionalOnMissingBean (types: dev.masteva.sb14.audit.AuditClient; SearchStrategy: all) found beans of type 'dev.masteva.sb14.audit.AuditClient' localAudit (OnBeanCondition)
+masteva.audit                            : audit order.cancelled order-7
+```
+
+</Expected>
+
+Tab 1 không in gì thêm. Class `MastevaAuditAutoConfiguration` vẫn khớp (thư viện có mặt, chưa bị tắt), nhưng method `auditClient` trượt vì đã có `localAudit`. Đây là hợp đồng của mọi starter: mặc định tốt, và ứng dụng thắng khi nó nói rõ ý mình.
+
+<Check id="sb14.1.lab-override">Ghi đè được bean của starter bằng một bean cùng kiểu trong ứng dụng, và đọc được trong báo cáo `--debug` dòng cho thấy starter đã lùi lại.</Check>
+
+### 9. Tắt thư viện
+
+Bấm Ctrl+C ở tab 2.
+
+<Predict question="Chạy lại không có profile local, thêm --masteva.audit.enabled=false. Ứng dụng khởi động được không?">
+
+Không. `MastevaAuditAutoConfiguration` trượt ở `@ConditionalOnBooleanProperty`, nên không có bean `AuditClient` nào, trong khi `OrderController` cần một cái qua constructor.
+
+</Predict>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb14/orders
+java -jar target/orders-0.0.1-SNAPSHOT.jar --masteva.audit.enabled=false 2>&1 | grep -A5 "APPLICATION FAILED"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Parameter 0 of constructor in vn.masteva.orders.OrderController required a bean of type 'dev.masteva.sb14.audit.AuditClient' that could not be found.
+```
+
+</Expected>
+
+Một công tắc `enabled` mà bật xuống làm chết ứng dụng là công tắc thiết kế dở. Phần Đào sâu bàn hai cách sửa và vì sao với audit, lựa chọn không hiển nhiên.
+
+### Khi gặp lỗi
+
+- Không có file `spring-configuration-metadata.json` trong jar: processor không chạy. Kiểm tra nó nằm trong `<annotationProcessorPaths>`, không phải chỉ là dependency. Từ JDK 23, processor trên classpath bị bỏ qua mà không báo lỗi.
+- Ứng dụng báo thiếu bean `AuditClient` dù đã thêm starter: mở jar module auto-configuration và kiểm tra đường dẫn file `.imports` (`META-INF/spring/`, đúng tên đầy đủ). Sai một ký tự là Boot không thấy auto-configuration nào, và báo cáo `--debug` cũng không nhắc tới nó.
+- `Could not find artifact dev.masteva.sb14:masteva-audit-spring-boot-starter:jar:1.0.0`: chưa chạy `./mvnw install` ở bước 5, hoặc build đó thất bại.
+- `BindException: Address already in use` ở tab 1 hoặc tab 2: cổng 9440 hoặc 8094 đang bận. `lsof -i :9440` cho biết tiến trình nào giữ cổng.
+- Tab 1 không in `received`, tab 2 có `WARNING: audit event order.cancelled lost: java.net.ConnectException`: dịch vụ audit giả chưa chạy. Ứng dụng vẫn trả `204`, đúng như thiết kế.
+
+### Dọn dẹp
+
+Bấm Ctrl+C ở tab 1. Lệnh ở bước 9 đã tự dừng. Giữ nguyên `~/masteva-sb14` và các jar trong `~/.m2/repository/dev/masteva/sb14`: SB14.2 phát hành bản 1.1.0 của thư viện này và dùng lại ứng dụng `orders`.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Thiết kế lại công tắc enabled để tắt mà không chết ứng dụng">
+
+Hai cách. Cách một: khi tắt, thư viện cung cấp một `AuditClient` không làm gì, trong một class cấu hình có `@ConditionalOnBooleanProperty(name = "masteva.audit.enabled", havingValue = false)` và `@ConditionalOnMissingBean`. Ứng dụng luôn có bean, code không đổi. Cách hai: ứng dụng inject `ObjectProvider<AuditClient>` và tự xử lý khi không có; mọi nơi gọi phải nhớ kiểm tra. Cách một gọn hơn, nhưng với audit có rủi ro: một khoá cấu hình sai ở production làm toàn bộ dấu vết tra soát biến mất trong im lặng. Thư viện tốt thì ghi `WARN` lúc khởi động khi đang chạy bản no-op, và đưa trạng thái đó lên `/actuator/health` hoặc thành một metric để cảnh báo được.
+
+</Reveal>
+
+<Reveal title="Gửi audit đồng bộ trong thread của request có ổn không?">
+
+Ở bài này mỗi lần huỷ đơn chờ dịch vụ audit tối đa 500 ms. Khi dịch vụ audit chậm, mọi request huỷ đơn chậm theo; khi nó chết hẳn, sự kiện mất. Thư viện thật thường đưa sự kiện vào một hàng đợi trong bộ nhớ có giới hạn và gửi theo lô bằng thread riêng (đổi lại: mất sự kiện khi pod bị kill), hoặc ghi vào bảng outbox trong cùng transaction rồi một tiến trình khác gửi đi (không mất, nhưng phức tạp hơn). Starter giấu được lựa chọn này sau cùng interface `AuditClient`, và đổi chiến lược mà ứng dụng không phải sửa code.
+
+</Reveal>
+
+<Reveal title="Kiểu trả về của method @Bean ảnh hưởng gì tới @ConditionalOnMissingBean?">
+
+Không ghi `value`, `@ConditionalOnMissingBean` lấy kiểu trả về của method làm kiểu cần tìm. Method trả về `AuditClient` nên bất kỳ bean nào implement `AuditClient` cũng làm starter lùi lại, đúng ý ở đây. Nếu method trả về `HttpAuditClient`, ứng dụng khai báo `LoggingAuditClient` thì starter vẫn tạo thêm `HttpAuditClient`, và controller nhận được hai ứng viên. Ngược lại, khi ứng dụng cần inject đúng lớp cụ thể, tài liệu Boot khuyên trả về kiểu cụ thể nhất, vì điều kiện bean chỉ dựa được vào thông tin kiểu có trong chữ ký method trước khi bean được tạo.
+
+</Reveal>
+
+<Reveal title="Đổi tên hoặc chuyển package một class auto-configuration thì ứng dụng có vỡ không?">
+
+Có thể. Ứng dụng có thể đang loại nó bằng `spring.autoconfigure.exclude=...MastevaAuditMetricsAutoConfiguration`, hoặc một thư viện khác khai báo `after` nó bằng tên. Đổi tên thì các tham chiếu đó trỏ vào không khí. Boot hỗ trợ file `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.replacements` ghi cặp `tên cũ=tên mới`, để exclude và thứ tự theo tên cũ vẫn có tác dụng. Tên class auto-configuration vì vậy là API công khai của starter, như tên khoá cấu hình. SB14.2 bàn cách thay đổi API mà không làm vỡ người dùng.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết khung ba module, viết test `ApplicationContextRunner` cho từng tổ hợp điều kiện, hoặc đọc giúp một báo cáo điều kiện dài. AI hay sinh `spring.factories` với khoá `EnableAutoConfiguration` (cách của Boot 2), đặt dependency processor ở scope `optional` mà không có `annotationProcessorPaths`, quên `@ConditionalOnMissingBean`, và dùng `@ConditionalOnBean` mà không khai báo thứ tự. Nó cũng hay viết tên package auto-configuration của Boot 3 (`org.springframework.boot.actuate.autoconfigure.metrics...`) cho Boot 4. Kiểm bằng `unzip -l` trên jar, bằng test có cả auto-configuration của Boot trong `AutoConfigurations.of`, và bằng `/actuator/conditions` của ứng dụng thật.
+
+</Callout>
+
+<Callout kind="link">
+
+SB1.1 đọc báo cáo điều kiện từ phía người dùng; SB1.2 dạy record `@ConfigurationProperties`; SB2 dạy test với context. J7.2 và J7.3 là nền của multi-module, BOM và wrapper. SB8 nói về Micrometer và Actuator mà phần đo đếm dựa vào. SB14.2 phát hành phiên bản tiếp theo của thư viện này mà không làm vỡ ứng dụng cũ, và gom phiên bản vào một BOM nội bộ.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb14.1.mastery-starter">Tự đóng gói được một thư viện nội bộ thành starter gồm module auto-configuration và module starter, có khoá cấu hình trong namespace riêng, metadata cho IDE, và bean mà ứng dụng ghi đè được.</Check>
+
+<Check id="sb14.1.mastery-conditions">Chọn được điều kiện đúng cho từng bean (`OnClass`, `OnBooleanProperty`, `OnMissingBean`, `OnBean`), khai báo thứ tự khi điều kiện phụ thuộc auto-configuration khác, và chứng minh bằng test `ApplicationContextRunner`.</Check>
+
+<Check id="sb14.1.mastery-diagnose">Khi một bean của starter không xuất hiện hoặc xuất hiện ngoài ý muốn, tìm được nguyên nhân bằng báo cáo điều kiện của `--debug`, `/actuator/conditions` hoặc `ConditionEvaluationReportLoggingListener`.</Check>
+
+</Mastery>

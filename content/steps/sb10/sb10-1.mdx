@@ -1,0 +1,1028 @@
+---
+title: Upload file lên object storage S3, presigned URL và xuất Excel, PDF không tràn heap
+description: Nhận file qua multipart với giới hạn kích thước, kiểm loại file theo nội dung, lưu vào object storage qua S3 API và metadata vào PostgreSQL, cho trình duyệt tải bằng presigned URL; rồi xuất 100.000 dòng ra Excel bằng SXSSF (đo heap thật so với XSSF), ra PDF có tiếng Việt, với tên file tiếng Việt đúng chuẩn.
+id: sb10.1
+step: sb10
+prerequisites: [j16.4]
+topics: [sb10.luu-file, sb10.xuat-bao-cao]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    docker: 29.8.0
+    postgresql: "18.6"
+    rustfs: 1.0.1
+    aws-cli: 2.37.11
+    aws-sdk-java: 2.55.13
+    apache-tika: 4.1.0
+    apache-poi: 5.5.1
+    openpdf: 3.0.5
+---
+
+<Goal>
+
+Thêm hai tính năng mà gần như service nghiệp vụ nào cũng có: nhận file người dùng tải lên và xuất báo cáo. Học xong bài này, bạn giải thích được:
+
+- Vì sao file `avatar.png` vẫn có thể là một đoạn script, và kiểm loại file thế nào cho đúng.
+- Vì sao link tải file "tự hết hạn sau 5 phút" mà ứng dụng không cần làm gì, và vì sao sửa một ký tự trong link là bị từ chối.
+- Vì sao xuất 100.000 dòng Excel làm instance chết vì `OutOfMemoryError` với heap 256 MB, trong khi cách khác chỉ cần khoảng 30 MB.
+- Vì sao PDF xuất ra mất hết chữ có dấu, và vì sao `curl -J` lưu file tải về thành `Bao cao _on hang.xlsx` trong khi trình duyệt giữ đúng tên tiếng Việt.
+
+</Goal>
+
+<Knowledge>
+
+### File không nằm trên đĩa của ứng dụng
+
+Ba chỗ hay được nghĩ tới để lưu file người dùng tải lên:
+
+| Lưu ở | Ưu | Vấn đề |
+|---|---|---|
+| Đĩa của máy chạy ứng dụng | Đơn giản | Hai instance không thấy file của nhau; container khởi động lại là mất; backup riêng |
+| PostgreSQL (`bytea`, large object) | Cùng transaction với dữ liệu | Database phình to, backup và replication chậm, mỗi lần tải file đi qua connection pool |
+| **Object storage** (S3 và tương thích) | Không giới hạn dung lượng, bền, rẻ, trình duyệt tải trực tiếp | Không cùng transaction với database, phải tự giữ nhất quán |
+
+Cách phổ biến: **byte của file nằm ở object storage, metadata nằm trong PostgreSQL** (tên gốc, loại, kích thước, mã băm, ai tải lên, key trỏ tới object).
+
+**Object storage** lưu **object** (một dãy byte cộng metadata) trong **bucket**, mỗi object có một **key** dạng chuỗi như `uploads/54c0940d-...`. Không có thư mục thật, không sửa được một phần object: ghi là ghi đè cả object. **S3 API** của Amazon đã thành chuẩn chung: AWS S3, Cloudflare R2, Google Cloud Storage (chế độ tương thích), và các phần mềm tự host như MinIO, Garage, SeaweedFS, RustFS đều nói cùng giao thức. Code dùng AWS SDK for Java 2.x chạy với tất cả, chỉ đổi `endpoint` và khoá.
+
+Hai chi tiết khi trỏ SDK sang dịch vụ không phải AWS:
+
+- **Path-style** (`http://host/bucket/key`) thay vì **virtual-hosted style** (`http://bucket.host/key`). Storage chạy trên `localhost` không có DNS cho `sb10-files.localhost`, nên lab bật `forcePathStyle(true)`.
+- **Region** vẫn phải đặt vì nó nằm trong chữ ký; storage tự host thường chấp nhận `us-east-1`.
+
+<Callout kind="pitfall">
+
+**Chọn S3 tự host cho lab:** MinIO, lựa chọn quen thuộc nhất, đã archive repository bản cộng đồng (4/2026) và không còn image cộng đồng chính thức: ngày chạy lab, `docker pull minio/minio` báo `pull access denied`, `quay.io/minio/minio` trả 401. Lab dùng **RustFS** (`rustfs/rustfs`, giấy phép Apache 2.0), image chính thức của dự án, nói S3 API như MinIO. RustFS mới phát hành bản GA (9/2026), nên trước khi dùng cho production cần tự đánh giá độ ổn định và cách vận hành; SeaweedFS là lựa chọn tự host trưởng thành hơn, còn khi chạy trên cloud thì dùng thẳng AWS S3, Cloudflare R2 hay Google Cloud Storage. Code trong bài không phụ thuộc vào lựa chọn đó.
+
+</Callout>
+
+### Upload qua ứng dụng
+
+```text
+ trình duyệt                Spring MVC (Tomcat)                    RustFS (S3)         PostgreSQL
+     | POST /files, multipart/form-data
+     |------------------------->| 1. Tomcat đọc body, ghi phần file ra file tạm
+     |                          |    quá max-file-size / max-request-size -> 413
+     |                          | 2. đọc vài byte đầu: Tika nhận ra image/png
+     |                          |    không thuộc danh sách cho phép -> 415
+     |                          | 3. PutObject key = uploads/<uuid> ------->|
+     |                          |    (tính SHA-256 trong lúc stream)        |
+     |                          | 4. INSERT stored_files (metadata) ------------------------>|
+     |<-------------------------| 5. trả id, loại, kích thước, sha256
+```
+
+**Multipart** là định dạng body của form có `<input type="file">`. Spring Boot cấu hình nó qua `spring.servlet.multipart.*`:
+
+| Thuộc tính | Mặc định | Ý nghĩa |
+|---|---|---|
+| `max-file-size` | 1MB | Một file vượt mức này thì từ chối |
+| `max-request-size` | 10MB | Tổng cả request (nhiều file cộng các trường khác) |
+| `file-size-threshold` | 0B | File lớn hơn mức này được ghi ra đĩa tạm; 0 nghĩa là luôn ghi ra đĩa |
+
+Vượt giới hạn, Spring ném `MaxUploadSizeExceededException`; với `spring.mvc.problemdetails.enabled=true` (SB1.3) client nhận `413 Content Too Large` dạng Problem Details. `MultipartFile.getInputStream()` gọi được nhiều lần: một lần để đoán loại, một lần để đẩy lên storage.
+
+**Không tin tên file, không tin header `Content-Type` của phần file.** Cả hai do client tự đặt. Kiểm loại bằng **magic bytes**, vài byte đầu đặc trưng của từng định dạng: PNG bắt đầu bằng `89 50 4E 47`, PDF bằng `%PDF-`. **Apache Tika** (`tika-core`) đọc các byte đó và trả loại MIME; lab dùng `Tika.detect(InputStream)`, không truyền tên file để Tika không đoán theo đuôi. Những điều cần làm thêm:
+
+- **Danh sách cho phép**, không phải danh sách cấm. SVG là XML có thể chứa `<script>`; HTML tải lên rồi mở trên cùng domain là XSS.
+- **Key do server sinh** (`uploads/<uuid>`), không dùng tên người dùng gửi: tránh `../../etc/passwd`, tránh hai người cùng tên file ghi đè nhau. Tên gốc chỉ lưu trong metadata.
+- **Trả file với `Content-Disposition: attachment`** để trình duyệt tải về thay vì hiển thị, và `X-Content-Type-Options: nosniff` để trình duyệt không tự đoán loại. Header này nên đặt ở proxy hay CDN phía trước storage: MinIO tự gửi nó, RustFS của lab thì không.
+- Magic bytes chỉ nói định dạng, không nói file vô hại: ảnh vẫn mang EXIF có toạ độ GPS, PDF vẫn có thể chứa mã độc. Quét virus (ClamAV), mã hoá lại ảnh, và phục vụ file từ một domain riêng là các lớp phòng thủ tiếp theo.
+
+**Nhất quán giữa storage và database.** PutObject và INSERT không cùng transaction. Lab ghi object trước, metadata sau: nếu INSERT lỗi, còn lại một object mồ côi, vô hại và dọn được bằng job định kỳ (so key trong bucket với bảng). Làm ngược lại, database có dòng trỏ tới object không tồn tại, lỗi lộ ra cho người dùng.
+
+### Presigned URL
+
+Bucket để **private**. Muốn cho trình duyệt tải một object, ứng dụng không stream byte qua chính nó mà tạo một **presigned URL**: URL chứa sẵn chữ ký SigV4 tính bằng secret key, cho phép đúng một thao tác (GET object này) tới một thời điểm hết hạn.
+
+```text
+ trình duyệt          ứng dụng                                     RustFS (S3)
+     | GET /files/{id}/download
+     |------------------->| kiểm tra quyền, đọc object_key từ PostgreSQL
+     |                    | S3Presigner ký: GET + key + hạn 300 s
+     |                    | + response-content-disposition (tên file gốc)
+     |<-------------------| 302 Location: http://localhost:9410/...&X-Amz-Signature=...
+     |------------------------------------------------------------------>| tính lại chữ ký
+     |<------------------------------------------------------------------| 200 + byte của file
+```
+
+- Ký là phép tính cục bộ, không gọi mạng. Storage tự kiểm chữ ký và hạn; đổi bất kỳ tham số nào (hạn, key, tên file) thì chữ ký không khớp, trả `403 SignatureDoesNotMatch`.
+- Ai có URL thì tải được tới khi hết hạn, và không thu hồi riêng một URL được. Giữ hạn ngắn (vài phút) và kiểm quyền **trước** khi ký. SigV4 cho hạn tối đa 7 ngày.
+- Tham số `response-content-disposition` khiến storage trả header `Content-Disposition` theo ý ứng dụng, nên file tải về mang tên gốc thay vì UUID.
+- Chiều ngược lại, **presigned PUT** cho trình duyệt tải thẳng file lớn lên storage mà không đi qua ứng dụng. Đổi lại, ứng dụng không còn chặn được ở bước 1 và 2 của sơ đồ upload; Đào sâu bàn cách kiểm sau.
+
+<Callout kind="production">
+
+Ứng dụng chạy trong Docker Compose hoặc Kubernetes gọi storage qua tên nội bộ `http://storage:9000`. Presigned URL ký với host đó, trình duyệt của người dùng không phân giải được `storage`. Sửa bằng cách thay host trong URL thì hỏng chữ ký, vì host nằm trong chuỗi được ký. Cách đúng: `S3Presigner` dùng endpoint công khai (ví dụ `https://files.example.com`), còn `S3Client` dùng endpoint nội bộ, và proxy phía trước giữ nguyên header `Host`.
+
+</Callout>
+
+<Check id="sb10.1.luu-file">Giải thích được vì sao lưu byte ở object storage và metadata ở PostgreSQL, vì sao kiểm loại bằng magic bytes theo danh sách cho phép, key do server sinh, và presigned URL bảo vệ object thế nào.</Check>
+
+### Xuất Excel: XSSF và SXSSF
+
+File `.xlsx` là một file zip chứa các file XML. **Apache POI** có hai cách ghi nó:
+
+| Lớp | Định dạng | Cách làm | Bộ nhớ |
+|---|---|---|---|
+| `XSSFWorkbook` | `.xlsx` | Mỗi ô là một cây đối tượng XML trong heap | Tăng theo số ô; đọc lại và sửa được mọi ô |
+| `SXSSFWorkbook` | `.xlsx` | Chỉ giữ một **cửa sổ** N dòng gần nhất, dòng cũ hơn ghi ra file tạm | Gần như cố định; dòng đã ghi ra file không đọc lại được |
+
+```text
+ SXSSFWorkbook(100)
+   createRow(1..100)     -> giữ trong heap
+   createRow(101)        -> dòng 1 được ghi ra file tạm poi-sxssf-sheet*.xml, xoá khỏi heap
+   ...
+   write(out)            -> nén file tạm và phần còn lại thành .xlsx, ghi ra out
+   close()               -> xoá file tạm
+```
+
+Giới hạn của SXSSF đến từ chính cửa sổ: không sửa được dòng đã ra file tạm, `autoSizeColumn` phải bật theo dõi trước (`trackAllColumnsForAutoSizing()`), công thức tham chiếu dòng cũ không được tính lại. Với báo cáo ghi một chiều từ trên xuống, đó không phải vấn đề. Một sheet Excel chứa tối đa 1.048.576 dòng, nên báo cáo lớn hơn phải chia sheet hoặc chuyển sang CSV.
+
+Workbook nhỏ chưa đủ: dữ liệu đọc từ database cũng phải chảy theo luồng. pgJDBC mặc định đọc **toàn bộ** kết quả vào bộ nhớ; nó chỉ dùng cursor và lấy từng đợt khi **auto-commit tắt** (nằm trong transaction) và **fetch size lớn hơn 0**. Lab dùng `JdbcClient...withFetchSize(1000)` trong method `@Transactional(readOnly = true)`, xử lý từng dòng bằng `RowCallbackHandler` thay vì `.list()`.
+
+**Stream response.** `StreamingResponseBody` cho controller trả về ngay, phần ghi byte chạy trên một thread của executor bất đồng bộ của Spring MVC và ghi thẳng vào socket. Ba hệ quả:
+
+- Thời gian ghi tính vào **async request timeout**, mặc định của Tomcat là 30 giây; quá hạn client nhận `503`. Lab đặt `spring.mvc.async.request-timeout=2m`.
+- Khi byte đầu tiên đã đi, status `200` đã gửi. Lỗi giữa chừng chỉ cắt cụt file, không đổi được thành `500`. Vì vậy lab dựng xong workbook rồi mới `write(out)`.
+- Transaction mở trên thread ghi, không phải thread của request.
+
+<Callout kind="production">
+
+Một nút "Xuất Excel" dùng `XSSFWorkbook` chạy ổn nhiều tháng với dữ liệu nhỏ. Một ngày kế toán chọn "cả năm", heap đầy, GC chạy liên tục, mọi request khác trên instance đó chậm theo rồi lỗi. Bước 11 tái hiện chuyện này với heap 256 MB. Sửa tận gốc là SXSSF cộng giới hạn phạm vi xuất (khoảng ngày tối đa, số dòng tối đa); báo cáo thật lớn thì chạy nền và gửi link qua email (SB10.2). Còn việc để JVM thoát hẳn sau `OutOfMemoryError` cho orchestrator khởi động lại là cấu hình JVM của SB11.3.
+
+</Callout>
+
+### PDF: thư viện, giấy phép và font
+
+| Thư viện | Giấy phép | Hợp với |
+|---|---|---|
+| iText 9 | AGPL hoặc thương mại | Đầy đủ tính năng; AGPL buộc công bố mã nguồn của cả dịch vụ dùng nó, nếu không thì mua giấy phép |
+| **OpenPDF** 3 | LGPL 2.1 hoặc MPL 2.0 | Nhánh từ iText 4 trước khi đổi giấy phép; API `Document`, `PdfPTable`; dùng trong lab |
+| Apache PDFBox | Apache 2.0 | Đọc, tách, ghép PDF; tạo PDF ở mức thấp (tự đặt toạ độ chữ) |
+| OpenHTMLtoPDF, Flying Saucer | LGPL | Viết HTML/CSS (template Thymeleaf như SB10.2) rồi chuyển sang PDF |
+
+Kiểm giấy phép trước khi thêm thư viện là việc của người viết code, không phải việc của phòng pháp chế sau khi sản phẩm đã bán. OpenPDF 3 đổi package từ `com.lowagie.text` sang `org.openpdf.text`; ví dụ trên mạng cho bản cũ không biên dịch được với bản mới.
+
+**Font.** PDF có 14 font chuẩn (Helvetica, Times…) mà trình đọc nào cũng có, nhưng chúng chỉ mã hoá bảng ký tự Latin cơ bản (WinAnsi, CP1252). Chữ `đ`, `ạ`, `ễ` không có trong bảng đó, và OpenPDF **lặng lẽ bỏ** chúng: không exception, chỉ mất chữ. Muốn tiếng Việt, nhúng một font TrueType có đủ glyph với encoding `IDENTITY_H` (Unicode). Lab dùng Liberation Sans (giấy phép SIL OFL) có sẵn trong artifact `openpdf-fonts-extra`. Font thương mại như Arial có giấy phép riêng về việc nhúng vào file phát hành.
+
+### Tên file tiếng Việt trong Content-Disposition
+
+Header HTTP về nguyên tắc chỉ chứa ASCII. **RFC 6266** quy định `Content-Disposition`, và **RFC 5987** (nay là RFC 8187) thêm cú pháp `filename*` mang chuỗi UTF-8 đã percent-encode. Gửi cả hai: trình duyệt hiểu `filename*` dùng nó, công cụ cũ dùng `filename`:
+
+```text
+Content-Disposition: attachment; filename="Bao cao _on hang.xlsx";
+                     filename*=UTF-8''B%C3%A1o%20c%C3%A1o%20%C4%91%C6%A1n%20h%C3%A0ng.xlsx
+```
+
+`ContentDisposition.attachment().filename(name, UTF_8)` của Spring sinh đúng dạng này: phần `filename` bỏ dấu, ký tự không quy được về ASCII như `đ` thành `_`. Đừng tự ghép chuỗi `"attachment; filename=\"" + name + "\""`: tên chứa dấu `"` hoặc xuống dòng sẽ phá header.
+
+<Check id="sb10.1.xuat-bao-cao">Giải thích được khác biệt bộ nhớ giữa XSSF và SXSSF, điều kiện để pgJDBC đọc theo luồng, hệ quả của `StreamingResponseBody`, và cách nhúng font, đặt tên file tiếng Việt cho báo cáo.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Work with Amazon S3 pre-signed URLs (AWS SDK for Java 2.x)](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/examples-s3-presign.html): tạo presigned GET và PUT bằng `S3Presigner`.
+- [File Upload (OWASP Cheat Sheet Series)](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html): danh sách kiểm tra cho upload: loại file, tên file, kích thước, nơi lưu, quét mã độc.
+- [Multipart Resolver (Spring Framework)](https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-servlet/multipart.html): multipart trong Spring MVC trên Servlet container.
+- [SXSSF (Apache POI)](https://poi.apache.org/components/spreadsheet/how-to.html#sxssf): cửa sổ dòng, file tạm và những gì SXSSF không làm được.
+- [RFC 6266](https://www.rfc-editor.org/rfc/rfc6266): mục 4.3 và ví dụ ở mục 5 về `filename` và `filename*`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25, Docker Desktop đang chạy, `curl` và `unzip`. Đã làm SB3.2 (JdbcClient, Flyway) và SB1.3 (Problem Details). Mở **hai tab Terminal**: tab 1 chạy ứng dụng ở cổng **8090**, tab 2 gửi request. Cả chặng SB10 dùng chung container PostgreSQL `sb10-pg` ở cổng **5410**.
+
+### 1. PostgreSQL và RustFS
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+mkdir -p ~/masteva-sb10 && cd ~/masteva-sb10
+docker run -d --name sb10-pg -e POSTGRES_PASSWORD=masteva -p 5410:5432 postgres:18-alpine
+docker run -d --name sb10-rustfs -p 9410:9000 -p 9411:9001 \
+  -e RUSTFS_ACCESS_KEY=masteva -e RUSTFS_SECRET_KEY=masteva-secret rustfs/rustfs:1.0.1
+sleep 5
+docker exec sb10-pg psql -U postgres -c 'CREATE DATABASE files'
+s3cli() {
+  docker run --rm -e AWS_ACCESS_KEY_ID=masteva -e AWS_SECRET_ACCESS_KEY=masteva-secret \
+    -e AWS_DEFAULT_REGION=us-east-1 amazon/aws-cli:2.37.11 \
+    --endpoint-url http://host.docker.internal:9410 "$@"
+}
+s3cli s3 mb s3://sb10-files
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CREATE DATABASE
+make_bucket: sb10-files
+```
+
+</Expected>
+
+- Cổng 9410 là S3 API, 9411 là giao diện web của RustFS. `RUSTFS_ACCESS_KEY` và `RUSTFS_SECRET_KEY` đặt cặp khoá quản trị; không đặt thì image dùng khoá mặc định `rustfsadmin` và in cảnh báo.
+- RustFS không có client dòng lệnh riêng như `mc` của MinIO. Lab dùng AWS CLI chính thức chạy trong container: hàm `s3cli` gọi nó với endpoint của RustFS. Từ trong container, `host.docker.internal` là máy Mac của bạn.
+- Bucket do người vận hành tạo; ứng dụng chỉ cần quyền đọc ghi object, không cần quyền tạo bucket. Bucket mới tạo là private: không có chữ ký thì không đọc được gì.
+
+### 2. Tạo project
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=files \
+  -d name=files -d packageName=vn.masteva.files \
+  -d dependencies=web,jdbc,flyway,postgresql,validation -o files.zip
+unzip -q files.zip -d files && cd files
+rm HELP.md src/test/java/vn/masteva/files/FilesApplicationTests.java
+perl -0pi -e 's#(\t\t<dependency>\n\t\t\t<groupId>org.postgresql</groupId>)#\t\t<dependency>\n\t\t\t<groupId>software.amazon.awssdk</groupId>\n\t\t\t<artifactId>s3</artifactId>\n\t\t\t<version>2.55.13</version>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>org.apache.tika</groupId>\n\t\t\t<artifactId>tika-core</artifactId>\n\t\t\t<version>4.1.0</version>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>org.apache.poi</groupId>\n\t\t\t<artifactId>poi-ooxml</artifactId>\n\t\t\t<version>5.5.1</version>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>com.github.librepdf</groupId>\n\t\t\t<artifactId>openpdf</artifactId>\n\t\t\t<version>3.0.5</version>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>com.github.librepdf</groupId>\n\t\t\t<artifactId>openpdf-fonts-extra</artifactId>\n\t\t\t<version>3.0.5</version>\n\t\t</dependency>\n$1#' pom.xml
+```
+
+</Terminal>
+
+Lệnh `perl` chèn năm dependency trước dependency `postgresql`. Spring Boot không quản lý phiên bản của các thư viện này, nên ghi rõ phiên bản. Cả năm đều có giấy phép thương mại dùng được: Apache 2.0 (AWS SDK, Tika, POI), LGPL/MPL (OpenPDF), SIL OFL (font Liberation). Bài chỉ dùng `JdbcClient`, nên starter `jdbc` (DataSource, transaction) là đủ, không cần JPA.
+
+### 3. Cấu hình và schema
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/files
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=files
+server.port=8090
+
+spring.datasource.url=jdbc:postgresql://localhost:5410/files
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+
+spring.servlet.multipart.max-file-size=5MB
+spring.servlet.multipart.max-request-size=6MB
+spring.mvc.problemdetails.enabled=true
+spring.mvc.async.request-timeout=2m
+
+storage.endpoint=http://localhost:9410
+storage.bucket=sb10-files
+storage.access-key=masteva
+storage.secret-key=masteva-secret
+EOF
+mkdir -p src/main/resources/db/migration
+cat > src/main/resources/db/migration/V1__schema.sql <<'EOF'
+CREATE TABLE stored_files (
+    id            uuid        PRIMARY KEY,
+    original_name text        NOT NULL,
+    content_type  text        NOT NULL,
+    size_bytes    bigint      NOT NULL CHECK (size_bytes > 0),
+    sha256        text        NOT NULL,
+    object_key    text        NOT NULL UNIQUE,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+    id         bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    customer   text        NOT NULL,
+    status     text        NOT NULL,
+    total      bigint      NOT NULL,
+    created_at timestamptz NOT NULL
+);
+EOF
+cat > src/main/resources/db/migration/V2__orders.sql <<'EOF'
+INSERT INTO orders (customer, status, total, created_at)
+SELECT (ARRAY['Nguyễn Văn An', 'Trần Thị Bình', 'Lê Hoàng Chí', 'Phạm Đức Dũng'])[1 + g % 4],
+       CASE WHEN g % 5 = 0 THEN 'CANCELLED' ELSE 'PAID' END,
+       10000 * (1 + g % 97),
+       timestamptz '2026-01-01 00:00+07' + g * interval '5 minutes'
+FROM generate_series(1, 100000) AS g;
+EOF
+```
+
+</Terminal>
+
+- `storage.*` là thuộc tính của riêng ứng dụng, đọc qua một record `@ConfigurationProperties`. Khoá ghi trong file chỉ chấp nhận cho lab; SB6.3 đưa secret ra khỏi code.
+- `V2` sinh 100.000 đơn để báo cáo có kích thước thật. Thời điểm ghi kèm offset `+07` để kết quả không phụ thuộc múi giờ của máy.
+
+### 4. Lưu file: S3Client, kiểm loại, metadata
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/files
+P=src/main/java/vn/masteva/files
+cat > $P/StorageProperties.java <<'EOF'
+package vn.masteva.files;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+@ConfigurationProperties("storage")
+public record StorageProperties(String endpoint, String bucket, String accessKey, String secretKey) {
+}
+EOF
+cat > $P/StorageConfig.java <<'EOF'
+package vn.masteva.files;
+
+import java.net.URI;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+
+@Configuration
+@EnableConfigurationProperties(StorageProperties.class)
+class StorageConfig {
+
+    @Bean
+    S3Client s3Client(StorageProperties p) {
+        return S3Client.builder()
+                .endpointOverride(URI.create(p.endpoint()))
+                .region(Region.US_EAST_1)
+                .credentialsProvider(credentials(p))
+                .forcePathStyle(true)
+                .build();
+    }
+
+    @Bean
+    S3Presigner s3Presigner(StorageProperties p) {
+        return S3Presigner.builder()
+                .endpointOverride(URI.create(p.endpoint()))
+                .region(Region.US_EAST_1)
+                .credentialsProvider(credentials(p))
+                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
+                .build();
+    }
+
+    private static StaticCredentialsProvider credentials(StorageProperties p) {
+        return StaticCredentialsProvider.create(AwsBasicCredentials.create(p.accessKey(), p.secretKey()));
+    }
+}
+EOF
+cat > $P/StoredFile.java <<'EOF'
+package vn.masteva.files;
+
+import java.util.UUID;
+
+public record StoredFile(UUID id, String originalName, String contentType, long sizeBytes,
+        String sha256, String objectKey) {
+}
+EOF
+cat > $P/FileService.java <<'EOF'
+package vn.masteva.files;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.util.HexFormat;
+import java.util.Set;
+import java.util.UUID;
+import org.apache.tika.Tika;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
+import org.springframework.web.ErrorResponseException;
+import org.springframework.web.multipart.MultipartFile;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+
+@Service
+public class FileService {
+    private static final Set<String> ALLOWED = Set.of("image/png", "image/jpeg", "application/pdf");
+
+    private final Tika tika = new Tika();
+    private final S3Client s3;
+    private final S3Presigner presigner;
+    private final JdbcClient jdbc;
+    private final String bucket;
+
+    public FileService(S3Client s3, S3Presigner presigner, JdbcClient jdbc, StorageProperties props) {
+        this.s3 = s3;
+        this.presigner = presigner;
+        this.jdbc = jdbc;
+        this.bucket = props.bucket();
+    }
+
+    public StoredFile upload(MultipartFile file) throws IOException {
+        String type;
+        try (InputStream in = file.getInputStream()) {
+            type = tika.detect(in);                       // đọc magic bytes, bỏ qua tên file
+        }
+        if (!ALLOWED.contains(type)) {
+            throw new ErrorResponseException(HttpStatus.UNSUPPORTED_MEDIA_TYPE,
+                    ProblemDetail.forStatusAndDetail(HttpStatus.UNSUPPORTED_MEDIA_TYPE,
+                            "Nội dung file là " + type + ", chỉ nhận PNG, JPEG, PDF"), null);
+        }
+        UUID id = UUID.randomUUID();
+        String key = "uploads/" + id;                     // không dùng tên người dùng gửi lên làm key
+        MessageDigest sha256 = sha256();
+        try (InputStream in = new DigestInputStream(file.getInputStream(), sha256)) {
+            s3.putObject(b -> b.bucket(bucket).key(key).contentType(type),
+                    RequestBody.fromInputStream(in, file.getSize()));
+        }
+        StoredFile stored = new StoredFile(id, file.getOriginalFilename(), type, file.getSize(),
+                HexFormat.of().formatHex(sha256.digest()), key);
+        jdbc.sql("""
+                INSERT INTO stored_files (id, original_name, content_type, size_bytes, sha256, object_key)
+                VALUES (:id, :originalName, :contentType, :sizeBytes, :sha256, :objectKey)
+                """).paramSource(stored).update();
+        return stored;
+    }
+
+    public URI downloadUrl(UUID id) {
+        StoredFile f = jdbc.sql("SELECT * FROM stored_files WHERE id = ?").param(id)
+                .query(StoredFile.class).optional()
+                .orElseThrow(() -> new ErrorResponseException(HttpStatus.NOT_FOUND));
+        String disposition = ContentDisposition.attachment()
+                .filename(f.originalName(), StandardCharsets.UTF_8).build().toString();
+        return URI.create(presigner.presignGetObject(r -> r
+                .signatureDuration(Duration.ofMinutes(5))
+                .getObjectRequest(g -> g.bucket(bucket).key(f.objectKey())
+                        .responseContentDisposition(disposition)))
+                .url().toString());
+    }
+
+    private static MessageDigest sha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `S3Client` gọi mạng; `S3Presigner` chỉ tính chữ ký. Cả hai cùng endpoint ở lab; production có thể khác nhau (callout Trên production).
+- `RequestBody.fromInputStream(in, size)` stream file lên storage, không đọc cả file vào `byte[]`. `DigestInputStream` tính SHA-256 trên đường đi; mã băm dùng để phát hiện file trùng hay file bị sửa.
+- `ErrorResponseException` mang sẵn status và `ProblemDetail`; handler Problem Details của Spring Boot trả nó thành `application/problem+json`.
+- `.paramSource(stored)` lấy tham số đặt tên từ các component của record.
+- Lab không có đăng nhập, nên ai biết id cũng tải được. Trong ứng dụng thật, `downloadUrl` kiểm người đang gọi có quyền với file này không, trước khi ký (SB6.3 bàn lỗi IDOR).
+
+### 5. Xuất Excel, PDF và controller
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/files
+P=src/main/java/vn/masteva/files
+cat > $P/OrderReport.java <<'EOF'
+package vn.masteva.files;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.lang.management.ManagementFactory;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import org.apache.poi.ss.usermodel.CellStyle;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.Workbook;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OrderReport {
+    private static final Logger log = LoggerFactory.getLogger(OrderReport.class);
+    private static final ZoneId VN = ZoneId.of("Asia/Ho_Chi_Minh");
+
+    private final JdbcClient jdbc;
+
+    public OrderReport(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    @Transactional(readOnly = true)
+    public void excel(String engine, OutputStream out) throws IOException {
+        try (Workbook wb = "xssf".equals(engine) ? new XSSFWorkbook() : new SXSSFWorkbook(100)) {
+            Sheet sheet = wb.createSheet("Đơn hàng");
+            CellStyle dateStyle = wb.createCellStyle();
+            dateStyle.setDataFormat(wb.createDataFormat().getFormat("dd/mm/yyyy hh:mm"));
+            Row header = sheet.createRow(0);
+            String[] titles = {"Mã đơn", "Khách hàng", "Trạng thái", "Tổng tiền", "Thời điểm"};
+            for (int i = 0; i < titles.length; i++) {
+                header.createCell(i).setCellValue(titles[i]);
+            }
+            int[] next = {1};
+            jdbc.sql("SELECT id, customer, status, total, created_at FROM orders ORDER BY id")
+                    .withFetchSize(1000)
+                    .query(rs -> {
+                        Row row = sheet.createRow(next[0]++);
+                        row.createCell(0).setCellValue(rs.getLong("id"));
+                        row.createCell(1).setCellValue(rs.getString("customer"));
+                        row.createCell(2).setCellValue(rs.getString("status"));
+                        row.createCell(3).setCellValue(rs.getLong("total"));
+                        var created = row.createCell(4);
+                        created.setCellValue(rs.getObject("created_at", OffsetDateTime.class)
+                                .atZoneSameInstant(VN).toLocalDateTime());
+                        created.setCellStyle(dateStyle);
+                    });
+            log.info(">> {}: {} dòng, heap sau GC: {} MB", engine, next[0] - 1, usedHeapAfterGcMb());
+            wb.write(out);
+        }
+    }
+
+    // Chỉ để đo trong lab: ép GC rồi đọc heap đang dùng.
+    private static long usedHeapAfterGcMb() {
+        System.gc();
+        return ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed() / (1024 * 1024);
+    }
+}
+EOF
+cat > $P/PdfReport.java <<'EOF'
+package vn.masteva.files;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import org.openpdf.text.Document;
+import org.openpdf.text.Font;
+import org.openpdf.text.PageSize;
+import org.openpdf.text.Paragraph;
+import org.openpdf.text.Phrase;
+import org.openpdf.text.pdf.BaseFont;
+import org.openpdf.text.pdf.PdfPTable;
+import org.openpdf.text.pdf.PdfWriter;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class PdfReport {
+    private static final DateTimeFormatter TIME =
+            DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm").withZone(ZoneId.of("Asia/Ho_Chi_Minh"));
+
+    private final JdbcClient jdbc;
+
+    public PdfReport(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    @Transactional(readOnly = true)
+    public void orders(String font, int limit, OutputStream out) throws IOException {
+        BaseFont base = "builtin".equals(font)
+                ? BaseFont.createFont(BaseFont.HELVETICA, BaseFont.CP1252, BaseFont.NOT_EMBEDDED)
+                : BaseFont.createFont("liberation/LiberationSans-Regular.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED);
+        Font text = new Font(base, 10);
+        try (Document doc = new Document(PageSize.A4)) {
+            PdfWriter.getInstance(doc, out);
+            doc.open();
+            doc.add(new Paragraph("Báo cáo đơn hàng của Nguyễn Văn An", new Font(base, 14)));
+            PdfPTable table = new PdfPTable(new float[] {1, 3, 2, 2, 3});
+            table.setWidthPercentage(100);
+            table.setHeaderRows(1);
+            for (String h : new String[] {"Mã", "Khách hàng", "Trạng thái", "Tổng tiền", "Thời điểm"}) {
+                table.addCell(new Phrase(h, text));
+            }
+            jdbc.sql("SELECT id, customer, status, total, created_at FROM orders ORDER BY id LIMIT :limit")
+                    .param("limit", limit)
+                    .query(rs -> {
+                        table.addCell(new Phrase(String.valueOf(rs.getLong("id")), text));
+                        table.addCell(new Phrase(rs.getString("customer"), text));
+                        table.addCell(new Phrase(rs.getString("status"), text));
+                        table.addCell(new Phrase("%,d".formatted(rs.getLong("total")), text));
+                        table.addCell(new Phrase(TIME.format(rs.getObject("created_at", OffsetDateTime.class)), text));
+                    });
+            doc.add(table);
+        }
+    }
+}
+EOF
+cat > $P/ApiController.java <<'EOF'
+package vn.masteva.files;
+
+import jakarta.validation.constraints.Max;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+
+@RestController
+public class ApiController {
+    private static final MediaType XLSX =
+            MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+
+    private final FileService files;
+    private final OrderReport excel;
+    private final PdfReport pdf;
+
+    public ApiController(FileService files, OrderReport excel, PdfReport pdf) {
+        this.files = files;
+        this.excel = excel;
+        this.pdf = pdf;
+    }
+
+    @PostMapping("/files")
+    public StoredFile upload(@RequestParam("file") MultipartFile file) throws IOException {
+        return files.upload(file);
+    }
+
+    @GetMapping("/files/{id}/download")
+    public ResponseEntity<Void> download(@PathVariable UUID id) {
+        return ResponseEntity.status(302).location(files.downloadUrl(id)).build();
+    }
+
+    @GetMapping("/reports/orders.xlsx")
+    public ResponseEntity<StreamingResponseBody> excel(@RequestParam(defaultValue = "sxssf") String engine) {
+        return attachment("Báo cáo đơn hàng.xlsx", XLSX, out -> excel.excel(engine, out));
+    }
+
+    @GetMapping("/reports/orders.pdf")
+    public ResponseEntity<StreamingResponseBody> pdf(@RequestParam(defaultValue = "embedded") String font,
+            @RequestParam(defaultValue = "500") @Max(5000) int limit) {
+        return attachment("Báo cáo đơn hàng.pdf", MediaType.APPLICATION_PDF, out -> pdf.orders(font, limit, out));
+    }
+
+    private static ResponseEntity<StreamingResponseBody> attachment(String filename, MediaType type,
+            StreamingResponseBody body) {
+        String disposition = ContentDisposition.attachment().filename(filename, StandardCharsets.UTF_8).build().toString();
+        return ResponseEntity.ok().contentType(type).header(HttpHeaders.CONTENT_DISPOSITION, disposition).body(body);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- Một controller cho cả upload lẫn báo cáo, để lab gọn; `attachment(...)` dựng header `Content-Disposition` bằng `ContentDisposition` của Spring.
+- `engine=xssf` chỉ để so sánh trong lab; báo cáo thật không cho client chọn.
+- Cột thời điểm đổi sang giờ Việt Nam trước khi ghi, vì ô ngày của Excel không mang múi giờ.
+- PDF có `@Max(5000)` cho `limit`: một tham số không giới hạn là cửa để một request làm cạn tài nguyên. `font=builtin` dùng Helvetica có sẵn của PDF để thấy lỗi mất chữ ở bước 10.
+- `usedHeapAfterGcMb()` gọi `System.gc()` để số đo chỉ còn đối tượng đang được giữ. Code thật không làm vậy.
+
+### 6. Chạy ứng dụng
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb10/files
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw spring-boot:run -Dspring-boot.run.jvmArguments="-Xmx1g"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "1 - schema"
+o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "2 - orders"
+vn.masteva.files.FilesApplication        : Started FilesApplication in 1.517 seconds (process running for 1.666)
+```
+
+</Expected>
+
+Heap tối đa đặt cố định 1 GB để số đo ở bước 9 không phụ thuộc RAM của máy (mặc định JVM lấy một phần tư RAM).
+
+### 7. Upload: file thật, file giả, file đổi đuôi, file quá lớn
+
+<Terminal where="mac" title="Tab 2: bốn file mẫu">
+
+```bash
+mkdir -p ~/masteva-sb10/samples && cd ~/masteva-sb10/samples
+echo 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d > 'ảnh đại diện.png'
+echo '<svg onload="alert(1)"/>' > avatar.png
+cp 'ảnh đại diện.png' anh.txt
+mkfile 7m big.png
+```
+
+</Terminal>
+
+`ảnh đại diện.png` là ảnh PNG 1×1 thật. `avatar.png` là một đoạn SVG có script, đội lốt đuôi `.png`. `anh.txt` là ảnh PNG mang đuôi `.txt`. `big.png` dài 7 MB toàn byte 0.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/samples
+curl -s -F 'file=@ảnh đại diện.png' localhost:8090/files; echo
+curl -s -F 'file=@avatar.png' localhost:8090/files; echo
+curl -s -F 'file=@anh.txt' localhost:8090/files; echo
+curl -s -i -F 'file=@big.png' localhost:8090/files | grep -E '^HTTP|^\{'
+```
+
+</Terminal>
+
+<Predict question="Ứng dụng nhận những file nào?">
+
+```text
+{"id":"8cf58597-0300-46c7-a700-9ad14b8c5804","originalName":"ảnh đại diện.png","contentType":"image/png","sizeBytes":70,"sha256":"c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77","objectKey":"uploads/8cf58597-0300-46c7-a700-9ad14b8c5804"}
+{"detail":"Nội dung file là text/plain, chỉ nhận PNG, JPEG, PDF","instance":"/files","status":415,"title":"Unsupported Media Type"}
+{"id":"aa052763-2555-4ab1-9ac0-2c3915d98417","originalName":"anh.txt","contentType":"image/png","sizeBytes":70,"sha256":"c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77","objectKey":"uploads/aa052763-2555-4ab1-9ac0-2c3915d98417"}
+HTTP/1.1 100
+HTTP/1.1 413
+{"detail":"Maximum upload size exceeded","instance":"/files","status":413,"title":"Content Too Large"}
+```
+
+- Ảnh thật được nhận; id là UUID ngẫu nhiên, khác trên máy bạn.
+- `avatar.png` bị từ chối dù đuôi là `.png`: Tika đọc nội dung và thấy văn bản. Nếu ứng dụng tin đuôi file rồi phục vụ nó với `Content-Type: image/svg+xml`, đoạn `onload` sẽ chạy trong trình duyệt của người mở.
+- `anh.txt` được nhận và ghi đúng `image/png`: loại file theo nội dung, không theo tên. Hai file cùng SHA-256 vì cùng nội dung.
+- `big.png` bị Spring chặn với `413` trước khi code của bạn chạy. `HTTP/1.1 100` là phản hồi tạm cho header `Expect: 100-continue` mà curl gửi kèm request lớn.
+
+</Predict>
+
+### 8. Object, metadata và presigned URL
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+s3cli s3 ls --recursive s3://sb10-files
+docker exec sb10-pg psql -U postgres -d files -c 'SELECT original_name, content_type, size_bytes, left(sha256, 12) AS sha256, object_key FROM stored_files'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2026-10-09 06:02:17         70 uploads/8cf58597-0300-46c7-a700-9ad14b8c5804
+2026-10-09 06:02:17         70 uploads/aa052763-2555-4ab1-9ac0-2c3915d98417
+  original_name   | content_type | size_bytes |    sha256    |                  object_key
+------------------+--------------+------------+--------------+----------------------------------------------
+ ảnh đại diện.png | image/png    |         70 | c414cd0e204d | uploads/8cf58597-0300-46c7-a700-9ad14b8c5804
+ anh.txt          | image/png    |         70 | c414cd0e204d | uploads/aa052763-2555-4ab1-9ac0-2c3915d98417
+(2 rows)
+```
+
+</Expected>
+
+Thay `ID` bằng id của `ảnh đại diện.png` mà bạn nhận ở bước 7, rồi tải file qua presigned URL:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/samples
+ID=8cf58597-0300-46c7-a700-9ad14b8c5804
+curl -s -L -D - -o downloaded.png localhost:8090/files/$ID/download | grep -i -E '^HTTP|^location|^content-disposition|^content-type'
+shasum -a 256 downloaded.png
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HTTP/1.1 302
+Location: http://localhost:9410/sb10-files/uploads/8cf58597-0300-46c7-a700-9ad14b8c5804?response-content-disposition=attachment%3B%20filename%3D%22anh%20_ai%20dien.png%22%3B%20filename%2A%3DUTF-8%27%27%25E1%25BA%25A3nh%2520%25C4%2591%25E1%25BA%25A1i%2520di%25E1%25BB%2587n.png&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261009T060224Z&X-Amz-SignedHeaders=host&X-Amz-Credential=masteva%2F20261009%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Expires=300&X-Amz-Signature=f81a445a5c005cda71e2378df50fefb59a443db7a03c74c8c9ced7c7142fd7a2
+HTTP/1.1 200 OK
+content-type: image/png
+content-disposition: attachment; filename="anh _ai dien.png"; filename*=UTF-8''%E1%BA%A3nh%20%C4%91%E1%BA%A1i%20di%E1%BB%87n.png
+c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77  downloaded.png
+```
+
+</Expected>
+
+Đọc URL: `X-Amz-Expires=300` là 5 phút, `X-Amz-Credential` chứa access key (không phải secret), `X-Amz-Signature` là chữ ký. Byte tải về có cùng SHA-256 với lúc tải lên. Giờ thử gian lận:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+U=$(curl -s -o /dev/null -w '%{redirect_url}' localhost:8090/files/$ID/download)
+curl -s "${U/X-Amz-Expires=300/X-Amz-Expires=3000}" | grep -o '<Code>[^<]*'
+curl -s localhost:9410/sb10-files/uploads/$ID | grep -o '<Code>[^<]*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+<Code>SignatureDoesNotMatch
+<Code>AccessDenied
+```
+
+</Expected>
+
+Kéo hạn từ 300 lên 3000 giây làm chữ ký sai. Gọi thẳng object không kèm chữ ký thì bị từ chối vì bucket private.
+
+<Check id="sb10.1.lab-upload">Tái hiện được việc chặn file đội lốt đuôi `.png`, file quá kích thước, tìm thấy object trong kho S3 và metadata trong PostgreSQL, và giải thích được vì sao presigned URL bị sửa thì không dùng được.</Check>
+
+### 9. Excel 100.000 dòng: SXSSF và XSSF
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/samples
+curl -s -D - -o orders-sxssf.xlsx localhost:8090/reports/orders.xlsx | grep -i -E '^HTTP|^content-disposition|^transfer-encoding'
+curl -s -o orders-xssf.xlsx -w 'xssf %{http_code} %{time_total}s\n' 'localhost:8090/reports/orders.xlsx?engine=xssf'
+wc -c orders-*.xlsx
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HTTP/1.1 200
+Content-Disposition: attachment; filename="Bao cao _on hang.xlsx"; filename*=UTF-8''B%C3%A1o%20c%C3%A1o%20%C4%91%C6%A1n%20h%C3%A0ng.xlsx
+Transfer-Encoding: chunked
+xssf 200 5.706054s
+ 2773479 orders-sxssf.xlsx
+ 2632431 orders-xssf.xlsx
+ 5405910 total
+```
+
+</Expected>
+
+Tab 1 in (đã bỏ phần thời gian và tên thread; số MB có thể lệch vài đơn vị):
+
+<Expected>
+
+```text
+vn.masteva.files.OrderReport             : >> sxssf: 100000 dòng, heap sau GC: 30 MB
+vn.masteva.files.OrderReport             : >> xssf: 100000 dòng, heap sau GC: 401 MB
+```
+
+</Expected>
+
+- `Transfer-Encoding: chunked`: server không biết trước độ dài, gửi dần từng khúc.
+- Khoảng 30 MB là phần nền của ứng dụng Spring Boot cộng 100 dòng của cửa sổ; XSSF giữ thêm khoảng 370 MB cho 500.000 ô. Bộ nhớ của XSSF tăng theo số ô: theo tỷ lệ này, 1 triệu dòng cần cỡ 3,7 GB. Thời gian tuyệt đối thay đổi theo máy và tải lúc chạy; số heap thì ổn định giữa các lần chạy.
+- `curl -J` (lưu theo tên server gửi) sẽ lưu file thành `Bao cao _on hang.xlsx`, vì curl chỉ đọc `filename`; trình duyệt hiện đại đọc `filename*` và giữ tên tiếng Việt. Mở file bằng Excel hoặc Numbers (`open orders-sxssf.xlsx`) để thấy tên sheet và cột thời điểm.
+- Thư mục `$TMPDIR/poifiles` sau mỗi lần xuất vẫn trống: `close()` đã xoá file tạm của SXSSF.
+
+### 10. PDF có tiếng Việt
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/samples
+for f in builtin embedded; do
+  curl -s -o orders-$f.pdf -w "$f %{http_code} %{size_download}\n" "localhost:8090/reports/orders.pdf?font=$f&limit=200"
+done
+curl -s 'localhost:8090/reports/orders.pdf?limit=100000'; echo
+open orders-builtin.pdf orders-embedded.pdf
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+builtin 200 10479
+embedded 200 27536
+{"detail":"Validation failure","instance":"/reports/orders.pdf","status":400,"title":"Bad Request"}
+```
+
+</Expected>
+
+<Predict question="Helvetica có sẵn trong mọi trình đọc PDF. Tiêu đề 'Báo cáo đơn hàng của Nguyễn Văn An' trong file builtin còn lại gì?">
+
+Preview mở hai file. Trong `orders-builtin.pdf`, tiêu đề thành `Báo cáo n hàng ca Nguyn Vn An`, tên khách `Trần Thị Bình` thành `Trn Th Bình`, cột `Trạng thái` thành `Trng thái`. Các ký tự có trong CP1252 (`á`, `à`, `ì`) còn lại; `đ`, `ơ`, `ủ`, `ễ`, `ạ`, `ầ` biến mất mà không có lỗi hay cảnh báo nào. `orders-embedded.pdf` giữ đủ chữ. Đơn 1 tạo lúc `2026-01-01 00:00+07` cộng 5 phút, hiển thị đúng `00:05` giờ Việt Nam.
+
+File nhúng font nặng hơn khoảng 17 KB: OpenPDF chỉ nhúng các glyph thực sự dùng (subset), không nhúng cả file font 400 KB. Request `limit=100000` bị `@Max(5000)` chặn với `400`.
+
+</Predict>
+
+<Check id="sb10.1.lab-pdf">Xuất được PDF tiếng Việt bằng font nhúng, thấy được chữ bị mất khi dùng font có sẵn của PDF, và giải thích được vì sao.</Check>
+
+### 11. Cùng báo cáo XSSF với heap 256 MB
+
+Heap 256 MB là mức hay gặp của một container nhỏ. Dừng ứng dụng (Ctrl+C ở tab 1) và chạy lại với heap đó. Cờ `-XX:+ExitOnOutOfMemoryError` (SB11.3) làm JVM thoát ngay khi gặp `OutOfMemoryError`, để kết quả của bước này lặp lại được:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+./mvnw spring-boot:run -Dspring-boot.run.jvmArguments="-Xmx256m -XX:+ExitOnOutOfMemoryError"
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -o /dev/null -w 'sxssf %{http_code}\n' localhost:8090/reports/orders.xlsx
+curl -s -o /dev/null -w 'xssf %{http_code} %{time_total}s\n' 'localhost:8090/reports/orders.xlsx?engine=xssf'
+```
+
+</Terminal>
+
+<Predict question="SXSSF cần khoảng 30 MB, XSSF khoảng 400 MB. Với heap 256 MB, chuyện gì xảy ra?">
+
+```text
+sxssf 200
+xssf 000 7.569975s
+```
+
+Tab 1:
+
+```text
+vn.masteva.files.OrderReport             : >> sxssf: 100000 dòng, heap sau GC: 29 MB
+Terminating due to java.lang.OutOfMemoryError: Java heap space
+```
+
+SXSSF vẫn chạy. XSSF làm heap đầy, JVM thoát, `curl` nhận kết nối bị đóng không có phản hồi (mã `000`).
+
+Không có cờ đó, triệu chứng mỗi lần một khác: request XSSF có thể nhận `500` hay `503`, request sau đó có thể vẫn chạy, có thể treo, hoặc nhận `500` với `ExceptionInInitializerError` ở một chỗ không liên quan. Điểm chung là tiến trình còn sống nhưng đã hỏng, vì một thread bất kỳ có thể đã chết giữa chừng. Stack trace của `OutOfMemoryError` cũng chỉ là nơi cấp phát đúng lúc heap đầy (trong một lần chạy là `SharedStringsTable.addEntry`, lần khác là một chỗ khác); thủ phạm là cây đối tượng của XSSF đang giữ bộ nhớ, như J12 đã dạy cách tìm bằng heap dump.
+
+</Predict>
+
+<Check id="sb10.1.lab-excel">Đo được heap của SXSSF và XSSF cho cùng một báo cáo, tái hiện được `OutOfMemoryError` khi heap nhỏ, và giải thích được vì sao stack trace của nó không chỉ ra thủ phạm.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `pull access denied for minio/minio`: ví dụ cũ dùng MinIO; image cộng đồng không còn, dùng RustFS như bước 1.
+- `S3Exception: The specified bucket does not exist`: chưa chạy `s3cli s3 mb` ở bước 1, hoặc tên bucket trong `storage.bucket` khác.
+- `s3cli` báo `Could not connect to the endpoint URL`: RustFS chưa chạy, hoặc Docker của bạn không có `host.docker.internal` (Docker trên Linux cần thêm `--add-host=host.docker.internal:host-gateway`).
+- PutObject bị từ chối với lỗi về checksum ở một dịch vụ tương thích S3 khác: từ khoảng bản 2.30, AWS SDK v2 mặc định tính và gửi checksum cho mọi request; dịch vụ chưa hỗ trợ thì đặt `requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED)` khi dựng `S3Client`.
+- `SignatureDoesNotMatch` khi tải bằng URL chưa sửa gì: endpoint của `S3Presigner` khác host mà trình duyệt gọi, hoặc một proxy ở giữa đổi header `Host`.
+- Excel nhận `503` sau đúng 30 giây: thiếu `spring.mvc.async.request-timeout`.
+- PDF báo không tìm thấy `liberation/LiberationSans-Regular.ttf`: thiếu dependency `openpdf-fonts-extra`.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Giữ container `sb10-pg` cho các bài sau của chặng. RustFS chỉ dùng trong bài này:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá container RustFS cùng mọi object trong đó.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker rm -f sb10-rustfs
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Trình duyệt tải thẳng file lên storage bằng presigned PUT. Làm sao vẫn chặn file quá lớn và file sai loại?">
+
+Presigned PUT ký phương thức, bucket, key và hạn; nếu không ký thêm header thì client gửi bao nhiêu byte cũng được. Có ba lớp kiểm tra. Lúc ký: ký kèm `Content-Length` và `Content-Type` mà client khai, để storage từ chối body khác cỡ; hoặc dùng presigned POST với policy `content-length-range`. Sau khi tải: client gọi API "xác nhận" của ứng dụng; ứng dụng `HeadObject` để biết kích thước thật, đọc vài KB đầu bằng `GetObject` có `Range` để kiểm magic bytes, rồi mới ghi metadata. Đặt object mới vào tiền tố `incoming/` có lifecycle rule tự xoá sau một ngày, và chỉ chuyển sang `uploads/` khi đã xác nhận. Cách này đổi sự đơn giản của bước 7 lấy việc file lớn không chiếm thread và băng thông của ứng dụng.
+
+</Reveal>
+
+<Reveal title="Người dùng cần báo cáo 2 triệu dòng. Tăng heap có phải cách?">
+
+Không. Excel chỉ chứa 1.048.576 dòng mỗi sheet, và một request HTTP chạy nhiều phút sẽ đụng timeout của proxy, load balancer và trình duyệt. Cách bền vững: request chỉ tạo một job (bảng `report_jobs` hoặc Spring Batch như SB9.4), job ghi file vào object storage bằng SXSSF hoặc CSV, xong thì gửi email chứa presigned URL (SB10.2). Thêm giới hạn số job đồng thời cho mỗi người để một người bấm mười lần không làm nghẽn cả hệ thống.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết code gọi S3 API, cấu hình presigned URL, hay khung báo cáo POI và OpenPDF. AI hay viết code cho AWS SDK 1.x (`AmazonS3ClientBuilder`) hoặc OpenPDF cũ (`com.lowagie`), hay kiểm loại file bằng `file.getContentType()` (giá trị client tự khai), hay dùng `XSSFWorkbook` cho mọi báo cáo, hay ghép tên file thẳng vào header `Content-Disposition`, và hay đề xuất iText mà không nhắc giấy phép AGPL. Kiểm lại bằng chính lab: upload `avatar.png` giả, đo heap với 100.000 dòng, mở PDF xem chữ có dấu còn không.
+
+</Callout>
+
+<Callout kind="link">
+
+SB1.3 dựng Problem Details mà bài này dùng cho `413` và `415`. SB3.2 giới thiệu `JdbcClient` và Flyway. SB6.3 bàn kiểm quyền theo đối tượng (IDOR) và đưa khoá storage ra khỏi code. SB9.4 chạy báo cáo lớn thành job nền. SB10.2 gửi email kèm link tải. SB11.3 đặt giới hạn bộ nhớ cho container và các cờ JVM như `ExitOnOutOfMemoryError`.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb10.1.mastery-upload">Tự viết được endpoint upload có giới hạn kích thước, kiểm loại theo nội dung với danh sách cho phép, lưu object với key do server sinh và metadata trong PostgreSQL, rồi phát presigned URL có hạn ngắn để tải.</Check>
+
+<Check id="sb10.1.mastery-report">Tự viết được báo cáo Excel bằng SXSSF đọc database theo luồng, đo được heap của nó, và báo cáo PDF tiếng Việt với font nhúng và tên file đúng RFC 6266.</Check>
+
+<Check id="sb10.1.mastery-tradeoff">Giải thích được cho đồng đội khi nào upload qua ứng dụng, khi nào dùng presigned PUT, và khi nào báo cáo phải chuyển thành job nền.</Check>
+
+</Mastery>

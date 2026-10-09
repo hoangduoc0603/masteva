@@ -1,0 +1,885 @@
+---
+title: Đo tải bằng k6 và tìm điểm nghẽn bằng metric và JFR
+description: Viết bài đo tải k6 có ngưỡng đạt hoặc trượt, thấy coordinated omission bằng số thật khi so mô hình closed với open, rồi đẩy service Spring tới giới hạn, đọc metric Micrometer và JFR để chỉ ra một khoá đang nghẽn, sửa và đo lại.
+id: sb12.1
+step: sb12
+prerequisites: [j17.4]
+topics: [sb12.do-tai, sb12.diem-nghen]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    tomcat: 11.0.24
+    docker: 29.8.0
+    postgresql: "18.6"
+    k6: 2.3.0
+---
+
+<Goal>
+
+Đo một service Spring Boot dưới tải theo cách cho ra con số tin được, rồi lần từ con số đó tới đúng dòng code gây chậm. Học xong bài này, bạn giải thích được:
+
+- Vì sao bài đo tải báo p99 11 ms trong khi người dùng thật thấy request 500 ms, trên cùng một service ở cùng một lưu lượng.
+- Vì sao service kẹt ở khoảng 320 request/giây dù máy có 10 nhân, và vì sao thêm thread không giúp gì.
+- Vì sao p95 do chính ứng dụng đo (1,2 giây) thấp hơn hẳn p95 client thấy (3,5 giây).
+
+</Goal>
+
+<Knowledge>
+
+### Đo cái gì
+
+Một bài đo tải trả lời câu hỏi: **ở lưu lượng X, độ trễ là bao nhiêu, và có bao nhiêu lỗi**. Ba đại lượng:
+
+| Đại lượng | Nghĩa | Lưu ý |
+|---|---|---|
+| **Throughput** (thông lượng) | Số request xử lý xong mỗi giây | Là kết quả, không phải thứ bạn đặt; nếu thấp hơn lưu lượng gửi vào, hàng đợi đang dài ra |
+| **Latency** (độ trễ) theo percentile | p50, p95, p99: giá trị mà 50%, 95%, 99% request nhanh hơn | Bài SB8.2 đã giải thích vì sao trung bình che mất request chậm |
+| **Tỉ lệ lỗi** | Phần request lỗi hoặc quá hạn | Service "nhanh" vì trả 500 ngay lập tức không phải service nhanh |
+
+Độ trễ không tăng đều theo tải. Khi một tài nguyên (CPU, khoá, pool kết nối, thread) gần bận 100%, request bắt đầu xếp hàng, và độ trễ tăng vọt ở "khuỷu":
+
+```text
+ độ trễ p95
+   |                                         *
+   |                                       *
+   |                                     *      <- quá khuỷu: hàng đợi dài ra
+   |                                  *            mãi, độ trễ tính bằng giây
+   |                             *
+   |  *    *    *    *    *   *                 <- dưới khuỷu: gần như phẳng
+   +-------------------------------------------- lưu lượng gửi vào (req/s)
+                                 ^ tài nguyên nghẽn chạm ~100%
+```
+
+Mục tiêu của đo tải là biết khuỷu nằm ở đâu và tài nguyên nào tạo ra nó.
+
+### Mô hình closed và open
+
+Công cụ đo tải sinh lưu lượng theo một trong hai mô hình:
+
+```text
+ CLOSED: N người dùng ảo (VU), mỗi người gửi request rồi CHỜ trả lời mới gửi tiếp
+   VU1: [req]---chờ---[resp] [req]---chờ---[resp] [req]...
+   VU2: [req]---chờ---[resp] [req]...
+   server chậm -> VU gửi ít đi -> tải tự giảm theo server
+
+ OPEN: request đến theo nhịp cố định, bất kể request trước đã xong chưa
+   t=0ms  t=10ms  t=20ms  t=30ms ...  (100 req/s)
+   server chậm -> request vẫn đến -> xếp hàng như người dùng thật
+```
+
+| | Closed | Open |
+|---|---|---|
+| Bạn đặt | Số VU (người dùng đồng thời) | Số request mỗi giây |
+| k6 executor | `constant-vus`, `ramping-vus` | `constant-arrival-rate`, `ramping-arrival-rate` |
+| Gatling | `constantConcurrentUsers` | `constantUsersPerSec` |
+| Giống hệ thống thật nào | Số client cố định có vòng lặp: worker nội bộ, kết nối pool từ service khác | Người dùng Internet, webhook, lưu lượng từ load balancer |
+
+Người dùng Internet không chờ người khác xong mới bấm. Với API công khai, mô hình open mới phản ánh đúng. Khi dùng open, k6 tự tạo thêm VU để giữ nhịp (tới `maxVUs`); nếu hết VU, nó bỏ lượt và đếm vào `dropped_iterations`. Con số này khác 0 nghĩa là chính công cụ đo không theo kịp nhịp, thường vì server đã quá chậm.
+
+### Coordinated omission
+
+Mô hình closed có một lỗi đo kinh điển, tên là **coordinated omission** (bỏ sót có phối hợp): khi server khựng lại, công cụ đo cũng ngừng gửi, nên nó bỏ sót đúng những request lẽ ra bị chậm.
+
+```text
+ server khựng 600 ms (một khoá bị giữ)
+                      |<------- 600 ms ------->|
+ closed, 2 VU:  VU1 [====== 1 request chậm =====]       chỉ 2 request bị ghi nhận chậm
+                VU2 [====== 1 request chậm =====]
+ open, 110 req/s: | | | | | | | | | | | | | | |        khoảng 66 request đến trong lúc khựng,
+                  mỗi request chờ 600, 590, 580... ms   tất cả đều bị ghi nhận chậm
+```
+
+Cùng một service, cùng khoảng 110 request/giây, closed báo p99 vài mili giây còn open báo p99 hơn nửa giây. Bước 5 của lab cho bạn thấy đúng hai con số này. Không phải k6 "sai": closed đo đúng thứ nó được thiết kế để đo, chỉ là không phải thứ người dùng trải qua.
+
+<Check id="sb12.1.coordinated-omission">Phân biệt được mô hình closed và open, giải thích được coordinated omission bằng ví dụ một lần server khựng, và chọn được executor k6 phù hợp cho API công khai.</Check>
+
+### Ngưỡng và warm-up
+
+**Threshold** (ngưỡng) biến bài đo thành phép thử đạt hoặc trượt: `http_req_duration: ['p(95)<50']` nghĩa là p95 phải dưới 50 ms. Khi có ngưỡng trượt, k6 in dấu `✗` và thoát với mã 99, nên CI có thể chặn một thay đổi làm chậm service.
+
+Bài J12.2 đã giải thích warm-up: vài giây đầu, JVM còn đang thông dịch và biên dịch JIT, Hibernate và Jackson còn nạp class. Đo luôn cả giai đoạn đó thì con số phụ thuộc vào việc bạn vừa khởi động lại ứng dụng hay chưa. Cách làm trong k6: chạy hai **scenario** nối nhau, `warmup` rồi `measure`, và chỉ đặt ngưỡng trên `{scenario:measure}`.
+
+| Quy tắc | Vì sao |
+|---|---|
+| Ngưỡng theo percentile, không theo trung bình | Trung bình che request chậm |
+| Có ngưỡng cho tỉ lệ lỗi | Service lỗi nhanh trông như service nhanh |
+| Bỏ giai đoạn warm-up khỏi ngưỡng | Đo hệ thống ở trạng thái ổn định, so sánh được giữa các lần |
+| Cùng máy, cùng cấu hình, cùng dữ liệu cho mọi lần so sánh | Con số tuyệt đối trên laptop không nói gì về production; chỉ chênh lệch trước và sau là có nghĩa |
+
+### k6 hay Gatling
+
+| | k6 | Gatling |
+|---|---|---|
+| Viết kịch bản bằng | JavaScript | Java, Kotlin, Scala (DSL) |
+| Chạy | Một file thực thi, hoặc image `grafana/k6` | Maven plugin `gatling-maven-plugin`, goal `gatling:test` |
+| Báo cáo | Tóm tắt trong terminal, xuất JSON, Prometheus, Grafana | Báo cáo HTML chi tiết theo thời gian |
+| Hợp với | Đội nhiều ngôn ngữ, chạy nhanh trong CI | Đội Java muốn kịch bản nằm cùng repo và cùng ngôn ngữ |
+
+Bài này dùng k6 chạy trong Docker để không phải cài gì thêm. Các khái niệm (open, closed, threshold, warm-up) giống hệt bên Gatling.
+
+<Check id="sb12.1.thresholds-warmup">Viết được ngưỡng k6 cho percentile và tỉ lệ lỗi, và giải thích được vì sao tách scenario warm-up khỏi scenario đo.</Check>
+
+### Tìm điểm nghẽn: đi theo hàng đợi
+
+Một request đi qua nhiều chỗ có thể phải chờ. Điểm nghẽn là chỗ hàng đợi dài nhất:
+
+```text
+ k6 --TCP--> Tomcat acceptor --> hàng đợi executor --> thread Tomcat (tối đa 200)
+                                 (không thấy trong     |
+                                  http.server.requests) v
+                                              khoá synchronized  --> jvm.threads.states{blocked}
+                                                       |
+                                              HikariCP (10 kết nối) --> hikaricp.connections.pending
+                                                       |
+                                              PostgreSQL
+```
+
+| Câu hỏi | Metric Micrometer (qua `/actuator/prometheus`) | Dấu hiệu nghẽn |
+|---|---|---|
+| Thread Tomcat còn không? | `tomcat_threads_busy_threads` so với `tomcat_threads_config_max_threads` | Bận bằng max: request mới xếp hàng trước khi vào ứng dụng |
+| Thread có đang chờ khoá? | `jvm_threads_states_threads{state="blocked"}` | Hàng trăm thread `BLOCKED` |
+| Pool kết nối có cạn? | `hikaricp_connections_pending` | Lớn hơn 0 kéo dài (SB3.3) |
+| Request trong ứng dụng mất bao lâu? | `http_server_requests_seconds{quantile=...}` | Tính từ lúc thread Tomcat bắt đầu xử lý; **không** tính thời gian xếp hàng trước đó |
+
+Metric cho biết **tài nguyên nào** nghẽn. Muốn biết **dòng code nào**, cần profiler. Bài J12.3 đã dạy JFR và async-profiler để tìm code tốn CPU và rò rỉ bộ nhớ; ở đây dùng thêm hai thứ của JFR cho bài toán khoá:
+
+- Sự kiện `jdk.JavaMonitorEnter`: một thread phải chờ vào khối `synchronized` lâu hơn ngưỡng (20 ms với cấu hình `default`, 10 ms với `profile`). Xem gộp theo chỗ trong code bằng `jfr view contention-by-site`.
+- `jfr print --events jdk.ExecutionSample --stack-depth 30` in cả stack của từng mẫu CPU; đếm số mẫu có method của bạn để biết phần CPU "bao gồm" của nó, thứ `hot-methods` (chỉ đếm method ở đỉnh stack) không cho thấy.
+
+async-profiler có chế độ `lock` cho cùng câu hỏi và `wall` cho thread đang chờ I/O; trên Linux, đó là công cụ nên thử tiếp khi JFR chưa đủ.
+
+<Callout kind="production">
+
+Một service ký báo giá bằng HMAC. Để "an toàn", lập trình viên dẫn xuất khoá ký từ secret bằng PBKDF2 ở mỗi request, và vì đối tượng `Mac` dùng chung không thread-safe, họ đánh dấu cả method là `synchronized`. Ở tải thử nghiệm 50 request/giây mọi thứ ổn. Ngày khuyến mãi, lưu lượng lên 400 request/giây: CPU cả cụm chỉ khoảng 10%, nhưng p99 vượt 3 giây và health check bắt đầu timeout. Thêm instance không giúp được bao nhiêu, vì mỗi instance chỉ xử lý được một request ký tại một thời điểm. Đây chính là service trong lab của bài này.
+
+</Callout>
+
+<Check id="sb12.1.queues-metrics">Kể được các hàng đợi một request đi qua trong service Spring MVC và metric cho từng hàng đợi, và giải thích được vì sao `http.server.requests` không thấy thời gian chờ thread Tomcat.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Open and closed models (k6)](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/): khác biệt hai mô hình và cảnh báo về coordinated omission.
+- [Thresholds (k6)](https://grafana.com/docs/k6/latest/using-k6/thresholds/): cú pháp ngưỡng, ngưỡng theo tag và scenario, `abortOnFail`.
+- [Gatling Maven Plugin](https://docs.gatling.io/integrations/build-tools/maven-plugin/): nếu đội bạn muốn viết kịch bản tải bằng Java và chạy bằng `mvn gatling:test`.
+- [Metrics (Spring Boot)](https://docs.spring.io/spring-boot/reference/actuator/metrics.html): mục "Supported Metrics and Meters" liệt kê metric JVM, Tomcat, HikariCP và `http.server.requests`.
+- [The jfr Command](https://docs.oracle.com/en/java/javase/25/docs/specs/man/jfr.html): các lệnh `view`, `print`, `summary` và danh sách view có sẵn.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25, Docker đang chạy, `curl`, `unzip`. Mở **ba tab Terminal**: tab 1 chạy ứng dụng, tab 2 chạy k6, tab 3 đọc metric và JFR trong lúc tải đang chạy. Ứng dụng nghe ở cổng **8092**, PostgreSQL ở **5412**. k6 chạy trong container, gọi ứng dụng trên máy bạn qua tên `host.docker.internal` của Docker Desktop.
+
+Số đo trong bài lấy trên `Apple M1 Pro` 10 nhân, 16 GB RAM, Docker Desktop cấp 6 CPU, với k6 và ứng dụng cùng chạy trên một máy. Con số tuyệt đối trên máy bạn sẽ khác; điều cần thấy là chênh lệch giữa các lần đo và chỗ con số thay đổi đột ngột.
+
+### 1. PostgreSQL và project
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+mkdir -p ~/masteva-sb12/k6 && cd ~/masteva-sb12
+docker run -d --name sb12-pg -e POSTGRES_PASSWORD=masteva -e POSTGRES_DB=shop \
+  -p 5412:5432 postgres:18
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=perf \
+  -d name=perf -d packageName=vn.masteva.perf \
+  -d dependencies=web,data-jpa,postgresql,actuator,prometheus -o perf.zip
+unzip -q perf.zip -d perf && cd perf
+grep -E '<artifactId>(spring-boot-starter-(actuator|webmvc|data-jpa)|micrometer-registry-prometheus|postgresql)</artifactId>' pom.xml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+			<artifactId>spring-boot-starter-actuator</artifactId>
+			<artifactId>spring-boot-starter-data-jpa</artifactId>
+			<artifactId>spring-boot-starter-webmvc</artifactId>
+			<artifactId>micrometer-registry-prometheus</artifactId>
+			<artifactId>postgresql</artifactId>
+```
+
+</Expected>
+
+### 2. Service báo giá
+
+Cấu hình, bảng và dữ liệu mẫu: 100 sản phẩm, một phần có giảm giá.
+
+<Terminal where="mac" title="Tab 2: cấu hình và SQL">
+
+```bash
+cd ~/masteva-sb12/perf
+R=src/main/resources
+cat > $R/application.properties <<'EOF'
+spring.application.name=perf
+server.port=8092
+
+spring.datasource.url=jdbc:postgresql://localhost:5412/shop
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+spring.sql.init.mode=always
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+
+server.tomcat.mbeanregistry.enabled=true
+management.endpoints.web.exposure.include=health,metrics,prometheus
+management.metrics.distribution.percentiles.http.server.requests=0.5,0.95,0.99
+
+app.signing-secret=lab-secret-khong-dung-tren-production
+EOF
+cat > $R/schema.sql <<'EOF'
+CREATE TABLE IF NOT EXISTS product (
+    id         bigint PRIMARY KEY,
+    sku        text   NOT NULL UNIQUE,
+    name       text   NOT NULL,
+    base_price bigint NOT NULL
+);
+CREATE TABLE IF NOT EXISTS discount (
+    sku     text PRIMARY KEY,
+    percent int  NOT NULL
+);
+EOF
+cat > $R/data.sql <<'EOF'
+INSERT INTO product (id, sku, name, base_price)
+SELECT g, 'SKU-' || g, 'Sản phẩm ' || g, 10000 * g FROM generate_series(1, 100) AS g
+ON CONFLICT DO NOTHING;
+INSERT INTO discount (sku, percent)
+SELECT 'SKU-' || g, 5 + g % 20 FROM generate_series(1, 100, 3) AS g
+ON CONFLICT DO NOTHING;
+EOF
+```
+
+</Terminal>
+
+- `server.tomcat.mbeanregistry.enabled=true` bật MBean của Tomcat; thiếu nó, Micrometer không có metric `tomcat.threads.*`.
+- `percentiles` cho `http.server.requests` tính sẵn p50, p95, p99 trong ứng dụng để đọc ngay. Bài SB8.2 đã so sánh cách này với histogram; khi chạy nhiều instance, dùng `percentiles-histogram` để Prometheus gộp được.
+- `spring.sql.init.mode=always` chạy `schema.sql` và `data.sql` mỗi lần khởi động; câu lệnh viết kiểu `IF NOT EXISTS`, `ON CONFLICT DO NOTHING` nên chạy lại không lỗi. Bài SB3.2 dùng Flyway cho việc này; lab rút gọn để tập trung vào hiệu năng.
+
+Code: entity, repository, controller, và `PricingService` mang hai lỗi hiệu năng có chủ đích.
+
+<Terminal where="mac" title="Tab 2: mã nguồn">
+
+```bash
+cd ~/masteva-sb12/perf
+P=src/main/java/vn/masteva/perf
+cat > $P/Product.java <<'EOF'
+package vn.masteva.perf;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+
+@Entity
+public class Product {
+    @Id
+    private Long id;
+    private String sku;
+    private String name;
+    private long basePrice;
+
+    protected Product() {
+    }
+
+    public String getSku() { return sku; }
+    public long getBasePrice() { return basePrice; }
+}
+EOF
+cat > $P/ProductRepository.java <<'EOF'
+package vn.masteva.perf;
+
+import java.util.Optional;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProductRepository extends JpaRepository<Product, Long> {
+
+    Optional<Product> findBySku(String sku);
+}
+EOF
+cat > $P/QuoteController.java <<'EOF'
+package vn.masteva.perf;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+public class QuoteController {
+    private final ProductRepository products;
+    private final PricingService pricing;
+
+    public QuoteController(ProductRepository products, PricingService pricing) {
+        this.products = products;
+        this.pricing = pricing;
+    }
+
+    @GetMapping("/api/quote/{sku}")
+    public PricingService.Quote quote(@PathVariable String sku) throws Exception {
+        Product p = products.findBySku(sku)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+        return pricing.quote(p);
+    }
+}
+EOF
+cat > $P/PricingService.java <<'EOF'
+package vn.masteva.perf;
+
+import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;
+import java.util.Map;
+import java.util.stream.Collectors;
+import javax.crypto.Mac;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+@Service
+public class PricingService {
+    private final JdbcClient jdbc;
+    private final char[] secret;
+    private final Mac mac;                       // Mac không thread-safe: dùng chung nên phải khoá
+    private Map<String, Integer> discounts = Map.of();
+
+    public PricingService(JdbcClient jdbc, @Value("${app.signing-secret}") String secret) throws Exception {
+        this.jdbc = jdbc;
+        this.secret = secret.toCharArray();
+        this.mac = Mac.getInstance("HmacSHA256");
+    }
+
+    public record Quote(String sku, long price, String signature) {
+    }
+
+    public synchronized Quote quote(Product p) throws Exception {
+        long price = p.getBasePrice() * (100 - discounts.getOrDefault(p.getSku(), 0)) / 100;
+        mac.init(signingKey());                  // dẫn xuất lại khoá ở MỌI request
+        byte[] sig = mac.doFinal((p.getSku() + ":" + price).getBytes(StandardCharsets.UTF_8));
+        return new Quote(p.getSku(), price, HexFormat.of().formatHex(sig, 0, 8));
+    }
+
+    private SecretKeySpec signingKey() throws Exception {
+        var spec = new PBEKeySpec(secret, "masteva".getBytes(StandardCharsets.UTF_8), 20_000, 256);
+        byte[] key = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+        return new SecretKeySpec(key, "HmacSHA256");
+    }
+
+    @Scheduled(fixedDelay = 5_000)
+    public synchronized void reloadDiscounts() {
+        // bảng giảm giá lấy từ một truy vấn chậm khoảng 600 ms, chạy trong lúc giữ khoá
+        discounts = jdbc.sql("SELECT sku, percent FROM discount, pg_sleep(0.6)")
+                .query((rs, n) -> Map.entry(rs.getString(1), rs.getInt(2)))
+                .list().stream()
+                .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey, Map.Entry::getValue));
+    }
+}
+EOF
+perl -0pi -e 's/(import org.springframework.boot.autoconfigure.SpringBootApplication;)/$1\nimport org.springframework.scheduling.annotation.EnableScheduling;/; s/\@SpringBootApplication\n/\@SpringBootApplication\n\@EnableScheduling\n/' $P/PerfApplication.java
+```
+
+</Terminal>
+
+Hai lỗi nằm trong `PricingService`, và lab sẽ tìm ra chúng bằng số đo chứ không bằng cách đọc code:
+
+- `quote` là `synchronized` và mỗi lần gọi chạy PBKDF2 20.000 vòng (khoảng 3 ms CPU): mọi request ký báo giá đi qua một cửa duy nhất.
+- `reloadDiscounts` chạy mỗi 5 giây, giữ **cùng khoá đó** trong lúc chờ một truy vấn 600 ms (`pg_sleep(0.6)` đóng vai truy vấn báo cáo chậm).
+
+### 3. Chạy ứng dụng
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb12/perf
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw -q -DskipTests package && java -jar target/perf-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+Lần đầu, Maven Wrapper tải Maven 3.9.16 và các thư viện. Khi thấy `Started PerfApplication`, thử ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s localhost:8092/api/quote/SKU-7; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"sku":"SKU-7","price":61600,"signature":"18979800a0e10888"}
+```
+
+</Expected>
+
+Giá 70.000 giảm 12%. `signature` giống hệt trên máy bạn vì khoá, dữ liệu và thuật toán đều cố định.
+
+### 4. Đo theo mô hình closed
+
+Kịch bản đầu tiên: 2 VU, mỗi VU gửi request, chờ trả lời, nghỉ 10 ms, lặp lại trong 30 giây. Ngưỡng: p95 dưới 50 ms, p99 dưới 200 ms, lỗi dưới 1%.
+
+<Terminal where="mac" title="Tab 2: k6/closed.js">
+
+```bash
+cd ~/masteva-sb12
+cat > k6/closed.js <<'EOF'
+import http from 'k6/http';
+import { sleep } from 'k6';
+
+const BASE = __ENV.BASE || 'http://host.docker.internal:8092';
+
+export const options = {
+  scenarios: {
+    closed: { executor: 'constant-vus', vus: 2, duration: '30s' },
+  },
+  thresholds: {
+    http_req_duration: ['p(95)<50', 'p(99)<200'],
+    http_req_failed: ['rate<0.01'],
+  },
+  summaryTrendStats: ['avg', 'p(50)', 'p(95)', 'p(99)', 'max'],
+};
+
+export default function () {
+  const sku = 'SKU-' + (1 + Math.floor(Math.random() * 100));
+  http.get(`${BASE}/api/quote/${sku}`);
+  sleep(0.01);
+}
+EOF
+docker run --rm -v "$PWD/k6:/scripts" grafana/k6:2.3.0 run --quiet /scripts/closed.js; echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  █ THRESHOLDS
+
+    http_req_duration
+    ✓ 'p(95)<50' p(95)=8.05ms
+    ✓ 'p(99)<200' p(99)=10.7ms
+
+    http_req_failed
+    ✓ 'rate<0.01' rate=0.00%
+
+  █ TOTAL RESULTS
+
+    HTTP
+    http_req_duration..............: avg=7.93ms  p(50)=5.26ms  p(95)=8.05ms p(99)=10.7ms  max=617.93ms
+    http_req_failed................: 0.00%  0 out of 3133
+    http_reqs......................: 3133   104.424239/s
+...
+exit=0
+```
+
+</Expected>
+
+Đã lược phần `EXECUTION` và `NETWORK`. Đạt mọi ngưỡng, khoảng 104 request/giây. Chỉ có `max=617.93ms` gợi ý điều gì đó: một vài request đã chờ đúng bằng thời gian truy vấn 600 ms.
+
+### 5. Cùng lưu lượng, mô hình open
+
+Kịch bản thứ hai gửi đều 110 request/giây (gần bằng lưu lượng closed vừa đạt), chia thành hai scenario: `warmup` 10 giây rồi `measure` 30 giây. Ngưỡng chỉ áp lên `measure`. Biến môi trường `RATE` cho phép đổi lưu lượng mà không sửa file.
+
+<Terminal where="mac" title="Tab 2: k6/open.js">
+
+```bash
+cd ~/masteva-sb12
+cat > k6/open.js <<'EOF'
+import http from 'k6/http';
+
+const BASE = __ENV.BASE || 'http://host.docker.internal:8092';
+const RATE = Number(__ENV.RATE || 110);
+
+const arrivals = (duration, startTime) => ({
+  executor: 'constant-arrival-rate', rate: RATE, timeUnit: '1s',
+  duration, startTime, preAllocatedVUs: 100, maxVUs: 1000,
+});
+
+export const options = {
+  scenarios: {
+    warmup: arrivals('10s', '0s'),
+    measure: arrivals('30s', '10s'),
+  },
+  thresholds: {
+    'http_req_duration{scenario:measure}': ['p(95)<50', 'p(99)<200'],
+    'http_req_failed{scenario:measure}': ['rate<0.01'],
+  },
+  summaryTrendStats: ['avg', 'p(50)', 'p(95)', 'p(99)', 'max'],
+};
+
+export default function () {
+  const sku = 'SKU-' + (1 + Math.floor(Math.random() * 100));
+  http.get(`${BASE}/api/quote/${sku}`);
+}
+EOF
+docker run --rm -v "$PWD/k6:/scripts" grafana/k6:2.3.0 run --quiet /scripts/open.js; echo "exit=$?"
+```
+
+</Terminal>
+
+<Predict question="Cùng service, cùng khoảng 110 request/giây. p95 và p99 lần này là bao nhiêu?">
+
+```text
+  █ THRESHOLDS
+
+    http_req_duration{scenario:measure}
+    ✗ 'p(95)<50' p(95)=410.42ms
+    ✗ 'p(99)<200' p(99)=578.41ms
+
+    http_req_failed{scenario:measure}
+    ✓ 'rate<0.01' rate=0.00%
+
+  █ TOTAL RESULTS
+
+    HTTP
+    http_req_duration..............: avg=53.1ms  p(50)=4.99ms p(95)=423.34ms p(99)=581.86ms max=620.54ms
+      { scenario:measure }.........: avg=50.33ms p(50)=4.98ms p(95)=410.42ms p(99)=578.41ms max=615.58ms
+    http_req_failed................: 0.00%  0 out of 4402
+    http_reqs......................: 4402   110.02901/s
+...
+time="..." level=error msg="thresholds on metrics 'http_req_duration{scenario:measure}' have been crossed"
+exit=99
+```
+
+p50 gần như không đổi, nhưng p95 từ 8 ms lên 410 ms, p99 từ 11 ms lên 578 ms. Mỗi 5,6 giây (5 giây nghỉ cộng 0,6 giây chạy), `reloadDiscounts` giữ khoá 600 ms. Với closed, trong 600 ms đó chỉ có 2 request đang chờ: 2 VU bị kẹt nên không gửi thêm. Với open, khoảng 66 request vẫn đến và xếp hàng sau khoá, chiếm khoảng 10% tổng số: đủ để đẩy p95 lên hàng trăm mili giây. Mã thoát 99 là cách k6 báo ngưỡng trượt cho CI.
+
+</Predict>
+
+<Check id="sb12.1.lab-closed-open">Chạy được cùng một service với k6 theo mô hình closed và open, và giải thích được vì sao p95 khác nhau hàng chục lần ở cùng lưu lượng.</Check>
+
+### 6. Đẩy tới giới hạn và đọc metric
+
+Bây giờ tìm khuỷu. Ở tab 2, chạy 500 request/giây:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb12
+docker run --rm -e RATE=500 -v "$PWD/k6:/scripts" grafana/k6:2.3.0 run --quiet /scripts/open.js
+```
+
+</Terminal>
+
+Trong lúc nó chạy (khoảng 15 giây sau khi bắt đầu, khi đã sang scenario `measure`), ở tab 3 đọc metric rồi bật JFR 15 giây:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb12
+curl -s localhost:8092/actuator/prometheus \
+  | grep -E '^(tomcat_threads_busy|jvm_threads_states_threads\{state="(blocked|runnable)"|hikaricp_connections_(active|pending)|http_server_requests_seconds\{.*quote)' \
+  | sed -E 's/error="none",exception="none",method="GET",outcome="SUCCESS",status="200",//'
+PID=$(pgrep -f perf-0.0.1-SNAPSHOT.jar)
+jcmd $PID JFR.start name=quote duration=15s settings=profile filename=$PWD/quote.jfr
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+hikaricp_connections_active{pool="HikariPool-1"} 0.0
+hikaricp_connections_pending{pool="HikariPool-1"} 0.0
+http_server_requests_seconds{uri="/api/quote/{sku}",quantile="0.5"} 0.570294272
+http_server_requests_seconds{uri="/api/quote/{sku}",quantile="0.95"} 1.20782848
+http_server_requests_seconds{uri="/api/quote/{sku}",quantile="0.99"} 1.20782848
+jvm_threads_states_threads{state="blocked"} 198.0
+jvm_threads_states_threads{state="runnable"} 8.0
+tomcat_threads_busy_threads{name="http-nio-8092"} 200.0
+39290:
+Started recording 1. The result will be written to:
+
+/Users/<bạn>/masteva-sb12/quote.jfr
+```
+
+</Expected>
+
+Đọc từng dòng theo bảng ở phần Kiến thức:
+
+- `tomcat_threads_busy_threads` 200: cả 200 thread mặc định của Tomcat đều bận. Request mới phải xếp hàng **trước** khi vào ứng dụng.
+- `blocked` 198: gần như toàn bộ số thread đó đang đứng chờ vào một khối `synchronized`. Chỉ vài thread thật sự chạy.
+- `hikaricp_connections_pending` 0 và `active` 0: database không phải điểm nghẽn. Truy vấn `findBySku` xong rất nhanh, rồi thread đi xếp hàng ở khoá.
+
+Kết quả ở tab 2:
+
+<Expected>
+
+```text
+    http_req_duration{scenario:measure}
+    ✗ 'p(95)<50' p(95)=3.53s
+    ✗ 'p(99)<200' p(99)=3.54s
+...
+    http_req_duration..............: avg=2.62s p(50)=2.86s p(95)=3.51s p(99)=3.54s max=3.55s
+    http_reqs......................: 13611  317.882715/s
+    dropped_iterations.............: 6390   149.237422/s
+```
+
+</Expected>
+
+Gửi 500 nhưng chỉ xong khoảng 318 request/giây: đó là trần. `dropped_iterations` khác 0 vì k6 đã dùng hết 1000 VU cho scenario và phải bỏ lượt. p95 phía client 3,5 giây, trong khi ứng dụng tự báo p95 1,2 giây: phần chênh là thời gian chờ thread Tomcat, nằm ngoài `http.server.requests`.
+
+<Check id="sb12.1.lab-saturation-metrics">Đẩy được service tới giới hạn bằng k6, đọc được thread Tomcat, thread `BLOCKED` và pool kết nối trong lúc tải chạy, và kết luận được tài nguyên nào đang nghẽn.</Check>
+
+### 7. JFR chỉ ra dòng code
+
+Khi tab 2 đã xong và file JFR đã được ghi (15 giây sau lệnh `JFR.start`), ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb12
+jfr view contention-by-site quote.jfr
+jfr view hot-methods quote.jfr | head -9
+jfr print --events jdk.ExecutionSample --stack-depth 30 quote.jfr \
+  | grep -o 'vn\.masteva\.perf\.[A-Za-z]*\.[A-Za-z]*' | sort | uniq -c | sort -rn
+jfr summary quote.jfr | grep -E 'JavaMonitorEnter|ExecutionSample '
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+
+                               Contention by Site
+
+StackTrace                                                  Count   Avg.   Max.
+----------------------------------------------------------- ----- ------ ------
+vn.masteva.perf.PricingService.quote(Product)               4,558 628 ms 1.22 s
+vn.masteva.perf.PricingService.reloadDiscounts()                2 577 ms 577 ms
+
+                                           Java Methods that Execute the Most
+
+Method                                                                                                  Samples Percent
+------------------------------------------------------------------------------------------------------- ------- -------
+sun.security.provider.ByteArrayAccess.i2bBig(int[], int, byte[], int, int)                                  609  59.53%
+com.sun.crypto.provider.PBKDF2KeyImpl.deriveKey(Mac, byte[], byte[], int, int)                              269  26.30%
+sun.security.provider.DigestBase.engineUpdate(byte[], int, int)                                             110  10.75%
+1001 vn.masteva.perf.QuoteController.quote
+ 997 vn.masteva.perf.PricingService.signingKey
+ 997 vn.masteva.perf.PricingService.quote
+ jdk.JavaMonitorEnter                     4560        115041
+ jdk.ExecutionSample                      1023         12884
+```
+
+</Expected>
+
+Ba bằng chứng ghép lại:
+
+- **Contention by Site:** trong 15 giây có 4.558 lần thread phải chờ vào `PricingService.quote`, trung bình 628 ms mỗi lần. Hai lần `reloadDiscounts` phải chờ là do chính nó tranh khoá với `quote`.
+- **Hot methods** chỉ đếm method ở đỉnh stack: SHA-256 (`i2bBig`, `engineUpdate`) và `PBKDF2KeyImpl.deriveKey`. Một mình bảng này chỉ nói "CPU dành cho băm", chưa nói ai gọi.
+- **Đếm theo stack:** 997 trên 1.023 mẫu CPU có `PricingService.signingKey` trong stack. Gần như toàn bộ CPU của service dùng để dẫn xuất lại một khoá không bao giờ đổi.
+
+Thêm một con số: cấu hình `profile` lấy mẫu mỗi 10 ms, nên một thread chạy liên tục 15 giây cho khoảng 1.500 mẫu. Cả service chỉ có 1.023 mẫu: trên máy 10 nhân, code Java của bạn chạy chưa tới một thread tại mỗi thời điểm. Đó là dấu vân tay của một khoá: thêm thread, thêm nhân đều không nâng được trần của mỗi instance.
+
+<Check id="sb12.1.lab-jfr-contention">Ghi được JFR trên ứng dụng đang chịu tải, dùng `contention-by-site`, `hot-methods` và đếm theo stack để chỉ ra method và dòng code gây nghẽn.</Check>
+
+### 8. Sửa và đo lại
+
+Hai thay đổi, đúng với hai lỗi:
+
+- Dẫn xuất khoá **một lần** trong constructor. Mỗi lời gọi tạo `Mac` riêng (rẻ, vài micro giây), nên không còn đối tượng dùng chung và không cần `synchronized`.
+- `reloadDiscounts` chạy truy vấn **ngoài** khoá, rồi thay cả bảng bằng một phép gán vào field `volatile`. Map mới là bất biến, nên thread đọc luôn thấy hoặc bảng cũ hoặc bảng mới, không bao giờ thấy bảng đang dở.
+
+Dừng ứng dụng ở tab 1 (Ctrl+C), rồi ở tab 2:
+
+<Terminal where="mac" title="Tab 2: sửa PricingService.java">
+
+```bash
+cd ~/masteva-sb12/perf
+cat > src/main/java/vn/masteva/perf/PricingService.java <<'EOF'
+package vn.masteva.perf;
+
+import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;
+import java.util.Map;
+import java.util.stream.Collectors;
+import javax.crypto.Mac;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+@Service
+public class PricingService {
+    private final JdbcClient jdbc;
+    private final SecretKeySpec signingKey;      // dẫn xuất MỘT lần lúc khởi động
+    private volatile Map<String, Integer> discounts = Map.of();
+
+    public PricingService(JdbcClient jdbc, @Value("${app.signing-secret}") String secret) throws Exception {
+        this.jdbc = jdbc;
+        var spec = new PBEKeySpec(secret.toCharArray(), "masteva".getBytes(StandardCharsets.UTF_8), 20_000, 256);
+        byte[] key = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+        this.signingKey = new SecretKeySpec(key, "HmacSHA256");
+    }
+
+    public record Quote(String sku, long price, String signature) {
+    }
+
+    public Quote quote(Product p) throws Exception {
+        long price = p.getBasePrice() * (100 - discounts.getOrDefault(p.getSku(), 0)) / 100;
+        Mac mac = Mac.getInstance("HmacSHA256");  // mỗi lời gọi một Mac riêng: không cần khoá
+        mac.init(signingKey);
+        byte[] sig = mac.doFinal((p.getSku() + ":" + price).getBytes(StandardCharsets.UTF_8));
+        return new Quote(p.getSku(), price, HexFormat.of().formatHex(sig, 0, 8));
+    }
+
+    @Scheduled(fixedDelay = 5_000)
+    public void reloadDiscounts() {
+        Map<String, Integer> fresh = jdbc.sql("SELECT sku, percent FROM discount, pg_sleep(0.6)")
+                .query((rs, n) -> Map.entry(rs.getString(1), rs.getInt(2)))
+                .list().stream()
+                .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey, Map.Entry::getValue));
+        discounts = fresh;                        // truy vấn chạy ngoài khoá, rồi thay cả bảng một lần
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Chạy lại lệnh ở bước 3 trong tab 1. Gọi `curl` như bước 3 một lần: `signature` vẫn là `18979800a0e10888`, vì khoá dẫn xuất vẫn y hệt, chỉ là tính một lần thay vì mỗi request. Rồi đo lại ở 500 request/giây:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb12
+docker run --rm -e RATE=500 -v "$PWD/k6:/scripts" grafana/k6:2.3.0 run --quiet /scripts/open.js
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    http_req_duration{scenario:measure}
+    ✓ 'p(95)<50' p(95)=1.69ms
+    ✓ 'p(99)<200' p(99)=2.66ms
+
+    http_req_failed{scenario:measure}
+    ✓ 'rate<0.01' rate=0.00%
+...
+    http_req_duration..............: avg=1.05ms   p(50)=883.62µs p(95)=1.92ms p(99)=2.94ms max=16.19ms
+      { scenario:measure }.........: avg=962.77µs p(50)=828.2µs  p(95)=1.69ms p(99)=2.66ms max=14.59ms
+    http_req_failed................: 0.00%  0 out of 20002
+    http_reqs......................: 20002  499.998653/s
+```
+
+</Expected>
+
+Từ 318 lên đủ 500 request/giây, p95 từ 3,53 giây xuống 1,69 ms. Đợt khựng 600 ms cũng biến mất: `max` chỉ còn 16 ms.
+
+Cuối cùng, xem warm-up. Dừng ứng dụng (Ctrl+C ở tab 1), chạy lại lệnh bước 3, và **không** gọi `curl` nào trước khi đo. `--summary-mode=full` in thêm số liệu riêng cho từng scenario; lệnh `awk` chỉ giữ dòng độ trễ:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb12
+docker run --rm -v "$PWD/k6:/scripts" grafana/k6:2.3.0 run --quiet --summary-mode=full /scripts/open.js \
+  | awk '/SCENARIO:/{s=$3} s && /http_req_duration\./{print s, $2, $3, $4, $5, $6}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+measure avg=3.24ms p(50)=2.68ms p(95)=6.52ms p(99)=10.42ms max=50.96ms
+warmup avg=15.06ms p(50)=3.28ms p(95)=14.04ms p(99)=373.47ms max=474.31ms
+```
+
+</Expected>
+
+k6 in các scenario theo thứ tự chữ cái, nên `measure` đứng trước. Mười giây đầu, p99 là 373 ms; ba mươi giây sau, 10,4 ms. Cùng code, cùng lưu lượng. Nếu ngưỡng áp lên cả hai giai đoạn, kết quả đạt hay trượt sẽ phụ thuộc vào việc bạn vừa khởi động lại ứng dụng hay chưa. Bài SB12.3 rút ngắn chính giai đoạn này.
+
+<Check id="sb12.1.lab-fix-remeasure">Sửa được điểm nghẽn đã tìm ra, đo lại bằng cùng kịch bản và so sánh được throughput, p95 trước và sau, cùng độ trễ của giai đoạn warm-up.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- k6 báo `dial tcp: lookup host.docker.internal: no such host`: Docker trên Linux không tự có tên này. Thêm `--add-host=host.docker.internal:host-gateway` vào `docker run`.
+- k6 báo `connection refused`: ứng dụng ở tab 1 chưa khởi động xong hoặc đã dừng.
+- Mọi request trả 404 trong k6: sai đường dẫn, hoặc `data.sql` chưa chạy vì thiếu `spring.sql.init.mode=always`.
+- `/actuator/prometheus` không có dòng `tomcat_threads_busy_threads`: thiếu `server.tomcat.mbeanregistry.enabled=true`.
+- Không có dòng `quantile`: thiếu dòng `percentiles` trong `application.properties`. Nếu bạn thêm cả `management.metrics.distribution.slo.http.server.requests`, endpoint Prometheus chuyển sang dạng histogram và các dòng `quantile` biến mất; lúc viết bài, đây là hành vi đã thấy với Spring Boot 4.1.1.
+- `jcmd` báo `AttachNotSupportedException`: JVM chạy dưới user khác, hoặc `PID` rỗng vì ứng dụng không chạy.
+- Số đo dao động mạnh giữa hai lần chạy: máy đang bận việc khác (build, trình duyệt, IDE đang index). Kiểm tra `uptime` trước khi đo; so sánh chỉ có nghĩa khi máy ở cùng trạng thái.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Giữ container `sb12-pg`, project `~/masteva-sb12/perf` và thư mục `k6`: bài SB12.2 dùng tiếp. File `quote.jfr` có thể giữ để xem lại.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao p95 ứng dụng tự đo thấp hơn p95 k6 thấy, và nên tin bên nào?">
+
+`http.server.requests` bắt đầu đếm khi filter của Spring chạy, tức là khi thread Tomcat đã nhận request. Thời gian nằm trong hàng đợi executor của Tomcat, trong backlog TCP, trên load balancer và trên mạng đều nằm ngoài. Khi thread Tomcat chưa cạn, hai con số gần nhau; khi cạn, chênh lệch chính là thời gian chờ thread. Người dùng trải qua con số phía client. Trên production, đo cả hai: metric của load balancer hoặc API gateway cho phía client, `http.server.requests` để biết thời gian bên trong ứng dụng, và cảnh báo khi chúng tách xa nhau.
+
+</Reveal>
+
+<Reveal title="Chạy k6 trên cùng máy với ứng dụng có ổn không?">
+
+Ổn để so sánh tương đối trên laptop, như bài này, miễn là k6 không giành CPU của ứng dụng tới mức trở thành điểm nghẽn. Dấu hiệu công cụ đo đang quá tải: `dropped_iterations` tăng trong khi server vẫn rảnh, hoặc `http_req_blocked` (thời gian chờ có kết nối) cao. Với số đo quyết định dung lượng production, chạy k6 trên máy riêng gần hạ tầng thật, với dữ liệu cỡ thật. Con số 318 request/giây của laptop không nói gì về máy chủ 32 nhân; chênh lệch "trước 318, sau 500 và chưa chạm trần" thì có.
+
+</Reveal>
+
+<Reveal title="Sao không thêm thread, thêm instance cho nhanh?">
+
+Khoá `synchronized` biến một đoạn code thành tuần tự: tại mỗi thời điểm chỉ một request ở trong đó. Áp định luật Little (SB12.2) cho khoá như cho một tài nguyên có đúng một chỗ: trần là 1 / 3 ms, khoảng 330 request/giây mỗi instance, dù có bao nhiêu thread. Định luật Amdahl nói cùng điều đó theo hướng khác: phần tuần tự giới hạn mức tăng tốc khi thêm nhân. Thêm instance thì nhân trần lên, nhưng CPU mỗi máy vẫn rảnh 90% và bạn trả tiền cho phần rảnh đó. Thêm thread còn tệ hơn: nhiều thread chờ khoá hơn, nhiều bộ nhớ stack hơn, hàng đợi dài hơn. Đo, tìm phần tuần tự, rút ngắn hoặc bỏ nó, rồi mới tính chuyện thêm máy.
+
+</Reveal>
+
+<Reveal title="Vì sao không viết kịch bản closed với nhiều VU hơn để bắt được đợt khựng?">
+
+Với N VU, mỗi lần server khựng chỉ có tối đa N request bị ghi nhận chậm, dù lưu lượng thật là bao nhiêu. Tăng N lên đủ lớn để giống lưu lượng thật thì mỗi VU lại phải nghỉ lâu hơn giữa hai request, và bạn đang tự tay mô phỏng mô hình open một cách vụng về. Dùng executor arrival-rate khi câu hỏi là "ở X request/giây, người dùng thấy gì". Dùng closed khi hệ thống thật đúng là có số client cố định, ví dụ 8 worker đọc từ hàng đợi.
+
+</Reveal>
+
+<Reveal title="Đưa bài đo tải vào CI thế nào cho có ích?">
+
+Ngưỡng và mã thoát 99 cho phép CI chặn một thay đổi. Nhưng runner CI dùng chung, nhiễu, nên ngưỡng tuyệt đối dễ đỏ vì lý do không liên quan code. Cách hay dùng: chạy một kịch bản ngắn ở lưu lượng thấp làm smoke test (bắt lỗi kiểu "mỗi request mất 3 giây"), và chạy bài đo đầy đủ trên môi trường cố định theo lịch, so sánh với lần chạy trước của chính môi trường đó. Lưu kết quả bằng `--summary-export` hoặc output Prometheus để thấy xu hướng.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết kịch bản k6 hoặc Gatling từ mô tả luồng người dùng, hay giải thích một bảng `jfr view`. AI rất hay viết `constant-vus` kèm `sleep(1)` cho API công khai (mô hình closed, dính coordinated omission), hay đặt ngưỡng theo `avg`, và hay quên tách warm-up. Khi được hỏi "vì sao chậm", AI hay đoán (thêm cache, tăng pool) thay vì đề nghị đo. Kiểm tra lại bằng cách đọc executor trong kịch bản, chạy cả open và closed như bước 4 và 5, và chỉ chấp nhận một kết luận về điểm nghẽn khi có metric hoặc profile chỉ ra nó.
+
+</Callout>
+
+<Callout kind="link">
+
+SB8.2 dựng metric Micrometer và giải thích percentile với histogram; bài này đọc chúng dưới tải. J12.2 giải thích warm-up và JIT, J12.3 dạy JFR và async-profiler. SB12.2 dùng chính kịch bản k6 này để đo thread pool, virtual thread và pool kết nối; SB12.3 rút ngắn khởi động và warm-up. SB3.3 đã làm cạn HikariCP bằng `xargs`; ở đây k6 thay thế cách đó.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb12.1.mastery-load-test">Tự viết được kịch bản k6 theo mô hình open cho một API, có scenario warm-up riêng, ngưỡng percentile và tỉ lệ lỗi, và giải thích được con số đo được có ý nghĩa tới đâu.</Check>
+
+<Check id="sb12.1.mastery-bottleneck">Tự tìm được điểm nghẽn của một service Spring dưới tải bằng metric (thread Tomcat, thread `BLOCKED`, pool kết nối) rồi JFR, sửa nó và chứng minh bằng số đo trước và sau.</Check>
+
+</Mastery>

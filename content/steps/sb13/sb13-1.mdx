@@ -1,0 +1,1199 @@
+---
+title: Phân quyền theo dữ liệu với method security và cô lập tenant bằng Row Level Security
+description: Đưa quy tắc "ai được xem đơn nào" vào một bean gọi từ @PreAuthorize, trả 404 thay 403 bằng @HandleAuthorizationDenied, hiểu cái giá của @PostFilter, rồi thêm lớp cô lập tenant ở PostgreSQL bằng Row Level Security đặt đúng chỗ trong transaction để không rò qua connection pool.
+id: sb13.1
+step: sb13
+prerequisites: [sb12.3]
+topics: [sb13.phan-quyen-du-lieu, sb13.co-lap-tenant]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    spring-security: 7.1.1
+    hibernate: 7.4.5
+    testcontainers: 2.0.5
+    docker: 29.8.0
+    postgresql: "18.6"
+    curl: 8.4.0
+---
+
+<Goal>
+
+Viết quy tắc phân quyền theo dữ liệu ở một chỗ, kiểm được bằng test, và thêm một lớp phòng thủ ở database để một câu truy vấn quên điều kiện tenant không làm lộ dữ liệu của khách hàng khác. Học xong bài này, bạn giải thích được:
+
+- Vì sao thêm `@PreAuthorize` gọi bean xong thì **mọi** request, kể cả của chủ đơn, đều nhận 404.
+- Vì sao test cô lập tenant trên Testcontainers vô nghĩa nếu ứng dụng kết nối bằng user `test` mà container tạo sẵn.
+- Vì sao `set_config('app.tenant_id', ..., false)` làm một job chạy sau thấy dữ liệu của tenant trước, còn `true` thì không.
+
+</Goal>
+
+<Knowledge>
+
+### Phân quyền theo dữ liệu: ba nơi có thể kiểm
+
+SB6.1 đã dùng `@PreAuthorize` với biểu thức SpEL so tham số với `authentication.name`. SB6.3 đã tái hiện IDOR (đổi `id` trong URL để đọc đơn người khác) và sửa bằng cách đưa điều kiện chủ sở hữu vào câu truy vấn. Bài này thêm hai việc mà một hệ thống nhiều khách hàng (tenant) cần: quy tắc phức tạp hơn "chủ đơn" và một lớp chặn ở database.
+
+| Kiểm ở đâu | Ví dụ | Hợp với | Giới hạn |
+|---|---|---|---|
+| Câu truy vấn | `findByIdAndOwner(id, user)` | Danh sách, phân trang, dữ liệu lớn | Quy tắc rải ở nhiều repository; quên một chỗ là lộ |
+| Method security | `@PreAuthorize("@orderAuthz.canRead(#id, authentication)")` | Quy tắc nghiệp vụ nhiều nhánh: chủ đơn, quản lý, người được chia sẻ | Thêm một truy vấn để kiểm; không lọc được danh sách hiệu quả |
+| Database (RLS) | Policy `tenant_id = current_setting('app.tenant_id')` | Lưới an toàn cho lỗi quên điều kiện tenant | Không biết quy tắc nghiệp vụ trong tenant; role ứng dụng tự đổi được tenant, nên không chặn SQL injection hay code bị chiếm quyền |
+
+Ba lớp không thay nhau. Trong lab: RLS giữ ranh giới giữa công ty `acme` và `globex`; method security quyết định trong `acme` ai được xem đơn nào.
+
+### Gọi bean từ @PreAuthorize
+
+Khi quy tắc dài hơn một dòng, đừng nhét nó vào chuỗi SpEL. Viết một bean bình thường và gọi nó bằng cú pháp `@tênBean`:
+
+```java
+@Component("orderAuthz")
+public class OrderAuthz {
+    public boolean canRead(long orderId, Authentication auth) { ... }   // chủ đơn hoặc quản lý
+}
+
+@PreAuthorize("@orderAuthz.canRead(#id, authentication)")
+public OrderView get(long id) { ... }
+```
+
+Bean này test được bằng unit test thường, đặt breakpoint được, và tên method đọc như tài liệu. `#id` là tham số của method, `authentication` là biến có sẵn trong mọi biểu thức method security.
+
+Method security chạy qua proxy, giống `@Transactional` (SB4.1). Khi một method có cả hai annotation, **thứ tự** các interceptor quyết định phần kiểm quyền có nằm trong transaction hay không:
+
+```text
+ controller gọi orderService.get(1)
+        |
+        v
+ proxy của OrderService
+   1. AuthorizationManagerBeforeMethodInterceptor (@PreAuthorize)   order = 200
+        |  gọi @orderAuthz.canRead(1, auth)  -> chạy TRƯỚC khi có transaction
+        v
+   2. TransactionInterceptor (@Transactional)                      order = Integer.MAX_VALUE
+        |  BEGIN
+        v
+   3. OrderService.get(1) thật
+```
+
+Thứ tự 200 lấy từ `AuthorizationInterceptorsOrder.PRE_AUTHORIZE` của Spring Security 7.1; `@EnableTransactionManagement` mặc định đứng cuối. Phần lab sẽ cho thấy chi tiết này đổi kết quả ra sao khi database có RLS.
+
+<Check id="sb13.1.method-security-bean">Viết được một bean phân quyền gọi từ `@PreAuthorize`, và nói được nó chạy trước hay sau khi transaction của method mở.</Check>
+
+### 403 hay 404, và @HandleAuthorizationDenied
+
+Khi `@PreAuthorize` trả `false`, Spring Security ném `AuthorizationDeniedException` và Spring MVC trả **403**. Với đối tượng theo id, 403 cho kẻ dò biết "đơn này tồn tại, chỉ là không phải của bạn". SB6.3 đã trả 404 bằng cách lọc ở câu truy vấn. Với method security, Spring Security từ 6.3 có `@HandleAuthorizationDenied`: chỉ định một `MethodAuthorizationDeniedHandler` quyết định thay cho việc ném lỗi mặc định.
+
+```java
+@PreAuthorize("@orderAuthz.canRead(#id, authentication)")
+@HandleAuthorizationDenied(handlerClass = NotFoundOnDenied.class)   // handler ném lỗi 404
+public OrderView get(long id) { ... }
+```
+
+Handler cũng có thể trả một giá trị thay thế (ví dụ `null` hay một bản đã che bớt). Chỉ áp 404 cho method nhận id đối tượng; quy tắc theo role như "chỉ quản lý được xuất báo cáo" nên giữ 403, vì người dùng cần biết họ thiếu quyền.
+
+### @PostAuthorize, @PostFilter và cái giá của chúng
+
+| Annotation | Kiểm lúc nào | Cái giá |
+|---|---|---|
+| `@PreAuthorize` | Trước khi method chạy, dựa trên tham số | Thường thêm một truy vấn nhỏ (`findOwnerById`) |
+| `@PostAuthorize("returnObject.owner == authentication.name")` | Sau khi method chạy xong | Đã đọc dữ liệu của người khác lên bộ nhớ; side effect trong method đã xảy ra |
+| `@PostFilter("filterObject.owner == authentication.name")` | Sau khi method trả về một collection | Database trả **tất cả** dòng, ứng dụng bỏ bớt; phân trang sai (trang 20 dòng chỉ còn 3) |
+| `@PreFilter` | Lọc collection **tham số** trước khi method chạy | Hiếm dùng; chỉ hợp với input nhỏ |
+
+`@PostFilter` duyệt từng phần tử và đánh giá SpEL cho mỗi cái. Với 3 đơn thì không sao; với một tenant 200.000 đơn, mỗi lần gọi đọc 200.000 dòng để trả 12. Lab dùng nó một lần để bạn thấy dòng log `Filtering collection with 3 elements`, rồi bảng trên trả lời câu "khi nào không dùng": mọi danh sách có phân trang hay có thể lớn.
+
+<Check id="sb13.1.post-filter-cost">Giải thích được vì sao `@PostFilter` và `@PostAuthorize` không thay được điều kiện trong câu truy vấn cho danh sách có phân trang.</Check>
+
+### Cô lập tenant: vì sao cần thêm lớp ở database
+
+SB10.4 dạy các mô hình đa tenant và `@TenantId` của Hibernate, cơ chế tự thêm điều kiện tenant vào truy vấn HQL và Criteria, rồi tái hiện dữ liệu rò qua native query và `JdbcClient`. Những đường đi không qua bộ lọc đó còn nhiều: view, báo cáo viết tay, script sửa dữ liệu, psql bằng user của ứng dụng. Chỉ cần một câu `SELECT * FROM orders WHERE item ILIKE ...` quên `AND tenant_id = ?` là khách của công ty này thấy đơn của công ty khác. Bài này dựng ứng dụng `orders` riêng thay cho `invoices` của SB10.4, để tách RLS khỏi `@TenantId`; cách áp lại cho `invoices` y hệt.
+
+**Row Level Security (RLS)** của PostgreSQL đặt điều kiện ngay trên bảng. Khi bảng bật RLS, mọi câu lệnh của role chịu policy đều bị database ghép thêm điều kiện của policy, bất kể câu SQL viết thế nào:
+
+```sql
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON orders
+    USING      (tenant_id = current_setting('app.tenant_id', true))   -- dòng nào được thấy
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true));  -- dòng nào được ghi
+```
+
+- `USING` lọc dòng cho `SELECT`, `UPDATE`, `DELETE`. `WITH CHECK` chặn `INSERT` và `UPDATE` tạo ra dòng không thoả điều kiện, nên không ai ghi được đơn mang `tenant_id` của công ty khác.
+- `current_setting('app.tenant_id', true)`: đọc một biến cấu hình tự đặt tên (phải có dấu chấm). Tham số `true` là *missing_ok*: chưa đặt thì trả `NULL` thay vì lỗi, và `tenant_id = NULL` không bao giờ đúng, nên **không đặt tenant thì không thấy gì**. Đó là hành vi fail closed (hỏng thì đóng) bạn muốn.
+- Sau khi biến đã được đặt rồi hết hiệu lực, PostgreSQL trả chuỗi rỗng `''` chứ không phải `NULL`. Với cột `text` điều này vô hại. Với cột `uuid`, `''::uuid` ném lỗi; viết `NULLIF(current_setting('app.tenant_id', true), '')::uuid`.
+- `current_setting` là hàm `STABLE`, nên trong một câu lệnh nó được coi như hằng số và điều kiện của policy dùng được index như so với một tham số. Đọc `EXPLAIN ANALYZE` bằng role ứng dụng; superuser bỏ qua policy nên plan của nó không có điều kiện đó.
+
+**RLS chặn được gì và không chặn được gì.** Biến `app.tenant_id` do chính ứng dụng đặt, và role `orders_app` gọi `set_config` sang tenant nào cũng được (bước 6 làm đúng điều đó bằng psql). Vì vậy RLS bắt lỗi *quên* điều kiện tenant, nhưng không chặn kẻ đã chạy được SQL tuỳ ý bằng role ứng dụng (SQL injection, code bị chiếm quyền): chúng chỉ cần đặt lại tenant. Cần ranh giới mạnh hơn thì mỗi tenant một role database riêng (`SET ROLE`, policy theo `current_user`), hoặc chỉ cho đặt tenant qua một hàm `security definer` kiểm chữ ký của token trước khi đặt.
+
+### Ai không chịu RLS
+
+| Role | Chịu policy? | Ghi chú |
+|---|---|---|
+| Superuser (`postgres`, và `test` của Testcontainers) | Không, bao giờ cũng bỏ qua | Ứng dụng tuyệt đối không kết nối bằng superuser |
+| Role có thuộc tính `BYPASSRLS` | Không | Dành cho job sao lưu, quản trị |
+| Owner của bảng | Không, trừ khi bảng có `FORCE ROW LEVEL SECURITY` | Thường là role chạy migration |
+| Role là thành viên (có `INHERIT`) của role owner | Không, vì có quyền của owner | Hay gặp khi `GRANT orders_owner TO orders_app` "cho tiện" |
+| Role thường được `GRANT` quyền trên bảng | Có | Role của ứng dụng |
+
+Vì vậy lab dùng ba role: `postgres` (superuser, chỉ để quản trị), `orders_owner` (sở hữu schema, chạy Flyway), `orders_app` (ứng dụng, không owner, không `BYPASSRLS`, không là thành viên của `orders_owner`). Spring Boot cho Flyway dùng user riêng qua `spring.flyway.user` và `spring.flyway.password`, trong khi `DataSource` của ứng dụng dùng `orders_app`.
+
+<Check id="sb13.1.rls-roles">Kể được những role bỏ qua RLS (superuser, `BYPASSRLS`, owner, thành viên của owner), và thiết kế được bộ role cho một ứng dụng: role chạy migration, role ứng dụng không là thành viên của role đó, role quản trị.</Check>
+
+### Đặt tenant đúng chỗ: mỗi transaction, không phải mỗi kết nối
+
+Ứng dụng nói với PostgreSQL "request này thuộc tenant nào" bằng `set_config('app.tenant_id', 'acme', is_local)`. Tham số cuối quyết định giá trị sống bao lâu:
+
+| `is_local` | Tương đương | Sống tới | Với connection pool |
+|---|---|---|---|
+| `false` | `SET app.tenant_id = 'acme'` | Hết **phiên** (kết nối đóng) | Kết nối về pool vẫn mang `acme`; người mượn sau thừa hưởng nó |
+| `true` | `SET LOCAL app.tenant_id = 'acme'` | Hết **transaction** (COMMIT hoặc ROLLBACK) | Kết nối về pool sạch |
+
+HikariCP (SB3.2) giữ kết nối sống hàng giờ và cho mượn lần lượt. Đặt ở mức phiên là để lại dấu của request trước cho request sau:
+
+```text
+ request của carol (globex)          kết nối #1 trong pool        job chạy nền, không có user
+ BEGIN                                    |
+ set_config('app.tenant_id','globex',X)   |
+ SELECT ... (thấy 2 đơn globex)           |
+ COMMIT -------- trả kết nối về pool ---> #1  ----- mượn kết nối ---> SELECT count(*) FROM orders
+                                                                       X = false: 2 (thấy đơn globex)
+                                                                       X = true : 0 (fail closed)
+```
+
+Trong Spring, chỗ tự nhiên để chạy `set_config(..., true)` là **ngay sau khi transaction mở**, trên chính kết nối của transaction đó. Spring Framework 6.1 thêm `TransactionExecutionListener` với callback `afterBegin`, và Spring Boot tự gắn mọi bean kiểu này vào transaction manager nó cấu hình:
+
+```java
+@Component
+public class TenantTransactionListener implements TransactionExecutionListener {
+    @Override
+    public void afterBegin(TransactionExecution tx, @Nullable Throwable beginFailure) {
+        if (beginFailure != null) return;
+        String tenant = CurrentTenant.get().orElse("");
+        jdbc.sql("SELECT set_config('app.tenant_id', ?, true)").param(tenant).query(String.class).single();
+    }
+}
+```
+
+`JpaTransactionManager` mở transaction Hibernate và gắn kết nối JDBC của nó vào luồng hiện tại, nên `JdbcClient` trong `afterBegin` chạy trên đúng kết nối đó. Callback chỉ chạy khi một transaction **mới** bắt đầu; method tham gia transaction có sẵn (REQUIRED lồng nhau) dùng lại giá trị đã đặt. Truy vấn chạy ngoài transaction thì không có tenant, và RLS trả về không dòng nào: lỗi lộ ra ngay ở môi trường dev thay vì âm thầm rò dữ liệu.
+
+<Check id="sb13.1.rls-mechanism">Giải thích được vì sao `set_config` phải dùng `is_local = true` và chạy sau BEGIN của mỗi transaction, và chuyện gì xảy ra với truy vấn chạy ngoài transaction.</Check>
+
+<Callout kind="production">
+
+Một SaaS quản lý kho chạy RLS, đặt tenant bằng `set_config('app.tenant_id', ..., false)` ngay sau BEGIN của mỗi transaction. Mọi thứ đúng suốt nhiều tháng, vì request nào cũng đặt lại giá trị trước khi truy vấn, nên giá trị cũ còn trên kết nối không ai thấy. Rồi đội thêm một job `@Scheduled` đồng bộ tồn kho, chạy truy vấn ngoài transaction và không có tenant. Job mượn kết nối vừa phục vụ request của một khách, kết nối đó còn mang tenant của khách, nên job đọc kho của khách đó và ghi số liệu sang báo cáo chung. Đổi `false` thành `true` là đủ sửa: job không có tenant thì không thấy dòng nào, lỗi lộ ra ở lần chạy đầu tiên trên môi trường dev. Bước 10 của lab tái hiện đúng chuyện này. Nếu đi qua PgBouncer ở chế độ transaction pooling, `SET` mức phiên còn tệ hơn vì hai câu lệnh liên tiếp có thể chạy trên hai kết nối server khác nhau; `SET LOCAL` trong transaction thì vẫn đúng.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [Method Security (Spring Security)](https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html): đọc "Using a Custom Bean in SpEL", "Handling Denied Authorization" (`@HandleAuthorizationDenied`), "Using a Custom Authorization Manager" và `@AuthorizeReturnObject`.
+- [Row Security Policies (PostgreSQL)](https://www.postgresql.org/docs/current/ddl-rowsecurity.html): ai bỏ qua RLS, `FORCE ROW LEVEL SECURITY`, và ví dụ policy dùng biến phiên.
+- [System Administration Functions (PostgreSQL)](https://www.postgresql.org/docs/current/functions-admin.html): mục "Configuration Settings Functions" về `current_setting` với `missing_ok` và `set_config` với `is_local`.
+- [Testing Method Security (Spring Security)](https://docs.spring.io/spring-security/reference/servlet/test/method.html): `@WithMockUser`, `@WithUserDetails` và cách tạo annotation người dùng giả của riêng bạn.
+- [Multi Tenant Security Cheat Sheet (OWASP)](https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html): danh sách kiểm tra cô lập tenant ở mọi tầng, không chỉ database.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker đang chạy, JDK 25, `curl` và `unzip`. Mở **hai tab Terminal**: tab 1 chạy ứng dụng, tab 2 gửi request và chạy `psql`. Ứng dụng nghe ở cổng **8093**, PostgreSQL ở cổng **5413**. Ở cả hai tab, chạy:
+
+<Terminal where="mac" title="Tab 1 và tab 2">
+
+```bash
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+```
+
+</Terminal>
+
+### 1. Tạo project
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+mkdir -p ~/masteva-sb13 && cd ~/masteva-sb13
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=orders \
+  -d name=orders -d packageName=vn.masteva.orders \
+  -d dependencies=web,security,data-jpa,flyway,postgresql,testcontainers -o orders.zip
+unzip -q orders.zip -d orders && cd orders
+rm src/test/java/vn/masteva/orders/OrdersApplicationTests.java
+```
+
+</Terminal>
+
+Test mặc định `OrdersApplicationTests` bị xoá vì bước 9 viết các test riêng.
+
+### 2. PostgreSQL với ba role
+
+File SQL dưới đây chạy một lần bằng superuser khi database được tạo. Nó nằm trong `src/test/resources` vì bước 9 dùng lại nó cho Testcontainers.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb13/orders
+mkdir -p src/test/resources
+cat > src/test/resources/init-roles.sql <<'EOF'
+-- Chạy một lần bằng superuser khi database được tạo
+CREATE ROLE orders_owner LOGIN PASSWORD 'owner-local' NOSUPERUSER NOBYPASSRLS;
+CREATE ROLE orders_app   LOGIN PASSWORD 'app-local'   NOSUPERUSER NOBYPASSRLS;
+ALTER SCHEMA public OWNER TO orders_owner;
+EOF
+docker run -d --name sb13-pg -p 5413:5432 -e POSTGRES_PASSWORD=postgres-local -e POSTGRES_DB=orders \
+  -v "$PWD/src/test/resources/init-roles.sql:/docker-entrypoint-initdb.d/init-roles.sql:ro" postgres:18-alpine
+sleep 5
+docker exec sb13-pg psql -U postgres -d orders -c '\du'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+3e980dede8d10073d593a2c4c671c144ca421e24426258c2041031091bf9a4ea
+                               List of roles
+  Role name   |                         Attributes                         
+--------------+------------------------------------------------------------
+ orders_app   | 
+ orders_owner | 
+ postgres     | Superuser, Create role, Create DB, Replication, Bypass RLS
+```
+
+</Expected>
+
+Dòng đầu là id của container, khác trên máy bạn. `postgres` có `Bypass RLS`; hai role kia không có thuộc tính đặc biệt nào. `ALTER SCHEMA public OWNER TO orders_owner` cho role migration quyền tạo bảng: từ PostgreSQL 15, schema `public` chỉ cho owner của database tạo bảng. Mật khẩu ở đây là giá trị cho máy của bạn; SB6.3 đã nói cách đưa mật khẩu thật ra khỏi code.
+
+### 3. Migration bật RLS và cấu hình hai user
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb13/orders
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=orders
+server.port=8093
+spring.datasource.url=jdbc:postgresql://localhost:5413/orders
+spring.datasource.username=orders_app
+spring.datasource.password=app-local
+spring.flyway.user=orders_owner
+spring.flyway.password=owner-local
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+logging.pattern.console=%5p %logger{0} : %m%n
+logging.level.org.springframework.security.access.expression.method=debug
+EOF
+cat > src/main/resources/db/migration/V1__orders_rls.sql <<'EOF'
+CREATE TABLE orders (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id text   NOT NULL,
+    owner     text   NOT NULL,
+    item      text   NOT NULL,
+    amount    bigint NOT NULL
+);
+CREATE INDEX orders_tenant_owner_idx ON orders (tenant_id, owner);
+
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON orders
+    USING      (tenant_id = current_setting('app.tenant_id', true))
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO orders_app;
+EOF
+cat > src/main/resources/db/migration/V2__seed.sql <<'EOF'
+INSERT INTO orders (tenant_id, owner, item, amount) VALUES
+    ('acme',   'alice', 'Bàn phím',  1200000),
+    ('acme',   'bob',   'Tai nghe',   850000),
+    ('acme',   'alice', 'Chuột',      450000),
+    ('globex', 'carol', 'Màn hình',  4300000),
+    ('globex', 'carol', 'Webcam',     900000);
+EOF
+```
+
+</Terminal>
+
+- Flyway chạy bằng `orders_owner`, nên bảng `orders` thuộc về role đó. Bảng không có `FORCE ROW LEVEL SECURITY`, nên owner bỏ qua policy và `V2__seed.sql` chèn được dữ liệu cho cả hai tenant.
+- `orders_app` chỉ có quyền DML, không tạo hay sửa được bảng, và chịu policy.
+- Index bắt đầu bằng `tenant_id`: policy thêm `tenant_id = ...` vào mọi câu truy vấn, nên mọi index hữu ích nên có cột này ở đầu.
+- Dòng `logging.level...expression.method=debug` dùng ở bước 8.
+
+### 4. Code ứng dụng, cố ý còn lỗi IDOR
+
+Người dùng lưu trong bộ nhớ. Tenant của mỗi người là một authority dạng `TENANT_acme`; ở hệ thống thật nó đến từ một claim trong JWT (SB6.2).
+
+<Terminal where="mac" title="Tab 2: tenant, entity, repository, service, controller, security">
+
+```bash
+cd ~/masteva-sb13/orders
+P=src/main/java/vn/masteva/orders
+mkdir -p $P/tenant $P/order
+cat > $P/tenant/CurrentTenant.java <<'EOF'
+package vn.masteva.orders.tenant;
+
+import java.util.Optional;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+
+/** Tenant của người đang gọi, lấy từ authority dạng TENANT_<id>. */
+public final class CurrentTenant {
+    private CurrentTenant() {
+    }
+
+    public static Optional<String> get() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        return auth == null ? Optional.empty() : auth.getAuthorities().stream()
+                .map(GrantedAuthority::getAuthority)
+                .filter(a -> a != null && a.startsWith("TENANT_"))
+                .map(a -> a.substring("TENANT_".length()))
+                .findFirst();
+    }
+}
+EOF
+cat > $P/tenant/TenantTransactionListener.java <<'EOF'
+package vn.masteva.orders.tenant;
+
+import org.jspecify.annotations.Nullable;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.TransactionExecution;
+import org.springframework.transaction.TransactionExecutionListener;
+
+/**
+ * Mỗi transaction mới: đặt app.tenant_id cho đúng kết nối của transaction đó.
+ * is_local = true nên giá trị tự mất khi COMMIT/ROLLBACK, trước khi kết nối về pool.
+ */
+@Component
+public class TenantTransactionListener implements TransactionExecutionListener {
+    private final JdbcClient jdbc;
+
+    public TenantTransactionListener(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    @Override
+    public void afterBegin(TransactionExecution transaction, @Nullable Throwable beginFailure) {
+        if (beginFailure != null) {
+            return;
+        }
+        String tenant = CurrentTenant.get().orElse("");
+        jdbc.sql("SELECT set_config('app.tenant_id', ?, true)").param(tenant).query(String.class).single();
+    }
+}
+EOF
+cat > $P/order/PurchaseOrder.java <<'EOF'
+package vn.masteva.orders.order;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+
+@Entity
+@Table(name = "orders")
+public class PurchaseOrder {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String tenantId;
+    private String owner;
+    private String item;
+    private long amount;
+
+    protected PurchaseOrder() {
+    }
+
+    public Long getId() { return id; }
+    public String getTenantId() { return tenantId; }
+    public String getOwner() { return owner; }
+    public String getItem() { return item; }
+    public long getAmount() { return amount; }
+}
+EOF
+cat > $P/order/OrderRepository.java <<'EOF'
+package vn.masteva.orders.order;
+
+import java.util.List;
+import java.util.Optional;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+
+public interface OrderRepository extends JpaRepository<PurchaseOrder, Long> {
+
+    @Query("select o.owner from PurchaseOrder o where o.id = :id")
+    Optional<String> findOwnerById(long id);
+
+    /** Cố ý quên điều kiện tenant: RLS phải cứu. */
+    @Query(value = "SELECT * FROM orders WHERE item ILIKE '%' || :q || '%' ORDER BY id", nativeQuery = true)
+    List<PurchaseOrder> search(String q);
+}
+EOF
+cat > $P/order/OrderView.java <<'EOF'
+package vn.masteva.orders.order;
+
+public record OrderView(long id, String tenant, String owner, String item, long amount) {
+    static OrderView from(PurchaseOrder o) {
+        return new OrderView(o.getId(), o.getTenantId(), o.getOwner(), o.getItem(), o.getAmount());
+    }
+}
+EOF
+cat > $P/order/OrderService.java <<'EOF'
+package vn.masteva.orders.order;
+
+import java.util.List;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
+
+@Service
+public class OrderService {
+    private final OrderRepository orders;
+
+    public OrderService(OrderRepository orders) {
+        this.orders = orders;
+    }
+
+    @Transactional(readOnly = true)
+    public OrderView get(long id) {
+        return orders.findById(id).map(OrderView::from)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+    }
+
+    @Transactional(readOnly = true)
+    public List<OrderView> search(String q) {
+        return orders.search(q).stream().map(OrderView::from).toList();
+    }
+}
+EOF
+cat > $P/order/OrderController.java <<'EOF'
+package vn.masteva.orders.order;
+
+import java.util.List;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class OrderController {
+    private final OrderService orders;
+
+    public OrderController(OrderService orders) {
+        this.orders = orders;
+    }
+
+    @GetMapping("/api/orders/{id}")
+    public OrderView get(@PathVariable long id) {
+        return orders.get(id);
+    }
+
+    @GetMapping("/api/orders")
+    public List<OrderView> search(@RequestParam(defaultValue = "") String q) {
+        return orders.search(q);
+    }
+}
+EOF
+cat > $P/SecurityConfig.java <<'EOF'
+package vn.masteva.orders;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.provisioning.InMemoryUserDetailsManager;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        http.authorizeHttpRequests(a -> a
+                        .requestMatchers("/error").permitAll()
+                        .requestMatchers("/api/**").authenticated()
+                        .anyRequest().denyAll())
+                .httpBasic(Customizer.withDefaults())
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+        return http.build();
+    }
+
+    /** {noop}: mật khẩu thô, chỉ cho lab. SB6.1 dùng bcrypt. */
+    @Bean
+    UserDetailsService users() {
+        return new InMemoryUserDetailsManager(
+                user("alice", "acme", "USER"),
+                user("bob", "acme", "USER"),
+                user("dave", "acme", "MANAGER"),
+                user("carol", "globex", "USER"));
+    }
+
+    private static UserDetails user(String name, String tenant, String role) {
+        return User.withUsername(name).password("{noop}" + name + "-pass")
+                .authorities("ROLE_" + role, "TENANT_" + tenant).build();
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `TenantTransactionListener` là phần nối Spring với RLS, như mục Kiến thức đã giải thích. Không có user thì đặt chuỗi rỗng, tức không khớp tenant nào.
+- `OrderService.get` đọc theo `id` mà không kiểm người gọi: lỗi IDOR của SB6.3, giữ lại để bước 7 thấy RLS chặn được gì và không chặn được gì.
+- `OrderRepository.search` là native query quên điều kiện tenant, kiểu câu báo cáo ai đó viết vội.
+
+### 5. Chạy ứng dụng
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb13/orders
+./mvnw spring-boot:run
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ INFO DbMigrate : Successfully applied 2 migrations to schema "public", now at version v2 (execution time 00:00.021s)
+ INFO OrdersApplication : Started OrdersApplication in 2.64 seconds (process running for 2.806)
+```
+
+</Expected>
+
+Lần đầu `./mvnw` tải Maven và thư viện, mất một lúc. Flyway chạy hai migration bằng `orders_owner`; các con số thời gian khác nhau mỗi lần chạy.
+
+### 6. Nhìn RLS từ psql
+
+Trước khi gọi API, xem chính PostgreSQL làm gì. Ở tab 2, đăng nhập bằng role của ứng dụng:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec -i sb13-pg psql -q -P footer=off -U orders_app -d orders <<'EOF'
+SELECT count(*) AS no_tenant FROM orders;
+BEGIN;
+SELECT set_config('app.tenant_id', 'acme', true);
+SELECT id, tenant_id, owner, item FROM orders ORDER BY id;
+INSERT INTO orders (tenant_id, owner, item, amount) VALUES ('globex', 'mallory', 'Ghi lén', 1);
+ROLLBACK;
+SELECT count(*) AS after_tx, current_setting('app.tenant_id', true) AS setting FROM orders;
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ no_tenant 
+-----------
+         0
+
+ set_config 
+------------
+ acme
+
+ id | tenant_id | owner |   item   
+----+-----------+-------+----------
+  1 | acme      | alice | Bàn phím
+  2 | acme      | bob   | Tai nghe
+  3 | acme      | alice | Chuột
+
+ERROR:  new row violates row-level security policy for table "orders"
+ after_tx | setting 
+----------+---------
+        0 | 
+```
+
+</Expected>
+
+- Chưa đặt tenant: 0 dòng, không lỗi. Đó là fail closed.
+- Trong transaction đã đặt `acme`: câu `SELECT` không có `WHERE` vẫn chỉ ra 3 đơn của `acme`.
+- `INSERT` dòng của `globex` bị `WITH CHECK` chặn.
+- Sau `ROLLBACK`, giá trị đặt bằng `is_local = true` biến mất; `current_setting` trả chuỗi rỗng, không phải `NULL`.
+- `-q` bỏ các dòng `BEGIN`, `ROLLBACK` và `-P footer=off` bỏ dòng đếm `(n rows)` cho output gọn.
+
+So với owner và superuser:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec sb13-pg psql -q -P footer=off -U orders_owner -d orders -c 'SELECT count(*) AS owner_sees FROM orders'
+docker exec sb13-pg psql -q -P footer=off -U postgres -d orders -c 'SELECT count(*) AS superuser_sees FROM orders'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ owner_sees 
+------------
+          5
+
+ superuser_sees 
+----------------
+              5
+```
+
+</Expected>
+
+Owner và superuser thấy cả 5 dòng vì bỏ qua RLS, đúng như bảng ở mục Kiến thức. Giá trị đặt bằng `is_local = false` bám vào kết nối ra sao thì bước 10 cho thấy qua connection pool.
+
+<Check id="sb13.1.lab-rls-psql">Dùng `psql` chứng minh được: không đặt tenant thì không thấy dòng nào, `WITH CHECK` chặn ghi sang tenant khác, `is_local = true` mất sau transaction, role ứng dụng tự đặt được tenant bất kỳ, và owner, superuser bỏ qua policy.</Check>
+
+### 7. Gọi API: RLS chặn được gì, không chặn được gì
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+B=localhost:8093
+curl -s -u bob:bob-pass $B/api/orders/2; echo
+curl -s -u bob:bob-pass $B/api/orders/1; echo
+curl -s -u carol:carol-pass $B/api/orders/1; echo
+curl -s -u carol:carol-pass "$B/api/orders?q="; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":2,"tenant":"acme","owner":"bob","item":"Tai nghe","amount":850000}
+{"id":1,"tenant":"acme","owner":"alice","item":"Bàn phím","amount":1200000}
+{"timestamp":"2026-10-09T06:11:28.705Z","status":404,"error":"Not Found","path":"/api/orders/1"}
+[{"id":4,"tenant":"globex","owner":"carol","item":"Màn hình","amount":4300000},{"id":5,"tenant":"globex","owner":"carol","item":"Webcam","amount":900000}]
+```
+
+</Expected>
+
+- Dòng 2: **bob đọc được đơn của alice**. Cùng tenant `acme`, nên RLS cho qua; đây là lỗi IDOR trong tenant, việc của tầng ứng dụng.
+- Dòng 3: carol ở `globex` gọi cùng URL nhận 404. Code không kiểm gì; `findById` chạy trong transaction có tenant `globex`, RLS trả về không dòng nào.
+- Dòng 4: native query không có điều kiện tenant vẫn chỉ trả đơn của `globex`.
+- `timestamp` là giờ UTC lúc bạn chạy lệnh.
+
+<Check id="sb13.1.lab-idor">Chỉ ra được trong output bước 7 đâu là việc RLS làm (cô lập tenant, kể cả native query) và đâu là lỗ hổng RLS không chặn được (IDOR trong cùng tenant).</Check>
+
+### 8. Sửa IDOR bằng method security
+
+Dừng ứng dụng ở tab 1 (**Ctrl+C**). Thêm bean phân quyền, handler biến từ chối thành 404, rồi gắn vào service. Danh sách `search` dùng `@PostFilter` để bạn thấy cái giá của nó: người dùng thường chỉ thấy đơn của mình, quản lý thấy cả tenant.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb13/orders
+P=src/main/java/vn/masteva/orders
+cat > $P/order/OrderAuthz.java <<'EOF'
+package vn.masteva.orders.order;
+
+import org.springframework.security.core.Authentication;
+import org.springframework.stereotype.Component;
+
+/** Quy tắc "ai được đọc đơn nào", gọi từ SpEL bằng @orderAuthz. */
+@Component("orderAuthz")
+public class OrderAuthz {
+    private final OrderRepository orders;
+
+    public OrderAuthz(OrderRepository orders) {
+        this.orders = orders;
+    }
+
+    public boolean canRead(long orderId, Authentication auth) {
+        boolean manager = auth.getAuthorities().stream()
+                .anyMatch(a -> "ROLE_MANAGER".equals(a.getAuthority()));
+        return orders.findOwnerById(orderId)          // RLS: đơn của tenant khác coi như không có
+                .map(owner -> manager || owner.equals(auth.getName()))
+                .orElse(false);
+    }
+}
+EOF
+cat > $P/order/NotFoundOnDenied.java <<'EOF'
+package vn.masteva.orders.order;
+
+import org.aopalliance.intercept.MethodInvocation;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.authorization.AuthorizationResult;
+import org.springframework.security.authorization.method.MethodAuthorizationDeniedHandler;
+import org.springframework.stereotype.Component;
+import org.springframework.web.server.ResponseStatusException;
+
+/** Bị từ chối thì trả lời như thể đơn không tồn tại. */
+@Component
+public class NotFoundOnDenied implements MethodAuthorizationDeniedHandler {
+    @Override
+    public Object handleDeniedInvocation(MethodInvocation invocation, AuthorizationResult result) {
+        throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    }
+}
+EOF
+perl -0pi -e 's/(    \@Transactional\(readOnly = true\)\n    public OrderView get)/    \@PreAuthorize("\@orderAuthz.canRead(#id, authentication)")\n    \@HandleAuthorizationDenied(handlerClass = NotFoundOnDenied.class)\n$1/; s/(    \@Transactional\(readOnly = true\)\n    public List<OrderView> search)/    \@PostFilter("hasRole(\x27MANAGER\x27) or filterObject.owner() == authentication.name")\n$1/; s/(import org.springframework.stereotype.Service;)/import org.springframework.security.access.prepost.PostFilter;\nimport org.springframework.security.access.prepost.PreAuthorize;\nimport org.springframework.security.authorization.method.HandleAuthorizationDenied;\n$1/' $P/order/OrderService.java
+grep -n -A1 -E '@(PreAuthorize|HandleAuthorizationDenied|PostFilter)' $P/order/OrderService.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+20:    @PreAuthorize("@orderAuthz.canRead(#id, authentication)")
+21:    @HandleAuthorizationDenied(handlerClass = NotFoundOnDenied.class)
+22-    @Transactional(readOnly = true)
+--
+28:    @PostFilter("hasRole('MANAGER') or filterObject.owner() == authentication.name")
+29-    @Transactional(readOnly = true)
+```
+
+</Expected>
+
+Chạy lại `./mvnw spring-boot:run` ở tab 1, rồi ở tab 2 cho bốn người cùng đọc đơn số 1 (của alice, tenant `acme`):
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+B=localhost:8093
+for u in alice bob dave carol; do printf "%-6s " $u; curl -s -o /dev/null -w '%{http_code}\n' -u $u:$u-pass $B/api/orders/1; done
+```
+
+</Terminal>
+
+<Predict question="alice là chủ đơn, dave là quản lý của acme. Bốn mã trạng thái là gì?">
+
+```text
+alice  404
+bob    404
+dave   404
+carol  404
+```
+
+Tất cả 404, kể cả chủ đơn. Nhìn lại sơ đồ interceptor ở mục Kiến thức: `@PreAuthorize` chạy **trước** `TransactionInterceptor`, nên `canRead` chạy khi chưa có transaction nào. `findOwnerById` là method truy vấn tự khai báo trong repository, không có `@Transactional` riêng (SB4.1 đã thấy điều này với `findBySku`), nên nó chạy ở chế độ auto-commit. Không có transaction thì `TenantTransactionListener` không chạy, `app.tenant_id` chưa được đặt, và RLS trả về không dòng nào. `canRead` nhận `Optional.empty()`, trả `false`, handler biến nó thành 404.
+
+Đây là fail closed làm đúng việc: thiếu ngữ cảnh tenant thì không ai thấy gì, thay vì mọi người thấy tất cả.
+
+</Predict>
+
+Sửa bằng cách cho `canRead` một transaction chỉ đọc của riêng nó. Dừng ứng dụng, rồi:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb13/orders
+P=src/main/java/vn/masteva/orders
+perl -0pi -e 's/(    public boolean canRead)/    \@Transactional(readOnly = true)\n$1/; s/(import org.springframework.stereotype.Component;)/$1\nimport org.springframework.transaction.annotation.Transactional;/' $P/order/OrderAuthz.java
+grep -n Transactional $P/order/OrderAuthz.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+5:import org.springframework.transaction.annotation.Transactional;
+16:    @Transactional(readOnly = true)
+```
+
+</Expected>
+
+Chạy lại ứng dụng ở tab 1, rồi ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+B=localhost:8093
+for u in alice bob dave carol; do printf "%-6s " $u; curl -s -o /dev/null -w '%{http_code}\n' -u $u:$u-pass $B/api/orders/1; done
+printf "bob/999 "; curl -s -o /dev/null -w '%{http_code}\n' -u bob:bob-pass $B/api/orders/999
+curl -s -u bob:bob-pass "$B/api/orders?q="; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+alice  200
+bob    404
+dave   200
+carol  404
+bob/999 404
+[{"id":2,"tenant":"acme","owner":"bob","item":"Tai nghe","amount":850000}]
+```
+
+</Expected>
+
+Đơn của người khác (`1`) và đơn không tồn tại (`999`) trả cùng một câu trả lời, kể cả thân lỗi JSON giống hệt (chỉ khác `path`). Ở tab 1, lệnh tìm kiếm của bob để lại:
+
+<Expected>
+
+```text
+DEBUG DefaultMethodSecurityExpressionHandler : Filtering with expression: hasRole('MANAGER') or filterObject.owner() == authentication.name
+DEBUG DefaultMethodSecurityExpressionHandler : Filtering collection with 3 elements
+DEBUG DefaultMethodSecurityExpressionHandler : Retaining elements: [OrderView[id=2, tenant=acme, owner=bob, item=Tai nghe, amount=850000]]
+```
+
+</Expected>
+
+`@Transactional` trên `canRead` có cái giá: mỗi lần đọc mở hai transaction (một để kiểm, một để đọc), và giữa hai lần đó dữ liệu có thể đổi chủ. Cách khác là cho transaction bọc ngoài method security bằng `@EnableTransactionManagement(order = 100)` (nhỏ hơn 200 của `@PreAuthorize`): khi đó `canRead` chạy trong transaction của `get` mà không cần annotation riêng. Cách này đã chạy thử với các test của bước 9; nó đổi thứ tự cho mọi bean của ứng dụng, nên cân nhắc trước khi áp.
+
+Với `@PostFilter`: database trả 3 đơn của `acme`, ứng dụng giữ 1. Với danh sách thật, đưa điều kiện `owner` vào câu truy vấn như SB6.3 và chỉ dùng method security cho đọc từng đối tượng.
+
+<Check id="sb13.1.lab-fail-closed">Tái hiện được lỗi mọi người đều nhận 404 khi bean phân quyền chạy ngoài transaction, giải thích bằng thứ tự interceptor và RLS, và sửa được nó.</Check>
+
+### 9. Test phân quyền và cô lập tenant
+
+Dừng ứng dụng (Ctrl+C ở tab 1). Hai lớp test:
+
+- `OrderAccessTest`: MockMvc với `@WithMockUser`, đặt sẵn tên và authority trong `SecurityContext` mà không qua HTTP Basic. Với resource server dùng JWT, `jwt()` của SB6.3 làm cùng việc.
+- `TenantIsolationTest`: native query quên tenant, ghi sang tenant khác, truy vấn ngoài transaction, và tenant rò qua pool. Lớp này chạy với pool chỉ **một** kết nối, nên lần mượn sau chắc chắn nhận lại đúng kết nối vừa được trả: chuyện rò qua pool từ "thỉnh thoảng" thành tất định.
+
+start.spring.io đã sinh `TestcontainersConfiguration` với `@ServiceConnection`. Ghim image, cho container tạo database `orders` và chạy `init-roles.sql`:
+
+<Terminal where="mac" title="Tab 2: TestcontainersConfiguration và hai lớp test">
+
+```bash
+cd ~/masteva-sb13/orders
+T=src/test/java/vn/masteva/orders
+perl -pi -e 's/DockerImageName.parse\("postgres:latest"\)\)/DockerImageName.parse("postgres:18-alpine"))\n\t\t\t\t.withDatabaseName("orders").withInitScript("init-roles.sql")/' $T/TestcontainersConfiguration.java
+cat > $T/OrderAccessTest.java <<'EOF'
+package vn.masteva.orders;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.context.annotation.Import;
+import org.springframework.security.test.context.support.WithMockUser;
+import org.springframework.test.web.servlet.MockMvc;
+
+@Import(TestcontainersConfiguration.class)
+@SpringBootTest
+@AutoConfigureMockMvc
+class OrderAccessTest {
+    @Autowired
+    MockMvc mvc;
+
+    @Test
+    @WithMockUser(username = "alice", authorities = {"ROLE_USER", "TENANT_acme"})
+    void ownerReadsOwnOrder() throws Exception {
+        mvc.perform(get("/api/orders/1")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.owner").value("alice"));
+    }
+
+    @Test
+    @WithMockUser(username = "bob", authorities = {"ROLE_USER", "TENANT_acme"})
+    void sameTenantOtherUserGets404() throws Exception {
+        mvc.perform(get("/api/orders/1")).andExpect(status().isNotFound());
+    }
+
+    @Test
+    @WithMockUser(username = "carol", authorities = {"ROLE_MANAGER", "TENANT_globex"})
+    void otherTenantGets404EvenAsManager() throws Exception {
+        mvc.perform(get("/api/orders/1")).andExpect(status().isNotFound());
+    }
+}
+EOF
+cat > $T/TenantIsolationTest.java <<'EOF'
+package vn.masteva.orders;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.test.context.support.WithMockUser;
+import org.springframework.transaction.support.TransactionTemplate;
+import vn.masteva.orders.order.OrderService;
+import vn.masteva.orders.order.OrderView;
+
+/** Pool chỉ có 1 kết nối: lần mượn sau chắc chắn nhận lại đúng kết nối vừa trả. */
+@Import(TestcontainersConfiguration.class)
+@SpringBootTest(properties = "spring.datasource.hikari.maximum-pool-size=1")
+class TenantIsolationTest {
+    @Autowired OrderService orders;
+    @Autowired JdbcClient jdbc;
+    @Autowired TransactionTemplate tx;
+
+    @Test
+    @WithMockUser(username = "carol", authorities = {"ROLE_MANAGER", "TENANT_globex"})
+    void nativeQueryWithoutTenantFilterStaysInTenant() {
+        assertThat(orders.search("")).isNotEmpty()
+                .extracting(OrderView::tenant).containsOnly("globex");
+    }
+
+    @Test
+    @WithMockUser(username = "carol", authorities = {"ROLE_MANAGER", "TENANT_globex"})
+    void cannotWriteIntoAnotherTenant() {
+        assertThatThrownBy(() -> tx.executeWithoutResult(s -> jdbc.sql(
+                "INSERT INTO orders (tenant_id, owner, item, amount) VALUES ('acme', 'carol', 'x', 1)").update()))
+                .rootCause().hasMessageContaining("violates row-level security policy");
+    }
+
+    @Test
+    void noTransactionNoTenantNoRows() {
+        assertThat(jdbc.sql("SELECT count(*) FROM orders").query(Long.class).single()).isZero();
+    }
+
+    @Test
+    @WithMockUser(username = "carol", authorities = {"ROLE_MANAGER", "TENANT_globex"})
+    void tenantDoesNotOutliveTransaction() {
+        orders.search("");                       // transaction của carol, đặt app.tenant_id = globex
+        SecurityContextHolder.clearContext();    // từ đây: không user, không transaction
+        long visible = jdbc.sql("SELECT count(*) FROM orders").query(Long.class).single();
+        System.out.println(">> rows visible to the next borrower: " + visible);
+        assertThat(visible).isZero();
+    }
+}
+EOF
+./mvnw test 2>&1 | grep -E 'Tests run:|<<< FAIL|^>>|BUILD'
+```
+
+</Terminal>
+
+<Predict question="Ứng dụng đã có RLS và method security. Bảy test này có xanh hết không?">
+
+```text
+[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 5.348 s <<< FAILURE! -- in vn.masteva.orders.OrderAccessTest
+[ERROR] vn.masteva.orders.OrderAccessTest.otherTenantGets404EvenAsManager -- Time elapsed: 0.013 s <<< FAILURE!
+>> rows visible to the next borrower: 5
+[ERROR] Tests run: 4, Failures: 4, Errors: 0, Skipped: 0, Time elapsed: 1.638 s <<< FAILURE! -- in vn.masteva.orders.TenantIsolationTest
+[ERROR] vn.masteva.orders.TenantIsolationTest.tenantDoesNotOutliveTransaction -- Time elapsed: 0.058 s <<< FAILURE!
+[ERROR] vn.masteva.orders.TenantIsolationTest.nativeQueryWithoutTenantFilterStaysInTenant -- Time elapsed: 0.012 s <<< FAILURE!
+[ERROR] vn.masteva.orders.TenantIsolationTest.noTransactionNoTenantNoRows -- Time elapsed: 0.003 s <<< FAILURE!
+[ERROR] vn.masteva.orders.TenantIsolationTest.cannotWriteIntoAnotherTenant -- Time elapsed: 0.008 s <<< FAILURE!
+[ERROR] Tests run: 7, Failures: 5, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
+
+Năm test đỏ, đúng những test liên quan tới tenant. `@ServiceConnection` đặt cả URL, user và mật khẩu của `DataSource` theo container, nên ứng dụng kết nối bằng user `test`, là **superuser** của image PostgreSQL. Superuser bỏ qua RLS: truy vấn không có tenant thấy đủ 5 đơn, và carol của `globex` đọc được đơn của `acme`. Flyway vẫn chạy bằng `orders_owner` vì `spring.flyway.user` được đặt riêng.
+
+Ở đây test đỏ là may. Nếu bộ test chỉ có các ca "alice đọc được đơn của alice", nó sẽ xanh trên superuser và bạn tin rằng RLS đang bảo vệ mình.
+
+</Predict>
+
+Sửa: bỏ `@ServiceConnection`, chỉ lấy URL từ container qua `DynamicPropertyRegistrar`; user và mật khẩu giữ nguyên như `application.properties`, giống production.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb13/orders
+cat > src/test/java/vn/masteva/orders/TestcontainersConfiguration.java <<'EOF'
+package vn.masteva.orders;
+
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.test.context.DynamicPropertyRegistrar;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
+
+@TestConfiguration(proxyBeanMethods = false)
+class TestcontainersConfiguration {
+
+	@Bean
+	PostgreSQLContainer postgresContainer() {
+		return new PostgreSQLContainer(DockerImageName.parse("postgres:18-alpine"))
+				.withDatabaseName("orders").withInitScript("init-roles.sql");
+	}
+
+	/** Chỉ lấy URL của container; user vẫn là orders_app và orders_owner như production. */
+	@Bean
+	DynamicPropertyRegistrar ordersDatabase(PostgreSQLContainer postgres) {
+		return registry -> registry.add("spring.datasource.url", postgres::getJdbcUrl);
+	}
+
+}
+EOF
+./mvnw test 2>&1 | grep -E 'Tests run:|<<< FAIL|^>>|BUILD'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.988 s -- in vn.masteva.orders.OrderAccessTest
+>> rows visible to the next borrower: 0
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.522 s -- in vn.masteva.orders.TenantIsolationTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+</Expected>
+
+Hai lớp test có cấu hình khác nhau (MockMvc, kích thước pool) nên Spring tạo hai context, mỗi context khởi động một container PostgreSQL riêng từ đúng hai migration; dữ liệu của container `sb13-pg` không liên quan. `cannotWriteIntoAnotherTenant` kiểm thông báo ở `rootCause()`: Spring dịch lỗi `42501` của PostgreSQL thành `BadSqlGrammarException` với thông báo chung, câu "violates row-level security policy" nằm ở `PSQLException` bên dưới.
+
+<Check id="sb13.1.lab-superuser-test">Giải thích được vì sao `@ServiceConnection` làm test RLS vô nghĩa, và cấu hình được Testcontainers để ứng dụng kết nối bằng role thường còn Flyway bằng role owner.</Check>
+
+### 10. Làm rò tenant qua pool, có chủ đích
+
+Đổi `true` thành `false` trong listener, chạy riêng test rò qua pool, rồi đổi lại:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb13/orders
+L=src/main/java/vn/masteva/orders/tenant/TenantTransactionListener.java
+perl -pi -e "s/set_config\('app.tenant_id', \?, true\)/set_config('app.tenant_id', ?, false)/" $L
+./mvnw test -Dtest='TenantIsolationTest#tenantDoesNotOutliveTransaction' 2>&1 | grep -E 'Tests run:|^>>|but was'
+perl -pi -e "s/set_config\('app.tenant_id', \?, false\)/set_config('app.tenant_id', ?, true)/" $L
+grep -c "?, true)" $L
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+>> rows visible to the next borrower: 2
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 5.282 s <<< FAILURE! -- in vn.masteva.orders.TenantIsolationTest
+ but was: 2L
+ but was: 2L
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0
+1
+```
+
+</Expected>
+
+Truy vấn cuối không có user, không có transaction, nhưng thấy 2 đơn của `globex`, vì nó mượn đúng kết nối carol vừa trả và kết nối đó còn mang `app.tenant_id = globex`. Dòng `1` cuối xác nhận file đã được trả về `true`.
+
+<Check id="sb13.1.lab-pool-leak">Tái hiện được tenant rò qua connection pool bằng pool một kết nối và `set_config(..., false)`, và giải thích vì sao pool một kết nối làm kết quả tất định.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `FATAL: password authentication failed for user "orders_app"`: container `sb13-pg` được tạo trước khi có `init-roles.sql`, nên script không chạy (nó chỉ chạy khi thư mục dữ liệu còn trống). Xoá container theo mục Dọn dẹp rồi chạy lại bước 2.
+- `permission denied for schema public` khi Flyway chạy: thiếu dòng `ALTER SCHEMA public OWNER TO orders_owner`.
+- `Port 8093 was already in use`: lần chạy trước chưa tắt. Tìm bằng `lsof -i :8093` rồi dừng tiến trình đó.
+- Mọi request đều 404 dù đúng chủ đơn: một truy vấn chạy ngoài transaction, như bước 8. Tìm method gọi repository mà không có `@Transactional` bao ngoài.
+- `ERROR: invalid input syntax for type uuid: ""`: cột tenant kiểu `uuid` mà policy không có `NULLIF(..., '')`.
+- `Could not find a valid Docker environment` khi chạy test: Docker Desktop chưa chạy.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Testcontainers tự xoá container của test. Giữ `~/masteva-sb13`: bài SB13.2 dùng chung thư mục lab. Container `sb13-pg` không còn cần cho các bài sau.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá container `sb13-pg` cùng toàn bộ dữ liệu trong nó. Chỉ chạy khi bạn không cần dữ liệu của bài này nữa.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker rm -f sb13-pg
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đã có RLS thì có cần điều kiện tenant trong câu truy vấn nữa không?">
+
+Có, vì hai lý do. Hiệu năng: policy thêm `tenant_id = current_setting(...)` vào truy vấn, nhưng planner chỉ dùng tốt index khi điều kiện đó khớp với index có `tenant_id` ở đầu; viết điều kiện tường minh trong truy vấn giúp người đọc và giúp kiểm tra execution plan. Phòng thủ nhiều lớp: RLS là lưới an toàn cuối cùng, không phải chỗ duy nhất giữ ranh giới. Nếu một ngày có người chạy ứng dụng bằng role owner hay superuser (như bước 9), lưới đó biến mất mà không ai nhận ra; `@TenantId` hay điều kiện tường minh vẫn còn. Ngược lại, RLS bắt được đúng loại lỗi mà tầng ứng dụng không bắt được: native query, script, báo cáo viết tay.
+
+</Reveal>
+
+<Reveal title="Chạy job xử lý cho mọi tenant (báo cáo cuối ngày, migration dữ liệu) thì làm sao khi RLS chặn hết?">
+
+Hai cách, tuỳ mức tin cậy. Cách an toàn hơn: job lặp qua danh sách tenant, mỗi tenant một transaction với `set_config` tương ứng, giống một request. Code job đi đúng đường của ứng dụng và vẫn được RLS bảo vệ khỏi lỗi ghép nhầm tenant. Cách thứ hai: một role riêng có `BYPASSRLS`, một `DataSource` riêng chỉ job đó dùng, và quyền tối thiểu trên đúng các bảng cần. Đừng thêm `BYPASSRLS` cho role ứng dụng "để job chạy được": mọi request cũng sẽ bỏ qua RLS theo.
+
+</Reveal>
+
+<Reveal title="Quy tắc dùng ở nhiều nơi: AuthorizationManager tự viết và @AuthorizeReturnObject">
+
+Bên dưới `@PreAuthorize`, Spring Security 7 dùng `AuthorizationManager<T>` với method `authorize(Supplier<Authentication>, T)` trả `AuthorizationResult` (method `check` cũ đã bị bỏ ở bản 7). Muốn kiểu dữ liệu thay cho chuỗi SpEL, viết một manager và gắn nó vào annotation riêng `@OrderReadAccess`:
+
+```java
+public class OrderReadAuthorizationManager
+        implements AuthorizationManager<MethodInvocation>, MethodAuthorizationDeniedHandler {
+    private final ObjectProvider<OrderAuthz> authz;   // lấy lười: chỉ khi có lời gọi đầu tiên
+
+    public OrderReadAuthorizationManager(ObjectProvider<OrderAuthz> authz) { this.authz = authz; }
+
+    @Override
+    public AuthorizationResult authorize(Supplier<? extends @Nullable Authentication> authentication,
+            MethodInvocation invocation) {
+        long orderId = (long) invocation.getArguments()[0];
+        Authentication auth = authentication.get();
+        return new AuthorizationDecision(auth != null && authz.getObject().canRead(orderId, auth));
+    }
+
+    @Override   // manager tự xử lý khi bị từ chối: 404 thay 403
+    public Object handleDeniedInvocation(MethodInvocation invocation, AuthorizationResult result) {
+        throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+    }
+}
+
+@Configuration(proxyBeanMethods = false)
+class MethodSecurityConfig {
+    @Bean
+    @Role(BeanDefinition.ROLE_INFRASTRUCTURE)
+    static Advisor orderReadAccess(ObjectProvider<OrderAuthz> authz) {
+        var interceptor = new AuthorizationManagerBeforeMethodInterceptor(
+                AnnotationMatchingPointcut.forMethodAnnotation(OrderReadAccess.class),
+                new OrderReadAuthorizationManager(authz));
+        interceptor.setOrder(AuthorizationInterceptorsOrder.PRE_AUTHORIZE.getOrder());
+        return interceptor;
+    }
+}
+```
+
+Đã chạy với project của lab (thay `@PreAuthorize` và `@HandleAuthorizationDenied` trên `get` bằng `@OrderReadAccess`) và các test của bước 9: xanh, Flyway chạy trên cổng ngẫu nhiên của container, `OrderAuthz` vẫn là proxy `OrderAuthz$$SpringCGLIB$$0`. Ba điểm dễ sai:
+
+- Advisor là bean hạ tầng, được tạo rất sớm. Nó phải là method `static` và chỉ giữ `ObjectProvider`, không gọi `getObject()` lúc tạo. Gọi sớm là kéo `OrderAuthz`, repository, `EntityManagerFactory` và `DataSource` ra đời trước khi các BeanPostProcessor và `DynamicPropertyRegistrar` kịp chạy: `OrderAuthz` mất proxy `@Transactional`, và trong test, Flyway chạy trên database dev ở `application.properties` thay vì container, đúng kiểu test xanh giả của bước 9.
+- `@HandleAuthorizationDenied` chỉ áp cho `@PreAuthorize` và `@PostAuthorize`; interceptor tự dựng trả 403 trừ khi chính manager cài `MethodAuthorizationDeniedHandler` như trên.
+- `@AuthorizeReturnObject` (từ 6.3) bọc đối tượng trả về trong proxy để `@PreAuthorize` trên getter của nó được kiểm, ví dụ chỉ quản lý đọc được `amount()`. Thử với `record` `OrderView` của lab thì nhận `ClassCastException`: record là class `final`, chỉ có proxy JDK, không ép kiểu về `OrderView` được. Hợp với domain object thường hơn là DTO.
+
+</Reveal>
+
+<Reveal title="Vì sao không đặt tenant trong một HandlerInterceptor hay filter HTTP cho gọn?">
+
+Vì lúc đó chưa có transaction và chưa biết kết nối nào sẽ được dùng. Đặt bằng `SET` mức phiên trên một kết nối mượn tạm thì kết nối của transaction sau có thể là kết nối khác; còn `SET LOCAL` ngoài transaction thì mất ngay ở câu lệnh kế. Filter HTTP cũng không bao được job `@Scheduled`, listener Kafka hay `@Async`. Đặt ở `afterBegin` của transaction phủ mọi đường vào, miễn là đường đó dùng transaction của Spring; filter chỉ nên làm phần "đọc tenant từ token và đặt vào `SecurityContext`".
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết policy RLS cho một danh sách bảng, sinh test pgTAP hay test Testcontainers cho từng policy, hoặc rà các method `@PreAuthorize` để tìm biểu thức SpEL quá dài nên chuyển thành bean. AI hay viết `SET app.tenant_id` mức phiên trong filter, hay để ứng dụng kết nối bằng owner hoặc user `postgres` rồi khẳng định RLS đang chạy, hay quên `WITH CHECK`, và hay dùng `@PostFilter` cho danh sách có phân trang. Kiểm tra lại bằng đúng các bước của lab: chạy test với role ứng dụng thật, đọc `pg_roles` để chắc role không có `rolbypassrls`, và thử pool một kết nối.
+
+</Callout>
+
+<Callout kind="link">
+
+SB4.1 giải thích proxy và thứ tự interceptor mà bước 8 dựa vào. SB3.2 giới thiệu HikariCP, nơi giá trị mức phiên rò qua. SB6.1 và SB6.3 là nền của method security và IDOR. SB10.4 dạy mô hình đa tenant ở tầng ứng dụng mà RLS bổ sung. SB13.2 thay người dùng trong bộ nhớ bằng authorization server và BFF; SB13.3 ghi lại các lần bị từ chối vào audit trail.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb13.1.mastery-authz">Tự thiết kế được phân quyền theo dữ liệu cho một API có nhiều vai trò: chọn chỗ kiểm (truy vấn hay `@PreAuthorize` gọi bean), trả 404 cho đối tượng không được phép, và viết test với ít nhất hai user khác nhau.</Check>
+
+<Check id="sb13.1.mastery-rls">Tự thêm được RLS cho một bảng đa tenant: role không owner và không `BYPASSRLS`, policy có `USING` và `WITH CHECK`, `set_config(..., true)` sau BEGIN, và test chứng minh native query quên điều kiện vẫn không rò, kể cả qua connection pool.</Check>
+
+</Mastery>

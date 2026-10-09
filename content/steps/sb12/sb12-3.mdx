@@ -1,0 +1,666 @@
+---
+title: Khởi động nhanh trên JVM với CDS, AOT cache, Spring AOT và JPA bất đồng bộ
+description: Đo thời gian khởi động của một service Spring Boot qua từng bước, từ JAR giải nén, CDS, AOT cache của JDK 25, Spring AOT trên JVM tới khởi động JPA bất đồng bộ, rồi huấn luyện AOT cache dưới tải để rút ngắn cả warm-up, kèm cái giá của từng cách.
+id: sb12.3
+step: sb12
+prerequisites: [sb12.2]
+topics: [sb12.khoi-dong-nhanh]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    docker: 29.8.0
+    postgresql: "18.6"
+    k6: 2.3.0
+---
+
+<Goal>
+
+Rút thời gian khởi động của service từ SB12.2 từ khoảng 3 giây xuống dưới 1 giây mà không rời JVM, biết mỗi bước lấy lại bao nhiêu và đổi lấy gì. Học xong bài này, bạn giải thích được:
+
+- JVM và Spring làm gì trong 3 giây khởi động, và mỗi kỹ thuật cắt vào phần nào.
+- Vì sao một file AOT cache 113 MB đang chạy tốt bỗng "không còn tác dụng" sau lần build tiếp theo, và làm sao để nó báo lỗi thay vì lặng lẽ chạy chậm.
+- Vì sao AOT cache huấn luyện bằng `spring.context.exit=onRefresh` làm khởi động nhanh nhưng 10 giây đầu vẫn có request 300 ms, còn cache huấn luyện dưới tải thì không.
+
+</Goal>
+
+<Knowledge>
+
+### Ba giây khởi động đi đâu
+
+```text
+ java -jar ...                                                              "Started ... in 2.9 s"
+ |-- JVM khởi động --|-- nạp, kiểm tra, liên kết ~16.000 class ------------------------------|
+                     |-- Spring: quét bean, đánh giá điều kiện auto-config, tạo bean -------|
+                                     |-- HikariCP mở kết nối, chạy schema.sql --|
+                                                |-- Hibernate dựng metamodel (0,6 s) --|
+                                                                         |-- Tomcat start --|
+
+ cắt vào đâu:
+   JAR giải nén ......... đọc class nhanh hơn từ JAR thường thay vì JAR lồng nhau
+   CDS, AOT cache ....... bỏ phần nạp, kiểm tra, liên kết class (JVM)
+   Spring AOT ........... bỏ phần quét và đánh giá điều kiện lúc chạy (Spring)
+   JPA bất đồng bộ ...... cho Hibernate chạy song song với phần còn lại
+```
+
+Ứng dụng nhỏ của lab nạp khoảng 16.000 class lúc khởi động, chỉ khoảng 1.450 lấy sẵn từ archive CDS mặc định của JDK; phần còn lại được đọc, kiểm tra bytecode và liên kết từng cái một. Đó là lý do phần lớn thời gian nằm ở JVM chứ không ở code của bạn.
+
+### CDS và AOT cache
+
+Cả hai làm cùng một ý tưởng: **chạy ứng dụng một lần để huấn luyện**, ghi lại trạng thái class đã xử lý ra file, các lần sau ánh xạ file đó vào bộ nhớ thay vì làm lại.
+
+```text
+ huấn luyện (một lần, lúc build)                    các lần chạy sau
+ java -XX:ArchiveClassesAtExit=app.jsa ...  ---->   java -XX:SharedArchiveFile=app.jsa ...   (CDS)
+ java -XX:AOTCacheOutput=app.aot ...        ---->   java -XX:AOTCache=app.aot ...            (AOT cache)
+      chạy tới khi thoát (onRefresh hoặc SIGTERM)        JVM kiểm: cùng JDK? cùng classpath,
+      JVM ghi class đã dùng ra file                       cùng thời điểm sửa của từng JAR?
+                                                          khớp -> dùng; lệch -> bỏ qua (hoặc lỗi)
+```
+
+| | CDS động | AOT cache |
+|---|---|---|
+| Có từ | JDK 13 (JEP 350) | JDK 24 (JEP 483), một bước từ JDK 25 (JEP 514) |
+| Lưu gì | Class đã đọc và kiểm tra | Như CDS, cộng class đã **liên kết** sẵn; từ JDK 25 thêm **profile của method** (JEP 515) để JIT biên dịch sớm |
+| Spring Boot khuyên | Cho JDK dưới 25 | Từ JDK 25 |
+| Giới hạn đáng nhớ | Cùng JDK, cùng classpath | Cùng JDK, cùng classpath; JDK 25 chưa dùng được với ZGC (JEP 516 của JDK 26 gỡ giới hạn này) |
+
+Bài J12.2 đã tạo AOT cache cho một chương trình nhỏ và cho thấy profile huấn luyện phải giống lưu lượng thật. Với ứng dụng Spring có thêm vài điều:
+
+- Cache **chỉ có tác dụng với JAR đã giải nén** (SB11.1): classpath phải là các file JAR thường, không phải JAR lồng trong fat JAR.
+- `-Dspring.context.exit=onRefresh` cho lần huấn luyện thoát ngay khi context sẵn sàng. Nhanh, nhưng cache chỉ biết những gì chạy lúc khởi động, không biết gì về đường xử lý request.
+- Lần huấn luyện khởi động context **thật**: ở lab, nó kết nối PostgreSQL, chạy `schema.sql` và Hibernate `validate`. Trong pipeline build, bước huấn luyện cần database (hoặc cấu hình để context khởi động được không cần nó).
+- Cú pháp JDK 25 có hai dạng. Một bước: `-XX:AOTCacheOutput=app.aot` (JVM tự ghi cấu hình tạm rồi gọi một JVM con để tạo cache lúc thoát). Hai bước, khi muốn tách huấn luyện và tạo cache: `-XX:AOTMode=record -XX:AOTConfiguration=app.aotconf`, rồi `-XX:AOTMode=create -XX:AOTConfiguration=app.aotconf -XX:AOTCache=app.aot`.
+- Khi dùng, `-XX:AOTMode` mặc định là `auto`: cache lệch thì JVM in lỗi rồi **chạy tiếp không có cache**. `-XX:AOTMode=on` biến việc đó thành lỗi khởi động. JEP 483 dặn dùng `on` ở production phải cẩn thận: một VM option không tương thích được thêm mà bạn không biết, ví dụ agent JVMTI của công cụ giám sát (javaagent của APM hay OpenTelemetry), sẽ làm ứng dụng không khởi động được. Từ JDK 27, `on` đổi tên thành `required`. Cách dùng hợp lý: `on` trong smoke test của image ở CI để bắt cache lệch; production giữ `auto` và cảnh báo khi log có `[error][aot]`.
+
+<Check id="sb12.3.cds-aot-cache">Giải thích được CDS và AOT cache lưu gì, điều kiện để cache được dùng (JDK, classpath, JAR giải nén), và khác biệt giữa `-XX:AOTMode=auto` và `on`.</Check>
+
+### Spring AOT trên JVM
+
+SB11.4 bước 5 đã bật Spring AOT trên JVM (goal `process-aot`, `-Dspring.aot.enabled=true`) cùng AOT cache huấn luyện bằng `onRefresh`, và bước 7 cho thấy `@ConditionalOnProperty` bị chốt lúc build. Bài này chỉ thêm ba điều trên một ứng dụng có JPA:
+
+- Spring Data cũng sinh sẵn phần cài đặt repository (`ProductRepositoryImpl__AotRepository.java`) với câu JPQL đã dựng sẵn.
+- Một cấu hình hay dùng để khởi động nhanh bị chốt theo cùng cách: `spring.data.jpa.repositories.bootstrap-mode=deferred` truyền lúc chạy bị bỏ qua lặng lẽ (lab bước 6 chỉ ra vì sao).
+- Thời gian của từng kỹ thuật khi cộng dồn, trên cùng một ứng dụng.
+
+### Khởi động JPA bất đồng bộ
+
+Dựng `EntityManagerFactory` (đọc entity, dựng metamodel, kiểm schema với `validate`) mất khoảng 0,6 giây trong lab, chạy trên thread `main` và chặn mọi thứ phía sau. Có hai cách cho nó chạy song song:
+
+| Cách | Property | Từ | Cơ chế |
+|---|---|---|---|
+| JPA bất đồng bộ | `spring.jpa.bootstrap=async` | Spring Boot 4.1 (không có trong 4.0.8) | `EntityManagerFactory` được dựng trên `applicationTaskExecutor`; bean nào cần nó thì chờ |
+| Repository hoãn | `spring.data.jpa.repositories.bootstrap-mode=deferred` | Spring Data | Như trên, và repository chỉ được khởi tạo khi context refresh xong, nên bean dùng repository không phải chờ |
+| Repository lười | `...bootstrap-mode=lazy` | Spring Data | Repository khởi tạo ở lần dùng đầu tiên |
+
+`async` chỉ đẩy việc dựng `EntityManagerFactory` sang thread khác; nếu controller được tạo sớm và cần repository, thread `main` vẫn phải chờ tới khi factory xong. `deferred` hoãn luôn cả repository, nên phần song song dài hơn. `lazy` nhanh nhất nhưng lỗi ánh xạ entity hay truy vấn sai chỉ lộ ra ở request đầu tiên, thay vì làm ứng dụng không khởi động được. Với cả ba, code chạy lúc khởi động (`@PostConstruct`, `ApplicationRunner`) mà chạm JPA sẽ chặn lại chờ; tài liệu Spring Boot khuyên dời việc đó sang `SmartInitializingSingleton`.
+
+Lợi ích tối đa bằng phần thời gian JPA chạy song song được với phần còn lại. Với một entity như lab, đó là khoảng 0,2 tới 0,4 giây; với vài trăm entity, phần JPA lớn hơn nhiều.
+
+<Check id="sb12.3.jpa-bootstrap">So sánh được `spring.jpa.bootstrap=async` với `bootstrap-mode` `deferred` và `lazy`: cơ chế, lợi ích và rủi ro của từng cách, và tương tác của chúng với Spring AOT.</Check>
+
+### Chọn cách nào
+
+| Cách | Cần làm thêm | Ràng buộc | Mất gì |
+|---|---|---|---|
+| Giải nén JAR | Một lệnh trong Dockerfile (SB11.1) | Không | Gần như không |
+| CDS | Lần huấn luyện lúc build, archive vài chục tới trăm MB | Cùng JDK, cùng classpath | Thời gian build |
+| AOT cache | Như CDS, file lớn hơn | Như CDS; JDK 25 không dùng với ZGC | Thời gian build, image lớn hơn |
+| Spring AOT | Goal `process-aot` | Tập bean và điều kiện chốt lúc build | Không đổi cấu hình bean lúc chạy được |
+| JPA bất đồng bộ | Một property | Không chạm JPA lúc khởi động | Lỗi ánh xạ lộ muộn hơn (với `lazy`) |
+| GraalVM native image (SB11.4) | Build vài phút, RAM lớn | Closed world, hint cho reflection | Khởi động vài chục mili giây, nhưng mất JIT ở tải dài và công cụ chẩn đoán JVM |
+
+Các cách trên JVM cộng dồn được với nhau. Chúng không đổi throughput khi service đã chạy ổn định; chúng rút ngắn khoảng thời gian từ lúc container khởi động tới lúc phục vụ tốt.
+
+<Callout kind="production">
+
+Một đội chạy service trên Kubernetes với autoscaling theo CPU. Mỗi lần tải tăng, pod mới mất 9 giây khởi động trên 1 vCPU rồi thêm vài chục giây warm-up, trong lúc đó các pod cũ quá tải và autoscaler tạo thêm pod. Họ thêm AOT cache vào Dockerfile: stage build dùng image JDK để giải nén JAR và chạy huấn luyện với một database tạm, stage chạy dùng image JRE gọn hơn. Khởi động còn 3 giây. Hai tuần sau, khởi động lại thành 9 giây mà không ai đổi code: image JRE được kéo bản vá JDK mới, còn image JDK trên runner CI vẫn là bản cũ đã cache. Cache tạo bằng JDK cũ bị bỏ qua, log chỉ có vài dòng `[error][aot]` không ai đọc. Cách sửa: huấn luyện bằng chính image dùng để chạy, ghim image theo digest, chạy smoke test image trong CI với `-XX:AOTMode=on` để cache lệch làm CI đỏ, còn production giữ `auto` kèm cảnh báo khi log có `[error][aot]`.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [AOT Cache (Spring Boot)](https://docs.spring.io/spring-boot/reference/packaging/aot-cache.html): lệnh chính thức cho AOT cache và CDS với JAR giải nén.
+- [Ahead-of-Time Processing With the JVM (Spring Boot)](https://docs.spring.io/spring-boot/reference/packaging/aot.html): bật Spring AOT trên JVM và giới hạn về điều kiện, profile.
+- [JEP 483: Ahead-of-Time Class Loading & Linking](https://openjdk.org/jeps/483): phần "Description" giải thích cache chứa gì, các giá trị của `-XX:AOTMode` và điều kiện classpath.
+- [JEP 515: Ahead-of-Time Method Profiling](https://openjdk.org/jeps/515): vì sao lần huấn luyện cần giống lưu lượng thật để profile có ích.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm xong SB12.2: `sb12-pg` và `sb12-partner` đang chạy, project `~/masteva-sb12/perf` có cấu hình virtual thread và `connection-timeout=250`, file `~/masteva-sb12/k6/open.js` của SB12.1. Bài cần một tab Terminal cho các bước 1–6, bước 7 dùng thêm k6. Mọi lệnh chạy trong zsh của macOS; bash cũng được.
+
+Số đo trên `Apple M1 Pro` 10 nhân, 16 GB RAM, máy không chạy tải nặng khác. Thời gian khởi động rất nhạy với việc máy đang bận: kiểm `uptime` trước khi đo, và chỉ so sánh các con số đo liền nhau.
+
+### 1. Hàm đo và mốc ban đầu
+
+Hàm `startup` chạy ứng dụng ba lần, mỗi lần chờ dòng `Started PerfApplication`, in dòng đó rồi dừng ứng dụng và chờ nó thoát hẳn. Chạy nền trong `( ... & )` để zsh không in thông báo job.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-sb12/perf
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+startup() {
+  for i in 1 2 3; do
+    : > start.log
+    ( "$@" > start.log 2>&1 & echo $! > start.pid )
+    until grep -q -E 'Started PerfApplication|APPLICATION FAILED' start.log; do sleep 0.2; done
+    grep -o 'Started PerfApplication in .*' start.log
+    kill $(cat start.pid)
+    while kill -0 $(cat start.pid) 2>/dev/null; do sleep 0.2; done
+  done
+}
+./mvnw -q -DskipTests package
+java -Xlog:class+load:file=classes.txt -Dspring.context.exit=onRefresh \
+  -jar target/perf-0.0.1-SNAPSHOT.jar > /dev/null
+wc -l < classes.txt
+grep -c 'shared objects file' classes.txt
+startup java -jar target/perf-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   16079
+1458
+Started PerfApplication in 2.66 seconds (process running for 2.916)
+Started PerfApplication in 2.678 seconds (process running for 2.918)
+Started PerfApplication in 2.675 seconds (process running for 2.918)
+```
+
+</Expected>
+
+- `-Xlog:class+load` ghi một dòng cho mỗi class được nạp: 16.079 class tới lúc context sẵn sàng. 1.458 dòng có `shared objects file`, tức lấy từ archive CDS mặc định đi kèm JDK; đó là class của chính JDK.
+- `Started ... in` là thời gian Spring đo từ lúc `SpringApplication.run`; `process running for` tính từ lúc JVM khởi động. Bài dùng số thứ hai để so sánh vì CDS và AOT cache tác động cả phần trước `run`.
+
+### 2. Giải nén JAR
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-sb12/perf
+java -Djarmode=tools -jar target/perf-0.0.1-SNAPSHOT.jar extract --destination target/app
+cd target/app && ls && ls lib | wc -l
+startup java -jar perf-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lib
+perf-0.0.1-SNAPSHOT.jar
+      84
+Started PerfApplication in 2.296 seconds (process running for 2.449)
+Started PerfApplication in 2.264 seconds (process running for 2.415)
+Started PerfApplication in 2.144 seconds (process running for 2.302)
+```
+
+</Expected>
+
+SB11.1 đã giải thích cấu trúc này: `perf-0.0.1-SNAPSHOT.jar` nhỏ, có `Class-Path` trỏ vào 84 JAR trong `lib/`. Khoảng 0,5 giây nhanh hơn vì JVM đọc JAR thường trực tiếp. Từ đây mọi lệnh chạy trong `target/app`.
+
+### 3. CDS
+
+<Terminal where="mac">
+
+```bash
+java -XX:ArchiveClassesAtExit=app.jsa -Dspring.context.exit=onRefresh \
+  -jar perf-0.0.1-SNAPSHOT.jar > cds-train.log 2>&1
+grep -c 'warning\]\[cds' cds-train.log
+ls -lh app.jsa | awk '{print $5, $9}'
+startup java -XX:SharedArchiveFile=app.jsa -jar perf-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+199
+87M app.jsa
+Started PerfApplication in 1.258 seconds (process running for 1.368)
+Started PerfApplication in 1.291 seconds (process running for 1.396)
+Started PerfApplication in 1.253 seconds (process running for 1.36)
+```
+
+</Expected>
+
+Gần một nửa thời gian biến mất. Khoảng 200 dòng cảnh báo `[warning][cds]` trong lần huấn luyện là bình thường: proxy sinh lúc chạy (`jdk/proxy2/$Proxy47: Unsupported location`) và một số class của JAR đa phiên bản như `spring-core` không đưa vào archive được, chúng vẫn được nạp theo cách thường.
+
+### 4. AOT cache
+
+<Terminal where="mac">
+
+```bash
+time java -XX:AOTCacheOutput=app.aot -Dspring.context.exit=onRefresh \
+  -jar perf-0.0.1-SNAPSHOT.jar > aot-train.log 2>&1
+grep -E 'AOTConfiguration recorded|AOTCache creation' aot-train.log
+ls -lh app.aot | awk '{print $5, $9}'
+startup java -XX:AOTCache=app.aot -jar perf-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+java -XX:AOTCacheOutput=app.aot -Dspring.context.exit=onRefresh -jar  >  2>&1  12.08s user 1.26s system 148% cpu 8.976 total
+Temporary AOTConfiguration recorded: app.aot.config
+AOTCache creation is complete: app.aot 118325248 bytes
+113M app.aot
+Started PerfApplication in 0.859 seconds (process running for 1.017)
+Started PerfApplication in 0.856 seconds (process running for 1.013)
+Started PerfApplication in 0.832 seconds (process running for 0.993)
+```
+
+</Expected>
+
+Dòng `time` là định dạng của zsh. Huấn luyện mất khoảng 9 giây: ứng dụng chạy tới lúc context sẵn sàng, rồi một JVM con đọc cấu hình tạm và ghi cache 113 MB. Khởi động còn khoảng 1 giây tính từ JVM. Cách hai bước cho cùng kết quả, hữu ích khi muốn huấn luyện ở một chỗ và tạo cache ở chỗ khác:
+
+<Terminal where="mac">
+
+```bash
+java -XX:AOTMode=record -XX:AOTConfiguration=app.aotconf -Dspring.context.exit=onRefresh \
+  -jar perf-0.0.1-SNAPSHOT.jar > record.log 2>&1
+java -XX:AOTMode=create -XX:AOTConfiguration=app.aotconf -XX:AOTCache=app2.aot \
+  -jar perf-0.0.1-SNAPSHOT.jar > create.log 2>&1
+grep -E 'AOTConfiguration recorded|AOTCache creation' record.log create.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+record.log: AOTConfiguration recorded: app.aotconf
+create.log:AOTCache creation is complete: app2.aot 118505472 bytes
+```
+
+</Expected>
+
+Bây giờ giả lập một lần build lại: `touch` đổi thời điểm sửa của JAR, giống hệt khi Maven ghi lại file.
+
+<Terminal where="mac">
+
+```bash
+touch perf-0.0.1-SNAPSHOT.jar
+java -XX:AOTCache=app.aot -Dspring.context.exit=onRefresh -jar perf-0.0.1-SNAPSHOT.jar 2>&1 \
+  | grep -E '^\[|Initialized JPA' | sed -E 's/^.*(Initialized JPA)/\1/'
+java -XX:AOTMode=on -XX:AOTCache=app.aot -jar perf-0.0.1-SNAPSHOT.jar; echo "exit=$?"
+```
+
+</Terminal>
+
+<Predict question="Cache được tạo trước khi JAR bị touch. Hai lệnh trên làm gì?">
+
+```text
+[0.021s][warning][aot] This file is not the one used while building the shared archive file: 'perf-0.0.1-SNAPSHOT.jar', timestamp has changed
+[0.021s][error  ][aot] An error has occurred while processing the AOT cache. Run with -Xlog:aot for details.
+[0.021s][error  ][aot] shared class paths mismatch (hint: enable -Xlog:class+path=info to diagnose the failure)
+[0.023s][error  ][aot] Unable to map shared spaces
+Initialized JPA EntityManagerFactory for persistence unit 'default'
+[0.020s][warning][aot] This file is not the one used while building the shared archive file: 'perf-0.0.1-SNAPSHOT.jar', timestamp has changed
+[0.020s][error  ][aot] shared class paths mismatch (hint: enable -Xlog:class+path=info to diagnose the failure)
+[0.020s][error  ][aot] An error has occurred while processing the AOT cache. Run with -Xlog:aot for details.
+[0.020s][error  ][aot] unrecoverable error
+Error occurred during initialization of VM
+Unable to use AOT cache.
+exit=1
+```
+
+Lệnh đầu in bốn dòng lỗi rồi **vẫn khởi động bình thường**, chỉ là không có cache: chậm lại về mức bước 2. Trong log hàng trăm dòng của một service thật, bốn dòng này rất dễ bị bỏ qua. Lệnh thứ hai với `-XX:AOTMode=on` từ chối khởi động: hợp cho smoke test trong CI, cần cẩn thận ở production như phần Kiến thức đã nói. JVM so thời điểm sửa và kích thước của từng JAR trên classpath với lúc tạo cache, nên mỗi lần build lại là phải huấn luyện lại.
+
+</Predict>
+
+<Check id="sb12.3.lab-cds-aot">Tạo và dùng được archive CDS và AOT cache cho một ứng dụng Spring đã giải nén, đo được thời gian khởi động của từng cách, và tái hiện được trường hợp cache lệch bị bỏ qua lặng lẽ với `AOTMode=auto`.</Check>
+
+### 5. Khởi động JPA bất đồng bộ
+
+Lợi ích ở đây nhỏ cỡ vài trăm mili giây, nhỏ hơn độ dao động giữa các lần chạy, nên đo **xen kẽ** ba cấu hình sáu vòng để mọi cấu hình chịu cùng nhiễu. Hàm `once` chạy một lần và in số giây `process running for`.
+
+<Terminal where="mac">
+
+```bash
+once() {
+  : > start.log
+  ( "$@" > start.log 2>&1 & echo $! > start.pid )
+  until grep -q -E 'Started PerfApplication|APPLICATION FAILED' start.log; do sleep 0.1; done
+  grep -o 'process running for [0-9.]*' start.log | awk '{print $4}'
+  kill $(cat start.pid)
+  while kill -0 $(cat start.pid) 2>/dev/null; do sleep 0.1; done
+}
+for r in 1 2 3 4 5 6; do
+  d=$(once java -jar perf-0.0.1-SNAPSHOT.jar)
+  a=$(once java -jar perf-0.0.1-SNAPSHOT.jar --spring.jpa.bootstrap=async)
+  f=$(once java -jar perf-0.0.1-SNAPSHOT.jar --spring.data.jpa.repositories.bootstrap-mode=deferred)
+  echo "default=$d async=$a deferred=$f"
+done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+default=2.541 async=2.296 deferred=2.135
+default=2.522 async=2.4 deferred=2.115
+default=2.258 async=2.29 deferred=2.206
+default=2.479 async=2.283 deferred=2.121
+default=2.37 async=2.245 deferred=2.11
+default=2.506 async=2.283 deferred=2.109
+```
+
+</Expected>
+
+Trung vị: 2,49 giây mặc định, 2,29 với `async`, 2,12 với `deferred`. Xem việc dựng `EntityManagerFactory` chạy trên thread nào:
+
+<Terminal where="mac">
+
+```bash
+startup java -jar perf-0.0.1-SNAPSHOT.jar > /dev/null
+grep -E 'HHH000001|Initialized JPA' start.log | sed -E 's/^.*\[perf\] //' | cut -c1-80
+startup java -jar perf-0.0.1-SNAPSHOT.jar --spring.data.jpa.repositories.bootstrap-mode=deferred > /dev/null
+grep -E 'Bootstrapping Spring Data|Initialized JPA' start.log | sed -E 's/^.*\[perf\] //' | cut -c1-80
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[           main] org.hibernate.orm.core                   : HHH000001: Hibernat
+[           main] j.LocalContainerEntityManagerFactoryBean : Initialized JPA Ent
+[           main] .s.d.r.c.RepositoryConfigurationDelegate : Bootstrapping Sprin
+[         task-1] j.LocalContainerEntityManagerFactoryBean : Initialized JPA Ent
+```
+
+</Expected>
+
+Mặc định Hibernate chạy trên `main`; trong log đầy đủ, từ dòng `HHH000001` tới `Initialized JPA` mất khoảng 0,6 giây. Với `deferred` (và cả `async`), nó chạy trên `task-1` của `applicationTaskExecutor`; vì ứng dụng bật virtual thread từ SB12.2, đó là một virtual thread. `deferred` nhanh hơn `async` vì `QuoteController` cần `ProductRepository` ngay khi được tạo: với `async`, thread `main` phải chờ factory xong ở điểm đó; với `deferred`, repository chỉ được khởi tạo sau khi context refresh xong.
+
+<Check id="sb12.3.lab-jpa-bootstrap">Bật được khởi động JPA bất đồng bộ bằng `spring.jpa.bootstrap=async` và `bootstrap-mode=deferred`, đo được chênh lệch bằng cách chạy xen kẽ, và chỉ ra được thread dựng `EntityManagerFactory` trong log.</Check>
+
+### 6. Spring AOT, rồi cộng tất cả
+
+SB11.4 bước 5 đã làm phần này cho một ứng dụng không có JPA; ở đây làm lại nhanh để có số đo cộng dồn và xem hai điều mới. Thêm goal `process-aot` vào plugin Spring Boot, build lại và giải nén lại. `--force` cần thiết vì thư mục `target/app` đã có file; nó ghi đè JAR nhưng giữ các file cache cũ, giờ đã lệch.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-sb12/perf
+perl -0pi -e 's|(\t\t\t\t<artifactId>spring-boot-maven-plugin</artifactId>\n)|$1\t\t\t\t<executions>\n\t\t\t\t\t<execution>\n\t\t\t\t\t\t<id>process-aot</id>\n\t\t\t\t\t\t<goals>\n\t\t\t\t\t\t\t<goal>process-aot</goal>\n\t\t\t\t\t\t</goals>\n\t\t\t\t\t</execution>\n\t\t\t\t</executions>\n|' pom.xml
+./mvnw -DskipTests package | grep -E 'process-aot|BUILD'
+ls target/spring-aot/main/sources/vn/masteva/perf/
+java -Djarmode=tools -jar target/perf-0.0.1-SNAPSHOT.jar extract --force --destination target/app
+cd target/app
+startup java -Dspring.aot.enabled=true -jar perf-0.0.1-SNAPSHOT.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[INFO] --- spring-boot:4.1.1:process-aot (process-aot) @ perf ---
+[INFO] BUILD SUCCESS
+ApiErrors__BeanDefinitions.java
+PartnerController__BeanDefinitions.java
+PerfApplication__ApplicationContextInitializer.java
+PerfApplication__BeanDefinitions.java
+PerfApplication__BeanFactoryRegistrations.java
+PricingService__BeanDefinitions.java
+ProductRepositoryImpl__AotRepository.java
+ProductRepository__BeanDefinitions.java
+QuoteController__BeanDefinitions.java
+ReportController__BeanDefinitions.java
+Started PerfApplication in 2.115 seconds (process running for 2.265)
+Started PerfApplication in 1.987 seconds (process running for 2.134)
+Started PerfApplication in 2.007 seconds (process running for 2.165)
+```
+
+</Expected>
+
+Một mình Spring AOT chỉ lấy lại khoảng 0,2 giây so với bước 2: phần Spring tiết kiệm được nhỏ hơn nhiều phần JVM nạp class. Mở `ProductRepositoryImpl__AotRepository.java` để thấy câu `SELECT p FROM Product p WHERE p.sku = :sku` đã được dựng sẵn cho `findBySku`. Bây giờ thử lại hai cách khởi động JPA dưới Spring AOT:
+
+<Terminal where="mac">
+
+```bash
+startup java -Dspring.aot.enabled=true -jar perf-0.0.1-SNAPSHOT.jar \
+  --spring.data.jpa.repositories.bootstrap-mode=deferred > /dev/null
+grep -E 'Bootstrapping Spring Data|Initialized JPA' start.log | sed -E 's/^.*\[perf\] //' | cut -c1-80
+startup java -Dspring.aot.enabled=true -jar perf-0.0.1-SNAPSHOT.jar --spring.jpa.bootstrap=async > /dev/null
+grep -E 'Bootstrapping Spring Data|Initialized JPA' start.log | sed -E 's/^.*\[perf\] //' | cut -c1-80
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[           main] j.LocalContainerEntityManagerFactoryBean : Initialized JPA Ent
+[         task-1] j.LocalContainerEntityManagerFactoryBean : Initialized JPA Ent
+```
+
+</Expected>
+
+Dưới Spring AOT, `deferred` bị bỏ qua lặng lẽ: Hibernate lại chạy trên `main`. Bằng chứng là tên thread, không phải dòng `Bootstrapping Spring Data`: dòng đó vắng ở mọi chế độ khi bật Spring AOT, vì không còn bước quét repository lúc chạy. Lý do nằm trong mã đã sinh:
+
+<Terminal where="mac">
+
+```bash
+grep -n 'public static' \
+  ../spring-aot/main/sources/org/springframework/boot/data/jpa/autoconfigure/DataJpaRepositoriesAutoConfiguration__BeanDefinitions.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+17:  public static BeanDefinition getDataJpaRepositoriesAutoConfigurationBeanDefinition() {
+26:  public static BeanDefinition getEagerJpaMetamodelCacheCleanupBeanDefinition() {
+```
+
+</Expected>
+
+Bean `entityManagerFactoryBootstrapExecutorCustomizer`, thứ giao việc dựng `EntityManagerFactory` cho executor khi chế độ là `deferred` hay `lazy`, có `@ConditionalOnProperty(spring.data.jpa.repositories.bootstrap-mode)`. Lúc `process-aot` chạy, property đó chưa được đặt, nên bean bị loại và không có trong danh sách trên. Ngược lại, `spring.jpa.bootstrap` được đọc lúc chạy, trong cấu hình JPA của Spring Boot (`JpaBaseConfiguration`), nên vẫn có tác dụng. Muốn dùng `deferred` cùng Spring AOT, đặt nó trong `application.properties` **trước** khi build: khi viết bài, thử riêng cách này thì `process-aot` sinh thêm `getEntityManagerFactoryBootstrapExecutorCustomizerBeanDefinition` và Hibernate chạy trên `task-1`. Lab dùng `async` cho cấu hình cuối vì nó không phụ thuộc lúc build. Huấn luyện AOT cache cho chính cấu hình đó và đo:
+
+<Terminal where="mac">
+
+```bash
+java -XX:AOTCacheOutput=app.aot -Dspring.aot.enabled=true -Dspring.context.exit=onRefresh \
+  -jar perf-0.0.1-SNAPSHOT.jar --spring.jpa.bootstrap=async > aot-train.log 2>&1
+grep 'AOTCache creation' aot-train.log
+startup java -XX:AOTCache=app.aot -Dspring.aot.enabled=true -jar perf-0.0.1-SNAPSHOT.jar --spring.jpa.bootstrap=async
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+AOTCache creation is complete: app.aot 114819072 bytes
+Started PerfApplication in 0.611 seconds (process running for 0.77)
+Started PerfApplication in 0.615 seconds (process running for 0.772)
+Started PerfApplication in 0.599 seconds (process running for 0.755)
+```
+
+</Expected>
+
+Tổng hợp các bước trên máy kiểm chứng (giây, `process running for`, ba lần chạy):
+
+| Cấu hình | Khởi động | Chi phí thêm |
+|---|---|---|
+| Fat JAR (bước 1) | 2,92 | |
+| JAR giải nén (bước 2) | 2,30 – 2,45 | Một lệnh `extract` |
+| Giải nén + CDS (bước 3) | 1,36 – 1,40 | Huấn luyện, archive 87 MB |
+| Giải nén + AOT cache (bước 4) | 0,99 – 1,02 | Huấn luyện khoảng 9 giây, cache 113 MB |
+| Giải nén, mặc định / JPA `async` / `deferred` (bước 5) | trung vị 2,49 / 2,29 / 2,12 | Một property |
+| Giải nén + Spring AOT (bước 6) | 2,13 – 2,27 | `process-aot`, bean chốt lúc build |
+| Giải nén + Spring AOT + JPA `async` + AOT cache | 0,76 – 0,77 | Tất cả những thứ trên |
+
+Native image ở SB11.4 khởi động trong vài chục mili giây trên một ứng dụng khác; JVM với AOT cache dừng ở mức gần 1 giây nhưng giữ JIT, GC và công cụ chẩn đoán đầy đủ.
+
+<Check id="sb12.3.lab-spring-aot">Bật được Spring AOT trên JVM bằng `process-aot` và `spring.aot.enabled`, nhận ra được một cấu hình bị chốt lúc build, và kết hợp được Spring AOT với AOT cache.</Check>
+
+### 7. Huấn luyện dưới tải
+
+Cache ở bước 6 chỉ biết những gì chạy lúc khởi động. Lần này huấn luyện bằng chính lưu lượng: chạy ứng dụng với `-XX:AOTCacheOutput`, cho kịch bản k6 của SB12.1 chạy qua, rồi dừng ứng dụng bằng SIGTERM. JVM ghi cache khi thoát.
+
+<Terminal where="mac">
+
+```bash
+( java -XX:AOTCacheOutput=load.aot -Dspring.aot.enabled=true \
+    -jar perf-0.0.1-SNAPSHOT.jar --spring.jpa.bootstrap=async > load-train.log 2>&1 & echo $! > train.pid )
+until grep -q 'Started PerfApplication' load-train.log; do sleep 0.5; done
+(cd ~/masteva-sb12 && docker run --rm -v "$PWD/k6:/scripts" grafana/k6:2.3.0 run --quiet /scripts/open.js > /dev/null 2>&1)
+kill $(cat train.pid)
+until grep -q 'AOTCache creation' load-train.log; do sleep 1; done
+grep -E 'AOTConfiguration recorded|AOTCache creation' load-train.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Temporary AOTConfiguration recorded: load.aot.config
+AOTCache creation is complete: load.aot 131694592 bytes
+```
+
+</Expected>
+
+Hàm `firstload` khởi động ứng dụng, chạy ngay `open.js` (110 request/giây, 10 giây `warmup` rồi 30 giây `measure`) và in độ trễ của từng scenario. So ba trường hợp:
+
+<Terminal where="mac">
+
+```bash
+firstload() {
+  : > first.log
+  ( "$@" > first.log 2>&1 & echo $! > first.pid )
+  until grep -q 'Started PerfApplication' first.log; do sleep 0.2; done
+  (cd ~/masteva-sb12 && docker run --rm -v "$PWD/k6:/scripts" grafana/k6:2.3.0 run --quiet \
+      --summary-mode=full /scripts/open.js 2>/dev/null) \
+    | awk '/SCENARIO:/{s=$3} s && /http_req_duration\./{print s, $2, $3, $4, $5, $6}'
+  kill $(cat first.pid)
+  while kill -0 $(cat first.pid) 2>/dev/null; do sleep 0.2; done
+}
+echo "== không cache"; firstload java -Dspring.aot.enabled=true -jar perf-0.0.1-SNAPSHOT.jar --spring.jpa.bootstrap=async
+echo "== app.aot"; firstload java -XX:AOTCache=app.aot -Dspring.aot.enabled=true -jar perf-0.0.1-SNAPSHOT.jar --spring.jpa.bootstrap=async
+echo "== load.aot"; firstload java -XX:AOTCache=load.aot -Dspring.aot.enabled=true -jar perf-0.0.1-SNAPSHOT.jar --spring.jpa.bootstrap=async
+```
+
+</Terminal>
+
+<Predict question="Cả hai cache đều khởi động dưới 1 giây. Mười giây đầu sau khởi động có khác nhau không?">
+
+```text
+== không cache
+measure avg=3.76ms p(50)=3.43ms p(95)=6.39ms p(99)=9.03ms max=15.93ms
+warmup avg=11.7ms p(50)=3.11ms p(95)=9.31ms p(99)=303.11ms max=400.16ms
+== app.aot
+measure avg=4.31ms p(50)=3.96ms p(95)=6.83ms p(99)=8.58ms max=98.78ms
+warmup avg=10.83ms p(50)=4.13ms p(95)=9.53ms p(99)=259.68ms max=358.08ms
+== load.aot
+measure avg=3.61ms p(50)=3.82ms p(95)=5.4ms p(99)=7.15ms max=35.45ms
+warmup avg=3.36ms p(50)=2.52ms p(95)=5.57ms p(99)=7.62ms max=74.82ms
+```
+
+k6 in scenario theo thứ tự chữ cái, nên `measure` đứng trước. Mỗi cấu hình chỉ chạy một lần, nên chỉ đọc chênh lệch lớn và so sánh tương đối: ở các lần đo khi viết bài, p99 của `measure` dao động từ 7 ms tới hơn 50 ms chỉ vì nhiễu của máy. Khác biệt lớn nằm ở `warmup`: không cache, p99 của 10 giây đầu là 303 ms; cache huấn luyện bằng `onRefresh` đỡ được ít (260 ms) vì nó không chứa class và profile của đường xử lý request; cache huấn luyện dưới tải đưa p99 xuống 7,6 ms, ngang mức ổn định. Kết quả này lặp lại ở cả ba lần đo khi viết bài. File `load.aot` lớn hơn (khoảng 126 MB so với 110 MB) vì chứa thêm những class đó và profile method theo JEP 515. Đổi lại, lần huấn luyện cần một kịch bản tải giống lưu lượng thật, như J12.2 đã cảnh báo.
+
+</Predict>
+
+<Check id="sb12.3.lab-training-load">Huấn luyện được AOT cache dưới tải bằng k6 và SIGTERM, và đo được khác biệt về độ trễ giai đoạn warm-up so với cache huấn luyện bằng `onRefresh`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `extract` báo `already exists and is not empty`: thêm `--force`, hoặc giải nén vào thư mục mới.
+- Có cache mà khởi động không nhanh hơn: tìm dòng `[error][aot]` hoặc `[error][cds]` ở đầu output. Hay gặp nhất là JAR đã đổi sau khi tạo cache, hoặc chạy fat JAR thay vì JAR giải nén. Thêm `-XX:AOTMode=on` khi thử để lỗi lộ ra ngay.
+- Lần huấn luyện báo `Connection to localhost:5412 refused`: `sb12-pg` chưa chạy. Huấn luyện khởi động context thật, nên cần database.
+- `firstload` treo: ứng dụng không khởi động được (xem `first.log`), hoặc container `sb12-pg` đã dừng.
+- `kill $(cat train.pid)` xong mà không thấy `AOTCache creation`: JVM cần vài giây để tạo cache sau khi thoát; nếu bạn dùng `kill -9`, JVM chết ngay và không tạo cache.
+- Số đo dao động hơn 0,5 giây giữa ba lần chạy: máy đang bận. Kiểm `uptime`, đóng ứng dụng nặng, đo lại.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá hai container của chặng SB12 (cùng toàn bộ dữ liệu PostgreSQL trong đó) và xoá vĩnh viễn thư mục `~/masteva-sb12`: project, kịch bản k6, file JFR, archive CDS và các AOT cache (vài trăm MB). Image Docker và thư viện Maven trong `~/.m2` không bị xoá.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+docker rm -f sb12-pg sb12-partner
+rm -rf ~/masteva-sb12
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Khởi động nhanh hơn 2 giây thì đáng bao nhiêu trên production?">
+
+Tuỳ khi nào service khởi động. Một service chạy hàng tuần không đổi, 2 giây chẳng đáng gì. Nhưng service scale theo tải thì mỗi giây khởi động là một giây các instance cũ phải gánh thêm; job chạy theo lịch và function khởi động mỗi lần gọi thì thời gian khởi động là chi phí trực tiếp. Rolling deploy 50 pod với `maxUnavailable: 1` nhân thời gian khởi động lên 50 lần. Và trên CPU giới hạn của container (1 vCPU thay vì 10 nhân của laptop), con số 3 giây có thể thành 10 giây trở lên, nên tỉ lệ tiết kiệm mới là thứ đáng nhớ.
+
+</Reveal>
+
+<Reveal title="Đưa AOT cache vào image container thế nào?">
+
+Trong Dockerfile nhiều stage của SB11.1: stage build giải nén JAR; một stage dựa trên **chính base image dùng để chạy** chạy lần huấn luyện với `-XX:AOTCacheOutput` và giữ lại thư mục giải nén cùng file cache. Đừng giả định cache huấn luyện bằng image JDK dùng được trên image JRE cùng số phiên bản: hai image có tập module và có thể bản build khác nhau; huấn luyện bằng chính image chạy là cách chắc chắn (bài này chưa thử trường hợp đó). `ENTRYPOINT` thêm `-XX:AOTCache=app.aot`. Trong CI, chạy smoke test image với thêm `-XX:AOTMode=on` để cache lệch làm build đỏ; `ENTRYPOINT` của production giữ `auto` để một agent giám sát được gắn thêm không làm service ngừng khởi động. Lần huấn luyện cần những gì context cần lúc khởi động; nếu đó là database, bước build cần một database tạm, hoặc profile huấn luyện tắt phần khởi tạo cần database. Buildpacks của Spring Boot cũng làm được việc này qua biến môi trường của buildpack; xem mục AOT cache trong tài liệu Spring Boot.
+
+</Reveal>
+
+<Reveal title="Vì sao không bật lazy initialization cho cả ứng dụng (spring.main.lazy-initialization)?">
+
+Lazy initialization chỉ tạo bean khi có ai cần, nên khởi động nhanh hơn đáng kể. Nhưng mọi lỗi cấu hình, thiếu bean, sai property chỉ lộ ra ở request đầu tiên chạm vào bean đó, và request đó chậm vì phải tạo bean giữa chừng. Nó chuyển chi phí từ khởi động sang những request đầu, đúng giai đoạn bạn đang cố làm nhanh, và readiness probe báo sẵn sàng trong khi ứng dụng chưa thật sự sẵn sàng. Hợp cho môi trường phát triển hơn là production.
+
+</Reveal>
+
+<Reveal title="AOT cache có giảm bộ nhớ không?">
+
+Tài liệu Spring Boot nói AOT cache có thể giảm cả thời gian khởi động lẫn bộ nhớ: dữ liệu class được ánh xạ từ file thay vì dựng lại trong bộ nhớ. Lab SB11.4 đo RSS sau 500 request: JVM có Spring AOT và AOT cache ở mức 150 tới 185 MB, so với 150 tới 230 MB của JVM thường. Có giảm, nhưng ít so với native image (64 MB), vì phần lớn RSS của một JVM đang chạy là heap và code JIT. Bài này không đo bộ nhớ; nếu bộ nhớ là mục tiêu, đo RSS trước và sau bằng chính workload của bạn.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết Dockerfile có bước huấn luyện AOT cache, hoặc giải thích một dòng `[error][aot]`. AI hay trộn cú pháp các phiên bản: `-XX:SharedArchiveFile` cho AOT cache, `-XX:+AutoCreateSharedArchive` (JDK 19) thay cho `AOTCacheOutput`, hay dùng cache với fat JAR, và hay đặt `-Dspring.aot.enabled=true` mà quên goal `process-aot` (ứng dụng dừng với `Startup with AOT mode enabled failed: AOT initializer ...__ApplicationContextInitializer could not be found`). Kiểm tra lại bằng chính output: dòng `AOTCache creation is complete`, không có `[error][aot]` khi chạy, và đo `process running for` trước và sau như bài này.
+
+</Callout>
+
+<Callout kind="link">
+
+SB11.1 giải nén JAR và dựng Dockerfile; SB11.4 so sánh JVM với native image; J12.2 giải thích JIT, warm-up và AOT cache trên chương trình nhỏ. SB12.1 cung cấp kịch bản k6 dùng để huấn luyện cache dưới tải. SB8.3 dùng readiness probe, nơi thời gian khởi động và warm-up quyết định khi nào pod nhận lưu lượng.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb12.3.mastery-startup">Tự đo được thời gian khởi động của một service Spring Boot qua từng kỹ thuật (JAR giải nén, CDS hoặc AOT cache, Spring AOT, JPA bất đồng bộ) và chọn được tổ hợp phù hợp kèm lý do và cái giá.</Check>
+
+<Check id="sb12.3.mastery-aot-pipeline">Giải thích được các điều kiện để AOT cache dùng được khi đưa vào quy trình build image: huấn luyện với lưu lượng đại diện, cùng JDK và classpath cho huấn luyện và chạy, và cách phát hiện cache lệch ở CI và production.</Check>
+
+</Mastery>

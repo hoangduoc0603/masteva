@@ -1,0 +1,765 @@
+---
+title: Đa tenant với @TenantId của Hibernate, và những chỗ dữ liệu vẫn rò
+description: Chọn giữa ba mô hình đa tenant (cột tenant chung bảng, schema riêng, database riêng) theo đánh đổi thật; cài cột tenant với @TenantId và CurrentTenantIdentifierResolver của Hibernate, xác định tenant từ request bằng filter; rồi tái hiện dữ liệu của tenant khác rò ra qua native query và JdbcClient, và hiểu giới hạn của việc lọc ở tầng ứng dụng.
+id: sb10.4
+step: sb10
+prerequisites: [sb10.3]
+topics: [sb10.da-tenant]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    flyway: 12.4.0
+    docker: 29.8.0
+    postgresql: "18.6"
+---
+
+<Goal>
+
+Biến một ứng dụng phục vụ một công ty thành ứng dụng SaaS phục vụ nhiều công ty (tenant) trên cùng hạ tầng, mà công ty này không bao giờ thấy dữ liệu của công ty kia. Học xong bài này, bạn giải thích được:
+
+- Vì sao phần lớn SaaS nhỏ chọn "một cột `tenant_id` trong mọi bảng", và khi nào phải đổi sang schema hay database riêng.
+- Vì sao ứng dụng không khởi động được ngay sau khi thêm `CurrentTenantIdentifierResolver`.
+- Vì sao báo cáo tổng tiền của tenant `acme` lại cộng cả hoá đơn của `globex`, dù mọi repository đã được lọc theo tenant.
+
+</Goal>
+
+<Knowledge>
+
+### Tenant và ba mô hình lưu dữ liệu
+
+**Tenant** là một khách hàng của SaaS, thường là một tổ chức với nhiều người dùng: công ty `acme`, công ty `globex`. **Đa tenant** (multi-tenancy) là một bản triển khai phục vụ nhiều tenant, với yêu cầu số một là **cô lập dữ liệu**: không tenant nào đọc hay sửa được dữ liệu của tenant khác.
+
+```text
+ 1. Cột tenant, chung bảng          2. Schema riêng                 3. Database riêng
+ ┌ database app ──────────────┐   ┌ database app ─────────────┐   ┌ db_acme ┐ ┌ db_globex ┐
+ │ invoices                   │   │ schema acme   invoices    │   │invoices │ │ invoices  │
+ │  id tenant_id customer ... │   │ schema globex invoices    │   └─────────┘ └───────────┘
+ │  1  acme      ...          │   │ ...                       │   connection pool theo tenant
+ │  3  globex    ...          │   │ search_path theo tenant   │
+ └────────────────────────────┘   └───────────────────────────┘
+```
+
+| | Cột `tenant_id` chung bảng | Schema riêng | Database riêng |
+|---|---|---|---|
+| Cô lập | Yếu nhất: một câu SQL quên điều kiện là rò | Trung bình: phải đặt đúng `search_path` | Mạnh nhất: kết nối sai database mới rò |
+| Số tenant hợp lý | Không giới hạn thực tế | Hàng trăm (catalog PostgreSQL phình theo số bảng × số schema) | Hàng chục tới vài trăm, tuỳ ngân sách |
+| Chi phí mỗi tenant mới | Một dòng trong bảng `tenants` | Tạo schema và chạy migration | Tạo database, pool, backup, giám sát |
+| Migration | Chạy một lần | Chạy N lần, có thể lệch phiên bản giữa các schema | Chạy N lần |
+| Backup, khôi phục một tenant | Khó: phải lọc dữ liệu | Được, theo schema | Dễ |
+| Một tenant tải nặng ảnh hưởng tenant khác | Có | Có (cùng máy chủ) | Không, nếu tách máy chủ |
+| Báo cáo xuyên tenant | Một câu SQL | Phải `UNION` qua các schema | Phải gom từ nhiều database |
+| Hợp với | SaaS nhiều khách nhỏ | Số khách vừa phải, cần tách mềm | Khách doanh nghiệp đòi dữ liệu ở nơi riêng, hay quy định pháp lý |
+
+Nhiều hệ thống trộn: phần đông khách ở mô hình 1, vài khách lớn trả tiền thêm được đưa ra database riêng. Bài này làm mô hình 1, mô hình mà lỗi rò dữ liệu dễ xảy ra nhất và cũng phổ biến nhất.
+
+### @TenantId và CurrentTenantIdentifierResolver
+
+Hibernate hỗ trợ cả ba mô hình. Với mô hình cột tenant, bạn đánh dấu field tenant bằng **`@TenantId`** (có từ Hibernate 6.0) và cung cấp một **`CurrentTenantIdentifierResolver`** cho Hibernate biết tenant hiện tại:
+
+```text
+ request: GET /invoices, X-Tenant: acme
+   TenantFilter        đọc và kiểm tenant -> TenantContext (ThreadLocal) = "acme"
+   controller -> repository -> Hibernate mở Session
+     TenantResolver.resolveCurrentTenantIdentifier() -> "acme"   gắn vào Session lúc mở
+     SELECT ... FROM invoices WHERE tenant_id = ?        mọi truy vấn trên entity có @TenantId
+     SELECT ... WHERE id = ? AND tenant_id = ?           cả findById
+     INSERT ... (tenant_id) VALUES ('acme')              tự điền khi persist; code không được gán
+   TenantFilter, khối finally: xoá ThreadLocal
+```
+
+- Tenant gắn vào **Session** khi Session mở và giữ nguyên tới khi đóng. `validateExistingCurrentSessions()` chỉ có tác dụng khi dùng `getCurrentSession()` với `CurrentSessionContext` của Hibernate; Spring Data JPA không đi đường đó, nên giá trị nó trả không ảnh hưởng tới lab.
+- `isRoot(tenantId)` (mặc định `false`) cho phép một tenant đặc biệt bỏ qua bộ lọc, dùng cho công cụ quản trị hay job xuyên tenant; cấp nó có chủ đích.
+- Spring Boot không tự cấu hình đa tenant. Đăng ký resolver bằng một bean `HibernatePropertiesCustomizer` đặt thuộc tính `hibernate.tenant_identifier_resolver`.
+- Resolver được gọi cả khi **không có request**: lúc khởi động, Spring Data mở Session để kiểm các truy vấn của repository; job nền, consumer Kafka cũng mở Session. Trả `null` thì Hibernate từ chối mở Session. Lab trả một giá trị canh gác không khớp tenant nào, để code chạy ngoài request đọc ra rỗng thay vì thấy hết; còn ghi thì Hibernate sẽ điền đúng giá trị canh gác đó, nên database phải có ràng buộc chặn nó.
+
+Hai mô hình còn lại dùng `MultiTenantConnectionProvider`: trả kết nối đã đặt `search_path` cho schema của tenant, hoặc kết nối từ pool của database tenant đó.
+
+### Xác định tenant từ request
+
+| Nguồn | Ví dụ | Tin được khi |
+|---|---|---|
+| Header | `X-Tenant: acme` | Chỉ khi gateway phía trước đặt nó sau khi xác thực và **xoá header client tự gửi** |
+| Subdomain | `acme.app.example.com` | Kèm kiểm tra người dùng đã đăng nhập thuộc tenant đó; tên miền ai cũng gõ được |
+| Claim trong JWT | `"tenant": "acme"` | Token do identity provider ký và ứng dụng kiểm chữ ký (SB6.2); nguồn đáng tin nhất |
+| Đường dẫn | `/t/acme/invoices` | Như subdomain: phải kiểm thành viên |
+
+Quy tắc: tenant là dữ liệu dùng để **phân quyền**, nên phải lấy từ thứ server kiểm chứng được, không phải từ thứ client tự khai. Lab dùng header cho đơn giản, và bước 5 cho thấy hậu quả: đổi header là đọc được dữ liệu của tenant khác.
+
+Filter giữ tenant trong một `ThreadLocal`. Ba điều phải nhớ:
+
+- **Xoá trong `finally`.** Tomcat dùng lại thread cho request sau; quên xoá thì request kế tiếp không có header vẫn mang tenant cũ.
+- **Không tự sang thread khác.** `@Async`, `CompletableFuture.supplyAsync`, executor của bạn: thread mới không có giá trị. Truyền tenant tường minh, hoặc dùng `TaskDecorator` để chép nó sang. Java 25 có `ScopedValue` (JEP 506) gắn giá trị vào một phạm vi lời gọi và tự hết hiệu lực khi ra khỏi phạm vi, không cần `finally`.
+- Filter chạy **sau** Spring Security nếu tenant lấy từ token đã xác thực.
+
+### Lọc ở tầng ứng dụng bỏ sót những gì
+
+`@TenantId` là một bộ lọc trong Hibernate. Mọi đường đi tới database không qua Hibernate, hoặc qua Hibernate nhưng không qua entity, đều không được lọc:
+
+| Đường đi | Có được lọc | Ghi chú |
+|---|---|---|
+| Repository, JPQL, `findById`, `save` | Có | Bước 4 kiểm chứng |
+| Native query (`nativeQuery = true`) | **Không** | Hibernate không phân tích SQL thuần; bước 6 tái hiện |
+| `JdbcClient`, `JdbcTemplate` | **Không** | Không đi qua Hibernate; bước 6 tái hiện |
+| psql, công cụ BI, script migration | **Không** | |
+| Cache (SB9.1) | **Không** | Key cache không có tenant thì tenant B nhận kết quả đã cache của tenant A |
+| Object storage (SB10.1) | **Không** | Key object nên có tiền tố tenant, và kiểm quyền trước khi ký URL |
+| Job nền, consumer Kafka | Tuỳ | Không có request: phải đặt tenant từ dữ liệu của job hay header của message |
+
+Mọi dòng "Không" đều cùng một bản chất: an toàn phụ thuộc vào việc **mọi lập trình viên nhớ thêm điều kiện ở mọi chỗ**. Một code review sót là đủ. Lớp phòng thủ tiếp theo đặt ở chính database: **Row Level Security** (RLS) của PostgreSQL cho database tự thêm điều kiện `tenant_id` vào mọi câu lệnh, kể cả native query và psql với user của ứng dụng. SB13.1 dựng RLS trên một ứng dụng đơn hàng nhỏ cùng mô hình cột `tenant_id`; áp lại cho bảng `invoices` của bài này là bài tập.
+
+<Callout kind="production">
+
+Một SaaS kế toán thêm `@Cacheable("dashboard")` cho endpoint tổng quan, key mặc định là tham số `year`. Mọi tenant gọi `GET /dashboard?year=2026` nhận về số liệu của tenant đầu tiên gọi trong ngày, tới khi cache hết hạn. Repository lọc tenant đúng, test đơn vị xanh, vì mỗi test chỉ có một tenant. Sự cố chỉ lộ ra khi một khách gọi hỗ trợ hỏi vì sao doanh thu của họ đột nhiên gấp mười. Cách sửa: tenant là một phần của mọi key cache, và test tích hợp luôn có ít nhất hai tenant với dữ liệu khác nhau, như lab này.
+
+</Callout>
+
+<Check id="sb10.4.da-tenant">So sánh được ba mô hình đa tenant theo cô lập, chi phí và vận hành; giải thích được `@TenantId` và `CurrentTenantIdentifierResolver` hoạt động thế nào, nguồn tenant nào đáng tin, và những đường đi nào không được lọc.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [A Short Guide to Hibernate 7: Multi-tenancy](https://docs.hibernate.org/orm/current/introduction/html_single/#multitenancy): ba cách đa tenant, `@TenantId` và `CurrentTenantIdentifierResolver`.
+- [Multi Tenant Security (OWASP Cheat Sheet Series)](https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html): danh sách kiểm tra cô lập tenant ở mọi tầng, kể cả cache và log.
+- [PostgreSQL: Row Security Policies](https://www.postgresql.org/docs/current/ddl-rowsecurity.html): đọc trước cho SB13.1, nơi RLS được dựng cho cùng mô hình cột `tenant_id`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm SB10.3, container `sb10-pg` đang chạy. Hai tab Terminal: tab 1 chạy ứng dụng ở cổng **8190**, tab 2 gửi request.
+
+### 1. Project, schema và dữ liệu hai tenant
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec sb10-pg psql -U postgres -c 'CREATE DATABASE tenant'
+cd ~/masteva-sb10
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=tenant \
+  -d name=tenant -d packageName=vn.masteva.tenant \
+  -d dependencies=web,data-jpa,flyway,postgresql -o tenant.zip
+unzip -q tenant.zip -d tenant && cd tenant
+rm HELP.md src/test/java/vn/masteva/tenant/TenantApplicationTests.java
+mkdir -p src/main/resources/db/migration
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=tenant
+server.port=8190
+
+spring.datasource.url=jdbc:postgresql://localhost:5410/tenant
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+spring.mvc.problemdetails.enabled=true
+logging.level.org.hibernate.SQL=debug
+EOF
+cat > src/main/resources/db/migration/V1__invoices.sql <<'EOF'
+CREATE TABLE invoices (
+    id        bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    tenant_id text   NOT NULL,
+    customer  text   NOT NULL,
+    amount    bigint NOT NULL CHECK (amount > 0)
+);
+CREATE INDEX invoices_tenant_idx ON invoices (tenant_id, id);
+
+INSERT INTO invoices (tenant_id, customer, amount) VALUES
+    ('acme',   'Công ty Ánh Dương', 1200000),
+    ('acme',   'Cửa hàng Bình An',   300000),
+    ('globex', 'Nhà sách Cánh Diều', 5000000),
+    ('globex', 'Quán cà phê Bình Minh', 750000);
+EOF
+```
+
+</Terminal>
+
+- Index bắt đầu bằng `tenant_id`: gần như mọi truy vấn đều có điều kiện tenant, nên nó là cột đầu của index (SB3.1, thứ tự cột).
+- Bảng `tenants` thật có tên, gói dịch vụ, trạng thái; lab giữ danh sách tenant trong code cho gọn.
+
+### 2. Tenant từ request, resolver, entity
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/tenant
+P=src/main/java/vn/masteva/tenant
+cat > $P/TenantContext.java <<'EOF'
+package vn.masteva.tenant;
+
+public final class TenantContext {
+    private static final ThreadLocal<String> CURRENT = new ThreadLocal<>();
+
+    private TenantContext() {
+    }
+
+    public static String get() { return CURRENT.get(); }
+    static void set(String tenant) { CURRENT.set(tenant); }
+    static void clear() { CURRENT.remove(); }
+}
+EOF
+cat > $P/TenantFilter.java <<'EOF'
+package vn.masteva.tenant;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.util.Set;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+@Component
+class TenantFilter extends OncePerRequestFilter {
+    private static final Set<String> KNOWN = Set.of("acme", "globex");   // thực tế: bảng tenants
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+            FilterChain chain) throws ServletException, IOException {
+        String tenant = request.getHeader("X-Tenant");
+        if (tenant == null || !KNOWN.contains(tenant)) {
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST);
+            return;
+        }
+        TenantContext.set(tenant);
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            TenantContext.clear();          // thread của Tomcat được dùng lại cho request sau
+        }
+    }
+}
+EOF
+cat > $P/TenantResolver.java <<'EOF'
+package vn.masteva.tenant;
+
+import java.util.Map;
+import org.hibernate.cfg.MultiTenancySettings;
+import org.hibernate.context.spi.CurrentTenantIdentifierResolver;
+import org.springframework.boot.hibernate.autoconfigure.HibernatePropertiesCustomizer;
+import org.springframework.stereotype.Component;
+
+@Component
+class TenantResolver implements CurrentTenantIdentifierResolver<String>, HibernatePropertiesCustomizer {
+
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+        return TenantContext.get();
+    }
+
+    @Override
+    public boolean validateExistingCurrentSessions() {
+        return true;
+    }
+
+    @Override
+    public void customize(Map<String, Object> properties) {
+        properties.put(MultiTenancySettings.MULTI_TENANT_IDENTIFIER_RESOLVER, this);
+    }
+}
+EOF
+cat > $P/Invoice.java <<'EOF'
+package vn.masteva.tenant;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import org.hibernate.annotations.TenantId;
+
+@Entity
+@Table(name = "invoices")
+public class Invoice {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @TenantId
+    private String tenantId;
+
+    private String customer;
+    private long amount;
+
+    protected Invoice() {
+    }
+
+    public Invoice(String customer, long amount) {
+        this.customer = customer;
+        this.amount = amount;
+    }
+
+    public Long getId() { return id; }
+    public String getTenantId() { return tenantId; }
+    public String getCustomer() { return customer; }
+    public long getAmount() { return amount; }
+}
+EOF
+```
+
+</Terminal>
+
+- `HibernatePropertiesCustomizer` nằm ở package `org.springframework.boot.hibernate.autoconfigure` từ Spring Boot 4, khi auto-configuration của Hibernate được tách thành module riêng.
+- `Invoice` không có setter cho `tenantId` và constructor không nhận tenant: code nghiệp vụ không thể gán nhầm tenant.
+- `sendError(400)` để Spring Boot trả trang lỗi mặc định. Filter chạy trước `DispatcherServlet`, nên `@RestControllerAdvice` và handler Problem Details không bắt được lỗi ở đây: client nhận JSON lỗi mặc định của Spring Boot (`timestamp`, `status`, `error`, `path`), không phải `application/problem+json`.
+
+### 3. Repository và controller
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/tenant
+P=src/main/java/vn/masteva/tenant
+cat > $P/InvoiceRepository.java <<'EOF'
+package vn.masteva.tenant;
+
+import java.util.List;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+
+public interface InvoiceRepository extends JpaRepository<Invoice, Long> {
+
+    List<Invoice> findByCustomerContainingIgnoreCaseOrderById(String q);
+
+    @Query(value = "SELECT * FROM invoices WHERE customer ILIKE '%' || :q || '%' ORDER BY id", nativeQuery = true)
+    List<Invoice> searchNative(String q);
+}
+EOF
+cat > $P/InvoiceController.java <<'EOF'
+package vn.masteva.tenant;
+
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.ErrorResponseException;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class InvoiceController {
+    public record InvoiceView(long id, String tenant, String customer, long amount) {
+        static InvoiceView of(Invoice i) {
+            return new InvoiceView(i.getId(), i.getTenantId(), i.getCustomer(), i.getAmount());
+        }
+    }
+
+    public record NewInvoice(String customer, long amount) {
+    }
+
+    private final InvoiceRepository invoices;
+    private final JdbcClient jdbc;
+
+    public InvoiceController(InvoiceRepository invoices, JdbcClient jdbc) {
+        this.invoices = invoices;
+        this.jdbc = jdbc;
+    }
+
+    @GetMapping("/invoices")
+    public List<InvoiceView> list() {
+        return invoices.findAll().stream().map(InvoiceView::of).toList();
+    }
+
+    @GetMapping("/invoices/{id}")
+    public InvoiceView get(@PathVariable long id) {
+        return invoices.findById(id).map(InvoiceView::of)
+                .orElseThrow(() -> new ErrorResponseException(HttpStatus.NOT_FOUND));
+    }
+
+    @PostMapping("/invoices")
+    @Transactional
+    public InvoiceView create(@RequestBody NewInvoice body) {
+        return InvoiceView.of(invoices.save(new Invoice(body.customer(), body.amount())));
+    }
+
+    @GetMapping("/invoices/search")
+    public List<InvoiceView> search(@RequestParam String q, @RequestParam(defaultValue = "jpql") String mode) {
+        List<Invoice> found = "native".equals(mode)
+                ? invoices.searchNative(q)
+                : invoices.findByCustomerContainingIgnoreCaseOrderById(q);
+        return found.stream().map(InvoiceView::of).toList();
+    }
+
+    @GetMapping("/reports/total")
+    public long total() {
+        return jdbc.sql("SELECT coalesce(sum(amount), 0) FROM invoices").query(Long.class).single();
+    }
+
+    @PostMapping("/invoices/async")
+    public InvoiceView createAsync(@RequestBody NewInvoice body) {
+        // save() chạy trên một thread của ForkJoinPool, nơi TenantContext trống
+        return CompletableFuture.supplyAsync(() -> InvoiceView.of(invoices.save(new Invoice(body.customer(), body.amount()))))
+                .join();
+    }
+}
+EOF
+```
+
+</Terminal>
+
+`searchNative` và `total` là hai cách viết rất bình thường: một native query vì cần `ILIKE` hay hàm riêng của PostgreSQL, một báo cáo bằng `JdbcClient` như SB3.2. Không có chỗ nào nhắc tới tenant. `createAsync` giả lập việc ghi từ một thread khác (job nền, `@Async`, `CompletableFuture`), dùng ở bước 7.
+
+Chạy ứng dụng ở tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb10/tenant
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw spring-boot:run
+```
+
+</Terminal>
+
+<Predict question="Chưa có request nào. Ứng dụng có khởi động được không?">
+
+Không. Maven báo `BUILD FAILURE`; phần quan trọng của log:
+
+```text
+Caused by: org.springframework.data.repository.query.QueryCreationException: Cannot create query for method [InvoiceRepository.searchNative(java.lang.String)]; SessionFactory configured for multi-tenancy, but no tenant identifier specified
+...
+Caused by: org.hibernate.HibernateException: SessionFactory configured for multi-tenancy, but no tenant identifier specified
+```
+
+Lúc khởi động, Spring Data mở một Session để chuẩn bị các truy vấn của repository. Không có request, `TenantContext.get()` là `null`, và Hibernate từ chối mở Session không có tenant. Job `@Scheduled` hay consumer Kafka cũng sẽ gặp đúng lỗi này.
+
+</Predict>
+
+Sửa resolver: ngoài request thì trả một giá trị canh gác không khớp tenant nào.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/tenant
+P=src/main/java/vn/masteva/tenant
+perl -0pi -e 's/        return TenantContext.get\(\);/        String tenant = TenantContext.get();\n        return tenant != null ? tenant : NO_TENANT;     \/\/ ngoài request: không khớp dòng nào/; s/(class TenantResolver implements[^\{]*\{\n)/$1    static final String NO_TENANT = "__none__";\n/' $P/TenantResolver.java
+sed -n '/class TenantResolver/,/^    }/p' $P/TenantResolver.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+class TenantResolver implements CurrentTenantIdentifierResolver<String>, HibernatePropertiesCustomizer {
+    static final String NO_TENANT = "__none__";
+
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+        String tenant = TenantContext.get();
+        return tenant != null ? tenant : NO_TENANT;     // ngoài request: không khớp dòng nào
+    }
+```
+
+</Expected>
+
+Code chạy ngoài request mà quên đặt tenant sẽ **đọc** thấy danh sách rỗng, một lỗi dễ nhận ra, thay vì thấy dữ liệu của mọi tenant. Đó là nguyên tắc **fail closed**: khi thiếu thông tin, từ chối thay vì cho qua. Với **ghi** thì giá trị canh gác chưa đủ; bước 7 cho thấy vì sao. Chạy lại `./mvnw spring-boot:run` ở tab 1; lần này `Started TenantApplication`.
+
+<Check id="sb10.4.lab-resolver">Cấu hình được `@TenantId` và `CurrentTenantIdentifierResolver` qua `HibernatePropertiesCustomizer`, và giải thích được vì sao resolver phải trả giá trị cả khi không có request.</Check>
+
+### 4. Mỗi tenant thấy dữ liệu của mình
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -H 'X-Tenant: acme' localhost:8190/invoices; echo
+curl -s -H 'X-Tenant: globex' localhost:8190/invoices; echo
+curl -s localhost:8190/invoices -w ' %{http_code}\n'
+curl -s -H 'X-Tenant: hacker' localhost:8190/invoices -w ' %{http_code}\n'
+curl -s -H 'X-Tenant: acme' localhost:8190/invoices/3 -w ' %{http_code}\n'
+curl -s -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"customer":"Tiệm bánh Cánh Diều","amount":200000}' localhost:8190/invoices; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"id":1,"tenant":"acme","customer":"Công ty Ánh Dương","amount":1200000},{"id":2,"tenant":"acme","customer":"Cửa hàng Bình An","amount":300000}]
+[{"id":3,"tenant":"globex","customer":"Nhà sách Cánh Diều","amount":5000000},{"id":4,"tenant":"globex","customer":"Quán cà phê Bình Minh","amount":750000}]
+{"timestamp":"2026-10-09T05:20:11.467Z","status":400,"error":"Bad Request","path":"/invoices"} 400
+{"timestamp":"2026-10-09T05:20:11.480Z","status":400,"error":"Bad Request","path":"/invoices"} 400
+{"instance":"/invoices/3","status":404,"title":"Not Found"} 404
+{"id":5,"tenant":"acme","customer":"Tiệm bánh Cánh Diều","amount":200000}
+```
+
+</Expected>
+
+Tab 1 cho thấy điều kiện tenant Hibernate tự thêm:
+
+<Expected>
+
+```text
+org.hibernate.SQL                        : select i1_0.id,i1_0.amount,i1_0.customer,i1_0.tenant_id from invoices i1_0 where i1_0.tenant_id = ?
+org.hibernate.SQL                        : select i1_0.id,i1_0.amount,i1_0.customer,i1_0.tenant_id from invoices i1_0 where i1_0.tenant_id = ?
+org.hibernate.SQL                        : select i1_0.id,i1_0.amount,i1_0.customer,i1_0.tenant_id from invoices i1_0 where i1_0.id=? and i1_0.tenant_id = ?
+org.hibernate.SQL                        : insert into invoices (amount,customer,tenant_id) values (?,?,?)
+```
+
+</Expected>
+
+- `findAll()` không có điều kiện nào trong code mà SQL vẫn có `tenant_id = ?`.
+- Hoá đơn 3 của `globex` không đọc được bằng `findById` khi đang là `acme`: `404`, không phải `403`. Trả `404` không để lộ rằng id đó có tồn tại ở tenant khác.
+- Hoá đơn mới tự mang `tenant = acme`.
+
+### 5. Header là thứ client tự khai
+
+Lệnh thứ hai ở bước 4 đọc toàn bộ hoá đơn của `globex` chỉ bằng cách đổi một header. Hibernate lọc đúng theo tenant nó được báo; nó không biết người gọi có thuộc tenant đó không. Trong ứng dụng thật, `TenantFilter` lấy tenant từ claim của JWT đã kiểm chữ ký (SB6.2), hoặc lấy từ header rồi kiểm người dùng đã xác thực là thành viên của tenant đó, và trả `403` nếu không.
+
+<Check id="sb10.4.lab-isolation">Chứng minh được bằng log SQL rằng repository, `findById` và `save` được lọc và điền tenant tự động, và giải thích được vì sao tenant không được lấy từ header client tự gửi.</Check>
+
+### 6. Dữ liệu rò qua native query và JdbcClient
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -G -H 'X-Tenant: acme' localhost:8190/invoices/search --data-urlencode 'q=cánh diều'; echo
+curl -s -G -H 'X-Tenant: acme' localhost:8190/invoices/search --data-urlencode 'q=cánh diều' -d mode=native; echo
+curl -s -H 'X-Tenant: acme' localhost:8190/reports/total; echo
+```
+
+</Terminal>
+
+<Predict question="Tenant acme có một hoá đơn 'Cánh Diều' (id 5) và tổng 1.700.000. Ba lệnh trả gì?">
+
+```text
+[{"id":5,"tenant":"acme","customer":"Tiệm bánh Cánh Diều","amount":200000}]
+[{"id":3,"tenant":"globex","customer":"Nhà sách Cánh Diều","amount":5000000},{"id":5,"tenant":"acme","customer":"Tiệm bánh Cánh Diều","amount":200000}]
+7450000
+```
+
+Tab 1:
+
+```text
+org.hibernate.SQL                        : select i1_0.id,i1_0.amount,i1_0.customer,i1_0.tenant_id from invoices i1_0 where i1_0.tenant_id = ? and upper(i1_0.customer) like upper(?) escape '\' order by i1_0.id
+org.hibernate.SQL                        : SELECT * FROM invoices WHERE customer ILIKE '%' || ? || '%' ORDER BY id
+```
+
+Derived query được lọc. Native query đi nguyên văn xuống database: `acme` thấy hoá đơn 5 triệu của `globex`. Báo cáo `JdbcClient` không qua Hibernate nên không có dòng log SQL nào, và tổng 7.450.000 là của **mọi** tenant. Không có lỗi, không có cảnh báo: chỉ có dữ liệu sai.
+
+</Predict>
+
+Sửa bằng cách đưa tenant vào cả hai câu SQL một cách tường minh:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/tenant
+P=src/main/java/vn/masteva/tenant
+perl -pi -e 's/WHERE customer ILIKE/WHERE tenant_id = :tenant AND customer ILIKE/; s/List<Invoice> searchNative\(String q\);/List<Invoice> searchNative(String tenant, String q);/' $P/InvoiceRepository.java
+perl -pi -e 's/invoices.searchNative\(q\)/invoices.searchNative(TenantContext.get(), q)/; s/"SELECT coalesce\(sum\(amount\), 0\) FROM invoices"\)\.query/"SELECT coalesce(sum(amount), 0) FROM invoices WHERE tenant_id = ?")\n                .param(TenantContext.get()).query/' $P/InvoiceController.java
+grep -n -A1 'tenant_id = ' $P/*.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+src/main/java/vn/masteva/tenant/InvoiceController.java:62:        return jdbc.sql("SELECT coalesce(sum(amount), 0) FROM invoices WHERE tenant_id = ?")
+src/main/java/vn/masteva/tenant/InvoiceController.java-63-                .param(TenantContext.get()).query(Long.class).single();
+--
+src/main/java/vn/masteva/tenant/InvoiceRepository.java:11:    @Query(value = "SELECT * FROM invoices WHERE tenant_id = :tenant AND customer ILIKE '%' || :q || '%' ORDER BY id", nativeQuery = true)
+src/main/java/vn/masteva/tenant/InvoiceRepository.java-12-    List<Invoice> searchNative(String tenant, String q);
+```
+
+</Expected>
+
+Chạy lại ứng dụng ở tab 1, rồi:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -G -H 'X-Tenant: acme' localhost:8190/invoices/search --data-urlencode 'q=cánh diều' -d mode=native; echo
+curl -s -H 'X-Tenant: acme' localhost:8190/reports/total; echo
+curl -s -H 'X-Tenant: globex' localhost:8190/reports/total; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"id":5,"tenant":"acme","customer":"Tiệm bánh Cánh Diều","amount":200000}]
+1700000
+5750000
+```
+
+</Expected>
+
+Đã đúng, nhưng hãy nhìn lại cách sửa: hai chỗ, mỗi chỗ một lập trình viên phải nhớ. Lần sau ai đó viết câu SQL thứ ba, hay mở psql bằng user của ứng dụng để "kiểm nhanh số liệu", mọi thứ lặp lại. Đó là giới hạn của việc lọc ở tầng ứng dụng, và lý do SB13.1 dựng Row Level Security cho cùng mô hình cột `tenant_id` (áp lại cho bảng `invoices` là bài tập): PostgreSQL tự thêm điều kiện tenant cho mọi câu lệnh, nên quên viết thì nhận rỗng thay vì nhận dữ liệu của người khác.
+
+<Check id="sb10.4.lab-leak">Tái hiện được dữ liệu của tenant khác rò ra qua native query và `JdbcClient`, sửa được bằng điều kiện tenant tường minh, và giải thích được vì sao cách sửa đó vẫn chưa đủ.</Check>
+
+### 7. Ghi từ thread không có tenant
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"customer":"Đơn tạo từ job nền","amount":100000}' localhost:8190/invoices/async; echo
+docker exec sb10-pg psql -U postgres -d tenant -c 'SELECT id, tenant_id, customer FROM invoices WHERE id > 5'
+```
+
+</Terminal>
+
+<Predict question="Request mang X-Tenant: acme. Hoá đơn mới thuộc tenant nào?">
+
+```text
+{"id":6,"tenant":"__none__","customer":"Đơn tạo từ job nền","amount":100000}
+ id | tenant_id |      customer
+----+-----------+--------------------
+  6 | __none__  | Đơn tạo từ job nền
+(1 row)
+```
+
+`ThreadLocal` không đi theo sang thread của `ForkJoinPool`, nên resolver trả `__none__` và Hibernate điền đúng giá trị đó vào `tenant_id`. Không lỗi nào: hoá đơn nằm trong database nhưng không tenant nào thấy, kể cả `acme` vừa tạo ra nó. Giá trị canh gác chỉ fail closed khi đọc. Muốn chặn cả khi ghi, để database từ chối giá trị đó. Dừng ứng dụng (Ctrl+C ở tab 1) rồi thêm migration:
+
+</Predict>
+
+<Callout kind="danger">
+
+Migration dưới xoá các hoá đơn mang tenant `__none__`, tức dòng mồ côi vừa tạo.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/tenant
+cat > src/main/resources/db/migration/V2__no_sentinel_tenant.sql <<'EOF'
+DELETE FROM invoices WHERE tenant_id = '__none__';
+ALTER TABLE invoices ADD CONSTRAINT invoices_tenant_known CHECK (tenant_id <> '__none__');
+EOF
+```
+
+</Terminal>
+
+Chạy lại ứng dụng ở tab 1, rồi gửi lại đúng request trên:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -H 'X-Tenant: acme' -H 'Content-Type: application/json' \
+  -d '{"customer":"Đơn tạo từ job nền","amount":100000}' localhost:8190/invoices/async; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"timestamp":"2026-10-09T06:08:07.047Z","status":500,"error":"Internal Server Error","path":"/invoices/async"}
+```
+
+</Expected>
+
+Tab 1:
+
+<Expected>
+
+```text
+org.hibernate.orm.jdbc.error             : ERROR: new row for relation "invoices" violates check constraint "invoices_tenant_known"
+...
+org.postgresql.util.PSQLException: ERROR: new row for relation "invoices" violates check constraint "invoices_tenant_known"
+```
+
+</Expected>
+
+Giờ cả đọc lẫn ghi đều fail closed: thiếu tenant thì đọc ra rỗng, ghi bị database từ chối. Một bảng `tenants` cùng khoá ngoại `invoices.tenant_id → tenants.id` làm được việc tương tự và chặn luôn mọi tenant không tồn tại. Cách sửa tận gốc cho job nền vẫn là truyền tenant tường minh sang thread mới (`TaskDecorator`, hay đặt `TenantContext` ở đầu job).
+
+<Check id="sb10.4.lab-write">Tái hiện được việc ghi từ thread không có tenant làm dữ liệu mang giá trị canh gác, và chặn được nó bằng ràng buộc ở database.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `SessionFactory configured for multi-tenancy, but no tenant identifier specified`: resolver trả `null` (bước 3), hoặc code chạy trên thread không có tenant.
+- Truy vấn không có `tenant_id = ?`: thiếu `@TenantId` trên field, hoặc resolver chưa được đăng ký (kiểm bean `HibernatePropertiesCustomizer`).
+- `cannot find symbol` ở dòng import `org.springframework.boot.autoconfigure.orm.jpa.HibernatePropertiesCustomizer`: ví dụ viết cho Spring Boot 3; Spring Boot 4 chuyển lớp này sang `org.springframework.boot.hibernate.autoconfigure`.
+- Request không có header nhưng vẫn ra dữ liệu của một tenant: `TenantContext` không được xoá trong `finally`.
+- Mọi request trả `400`: header viết sai tên, hay tenant không có trong danh sách `KNOWN`.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Đây là bài cuối của chặng SB10.
+
+<Callout kind="danger">
+
+Hai lệnh dưới xoá container PostgreSQL cùng mọi database của chặng (`files`, `notify`, `search`, `tenant`), và xoá thư mục lab với mọi project, file mẫu, báo cáo đã xuất.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker rm -f sb10-pg
+rm -rf ~/masteva-sb10
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Chọn mô hình 1 lúc đầu, sau này một khách lớn đòi database riêng. Chuyển thế nào?">
+
+Thiết kế từ đầu để việc này khả thi: mọi bảng có `tenant_id` (kể cả bảng con, không chỉ bảng gốc), khoá chính không trùng giữa các tenant (UUID hay sequence chung, không đánh số lại từ 1 theo tenant), và không có khoá ngoại trỏ chéo tenant. Khi đó chuyển một tenant là: chép dữ liệu `WHERE tenant_id = 'big'` sang database mới, bật chế độ chỉ đọc cho tenant đó trong lúc chuyển, rồi cho ứng dụng định tuyến tenant đó sang `DataSource` riêng (một `AbstractRoutingDataSource` theo tenant, hoặc `MultiTenantConnectionProvider` của Hibernate). Ứng dụng phục vụ đồng thời hai mô hình là chuyện bình thường ở SaaS trưởng thành.
+
+</Reveal>
+
+<Reveal title="Ràng buộc UNIQUE trong mô hình cột tenant cần chú ý gì?">
+
+`UNIQUE (email)` trên bảng người dùng có nghĩa hai tenant không thể có cùng một email, thường là sai: một người có thể làm cho hai công ty. Ràng buộc đúng gần như luôn là `UNIQUE (tenant_id, email)`, và tương tự cho mã hoá đơn, mã sản phẩm. Khoá ngoại cũng nên gồm tenant (`FOREIGN KEY (tenant_id, customer_id) REFERENCES customers (tenant_id, id)`) để database chặn một hoá đơn của `acme` trỏ tới khách hàng của `globex`, lỗi mà lọc ở tầng ứng dụng không bắt được khi id do client gửi lên.
+
+</Reveal>
+
+<Reveal title="Job nền chạy cho mọi tenant thì đặt tenant thế nào?">
+
+Job lấy danh sách tenant (một truy vấn không qua entity có `@TenantId`, hoặc qua tenant root với `isRoot`), rồi với mỗi tenant đặt `TenantContext` và chạy phần việc trong `try/finally`, mỗi tenant một transaction. Đừng chạy một transaction lớn cho mọi tenant: một tenant lỗi làm rollback tất cả, và Session đã mở giữ nguyên tenant đầu tiên. Message Kafka mang tenant trong header; consumer đặt `TenantContext` từ header đó trước khi xử lý, và từ chối message không có tenant.
+
+</Reveal>
+
+<Reveal title="Có cần kiểm tenant ở cả tầng ứng dụng khi đã có Row Level Security?">
+
+Có, hai lớp làm hai việc. Tầng ứng dụng biết ngữ cảnh: trả `404` đẹp, ghi log có tenant, dùng tenant trong key cache và key object storage, những thứ database không biết. RLS là lưới an toàn: khi ứng dụng sai, database vẫn không trả dữ liệu của tenant khác. RLS cũng có cái giá riêng (mỗi transaction phải đặt biến tenant, ứng dụng không được kết nối bằng superuser hay owner của bảng (nếu buộc phải dùng owner thì bật `FORCE ROW LEVEL SECURITY`), kế hoạch truy vấn có thêm điều kiện), sẽ gặp ở SB13.1.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI phân tích một codebase để liệt kê mọi native query, `JdbcClient`, `@Cacheable` và job nền cần thêm tenant: việc dò tìm này AI làm nhanh và khá đầy đủ. AI hay đề xuất `@Filter` cũ của Hibernate hay `@Where` thay cho `@TenantId`, hay quên xoá `ThreadLocal`, hay lấy tenant từ header mà không kiểm thành viên, và hay viết test chỉ với một tenant. Kiểm lại bằng một test tích hợp có hai tenant với dữ liệu khác nhau, gọi mọi endpoint bằng tenant này và assert không thấy id nào của tenant kia.
+
+</Callout>
+
+<Callout kind="link">
+
+SB3.1 bàn thứ tự cột của index mà `(tenant_id, id)` dựa vào. SB6.2 kiểm chữ ký JWT, nguồn tenant đáng tin. SB9.1 cần tenant trong key cache; SB9.2 mang tenant trong header message. SB10.1 nên đặt tenant vào key object. SB13.1 thêm Row Level Security cho một bảng đa tenant cùng mô hình. Lộ trình Microservices, chặng M10, bàn cô lập tenant giữa nhiều service.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb10.4.mastery-model">Chọn được mô hình đa tenant cho một sản phẩm cụ thể và bảo vệ được lựa chọn đó bằng bảng đánh đổi về cô lập, chi phí, migration và khách hàng lớn.</Check>
+
+<Check id="sb10.4.mastery-impl">Tự cài được đa tenant bằng cột tenant với `@TenantId` và resolver fail closed cả khi đọc lẫn ghi, kiểm chứng được với hai tenant rằng dữ liệu không rò qua repository, native query và `JdbcClient`, và giải thích được cần thay header `X-Tenant` bằng claim trong JWT ra sao.</Check>
+
+</Mastery>

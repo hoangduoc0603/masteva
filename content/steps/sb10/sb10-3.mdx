@@ -1,0 +1,968 @@
+---
+title: Tìm kiếm tiếng Việt bằng full-text PostgreSQL và lịch sử thay đổi với Hibernate Envers
+description: Dựng tìm kiếm full-text trên PostgreSQL 18 với cột tsvector generated, index GIN, cấu hình bỏ dấu cho tiếng Việt, pg_trgm cho gõ sai và xếp hạng ts_rank, đo bằng EXPLAIN ANALYZE; rồi ghi lịch sử mọi lần sửa bằng Hibernate Envers, xem và khôi phục bản cũ, so với bảng audit bằng trigger.
+id: sb10.3
+step: sb10
+prerequisites: [sb10.2]
+topics: [sb10.full-text, sb10.lich-su-thay-doi]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    flyway: 12.4.0
+    docker: 29.8.0
+    postgresql: "18.6"
+---
+
+<Goal>
+
+Thêm ô tìm kiếm sản phẩm hiểu tiếng Việt có dấu lẫn không dấu, nhanh trên 200.000 dòng mà không cần thêm Elasticsearch; và trả lời được câu hỏi "ai đổi giá sản phẩm này, lúc nào, từ bao nhiêu". Học xong bài này, bạn giải thích được:
+
+- Vì sao `WHERE name ILIKE '%da lat%'` không tìm ra "Đà Lạt", và vì sao nó quét cả bảng.
+- Vì sao `GENERATED ALWAYS AS (to_tsvector('simple', unaccent(name)))` bị PostgreSQL từ chối.
+- Vì sao lịch sử Envers nói giá đi từ 490.000 lên 500.000, trong khi thực tế có một lần giá thành 980.000 ở giữa.
+
+</Goal>
+
+<Knowledge>
+
+### Vì sao không dùng LIKE
+
+`WHERE lower(name) LIKE '%ao khoac%'` có ba vấn đề: không khớp chữ có dấu ("áo khoác"), không khớp thứ tự từ khác ("khoác áo"), và với `%` ở đầu thì index B-tree vô dụng, PostgreSQL đọc cả bảng. Tìm kiếm thật cần tách văn bản thành từ, chuẩn hoá từng từ, đánh index theo từ, và xếp hạng kết quả.
+
+### Full-text search trong PostgreSQL
+
+```text
+ văn bản 'Áo khoác đi mưa Đà Lạt'
+     |  parser: tách token, gán loại (word, number, email...)
+     v
+ 'Áo' 'khoác' 'đi' 'mưa' 'Đà' 'Lạt'
+     |  dictionary của cấu hình text search: unaccent -> simple
+     v
+ tsvector: 'ao':1 'da':5 'di':3 'khoac':2 'lat':6 'mua':4      lexeme kèm vị trí
+     |
+     |  @@ (khớp)         tsquery: websearch_to_tsquery('vn', 'đà lạt') = 'da' & 'lat'
+     v
+ GIN index: lexeme -> danh sách dòng có lexeme đó
+```
+
+| Khái niệm | Là gì | Ví dụ |
+|---|---|---|
+| `tsvector` | Danh sách lexeme đã chuẩn hoá, kèm vị trí | `'ao':1 'khoac':2` |
+| `tsquery` | Biểu thức tìm: `&` và, `\|` hoặc, `!` không, `<->` đứng liền nhau | `'ao' <-> 'khoac' & 'da'` |
+| Cấu hình text search | Parser cộng chuỗi dictionary cho từng loại token | `english` có stemming, `simple` chỉ viết thường |
+| `websearch_to_tsquery` | Đổi chuỗi người dùng gõ thành `tsquery` an toàn | `"ao khoac" -balo` |
+| `ts_rank` | Điểm liên quan theo tần suất và trọng số | Tên (`A`) nặng hơn mô tả (`B`) |
+
+**Tiếng Việt.** PostgreSQL không có cấu hình `vietnamese`. Tiếng Việt không biến đổi hình thái từ, nên không cần stemming: cấu hình `simple` (chỉ viết thường) là nền đúng. Thiếu là bỏ dấu, để người gõ "da lat" vẫn ra "Đà Lạt". Extension **`unaccent`** có dictionary cùng tên, bỏ dấu cả `đ` thành `d`. Lab tạo cấu hình riêng:
+
+```sql
+CREATE TEXT SEARCH CONFIGURATION vn (COPY = simple);
+ALTER TEXT SEARCH CONFIGURATION vn
+    ALTER MAPPING FOR hword, hword_part, word WITH unaccent, simple;
+```
+
+Mỗi âm tiết là một token, nên "áo khoác" là hai lexeme. Muốn khớp đúng cụm, người dùng gõ trong ngoặc kép, `websearch_to_tsquery` đổi thành toán tử `<->` (liền nhau).
+
+**Cột generated và index.** Tính `tsvector` mỗi lần truy vấn thì không dùng được index. Lưu nó vào một **cột generated** để PostgreSQL tự cập nhật khi `name` hay `description` đổi, rồi tạo **GIN index** (Generalized Inverted Index, index đảo: lexeme trỏ tới các dòng) trên cột đó:
+
+```sql
+ALTER TABLE products ADD COLUMN search tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('vn', name), 'A') || setweight(to_tsvector('vn', description), 'B')
+) STORED;
+CREATE INDEX products_search_idx ON products USING gin (search);
+```
+
+Hai chi tiết của PostgreSQL 18:
+
+- Biểu thức của cột generated phải **IMMUTABLE** (cùng đầu vào luôn cùng kết quả). `to_tsvector('vn', ...)` với cấu hình ghi rõ là immutable; hàm `unaccent(text)` thì chỉ **STABLE** vì nó phụ thuộc cấu hình tìm dictionary, nên gọi thẳng `unaccent()` trong biểu thức bị từ chối. Bỏ dấu trong cấu hình text search, như trên, tránh được vấn đề này.
+- Từ PostgreSQL 18, cột generated mặc định là **VIRTUAL** (tính khi đọc, không lưu). Cột virtual không đánh index được, nên phải ghi rõ `STORED`.
+
+### Gõ sai và tìm gần đúng: pg_trgm
+
+Full-text khớp theo **từ nguyên vẹn**: "khoak" không khớp "khoac". Extension **`pg_trgm`** tách chuỗi thành các **trigram** (bộ ba ký tự liên tiếp) và đo độ giống bằng tỉ lệ trigram chung. `word_similarity(a, b)` đo `a` giống phần nào trong `b` nhất; toán tử `a <% b` đúng khi giá trị đó vượt `pg_trgm.word_similarity_threshold` (mặc định 0,6). Index `gin_trgm_ops` tăng tốc cả `<%` lẫn `LIKE '%...%'`.
+
+Muốn trigram cũng bỏ dấu, phải index biểu thức `lower(unaccent(name))`, mà index biểu thức cũng đòi hàm immutable. Cách chuẩn là bọc `unaccent` trong một hàm khai báo `IMMUTABLE` và ghi rõ dictionary:
+
+```sql
+CREATE FUNCTION immutable_unaccent(text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    RETURN public.unaccent('public.unaccent'::regdictionary, $1);
+```
+
+Lời hứa "immutable" là của bạn: nếu ai đó sửa file luật của `unaccent`, index cũ không tự tính lại và phải `REINDEX`.
+
+| Nhu cầu | Công cụ |
+|---|---|
+| Tìm theo từ, có dấu hay không, xếp hạng | Full-text với cấu hình `vn`, `ts_rank` |
+| Gõ sai một hai ký tự, gợi ý "có phải bạn muốn tìm" | `pg_trgm` với `word_similarity` |
+| Tìm chuỗi con (`%da lat%`) | `pg_trgm` index cho `LIKE` |
+| Đảo hai chữ cái ("khaoc"), viết liền ("dalat") | Trigram yếu ở đây; cần từ điển đồng nghĩa hoặc công cụ tìm kiếm chuyên dụng |
+
+### Khi nào mới cần OpenSearch hay Elasticsearch
+
+PostgreSQL full-text đủ cho tìm kiếm trong một ứng dụng nghiệp vụ: vài triệu dòng, truy vấn đơn giản, dữ liệu luôn khớp với transaction. Chuyển sang **OpenSearch** hoặc **Elasticsearch** khi cần thứ PostgreSQL không có: tách từ tiếng Việt theo từ điển (bằng plugin analyzer tiếng Việt của bên thứ ba, OpenSearch và Elasticsearch không có sẵn), gợi ý khi đang gõ, tìm mờ theo khoảng cách sửa, faceting (đếm theo nhiều chiều cùng lúc) trên hàng chục triệu bản ghi, hoặc tải tìm kiếm lớn đến mức không muốn đè lên database chính. Cái giá: một hệ thống nữa để vận hành, và dữ liệu chỉ **nhất quán sau một lúc** vì phải đồng bộ (thường qua outbox hay CDC, cùng ý tưởng với SB10.2).
+
+<Callout kind="production">
+
+Ô tìm kiếm sắp xếp theo `ts_rank` chạy dưới 1 ms khi người dùng gõ tên riêng như "Đà Lạt". Một hôm marketing đặt từ khoá "chống nước" lên banner, và truy vấn đó khớp 28.572 dòng: GIN index tìm ra chúng rất nhanh, nhưng `ts_rank` phải tính cho **từng dòng khớp** rồi mới sắp xếp, vì index không biết điểm. Thời gian lên 22 ms mỗi lần, nhân với lưu lượng từ banner. Bước 6 đo đúng chênh lệch này. Cách giảm: giới hạn số dòng xếp hạng (xếp hạng trong 1.000 dòng mới nhất), cache kết quả cho truy vấn phổ biến (SB9.1), hoặc khi đã cần xếp hạng phức tạp ở quy mô lớn thì chuyển sang công cụ chuyên dụng.
+
+</Callout>
+
+<Check id="sb10.3.full-text">Giải thích được `tsvector`, `tsquery`, cấu hình text search bỏ dấu cho tiếng Việt, vì sao cần cột generated `STORED` với GIN index, khi nào dùng `pg_trgm`, và khi nào mới cần OpenSearch.</Check>
+
+### Lịch sử thay đổi với Hibernate Envers
+
+SB5.4 đã dùng auditing của Spring Data để biết **ai sửa lần cuối**. Câu hỏi "giá sản phẩm này đã đổi những lần nào" cần **toàn bộ lịch sử**. **Hibernate Envers** ghi lại mỗi lần entity có `@Audited` được thêm, sửa, xoá:
+
+```text
+ products.update(...) -> dirty checking -> lúc flush
+   UPDATE products SET ... WHERE id = 200001
+   Envers (listener của Hibernate, cùng transaction):
+     INSERT revinfo (changed_at, changed_by)                  một revision cho cả transaction
+       RevisionListener.newRevision(): điền changed_by = "binh"
+     INSERT products_aud (id, rev, revtype, name, description, price)
+                                                               ảnh chụp toàn bộ dòng sau thay đổi
+ COMMIT
+```
+
+| Bảng | Nội dung |
+|---|---|
+| `revinfo` (revision entity) | Một dòng cho mỗi transaction có thay đổi: số revision, thời điểm, và cột bạn tự thêm như người sửa |
+| `<bảng>_aud` | Một dòng cho mỗi entity bị đổi trong revision đó: khoá `(id, rev)`, `revtype` (0 thêm, 1 sửa, 2 xoá), giá trị mọi cột được audit |
+
+Đọc lịch sử qua `AuditReader`:
+
+- `createQuery().forRevisionsOfEntity(Product.class, false, true)` trả mỗi revision của entity thành mảng `{entity, revision entity, RevisionType}`.
+- `find(Product.class, id, rev)` trả **trạng thái của entity tại revision `rev`**: tức bản ghi `_aud` có revision lớn nhất nhỏ hơn hoặc bằng `rev`. Revision đó không nhất thiết đã đụng tới entity này.
+
+**Khôi phục bản cũ** không phải "quay ngược" bảng `_aud`. Nó là một **sửa đổi mới**: đọc trạng thái tại revision cũ, chép các giá trị vào entity hiện tại, để Envers ghi thêm một revision. Lịch sử chỉ thêm, không sửa.
+
+Trong lab, schema của `revinfo` và `products_aud` do Flyway tạo như mọi bảng khác; `ddl-auto=validate` kiểm Envers khớp với chúng. Spring Data cũng có module **Spring Data Envers** (`RevisionRepository` với `findRevisions(id)`) bọc chính `AuditReader` này.
+
+### Envers hay trigger
+
+| | Hibernate Envers | Trigger ghi bảng audit |
+|---|---|---|
+| Bắt được thay đổi từ | Chỉ entity đi qua Hibernate | Mọi câu `UPDATE`: JPA, `JdbcClient`, psql, migration |
+| Biết ai sửa | Có: lấy từ request hoặc SecurityContext | Chỉ thấy user database (thường một user chung cho cả ứng dụng), trừ khi ứng dụng `SET LOCAL app.user` mỗi transaction |
+| Truy vấn lịch sử | API Java có kiểu: trạng thái tại revision, các revision của entity | SQL trên `jsonb` |
+| Bỏ qua khi | `@Modifying @Query` UPDATE hàng loạt, `JdbcClient`, sửa tay | Tắt trigger, `TRUNCATE` (trigger `UPDATE` không chạy) |
+
+Hai cách bổ sung cho nhau; bài lab cho thấy mỗi cách bỏ sót một nửa. Audit trail chống chối bỏ (không ai sửa được dấu vết, kể cả DBA) là chủ đề của chặng SB13.
+
+<Check id="sb10.3.lich-su">Giải thích được Envers ghi những bảng nào trong cùng transaction, `find` theo revision trả về gì, vì sao khôi phục là một revision mới, và Envers khác trigger audit ở đâu.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [PostgreSQL: Full Text Search](https://www.postgresql.org/docs/current/textsearch.html): mục 12.3 "Controlling Text Search" về `ts_rank`, `setweight`, `websearch_to_tsquery`; mục 12.9 về GIN.
+- [PostgreSQL: unaccent](https://www.postgresql.org/docs/current/unaccent.html): dùng `unaccent` làm dictionary trong cấu hình text search.
+- [PostgreSQL: pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html): `similarity`, `word_similarity`, các toán tử và index.
+- [Hibernate ORM User Guide: Envers](https://docs.hibernate.org/orm/current/userguide/html_single/#envers): revision entity, `RevisionListener`, `AuditReader` và truy vấn.
+- [Envers (Spring Data JPA)](https://docs.spring.io/spring-data/jpa/reference/envers.html): `RevisionRepository` nếu muốn dùng qua Spring Data.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm SB10.2, container `sb10-pg` đang chạy. Hai tab Terminal: tab 1 chạy ứng dụng ở cổng **8290**, tab 2 gửi request và chạy psql. Ở tab 2, định nghĩa một hàm gọi psql vào database của bài:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+Q() { docker exec -i sb10-pg psql -U postgres -d search "$@"; }
+```
+
+</Terminal>
+
+### 1. Project, cấu hình và migration
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker exec sb10-pg psql -U postgres -c 'CREATE DATABASE search'
+cd ~/masteva-sb10
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=search \
+  -d name=search -d packageName=vn.masteva.search \
+  -d dependencies=web,data-jpa,flyway,postgresql -o search.zip
+unzip -q search.zip -d search && cd search
+rm HELP.md src/test/java/vn/masteva/search/SearchApplicationTests.java
+perl -0pi -e 's#(\t\t<dependency>\n\t\t\t<groupId>org.postgresql</groupId>)#\t\t<dependency>\n\t\t\t<groupId>org.hibernate.orm</groupId>\n\t\t\t<artifactId>hibernate-envers</artifactId>\n\t\t</dependency>\n$1#' pom.xml
+mkdir -p src/main/resources/db/migration
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=search
+server.port=8290
+
+spring.datasource.url=jdbc:postgresql://localhost:5410/search
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+spring.mvc.problemdetails.enabled=true
+EOF
+cat > src/main/resources/db/migration/V1__products.sql <<'EOF'
+CREATE TABLE products (
+    id          bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    name        text   NOT NULL,
+    description text   NOT NULL,
+    price       bigint NOT NULL CHECK (price > 0)
+);
+
+INSERT INTO products (name, description, price)
+SELECT (ARRAY['Áo khoác', 'Áo sơ mi', 'Quần jean', 'Giày chạy bộ', 'Balo', 'Mũ lưỡi trai', 'Đồng hồ', 'Bình giữ nhiệt'])[1 + g % 8]
+           || ' ' || (ARRAY['chống nước', 'mùa đông', 'thể thao', 'công sở', 'du lịch', 'trẻ em', 'cao cấp'])[1 + g % 7]
+           || ' màu ' || (ARRAY['đen', 'trắng', 'xanh dương', 'đỏ', 'xám'])[1 + g % 5],
+       'Hàng chính hãng, bảo hành 12 tháng, giao nhanh toàn quốc.',
+       10000 * (10 + g % 90)
+FROM generate_series(1, 200000) AS g;
+
+INSERT INTO products (name, description, price) VALUES
+    ('Áo khoác đi mưa Đà Lạt', 'Áo khoác gió mỏng, chống nước, gấp gọn bỏ balo khi đi Đà Lạt.', 450000),
+    ('Ô gấp gọn chống tia UV', 'Ô hai lớp, hợp đi mưa Sài Gòn và đi nắng Đà Lạt.', 180000),
+    ('Bản đồ du lịch Đà Nẵng', 'Bản đồ giấy, có chú thích các bãi biển.', 50000);
+EOF
+cat > src/main/resources/db/migration/V2__full_text.sql <<'EOF'
+CREATE EXTENSION IF NOT EXISTS unaccent;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Tiếng Việt: tách theo từ đơn (simple), bỏ dấu (unaccent), không stemming.
+CREATE TEXT SEARCH CONFIGURATION vn (COPY = simple);
+ALTER TEXT SEARCH CONFIGURATION vn
+    ALTER MAPPING FOR hword, hword_part, word WITH unaccent, simple;
+
+ALTER TABLE products ADD COLUMN search tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('vn', name), 'A') || setweight(to_tsvector('vn', description), 'B')
+) STORED;
+CREATE INDEX products_search_idx ON products USING gin (search);
+
+-- unaccent() chỉ là STABLE; bọc lại thành IMMUTABLE để dùng trong index.
+CREATE FUNCTION immutable_unaccent(text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    RETURN public.unaccent('public.unaccent'::regdictionary, $1);
+
+CREATE INDEX products_name_trgm_idx ON products USING gin (lower(immutable_unaccent(name)) gin_trgm_ops);
+EOF
+```
+
+</Terminal>
+
+- Dependency `hibernate-envers` không ghi phiên bản: Spring Boot quản lý nó cùng Hibernate.
+- 200.000 sản phẩm sinh từ 8 loại × 7 thuộc tính × 5 màu, nên mỗi cụm như "chống nước" lặp lại hàng chục nghìn lần. Ba sản phẩm cuối chứa các tên riêng hiếm: "Đà Lạt", "Đà Nẵng".
+- `unaccent` và `pg_trgm` là extension có sẵn trong image PostgreSQL và được đánh dấu **trusted**: người dùng có quyền `CREATE` trên database tạo được, không cần superuser. Phần lớn dịch vụ PostgreSQL có quản lý cũng cho phép hai extension này.
+
+### 2. Endpoint tìm kiếm
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/search
+cat > src/main/java/vn/masteva/search/SearchController.java <<'EOF'
+package vn.masteva.search;
+
+import java.util.List;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class SearchController {
+    public record Hit(long id, String name, double score) {
+    }
+
+    private final JdbcClient jdbc;
+
+    public SearchController(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    @GetMapping("/products/search")
+    public List<Hit> search(@RequestParam String q) {
+        List<Hit> hits = jdbc.sql("""
+                SELECT id, name, round(ts_rank(search, query)::numeric, 4) AS score
+                FROM products, websearch_to_tsquery('vn', :q) AS query
+                WHERE search @@ query
+                ORDER BY score DESC, id
+                LIMIT 5
+                """).param("q", q).query(Hit.class).list();
+        if (!hits.isEmpty()) {
+            return hits;
+        }
+        return jdbc.sql("""
+                SELECT id, name, round(word_similarity(lower(immutable_unaccent(:q)), lower(immutable_unaccent(name)))::numeric, 2) AS score
+                FROM products
+                WHERE lower(immutable_unaccent(:q)) <% lower(immutable_unaccent(name))
+                ORDER BY score DESC, id
+                LIMIT 5
+                """).param("q", q).query(Hit.class).list();
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- Tìm kiếm là SQL đặc thù của PostgreSQL, nên viết bằng `JdbcClient` thay vì ép vào JPQL. Chuỗi người dùng gõ đi qua tham số `:q`, không ghép vào SQL; `websearch_to_tsquery` không báo lỗi cú pháp với chuỗi lạ.
+- Full-text không ra kết quả nào thì thử trigram: đó là chỗ của "có phải bạn muốn tìm".
+
+Chạy ứng dụng ở tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb10/search
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw spring-boot:run
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "1 - products"
+o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "2 - full text"
+o.f.core.internal.command.DbMigrate      : Successfully applied 2 migrations to schema "public", now at version v2 (execution time 00:04.899s)
+vn.masteva.search.SearchApplication      : Started SearchApplication in 7.608 seconds (process running for 7.872)
+```
+
+</Expected>
+
+### 3. Văn bản thành tsvector
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+Q -c "SELECT to_tsvector('simple', 'Áo khoác đi mưa Đà Lạt') AS simple_cfg, to_tsvector('vn', 'Áo khoác đi mưa Đà Lạt') AS vn_cfg"
+Q -c "SELECT unaccent('Đồng hồ ĐẸP ạ ữ')"
+Q -c "SELECT websearch_to_tsquery('vn', 'đà lạt -balo'), websearch_to_tsquery('vn', '\"ao khoac\" da lat')"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+                   simple_cfg                   |                     vn_cfg
+------------------------------------------------+------------------------------------------------
+ 'khoác':2 'lạt':6 'mưa':4 'áo':1 'đi':3 'đà':5 | 'ao':1 'da':5 'di':3 'khoac':2 'lat':6 'mua':4
+(1 row)
+
+    unaccent
+-----------------
+ Dong ho DEP a u
+(1 row)
+
+  websearch_to_tsquery  |      websearch_to_tsquery
+------------------------+---------------------------------
+ 'da' & 'lat' & !'balo' | 'ao' <-> 'khoac' & 'da' & 'lat'
+(1 row)
+```
+
+</Expected>
+
+- Cấu hình `simple` giữ dấu: người gõ "da lat" không khớp `'đà' 'lạt'`. Cấu hình `vn` bỏ dấu ở cả hai phía, văn bản lẫn truy vấn.
+- `unaccent` đổi cả `Đ` thành `D`, và giữ chữ hoa; viết thường là việc của dictionary `simple` phía sau.
+- `-balo` thành `!'balo'`; cụm trong ngoặc kép thành `<->`.
+
+### 4. Hai cái bẫy của cột generated
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+Q -c "CREATE TEMP TABLE t1 (name text, s tsvector GENERATED ALWAYS AS (to_tsvector('simple', unaccent(name))) STORED)"
+Q -c "CREATE TEMP TABLE t2 (name text, s tsvector GENERATED ALWAYS AS (to_tsvector('vn', name)))" -c "CREATE INDEX ON t2 USING gin (s)"
+```
+
+</Terminal>
+
+<Predict question="Hai lệnh này có chạy được không?">
+
+```text
+ERROR:  generation expression is not immutable
+CREATE TABLE
+ERROR:  indexes on virtual generated columns are not supported
+```
+
+Lệnh đầu gọi `unaccent(text)`, hàm STABLE, trong biểu thức của cột generated. Lệnh thứ hai tạo được bảng, vì không ghi `STORED` nên PostgreSQL 18 tạo cột **virtual**; đến lúc tạo index thì bị từ chối. Bảng tạm biến mất khi phiên psql kết thúc.
+
+</Predict>
+
+### 5. Tìm có dấu, không dấu, cụm từ, loại trừ, gõ sai
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for q in 'da lat' 'đà lạt' '"di mua"' 'chống nước -giày' 'ao khoak' 'dalat'; do
+  echo "== $q"; curl -s -G localhost:8290/products/search --data-urlencode "q=$q"; echo
+done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+== da lat
+[{"id":200001,"name":"Áo khoác đi mưa Đà Lạt","score":0.9954},{"id":200002,"name":"Ô gấp gọn chống tia UV","score":0.3964}]
+== đà lạt
+[{"id":200001,"name":"Áo khoác đi mưa Đà Lạt","score":0.9954},{"id":200002,"name":"Ô gấp gọn chống tia UV","score":0.3964}]
+== "di mua"
+[{"id":200001,"name":"Áo khoác đi mưa Đà Lạt","score":0.9917},{"id":200002,"name":"Ô gấp gọn chống tia UV","score":0.6264}]
+== chống nước -giày
+[{"id":7,"name":"Bình giữ nhiệt chống nước màu xanh dương","score":0.991},{"id":14,"name":"Đồng hồ chống nước màu xám","score":0.991},{"id":21,"name":"Mũ lưỡi trai chống nước màu trắng","score":0.991},{"id":28,"name":"Balo chống nước màu đỏ","score":0.991},{"id":42,"name":"Quần jean chống nước màu xanh dương","score":0.991}]
+== ao khoak
+[{"id":8,"name":"Áo khoác mùa đông màu đỏ","score":0.78},{"id":16,"name":"Áo khoác thể thao màu trắng","score":0.78},{"id":24,"name":"Áo khoác công sở màu xám","score":0.78},{"id":32,"name":"Áo khoác du lịch màu xanh dương","score":0.78},{"id":40,"name":"Áo khoác trẻ em màu đen","score":0.78}]
+== dalat
+[]
+```
+
+</Expected>
+
+- "da lat" và "đà lạt" cho cùng kết quả. Chiếc ô xuất hiện vì mô tả của nó có "Đà Lạt", nhưng điểm thấp hơn nhiều: tên có trọng số `A`, mô tả `B`.
+- "chống nước -giày" bỏ hết giày (id 35 là "Giày chạy bộ chống nước" không có mặt).
+- "ao khoak": full-text không khớp từ nào, trigram cứu được với độ giống 0,78.
+- "dalat" không ra gì: viết liền làm mất hầu hết trigram chung với "da lat" (độ giống 0,44, dưới ngưỡng 0,6). Đây là giới hạn thật của cách làm này.
+
+<Check id="sb10.3.lab-search">Dựng được cấu hình text search bỏ dấu, cột `tsvector` generated `STORED` với GIN index, và endpoint tìm kiếm có xếp hạng và trigram dự phòng cho từ gõ sai.</Check>
+
+### 6. Đo bằng EXPLAIN ANALYZE
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+Q <<'EOF'
+EXPLAIN (ANALYZE, COSTS OFF) SELECT id FROM products WHERE search @@ websearch_to_tsquery('vn', 'da lat');
+SET enable_bitmapscan = off;
+EXPLAIN (ANALYZE, COSTS OFF) SELECT id FROM products WHERE search @@ websearch_to_tsquery('vn', 'da lat');
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Bitmap Heap Scan on products (actual time=0.021..0.022 rows=2.00 loops=1)
+   Recheck Cond: (search @@ '''da'' & ''lat'''::tsquery)
+   Heap Blocks: exact=1
+   ->  Bitmap Index Scan on products_search_idx (actual time=0.010..0.011 rows=2.00 loops=1)
+         Index Cond: (search @@ '''da'' & ''lat'''::tsquery)
+ Execution Time: 0.053 ms
+
+ Gather (actual time=12.438..15.339 rows=2.00 loops=1)
+   Workers Planned: 2
+   ->  Parallel Seq Scan on products (actual time=10.116..10.177 rows=0.67 loops=3)
+         Filter: (search @@ '''da'' & ''lat'''::tsquery)
+         Rows Removed by Filter: 66667
+ Execution Time: 15.362 ms
+```
+
+</Expected>
+
+GIN index trả thẳng 2 dòng khớp: 0,05 ms. Tắt bitmap scan để mô phỏng "không có index": PostgreSQL quét song song 200.000 dòng, chậm gần 300 lần. (Đã bỏ các dòng `Buffers` và `Planning` cho gọn.) Giờ một từ khoá phổ biến, có xếp hạng:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+Q -c "EXPLAIN (ANALYZE, COSTS OFF) SELECT id, ts_rank(search, q) AS r FROM products, websearch_to_tsquery('vn', 'chống nước') q WHERE search @@ q ORDER BY r DESC LIMIT 5"
+Q -c "EXPLAIN (ANALYZE, COSTS OFF) SELECT id FROM products WHERE lower(immutable_unaccent(name)) LIKE '%da lat%'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Limit (actual time=21.790..21.791 rows=5.00 loops=1)
+   ->  Sort (actual time=21.789..21.789 rows=5.00 loops=1)
+         Sort Key: (ts_rank(products.search, '''chong'' & ''nuoc'''::tsquery)) DESC
+         Sort Method: top-N heapsort  Memory: 25kB
+         ->  Bitmap Heap Scan on products (actual time=4.673..19.424 rows=28572.00 loops=1)
+               Heap Blocks: exact=9091
+               ->  Bitmap Index Scan on products_search_idx (actual time=3.589..3.589 rows=28572.00 loops=1)
+ Execution Time: 21.927 ms
+
+ Bitmap Heap Scan on products (actual time=0.120..0.120 rows=1.00 loops=1)
+   Recheck Cond: (lower(immutable_unaccent(name)) ~~ '%da lat%'::text)
+   ->  Bitmap Index Scan on products_name_trgm_idx (actual time=0.104..0.104 rows=1.00 loops=1)
+         Index Cond: (lower(immutable_unaccent(name)) ~~ '%da lat%'::text)
+ Execution Time: 0.215 ms
+```
+
+</Expected>
+
+- Index tìm 28.572 dòng trong 3,6 ms; phần còn lại là đọc 9.091 trang dữ liệu và tính `ts_rank` cho từng dòng trước khi lấy 5 dòng đầu. Đó là tình huống của callout Trên production.
+- `LIKE '%da lat%'` dùng được index trigram vì biểu thức khớp đúng biểu thức của index. Viết `lower(unaccent(name))` thay vì `lower(immutable_unaccent(name))` thì planner không nhận ra và quay về quét cả bảng.
+
+<Check id="sb10.3.lab-explain">Đọc được EXPLAIN ANALYZE của truy vấn full-text, chỉ ra phần thời gian của index và phần của xếp hạng, và giải thích vì sao từ khoá phổ biến chậm hơn từ khoá hiếm.</Check>
+
+### 7. Envers: entity, revision và người sửa
+
+Dừng ứng dụng (Ctrl+C ở tab 1). Thêm bảng của Envers, entity có `@Audited`, revision entity có cột người sửa, và các endpoint sửa, xem lịch sử, khôi phục:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/search
+P=src/main/java/vn/masteva/search
+echo 'logging.level.org.hibernate.SQL=debug' >> src/main/resources/application.properties
+cat > src/main/resources/db/migration/V3__envers.sql <<'EOF'
+CREATE TABLE revinfo (
+    id         bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    changed_at timestamptz NOT NULL,
+    changed_by text        NOT NULL
+);
+
+CREATE TABLE products_aud (
+    id          bigint   NOT NULL,
+    rev         bigint   NOT NULL REFERENCES revinfo (id),
+    revtype     smallint NOT NULL,
+    name        text,
+    description text,
+    price       bigint,
+    PRIMARY KEY (id, rev)
+);
+EOF
+cat > $P/Product.java <<'EOF'
+package vn.masteva.search;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import org.hibernate.envers.Audited;
+
+@Entity
+@Table(name = "products")
+@Audited
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String name;
+    private String description;
+    private long price;
+
+    protected Product() {
+    }
+
+    public Long getId() { return id; }
+    public String getName() { return name; }
+    public String getDescription() { return description; }
+    public long getPrice() { return price; }
+
+    public void update(String name, String description, long price) {
+        this.name = name;
+        this.description = description;
+        this.price = price;
+    }
+}
+EOF
+cat > $P/Revision.java <<'EOF'
+package vn.masteva.search;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import java.time.Instant;
+import org.hibernate.envers.RevisionEntity;
+import org.hibernate.envers.RevisionNumber;
+import org.hibernate.envers.RevisionTimestamp;
+
+@Entity
+@Table(name = "revinfo")
+@RevisionEntity(UserRevisionListener.class)
+public class Revision {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @RevisionNumber
+    private Long id;
+
+    @RevisionTimestamp
+    private Instant changedAt;
+
+    private String changedBy;
+
+    public Long getId() { return id; }
+    public Instant getChangedAt() { return changedAt; }
+    public String getChangedBy() { return changedBy; }
+    void setChangedBy(String changedBy) { this.changedBy = changedBy; }
+}
+EOF
+cat > $P/UserRevisionListener.java <<'EOF'
+package vn.masteva.search;
+
+import org.hibernate.envers.RevisionListener;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+
+public class UserRevisionListener implements RevisionListener {
+
+    @Override
+    public void newRevision(Object revision) {
+        String user = "system";
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attrs
+                && attrs.getRequest().getHeader("X-User") != null) {
+            user = attrs.getRequest().getHeader("X-User");   // SB6: lấy từ SecurityContext
+        }
+        ((Revision) revision).setChangedBy(user);
+    }
+}
+EOF
+cat > $P/ProductRepository.java <<'EOF'
+package vn.masteva.search;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProductRepository extends JpaRepository<Product, Long> {
+}
+EOF
+cat > $P/ProductService.java <<'EOF'
+package vn.masteva.search;
+
+import jakarta.persistence.EntityManager;
+import java.time.Instant;
+import java.util.List;
+import org.hibernate.envers.AuditReader;
+import org.hibernate.envers.AuditReaderFactory;
+import org.hibernate.envers.RevisionType;
+import org.hibernate.envers.query.AuditEntity;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.ErrorResponseException;
+
+@Service
+public class ProductService {
+    public record Change(String name, String description, long price) {
+    }
+
+    public record HistoryEntry(long rev, Instant changedAt, String changedBy, RevisionType type,
+            String name, long price) {
+    }
+
+    private final ProductRepository products;
+    private final EntityManager em;
+
+    public ProductService(ProductRepository products, EntityManager em) {
+        this.products = products;
+        this.em = em;
+    }
+
+    @Transactional
+    public void update(long id, Change c) {
+        load(id).update(c.name(), c.description(), c.price());     // dirty checking -> UPDATE + bản ghi _aud
+    }
+
+    @Transactional(readOnly = true)
+    public List<HistoryEntry> history(long id) {
+        AuditReader reader = AuditReaderFactory.get(em);
+        List<?> rows = reader.createQuery()
+                .forRevisionsOfEntity(Product.class, false, true)
+                .add(AuditEntity.id().eq(id))
+                .addOrder(AuditEntity.revisionNumber().asc())
+                .getResultList();
+        return rows.stream().map(row -> {
+            Object[] r = (Object[]) row;                    // {entity, revision entity, RevisionType}
+            Product p = (Product) r[0];
+            Revision rev = (Revision) r[1];
+            return new HistoryEntry(rev.getId(), rev.getChangedAt(), rev.getChangedBy(),
+                    (RevisionType) r[2], p.getName(), p.getPrice());
+        }).toList();
+    }
+
+    @Transactional
+    public void restore(long id, long rev) {
+        Product old = AuditReaderFactory.get(em).find(Product.class, id, rev);
+        if (old == null) {
+            throw new ErrorResponseException(HttpStatus.NOT_FOUND);
+        }
+        load(id).update(old.getName(), old.getDescription(), old.getPrice());   // khôi phục = một sửa đổi mới
+    }
+
+    private Product load(long id) {
+        return products.findById(id).orElseThrow(() -> new ErrorResponseException(HttpStatus.NOT_FOUND));
+    }
+}
+EOF
+cat > $P/ProductController.java <<'EOF'
+package vn.masteva.search;
+
+import java.util.List;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProductController {
+    private final ProductService service;
+
+    public ProductController(ProductService service) {
+        this.service = service;
+    }
+
+    @PutMapping("/products/{id}")
+    public void update(@PathVariable long id, @RequestBody ProductService.Change change) {
+        service.update(id, change);
+    }
+
+    @GetMapping("/products/{id}/history")
+    public List<ProductService.HistoryEntry> history(@PathVariable long id) {
+        return service.history(id);
+    }
+
+    @PostMapping("/products/{id}/restore")
+    public void restore(@PathVariable long id, @RequestParam long rev) {
+        service.restore(id, rev);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- Entity không ánh xạ cột `search`: PostgreSQL tự tính nó, Hibernate không đọc cũng không ghi. `ddl-auto=validate` chỉ kiểm các cột được ánh xạ.
+- Tên bảng `products_aud`, cột `rev`, `revtype` là mặc định của Envers sau khi Spring Boot đổi tên sang snake_case.
+- Envers 7.4 lấy `RevisionListener` qua `ManagedBeanRegistry` của Hibernate, và Spring đăng ký `SpringBeanContainer` cho Hibernate, nên listener có thể là bean Spring nhận dependency qua constructor. Lab giữ nó là class thường, đọc request hiện tại qua `RequestContextHolder`. Header `X-User` chỉ để lab có "người sửa"; ở ứng dụng thật lấy từ `SecurityContextHolder` (SB6.1), không bao giờ tin header do client gửi.
+
+Chạy lại ứng dụng ở tab 1 (Flyway áp `V3`). Ở tab 2, Bình rồi Chi sửa chiếc áo Đà Lạt:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/search
+curl -s -X PUT -H 'X-User: binh' -H 'Content-Type: application/json' \
+  -d '{"name":"Áo khoác đi mưa Đà Lạt","description":"Áo khoác gió mỏng, chống nước.","price":490000}' \
+  localhost:8290/products/200001 -w '%{http_code}\n'
+curl -s -X PUT -H 'X-User: chi' -H 'Content-Type: application/json' \
+  -d '{"name":"Áo khoác gió Đà Lạt","description":"Áo khoác gió mỏng, chống nước.","price":520000}' \
+  localhost:8290/products/200001 -w '%{http_code}\n'
+curl -s localhost:8290/products/200001/history; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200
+200
+[{"rev":1,"changedAt":"2026-10-09T05:16:16.751Z","changedBy":"binh","type":"MOD","name":"Áo khoác đi mưa Đà Lạt","price":490000},{"rev":2,"changedAt":"2026-10-09T05:16:16.783Z","changedBy":"chi","type":"MOD","name":"Áo khoác gió Đà Lạt","price":520000}]
+```
+
+</Expected>
+
+Tab 1 cho thấy mỗi lần sửa là bốn câu SQL trong cùng transaction:
+
+<Expected>
+
+```text
+org.hibernate.SQL                        : select p1_0.id,p1_0.description,p1_0.name,p1_0.price from products p1_0 where p1_0.id=?
+org.hibernate.SQL                        : update products set description=?,name=?,price=? where id=?
+org.hibernate.SQL                        : insert into revinfo (changed_at,changed_by) values (?,?)
+org.hibernate.SQL                        : insert into products_aud (revtype,description,name,price,rev,id) values (?,?,?,?,?,?)
+```
+
+</Expected>
+
+Lịch sử bắt đầu bằng `MOD`, không có `ADD`, và không có giá gốc 450.000: sản phẩm được tạo bằng migration trước khi bật Envers, nên Envers chưa từng thấy trạng thái ban đầu. Khi bật Envers cho bảng đã có dữ liệu, chạy một migration chép trạng thái hiện tại vào `_aud` làm revision gốc nếu cần khôi phục về đó.
+
+### 8. Khôi phục bản cũ
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -X POST -H 'X-User: an' 'localhost:8290/products/200001/restore?rev=1' -w '%{http_code}\n'
+curl -s -X POST -H 'X-User: an' 'localhost:8290/products/200001/restore?rev=99' -w '%{http_code}\n'
+Q -c "SELECT id, rev, revtype, name, price FROM products_aud ORDER BY rev" -c "SELECT * FROM revinfo"
+```
+
+</Terminal>
+
+<Predict question="Revision 99 không tồn tại. Lệnh khôi phục thứ hai trả gì, và bảng _aud có bao nhiêu dòng?">
+
+```text
+200
+200
+   id   | rev | revtype |          name          | price
+--------+-----+---------+------------------------+--------
+ 200001 |   1 |       1 | Áo khoác đi mưa Đà Lạt | 490000
+ 200001 |   2 |       1 | Áo khoác gió Đà Lạt    | 520000
+ 200001 |   3 |       1 | Áo khoác đi mưa Đà Lạt | 490000
+(3 rows)
+
+ id |         changed_at         | changed_by
+----+----------------------------+------------
+  1 | 2026-10-09 05:16:16.751+00 | binh
+  2 | 2026-10-09 05:16:16.783+00 | chi
+  3 | 2026-10-09 05:16:22.154+00 | an
+(3 rows)
+```
+
+Khôi phục về revision 1 tạo revision 3 của An, giá trị giống revision 1. Lời gọi với `rev=99` **không lỗi**: `find(Product.class, id, 99)` trả trạng thái của sản phẩm tại revision 99, tức bản ghi `_aud` mới nhất có `rev <= 99`, chính là trạng thái hiện tại. Chép trạng thái hiện tại vào chính nó không đổi gì, dirty checking không sinh `UPDATE`, nên cũng không có revision 4. Muốn từ chối revision không thuộc lịch sử của sản phẩm, kiểm `rev` có trong `history(id)` trước khi khôi phục.
+
+</Predict>
+
+<Check id="sb10.3.lab-envers">Ghi được lịch sử bằng Envers với revision entity có người sửa, đọc lịch sử một bản ghi, khôi phục bản cũ thành một revision mới, và giải thích được kết quả của `find` với revision không tồn tại.</Check>
+
+### 9. Envers bỏ sót gì: so với trigger
+
+Dừng ứng dụng. Thêm bảng audit do trigger ghi, cho mọi câu `UPDATE` trên `products`:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/search
+cat > src/main/resources/db/migration/V4__trigger_audit.sql <<'EOF'
+CREATE TABLE product_changes (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    product_id bigint      NOT NULL,
+    changed_at timestamptz NOT NULL DEFAULT now(),
+    changed_by text        NOT NULL,
+    old_row    jsonb       NOT NULL,
+    new_row    jsonb       NOT NULL
+);
+
+CREATE FUNCTION log_product_change() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO product_changes (product_id, changed_by, old_row, new_row)
+    VALUES (NEW.id,
+            coalesce(nullif(current_setting('app.user', true), ''), current_user),
+            to_jsonb(OLD) - 'search',
+            to_jsonb(NEW) - 'search');
+    RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER products_audit AFTER UPDATE ON products
+    FOR EACH ROW WHEN (OLD IS DISTINCT FROM NEW) EXECUTE FUNCTION log_product_change();
+EOF
+```
+
+</Terminal>
+
+- `current_setting('app.user', true)` đọc một biến của phiên nếu ứng dụng đã đặt, không có thì `NULL`; khi đó trigger ghi `current_user`, tên user database.
+- `WHEN (OLD IS DISTINCT FROM NEW)` bỏ qua `UPDATE` không đổi gì. `- 'search'` bỏ cột tsvector khỏi bản chụp.
+
+Chạy lại ứng dụng ở tab 1. Một người vận hành nhân đôi giá bằng psql, rồi Bình sửa giá qua API:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+Q -c "UPDATE products SET price = price * 2 WHERE id = 200001"
+curl -s -X PUT -H 'X-User: binh' -H 'Content-Type: application/json' \
+  -d '{"name":"Áo khoác đi mưa Đà Lạt","description":"Áo khoác gió mỏng, chống nước.","price":500000}' \
+  localhost:8290/products/200001 -w '%{http_code}\n'
+Q -c "SELECT id, changed_by, old_row->>'price' AS old_price, new_row->>'price' AS new_price FROM product_changes"
+curl -s localhost:8290/products/200001/history | grep -o '"rev":[0-9]*,[^}]*"price":[0-9]*' | sed 's/"changedAt":"[^"]*",//; s/"name":"[^"]*",//'
+```
+
+</Terminal>
+
+<Predict question="Mỗi cách ghi nhận được mấy lần sửa, và biết ai sửa không?">
+
+```text
+UPDATE 1
+200
+ id | changed_by | old_price | new_price
+----+------------+-----------+-----------
+  1 | postgres   | 490000    | 980000
+  2 | postgres   | 980000    | 500000
+(2 rows)
+
+"rev":1,"changedBy":"binh","type":"MOD","price":490000
+"rev":2,"changedBy":"chi","type":"MOD","price":520000
+"rev":3,"changedBy":"an","type":"MOD","price":490000
+"rev":4,"changedBy":"binh","type":"MOD","price":500000
+```
+
+Trigger thấy cả hai lần sửa nhưng cả hai đều mang tên `postgres`, user database mà cả psql lẫn ứng dụng dùng. Envers chỉ thấy lần sửa qua Hibernate, biết đúng là Bình, nhưng lịch sử của nó nói giá đi từ 490.000 lên 500.000: lần nhân đôi lên 980.000 ở giữa đã biến mất. Muốn trigger biết người sửa, ứng dụng chạy `SELECT set_config('app.user', ?, true)` ở đầu mỗi transaction; tham số `true` giới hạn giá trị trong transaction đó, không rò sang request sau dùng lại cùng kết nối của pool.
+
+</Predict>
+
+<Check id="sb10.3.lab-trigger">Tái hiện được một thay đổi mà Envers bỏ sót và trigger bắt được, và ngược lại thông tin người sửa mà trigger không có.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `text search configuration "vn" does not exist` khi chạy psql: đang ở database khác; hàm `Q` trỏ vào `search`.
+- `function unaccent(unknown) does not exist`: chưa `CREATE EXTENSION unaccent` trong database này; extension cài theo từng database.
+- Truy vấn trigram quét cả bảng dù có index: biểu thức trong `WHERE` phải giống hệt biểu thức của index, kể cả thứ tự `lower` và `immutable_unaccent`.
+- `Schema-validation: missing table [products_aud]` hoặc `[revinfo]`: thiếu `V3__envers.sql`, hoặc tên bảng khác mặc định của Envers.
+- `changedBy` luôn là `system`: thiếu header `X-User`, hoặc sửa từ một thread không có request (job nền), nơi `RequestContextHolder` trống.
+- Lịch sử trống sau khi sửa: method sửa không có `@Transactional`, hoặc giá trị gửi lên giống hệt giá trị cũ nên không có `UPDATE`.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Giữ `sb10-pg` cho bài SB10.4. Database `search` không ảnh hưởng gì tới bài sau.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Tìm kiếm trên nhiều bảng (sản phẩm, danh mục, thương hiệu) thì cột generated còn dùng được không?">
+
+Cột generated chỉ đọc được các cột của chính dòng đó, không join sang bảng khác. Có ba cách. Thêm cột phi chuẩn hoá (tên danh mục) vào `products` và cập nhật khi danh mục đổi tên. Dùng một bảng `search_documents` riêng do trigger hoặc ứng dụng cập nhật, chứa `tsvector` gộp từ nhiều nguồn. Hoặc dùng materialized view có GIN index và `REFRESH MATERIALIZED VIEW CONCURRENTLY` định kỳ, chấp nhận dữ liệu trễ vài phút. Khi số nguồn và tần suất cập nhật lớn, đây cũng là lúc cân nhắc OpenSearch với một luồng đồng bộ.
+
+</Reveal>
+
+<Reveal title="Bỏ dấu khiến 'bán' và 'bạn' thành cùng một từ. Có giữ được độ chính xác không?">
+
+Có, bằng cách lưu cả hai dạng với trọng số khác nhau: `setweight(to_tsvector('simple', name), 'A') || setweight(to_tsvector('vn', name), 'B')`. Người gõ có dấu khớp cả hai dạng và được điểm cao hơn ở dạng có dấu; người gõ không dấu vẫn khớp dạng `vn`. Truy vấn tạo `tsquery` từ cả hai cấu hình rồi nối bằng `||`. Cái giá là `tsvector` và index lớn gần gấp đôi.
+
+</Reveal>
+
+<Reveal title="Bảng _aud lớn dần mãi. Vận hành nó thế nào?">
+
+Mỗi lần sửa thêm một bản sao đầy đủ của dòng. Chỉ audit các cột cần (`@NotAudited` trên cột lớn như mô tả dài hay ảnh), đặt chính sách lưu giữ (xoá hoặc chuyển sang kho lưu trữ các revision cũ hơn N năm, theo yêu cầu pháp lý), và index `_aud` theo cách bạn truy vấn (thường `(id, rev)` đã đủ). Với `ValidityAuditStrategy`, Envers ghi thêm cột `revend` để truy vấn "trạng thái tại thời điểm" nhanh hơn, đổi lại mỗi lần sửa phải `UPDATE` thêm bản ghi trước đó.
+
+</Reveal>
+
+<Reveal title="Envers ghi trong cùng transaction. Điều đó có giá gì?">
+
+Mỗi lần sửa thêm hai câu `INSERT`, và transaction rollback thì lịch sử cũng rollback: đúng điều bạn muốn, không có lịch sử cho thay đổi không xảy ra. Nhưng nó cũng có nghĩa ai có quyền ghi vào database thì sửa được cả `_aud`: lịch sử này giúp trả lời "chuyện gì đã xảy ra", không chống được người cố ý xoá dấu vết. Audit trail không sửa được (ghi ra nơi chỉ thêm, ký số hoặc chuỗi băm) là việc của chặng SB13.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết migration cho cấu hình text search, câu truy vấn `ts_rank` có trọng số, hay mapping Envers cho một entity có quan hệ. AI hay dùng cấu hình `english` hay `simple` cho tiếng Việt mà không bỏ dấu, hay gọi `unaccent()` thẳng trong cột generated hoặc index, hay quên `STORED` với PostgreSQL 18, hay đề xuất Elasticsearch cho bảng vài chục nghìn dòng, và hay để Envers tự tạo bảng bằng `ddl-auto=update`. Kiểm lại bằng `EXPLAIN ANALYZE` (index có được dùng không) và bằng một lần sửa qua psql (lịch sử có ghi không).
+
+</Callout>
+
+<Callout kind="link">
+
+SB3.1 dạy đọc EXPLAIN ANALYZE với index B-tree; bài này dùng GIN. SB5.4 có auditing bốn cột; bài này giữ toàn bộ lịch sử. SB6.1 cung cấp `SecurityContext` thay cho header `X-User`. SB9.1 cache kết quả cho từ khoá phổ biến. SB10.2 dùng outbox, cũng là cách đồng bộ dữ liệu sang OpenSearch nếu sau này cần. Chặng SB13 xây audit trail không sửa được.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb10.3.mastery-search">Tự dựng được tìm kiếm tiếng Việt có dấu và không dấu trên PostgreSQL với index phù hợp, có xếp hạng và dự phòng cho từ gõ sai, và chứng minh bằng EXPLAIN ANALYZE rằng truy vấn dùng index.</Check>
+
+<Check id="sb10.3.mastery-history">Tự thêm được lịch sử thay đổi bằng Envers cho một entity, có người sửa, xem và khôi phục được bản cũ, và nói được những thay đổi nào Envers sẽ bỏ sót.</Check>
+
+<Check id="sb10.3.mastery-choice">Giải thích được cho đồng đội khi nào PostgreSQL full-text đủ dùng và khi nào cần OpenSearch, khi nào dùng Envers và khi nào cần trigger hoặc audit trail.</Check>
+
+</Mastery>

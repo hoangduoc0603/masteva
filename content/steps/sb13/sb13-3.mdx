@@ -1,0 +1,1054 @@
+---
+title: Audit trail cho sự kiện bảo mật và rate limiting
+description: Ghi sự kiện bảo mật từ AuthenticationEventPublisher và AuthorizationEventPublisher vào một bảng chỉ thêm, có chuỗi băm phát hiện sửa đổi; rồi giới hạn tốc độ bằng token bucket với Bucket4j và Redis cho nhiều instance, trả 429 kèm Retry-After và Problem Details, và tránh bẫy X-Forwarded-For giả.
+id: sb13.3
+step: sb13
+prerequisites: [sb13.2]
+topics: [sb13.audit-trail, sb13.rate-limit]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    spring-security: 7.1.1
+    bucket4j: 8.21.0
+    lettuce: 7.5.2
+    docker: 29.8.0
+    postgresql: "18.6"
+    redis: 8.10.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Thêm hai lớp mà mọi API công khai cần sau khi đã có xác thực và phân quyền: một sổ ghi sự kiện bảo mật không sửa lén được, và một giới hạn tốc độ đúng cho cả cụm instance. Học xong bài này, bạn giải thích được:
+
+- Vì sao role của ứng dụng không xoá được dòng audit nào, còn role owner thì sửa được, và chuỗi băm phát hiện việc đó ra sao.
+- Vì sao giới hạn 5 request mỗi phút trên mỗi instance thành 15 request khi bạn chạy ba instance, và Redis sửa điều đó thế nào.
+- Vì sao bật `server.forward-headers-strategy=native` để lấy IP thật sau proxy lại cho kẻ tấn công vượt qua giới hạn theo IP chỉ bằng một header, khi họ gọi thẳng được vào ứng dụng từ một dải mạng nằm trong danh sách proxy tin cậy.
+
+</Goal>
+
+<Knowledge>
+
+### Audit trail khác gì những thứ đã có
+
+Bạn đã gặp ba cách ghi "ai làm gì". Audit trail cho sự kiện bảo mật là cách thứ tư, với mục đích khác:
+
+| | Ghi gì | Ai đọc | Sửa được không |
+|---|---|---|---|
+| Auditing `@CreatedBy` (SB5.4) | Ai tạo, ai sửa lần cuối một dòng | Ứng dụng | Ghi đè mỗi lần sửa |
+| Lịch sử thay đổi bằng Envers (SB10.3) | Mọi phiên bản của entity | Nghiệp vụ: "đơn này đổi giá lúc nào" | Ai ghi được bảng `_aud` thì sửa được |
+| Log ứng dụng (SB8) | Mọi thứ, dạng văn bản | Lập trình viên gỡ lỗi | Xoay vòng, xoá sau vài ngày |
+| Audit trail bảo mật | Đăng nhập hỏng, truy cập bị từ chối, đổi quyền, xuất dữ liệu nhạy cảm | Đội bảo mật, kiểm toán, điều tra sự cố | **Chỉ thêm**; sửa thì phải lộ |
+
+Một dòng audit trả lời bốn câu: **ai** (tài khoản, hoặc tên đã thử khi đăng nhập hỏng), **làm gì** (hành động và đối tượng), **lúc nào** (giờ của server, có múi giờ), **từ đâu** (địa chỉ IP, có thể thêm trace id của SB8). Nó **không** chứa mật khẩu, token, cookie phiên, nội dung request hay dữ liệu cá nhân không cần thiết. Một điểm hay bị quên: người dùng thường gõ nhầm mật khẩu vào ô tên đăng nhập, nên tên trong sự kiện đăng nhập hỏng có thể chính là mật khẩu. Cắt ngắn không giúp gì (một mật khẩu 13 ký tự vẫn nằm nguyên). Cách lab dùng: tài khoản tồn tại thì ghi tên; không tồn tại thì ghi `unknown` kèm HMAC-SHA256 của chuỗi đã thử với một khoá bí mật. Hai lần thử cùng chuỗi cho cùng dấu vân tay, nên vẫn nhận ra một đợt dò hàng loạt, nhưng không đọc ngược được chuỗi nếu không có khoá. Không dùng SHA-256 trần: mật khẩu ngắn bị dò ngược bằng từ điển trong vài giây.
+
+<Check id="sb13.3.audit-vs-history">Phân biệt được audit trail bảo mật với auditing bốn cột, lịch sử Envers và log ứng dụng, và kể được bốn câu hỏi một dòng audit phải trả lời cùng những thứ không được ghi.</Check>
+
+### Sự kiện bảo mật của Spring Security
+
+Spring Security phát sự kiện qua `ApplicationEventPublisher`, nên bạn chỉ cần `@EventListener`:
+
+| Sự kiện | Ai phát | Mặc định trong Spring Boot |
+|---|---|---|
+| `AuthenticationSuccessEvent` | `AuthenticationEventPublisher` của `ProviderManager` | Bật: Boot tự tạo `DefaultAuthenticationEventPublisher` |
+| `AuthenticationFailureBadCredentialsEvent` và các lớp con khác của `AbstractAuthenticationFailureEvent` | Như trên, mỗi loại exception một lớp sự kiện | Bật |
+| `AuthorizationDeniedEvent` từ `authorizeHttpRequests` | `AuthorizationFilter` | Bật: Spring Security 7.1 tự tạo một `SpringAuthorizationEventPublisher` cho filter khi không có bean nào |
+| `AuthorizationDeniedEvent` từ `@PreAuthorize`, `@PostAuthorize` | Interceptor của method security | **Tắt**: phải khai báo bean `AuthorizationEventPublisher` |
+| `AuthorizationGrantedEvent` | Như trên | Tắt, kể cả khi đã có bean (quá nhiều); bật có chọn lọc bằng `setShouldPublishResult` (từ 7.0) |
+
+Tài liệu Spring Security vẫn hướng dẫn khai báo bean `SpringAuthorizationEventPublisher`; khai báo là vô hại, và cần thiết nếu bạn muốn cả sự kiện của method security. Lab khai báo nó.
+
+Cẩn thận với `AuthenticationSuccessEvent` ở API không giữ session: với HTTP Basic hay JWT, mỗi request là một lần xác thực, nên ba request sinh ba sự kiện "đăng nhập thành công". Ghi đăng nhập thành công ở nơi có đăng nhập thật (authorization server, BFF của SB13.2); ở API, ghi thất bại và từ chối là đủ.
+
+```text
+ curl -u bob:bob-pass /api/admin/audit
+        |
+ BasicAuthenticationFilter -> ProviderManager.authenticate()
+        |   sai mật khẩu -> DefaultAuthenticationEventPublisher -> AuthenticationFailureBadCredentialsEvent
+        v
+ AuthorizationFilter: /api/admin/** cần ROLE_ADMIN, bob chỉ có ROLE_USER
+        |   -> SpringAuthorizationEventPublisher -> AuthorizationDeniedEvent(object = HttpServletRequest)
+        v
+ @EventListener SecurityAuditListener -> INSERT INTO security_audit (cùng thread, ngay lúc đó)
+```
+
+<Check id="sb13.3.security-events">Kể được sự kiện nào Spring Boot phát sẵn và sự kiện nào phải bật bằng bean, và giải thích được vì sao không ghi `AuthenticationSuccessEvent` ở API dùng HTTP Basic hay JWT.</Check>
+
+### Bảng chỉ thêm và chuỗi băm
+
+Hai lớp bảo vệ, chống hai loại người khác nhau:
+
+1. **Quyền ở database**: role của ứng dụng chỉ có `INSERT` và `SELECT`. Lỗ hổng SQL injection hay một lập trình viên viết nhầm `DELETE` không xoá được dấu vết, vì database từ chối. Cách này giống SB13.1: role ứng dụng khác role owner.
+2. **Chuỗi băm** (hash chain): mỗi dòng lưu `hash = SHA-256(hash của dòng trước || nội dung dòng này)`. Owner hay DBA vẫn sửa được dữ liệu, nhưng sửa một dòng làm hash của nó không còn khớp, và mọi dòng sau mất liên kết.
+
+```text
+ id 1: payload1  prev = (rỗng)   hash1 = sha256(           payload1)
+ id 2: payload2  prev = hash1    hash2 = sha256(hash1   || payload2)
+ id 3: payload3  prev = hash2    hash3 = sha256(hash2   || payload3)
+        ^ sửa actor của id 2  ->  sha256(hash1 || payload2') != hash2   -> phát hiện
+```
+
+Chuỗi băm **phát hiện** chứ không **ngăn**, và có ba chỗ nó không thấy: xoá vài dòng **cuối** chuỗi (không còn dòng sau nào để mất liên kết), owner hay superuser `ALTER TABLE ... DISABLE TRIGGER` rồi chèn dòng tuỳ ý, hoặc sửa một dòng rồi tính lại toàn bộ hash phía sau. Muốn bắt cả ba, định kỳ gửi `seq` và hash mới nhất ra một nơi họ không sửa được (hệ thống log tập trung, object storage có khoá ghi một lần như S3 Object Lock), rồi khi kiểm tra thì so với bản đã gửi. Ba chi tiết khi cài trong PostgreSQL:
+
+- Nội dung đem băm phải **chuẩn hoá** và không mơ hồ. Lab đổi `occurred_at` thành số micro giây từ epoch, vì chuyển `timestamptz` sang chữ phụ thuộc `TimeZone` của phiên. Các cột được gói bằng `jsonb_build_array(...)::text` chứ không nối bằng `concat_ws('|', ...)`: `concat_ws` bỏ qua `NULL` và không thoát dấu `|`, nên dời giá trị từ cột này sang cột kia (`source_ip = NULL`, `detail = '127.0.0.1|...'`) cho ra đúng chuỗi cũ và hash vẫn khớp. Mảng JSON giữ vị trí từng cột, ghi `null` rõ ràng và thoát ký tự đặc biệt; bước 7 thử đúng kiểu sửa đó.
+- Trigger lấy hash của dòng trước, nên hai `INSERT` song song có thể cùng nối vào một dòng và chuỗi rẽ nhánh. `pg_advisory_xact_lock` bắt các lần ghi đi tuần tự, và câu `SELECT` dòng cuối chạy **sau** khi có khoá. Ở READ COMMITTED, mỗi câu lệnh trong hàm lấy snapshot mới nên thấy dòng vừa commit trước đó; ở REPEATABLE READ hay SERIALIZABLE, snapshot đã chụp từ đầu transaction nên vẫn rẽ nhánh, vì vậy trigger từ chối hai mức đó. Thứ tự trong chuỗi là cột `seq` do trigger gán sau khi có khoá, không phải `id`: identity được cấp trước khi trigger chạy, nên thứ tự `id` có thể khác thứ tự lấy khoá. Cái giá: mọi lần ghi audit xếp hàng, nên ghi trong transaction ngắn của riêng nó.
+- **Giữ bao lâu** là quyết định chính sách, không phải kỹ thuật. Ví dụ PCI DSS v4 (yêu cầu 10.5.1) đòi giữ ít nhất 12 tháng, 3 tháng gần nhất phải tra cứu được ngay. Bảng lớn thì chia partition theo tháng và chuyển partition cũ sang kho lưu trữ, bằng role owner, theo lịch được ghi lại; địa chỉ IP là dữ liệu cá nhân ở nhiều luật bảo vệ dữ liệu, nên cũng không giữ lâu hơn mức cần.
+
+<Check id="sb13.3.append-only">Thiết kế được bảng audit chỉ thêm bằng `GRANT`/`REVOKE`, giải thích được chuỗi băm phát hiện gì và không thấy gì (xoá dòng cuối, tắt trigger, tính lại cả chuỗi), vì sao nội dung băm phải chuẩn hoá và không mơ hồ, và vì sao trigger cần khoá, `seq` và READ COMMITTED.</Check>
+
+<Callout kind="production">
+
+Một công ty fintech phát hiện danh sách khách hàng bị xuất ra ngoài. Log ứng dụng chỉ giữ 7 ngày, còn bảng `admin_actions` nằm cùng database với quyền ghi đầy đủ của tài khoản ứng dụng. Khi đội điều tra mở bảng, các dòng của đúng ba ngày nghi vấn đã biến mất: người gây ra sự cố có quyền quản trị ứng dụng, và màn hình quản trị có nút "dọn log cũ". Bài học họ ghi lại: audit ghi bằng role không xoá được, hash mới nhất gửi ra hệ thống log tập trung mỗi giờ, và không tính năng nào của ứng dụng được xoá audit.
+
+</Callout>
+
+### Rate limiting và token bucket
+
+**Rate limiting** (giới hạn tốc độ) chặn một khách gửi quá nhiều request: chống dò mật khẩu, chống cào dữ liệu, và giữ cho một khách lỗi vòng lặp không làm sập dịch vụ của mọi người. Các thuật toán:
+
+| Thuật toán | Cách đếm | Ưu | Nhược |
+|---|---|---|---|
+| Fixed window | Đếm trong mỗi phút tròn | Đơn giản, một bộ đếm | Dồn được gấp đôi ở ranh giới hai cửa sổ (59 giây và giây 0) |
+| Sliding window log | Lưu thời điểm từng request | Chính xác | Tốn bộ nhớ theo số request |
+| Token bucket | Xô chứa tối đa N token, nạp lại đều; mỗi request lấy một | Cho phép dồn ngắn tới N, giữ tốc độ trung bình; trạng thái chỉ hai con số | Phải chọn cả dung lượng lẫn tốc độ nạp |
+| Leaky bucket | Hàng đợi chảy ra với tốc độ cố định | Đầu ra đều | Thêm độ trễ, request phải xếp hàng |
+
+```text
+ capacity = 5, nạp 5 token / phút (greedy: 1 token mỗi 12 giây)
+
+ t=0s   [#####] 5   request 1..5 lấy hết       -> 200 200 200 200 200
+ t=0s   [     ] 0   request 6: thiếu 1 token   -> 429, Retry-After: 12
+ t=12s  [#    ] 1   nạp được 1                 -> request tiếp theo 200
+ t=60s  [#####] 5   đầy lại (không vượt capacity)
+```
+
+**Bucket4j** cài token bucket cho Java. Với một instance, bucket nằm trong bộ nhớ. Với nhiều instance, mỗi instance một bucket nghĩa là giới hạn nhân theo số instance, và autoscaling làm nó thay đổi theo giờ. Bucket4j lưu trạng thái bucket (vài chục byte) trong Redis qua `ProxyManager`: mỗi lần tiêu token, nó đọc trạng thái, tính ở ứng dụng, rồi ghi lại bằng một Lua script so-và-đổi (compare-and-swap); hai instance tranh nhau thì một bên thử lại. Key tự hết hạn khi bucket đã đầy lại, nên Redis không phình theo số người dùng từng ghé.
+
+Khi bị chặn, trả **429 Too Many Requests** (RFC 6585) kèm `Retry-After` tính bằng giây, và thân lỗi dạng Problem Details (RFC 9457) như SB1.3. Client tử tế đọc `Retry-After` để chờ thay vì thử lại ngay.
+
+<Check id="sb13.3.token-bucket">Giải thích được token bucket bằng hai tham số dung lượng và tốc độ nạp, so được với fixed window, và nói được vì sao nhiều instance cần trạng thái bucket chung.</Check>
+
+### Giới hạn theo ai: user, IP, và X-Forwarded-For
+
+| Khoá | Hợp với | Bẫy |
+|---|---|---|
+| User đã đăng nhập | API sau đăng nhập; công bằng giữa các khách | Không áp được trước khi xác thực (dò mật khẩu) |
+| Địa chỉ IP | Endpoint công khai, trang đăng nhập | Cả văn phòng hay mạng di động dùng chung một IP; kẻ tấn công có hàng nghìn IP |
+| API key, client id | API cho đối tác | Phải quản lý key |
+
+Sau load balancer hay ingress, `request.getRemoteAddr()` là IP của proxy, không phải của khách. Proxy thêm header `X-Forwarded-For: <ip khách>`. Spring Boot đọc nó khi bạn đặt `server.forward-headers-strategy=native`: Tomcat bật `RemoteIpValve`, và nếu request đến từ một địa chỉ thuộc `server.tomcat.remoteip.internal-proxies` thì `getRemoteAddr()` trả IP trong header. Mặc định của Spring Boot 4.1 cho property này là **mọi** dải nội bộ: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `169.254.0.0/16`, `127.0.0.0/8` và các dải IPv6 tương ứng (`::1/128`, `fc00::/7`, `fe80::/10`). Nếu khách gọi thẳng được vào ứng dụng từ một trong các dải đó (cùng VPC, hay chính `localhost` như lab), họ tự viết `X-Forwarded-For` và mỗi request mang một IP mới. Hai cách sai đối xứng:
+
+- Tin header từ bất kỳ ai: kẻ tấn công đổi IP giả mỗi request, giới hạn theo IP vô dụng.
+- Không tin header nào sau proxy: mọi khách cùng IP của load balancer, một khách dùng nhiều làm cả hệ thống nhận 429.
+
+Đúng là chỉ tin đúng địa chỉ của proxy của bạn (`internal-proxies` nhận danh sách CIDR, hoặc một biểu thức chính quy). `RemoteIpValve` đọc `X-Forwarded-For` từ phải sang trái và dừng ở địa chỉ đầu tiên không phải proxy tin cậy, nên vẫn đúng khi proxy nối IP thật vào sau giá trị khách tự gửi. Code tự đọc `request.getHeader("X-Forwarded-For")` rồi lấy phần tử đầu tiên thì lấy đúng phần khách tự viết.
+
+### Giới hạn ở đâu: ứng dụng hay gateway
+
+| Đặt ở | Ví dụ | Hợp với |
+|---|---|---|
+| CDN, WAF | Cloudflare, AWS WAF | Chặn lũ request thô theo IP trước khi tới hạ tầng của bạn |
+| Ingress, gateway | `limit_req` của nginx, Envoy, Spring Cloud Gateway `RequestRateLimiter` | Giới hạn chung cho mọi service, theo route, theo IP hay header |
+| Trong ứng dụng | Bucket4j như lab | Giới hạn theo nghiệp vụ: theo user, theo gói cước, theo loại thao tác đắt |
+
+Hai tầng không loại trừ nhau. Gateway chặn lượng thô và dò mật khẩu theo IP; ứng dụng biết `alice` thuộc gói miễn phí và chỉ được xuất báo cáo 10 lần mỗi giờ. Lab đặt giới hạn trong một `HandlerInterceptor` của Spring MVC, chạy sau filter chain của Spring Security nên đã biết user; request bị từ chối xác thực (401) không đi tới đó, nên chống dò mật khẩu phải nằm ở tầng trước (gateway, hay một filter đặt trước xác thực).
+
+<Check id="sb13.3.client-ip">Chọn được khoá giới hạn (user, IP, API key) và tầng đặt giới hạn cho một API, và giải thích được cả hai cách cấu hình `X-Forwarded-For` sai.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Authentication Events (Spring Security)](https://docs.spring.io/spring-security/reference/servlet/authentication/events.html) và [Authorization Events](https://docs.spring.io/spring-security/reference/servlet/authorization/events.html): danh sách sự kiện, cách ánh xạ exception sang sự kiện, và bean `SpringAuthorizationEventPublisher`.
+- [Logging Cheat Sheet (OWASP)](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html): mục "Which events to log" và "Data to exclude".
+- [Bucket4j 8.21.0 Reference](https://bucket4j.com/8.21.0/toc.html): chương 3 "Distributed facilities", đặc biệt mục 3.2 (checklist production) và 3.5 (Bucket4j-Redis).
+- [RFC 6585: Additional HTTP Status Codes](https://www.rfc-editor.org/rfc/rfc6585): mục 4 định nghĩa 429 và cách dùng `Retry-After`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm SB13.1 và SB13.2 (thư mục `~/masteva-sb13`). Docker đang chạy, JDK 25, `curl`, `unzip`. Ba tab Terminal: tab 1 instance A (cổng **8093**), tab 2 instance B (cổng **8193**), tab 3 gửi request. Ở cả ba tab, chạy `export JAVA_HOME=$(/usr/libexec/java_home -v 25)`. Dừng các ứng dụng của SB13.2 nếu còn chạy, vì chúng dùng cùng cổng. Bài này dùng cổng 5413 cho PostgreSQL; nếu container `sb13-pg` của SB13.1 còn chạy, dừng nó (dữ liệu vẫn giữ). Nếu bạn đã xoá nó ở SB13.1, lệnh báo `No such container`, bỏ qua:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+docker stop sb13-pg
+```
+
+</Terminal>
+
+### 1. Project và Bucket4j
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb13
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=shop \
+  -d name=shop -d packageName=vn.masteva.shop \
+  -d dependencies=web,security,jdbc,flyway,postgresql -o shop.zip
+unzip -q shop.zip -d shop && cd shop
+perl -0pi -e 's#(<dependencies>\n)#$1\t\t<dependency>\n\t\t\t<groupId>com.bucket4j</groupId>\n\t\t\t<artifactId>bucket4j_jdk17-lettuce</artifactId>\n\t\t\t<version>8.21.0</version>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>io.lettuce</groupId>\n\t\t\t<artifactId>lettuce-core</artifactId>\n\t\t</dependency>\n#' pom.xml
+./mvnw -q dependency:list -DoutputFile=/dev/stdout 2>&1 | grep -E 'bucket4j|lettuce-core' | sort
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   com.bucket4j:bucket4j_jdk17-core:jar:8.21.0:compile -- module io.github.bucket4j.core [auto]
+   com.bucket4j:bucket4j_jdk17-lettuce:jar:8.21.0:compile -- module io.github.bucket4j.lettuce [auto]
+   com.bucket4j:bucket4j_jdk17-redis-common:jar:8.21.0:compile -- module io.github.bucket4j.redis.common [auto]
+   io.lettuce:lettuce-core:jar:7.5.2.RELEASE:compile -- module lettuce.core [auto]
+```
+
+</Expected>
+
+- `bucket4j_jdk17-lettuce` kéo theo lõi của Bucket4j và phần dùng chung cho Redis. Nó khai báo Lettuce ở scope `provided`, nên phải tự thêm `lettuce-core`; không ghi version để Spring Boot quản lý (7.5.2 với Boot 4.1.1).
+- Lab dùng thẳng client Lettuce thay vì `spring-boot-starter-data-redis`, vì Bucket4j cần kết nối kiểu `String` khoá, `byte[]` giá trị.
+
+### 2. PostgreSQL và Redis
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb13/shop
+mkdir -p db
+cat > db/init-roles.sql <<'EOF'
+CREATE ROLE shop_owner LOGIN PASSWORD 'owner-local' NOSUPERUSER NOBYPASSRLS;
+CREATE ROLE shop_app   LOGIN PASSWORD 'app-local'   NOSUPERUSER NOBYPASSRLS;
+ALTER SCHEMA public OWNER TO shop_owner;
+EOF
+docker run -d --name sb13-audit-pg -p 5413:5432 -e POSTGRES_PASSWORD=postgres-local -e POSTGRES_DB=shop \
+  -v "$PWD/db/init-roles.sql:/docker-entrypoint-initdb.d/init-roles.sql:ro" postgres:18-alpine
+docker run -d --name sb13-redis -p 9431:6379 redis:8-alpine
+sleep 5
+docker exec sb13-redis redis-cli PING
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d21d91655c394ced40ba27c5f8362d619c6b6a437c38135ec4421fbc0045bd7a
+5211aea10f495731144859d35dd010188ded43d82ea24914d4489e531baa1a82
+PONG
+```
+
+</Expected>
+
+Hai dòng đầu là id của hai container, khác trên máy bạn. Bộ role giống SB13.1: `shop_owner` chạy migration, `shop_app` cho ứng dụng.
+
+### 3. Bảng audit chỉ thêm, có chuỗi băm
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb13/shop
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=shop
+server.port=8093
+spring.datasource.url=jdbc:postgresql://localhost:5413/shop
+spring.datasource.username=shop_app
+spring.datasource.password=app-local
+spring.flyway.user=shop_owner
+spring.flyway.password=owner-local
+spring.mvc.problemdetails.enabled=true
+app.redis-url=redis://localhost:9431
+# Khoá HMAC cho tên đăng nhập không tồn tại: giá trị giả của lab; production nạp như secret (SB6.3)
+app.audit.attempt-key=lab-only-audit-hmac-key
+logging.pattern.console=%5p %logger{0} : %m%n
+EOF
+cat > src/main/resources/db/migration/V1__security_audit.sql <<'EOF'
+CREATE TABLE security_audit (
+    id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    seq         bigint      NOT NULL UNIQUE,   -- thứ tự trong chuỗi, trigger gán
+    occurred_at timestamptz NOT NULL DEFAULT now(),
+    actor       text        NOT NULL,
+    action      text        NOT NULL,
+    outcome     text        NOT NULL,
+    source_ip   text,
+    detail      text,
+    prev_hash   bytea,
+    hash        bytea       NOT NULL
+);
+
+-- Nội dung chuẩn hoá của một dòng: mảng JSON giữ vị trí cột, ghi rõ null,
+-- không phụ thuộc TimeZone của phiên
+CREATE FUNCTION security_audit_payload(a security_audit) RETURNS bytea
+    LANGUAGE sql STABLE AS $$
+    SELECT convert_to(jsonb_build_array(a.seq, (extract(epoch FROM a.occurred_at) * 1000000)::bigint,
+                                        a.actor, a.action, a.outcome, a.source_ip, a.detail)::text, 'UTF8')
+$$;
+
+-- Mỗi dòng mới móc vào hash của dòng trước: sửa một dòng cũ là gãy chuỗi
+CREATE FUNCTION security_audit_chain() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+DECLARE
+    last security_audit;
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'security_audit requires READ COMMITTED, got %', current_setting('transaction_isolation');
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('security_audit'));   -- ghi tuần tự để chuỗi không rẽ nhánh
+    SELECT * INTO last FROM security_audit ORDER BY seq DESC LIMIT 1;   -- snapshot mới, sau khi có khoá
+    NEW.seq := coalesce(last.seq, 0) + 1;
+    NEW.prev_hash := last.hash;
+    NEW.hash := sha256(coalesce(NEW.prev_hash, '\x'::bytea) || security_audit_payload(NEW));
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER security_audit_chain BEFORE INSERT ON security_audit
+    FOR EACH ROW EXECUTE FUNCTION security_audit_chain();
+
+-- Role ứng dụng chỉ được thêm và đọc
+REVOKE ALL ON security_audit FROM PUBLIC;
+GRANT SELECT, INSERT ON security_audit TO shop_app;
+EOF
+```
+
+</Terminal>
+
+- Trigger `BEFORE INSERT` chạy sau khi `occurred_at` đã nhận giá trị mặc định, nên hash bao gồm nó. Cột `seq` và `hash` có `NOT NULL` nhưng ứng dụng không gửi: trigger điền trước khi ràng buộc được kiểm.
+- Ứng dụng không phải biết gì về chuỗi băm. Một job hay script ghi audit bằng SQL thuần cũng tự vào chuỗi.
+- `spring.mvc.problemdetails.enabled=true` cho Spring MVC trả lỗi dạng `application/problem+json` (SB1.3), dùng ở bước 7.
+
+### 4. Ghi sự kiện bảo mật
+
+<Terminal where="mac" title="Tab 3: SecurityConfig, AuditLog, listener, controller">
+
+```bash
+cd ~/masteva-sb13/shop
+P=src/main/java/vn/masteva/shop
+mkdir -p $P/audit $P/ratelimit
+cat > $P/SecurityConfig.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authorization.AuthorizationEventPublisher;
+import org.springframework.security.authorization.SpringAuthorizationEventPublisher;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.provisioning.InMemoryUserDetailsManager;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        http.authorizeHttpRequests(a -> a
+                        .requestMatchers("/error", "/api/public/**").permitAll()
+                        .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                        .requestMatchers("/api/**").authenticated()
+                        .anyRequest().denyAll())
+                .httpBasic(Customizer.withDefaults())
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+        return http.build();
+    }
+
+    /** Bật sự kiện từ chối cho method security; filter HTTP của Spring Security 7.1 đã tự phát. */
+    @Bean
+    AuthorizationEventPublisher authorizationEventPublisher(ApplicationEventPublisher publisher) {
+        return new SpringAuthorizationEventPublisher(publisher);
+    }
+
+    /** {noop}: mật khẩu thô, chỉ cho lab. */
+    @Bean
+    UserDetailsService users() {
+        return new InMemoryUserDetailsManager(
+                User.withUsername("alice").password("{noop}alice-pass").roles("USER").build(),
+                User.withUsername("bob").password("{noop}bob-pass").roles("USER").build(),
+                User.withUsername("carol").password("{noop}carol-pass").roles("ADMIN").build());
+    }
+}
+EOF
+cat > $P/audit/AuditLog.java <<'EOF'
+package vn.masteva.shop.audit;
+
+import java.util.List;
+import java.util.Map;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Component;
+
+@Component
+public class AuditLog {
+    private final JdbcClient jdbc;
+
+    AuditLog(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    public void record(String actor, String action, String outcome, String sourceIp, String detail) {
+        jdbc.sql("""
+                INSERT INTO security_audit (actor, action, outcome, source_ip, detail)
+                VALUES (?, ?, ?, ?, ?)""")
+                .params(actor, action, outcome, sourceIp, detail)
+                .update();
+    }
+
+    public List<Map<String, Object>> latest(int limit) {
+        return jdbc.sql("""
+                SELECT seq, actor, action, outcome, source_ip, detail,
+                       left(encode(hash, 'hex'), 12) AS hash
+                FROM security_audit ORDER BY seq DESC LIMIT ?""")
+                .param(limit).query().listOfRows();
+    }
+}
+EOF
+cat > $P/audit/SecurityAuditListener.java <<'EOF'
+package vn.masteva.shop.audit;
+
+import jakarta.servlet.http.HttpServletRequest;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.util.HexFormat;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.event.EventListener;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.authentication.event.AbstractAuthenticationFailureEvent;
+import org.springframework.security.authorization.event.AuthorizationDeniedEvent;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.web.authentication.WebAuthenticationDetails;
+import org.springframework.stereotype.Component;
+
+/** Ai, làm gì, kết quả, từ đâu. Không ghi mật khẩu, token hay nội dung request. */
+@Component
+class SecurityAuditListener {
+    private final AuditLog audit;
+    private final UserDetailsService users;
+    private final SecretKeySpec attemptKey;
+
+    SecurityAuditListener(AuditLog audit, UserDetailsService users,
+            @Value("${app.audit.attempt-key}") String attemptKey) {
+        this.audit = audit;
+        this.users = users;
+        this.attemptKey = new SecretKeySpec(attemptKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+    }
+
+    @EventListener
+    void onLoginFailure(AbstractAuthenticationFailureEvent event) {
+        Authentication attempt = event.getAuthentication();
+        String ip = attempt.getDetails() instanceof WebAuthenticationDetails d ? d.getRemoteAddress() : null;
+        String reason = event.getException().getClass().getSimpleName();
+        String name = attempt.getName();
+        if (exists(name)) {
+            audit.record(name, "LOGIN", "FAILURE", ip, reason);
+        } else {
+            // Tên không tồn tại có thể là mật khẩu gõ nhầm ô: chỉ lưu dấu vân tay có khoá
+            audit.record("unknown", "LOGIN", "FAILURE", ip, reason + " attempt=" + fingerprint(name));
+        }
+    }
+
+    @EventListener
+    void onAccessDenied(AuthorizationDeniedEvent<?> event) {
+        Authentication auth = event.getAuthentication().get();
+        if (auth == null || auth instanceof AnonymousAuthenticationToken) {
+            return; // chưa đăng nhập: 401, không phải hành vi của một tài khoản
+        }
+        if (event.getObject() instanceof HttpServletRequest request) {
+            audit.record(auth.getName(), request.getMethod() + " " + request.getRequestURI(), "DENIED",
+                    request.getRemoteAddr(), null);
+        }
+    }
+
+    private boolean exists(String name) {
+        try {
+            users.loadUserByUsername(name);
+            return true;
+        } catch (UsernameNotFoundException e) {
+            return false;
+        }
+    }
+
+    private String fingerprint(String value) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(attemptKey);
+            return HexFormat.of().formatHex(mac.doFinal(value.getBytes(StandardCharsets.UTF_8))).substring(0, 16);
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+EOF
+cat > $P/ApiController.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import java.util.Map;
+import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+import vn.masteva.shop.audit.AuditLog;
+
+@RestController
+class ApiController {
+    private final AuditLog audit;
+
+    ApiController(AuditLog audit) {
+        this.audit = audit;
+    }
+
+    @GetMapping("/api/public/ping")
+    String ping() {
+        return "pong";
+    }
+
+    @GetMapping("/api/orders")
+    Map<String, Object> orders(Authentication auth) {
+        return Map.of("user", auth.getName());
+    }
+
+    @GetMapping("/api/admin/audit")
+    List<Map<String, Object>> latestAudit() {
+        return audit.latest(5);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+`SecurityAuditListener` bỏ qua người chưa đăng nhập bị từ chối: đó là 401 của bot và health check, không phải hành vi của một tài khoản cụ thể. Danh sách người dùng trong bộ nhớ thay cho authorization server của SB13.2 để lab gọn.
+
+### 5. Giới hạn tốc độ bằng Bucket4j và Redis
+
+<Terminal where="mac" title="Tab 3: RateLimitConfig, RateLimitInterceptor, WebConfig">
+
+```bash
+cd ~/masteva-sb13/shop
+P=src/main/java/vn/masteva/shop/ratelimit
+cat > $P/RateLimitConfig.java <<'EOF'
+package vn.masteva.shop.ratelimit;
+
+import io.github.bucket4j.distributed.ExpirationAfterWriteStrategy;
+import io.github.bucket4j.distributed.proxy.ProxyManager;
+import io.github.bucket4j.redis.lettuce.Bucket4jLettuce;
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.codec.ByteArrayCodec;
+import io.lettuce.core.codec.RedisCodec;
+import io.lettuce.core.codec.StringCodec;
+import java.time.Duration;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+class RateLimitConfig {
+
+    @Bean(destroyMethod = "shutdown")
+    RedisClient redisClient(@Value("${app.redis-url}") String url) {
+        return RedisClient.create(url);
+    }
+
+    @Bean(destroyMethod = "close")
+    StatefulRedisConnection<String, byte[]> bucketConnection(RedisClient client) {
+        return client.connect(RedisCodec.of(StringCodec.UTF8, ByteArrayCodec.INSTANCE));
+    }
+
+    /** Trạng thái bucket nằm trong Redis: mọi instance dùng chung. Key tự hết hạn khi bucket đầy lại. */
+    @Bean
+    ProxyManager<String> buckets(StatefulRedisConnection<String, byte[]> connection) {
+        return Bucket4jLettuce.casBasedBuilder(connection)
+                .expirationAfterWrite(ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(Duration.ofSeconds(10)))
+                .requestTimeout(Duration.ofMillis(500))   // Redis chậm hay chết: lỗi sau 0,5 giây thay vì treo request
+                .build();
+    }
+}
+EOF
+cat > $P/RateLimitInterceptor.java <<'EOF'
+package vn.masteva.shop.ratelimit;
+
+import io.github.bucket4j.BucketConfiguration;
+import io.github.bucket4j.ConsumptionProbe;
+import io.github.bucket4j.distributed.proxy.ProxyManager;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.time.Duration;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.ErrorResponseException;
+import org.springframework.web.servlet.HandlerInterceptor;
+
+/** Token bucket: tối đa 5 request, nạp lại đều 5 token mỗi phút (1 token mỗi 12 giây). */
+@Component
+class RateLimitInterceptor implements HandlerInterceptor {
+    private static final BucketConfiguration LIMIT = BucketConfiguration.builder()
+            .addLimit(limit -> limit.capacity(5).refillGreedy(5, Duration.ofMinutes(1)))
+            .build();
+
+    private final ProxyManager<String> buckets;
+
+    RateLimitInterceptor(ProxyManager<String> buckets) {
+        this.buckets = buckets;
+    }
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        String key = key(request);
+        ConsumptionProbe probe = buckets.getProxy(key, () -> LIMIT).tryConsumeAndReturnRemaining(1);
+        if (probe.isConsumed()) {
+            response.setHeader("X-RateLimit-Remaining", String.valueOf(probe.getRemainingTokens()));
+            return true;
+        }
+        long retryAfter = Math.max(1, (probe.getNanosToWaitForRefill() + 999_999_999L) / 1_000_000_000L);
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.TOO_MANY_REQUESTS,
+                "Quá nhiều request, thử lại sau " + retryAfter + " giây");
+        ErrorResponseException tooMany = new ErrorResponseException(HttpStatus.TOO_MANY_REQUESTS, problem, null);
+        tooMany.getHeaders().set(HttpHeaders.RETRY_AFTER, String.valueOf(retryAfter));
+        throw tooMany;
+    }
+
+    /** Đã đăng nhập: theo user. Chưa: theo địa chỉ IP mà Tomcat xác định. */
+    private static String key(HttpServletRequest request) {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth != null && auth.isAuthenticated() && !(auth instanceof AnonymousAuthenticationToken)) {
+            return "rl:user:" + auth.getName();
+        }
+        return "rl:ip:" + request.getRemoteAddr();
+    }
+}
+EOF
+cat > $P/WebConfig.java <<'EOF'
+package vn.masteva.shop.ratelimit;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+@Configuration
+class WebConfig implements WebMvcConfigurer {
+    private final RateLimitInterceptor rateLimit;
+
+    WebConfig(RateLimitInterceptor rateLimit) {
+        this.rateLimit = rateLimit;
+    }
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(rateLimit).addPathPatterns("/api/**");
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `getProxy(key, () -> LIMIT)` trả một bucket ảo; trạng thái thật nằm ở key Redis `rl:user:alice` hay `rl:ip:127.0.0.1`. Cấu hình chỉ được ghi lần đầu key xuất hiện.
+- `getNanosToWaitForRefill()` cho biết bao lâu nữa có đủ token; làm tròn lên giây cho `Retry-After`.
+- Ném `ErrorResponseException` thay vì tự ghi response: Spring MVC biến nó thành 429 dạng Problem Details, giữ header `Retry-After`, giống mọi lỗi khác của API.
+- Interceptor của Spring MVC chạy sau filter chain của Spring Security, nên `SecurityContextHolder` đã có user.
+
+### 6. Sinh sự kiện và đọc audit
+
+Chạy instance A ở tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb13/shop && ./mvnw spring-boot:run
+```
+
+</Terminal>
+
+Khi thấy `Started ShopApplication`, ở tab 3 tạo bốn tình huống rồi đọc audit bằng tài khoản quản trị:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+B=127.0.0.1:8093
+curl -s -o /dev/null -w '%{http_code}\n' -u alice:wrong $B/api/orders
+curl -s -o /dev/null -w '%{http_code}\n' -u 'mypassword123:x' $B/api/orders
+curl -s -o /dev/null -w '%{http_code}\n' -u bob:bob-pass $B/api/admin/audit
+curl -s -o /dev/null -w '%{http_code}\n' $B/api/admin/audit
+curl -s -u carol:carol-pass $B/api/admin/audit; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+401
+401
+403
+401
+[{"seq":3,"actor":"bob","action":"GET /api/admin/audit","outcome":"DENIED","source_ip":"127.0.0.1","detail":null,"hash":"60fe166fe2a2"},{"seq":2,"actor":"unknown","action":"LOGIN","outcome":"FAILURE","source_ip":"127.0.0.1","detail":"BadCredentialsException attempt=03a30d179c78b3e1","hash":"6294d747592e"},{"seq":1,"actor":"alice","action":"LOGIN","outcome":"FAILURE","source_ip":"127.0.0.1","detail":"BadCredentialsException","hash":"67ad63556f07"}]
+```
+
+</Expected>
+
+- Bốn request, ba dòng audit. Request thứ tư không có thông tin đăng nhập: bị 401, không ghi.
+- Dòng 2: "tên đăng nhập" `mypassword123` không tồn tại, trông như một mật khẩu gõ nhầm ô. Bảng chỉ có `unknown` và dấu vân tay HMAC 16 ký tự hex; cùng khoá `lab-only-audit-hmac-key` thì dấu vân tay trên máy bạn giống hệt. Dòng 1 giữ tên `alice` vì tài khoản đó tồn tại.
+- Hash khác trên máy bạn vì nó phụ thuộc thời điểm ghi.
+
+<Check id="sb13.3.lab-audit-events">Ghi được đăng nhập hỏng và truy cập bị từ chối vào bảng audit bằng `@EventListener`, và giải thích được vì sao request không có thông tin đăng nhập không sinh dòng nào.</Check>
+
+### 7. Thử xoá dấu vết
+
+<Callout kind="danger">
+
+Bước này chạy `UPDATE`, `DELETE`, `TRUNCATE` trên bảng audit. Chỉ chạy trên container `sb13-audit-pg` của lab, không bao giờ trên database thật.
+
+</Callout>
+
+Đóng vai lỗ hổng SQL injection chạy bằng role của ứng dụng, rồi thử ghi audit trong một transaction REPEATABLE READ:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+docker exec -i sb13-audit-pg psql -q -P footer=off -U shop_app -d shop <<'EOF'
+UPDATE security_audit SET actor = 'mallory' WHERE seq = 1;
+DELETE FROM security_audit WHERE seq = 1;
+TRUNCATE security_audit;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+INSERT INTO security_audit (actor, action, outcome) VALUES ('job', 'TEST', 'OK');
+ROLLBACK;
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ERROR:  permission denied for table security_audit
+ERROR:  permission denied for table security_audit
+ERROR:  permission denied for table security_audit
+ERROR:  security_audit requires READ COMMITTED, got repeatable read
+CONTEXT:  PL/pgSQL function security_audit_chain() line 6 at RAISE
+```
+
+</Expected>
+
+- Role ứng dụng không sửa, không xoá, không `TRUNCATE` được: lớp bảo vệ thứ nhất.
+- Trigger từ chối ghi ở REPEATABLE READ, vì snapshot chụp trước khi lấy khoá sẽ làm chuỗi rẽ nhánh.
+
+Giờ đóng vai người có quyền owner. Trước hết là một truy vấn kiểm chuỗi mà ai có quyền đọc cũng chạy được; rồi owner sửa hai dòng theo hai cách:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cat > ~/masteva-sb13/shop/db/verify-chain.sql <<'EOF'
+SELECT seq, actor,
+       prev_hash IS NOT DISTINCT FROM lag(hash) OVER w AS linked,
+       hash = sha256(coalesce(prev_hash, '\x'::bytea) || security_audit_payload(a)) AS intact
+FROM security_audit a WINDOW w AS (ORDER BY seq) ORDER BY seq;
+EOF
+docker exec -i sb13-audit-pg psql -q -P footer=off -U shop_app -d shop < ~/masteva-sb13/shop/db/verify-chain.sql
+docker exec -i sb13-audit-pg psql -q -P footer=off -U shop_owner -d shop <<'EOF'
+SELECT concat_ws('|', '127.0.0.1', 'BadCredentialsException')
+     = concat_ws('|', NULL, '127.0.0.1|BadCredentialsException') AS concat_ws_ambiguous;
+UPDATE security_audit SET source_ip = NULL, detail = source_ip || '|' || detail WHERE seq = 1;
+UPDATE security_audit SET actor = 'someone-else' WHERE seq = 3;
+EOF
+docker exec -i sb13-audit-pg psql -q -P footer=off -U shop_app -d shop < ~/masteva-sb13/shop/db/verify-chain.sql
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ seq |  actor  | linked | intact 
+-----+---------+--------+--------
+   1 | alice   | t      | t
+   2 | unknown | t      | t
+   3 | bob     | t      | t
+
+ concat_ws_ambiguous 
+---------------------
+ t
+
+ seq |    actor     | linked | intact 
+-----+--------------+--------+--------
+   1 | alice        | t      | f
+   2 | unknown      | t      | t
+   3 | someone-else | t      | f
+```
+
+</Expected>
+
+- Owner sửa được (`REVOKE` không áp cho owner), nhưng cả hai dòng bị sửa giờ `intact = f`: hash lưu trong dòng không còn khớp nội dung. Lớp thứ hai phát hiện được.
+- Dòng `seq = 1` bị sửa theo kiểu dời giá trị: `source_ip` thành `NULL`, giá trị cũ dồn sang `detail`. `concat_ws_ambiguous = t` cho thấy nếu payload nối bằng `concat_ws('|', ...)`, hai dòng trước và sau khi sửa cho cùng một chuỗi, hash vẫn khớp và việc sửa lọt qua. Mảng JSON ghi `null` và giữ vị trí cột nên bắt được.
+- Người sửa có thể tính lại hash của các dòng phía sau để mọi cột lại là `t`, hoặc xoá dòng cuối cùng mà không dòng nào mất liên kết. Đó là lý do `seq` và hash mới nhất phải được gửi ra ngoài định kỳ, như mục Kiến thức đã nói.
+
+<Check id="sb13.3.lab-tamper">Chứng minh được role ứng dụng không sửa hay xoá được audit, phát hiện được dòng bị owner sửa (kể cả kiểu dời giá trị sang cột khác) bằng truy vấn kiểm chuỗi, và giải thích được vì sao chuỗi băm vẫn cần neo ra bên ngoài.</Check>
+
+### 8. 429, Retry-After và Problem Details
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+B=127.0.0.1:8093
+for i in 1 2 3 4 5 6; do
+  curl -s -o /dev/null -w "%{http_code} remaining=%header{x-ratelimit-remaining} retry=%header{retry-after}\n" -u alice:alice-pass $B/api/orders
+done
+curl -s -i -u alice:alice-pass $B/api/orders | grep -E '^HTTP|^Retry-After|^Content-Type|^\{'
+docker exec sb13-redis redis-cli --scan --pattern 'rl:*'
+docker exec sb13-redis redis-cli TTL rl:user:alice
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 remaining=4 retry=
+200 remaining=3 retry=
+200 remaining=2 retry=
+200 remaining=1 retry=
+200 remaining=0 retry=
+429 remaining= retry=12
+HTTP/1.1 429 
+Retry-After: 12
+Content-Type: application/problem+json
+{"detail":"Quá nhiều request, thử lại sau 12 giây","instance":"/api/orders","status":429,"title":"Too Many Requests"}
+rl:user:alice
+rl:user:carol
+69
+```
+
+</Expected>
+
+- Năm request đầu tiêu hết dung lượng; request thứ sáu thiếu một token, phải chờ 12 giây (một token mỗi 12 giây). Sáu request chạy trong chưa tới một giây, nên số chờ làm tròn lên vẫn là 12.
+- Có key `rl:user:carol` vì lệnh đọc audit của carol ở bước 6 cũng đi qua `/api/**`.
+- `TTL` khoảng 70 giây: thời gian để bucket nạp đầy lại (60 giây) cộng 10 giây của `basedOnTimeForRefillingBucketUpToMax`. Sau đó key tự biến mất; một bucket đầy và một bucket không tồn tại là như nhau.
+
+<Check id="sb13.3.lab-429">Tái hiện được 429 kèm `Retry-After` và thân Problem Details, đọc được key bucket và TTL trong Redis, và giải thích được con số 12 giây.</Check>
+
+### 9. Hai instance, một giới hạn
+
+Chạy instance B ở tab 2 trên cổng 8193, cùng database và Redis:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb13/shop && ./mvnw spring-boot:run -Dspring-boot.run.arguments=--server.port=8193
+```
+
+</Terminal>
+
+Xoá bucket của alice để bắt đầu từ đầy, rồi gửi xen kẽ sang hai instance:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+docker exec sb13-redis redis-cli DEL rl:user:alice
+for port in 8093 8193 8093 8193 8093 8193; do
+  curl -s -o /dev/null -w "$port %{http_code} remaining=%header{x-ratelimit-remaining}\n" -u alice:alice-pass 127.0.0.1:$port/api/orders
+done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1
+8093 200 remaining=4
+8193 200 remaining=3
+8093 200 remaining=2
+8193 200 remaining=1
+8093 200 remaining=0
+8193 429 remaining=
+```
+
+</Expected>
+
+Số `remaining` giảm liên tục qua hai instance: cả hai tiêu từ cùng một bucket trong Redis. Nếu mỗi instance giữ bucket trong bộ nhớ, cả sáu request đều qua, và alice gửi được 10 request mỗi phút với hai instance, 15 với ba. Dòng `1` đầu tiên là kết quả của `DEL`.
+
+<Check id="sb13.3.lab-shared-bucket">Chứng minh được hai instance dùng chung một giới hạn qua Redis, và tính được giới hạn thực tế khi mỗi instance giữ bucket riêng.</Check>
+
+### 10. X-Forwarded-For giả
+
+`/api/public/ping` không cần đăng nhập, nên bucket theo IP. Thử gửi sáu request với sáu IP giả tới instance A, đang dùng cấu hình mặc định:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.$i" 127.0.0.1:8093/api/public/ping; done; echo
+docker exec sb13-redis redis-cli --scan --pattern 'rl:ip:*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 200 200 200 200 429 
+rl:ip:127.0.0.1
+```
+
+</Expected>
+
+Mặc định Spring Boot không đọc `X-Forwarded-For`; mọi request được tính cho `127.0.0.1`. Giờ giả sử đội triển khai sau load balancer và bật `native` để lấy IP thật. Dừng instance B (Ctrl+C ở tab 2) rồi chạy lại với cấu hình đó:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+./mvnw spring-boot:run -Dspring-boot.run.arguments="--server.port=8193 --server.forward-headers-strategy=native"
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 203.0.113.$i" 127.0.0.1:8193/api/public/ping; done; echo
+docker exec sb13-redis redis-cli --scan --pattern 'rl:ip:203*' | wc -l
+```
+
+</Terminal>
+
+<Predict question="Tám request, mỗi cái một X-Forwarded-For khác nhau. Bao nhiêu cái bị 429?">
+
+```text
+200 200 200 200 200 200 200 200 
+       8
+```
+
+Không cái nào. `127.0.0.1` thuộc dải `127.0.0.0/8` trong danh sách proxy tin cậy mặc định, nên `RemoteIpValve` tin header và `getRemoteAddr()` trả `203.0.113.1`, `203.0.113.2`… Mỗi request một bucket mới, tám key trong Redis. Trên production, điều này xảy ra khi kẻ tấn công gọi được thẳng vào ứng dụng từ một dải mạng nội bộ (cùng VPC, một pod khác trong cụm), hoặc khi code tự đọc header thay vì để Tomcat xử lý.
+
+</Predict>
+
+Sửa: chỉ tin đúng địa chỉ của load balancer thật (ở đây giả sử là `10.0.0.5`). Dừng instance B rồi chạy:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+./mvnw spring-boot:run -Dspring-boot.run.arguments="--server.port=8193 --server.forward-headers-strategy=native --server.tomcat.remoteip.internal-proxies=10.0.0.5/32"
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+docker exec sb13-redis redis-cli DEL rl:ip:127.0.0.1
+for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w "%{http_code} " -H "X-Forwarded-For: 198.51.100.$i" 127.0.0.1:8193/api/public/ping; done; echo
+docker exec sb13-redis redis-cli --scan --pattern 'rl:ip:198*' | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1
+200 200 200 200 200 429 
+       0
+```
+
+</Expected>
+
+`10.0.0.5/32` là một địa chỉ duy nhất dạng CIDR; nhiều proxy thì ngăn cách bằng dấu phẩy. Request từ `127.0.0.1` giờ không đến từ proxy tin cậy, nên header bị bỏ qua và giới hạn theo IP hoạt động lại. Các dải `203.0.113.x` và `198.51.100.x` là địa chỉ dành cho tài liệu (RFC 5737), không thuộc ai.
+
+<Check id="sb13.3.lab-xff">Tái hiện được việc vượt giới hạn theo IP bằng `X-Forwarded-For` giả khi bật `forward-headers-strategy=native` với proxy tin cậy mặc định, và sửa được bằng `server.tomcat.remoteip.internal-proxies`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Bind for 0.0.0.0:5413 failed: port is already allocated`: container `sb13-pg` của SB13.1 còn chạy. `docker stop sb13-pg` rồi chạy lại `docker run`.
+- `RedisConnectionException: Unable to connect to localhost/<unresolved>:9431`: container `sb13-redis` chưa chạy.
+- `curl: unknown --write-out variable: 'header'`: `%header{...}` cần curl 7.84 trở lên; macOS 14 có sẵn curl 8.4.
+- Bước 8 ra `remaining=3` ngay lần đầu: bucket còn lại từ lần chạy trước. `docker exec sb13-redis redis-cli DEL rl:user:alice` rồi chạy lại.
+- `retry=11` thay vì `12`: vòng lặp chạy chậm hơn một giây (ví dụ máy đang bận), token đầu tiên đã nạp được một phần.
+- Instance B báo `Port 8193 was already in use`: lần chạy trước chưa dừng, hoặc authorization server của SB13.2 còn chạy.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng hai instance bằng Ctrl+C ở tab 1 và tab 2. Đây là bài cuối của chặng SB13.
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá container PostgreSQL của bài này (cùng bảng audit), container Redis, container `sb13-pg` của SB13.1 nếu còn (đã xoá thì Docker báo `No such container` cho riêng nó), và toàn bộ thư mục lab của chặng. Chỉ chạy khi bạn không cần gì trong `~/masteva-sb13` nữa.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker rm -f sb13-audit-pg sb13-redis sb13-pg
+rm -rf ~/masteva-sb13
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Redis chết thì giới hạn tốc độ làm gì: chặn hết hay cho qua hết?">
+
+Với cấu hình của lab, Bucket4j ném `io.github.bucket4j.TimeoutException: Violated timeout while waiting for redis future for 500000000ns` sau `requestTimeout` 0,5 giây, và request nhận 500: hỏng thì đóng (fail closed). Thử bằng `docker pause sb13-redis`: request mất khoảng 0,76 giây rồi trả 500. Không có `requestTimeout`, request treo tới timeout của Lettuce (mặc định 60 giây) và làm cạn thread của Tomcat. Với giới hạn chống lạm dụng thông thường, nhiều đội chọn hỏng thì mở (fail open): bắt exception trong interceptor, ghi log, cho request đi qua, kết hợp circuit breaker của SB7 để không gọi Redis liên tục khi nó đang chết. Với giới hạn gắn tiền (số lần gọi API trả phí của một gói cước), fail closed có lý hơn. Đây là quyết định nghiệp vụ; hãy ghi nó ra.
+
+</Reveal>
+
+<Reveal title="Ghi audit cùng transaction nghiệp vụ hay tách riêng?">
+
+Tuỳ loại sự kiện. Sự kiện bảo mật như đăng nhập hỏng hay bị từ chối không có transaction nghiệp vụ nào, ghi ngay như lab. Sự kiện nghiệp vụ nhạy cảm ("xuất danh sách khách hàng") thì có hai câu hỏi: nếu nghiệp vụ rollback, có cần dòng audit không (thường là có, vì *ý định* xuất cũng đáng ghi), và nếu ghi audit lỗi thì nghiệp vụ có được tiếp tục không. Cách hay gặp: ghi audit trong `REQUIRES_NEW` (SB4.1) để không bị rollback theo, giữ transaction đó thật ngắn vì `pg_advisory_xact_lock` bắt mọi lần ghi audit xếp hàng. Muốn tách hẳn, phát sự kiện vào outbox (SB10.2) rồi một tiến trình khác chuyển sang kho audit.
+
+</Reveal>
+
+<Reveal title="Spring Boot Actuator có /actuator/auditevents, sao không dùng?">
+
+Actuator có `AuditEventRepository` và endpoint `auditevents`, và tự ghi sự kiện xác thực khi có bean repository. Nhưng bản có sẵn là `InMemoryAuditEventRepository`, giữ một số sự kiện gần nhất trong bộ nhớ, mất khi khởi động lại; nó hợp để xem nhanh khi phát triển. Audit trail cho điều tra sự cố cần lưu bền, chỉ thêm, có kiểm toàn vẹn, và thường gửi sang hệ thống SIEM (quản lý sự kiện bảo mật tập trung). Bạn có thể tự viết một `AuditEventRepository` ghi vào bảng như lab, nhưng khi đó endpoint cũng thành nơi đọc dữ liệu nhạy cảm, phải bảo vệ như `/api/admin/audit`.
+
+</Reveal>
+
+<Reveal title="Đếm theo request có công bằng không khi các endpoint có giá rất khác nhau?">
+
+Không. Một lần xuất báo cáo tốn bằng hàng nghìn lần đọc một đơn. Bucket4j cho tiêu nhiều token một lần (`tryConsumeAndReturnRemaining(n)`), nên endpoint đắt lấy 50 token, endpoint rẻ lấy 1. Một cách khác là nhiều bucket cho mỗi user: một cho đọc, một riêng cho thao tác đắt, mỗi cái một cấu hình. Và một bucket có thể có nhiều giới hạn cùng lúc (`addLimit` hai lần): 10 request mỗi giây để chặn dồn, và 1.000 mỗi giờ để chặn cào dữ liệu đều đặn.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI liệt kê sự kiện nên ghi audit cho một hệ thống, viết trigger và truy vấn kiểm chuỗi băm, hay đề xuất cấu hình giới hạn theo gói cước. AI hay ghi cả request body hay header `Authorization` vào audit "cho đủ", hay đọc `X-Forwarded-For` trực tiếp bằng `request.getHeader` và lấy phần tử đầu tiên (chính là phần khách tự viết), hay đặt bucket trong `ConcurrentHashMap` rồi gọi đó là giới hạn cho cả cụm, và hay quên `requestTimeout`. Kiểm tra lại bằng các bước của lab: thử xoá audit bằng role ứng dụng, chạy hai instance, và gửi `X-Forwarded-For` giả.
+
+</Callout>
+
+<Callout kind="link">
+
+SB5.4 và SB10.3 là auditing và lịch sử thay đổi mà audit trail bổ sung; SB13.1 dùng cùng cách tách role owner và role ứng dụng. SB1.3 dạy Problem Details mà lỗi 429 dùng lại. SB9.1 giới thiệu Redis. SB8 nối audit với trace id và đưa log về hệ thống tập trung. SB7 có circuit breaker cho lúc Redis chết. Microservices M8 đặt giới hạn tốc độ ở gateway cho cả hệ thống; M10 mở rộng audit sang lời gọi giữa các service.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb13.3.mastery-audit">Tự thiết kế được audit trail bảo mật cho một service: chọn sự kiện cần ghi và thứ không ghi, bảng chỉ thêm bằng quyền database, chuỗi băm có neo ra ngoài, và thời gian giữ.</Check>
+
+<Check id="sb13.3.mastery-ratelimit">Tự thêm được giới hạn tốc độ dùng chung cho nhiều instance bằng Bucket4j và Redis, trả 429 đúng chuẩn, chọn đúng khoá theo user hay IP, và cấu hình được proxy tin cậy để `X-Forwarded-For` không bị giả.</Check>
+
+</Mastery>

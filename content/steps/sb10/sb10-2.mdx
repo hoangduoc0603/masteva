@@ -1,0 +1,912 @@
+---
+title: Email theo ngôn ngữ người nhận, gửi sau commit, outbox và MessageSource
+description: Gửi email HTML bằng Spring Mail và template Thymeleaf, thử với Mailpit trong Docker; thấy email mất khi máy chủ mail lỗi rồi sửa bằng bảng outbox có thử lại; dịch message, lỗi validation và Problem Details theo ngôn ngữ của request, và email theo ngôn ngữ của người nhận.
+id: sb10.2
+step: sb10
+prerequisites: [sb10.1]
+topics: [sb10.email-thong-bao, sb10.i18n]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    docker: 29.8.0
+    postgresql: "18.6"
+    mailpit: v1.31.4
+    thymeleaf: 3.1.5
+    angus-mail: 2.0.5
+    hibernate-validator: 9.1.3
+---
+
+<Goal>
+
+Gửi email xác nhận đơn hàng đúng lúc, đúng ngôn ngữ, và không mất khi máy chủ mail trục trặc; đồng thời cho API trả thông báo lỗi theo ngôn ngữ của người gọi. Học xong bài này, bạn giải thích được:
+
+- Vì sao email "đã gửi sau commit" vẫn có thể không bao giờ tới, và bảng outbox sửa điều đó thế nào.
+- Vì sao khách Mỹ nhận lỗi "không được để trống" bằng tiếng Việt dù đã có file `messages_en.properties`.
+- Vì sao tiêu đề email thành `Đơn hàng #1.001` thay vì `#1001`, và vì sao job gửi email nền không dùng được ngôn ngữ của request.
+
+</Goal>
+
+<Knowledge>
+
+### Gửi email từ Spring Boot
+
+Email đi qua **SMTP**: ứng dụng mở kết nối tới máy chủ mail (Amazon SES, SendGrid, Postfix của công ty…), giao thư, và máy chủ đó lo chuyển tiếp tới hộp thư người nhận. Spring Boot tạo bean `JavaMailSender` khi có `spring.mail.host`; bên dưới là **Jakarta Mail** với bản cài đặt **Eclipse Angus Mail**.
+
+| Thành phần | Việc | Ghi chú |
+|---|---|---|
+| `JavaMailSender` | Mở kết nối SMTP, gửi `MimeMessage` | Cấu hình bằng `spring.mail.*` |
+| `MimeMessageHelper` | Dựng thư: người gửi, người nhận, tiêu đề, HTML, đính kèm | Truyền `"UTF-8"` để tiêu đề tiếng Việt không vỡ |
+| `TemplateEngine` (Thymeleaf) | Sinh HTML từ template và biến | Template ở `templates/mail/`, lấy chữ từ `MessageSource` qua `#{...}` |
+| Mailpit | Máy chủ SMTP giả: nhận mọi thư, không chuyển đi đâu | Có giao diện web và API để test đọc lại thư |
+
+Ba điều hay bị bỏ qua:
+
+- **Timeout.** Mặc định của Jakarta Mail là chờ vô hạn. Máy chủ mail treo thì thread gửi treo theo. Đặt `mail.smtp.connectiontimeout`, `mail.smtp.timeout`, `mail.smtp.writetimeout` qua `spring.mail.properties.*`.
+- **Môi trường dev và staging không bao giờ trỏ vào SMTP thật.** Trỏ vào Mailpit; thư nào gửi đi đều nằm lại trong Mailpit để xem.
+- **HTML email không phải trang web.** Trình đọc thư bỏ JavaScript, nhiều nơi bỏ CSS ngoài; viết CSS inline, bảng đơn giản, kèm phần text cho trình đọc không hiển thị HTML.
+
+### Gửi lúc nào: không gửi trong transaction
+
+SB4.2 đã so các cách phát sự kiện theo thời điểm chạy và khả năng mất sự kiện: gửi trong transaction thì có thể gửi cho đơn bị rollback, `@Async @TransactionalEventListener` thì gửi đúng lúc nhưng mất khi gửi lỗi hay tiến trình chết. Với email có thêm một tiêu chí:
+
+| Cách gửi | Giữ kết nối database lúc chờ SMTP |
+|---|---|
+| Gọi `send()` trong method `@Transactional` | **Có**: vài giây mỗi thư, trong lúc pool chỉ có cỡ 10 kết nối (SB3.3); lỗi SMTP còn làm rollback cả đơn |
+| `@Async @TransactionalEventListener` (AFTER_COMMIT) | Không |
+| **Outbox**: ghi một dòng vào bảng `email_outbox` trong cùng transaction, job nền gửi | Không, và thư không mất: dòng còn đó tới khi gửi được |
+
+**Transactional outbox** (hộp thư đi) biến "gửi email" thành "ghi một dòng dữ liệu", nên nó hưởng đúng tính nguyên tử của transaction:
+
+```text
+ POST /orders
+   BEGIN
+     INSERT orders            (id 1004)
+     INSERT email_outbox      (order_id 1004, status PENDING, attempts 0)
+   COMMIT                      cả hai cùng có hoặc cùng không
+ trả 200 ngay, không chờ SMTP
+
+ OutboxRelay, @Scheduled mỗi 2 giây
+   BEGIN
+     SELECT ... FROM email_outbox WHERE status = 'PENDING' AND next_attempt_at <= now()
+       FOR UPDATE OF e SKIP LOCKED              instance khác bỏ qua dòng đang bị khoá
+     với mỗi dòng: dựng thư theo locale người nhận, gửi SMTP
+       thành công -> status SENT
+       lỗi        -> attempts + 1, next_attempt_at = now() + 5s, 10s, 20s...
+                     đủ 5 lần -> FAILED, chờ người xem
+   COMMIT
+```
+
+- **Ít nhất một lần** (at-least-once), như consumer Kafka ở SB9.2: nếu tiến trình chết sau khi gửi xong mà trước khi `UPDATE ... SENT` commit, lần sau thư được gửi lại. Với email xác nhận, nhận trùng chấp nhận được; mất thì không.
+- **Backoff** (giãn cách thử lại) để không dội máy chủ mail đang quá tải. **Giới hạn số lần** để thư cho địa chỉ sai không thử mãi.
+- `FOR UPDATE SKIP LOCKED` cho phép chạy nhiều instance mà không gửi trùng: mỗi instance khoá các dòng nó lấy, instance khác bỏ qua chúng. Đây là cách khác với ShedLock của SB9.3: không cần chọn một instance duy nhất, các instance chia việc.
+- Relay giữ transaction trong lúc gửi lô 20 thư; với timeout SMTP 3 giây, trường hợp xấu là một transaction dài cỡ một phút. Lô lớn hơn thì chuyển sang cách "nhận việc": `UPDATE ... SET status = 'SENDING'` rồi commit, gửi ngoài transaction, sau đó cập nhật kết quả.
+
+<Check id="sb10.2.email-outbox">Giải thích được vì sao không gửi email trong transaction, vì sao `@TransactionalEventListener` vẫn có thể mất thư, và outbox cùng `SKIP LOCKED` sửa điều đó thế nào với cái giá là gửi trùng.</Check>
+
+### MessageSource: một khoá, nhiều ngôn ngữ
+
+Code không chứa câu chữ hiển thị, chỉ chứa **khoá** như `order.total.positive`. **`MessageSource`** tra khoá theo **`Locale`**. Spring Boot tự tạo nó khi có `src/main/resources/messages.properties`; mỗi ngôn ngữ thêm một file hậu tố: `messages_en.properties`, `messages_ja.properties`. Từ Java 9 file `.properties` đọc bằng UTF-8, Spring Boot cũng mặc định `spring.messages.encoding=UTF-8`.
+
+Thứ tự tìm một khoá có hai luồng, tuỳ có file cho locale được hỏi hay không (`en-US` tìm `messages_en_US` trước, không có thì coi như `en`):
+
+```text
+ Locale en (có file messages_en.properties)
+   messages_en.properties        có khoá -> dùng
+   messages.properties           thiếu khoá ở messages_en -> tra tiếp ở bundle cha là file gốc
+   không thấy                    NoSuchMessageException, hoặc message mặc định nếu code truyền
+
+ Locale fr (không có file messages_fr.properties nào)
+   messages_<locale hệ thống>    chỉ khi spring.messages.fallback-to-system-locale=true (mặc định):
+                                 JVM đặt tiếng Anh -> dùng messages_en (rồi tới file gốc)
+   messages.properties           khi đã tắt fallback, hoặc locale hệ thống cũng không có file
+```
+
+Hai hệ quả:
+
+- **File gốc là bản dự phòng cho mọi ngôn ngữ.** Lab đặt tiếng Việt ở file gốc; khoá nào quên dịch trong `messages_en`, khách tiếng Anh sẽ thấy tiếng Việt. Bước 5 gặp đúng chuyện này.
+- **Fallback theo locale hệ thống** chỉ xảy ra khi không có file nào cho locale được hỏi, nhưng nó làm kết quả phụ thuộc máy chạy: cùng request `fr`, laptop đặt tiếng Anh trả tiếng Anh, container đặt `C` trả tiếng Việt. Tắt bằng `spring.messages.fallback-to-system-locale=false`.
+
+Giá trị dùng cú pháp `java.text.MessageFormat`, với hai bẫy:
+
+| Viết | Ra | Vì sao |
+|---|---|---|
+| `Đơn hàng #{0}` với `1001L`, locale `vi` | `Đơn hàng #1.001` | `{0}` là số thì được định dạng theo locale, có dấu phân cách hàng nghìn |
+| `Đơn hàng #{0,number,#}` | `Đơn hàng #1001` | Mẫu `#` không phân cách |
+| `We've received {0}` | `Weve received {0}` | Dấu `'` mở một đoạn trích nguyên văn; phải viết `''` |
+
+### Ngôn ngữ của request: LocaleResolver
+
+`DispatcherServlet` hỏi **`LocaleResolver`** để biết locale của mỗi request, rồi đặt nó vào `LocaleContextHolder` cho cả request.
+
+| `LocaleResolver` | Lấy locale từ | Dùng khi |
+|---|---|---|
+| `AcceptHeaderLocaleResolver` (mặc định) | Header `Accept-Language` trình duyệt tự gửi | API, không trạng thái |
+| `CookieLocaleResolver` | Cookie do người dùng chọn | Web có nút chọn ngôn ngữ |
+| `SessionLocaleResolver` | HTTP session | Ứng dụng có session |
+| `FixedLocaleResolver` | Cấu hình | Ứng dụng một ngôn ngữ |
+
+Spring Boot có `spring.web.locale` và `spring.web.locale-resolver`, nhưng không có thuộc tính cho danh sách ngôn ngữ hỗ trợ. Lab tự khai báo bean tên **`localeResolver`** (`DispatcherServlet` tìm theo đúng tên này): chỉ nhận `vi` và `en`, còn lại dùng `vi`. `en-US,en;q=0.9` khớp `en` theo ngôn ngữ.
+
+### Lỗi validation và Problem Details theo ngôn ngữ
+
+SB1.3 viết thông điệp cố định trong `message = "..."`. Thay bằng khoá trong ngoặc nhọn, `@Positive(message = "{order.total.positive}")`: validator mà Spring Boot cấu hình tra khoá đó trong `MessageSource` theo locale của request, rồi mới tới file `ValidationMessages` của Hibernate Validator. Hibernate Validator không có bản tiếng Việt; muốn dịch thông điệp mặc định của `@NotNull`, khai báo đúng khoá của nó, `jakarta.validation.constraints.NotNull.message`, trong `messages.properties`.
+
+Problem Details cũng tra `MessageSource`. Với mỗi exception, `ResponseEntityExceptionHandler` tìm ba khoá theo tên lớp đầy đủ:
+
+```text
+ problemDetail.title.org.springframework.web.bind.MethodArgumentNotValidException   -> "title"
+ problemDetail.org.springframework.web.bind.MethodArgumentNotValidException         -> "detail"
+ problemDetail.type.org.springframework.web.bind.MethodArgumentNotValidException    -> "type" (URI)
+ problemDetail.title.vn.masteva.notify.CustomerNotFoundException                    -> exception của bạn
+```
+
+Exception của bạn kế thừa `ErrorResponseException` và truyền tham số (mã khách hàng) để chèn vào `{0}`. Tham số mặc định Spring truyền cho `MethodArgumentNotValidException` là danh sách lỗi nối bằng chữ tiếng Anh `, and` theo thứ tự không cố định, nên lab trả danh sách lỗi riêng trong trường `errors`, sắp theo tên field.
+
+### Email theo ngôn ngữ người nhận
+
+Ngôn ngữ của email là ngôn ngữ của **người nhận**, không phải của người bấm nút: admin tiếng Việt duyệt đơn cho khách tiếng Anh thì khách nhận tiếng Anh. Lưu `locale` trong bảng khách hàng, và truyền nó tường minh vào mọi chỗ cần dịch: `messageSource.getMessage(key, args, locale)` cho tiêu đề, `new Context(locale, vars)` cho Thymeleaf. Định dạng số trong template (`#numbers.formatInteger`) cũng theo locale đó: `1.250.000` cho `vi`, `1,250,000` cho `en`.
+
+<Callout kind="production">
+
+Email xác nhận chạy tốt khi gửi ngay trong request: `LocaleContextHolder` có locale của request. Sau khi chuyển sang job outbox, mọi email đều ra cùng một ngôn ngữ. Job chạy trên thread của scheduler, không có request nào, nên code gọi `getMessage(key, args, LocaleContextHolder.getLocale())` nhận locale mặc định của JVM, trong container thường là tiếng Anh. Lỗi không lộ ra ở máy dev vì máy dev cũng đặt tiếng Anh và người viết chỉ thử với tài khoản tiếng Anh. Lab truyền locale của người nhận vào `OrderMailer` một cách tường minh để tránh đúng lỗi này.
+
+</Callout>
+
+<Check id="sb10.2.i18n">Giải thích được thứ tự tìm khoá của `MessageSource`, vai trò của `LocaleResolver` và `LocaleContextHolder`, các khoá `problemDetail.*`, và vì sao email phải dùng locale của người nhận.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Sending Email (Spring Boot)](https://docs.spring.io/spring-boot/reference/io/email.html): thuộc tính `spring.mail.*` và ví dụ timeout.
+- [Internationalization (Spring Boot)](https://docs.spring.io/spring-boot/reference/features/internationalization.html): điều kiện tạo `MessageSource` và các thuộc tính `spring.messages.*`.
+- [Error Responses (Spring Framework)](https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-rest-exceptions.html): mục "Internationalization" liệt kê khoá `problemDetail.*` và tham số của từng exception.
+- [Locale (Spring Framework)](https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-servlet/localeresolver.html): các `LocaleResolver` và `LocaleChangeInterceptor`.
+- [Mailpit features](https://mailpit.axllent.org/docs/): giao diện web, REST API và các cách test email.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm SB10.1, container `sb10-pg` đang chạy (`docker start sb10-pg` nếu đã dừng). Hai tab Terminal: tab 1 chạy ứng dụng ở cổng **8190**, tab 2 gửi request. Mailpit nhận SMTP ở cổng **9412** và có giao diện web ở **9413**.
+
+### 1. Mailpit và database
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker run -d --name sb10-mailpit -p 9412:1025 -p 9413:8025 axllent/mailpit:v1.31.4
+docker exec sb10-pg psql -U postgres -c 'CREATE DATABASE notify'
+```
+
+</Terminal>
+
+Mở `http://localhost:9413` trong trình duyệt để xem hộp thư của Mailpit; nó trống.
+
+### 2. Tạo project
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=notify \
+  -d name=notify -d packageName=vn.masteva.notify \
+  -d dependencies=web,jdbc,flyway,postgresql,validation,mail,thymeleaf -o notify.zip
+unzip -q notify.zip -d notify && cd notify
+rm HELP.md src/test/java/vn/masteva/notify/NotifyApplicationTests.java
+grep -E '<artifactId>spring-boot-starter-(mail|thymeleaf|jdbc)<' pom.xml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+			<artifactId>spring-boot-starter-jdbc</artifactId>
+			<artifactId>spring-boot-starter-mail</artifactId>
+			<artifactId>spring-boot-starter-thymeleaf</artifactId>
+```
+
+</Expected>
+
+Bài này chỉ dùng `JdbcClient`, không cần JPA.
+
+### 3. Cấu hình, schema, message và template
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/notify
+mkdir -p src/main/resources/db/migration src/main/resources/templates/mail
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=notify
+server.port=8190
+
+spring.datasource.url=jdbc:postgresql://localhost:5410/notify
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+
+spring.mail.host=localhost
+spring.mail.port=9412
+spring.mail.properties.mail.smtp.connectiontimeout=2000
+spring.mail.properties.mail.smtp.timeout=3000
+spring.mail.properties.mail.smtp.writetimeout=3000
+
+spring.messages.basename=messages
+spring.messages.fallback-to-system-locale=false
+spring.mvc.problemdetails.enabled=true
+EOF
+cat > src/main/resources/db/migration/V1__schema.sql <<'EOF'
+CREATE TABLE customers (
+    id        bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    email     text NOT NULL UNIQUE,
+    full_name text NOT NULL,
+    locale    text NOT NULL DEFAULT 'vi'
+);
+
+CREATE TABLE orders (
+    id          bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 1001) PRIMARY KEY,
+    customer_id bigint      NOT NULL REFERENCES customers (id),
+    total       bigint      NOT NULL CHECK (total > 0),
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO customers (email, full_name, locale) VALUES
+    ('an@example.com', 'Nguyễn An', 'vi'),
+    ('john@example.com', 'John Smith', 'en');
+EOF
+cat > src/main/resources/messages.properties <<'EOF'
+order.customer.required=Phải chọn khách hàng
+order.total.positive=Tổng tiền phải lớn hơn 0
+jakarta.validation.constraints.NotNull.message=không được để trống
+problemDetail.title.org.springframework.web.bind.MethodArgumentNotValidException=Dữ liệu không hợp lệ
+problemDetail.org.springframework.web.bind.MethodArgumentNotValidException=Có trường không hợp lệ, xem errors
+problemDetail.title.vn.masteva.notify.CustomerNotFoundException=Không tìm thấy khách hàng
+problemDetail.vn.masteva.notify.CustomerNotFoundException=Không có khách hàng mã {0,number,#}
+
+mail.order.subject=Đơn hàng #{0,number,#} đã được ghi nhận
+mail.order.greeting=Chào {0},
+mail.order.body=Cảm ơn bạn đã đặt hàng. Tổng tiền: {0} đồng.
+EOF
+cat > src/main/resources/messages_en.properties <<'EOF'
+order.customer.required=Customer is required
+order.total.positive=Total must be greater than 0
+problemDetail.title.org.springframework.web.bind.MethodArgumentNotValidException=Invalid request
+problemDetail.org.springframework.web.bind.MethodArgumentNotValidException=Some fields are invalid, see errors
+problemDetail.title.vn.masteva.notify.CustomerNotFoundException=Customer not found
+problemDetail.vn.masteva.notify.CustomerNotFoundException=No customer with id {0,number,#}
+
+mail.order.subject=Order #{0,number,#} received
+mail.order.greeting=Hi {0},
+mail.order.body=Thanks for your order. We''ve received {0} VND.
+EOF
+cat > src/main/resources/templates/mail/order-placed.html <<'EOF'
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<body>
+<p th:text="#{mail.order.greeting(${name})}">Chào bạn,</p>
+<p th:text="#{mail.order.body(${#numbers.formatInteger(total, 1, 'DEFAULT')})}">Nội dung</p>
+</body>
+</html>
+EOF
+```
+
+</Terminal>
+
+- Id đơn bắt đầu từ 1001 để thấy vì sao tiêu đề dùng `{0,number,#}`.
+- `messages_en.properties` cố ý **thiếu** khoá `jakarta.validation.constraints.NotNull.message`.
+- Template lấy chữ bằng `#{khoá(tham số)}`; Thymeleaf hỏi `MessageSource` của Spring với locale của `Context`.
+
+### 4. Code: locale, validation, email sau commit
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/notify
+P=src/main/java/vn/masteva/notify
+cat > $P/WebConfig.java <<'EOF'
+package vn.masteva.notify;
+
+import java.util.List;
+import java.util.Locale;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.web.servlet.LocaleResolver;
+import org.springframework.web.servlet.i18n.AcceptHeaderLocaleResolver;
+
+@Configuration
+@EnableAsync
+class WebConfig {
+
+    @Bean
+    LocaleResolver localeResolver() {                 // tên bean phải là "localeResolver"
+        AcceptHeaderLocaleResolver resolver = new AcceptHeaderLocaleResolver();
+        resolver.setSupportedLocales(List.of(Locale.of("vi"), Locale.ENGLISH));
+        resolver.setDefaultLocale(Locale.of("vi"));
+        return resolver;
+    }
+}
+EOF
+cat > $P/PlaceOrder.java <<'EOF'
+package vn.masteva.notify;
+
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+
+public record PlaceOrder(
+        @NotNull(message = "{order.customer.required}") Long customerId,
+        @NotNull @Positive(message = "{order.total.positive}") Long total) {
+}
+EOF
+cat > $P/CustomerNotFoundException.java <<'EOF'
+package vn.masteva.notify;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.ErrorResponseException;
+
+class CustomerNotFoundException extends ErrorResponseException {
+    CustomerNotFoundException(long id) {
+        // title, detail lấy từ problemDetail.title.<tên lớp> và problemDetail.<tên lớp>, {0} = id
+        super(HttpStatus.NOT_FOUND, ProblemDetail.forStatus(HttpStatus.NOT_FOUND), null, null, new Object[] {id});
+    }
+}
+EOF
+cat > $P/ApiExceptionHandler.java <<'EOF'
+package vn.masteva.notify;
+
+import java.util.Comparator;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.WebRequest;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
+
+@RestControllerAdvice
+class ApiExceptionHandler extends ResponseEntityExceptionHandler {
+    record FieldMessage(String field, String message) {
+    }
+
+    @Override
+    protected ResponseEntity<Object> handleMethodArgumentNotValid(MethodArgumentNotValidException ex,
+            HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+        ResponseEntity<Object> response = super.handleMethodArgumentNotValid(ex, headers, status, request);
+        if (response != null && response.getBody() instanceof ProblemDetail problem) {
+            problem.setProperty("errors", ex.getFieldErrors().stream()
+                    .sorted(Comparator.comparing(FieldError::getField))
+                    .map(f -> new FieldMessage(f.getField(), f.getDefaultMessage()))
+                    .toList());
+        }
+        return response;
+    }
+}
+EOF
+cat > $P/OrderPlaced.java <<'EOF'
+package vn.masteva.notify;
+
+public record OrderPlaced(long orderId, String email, String fullName, String locale, long total) {
+}
+EOF
+cat > $P/OrderMailer.java <<'EOF'
+package vn.masteva.notify;
+
+import jakarta.mail.MessagingException;
+import jakarta.mail.internet.MimeMessage;
+import java.util.Locale;
+import java.util.Map;
+import org.springframework.context.MessageSource;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.stereotype.Component;
+import org.thymeleaf.TemplateEngine;
+import org.thymeleaf.context.Context;
+
+@Component
+public class OrderMailer {
+    private final JavaMailSender sender;
+    private final TemplateEngine templates;
+    private final MessageSource messages;
+
+    public OrderMailer(JavaMailSender sender, TemplateEngine templates, MessageSource messages) {
+        this.sender = sender;
+        this.templates = templates;
+        this.messages = messages;
+    }
+
+    public void sendOrderPlaced(OrderPlaced e) throws MessagingException {
+        Locale locale = Locale.forLanguageTag(e.locale());         // ngôn ngữ của người nhận
+        Context ctx = new Context(locale, Map.of("name", e.fullName(), "total", e.total()));
+        MimeMessage message = sender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(message, "UTF-8");
+        helper.setFrom("no-reply@masteva.vn");
+        helper.setTo(e.email());
+        helper.setSubject(messages.getMessage("mail.order.subject", new Object[] {e.orderId()}, locale));
+        helper.setText(templates.process("mail/order-placed", ctx), true);
+        sender.send(message);
+    }
+}
+EOF
+cat > $P/OrderMailListener.java <<'EOF'
+package vn.masteva.notify;
+
+import jakarta.mail.MessagingException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+@Component
+class OrderMailListener {
+    private static final Logger log = LoggerFactory.getLogger(OrderMailListener.class);
+    private final OrderMailer mailer;
+
+    OrderMailListener(OrderMailer mailer) {
+        this.mailer = mailer;
+    }
+
+    @Async
+    @TransactionalEventListener
+    void onPlaced(OrderPlaced e) throws MessagingException {
+        mailer.sendOrderPlaced(e);
+        log.info(">> đã gửi email đơn {} tới {}", e.orderId(), e.email());
+    }
+}
+EOF
+cat > $P/OrderService.java <<'EOF'
+package vn.masteva.notify;
+
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OrderService {
+    record Customer(String email, String fullName, String locale) {
+    }
+
+    private final JdbcClient jdbc;
+    private final ApplicationEventPublisher events;
+
+    public OrderService(JdbcClient jdbc, ApplicationEventPublisher events) {
+        this.jdbc = jdbc;
+        this.events = events;
+    }
+
+    @Transactional
+    public long place(PlaceOrder cmd) {
+        Customer c = jdbc.sql("SELECT email, full_name, locale FROM customers WHERE id = ?")
+                .param(cmd.customerId()).query(Customer.class).optional()
+                .orElseThrow(() -> new CustomerNotFoundException(cmd.customerId()));
+        long id = jdbc.sql("INSERT INTO orders (customer_id, total) VALUES (?, ?) RETURNING id")
+                .params(cmd.customerId(), cmd.total()).query(Long.class).single();
+        events.publishEvent(new OrderPlaced(id, c.email(), c.fullName(), c.locale(), cmd.total()));
+        return id;
+    }
+}
+EOF
+cat > $P/OrderController.java <<'EOF'
+package vn.masteva.notify;
+
+import jakarta.validation.Valid;
+import java.util.Map;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class OrderController {
+    private final OrderService orders;
+
+    public OrderController(OrderService orders) {
+        this.orders = orders;
+    }
+
+    @PostMapping("/orders")
+    public Map<String, Long> place(@Valid @RequestBody PlaceOrder cmd) {
+        return Map.of("id", orders.place(cmd));
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `ApiExceptionHandler` kế thừa `ResponseEntityExceptionHandler`, nên handler Problem Details của Spring Boot tự lùi lại (SB1.3). `super.handleMethodArgumentNotValid` đã tra `title` và `detail` theo locale; method chỉ thêm `errors`. `getDefaultMessage()` của mỗi lỗi đã được dịch lúc validate, vì validation chạy trong request.
+- `OrderMailListener` là cách của SB4.2: `@TransactionalEventListener` (mặc định `AFTER_COMMIT`) cộng `@Async` để không giữ thread của request.
+
+### 5. Thông báo lỗi theo ngôn ngữ
+
+Chạy ứng dụng ở tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb10/notify
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw spring-boot:run
+```
+
+</Terminal>
+
+Khi thấy `Started NotifyApplication`, ở tab 2 gửi một đơn sai với ba ngôn ngữ, rồi một đơn cho khách không tồn tại:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for L in vi en fr; do
+  curl -s -H "Accept-Language: $L" -H 'Content-Type: application/json' -d '{"total": -5}' localhost:8190/orders; echo
+done
+curl -s -H 'Content-Type: application/json' -d '{"customerId": 1099, "total": 100}' localhost:8190/orders; echo
+curl -s -H 'Accept-Language: en-US,en;q=0.9' -H 'Content-Type: application/json' -d '{"customerId": 1099, "total": 100}' localhost:8190/orders; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"detail":"Có trường không hợp lệ, xem errors","instance":"/orders","status":400,"title":"Dữ liệu không hợp lệ","errors":[{"field":"customerId","message":"Phải chọn khách hàng"},{"field":"total","message":"Tổng tiền phải lớn hơn 0"}]}
+{"detail":"Some fields are invalid, see errors","instance":"/orders","status":400,"title":"Invalid request","errors":[{"field":"customerId","message":"Customer is required"},{"field":"total","message":"Total must be greater than 0"}]}
+{"detail":"Có trường không hợp lệ, xem errors","instance":"/orders","status":400,"title":"Dữ liệu không hợp lệ","errors":[{"field":"customerId","message":"Phải chọn khách hàng"},{"field":"total","message":"Tổng tiền phải lớn hơn 0"}]}
+{"detail":"Không có khách hàng mã 1099","instance":"/orders","status":404,"title":"Không tìm thấy khách hàng"}
+{"detail":"No customer with id 1099","instance":"/orders","status":404,"title":"Customer not found"}
+```
+
+</Expected>
+
+`fr` không được hỗ trợ nên rơi về `vi`. Không có header cũng là `vi`. `en-US` khớp `en`. Giờ một đơn thiếu `total`, trường chỉ có `@NotNull` với thông điệp mặc định:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+for L in vi en; do
+  curl -s -H "Accept-Language: $L" -H 'Content-Type: application/json' -d '{"customerId": 1}' localhost:8190/orders; echo
+done
+```
+
+</Terminal>
+
+<Predict question="Hibernate Validator có sẵn thông điệp tiếng Anh 'must not be null'. Khách tiếng Anh thấy gì?">
+
+```text
+{"detail":"Có trường không hợp lệ, xem errors","instance":"/orders","status":400,"title":"Dữ liệu không hợp lệ","errors":[{"field":"total","message":"không được để trống"}]}
+{"detail":"Some fields are invalid, see errors","instance":"/orders","status":400,"title":"Invalid request","errors":[{"field":"total","message":"không được để trống"}]}
+```
+
+Khoá `jakarta.validation.constraints.NotNull.message` được tra trong `MessageSource` **trước** file của Hibernate Validator. Với `en`, `messages_en.properties` không có khoá đó, Spring rơi về file gốc `messages.properties`, nơi khoá có bản tiếng Việt, và dừng ở đó. Bản tiếng Anh của Hibernate Validator không bao giờ được hỏi tới.
+
+</Predict>
+
+Sửa bằng cách thêm khoá vào file tiếng Anh. Dừng ứng dụng (Ctrl+C ở tab 1), rồi:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/notify
+echo 'jakarta.validation.constraints.NotNull.message=must not be null' >> src/main/resources/messages_en.properties
+```
+
+</Terminal>
+
+Chạy lại `./mvnw spring-boot:run` ở tab 1, gửi lại hai lệnh trên: bản `en` giờ là `"message":"must not be null"`. Quy tắc rút ra: khi file gốc là một ngôn ngữ thật, mọi khoá trong file gốc phải có ở mọi file ngôn ngữ khác; một test so tập khoá giữa các file bắt được lỗi này trước khi khách thấy.
+
+<Check id="sb10.2.lab-i18n">Trả được lỗi validation và Problem Details theo `Accept-Language`, giải thích được vì sao khách tiếng Anh thấy thông điệp tiếng Việt, và sửa được nó.</Check>
+
+### 6. Email sau commit, theo ngôn ngữ người nhận
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -H 'Content-Type: application/json' -d '{"customerId": 1, "total": 1250000}' localhost:8190/orders; echo
+sleep 1; curl -s localhost:9413/view/latest.txt; echo
+curl -s -H 'Content-Type: application/json' -d '{"customerId": 2, "total": 1250000}' localhost:8190/orders; echo
+sleep 1; curl -s localhost:9413/view/latest.txt; echo
+curl -s localhost:9413/api/v1/messages | grep -o '"Subject":"[^"]*"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":1001}
+Chào Nguyễn An,
+
+Cảm ơn bạn đã đặt hàng. Tổng tiền: 1.250.000 đồng.
+{"id":1002}
+Hi John Smith,
+
+Thanks for your order. We've received 1,250,000 VND.
+"Subject":"Order #1002 received"
+"Subject":"Đơn hàng #1001 đã được ghi nhận"
+```
+
+</Expected>
+
+- `/view/latest.txt` của Mailpit trả phần chữ của thư mới nhất (Mailpit tự trích từ HTML). Mở `http://localhost:9413` để xem bản HTML.
+- Cả hai request đều không gửi `Accept-Language`; ngôn ngữ của thư lấy từ cột `locale` của khách. Số tiền định dạng theo locale đó, `''` trong file tiếng Anh thành một dấu `'`.
+- Tiêu đề là `#1001`, không phải `#1.001`, nhờ `{0,number,#}`.
+
+### 7. Máy chủ mail ngừng
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker stop sb10-mailpit && curl -s -H 'Content-Type: application/json' -d '{"customerId": 1, "total": 90000}' localhost:8190/orders; echo
+```
+
+</Terminal>
+
+Như SB4.2 đã thấy với listener sau commit: người dùng nhận `{"id":1003}`, đơn đã lưu, tab 1 chỉ có dòng `Unexpected exception occurred invoking async method` của `SimpleAsyncUncaughtExceptionHandler` kèm `java.net.ConnectException: Connection refused`, và không còn gì nhớ rằng đơn 1003 chưa có email. Bước 8 sửa điều đó bằng outbox; để Mailpit tắt nguyên như vậy.
+
+### 8. Outbox có thử lại
+
+Dừng ứng dụng (Ctrl+C ở tab 1). Thêm bảng outbox, bỏ listener, cho `OrderService` ghi outbox trong cùng transaction, và thêm relay chạy định kỳ:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb10/notify
+P=src/main/java/vn/masteva/notify
+cat > src/main/resources/db/migration/V2__email_outbox.sql <<'EOF'
+CREATE TABLE email_outbox (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    order_id        bigint      NOT NULL REFERENCES orders (id),
+    status          text        NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SENT', 'FAILED')),
+    attempts        int         NOT NULL DEFAULT 0,
+    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    last_error      text,
+    sent_at         timestamptz
+);
+CREATE INDEX email_outbox_due_idx ON email_outbox (next_attempt_at) WHERE status = 'PENDING';
+EOF
+rm $P/OrderMailListener.java
+perl -0pi -e 's/        events.publishEvent\(new OrderPlaced\(id, c.email\(\), c.fullName\(\), c.locale\(\), cmd.total\(\)\)\);/        jdbc.sql("INSERT INTO email_outbox (order_id) VALUES (?)").param(id).update();/; s/import org.springframework.context.ApplicationEventPublisher;\n//; s/    private final ApplicationEventPublisher events;\n//; s/JdbcClient jdbc, ApplicationEventPublisher events\)/JdbcClient jdbc)/; s/        this.events = events;\n//' $P/OrderService.java
+perl -pi -e 's/^\@EnableAsync$/\@EnableScheduling/; s/import org.springframework.scheduling.annotation.EnableAsync;/import org.springframework.scheduling.annotation.EnableScheduling;/' $P/WebConfig.java
+cat > $P/OutboxRelay.java <<'EOF'
+package vn.masteva.notify;
+
+import jakarta.mail.MessagingException;
+import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.mail.MailException;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+@Component
+class OutboxRelay {
+    private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
+    private static final int MAX_ATTEMPTS = 5;
+
+    record Due(long id, int attempts, long orderId, String email, String fullName, String locale, long total) {
+    }
+
+    private final JdbcClient jdbc;
+    private final OrderMailer mailer;
+
+    OutboxRelay(JdbcClient jdbc, OrderMailer mailer) {
+        this.jdbc = jdbc;
+        this.mailer = mailer;
+    }
+
+    @Scheduled(fixedDelay = 2000)
+    @Transactional
+    public void relay() {
+        List<Due> due = jdbc.sql("""
+                SELECT e.id, e.attempts, o.id AS order_id, c.email, c.full_name, c.locale, o.total
+                FROM email_outbox e
+                JOIN orders o ON o.id = e.order_id
+                JOIN customers c ON c.id = o.customer_id
+                WHERE e.status = 'PENDING' AND e.next_attempt_at <= now()
+                ORDER BY e.id
+                LIMIT 20
+                FOR UPDATE OF e SKIP LOCKED
+                """).query(Due.class).list();
+        for (Due d : due) {
+            try {
+                mailer.sendOrderPlaced(new OrderPlaced(d.orderId(), d.email(), d.fullName(), d.locale(), d.total()));
+                jdbc.sql("UPDATE email_outbox SET status = 'SENT', attempts = attempts + 1, sent_at = now() WHERE id = ?")
+                        .param(d.id()).update();
+                log.info(">> outbox {}: đã gửi đơn {} tới {}", d.id(), d.orderId(), d.email());
+            } catch (MailException | MessagingException e) {
+                int attempts = d.attempts() + 1;
+                long backoff = 5L << (attempts - 1);                 // 5, 10, 20, 40 giây
+                String status = attempts >= MAX_ATTEMPTS ? "FAILED" : "PENDING";
+                jdbc.sql("""
+                        UPDATE email_outbox SET attempts = ?, status = ?, last_error = ?,
+                               next_attempt_at = now() + make_interval(secs => ?)
+                        WHERE id = ?
+                        """).params(attempts, status, e.getMessage(), backoff, d.id()).update();
+                log.warn(">> outbox {}: lần {} lỗi, {} sau {} giây", d.id(), attempts,
+                        status.equals("FAILED") ? "dừng" : "thử lại", backoff);
+            }
+        }
+    }
+}
+EOF
+sed -n '/public long place/,/^    }/p' $P/OrderService.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    public long place(PlaceOrder cmd) {
+        Customer c = jdbc.sql("SELECT email, full_name, locale FROM customers WHERE id = ?")
+                .param(cmd.customerId()).query(Customer.class).optional()
+                .orElseThrow(() -> new CustomerNotFoundException(cmd.customerId()));
+        long id = jdbc.sql("INSERT INTO orders (customer_id, total) VALUES (?, ?) RETURNING id")
+                .params(cmd.customerId(), cmd.total()).query(Long.class).single();
+        jdbc.sql("INSERT INTO email_outbox (order_id) VALUES (?)").param(id).update();
+        return id;
+    }
+```
+
+</Expected>
+
+- Dòng outbox chỉ chứa `order_id`. Relay đọc email, tên, locale của khách **lúc gửi**, nên khách đổi ngôn ngữ trước khi thư đi thì thư theo ngôn ngữ mới. Muốn "chụp" nội dung lúc đặt hàng, lưu payload vào cột `jsonb`.
+- `@Scheduled` cùng `@Transactional` trên một method public của bean: lời gọi từ scheduler đi qua proxy nên transaction có hiệu lực (SB4.1).
+- `@EnableAsync` không còn cần, thay bằng `@EnableScheduling`.
+
+Chạy lại ứng dụng ở tab 1 (Flyway áp `V2`). Mailpit vẫn đang tắt từ bước 7; đặt một đơn:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -H 'Content-Type: application/json' -d '{"customerId": 2, "total": 90000}' localhost:8190/orders; echo
+sleep 12
+docker exec sb10-pg psql -U postgres -d notify -c "SELECT id, order_id, status, attempts, next_attempt_at > now() AS waiting, left(last_error, 40) AS last_error FROM email_outbox"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":1004}
+ id | order_id | status  | attempts | waiting |                last_error
+----+----------+---------+----------+---------+------------------------------------------
+  1 |     1004 | PENDING |        2 | t       | Mail server connection failed. Failed me
+(1 row)
+```
+
+</Expected>
+
+Tab 1 (số lần thử khi bạn đọc bảng tuỳ vào thời điểm chạy lệnh):
+
+<Expected>
+
+```text
+vn.masteva.notify.OutboxRelay            : >> outbox 1: lần 1 lỗi, thử lại sau 5 giây
+vn.masteva.notify.OutboxRelay            : >> outbox 1: lần 2 lỗi, thử lại sau 10 giây
+```
+
+</Expected>
+
+Bật lại máy chủ mail và chờ lần thử kế tiếp:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker start sb10-mailpit
+sleep 15
+docker exec sb10-pg psql -U postgres -d notify -c "SELECT id, order_id, status, attempts, sent_at IS NOT NULL AS sent FROM email_outbox"
+curl -s localhost:9413/api/v1/messages | grep -o '"Subject":"[^"]*"'
+```
+
+</Terminal>
+
+<Predict question="Hộp thư Mailpit có những thư nào?">
+
+```text
+sb10-mailpit
+ id | order_id | status | attempts | sent
+----+----------+--------+----------+------
+  1 |     1004 | SENT   |        3 | t
+(1 row)
+
+"Subject":"Order #1004 received"
+```
+
+Thư của đơn 1004 tới được sau ba lần thử, bằng tiếng Anh vì John đặt `locale = 'en'`. Hộp thư chỉ có đúng thư này: Mailpit mặc định lưu thư trong một database tạm, dừng container là mất các thư cũ. Thư của đơn 1003 ở bước 7 không bao giờ được gửi, vì không có dòng outbox nào cho nó.
+
+</Predict>
+
+<Check id="sb10.2.lab-outbox">Chuyển được việc gửi email sang bảng outbox ghi trong cùng transaction, và quan sát được relay thử lại có backoff rồi gửi thành công khi máy chủ mail sống lại.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `No message found under code 'mail.order.subject' for locale 'en'`: tên file sai (phải là `messages_en.properties` trong `src/main/resources`) hoặc `spring.messages.basename` khác.
+- Thông điệp validation hiện nguyên `{order.total.positive}`: khoá không có trong file nào, hoặc viết thiếu ngoặc nhọn.
+- Request gửi đơn treo lâu khi máy chủ mail chậm: thiếu các thuộc tính `mail.smtp.*timeout`, hoặc gửi email ngay trong request.
+- Relay không chạy: thiếu `@EnableScheduling`.
+- `Port 8190 was already in use`: một lần chạy trước chưa tắt; `lsof -i :8190` để tìm.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Giữ `sb10-pg` cho bài sau.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá container Mailpit cùng mọi thư trong đó.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker rm -f sb10-mailpit
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Outbox gửi lặp khi nào, và có tránh hẳn được không?">
+
+Gửi SMTP và `UPDATE ... SENT` là hai hệ thống, không có transaction chung. Tiến trình chết, mất kết nối database, hay commit thất bại ngay sau khi SMTP nhận thư thì dòng vẫn `PENDING` và lần sau gửi lại. Không tránh hẳn được, chỉ thu nhỏ khoảng hở: commit ngay sau mỗi thư thay vì cả lô, và đặt header `Message-ID` cố định theo id outbox để một số hệ thống phía nhận gộp được thư trùng. Với thông báo mà gửi trùng gây hại (trừ tiền, cấp mã kích hoạt dùng một lần), phía nhận phải idempotent như SB9.2, còn email thì chấp nhận trùng.
+
+</Reveal>
+
+<Reveal title="Chạy ba instance, relay có gửi một thư ba lần không?">
+
+Không. Mỗi instance chạy câu `SELECT ... FOR UPDATE OF e SKIP LOCKED` trong transaction riêng: instance đầu khoá các dòng nó lấy, hai instance kia gặp dòng đã khoá thì bỏ qua và lấy các dòng khác, nên việc được chia ra thay vì bị lặp. So với ShedLock của SB9.3, cách này không cần một instance "giữ khoá", nhưng chỉ đúng khi mọi trạng thái nằm trong cùng database. Thiếu `SKIP LOCKED` thì instance thứ hai đứng chờ khoá, rồi đọc lại dòng đã `SENT` theo Read Committed và bỏ qua: không trùng nhưng ba instance xếp hàng làm một việc.
+
+</Reveal>
+
+<Reveal title="Khi nào cần bỏ file properties, chuyển bản dịch vào database hay một dịch vụ dịch?">
+
+File properties nằm trong artifact: đổi một chữ là build và deploy lại, và người dịch phải sửa file trong Git. Khi đội nội dung cần sửa câu chữ mà không chờ release, hoặc số ngôn ngữ lớn, dùng một `MessageSource` tự viết đọc từ bảng (có cache), hoặc đồng bộ file từ một nền tảng quản lý bản dịch ở bước build. `MessageFormat` cũng không xử lý số nhiều phức tạp (tiếng Nga, tiếng Ả Rập có nhiều dạng); ICU4J có `MessageFormat` theo chuẩn ICU cho trường hợp đó. Tiếng Việt và tiếng Anh thì `MessageFormat` của JDK đủ dùng.
+
+</Reveal>
+
+<Reveal title="Thư gửi đi rồi vẫn không vào hộp thư người nhận. Phía ứng dụng cần lo gì?">
+
+Máy chủ nhận kiểm SPF (IP gửi có được phép gửi cho domain không), DKIM (chữ ký trên thư) và DMARC (chính sách khi hai thứ trên sai); thiếu chúng thì thư vào spam hoặc bị từ chối. Đó là cấu hình DNS và dịch vụ gửi thư, không phải code. Phần của ứng dụng: xử lý **bounce** (địa chỉ không tồn tại) và **complaint** (người nhận bấm "spam") mà dịch vụ gửi thư báo về qua webhook, đánh dấu địa chỉ đó để ngừng gửi; tiếp tục gửi vào địa chỉ hỏng làm uy tín domain giảm và thư của mọi người dùng khác cũng vào spam.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết template email, file message cho nhiều ngôn ngữ, hay bộ test so tập khoá giữa các file properties. AI hay gửi email ngay trong method `@Transactional`, hay dùng `LocaleContextHolder.getLocale()` trong job nền, hay quên timeout của SMTP, hay viết `'` đơn trong message có tham số, và hay sinh `messages_vi.properties` mà quên rằng file gốc là bản dự phòng. Kiểm lại bằng lab: tắt Mailpit giữa chừng, gửi `Accept-Language: en` cho trường chỉ có `@NotNull`, đặt id đơn lớn hơn 999.
+
+</Callout>
+
+<Callout kind="link">
+
+SB1.3 dựng Problem Details mà bài này dịch. SB4.1 giải thích proxy mà `@Scheduled @Transactional` dựa vào; SB4.2 tái hiện các pha của `@TransactionalEventListener`. SB9.2 bàn at-least-once và consumer idempotent; SB9.3 so sánh với ShedLock. SB10.1 tạo file báo cáo mà email có thể gửi kèm link. Lộ trình Microservices, chặng M7, dùng outbox để phát sự kiện giữa các service.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb10.2.mastery-email">Tự viết được luồng gửi email bằng template theo ngôn ngữ người nhận, đi qua bảng outbox có thử lại, backoff và giới hạn số lần, và kiểm thử được bằng Mailpit.</Check>
+
+<Check id="sb10.2.mastery-i18n">Tự cấu hình được `MessageSource`, `LocaleResolver` và các khoá `problemDetail.*` để API trả lỗi theo ngôn ngữ của request, và giải thích được thứ tự dự phòng giữa các file.</Check>
+
+</Mastery>

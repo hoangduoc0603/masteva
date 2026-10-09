@@ -1,0 +1,852 @@
+---
+title: Thread pool, virtual thread, pool kết nối và chuỗi timeout dưới tải
+description: Ước lượng số thread bằng định luật Little, đo bằng k6 khi nào virtual thread nâng được thông lượng và khi nào pool kết nối mới là trần, rồi đặt connection-timeout của HikariCP và chuỗi timeout để service từ chối nhanh thay vì làm việc cho client đã bỏ đi.
+id: sb12.2
+step: sb12
+prerequisites: [sb12.1]
+topics: [sb12.thread-pool, sb12.pool-timeout]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    tomcat: 11.0.24
+    hikaricp: 7.0.2
+    docker: 29.8.0
+    postgresql: "18.6"
+    k6: 2.3.0
+    wiremock: 3.13.2
+---
+
+<Goal>
+
+Chọn số thread, kích thước pool và các timeout của một service Spring MVC bằng phép tính rồi kiểm lại bằng k6, thay vì đổi số và hy vọng. Học xong bài này, bạn giải thích được:
+
+- Vì sao service gọi đối tác mất 100 ms kẹt ở khoảng 187 request/giây với 20 thread, và bật virtual thread thì đạt gần 300 request/giây mà không đổi dòng code nào.
+- Vì sao cũng virtual thread đó không giúp được endpoint đọc database: vẫn khoảng 185 request/giây.
+- Vì sao khi client chỉ chờ 1 giây mà pool chờ 30 giây, 97% request thất bại trong khi database vẫn bận hết công suất.
+
+</Goal>
+
+<Knowledge>
+
+### Tomcat xử lý request bằng thread nào
+
+Spring MVC chạy theo kiểu **thread-per-request**: mỗi request chiếm một thread từ lúc bắt đầu xử lý tới lúc ghi xong response, kể cả lúc thread đó chỉ ngồi chờ database hay service khác trả lời.
+
+```text
+ kết nối TCP
+     |  backlog của hệ điều hành (accept-count)
+     v
+ Acceptor + Poller (NIO)  -- giữ tới max-connections kết nối mở, không tốn thread khi kết nối rảnh
+     |  request đã đọc xong header
+     v
+ hàng đợi executor        -- request chờ thread; mặc định không giới hạn độ dài
+     |
+     v
+ worker thread (threads.max) -- chạy filter, controller, service; giữ thread tới khi xong
+```
+
+| Property | Mặc định (Boot 4.1) | Nghĩa |
+|---|---|---|
+| `server.tomcat.threads.max` | 200 | Số worker thread tối đa: số request xử lý **đồng thời** |
+| `server.tomcat.threads.min-spare` | 10 | Số thread luôn giữ sẵn |
+| `server.tomcat.threads.max-queue-capacity` | `Integer.MAX_VALUE` | Độ dài hàng đợi executor khi mọi thread đều bận |
+| `server.tomcat.max-connections` | 8192 | Số kết nối TCP Tomcat giữ mở cùng lúc |
+| `server.tomcat.accept-count` | 100 | Backlog của socket: kết nối mới chờ được nhận khi đã đủ `max-connections` |
+
+Khi cả 200 thread bận, request mới không bị từ chối: nó nằm trong hàng đợi executor, và như SB12.1 đã thấy, `http.server.requests` không đếm thời gian nằm ở đó.
+
+### Định luật Little: cần bao nhiêu thread
+
+Bài SB3.3 đã dùng **định luật Little** để tính số kết nối database. Định luật áp dụng cho mọi hàng đợi ổn định:
+
+```text
+ L = λ × W
+ L: số request đang ở trong hệ thống cùng lúc (đang xử lý)
+ λ: lưu lượng đến (request/giây)
+ W: thời gian mỗi request ở trong hệ thống (giây)
+```
+
+Đổi chiều, ta có trần thông lượng của một tài nguyên có `N` chỗ: **λ tối đa = N / W**.
+
+| Tài nguyên | N | W mỗi request | Trần |
+|---|---|---|---|
+| 20 thread, mỗi request chờ đối tác 100 ms | 20 | 0,1 s | 200 request/giây |
+| 200 thread (mặc định), cùng endpoint | 200 | 0,1 s | 2.000 request/giây |
+| Pool 10 kết nối, mỗi truy vấn giữ kết nối 50 ms | 10 | 0,05 s | 200 request/giây |
+| Khoá `synchronized`, giữ 3 ms (SB12.1) | 1 | 0,003 s | khoảng 330 request/giây |
+
+Trần thật của service là trần **nhỏ nhất** trên đường đi của request. Lab thu nhỏ Tomcat còn 20 thread để chạm được trần thread ở lưu lượng laptop chịu nổi; phép tính với 200 thread y hệt, chỉ nhân lên.
+
+<Check id="sb12.2.littles-law">Dùng được định luật Little để tính trần thông lượng của thread pool và pool kết nối, và chỉ ra trần nào quyết định thông lượng của một endpoint.</Check>
+
+### Virtual thread trong Spring Boot
+
+Bài J11.3 đã giải thích virtual thread: mount, unmount, carrier thread, và vì sao không gom chúng vào pool. Trong Spring Boot, một dòng bật nó cho cả ứng dụng:
+
+```properties
+spring.threads.virtual.enabled=true
+```
+
+Tomcat xử lý mỗi request trên một virtual thread mới; `applicationTaskExecutor` (dùng cho `@Async`) và scheduler cũng chuyển sang virtual thread. `server.tomcat.threads.max` không còn tác dụng, và metric `tomcat.threads.busy` trả về -1.
+
+Virtual thread bỏ đi **trần thread**, không bỏ các trần khác:
+
+| Request tốn thời gian vào | Virtual thread giúp? | Vì sao |
+|---|---|---|
+| Chờ I/O không giữ tài nguyên khan hiếm (gọi HTTP, đọc file) | Có | Thread chờ không chiếm carrier; trần thread biến mất |
+| Chờ kết nối từ pool, hoặc truy vấn đang giữ kết nối | Không | Trần là `pool / W`, không phải số thread |
+| Tính toán CPU | Không | Số nhân CPU là trần; thêm thread chỉ thêm chuyển ngữ cảnh |
+| Chờ khoá dùng chung | Không | Khoá vẫn cho từng thread đi qua một |
+
+Một thay đổi tinh tế: với platform thread, 200 thread của Tomcat vô tình là một giới hạn đồng thời cho mọi thứ phía sau. Bật virtual thread, giới hạn đó biến mất, và hàng đợi chuyển vào bên trong ứng dụng: hàng nghìn virtual thread xếp hàng chờ HikariCP. Bài J11.3 đã kể một sự cố như vậy; lab bước 6 cho bạn thấy con số `pending` lên gần 1.000.
+
+**Pinning trên JDK 25.** Từ JDK 24 (JEP 491), virtual thread chặn bên trong `synchronized` hay `Object.wait()` **không còn** ghim carrier thread. Trên JDK 25 chỉ còn ghim khi chặn trong lúc có frame native trên stack, hoặc trong lúc nạp và khởi tạo class (J11.3 có lab so sánh JDK 21 và 25). Lời khuyên cũ "đổi `synchronized` sang `ReentrantLock` trước khi bật virtual thread" không còn cần trên JDK 25. Cách kiểm cho ứng dụng của bạn: JFR ghi sự kiện `jdk.VirtualThreadPinned` khi một lần ghim kéo dài quá 20 ms (cả cấu hình `default` lẫn `profile`).
+
+<Check id="sb12.2.virtual-thread-fit">Phân loại được một endpoint theo chỗ nó tốn thời gian và nói được virtual thread có nâng thông lượng của nó không, và nói đúng tình trạng pinning trên JDK 25.</Check>
+
+### Pool kết nối khi quá tải
+
+SB3.3 đã chọn kích thước pool và cho thấy lỗi `Connection is not available, request timed out`. Ở đây câu hỏi là: **khi lưu lượng vượt trần của pool, request chờ bao lâu?** Câu trả lời là `connection-timeout`, mặc định 30 giây. Vượt trần 50%, hàng đợi dài thêm 100 request mỗi giây; chỉ sau 10 giây, request mới phải chờ 5 giây mới tới lượt.
+
+| Tham số HikariCP | Mặc định | Lưu ý |
+|---|---|---|
+| `spring.datasource.hikari.maximum-pool-size` | 10 | Trần đồng thời của database; chọn theo SB3.3 |
+| `spring.datasource.hikari.connection-timeout` | 30000 | Đơn vị mili giây, viết **số trơn**: `250`, không phải `250ms` (Spring báo `failed to convert java.lang.String to long`). Nhỏ nhất 250. SB3.3 gợi ý 1 tới 5 giây; khi client chỉ chờ 1 giây như lab, phải ngắn hơn nữa |
+
+Chờ pool quá hạn, `JdbcClient` và `JdbcTemplate` ném `CannotGetJdbcConnectionException`; code đi qua JPA hoặc `@Transactional` nhận `CannotCreateTransactionException` thay vào đó, vì lỗi xảy ra lúc mở transaction. Mặc định cả hai thành 500. Đây là quá tải tạm thời **phía server**, nên trả **503 Service Unavailable** kèm `Retry-After` (RFC 9110, mục 15.6.4), như SB7.1 làm với service khác. Đừng dùng 429: theo RFC 6585, 429 nghĩa là **client** gửi quá nhiều (rate limit, chủ đề của SB13), và Micrometer xếp nó vào `outcome=CLIENT_ERROR`, nên cảnh báo theo tỉ lệ 5xx sẽ không thấy service đang quá tải. Phần Đào sâu nói về một đánh đổi của 503 trên Tomcat.
+
+### Chuỗi timeout: trong phải ngắn hơn ngoài
+
+Một request đi qua nhiều lớp, mỗi lớp có timeout riêng:
+
+```text
+ client / gateway: chờ tối đa 1 s
+   └─ Tomcat + controller: không có timeout cho request đồng bộ
+        ├─ chờ kết nối HikariCP: connection-timeout          (lab: 30 s -> 250 ms)
+        │    └─ truy vấn: statement_timeout của PostgreSQL     (SB4.2)
+        └─ gọi đối tác: spring.http.clients.read-timeout       (SB7.1, lab: 1 s)
+```
+
+Quy tắc: **tổng thời gian chờ có thể có ở các lớp trong phải nhỏ hơn timeout của lớp ngoài**. Nếu ngược lại:
+
+```text
+ t=0      client gửi request; server xếp nó vào hàng chờ pool (30 s)
+ t=1 s    client hết kiên nhẫn, đóng kết nối, có thể gửi lại (retry)
+ t=4 s    server tới lượt, chạy truy vấn, ghi response vào kết nối đã đóng
+          -> database làm việc hết công suất cho người đã bỏ đi
+```
+
+Thông lượng không đổi, nhưng **goodput** (số response còn có người nhận) về gần 0. Retry ở client làm hàng đợi dài thêm, và hệ thống có thể kẹt ở trạng thái quá tải kể cả khi lưu lượng gốc đã giảm. Với `connection-timeout` 250 ms, request dư bị từ chối sau 250 ms, phần còn lại được phục vụ trong khoảng 300 ms: goodput bằng đúng trần của pool.
+
+| Lớp | Đặt ở đâu | Gợi ý |
+|---|---|---|
+| Client, gateway | Cấu hình gateway, `timeout` của k6 | Lớn nhất trong chuỗi |
+| Chờ pool | `spring.datasource.hikari.connection-timeout` | Vài trăm mili giây tới 1–2 giây, nhỏ hơn timeout client rõ rệt |
+| Một câu SQL | `statement_timeout` của PostgreSQL (SB4.2) | Theo truy vấn chậm nhất chấp nhận được; `spring.jdbc.template.query-timeout` đi qua `setQueryTimeout` của JDBC, chỉ có độ phân giải giây |
+| Gọi service khác | `spring.http.clients.read-timeout`, connect-timeout (SB7.1) | Theo p99 của service kia, cộng biên |
+
+<Callout kind="production">
+
+Một service báo cáo bật virtual thread để "chịu tải tốt hơn" và giữ `connection-timeout` mặc định 30 giây. API gateway phía trước cắt request sau 5 giây, và app di động tự retry hai lần. Cuối tháng, lưu lượng báo cáo tăng gấp đôi trần của pool. Gateway báo 504 hàng loạt, nhưng dashboard database cho thấy CPU 100% và số truy vấn mỗi giây ổn định: database làm việc đều, chỉ là cho những request đã bị gateway bỏ. Mỗi lần retry thêm vào cuối một hàng đợi đã dài 20 giây. Sự cố chỉ hết khi họ tắt bớt instance của app di động. Cách sửa: `connection-timeout` 500 ms, trả 503 kèm `Retry-After` để client lùi lại thay vì retry ngay, và cảnh báo trên `hikaricp.connections.pending`.
+
+</Callout>
+
+<Check id="sb12.2.timeout-chain">Vẽ được chuỗi timeout của một request qua gateway, Tomcat, HikariCP, database và service khác, và giải thích được vì sao timeout lớp trong phải ngắn hơn lớp ngoài bằng khái niệm goodput.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Apache Tomcat 11 Configuration Reference: The HTTP Connector](https://tomcat.apache.org/tomcat-11.0-doc/config/http.html): ý nghĩa thật của `maxThreads`, `acceptCount`, `maxConnections` mà các property `server.tomcat.*` ánh xạ tới.
+- [JEP 491: Synchronize Virtual Threads without Pinning](https://openjdk.org/jeps/491): phần "Description" nói rõ trường hợp nào còn ghim trên JDK 24 trở đi.
+- [HikariCP](https://github.com/brettwooldridge/HikariCP): bảng cấu hình, đọc `connectionTimeout` (đơn vị, giá trị nhỏ nhất) và `maximumPoolSize`.
+- [PostgreSQL: Client Connection Defaults](https://www.postgresql.org/docs/current/runtime-config-client.html): `statement_timeout`, `lock_timeout` cho lớp trong cùng của chuỗi timeout.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm xong SB12.1: container `sb12-pg` đang chạy (`docker start sb12-pg` nếu đã dừng), project `~/masteva-sb12/perf` có `PricingService` đã sửa, thư mục `~/masteva-sb12/k6`. Ba tab như bài trước: tab 1 chạy ứng dụng, tab 2 chạy k6, tab 3 đọc metric. Đối tác giả lập nghe ở cổng **9420**.
+
+Như SB12.1, con số đo trên `Apple M1 Pro` 10 nhân, 16 GB RAM, Docker Desktop 6 CPU. Các phép tính Little trong bài không phụ thuộc máy: trần 200 request/giây vẫn là 200 trên máy bạn.
+
+### 1. Đối tác chậm 100 ms
+
+WireMock giả một API giá của đối tác, luôn trả lời sau đúng 100 ms. `--async-response-enabled` cho WireMock chờ mà không giữ thread của chính nó, để nó không thành điểm nghẽn của bài đo.
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+mkdir -p ~/masteva-sb12/partner/mappings && cd ~/masteva-sb12
+cat > partner/mappings/price.json <<'EOF'
+{
+  "request": { "method": "GET", "urlPathPattern": "/prices/.*" },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": { "partnerPrice": 99000 },
+    "fixedDelayMilliseconds": 100
+  }
+}
+EOF
+docker run -d --name sb12-partner -p 9420:8080 -v "$PWD/partner:/home/wiremock" \
+  wiremock/wiremock:3.13.2 --async-response-enabled=true --no-request-journal --disable-request-logging
+until curl -s localhost:9420/prices/SKU-1 > /dev/null; do sleep 1; done
+curl -s -w ' %{time_total}s\n' localhost:9420/prices/SKU-1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"partnerPrice":99000} 0.115502s
+```
+
+</Expected>
+
+### 2. Hai endpoint mới, 20 thread
+
+Một endpoint chỉ chờ I/O (gọi đối tác), một endpoint giữ kết nối database 50 ms (truy vấn báo cáo giả bằng `pg_sleep(0.05)`), và một handler đổi lỗi chờ pool thành 503 kèm `Retry-After`. Từ Spring Boot 4, `RestClient.Builder` nằm trong starter riêng `spring-boot-starter-restclient` (SB7.1).
+
+<Terminal where="mac" title="Tab 2: dependency, code, cấu hình">
+
+```bash
+cd ~/masteva-sb12/perf
+perl -0pi -e 's|(\t\t\t<artifactId>spring-boot-starter-webmvc</artifactId>\n\t\t</dependency>\n)|$1\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-starter-restclient</artifactId>\n\t\t</dependency>\n|' pom.xml
+P=src/main/java/vn/masteva/perf
+cat > $P/PartnerController.java <<'EOF'
+package vn.masteva.perf;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.client.RestClient;
+
+@RestController
+public class PartnerController {
+    private final RestClient partner;
+
+    public PartnerController(RestClient.Builder builder, @Value("${app.partner-url}") String url) {
+        this.partner = builder.baseUrl(url).build();
+    }
+
+    public record PartnerPrice(long partnerPrice) {
+    }
+
+    // Chờ I/O khoảng 100 ms, không dùng database
+    @GetMapping("/api/partner/{sku}")
+    public PartnerPrice price(@PathVariable String sku) {
+        return partner.get().uri("/prices/{sku}", sku).retrieve().body(PartnerPrice.class);
+    }
+}
+EOF
+cat > $P/ReportController.java <<'EOF'
+package vn.masteva.perf;
+
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ReportController {
+    private final JdbcClient jdbc;
+
+    public ReportController(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    public record Report(long products) {
+    }
+
+    // Giữ một kết nối database khoảng 50 ms
+    @GetMapping("/api/report")
+    public Report report() {
+        long n = jdbc.sql("SELECT count(*) FROM product, pg_sleep(0.05)").query(Long.class).single();
+        return new Report(n);
+    }
+}
+EOF
+cat > $P/ApiErrors.java <<'EOF'
+package vn.masteva.perf;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class ApiErrors {
+
+    // Chờ pool quá connection-timeout: server quá tải tạm thời, mời client thử lại sau 1 giây
+    @ExceptionHandler(CannotGetJdbcConnectionException.class)
+    public ResponseEntity<ProblemDetail> poolExhausted() {
+        var problem = ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, "database busy, retry later");
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).header("Retry-After", "1").body(problem);
+    }
+}
+EOF
+cat >> src/main/resources/application.properties <<'EOF'
+
+server.tomcat.threads.max=20
+app.partner-url=http://localhost:9420
+spring.http.clients.read-timeout=1s
+EOF
+```
+
+</Terminal>
+
+`server.tomcat.threads.max=20` thu nhỏ Tomcat để trần thread (20 / 0,1 s = 200 request/giây) nằm trong tầm laptop. Chạy lại ứng dụng ở tab 1 bằng lệnh của bước 3 bài SB12.1, rồi thử:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -w ' %{time_total}s\n' localhost:8092/api/partner/SKU-1
+curl -s -w ' %{time_total}s\n' localhost:8092/api/report
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"partnerPrice":99000} 0.319538s
+{"products":100} 0.061802s
+```
+
+</Expected>
+
+Lời gọi đối tác đầu tiên chậm hơn 100 ms vì phải nạp class và mở kết nối HTTP; các lần sau khoảng 100 ms.
+
+### 3. Kịch bản k6 có tham số, và trần thread
+
+Một kịch bản cho mọi bước còn lại: `TARGET` là đường dẫn, `RATE` là lưu lượng, `TIMEOUT` là thời gian client chịu chờ. Ngưỡng: p95 dưới 300 ms, lỗi dưới 1%.
+
+<Terminal where="mac" title="Tab 2: k6/rate.js">
+
+```bash
+cd ~/masteva-sb12
+cat > k6/rate.js <<'EOF'
+import http from 'k6/http';
+
+const BASE = __ENV.BASE || 'http://host.docker.internal:8092';
+const TARGET = __ENV.TARGET || '/api/partner/SKU-1';
+const RATE = Number(__ENV.RATE || 100);
+const TIMEOUT = __ENV.TIMEOUT || '60s';
+
+const arrivals = (duration, startTime) => ({
+  executor: 'constant-arrival-rate', rate: RATE, timeUnit: '1s',
+  duration, startTime, preAllocatedVUs: 100, maxVUs: 1000,
+});
+
+export const options = {
+  scenarios: {
+    warmup: arrivals('10s', '0s'),
+    measure: arrivals('30s', '10s'),
+  },
+  thresholds: {
+    'http_req_duration{scenario:measure}': ['p(95)<300'],
+    'http_req_failed{scenario:measure}': ['rate<0.01'],
+  },
+  summaryTrendStats: ['avg', 'p(50)', 'p(95)', 'p(99)', 'max'],
+};
+
+export default function () {
+  http.get(`${BASE}${TARGET}`, { timeout: TIMEOUT });
+}
+EOF
+k6run() { docker run --rm "$@" -v "$PWD/k6:/scripts" grafana/k6:2.3.0 run --quiet /scripts/rate.js 2>/dev/null | grep -E "✓|✗|http_req_duration\.|http_req_failed\.|http_reqs|dropped"; }
+k6run -e RATE=150
+```
+
+</Terminal>
+
+`k6run` là hàm tiện lợi: chuyển tham số `-e` cho `docker run`, ẩn log cảnh báo của k6 (`2>/dev/null`) và chỉ giữ các dòng quan trọng. Nó chỉ tồn tại trong tab 2; mở tab mới thì định nghĩa lại.
+
+<Expected>
+
+```text
+    ✓ 'p(95)<300' p(95)=109.37ms
+    ✓ 'rate<0.01' rate=0.00%
+    http_req_duration..............: avg=104.24ms p(50)=103.05ms p(95)=109.23ms p(99)=127.57ms max=180.78ms
+    http_req_failed................: 0.00%  0 out of 6002
+    http_reqs......................: 6002   149.650781/s
+```
+
+</Expected>
+
+150 request/giây cần 150 × 0,1 = 15 thread, dưới 20: đạt. Bây giờ 300 request/giây, cần 30 thread:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+k6run -e RATE=300
+```
+
+</Terminal>
+
+Trong lúc chạy, ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:8092/actuator/prometheus \
+  | grep -E '^(tomcat_threads_(busy|config_max)|jvm_threads_live|http_server_requests_seconds\{.*partner)' \
+  | sed -E 's/error="none",exception="none",method="GET",outcome="SUCCESS",status="200",//'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+http_server_requests_seconds{uri="/api/partner/{sku}",quantile="0.5"} 0.100663296
+http_server_requests_seconds{uri="/api/partner/{sku}",quantile="0.95"} 0.109051904
+http_server_requests_seconds{uri="/api/partner/{sku}",quantile="0.99"} 0.130023424
+jvm_threads_live_threads 66.0
+tomcat_threads_busy_threads{name="http-nio-8092"} 20.0
+tomcat_threads_config_max_threads{name="http-nio-8092"} 20.0
+```
+
+</Expected>
+
+Kết quả ở tab 2:
+
+<Expected>
+
+```text
+    ✗ 'p(95)<300' p(95)=5.41s
+    ✓ 'rate<0.01' rate=0.00%
+    http_req_duration..............: avg=3.74s p(50)=3.99s p(95)=5.4s  p(99)=5.44s max=5.48s
+    http_req_failed................: 0.00%  0 out of 8521
+    http_reqs......................: 8521   187.495319/s
+    dropped_iterations.............: 3479   76.551604/s
+```
+
+</Expected>
+
+Thông lượng 187 request/giây, sát trần 200 của phép tính Little. Ứng dụng tự báo p95 109 ms vì mỗi request, **khi đã có thread**, vẫn chỉ mất 100 ms; client thấy 5,4 giây vì phần còn lại là chờ trong hàng đợi executor của Tomcat. Cả 20 thread bận.
+
+<Check id="sb12.2.lab-platform-limit">Tái hiện được trần thread của Tomcat bằng k6, khớp được thông lượng đo với phép tính Little, và giải thích được vì sao p95 phía ứng dụng và phía client khác nhau.</Check>
+
+### 4. Endpoint database, cùng 20 thread
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+k6run -e RATE=300 -e TARGET=/api/report
+```
+
+</Terminal>
+
+Khoảng 20 giây sau khi bắt đầu, ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:8092/actuator/prometheus \
+  | grep -E '^(tomcat_threads_busy|hikaricp_connections_(active|pending)|http_server_requests_seconds\{.*report)' \
+  | sed -E 's/error="none",exception="none",method="GET",outcome="SUCCESS",status="200",//'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+hikaricp_connections_active{pool="HikariPool-1"} 10.0
+hikaricp_connections_pending{pool="HikariPool-1"} 9.0
+http_server_requests_seconds{uri="/api/report",quantile="0.5"} 0.102760448
+http_server_requests_seconds{uri="/api/report",quantile="0.95"} 0.165675008
+http_server_requests_seconds{uri="/api/report",quantile="0.99"} 0.299892736
+tomcat_threads_busy_threads{name="http-nio-8092"} 20.0
+```
+
+</Expected>
+
+Kết quả ở tab 2:
+
+<Expected>
+
+```text
+    ✗ 'p(95)<300' p(95)=5.4s
+    ✓ 'rate<0.01' rate=0.00%
+    http_req_duration..............: avg=3.72s p(50)=3.96s p(95)=5.37s p(99)=5.52s max=5.97s
+    http_req_failed................: 0.00%  0 out of 8573
+    http_reqs......................: 8573   189.03505/s
+    dropped_iterations.............: 3427   75.56551/s
+```
+
+</Expected>
+
+Lại khoảng 190 request/giây. Lần này có hai trần: 20 thread / 0,05 s = 400, nhưng pool 10 kết nối / 0,05 s = 200. Trần thấp hơn là pool. Metric cho thấy đúng điều đó: 20 thread bận, 10 giữ kết nối (`active` 10), 9 đang chờ pool (`pending` 9). Ứng dụng tự báo p50 103 ms, gồm 50 ms truy vấn và khoảng 50 ms chờ pool; hàng nghìn request còn lại chờ thread ở Tomcat, ngoài tầm nhìn của `http.server.requests`.
+
+### 5. Bật virtual thread
+
+Dừng ứng dụng (Ctrl+C ở tab 1) và chạy lại với virtual thread. Tham số dòng lệnh `--...` ghi đè `application.properties` cho lần chạy này:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+java -jar target/perf-0.0.1-SNAPSHOT.jar --spring.threads.virtual.enabled=true
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+k6run -e RATE=300
+```
+
+</Terminal>
+
+<Predict question="Endpoint gọi đối tác, 300 request/giây, vẫn cấu hình threads.max=20. Kết quả?">
+
+```text
+    ✓ 'p(95)<300' p(95)=105ms
+    ✓ 'rate<0.01' rate=0.00%
+    http_req_duration..............: avg=106.35ms p(50)=101.94ms p(95)=108.01ms p(99)=169.05ms max=672.25ms
+    http_req_failed................: 0.00%  0 out of 11944
+    http_reqs......................: 11944  297.81724/s
+    dropped_iterations.............: 58     1.446199/s
+```
+
+Đạt, gần đủ 300 request/giây, không đổi dòng code nào. 58 lượt bị bỏ là k6 tạo thêm VU chậm trong vài giây đầu. Đọc metric ở tab 3 bằng lệnh của bước 3:
+
+```text
+http_server_requests_seconds{uri="/api/partner/{sku}",quantile="0.5"} 0.100663296
+http_server_requests_seconds{uri="/api/partner/{sku}",quantile="0.95"} 0.1048576
+http_server_requests_seconds{uri="/api/partner/{sku}",quantile="0.99"} 0.448790528
+jvm_threads_live_threads 39.0
+tomcat_threads_busy_threads{name="http-nio-8092"} -1.0
+tomcat_threads_config_max_threads{name="http-nio-8092"} -1.0
+```
+
+`tomcat_threads_busy_threads` và `config_max` là -1: Tomcat không còn dùng thread pool của nó, nên `threads.max=20` không còn tác dụng. `jvm_threads_live_threads` chỉ đếm platform thread và còn 39, ít hơn lúc trước, dù có khoảng 30 request đang chờ đối tác cùng lúc.
+
+</Predict>
+
+<Check id="sb12.2.lab-virtual-io">Bật được virtual thread cho Tomcat bằng một property, đo được thông lượng của endpoint chờ I/O trước và sau, và giải thích được vì sao `threads.max` hết tác dụng.</Check>
+
+### 6. Virtual thread và endpoint database
+
+Vẫn ứng dụng đang chạy với virtual thread. Ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+k6run -e RATE=300 -e TARGET=/api/report
+```
+
+</Terminal>
+
+Khoảng 15 giây sau khi bắt đầu, ở tab 3 bật JFR 10 giây để kiểm pinning, rồi đọc metric:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb12
+jcmd $(pgrep -f perf-0.0.1-SNAPSHOT.jar) JFR.start name=vt duration=10s filename=$PWD/vt.jfr > /dev/null
+sleep 10
+curl -s localhost:8092/actuator/prometheus \
+  | grep -E '^(jvm_threads_live|hikaricp_connections_(active|pending)|http_server_requests_seconds\{.*report)' \
+  | sed -E 's/error="none",exception="none",method="GET",outcome="SUCCESS",status="200",//'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+hikaricp_connections_active{pool="HikariPool-1"} 10.0
+hikaricp_connections_pending{pool="HikariPool-1"} 984.0
+http_server_requests_seconds{uri="/api/report",quantile="0.5"} 2.950692864
+http_server_requests_seconds{uri="/api/report",quantile="0.95"} 4.829741056
+http_server_requests_seconds{uri="/api/report",quantile="0.99"} 4.829741056
+jvm_threads_live_threads 44.0
+```
+
+</Expected>
+
+Kết quả ở tab 2:
+
+<Expected>
+
+```text
+    ✗ 'p(95)<300' p(95)=5.7s
+    ✓ 'rate<0.01' rate=0.00%
+    http_req_duration..............: avg=3.83s p(50)=4.05s p(95)=5.68s p(99)=5.75s max=11.17s
+    http_req_failed................: 0.00%  0 out of 8395
+    http_reqs......................: 8395   184.206064/s
+    dropped_iterations.............: 3606   79.124129/s
+```
+
+</Expected>
+
+184 request/giây, gần như y hệt 189 của bước 4. Virtual thread không đổi trần, chỉ đổi **chỗ xếp hàng**:
+
+| | 20 platform thread (bước 4) | Virtual thread (bước 6) |
+|---|---|---|
+| Thông lượng | 189 request/giây | 184 request/giây |
+| Request chờ ở | Hàng đợi executor của Tomcat; chỉ 9 thread chờ pool | `hikaricp_connections_pending`: 984 |
+| p95 do ứng dụng đo | 166 ms | 4,8 giây: thời gian chờ pool nằm **trong** ứng dụng |
+
+Kiểm pinning trong lúc gần 1.000 virtual thread cùng chờ pool:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+jfr summary vt.jfr | grep -E 'VirtualThreadPinned'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ jdk.VirtualThreadPinned                     0             0
+```
+
+</Expected>
+
+Không lần ghim nào quá 20 ms: HikariCP, driver PostgreSQL 42.7 và Tomcat trên JDK 25 đều cho virtual thread unmount khi chờ.
+
+<Check id="sb12.2.lab-virtual-pool">Chứng minh được bằng k6 và metric rằng virtual thread không nâng thông lượng của endpoint bị giới hạn bởi pool kết nối, chỉ ra hàng đợi đã chuyển vào HikariCP, và kiểm được pinning bằng JFR.</Check>
+
+### 7. Client chờ 1 giây, pool chờ 30 giây
+
+Đợi `hikaricp_connections_pending` về 0 (vài giây sau khi k6 dừng), rồi chạy lại kịch bản với client chỉ chịu chờ 1 giây:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+k6run -e RATE=300 -e TARGET=/api/report -e TIMEOUT=1s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    ✗ 'p(95)<300' p(95)=1s
+    ✗ 'rate<0.01' rate=97.40%
+    http_req_duration..............: avg=950.45ms p(50)=999.23ms p(95)=1s       p(99)=1s      max=1.05s
+    http_req_failed................: 92.22% 10659 out of 11558
+    http_reqs......................: 11558  281.822072/s
+    dropped_iterations.............: 446    10.874948/s
+```
+
+</Expected>
+
+97% request của scenario `measure` thất bại: client bỏ đi sau 1 giây. Ngay sau khi k6 kết thúc, ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+for i in 1 2 3; do
+  curl -s localhost:8092/actuator/prometheus \
+    | grep -E '^(hikaricp_connections_pending|http_server_requests_seconds_count\{.*SUCCESS.*report)' \
+    | sed -E 's/error="none",exception="none",method="GET",outcome="SUCCESS",status="200",//'
+  sleep 5
+done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+hikaricp_connections_pending{pool="HikariPool-1"} 3988.0
+http_server_requests_seconds_count{uri="/api/report"} 15958
+hikaricp_connections_pending{pool="HikariPool-1"} 3157.0
+http_server_requests_seconds_count{uri="/api/report"} 16786
+hikaricp_connections_pending{pool="HikariPool-1"} 2292.0
+http_server_requests_seconds_count{uri="/api/report"} 17640
+```
+
+</Expected>
+
+k6 đã dừng, nhưng 3.988 request vẫn xếp hàng chờ pool, và ứng dụng tiếp tục "thành công" khoảng 170 request mỗi giây: truy vấn chạy, response được ghi vào những kết nối không còn ai nghe. Database bận hết công suất, goodput gần 0. Số đếm `_count` của bạn cộng dồn cả các bước trước, nên chỉ nhìn mức tăng giữa các lần đọc.
+
+### 8. Timeout lớp trong ngắn hơn
+
+Đợi `pending` về 0 lần nữa. Dừng ứng dụng, chạy lại với `connection-timeout` 250 ms. Nhớ viết **số trơn**: `250ms` làm ứng dụng không khởi động được.
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+java -jar target/perf-0.0.1-SNAPSHOT.jar --spring.threads.virtual.enabled=true \
+  --spring.datasource.hikari.connection-timeout=250
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+k6run -e RATE=300 -e TARGET=/api/report -e TIMEOUT=1s
+curl -s localhost:8092/actuator/prometheus \
+  | grep -E '^(hikaricp_connections_(pending|timeout_total)|http_server_requests_seconds_count\{.*report)' \
+  | sed -E 's/error="none",exception="none",method="GET",//'
+curl -s -i localhost:8092/api/report | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    ✗ 'p(95)<300' p(95)=301.47ms
+    ✗ 'rate<0.01' rate=35.88%
+    http_req_duration..............: avg=266.53ms p(50)=282.94ms p(95)=301.75ms p(99)=307.27ms max=411.25ms
+    http_req_failed................: 35.62% 4268 out of 11979
+    http_reqs......................: 11979  292.343565/s
+    dropped_iterations.............: 22     0.536903/s
+hikaricp_connections_pending{pool="HikariPool-1"} 0.0
+hikaricp_connections_timeout_total{pool="HikariPool-1"} 3945.0
+http_server_requests_seconds_count{outcome="SERVER_ERROR",status="503",uri="/api/report"} 3942
+http_server_requests_seconds_count{outcome="SUCCESS",status="200",uri="/api/report"} 7711
+HTTP/1.1 200
+```
+
+</Expected>
+
+Vẫn trượt ngưỡng, vì lưu lượng vẫn vượt trần 50%. Nhưng hành vi khác hẳn:
+
+| | Pool chờ 30 s (bước 7) | Pool chờ 250 ms (bước 8) |
+|---|---|---|
+| Request client nhận được 200 | Khoảng 2% | 7.711 trong 40 giây, khoảng 190 mỗi giây: đúng trần của pool |
+| Request thất bại | Treo đủ 1 giây rồi client bỏ | 3.942 nhận 503 trong khoảng 250 ms, kèm `Retry-After: 1` |
+| Sau khi tải dừng | Hàng nghìn request còn xếp hàng | `pending` 0, request tiếp theo được phục vụ ngay |
+
+Request được ứng dụng trả lời đều xong trong khoảng 300 ms: tối đa 250 ms chờ pool cộng 50 ms truy vấn. Cộng 200 và 503 phía server được 11.653, ít hơn 11.979 request k6 gửi: 326 request (2,7%) không bao giờ tới ứng dụng và hết hạn 1 giây ở k6, cũng nằm trong 4.268 lỗi. Đó là cái giá của 503 trên Tomcat, phần Đào sâu giải thích. `hikaricp_connections_timeout_total` lớn hơn số 503 ba đơn vị: đó là `reloadDiscounts` của SB12.1, cũng không lấy được kết nối và ghi `Unexpected error occurred in scheduled task` vào log. Job nền và request dùng chung pool, nên quá tải ở API cũng làm job nền thất bại; service lớn thường tách pool riêng cho job.
+
+Cuối cùng, ở lưu lượng dưới trần. Chờ khoảng một phút sau lệnh trên rồi mới chạy: ngay sau một đợt 503, lớp mạng của Docker Desktop còn kẹt một số kết nối mới (lần kiểm chứng chạy ngay có 141 trên 7.201 request treo, ứng dụng không hề thấy chúng).
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+k6run -e RATE=180 -e TARGET=/api/report -e TIMEOUT=1s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    ✓ 'p(95)<300' p(95)=66.33ms
+    ✓ 'rate<0.01' rate=0.00%
+    http_req_duration..............: avg=54.05ms p(50)=51.96ms p(95)=64.97ms p(99)=77.32ms max=98.59ms
+    http_req_failed................: 0.01%  1 out of 7202
+    http_reqs......................: 7202   179.789465/s
+```
+
+</Expected>
+
+180 request/giây là 90% trần của pool: đạt, p95 66 ms. Muốn chịu 300 request/giây thật, phải rút ngắn thời gian giữ kết nối (truy vấn nhanh hơn, cache) hoặc tăng trần của database, không phải tăng thread.
+
+<Check id="sb12.2.lab-timeout">Tái hiện được tình trạng server làm việc cho client đã bỏ đi khi timeout lớp trong dài hơn lớp ngoài, rồi sửa bằng `connection-timeout` và đo được goodput trước và sau bằng k6.</Check>
+
+### 9. Giữ cấu hình cuối
+
+Dừng ứng dụng. Ghi cấu hình vừa chọn vào `application.properties` và bỏ dòng `threads.max=20` không còn tác dụng; SB12.3 dùng cấu hình này:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb12/perf
+perl -ni -e 'print unless /^server.tomcat.threads.max=20$/' src/main/resources/application.properties
+cat >> src/main/resources/application.properties <<'EOF'
+spring.threads.virtual.enabled=true
+spring.datasource.hikari.connection-timeout=250
+EOF
+tail -4 src/main/resources/application.properties
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+app.partner-url=http://localhost:9420
+spring.http.clients.read-timeout=1s
+spring.threads.virtual.enabled=true
+spring.datasource.hikari.connection-timeout=250
+```
+
+</Expected>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Failed to bind properties under 'spring.datasource.hikari.connection-timeout' to long`: bạn viết `250ms`. HikariCP nhận số mili giây trơn.
+- `/api/partner` trả 500 với `I/O error on GET request ... Connection refused`: container `sb12-partner` chưa chạy.
+- `tomcat_threads_busy_threads` vẫn là số dương sau khi bật virtual thread: tab 1 chưa chạy lại với `--spring.threads.virtual.enabled=true`.
+- Kết quả bước 7 hoặc 8 lệch nhiều so với bài: bước trước chưa xả hết hàng đợi. Chờ `hikaricp_connections_pending` về 0 trước mỗi lần đo.
+- k6 báo `request timeout` cho một phần request dù ứng dụng trả lời trong 300 ms, và tổng 200 cộng 503 phía ứng dụng ít hơn số request k6 gửi: các request đó treo ở lớp mạng của Docker Desktop khi mở kết nối mới, nhiều nhất sau một đợt 503 (xem Đào sâu). Chờ một phút giữa hai lần đo.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng ở tab 1. Giữ hai container `sb12-pg`, `sb12-partner` và project: SB12.3 đo khởi động trên chính ứng dụng này. File `vt.jfr` có thể xoá.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Trả 503 khi quá tải có cái giá gì trên Tomcat?">
+
+Tomcat 11 **đóng kết nối keep-alive** sau mọi response có status 400, 408, 411, 413, 414, 500, 501 và 503 (danh sách trong `Http11Processor.statusDropsConnection`). Dưới quá tải, mỗi request bị từ chối bằng 503 kéo theo một kết nối TCP mới, và với HTTPS là một lần bắt tay TLS mới, đúng lúc server đang quá tải. Trên máy kiểm chứng, chạy đúng các lệnh của bước 8: với 503, 326 trên 11.979 request của k6 treo tới hết hạn 1 giây mà không bao giờ tới ứng dụng; tạm đổi handler sang 429 (status không làm Tomcat đóng kết nối) thì 0 trên 12.001. Phần treo đó chủ yếu do lớp mạng của Docker Desktop khi phải mở lại hàng trăm kết nối mỗi giây, không điển hình cho production, nơi load balancer giữ pool kết nối riêng tới ứng dụng. Dù vậy, chi phí mở lại kết nối là có thật. Đừng vì nó mà đổi sang 429: 429 nói "client gửi quá nhiều", làm client và cảnh báo hiểu sai. Cách xử lý đúng là giữ 503 kèm `Retry-After`, để load balancer hoặc gateway hấp thụ việc mở lại kết nối, và khi cần thì từ chối sớm hơn ở gateway hay bằng rate limiting (SB13) trước khi request vào tới Tomcat.
+
+</Reveal>
+
+<Reveal title="Có nên giới hạn độ dài hàng đợi executor của Tomcat thay vì dùng timeout?">
+
+Được, và hai cách bổ sung cho nhau. `server.tomcat.threads.max-queue-capacity` giới hạn số request chờ thread; vượt quá, Tomcat từ chối ngay thay vì để chúng chờ vô hạn. Nhưng với virtual thread, hàng đợi đó không còn, nên giới hạn phải đặt ở chỗ có tài nguyên khan hiếm: `connection-timeout` cho pool, `Semaphore` hoặc `@ConcurrencyLimit` (SB7.2) cho lời gọi đối tác. Nguyên tắc chung: mọi hàng đợi phải có giới hạn, theo độ dài hoặc theo thời gian chờ.
+
+</Reveal>
+
+<Reveal title="Pool lớn hơn có cứu được bước 6 không?">
+
+Tăng pool lên 50 nâng trần lý thuyết lên 1.000 request/giây, nhưng chỉ khi database thật sự chạy được 50 truy vấn cùng lúc mà không chậm đi. Với truy vấn `pg_sleep` thì có, vì nó không tốn CPU; với truy vấn thật, 50 tiến trình PostgreSQL tranh nhau CPU và I/O, mỗi truy vấn chậm hơn, và W tăng làm trần không tăng như mong đợi (SB3.3, About Pool Sizing). Pool cũng nhân theo số instance và phải nằm dưới `max_connections`. Cách bền hơn là giảm W: truy vấn nhanh hơn, ít truy vấn hơn mỗi request, cache kết quả báo cáo.
+
+</Reveal>
+
+<Reveal title="Bật virtual thread có rủi ro gì khác ngoài chuyển hàng đợi?">
+
+Ba điều hay gặp. `ThreadLocal` dùng làm cache theo thread (ví dụ `SimpleDateFormat`, buffer) không còn được tái sử dụng, vì mỗi request một thread mới, nên bộ nhớ có thể tăng. Code giả định số thread có hạn, như pool đối tượng kích thước bằng `threads.max`, mất ý nghĩa. Và một ứng dụng chỉ có job `@Scheduled` mà không có web server có thể tự thoát, vì virtual thread là daemon; Spring Boot có `spring.main.keep-alive=true` cho trường hợp đó. Đo bằng k6 và theo dõi heap trước khi bật trên production.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI ước lượng số thread hay kích thước pool từ lưu lượng và thời gian xử lý, hoặc rà một bộ timeout. AI hay khuyên "bật virtual thread để tăng hiệu năng" mà không hỏi endpoint tốn thời gian vào đâu, hay khuyên đổi `synchronized` sang `ReentrantLock` vì pinning (lời khuyên của JDK 21, không còn đúng từ JDK 24), hay viết `connection-timeout: 250ms`, và hay đặt timeout lớp trong dài hơn lớp ngoài. Kiểm tra lại bằng phép tính Little cho từng tài nguyên, đọc đơn vị của property trong tài liệu HikariCP, và đo trước và sau bằng k6 như bài này.
+
+</Callout>
+
+<Callout kind="link">
+
+J11.3 là nền về virtual thread và pinning; SB3.3 là nền về kích thước pool; SB7.1 và SB4.2 đặt timeout cho lời gọi HTTP và cho PostgreSQL. SB12.1 cung cấp kịch bản k6 và cách đọc metric dưới tải. SB13 có chủ đề rate limiting, một cách khác để từ chối sớm trước khi tài nguyên bên trong cạn.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb12.2.mastery-sizing">Tự ước lượng được số thread và kích thước pool cho một endpoint từ lưu lượng mục tiêu và thời gian giữ tài nguyên, quyết định có nên bật virtual thread, và kiểm chứng bằng k6.</Check>
+
+<Check id="sb12.2.mastery-timeouts">Tự đặt được chuỗi timeout từ client tới database và service khác theo nguyên tắc trong ngắn hơn ngoài, và chứng minh được bằng số đo rằng service từ chối nhanh khi quá tải thay vì làm việc cho client đã bỏ đi.</Check>
+
+</Mastery>
