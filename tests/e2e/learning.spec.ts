@@ -27,7 +27,7 @@ test('trang / chuyển sang /vi', async ({ page }) => {
 test('trang chủ không có link Roadmap trên nav', async ({ page }) => {
   await page.goto('/vi/');
   await expect(page.getByRole('navigation').getByRole('link', { name: 'Roadmap', exact: true })).toHaveCount(0);
-  await expect(page.locator('.hm-card')).toHaveCount(4);
+  await expect(page.locator('.hm-card')).toHaveCount(5);
 });
 
 test('trang chủ: tìm kafka ra chủ đề SB9 và mở đúng khung chi tiết', async ({ page }) => {
@@ -229,6 +229,11 @@ test('luồng Java: Học tiếp vào bài J1.1, tích mục làm chủ đề th
   await expect(cta).toHaveAttribute('href', '/vi/learn/j1/j1-1');
   await cta.click();
   await expect(page).toHaveURL(/\/vi\/learn\/j1\/j1-1/);
+  // Sau chuyển trang phía trình duyệt, ô tích có thể đã hiện nhưng React chưa gắn handler: chờ rồi mới bấm.
+  await page.waitForFunction(() => {
+    const box = document.querySelector('[data-check-id="j1.1.lab-compile-run"]');
+    return box !== null && Object.keys(box).some((key) => key.startsWith('__reactProps'));
+  });
   await page.locator('[data-check-id="j1.1.lab-compile-run"]').check();
   await page.goto('/vi/roadmaps/java');
   await expect(chip(page, 'j1.jdk-lts')).toHaveAttribute('data-st', 'learning');
@@ -434,7 +439,7 @@ test('trang chủ: vùng trạng thái đọc tóm tắt kết quả tìm', asyn
   await page.goto('/vi/');
   const status = page.getByRole('status');
   await page.getByLabel('Tìm roadmap hoặc chủ đề').fill('kafka');
-  await expect(status).toHaveText(/2 chủ đề/);
+  await expect(status).toHaveText(/3 chủ đề/);
   await page.getByLabel('Tìm roadmap hoặc chủ đề').fill('zzzz');
   await expect(status).toHaveText('Không có roadmap hay chủ đề nào khớp "zzzz".');
   await expect(page.locator('[aria-live="polite"]').filter({ has: page.locator('.hm-topic-list, .hm-grid') })).toHaveCount(0);
@@ -517,4 +522,32 @@ test('cấp Senior của Java dẫn sang Spring Boot vì lab dùng Spring', asyn
   await expect(page.locator('section#level-senior .rm-lhead')).toContainText('Spring Boot');
   await expect(page.locator('#step-j19 .rm-refs a[href="/vi/roadmaps/spring-boot#step-j11"]')).toHaveCount(1);
   await expect(page.locator('#step-j20 .rm-refs a[href="/vi/roadmaps/spring-boot#step-j12"]')).toHaveCount(1);
+});
+
+test('roadmap Kubernetes có 11 chặng; DevOps có 25 chặng', async ({ page }) => {
+  await page.goto('/vi/roadmaps/kubernetes');
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Kubernetes');
+  await expect(page.locator('.rm-step')).toHaveCount(11);
+  await expect(page.locator('#step-d11')).toContainText('K1');
+  await expect(page.locator('#step-k2')).toContainText('K2');
+  await page.goto('/vi/roadmaps/devops');
+  await expect(page.locator('.rm-step')).toHaveCount(25);
+  await expect(page.locator('#step-d6')).toContainText('D5');
+  await expect(page.locator('#step-d27')).toContainText('D24');
+});
+
+test('chủ đề đã đánh dấu theo mã cũ hiện ở mã mới', async ({ page }) => {
+  await page.addInitScript(() => {
+    if (!localStorage.getItem('masteva:progress:v2:seeded')) {
+      localStorage.setItem('masteva:progress:v2', JSON.stringify({
+        v: 2, items: {}, topics: { 'd11.networkpolicy': { s: 'done', at: '2026-10-01T00:00:00.000Z' } }, start: {},
+      }));
+      localStorage.setItem('masteva:progress:v2:seeded', '1');
+    }
+  });
+  await page.goto('/vi/roadmaps/kubernetes');
+  await expect(page.locator('[data-topic="k2.networkpolicy"]')).toHaveAttribute('data-st', 'done');
+  // Trang chủ không có roadmap riêng nhưng vẫn phải đọc mã cũ theo bảng thay thế.
+  await page.goto('/vi/');
+  await expect(page.locator('.hm-card[href="/vi/roadmaps/kubernetes"] .rm-meter')).toContainText('1/');
 });

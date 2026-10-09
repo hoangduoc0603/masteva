@@ -19,7 +19,7 @@ export function getRoadmapView(roadmapId: string, lang: string): RoadmapView | u
   return buildRoadmapView(viewInput(lang), roadmapId);
 }
 
-const ROADMAP_ORDER = ['java', 'spring-boot', 'devops', 'microservices'];
+const ROADMAP_ORDER = ['java', 'spring-boot', 'devops', 'kubernetes', 'microservices'];
 
 export function listRoadmapViews(lang: string): RoadmapView[] {
   const input = viewInput(lang);

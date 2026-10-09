@@ -104,6 +104,7 @@ describe('validateCodeRefs', () => {
     ['J1', 3],
     ['SB3', 2],
     ['M5', 0],
+    ['K2', 0],
   ]);
 
   it('accepts known step and lesson codes', () => {
@@ -120,6 +121,11 @@ describe('validateCodeRefs', () => {
 
   it('does not check lesson numbers of a step without lessons', () => {
     expect(validateCodeRefs('M5.4', steps)).toEqual([]);
+  });
+
+  it('checks Kubernetes step codes but not K8s or K3s', () => {
+    expect(validateCodeRefs('Xem K2, chạy trên K8s và K3s.', steps)).toEqual([]);
+    expect(validateCodeRefs('Xem K12.', steps)).toEqual(['nhắc mã chặng "K12" không có trong roadmap nào']);
   });
 
   it('ignores fenced and inline code', () => {

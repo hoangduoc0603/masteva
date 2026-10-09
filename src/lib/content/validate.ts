@@ -161,7 +161,7 @@ export function validateGraph(graph: ContentGraph): string[] {
 }
 
 /** Mã chặng hoặc mã bài nhắc trong văn bản: `J7`, `SB3`, `D12`, `M5`, `SB3.2`. */
-const CODE_REF = /\b(J|SB|D|M)(\d{1,2})(?:\.(\d+))?\b/g;
+const CODE_REF = /\b(J|SB|D|M|K)(\d{1,2})(?:\.(\d+))?\b/g;
 
 /** Bỏ khối code (```…``` và `…`) để không bắt nhầm tên trong lệnh. */
 function stripCode(text: string): string {

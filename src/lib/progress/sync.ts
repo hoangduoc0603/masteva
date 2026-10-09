@@ -1,5 +1,5 @@
 import type { Level } from '@/lib/content/constants';
-import type { Progress, TopicMark } from './model';
+import { resolveId, type Progress, type TopicMark } from './model';
 
 /**
  * Dữ liệu đồng bộ tiến độ với Supabase (spec 2026-10-07 §3, migration learning_progress).
@@ -141,13 +141,52 @@ export function removeSent(queue: PendingChanges, sent: PendingChanges): Pending
 }
 
 /**
+ * Đổi mã cũ trong hàng đợi sang mã mới (xếp hàng trước khi nội dung đổi mã), mỗi mã giữ thao tác mới nhất.
+ * Server so bản mới nhất theo từng mã, nên không được đẩy lên mã cũ.
+ */
+export function resolvePending(pending: PendingChanges, replacements: Readonly<Record<string, string>>): PendingChanges {
+  const items: Record<string, ItemRow> = {};
+  for (const row of Object.values(pending.items)) {
+    const id = resolveId(row.item_id, replacements);
+    const prev = own(items, id);
+    if (!prev || time(row.changed_at) > time(prev.changed_at)) items[id] = { ...row, item_id: id };
+  }
+  const topics: Record<string, TopicRow> = {};
+  for (const row of Object.values(pending.topics)) {
+    const id = resolveId(row.topic_id, replacements);
+    const prev = own(topics, id);
+    if (!prev || time(row.changed_at) > time(prev.changed_at)) topics[id] = { ...row, topic_id: id };
+  }
+  return { items, topics, starts: { ...pending.starts } };
+}
+
+/** Gom dòng theo mã đích sau khi thay mã cũ; mỗi mã đích giữ dòng có `changed_at` muộn nhất. */
+function latestByTarget<R extends { changed_at: string }>(
+  list: readonly R[],
+  idOf: (row: R) => string,
+  replacements: Readonly<Record<string, string>>,
+): Map<string, R> {
+  const out = new Map<string, R>();
+  for (const row of list) {
+    const target = resolveId(idOf(row), replacements);
+    const prev = out.get(target);
+    const newer = !prev || time(row.changed_at) > time(prev.changed_at);
+    const sameTimeOnTarget = prev !== undefined && time(row.changed_at) === time(prev.changed_at) && idOf(row) === target;
+    if (newer || sameTimeOnTarget) out.set(target, row);
+  }
+  return out;
+}
+
+/**
  * Áp dòng từ server lên tiến độ trên máy. Thao tác chưa đẩy lên mà không cũ hơn dòng server thì giữ;
  * cũ hơn thì bỏ khỏi hàng đợi và lấy bản server (bản mới nhất thắng).
+ * Dòng mang mã cũ được gộp vào mã mới theo `replacements`.
  */
 export function applyRemote(
   progress: Progress,
   pending: PendingChanges,
   rows: RemoteRows,
+  replacements: Readonly<Record<string, string>> = {},
 ): { progress: Progress; pending: PendingChanges } {
   const items = { ...progress.items };
   const topics = { ...progress.topics };
@@ -160,20 +199,20 @@ export function applyRemote(
     return false;
   };
 
-  for (const row of rows.items) {
-    if (localWins(next.items, row.item_id, row.changed_at)) continue;
-    if (row.completed_at) items[row.item_id] = normalize(row.completed_at);
-    else delete items[row.item_id];
+  for (const [id, row] of latestByTarget(rows.items, (r) => r.item_id, replacements)) {
+    if (localWins(next.items, id, row.changed_at)) continue;
+    if (row.completed_at) items[id] = normalize(row.completed_at);
+    else delete items[id];
   }
-  for (const row of rows.topics) {
-    if (localWins(next.topics, row.topic_id, row.changed_at)) continue;
-    if (row.mark) topics[row.topic_id] = { s: row.mark, at: normalize(row.changed_at) };
-    else delete topics[row.topic_id];
+  for (const [id, row] of latestByTarget(rows.topics, (r) => r.topic_id, replacements)) {
+    if (localWins(next.topics, id, row.changed_at)) continue;
+    if (row.mark) topics[id] = { s: row.mark, at: normalize(row.changed_at) };
+    else delete topics[id];
   }
-  for (const row of rows.starts) {
-    if (localWins(next.starts, row.roadmap_id, row.changed_at)) continue;
-    if (row.level) start[row.roadmap_id] = row.level;
-    else delete start[row.roadmap_id];
+  for (const [id, row] of latestByTarget(rows.starts, (r) => r.roadmap_id, {})) {
+    if (localWins(next.starts, id, row.changed_at)) continue;
+    if (row.level) start[id] = row.level;
+    else delete start[id];
   }
   return { progress: { ...progress, items, topics, start }, pending: next };
 }

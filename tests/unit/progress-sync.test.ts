@@ -134,6 +134,37 @@ describe('applyRemote', () => {
     expect(result.progress.items).toEqual({ newer: T3 });
     expect(Object.keys(result.pending.items)).toEqual(['newer']);
   });
+
+  it('resolves replaced ids and keeps the newest row for each target', () => {
+    const map = { 'old.t': 'new.t' };
+    const untickedLater = applyRemote(progress(), emptyPending(), rows({
+      topics: [
+        { topic_id: 'old.t', mark: 'done', changed_at: T1, synced_at: T3 },
+        { topic_id: 'new.t', mark: null, changed_at: T2, synced_at: T3 },
+      ],
+    }), map);
+    expect(untickedLater.progress.topics).toEqual({});
+
+    const markedLater = applyRemote(progress(), emptyPending(), rows({
+      topics: [
+        { topic_id: 'new.t', mark: null, changed_at: T2, synced_at: T3 },
+        { topic_id: 'old.t', mark: 'done', changed_at: T3, synced_at: T3 },
+      ],
+    }), map);
+    expect(markedLater.progress.topics).toEqual({ 'new.t': { s: 'done', at: T3 } });
+  });
+
+  it('keeps a newer pending change on the new id against rows for the old id', () => {
+    const pending: PendingChanges = {
+      ...emptyPending(),
+      topics: { 'new.t': { topic_id: 'new.t', mark: 'learning', changed_at: T3 } },
+    };
+    const result = applyRemote(progress({ topics: { 'new.t': { s: 'learning', at: T3 } } }), pending, rows({
+      topics: [{ topic_id: 'old.t', mark: 'done', changed_at: T2, synced_at: T3 }],
+    }), { 'old.t': 'new.t' });
+    expect(result.progress.topics).toEqual({ 'new.t': { s: 'learning', at: T3 } });
+    expect(Object.keys(result.pending.topics)).toEqual(['new.t']);
+  });
 });
 
 describe('cursor, chunks, payload', () => {

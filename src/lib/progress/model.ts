@@ -65,7 +65,7 @@ export function emptyProgress(): Progress {
 }
 
 /** Đi theo chuỗi mã thay thế, dừng khi gặp vòng lặp. */
-function resolve(id: string, replacements: Readonly<Record<string, string>>): string {
+export function resolveId(id: string, replacements: Readonly<Record<string, string>>): string {
   let current = id;
   const visited = new Set<string>();
   while (Object.hasOwn(replacements, current) && !visited.has(current)) {
@@ -91,13 +91,13 @@ const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 export function applyReplacements(progress: Progress, replacements: Readonly<Record<string, string>>): Progress {
   const items: Record<string, string> = {};
   for (const [id, at] of Object.entries(progress.items)) {
-    const target = resolve(id, replacements);
+    const target = resolveId(id, replacements);
     if (UNSAFE_KEYS.has(target)) continue;
     items[target] = items[target] && items[target] < at ? items[target] : at;
   }
   const topics: Record<string, TopicEntry> = {};
   for (const [id, entry] of Object.entries(progress.topics)) {
-    const target = resolve(id, replacements);
+    const target = resolveId(id, replacements);
     if (UNSAFE_KEYS.has(target)) continue;
     topics[target] = topics[target] && topics[target].at > entry.at ? topics[target] : entry;
   }

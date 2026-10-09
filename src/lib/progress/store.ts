@@ -38,6 +38,7 @@ export class ProgressStore {
   private snapshot: ProgressSnapshot;
   private readonly listeners = new Set<Listener>();
   private readonly changeListeners = new Set<ChangeListener>();
+  private readonly replacementListeners = new Set<Listener>();
 
   constructor(
     private readonly storage: StorageLike | null,
@@ -71,10 +72,28 @@ export class ProgressStore {
     return () => this.listeners.delete(listener);
   };
 
-  /** Cập nhật bảng mã thay thế khi trang có manifest mới. */
+  getReplacements = (): Readonly<Record<string, string>> => this.replacements;
+
+  /** Báo khi bảng mã thay thế đổi, để đồng bộ tài khoản kéo lại theo mã mới. */
+  onReplacements = (listener: Listener): (() => void) => {
+    this.replacementListeners.add(listener);
+    return () => this.replacementListeners.delete(listener);
+  };
+
+  /**
+   * Cập nhật bảng mã thay thế khi trang có manifest mới; bỏ qua nếu bảng không đổi.
+   * Chỉ báo giao diện vẽ lại khi bảng mới làm đổi tiến độ đang lưu: mọi trang đều gọi hàm này lúc tải,
+   * nên không vẽ lại thừa khi tiến độ không có mã cũ nào.
+   */
   setReplacements(replacements: Readonly<Record<string, string>>): void {
+    if (sameReplacements(this.replacements, replacements)) return;
     this.replacements = replacements;
-    this.reload();
+    const next = this.read();
+    if (next.persistent !== this.snapshot.persistent || JSON.stringify(next.progress) !== JSON.stringify(this.snapshot.progress)) {
+      this.snapshot = next;
+      this.emit();
+    }
+    for (const listener of this.replacementListeners) listener();
   }
 
   toggle(id: string): void {
@@ -203,4 +222,9 @@ export function getProgressStore(): ProgressStore {
 export function stopEarlyQueue(): void {
   releaseEarlyQueue?.();
   releaseEarlyQueue = undefined;
+}
+
+function sameReplacements(a: Readonly<Record<string, string>>, b: Readonly<Record<string, string>>): boolean {
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((key) => Object.hasOwn(b, key) && b[key] === a[key]);
 }

@@ -239,3 +239,93 @@ describe('session ending and early start', () => {
     expect(sync.pendingCount()).toBe(0);
   });
 });
+
+describe('replacements during account sync', () => {
+  const MAP = { 'old.t': 'new.t' };
+  const T2 = '2026-10-02T10:00:00.000Z';
+  const S = '2026-10-07T00:00:00.000Z';
+
+  it('pulls everything again once when replacements become known, so an old mark does not come back', async () => {
+    const { storage, store, remote, sync } = setup();
+    remote.rows = {
+      items: [],
+      topics: [
+        { topic_id: 'old.t', mark: 'done', changed_at: T1, synced_at: S },
+        { topic_id: 'new.t', mark: null, changed_at: T2, synced_at: S },
+      ],
+      starts: [],
+    };
+    await sync.start();
+    expect(remote.pulls).toEqual([null]);
+
+    store.setReplacements(MAP);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(remote.pulls).toEqual([null, null]);
+    expect(store.getSnapshot().progress.topics).toEqual({});
+    expect(meta(storage).replacements).toBe(JSON.stringify([['old.t', 'new.t']]));
+
+    store.setReplacements({ ...MAP });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(remote.pulls).toHaveLength(2);
+    await sync.syncNow();
+    expect(remote.pulls[2]).not.toBeNull();
+  });
+
+  it('pushes guest progress under the new ids on first sign-in', async () => {
+    const { store, remote, sync } = setup(progress({ topics: { 'old.t': { s: 'done', at: T1 } } }));
+    store.setReplacements(MAP);
+    await sync.start();
+    expect(Object.keys(remote.pushes[0].topics)).toEqual(['new.t']);
+    expect(store.getSnapshot().progress.topics).toEqual({ 'new.t': { s: 'done', at: T1 } });
+  });
+
+  it('does not reload or notify when the same replacements are set again', () => {
+    const store = new ProgressStore(memoryStorage());
+    let notified = 0;
+    store.onReplacements(() => (notified += 1));
+    store.setReplacements(MAP);
+    store.setReplacements({ ...MAP });
+    expect(notified).toBe(1);
+    expect(store.getReplacements()).toEqual(MAP);
+  });
+
+  it('rewrites a queued change on an old id to the new id before pulling and pushing', async () => {
+    const { storage, store, remote, sync } = setup();
+    storage.setItem(accountMetaKey(USER), JSON.stringify({
+      v: 1, cursor: null,
+      pending: { items: {}, topics: { 'old.t': { topic_id: 'old.t', mark: null, changed_at: '2026-10-05T00:00:00.000Z' } }, starts: {} },
+    }));
+    remote.rows = { items: [], topics: [{ topic_id: 'old.t', mark: 'done', changed_at: T1, synced_at: S }], starts: [] };
+    store.setReplacements(MAP);
+    await sync.start();
+    expect(store.getSnapshot().progress.topics).toEqual({});
+    expect(Object.keys(remote.pushes[0].topics)).toEqual(['new.t']);
+    expect(remote.pushes[0].topics['new.t']).toMatchObject({ topic_id: 'new.t', mark: null });
+  });
+
+  it('does not pull again when a page sets the replacements this device already synced with', async () => {
+    const { storage, store, remote, sync } = setup();
+    storage.setItem(accountMetaKey(USER), JSON.stringify({
+      v: 1, cursor: S, pending: { items: {}, topics: {}, starts: {} }, replacements: JSON.stringify([['old.t', 'new.t']]),
+    }));
+    await sync.start();
+    expect(remote.pulls).toHaveLength(1);
+    store.setReplacements(MAP);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(remote.pulls).toHaveLength(1);
+  });
+
+  it('re-renders only when the replacements change what is stored', () => {
+    const storage = memoryStorage();
+    storage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(progress({ items: { a: T1 } })));
+    const store = new ProgressStore(storage);
+    let renders = 0;
+    store.subscribe(() => (renders += 1));
+    store.setReplacements(MAP);
+    expect(renders).toBe(0);
+    storage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(progress({ topics: { 'old.t': { s: 'done', at: T1 } } })));
+    store.setReplacements({ 'old.t': 'newer.t' });
+    expect(renders).toBe(1);
+    expect(store.getSnapshot().progress.topics).toEqual({ 'newer.t': { s: 'done', at: T1 } });
+  });
+});

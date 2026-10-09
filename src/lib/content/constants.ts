@@ -2,7 +2,7 @@
  * Hằng số nội dung dùng được ở cả máy chủ lẫn trình duyệt.
  * Tách khỏi schema.ts để component phía trình duyệt không kéo theo Zod.
  */
-export const TRACKS = ['java', 'spring', 'devops', 'microservices'] as const;
+export const TRACKS = ['java', 'spring', 'devops', 'kubernetes', 'microservices'] as const;
 export type Track = (typeof TRACKS)[number];
 
 /** Ba cấp của một roadmap, theo thứ tự. */

@@ -11,6 +11,7 @@
 | [design-direction.md](design-direction.md) | **Định hướng thiết kế đã chốt** (Sổ tay kỹ sư): tính cách, màu, chữ, bố cục trong Fumadocs, component bài học và roadmap, thứ tự áp dụng |
 | [superpowers/specs/](superpowers/specs/), [superpowers/plans/](superpowers/plans/) | Spec và kế hoạch triển khai (tách roadmap, ngày 03/10/2026) |
 | [java-content-review.md](java-content-review.md) | Đánh giá độ đủ của roadmap Java và Spring Boot cho dự án thật, đề xuất tách roadmap Spring Boot và nội dung bổ sung (09/10/2026, đợt 1 đã làm) |
+| [devops-content-review.md](devops-content-review.md) | Đánh giá roadmap DevOps cho hệ thống lớn, đề xuất tách roadmap Kubernetes, capstone (09/10/2026); báo cáo nghiên cứu chi tiết ở [research/devops/](research/devops/) |
 | [framework-comparison.md](framework-comparison.md) | So sánh Astro Starlight và Fumadocs theo yêu cầu của Masteva, đã chốt Fumadocs |
 
 Thứ tự đọc đề xuất: product-vision → market-research → features → content-standard → architecture.

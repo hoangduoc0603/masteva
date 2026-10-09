@@ -23,6 +23,7 @@ Cập nhật lần cuối: 09/10/2026. File này giúp một session mới biế
 | **Tách roadmap Spring Boot (đợt 1)** | Roadmap mới `spring-boot` (track `spring`, màu sáng `#2e7031`, tối `#6fd27a`), 14 chặng SB1–SB14: 6 chặng chuyển từ Java giữ nguyên mã, URL và bài (j11, j12, j13, j15, j16, j17), 8 chặng khung mới (sb2, sb4, sb5, sb7, sb10, sb12, sb13, sb14) với 53 chủ đề mới, chưa có bài. Java còn 14 chặng J1–J14 (j14 thành J11 Concurrency, j18 thành J12 JVM, j19 thành J13, j20 thành J14), mô tả mới. Đổi mã hiển thị một lượt bằng script: 472 chỗ trong 72 file (bảng ánh xạ bên dưới). Mã bài hiển thị tính từ mã chặng và thứ tự bài (`LessonRef.code`, `LiteTopic.lessonCode`, ví dụ "bài SB3.2"). `content:check` thêm `validateCodeRefs`: báo lỗi khi nội dung nhắc mã chặng (J/SB/D/M) không tồn tại hoặc số bài vượt số bài của chặng, bỏ qua khối code. Tổng 4 roadmap, 66 chặng, 432 chủ đề. Unit test: 136 | [spec](superpowers/specs/2026-10-09-tach-roadmap-spring-boot-design.md), [plan](superpowers/plans/2026-10-09-tach-roadmap-spring-boot.md), [đánh giá](java-content-review.md) |
 | **Roadmap Spring Boot đợt 2** | 12 bài mới cho 4 chặng khung: SB2 Kiểm thử với Spring (2 bài: test slice, cache context, Testcontainers `@ServiceConnection`, Docker Compose, `RestTestClient`, chiến lược test), SB4 Transaction (2 bài: proxy, propagation, rollback, tự gọi; `readOnly`, isolation và write skew trên PostgreSQL, transaction dài và khoá dòng, `@TransactionalEventListener`), SB5 Spring Data JPA chuyên sâu (5 bài: quan hệ và cascade; persistence context và flush; fetch plan, projection, Specification, keyset; auditing, `@SoftDelete`, batch, Spring Data JDBC; migration không downtime với Flyway), SB7 Gọi service khác (3 bài: `RestClient`, HTTP Service Client, timeout, chống SSRF bằng `InetAddressFilter`; `@Retryable`, `@ConcurrencyLimit`, Resilience4j; gRPC). Viết bằng 4 agent song song, mọi lab chạy thật (Spring Boot 4.1.1, Hibernate 7.4.5, Flyway 12.4.0, Testcontainers 2.0.5, PostgreSQL 18.6, Resilience4j 2.4.0, Spring gRPC 1.1.1), mỗi chặng một reviewer độc lập và một vòng sửa. Phát hiện từ lab đưa vào bài: `InetAddressFilter` với HttpClient JDK không lọc lại sau redirect; keyset `Window` của Spring Data sinh điều kiện `OR` không dùng được index; `@SoftDelete` cấm to-one LAZY và giữ khoá chính bảng nối; `CREATE INDEX CONCURRENTLY` cần `spring.flyway.postgresql.transactional-lock=false` và `SET LOCAL lock_timeout`. J9.3 trỏ retry và circuit breaker sang SB7 | `content/steps/sb2/`, `sb4/`, `sb5/`, `sb7/` |
 | **Roadmap Spring Boot đợt 3 (đủ 14 chặng)** | 13 bài mới cho 4 chặng còn lại: SB10 Tính năng nghiệp vụ hay gặp (4 bài: upload lên object storage tương thích S3 và presigned URL, xuất Excel streaming và PDF tiếng Việt; email sau commit, outbox, `MessageSource`; full-text PostgreSQL với `unaccent`/`pg_trgm`, Envers; đa tenant với `@TenantId`), SB12 Hiệu năng (3 bài: đo tải k6 closed/open và coordinated omission, JFR tìm điểm nghẽn; thread pool Tomcat với virtual thread, Hikari và chuỗi timeout; CDS, AOT cache JDK 25, Spring AOT, JPA bootstrap bất đồng bộ), SB13 Bảo mật nâng cao (3 bài: method security và IDOR, Row Level Security theo tenant; Spring Authorization Server/Keycloak, BFF cho SPA; audit trail có chuỗi băm, rate limit Bucket4j + Redis), SB14 Starter và nâng cấp (3 bài: auto-configuration và starter tự viết; BOM nội bộ, deprecation, japicmp; nâng cấp Boot 3.5 → 4.1 bằng OpenRewrite). 4 agent song song, lab chạy thật, mỗi chặng một reviewer độc lập (bắt 2 lỗi Critical ở SB13: test chạy nhầm database dev, chuỗi băm sửa được) và một vòng sửa. Lab SB10 dùng RustFS thay MinIO (MinIO đã archive, không còn image cộng đồng). Sửa kèm bài cũ: SB1.2 (configuration processor phải khai trong `annotationProcessorPaths` từ JDK 23), SB9.2 (outbox ở M7), J14.2 (lệnh nâng phiên bản không ghim 4.0.8) | `content/steps/sb10/`, `sb12/`, `sb13/`, `sb14/` |
+| **Tái cấu trúc DevOps, tách roadmap Kubernetes (đợt 1)** | Theo [đánh giá](devops-content-review.md) (5 báo cáo nghiên cứu ở `docs/research/devops/`: chuẩn tham chiếu và chứng chỉ, vận hành hệ thống lớn, bản đồ công cụ 10/2026, chiến lược lab và chi phí AWS, bối cảnh Việt Nam). DevOps 25 chặng D0–D24 (8 chặng mới: quản lý cấu hình máy, proxy/LB/TLS, sự cố, dung lượng, dữ liệu stateful, blast radius, cloud ở quy mô tổ chức, tuân thủ); roadmap mới `kubernetes` 11 chặng K1–K11 (track xanh dương `#1f4fb3`/`#7aa2ff`), chuyển `d11`, `d13`, `d18` sang và thêm 8 chặng khung. 146 chủ đề mới (tổng 560), 18 mã thay thế. Mọi trang đặt bảng mã thay thế ngay khi tải (component trong layout). Đồng bộ tài khoản áp mã thay thế: gộp dòng mã cũ theo bản mới nhất, đổi mã cũ trong hàng đợi trước khi kéo và đẩy, kéo lại toàn bộ một lần khi bảng thay thế khác bảng đã đồng bộ, tiến độ khách đẩy lên bằng mã mới. Review độc lập: sửa 2 lỗi Important (bảng thay thế chưa có ở trang callback và trang chủ; hàng đợi giữ mã cũ), 3 lỗi nhỏ để lại. Kiểm tra mã nhận tiền tố `K`. Chưa có bài mới; tóm tắt và tài liệu chủ đề viết cùng bài. Unit 145, E2E 93 | [spec](superpowers/specs/2026-10-09-tai-cau-truc-roadmap-devops-design.md), [plan](superpowers/plans/2026-10-09-tai-cau-truc-roadmap-devops.md) |
 | Công cụ cho Claude Code | Đã cài cho project: plugin Impeccable, frontend-design, Superpowers; skill web-design-guidelines, vercel-react-best-practices | `.claude/settings.json`, `.claude/skills/` |
 
 Ánh xạ mã chặng khi tách Spring Boot (09/10/2026). Mã định danh và URL (`j11`, `/vi/learn/j11/…`) không đổi, chỉ đổi mã hiển thị; tài liệu cũ trong `docs/` vẫn dùng mã cũ.
@@ -30,6 +31,12 @@ Cập nhật lần cuối: 09/10/2026. File này giúp một session mới biế
 | Cũ | J11 | J12 | J13 | J14 | J15 | J16 | J17 | J18 | J19 | J20 |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Mới | SB1 | SB3 | SB6 | J11 | SB8 | SB9 | SB11 | J12 | J13 | J14 |
+
+Ánh xạ mã chặng DevOps khi tái cấu trúc (09/10/2026). Mã định danh và URL giữ nguyên.
+
+| Cũ | D5 | D6 | D7 | D8 | D9 | D10 | D11 | D13 | D14 | D17 | D18 | D19 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Mới | D7 | D5 | D6 | D14 | D10 | D11 | K1 | K4 | D13 | D20 | K11 | D23 |
 
 ## Quyết định đã chốt
 
@@ -53,7 +60,7 @@ Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva
 
 0. **Tài khoản trên production:** người dùng thử đăng nhập Google trên https://masteva.kevin-itbk.workers.dev. Muốn mọi tài khoản Google đăng nhập được thì bấm Publish app trên Google Auth Platform (hiện ở chế độ Testing). Gói Free của Supabase tạm dừng project khi database ít hoạt động trong 7 ngày; workflow `supabase-keepalive.yml` gọi `public.keepalive()` mỗi ngày lúc 09:17 giờ Việt Nam (thêm 08/10/2026; lần chạy lỗi thì GitHub báo qua email). Cảnh báo duy nhất của advisors trên production là Leaked Password Protection, không áp dụng vì chỉ đăng nhập Google.
 1. **Người dùng học thử roadmap Java và Spring Boot** (88 bài) và ghi lại chỗ vướng; ưu tiên sửa nội dung theo phản hồi thật.
-2. **Roadmap DevOps** theo đúng quy trình Java và Spring Boot: tóm tắt và tài liệu cho chủ đề, bài cho từng chặng (lab trên VM Lima, Docker, Kubernetes local), review và sửa. Sau đó Microservices.
+2. **DevOps và Kubernetes đợt 2:** bài cho D0–D5 và K1–K3 (kèm tóm tắt và tài liệu chủ đề), lab chạy thật theo [chiến lược lab](research/devops/d-chien-luoc-lab.md); 4 chặng song song, reviewer độc lập, vòng sửa. Bài cần AWS: người dùng tạo tài khoản AWS lab riêng (Free plan, budget alarm 5 và 10 USD) trước khi tới D10. Sau đó Microservices.
 3. **Đề cương hai dự án** (Neobank, Hub hội thoại) và trang `/setup` chuẩn bị môi trường.
 4. Kiểm tra bản deploy đầu tiên trên `*.workers.dev`, rồi gắn tên miền.
 
@@ -76,7 +83,6 @@ Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva
 - Lỗi nhỏ của tài khoản (review 07/10/2026), chưa sửa:
   - Kéo về phân trang theo offset có thể bỏ sót dòng khi một bảng quá 1.000 dòng và máy khác ghi giữa chừng; nên đổi sang keyset (`synced_at`, mã).
   - `PAGE_SIZE = 1000` giả định `max_rows` của project cloud là 1000.
-  - `replacements` chưa áp vào tiến độ khách khi gộp và trước bước so thời điểm trong `applyRemote` (hiện `replacements` rỗng).
   - Hai máy gộp hai cấp bắt đầu khác nhau (cùng thời điểm 0) có thể lệch nhau tới khi người học đổi lại.
   - Nút Đăng xuất không có `try/finally`; `signOut()` chờ `syncNow()` không giới hạn thời gian.
   - `start()` ném lỗi (hết quota) thì menu hiện khách dù kho đang ở bản sao tài khoản.
@@ -96,12 +102,13 @@ Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva
   - Bài SB dài 430–1170 dòng (lab đầy đủ trong heredoc); muốn ngắn hơn thì tách code lab ra repo mẫu (chuẩn nội dung §2.4) hoặc tách SSRF khỏi SB7.1.
   - SB1.4 (`j11-4.mdx`) dùng `RestClient.create(...)`, trái lời khuyên của SB7.1 (dùng builder do Boot cấu hình); sửa thì phải chạy lại lab.
   - Lab SB7.1 cần Internet (httpbin.org cho bước redirect); Spring Data JDBC (chủ đề tuỳ chọn của SB5) chỉ có phần Kiến thức.
-  - Thư mục lab còn trên máy (lệnh xoá bị chặn quyền): `~/masteva-sb*` (lab, bản nháp, `-review`) và `~/.m2/repository/dev/masteva/`.
 - Sau đợt 3 Spring Boot (09/10/2026):
   - Bài SB10–SB14 dài 640–1200 dòng; SB13.1, SB14.1, SB14.2 trên 1100 dòng vì lab dựng từ đầu (thư viện nhiều module, ba role PostgreSQL). Muốn ngắn hơn thì cần repo mẫu.
   - Số đo của SB12 lấy trên `Apple M1 Pro` 10 core, chỉ có nghĩa khi so trước/sau trên cùng máy; máy tải cao làm số dao động.
   - Lab SB10.1 dùng RustFS 1.0.1 (GA 09/2026); SB13.3 dùng Bucket4j 8.21.0 (phát hành 02/10/2026). Hai công cụ mới, nên rà lại khi lên phiên bản.
   - Lab SB14.3 cần mạng (Spring Boot 3.5 và recipe OpenRewrite); recipe `UpgradeSpringBoot_4_1` không có trong `rewrite-spring` 6.37.1.
+- Sau tái cấu trúc DevOps (09/10/2026): người đã đặt "Tôi đã biết cấp Middle/Senior" ở DevOps giờ được hiểu theo cấu trúc mới (cấp đổi nội dung, Kubernetes thành roadmap riêng); tiến độ lưu theo cấp nên không tự chuyển.
+- Ô tích trong bài bấm ngay sau chuyển trang phía trình duyệt, trước khi React gắn handler, thì không được ghi (E2E đã chờ handler; người dùng thật hiếm gặp).
 - Lighthouse CI chưa cài.
 
 ## Cách làm việc với người dùng

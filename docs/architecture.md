@@ -55,7 +55,7 @@ Phiên bản cụ thể của từng thư viện được ghi trong `package.jso
 ```text
 masteva/
 ├── content/
-│   ├── roadmaps/              # roadmap: cấp và thứ tự chặng (java, spring-boot, devops, microservices)
+│   ├── roadmaps/              # roadmap: cấp và thứ tự chặng (java, spring-boot, devops, kubernetes, microservices)
 │   ├── steps/                 # mỗi bước một thư mục, chứa các bài học
 │   │   └── d1/
 │   │       ├── meta.json      # thông tin chặng, chủ đề trên sơ đồ, liên kết, thứ tự bài
@@ -89,8 +89,8 @@ Quy tắc phụ thuộc:
 
 | Thực thể | Định danh | Chứa gì | Ghi chú |
 |---|---|---|---|
-| Roadmap | `java`, `spring-boot`, `devops`, `microservices` | Tên, mô tả, màu (`track`), ba cấp (Nền tảng, Middle, Senior) mỗi cấp có mục tiêu và danh sách chặng; bước nên học trước từ roadmap khác (`recommended`) | Chỉ tham chiếu tới chặng, không chứa bài |
-| Bước (chặng) | `d1` | Tên, mã hiển thị (`code`, ví dụ `D1`, `SB3`), nhánh, bước tiên quyết, chủ đề trên sơ đồ, liên kết sang chặng của roadmap khác, danh sách bài; `optional` cho chặng tuỳ chọn | Mỗi chặng thuộc đúng một roadmap. Mã hiển thị khai báo trong `meta.json`, độc lập với định danh (chặng `j12` có mã `SB3`); mã bài tính từ mã chặng và thứ tự bài (`SB3.2`). `content:check` báo lỗi khi nội dung nhắc mã chặng không tồn tại hoặc số bài vượt số bài của chặng ([spec 2026-10-09](superpowers/specs/2026-10-09-tach-roadmap-spring-boot-design.md) §5) |
+| Roadmap | `java`, `spring-boot`, `devops`, `kubernetes`, `microservices` | Tên, mô tả, màu (`track`), ba cấp (Nền tảng, Middle, Senior) mỗi cấp có mục tiêu và danh sách chặng; bước nên học trước từ roadmap khác (`recommended`) | Chỉ tham chiếu tới chặng, không chứa bài |
+| Bước (chặng) | `d1` | Tên, mã hiển thị (`code`, ví dụ `D1`, `SB3`, `K2`), nhánh, bước tiên quyết, chủ đề trên sơ đồ, liên kết sang chặng của roadmap khác, danh sách bài; `optional` cho chặng tuỳ chọn | Mỗi chặng thuộc đúng một roadmap. Mã hiển thị khai báo trong `meta.json`, độc lập với định danh (chặng `j12` có mã `SB3`); mã bài tính từ mã chặng và thứ tự bài (`SB3.2`). `content:check` báo lỗi khi nội dung nhắc mã chặng không tồn tại hoặc số bài vượt số bài của chặng ([spec 2026-10-09](superpowers/specs/2026-10-09-tach-roadmap-spring-boot-design.md) §5) |
 | Chủ đề | `j5.generics` | Tên, loại (`core`, `pick` kèm `options`, `opt`), mô tả ngắn, chủ đề nên học trước, đọc thêm | Nút trên sơ đồ; bài khai báo chủ đề mình bao phủ bằng frontmatter `topics` |
 | Bài học | `d1.1` | Metadata (mục 5.2) và nội dung 6 phần | File MDX |
 | Mục đánh dấu | `d1.1.exit-code` | Một ý kiến thức, một bước thực hành hoặc một tiêu chí | Khai báo bằng component trong MDX |

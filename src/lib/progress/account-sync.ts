@@ -18,6 +18,7 @@ import {
   nextCursor,
   pendingSize,
   removeSent,
+  resolvePending,
   type PendingChanges,
   type RemoteRows,
 } from './sync';
@@ -43,7 +44,7 @@ export const RETRY_DELAY_MS = 30_000;
 
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error';
 
-type Meta = { v: 1; cursor: string | null; pending: PendingChanges };
+type Meta = { v: 1; cursor: string | null; pending: PendingChanges; replacements?: string };
 
 export interface AccountSyncOptions {
   store: ProgressStore;
@@ -65,7 +66,8 @@ function readMeta(storage: StorageLike, userId: string): Meta | null {
       'cursor' in meta && (meta.cursor === null || typeof meta.cursor === 'string') &&
       'pending' in meta && isPendingChanges(meta.pending)
     ) {
-      return { v: 1, cursor: meta.cursor, pending: meta.pending };
+      const replacements = 'replacements' in meta && typeof meta.replacements === 'string' ? meta.replacements : undefined;
+      return { v: 1, cursor: meta.cursor, pending: meta.pending, ...(replacements ? { replacements } : {}) };
     }
     return null;
   } catch {
@@ -79,6 +81,12 @@ function saveMeta(storage: StorageLike, userId: string, meta: Meta): void {
   } catch {
     // Hết quota: kho tiến độ đã báo `persistent = false`; lần sau sẽ đồng bộ lại từ server.
   }
+}
+
+/** Khoá ổn định của bảng thay thế; rỗng khi chưa có bảng. */
+function replacementsKey(replacements: Readonly<Record<string, string>>): string {
+  const entries = Object.entries(replacements).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return entries.length === 0 ? '' : JSON.stringify(entries);
 }
 
 /**
@@ -112,11 +120,11 @@ export function queueEarlyChanges(store: ProgressStore, storage: StorageLike): (
   });
 }
 
-function readGuest(storage: StorageLike): Progress {
+function readGuest(storage: StorageLike, replacements: Readonly<Record<string, string>>): Progress {
   for (const key of [PROGRESS_STORAGE_KEY, LEGACY_PROGRESS_STORAGE_KEY]) {
     try {
       const raw = storage.getItem(key);
-      if (raw) return parseProgress(JSON.parse(raw)) ?? emptyProgress();
+      if (raw) return parseProgress(JSON.parse(raw), replacements) ?? emptyProgress();
     } catch {
       return emptyProgress();
     }
@@ -130,6 +138,7 @@ export class AccountSync {
   private chain: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private unsubscribe: (() => void) | undefined;
+  private offReplacements: (() => void) | undefined;
   private stopped = false;
 
   constructor(private readonly options: AccountSyncOptions) {}
@@ -155,7 +164,7 @@ export class AccountSync {
     let meta = this.readMeta();
     store.switchKey(accountProgressKey(userId));
     if (!meta) {
-      const guest = readGuest(storage);
+      const guest = readGuest(storage, store.getReplacements());
       const current = store.getSnapshot().progress;
       store.replaceProgress(mergeProgress(current, guest));
       meta = { v: 1, cursor: null, pending: addPending(emptyPending(), guestRows(guest)) };
@@ -163,6 +172,10 @@ export class AccountSync {
       storage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(emptyProgress()));
     }
     this.unsubscribe = store.onChange((before, after) => this.enqueue(diffProgress(before, after, this.now())));
+    // Chỉ kéo lại khi bảng thay thế khác bảng máy này đã đồng bộ (mọi trang đều đặt bảng lúc tải).
+    this.offReplacements = store.onReplacements(() => {
+      if (replacementsKey(store.getReplacements()) !== this.readMeta()?.replacements) void this.syncNow();
+    });
     await this.syncNow();
   }
 
@@ -178,6 +191,7 @@ export class AccountSync {
     this.stopped = true;
     clearTimeout(this.timer);
     this.unsubscribe?.();
+    this.offReplacements?.();
   }
 
   private now(): Date {
@@ -193,17 +207,24 @@ export class AccountSync {
 
   private async pull(): Promise<void> {
     const before = this.readMeta();
-    const since = before?.cursor ? new Date(Date.parse(before.cursor) - PULL_OVERLAP_MS).toISOString() : null;
+    const replacements = this.options.store.getReplacements();
+    const key = replacementsKey(replacements);
+    // Bảng thay thế mới: kéo lại toàn bộ một lần để dòng mã cũ được gộp đúng vào mã mới.
+    const full = key !== '' && key !== before?.replacements;
+    const since = !full && before?.cursor ? new Date(Date.parse(before.cursor) - PULL_OVERLAP_MS).toISOString() : null;
     const rows = await this.options.remote.pull(since);
     if (this.stopped) return;
     // Đọc lại: trong lúc chờ mạng người học có thể đã tích thêm.
     const meta = this.readMeta() ?? { v: 1, cursor: null, pending: emptyPending() };
-    const { progress, pending } = applyRemote(this.options.store.getSnapshot().progress, meta.pending, rows);
+    const queued = resolvePending(meta.pending, replacements);
+    const { progress, pending } = applyRemote(this.options.store.getSnapshot().progress, queued, rows, replacements);
     this.options.store.replaceProgress(progress);
-    this.saveMeta({ ...meta, cursor: nextCursor(meta.cursor, rows), pending });
+    this.saveMeta({ ...meta, cursor: nextCursor(meta.cursor, rows), pending, ...(key ? { replacements: key } : {}) });
   }
 
   private async push(): Promise<void> {
+    const current = this.readMeta();
+    if (current) this.saveMeta({ ...current, pending: resolvePending(current.pending, this.options.store.getReplacements()) });
     for (const batch of chunkPending(this.readMeta()?.pending ?? emptyPending())) {
       await this.options.remote.push(batch);
       if (this.stopped) return;
