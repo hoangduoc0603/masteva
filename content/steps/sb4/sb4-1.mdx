@@ -1,0 +1,1041 @@
+---
+title: "@Transactional qua proxy: propagation, rollback và lỗi tự gọi"
+description: Nhìn tận mắt proxy và TransactionInterceptor mở, commit, rollback transaction qua log của JpaTransactionManager, chọn propagation đúng cho từng việc, nắm quy tắc rollback và lỗi rollback-only, rồi tái hiện và sửa lỗi tự gọi làm mất transaction.
+id: sb4.1
+step: sb4
+prerequisites: [j12.3]
+topics: [sb4.transactional-proxy, sb4.propagation, sb4.rollback, sb4.tu-goi]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    spring-framework: 7.0.9
+    hibernate: 7.4.5
+    hikaricp: 7.0.2
+    testcontainers: 2.0.5
+    docker: 29.8.0
+    postgresql: "18.6"
+---
+
+<Goal>
+
+Hiểu `@Transactional` từ bên trong: ai mở transaction, transaction gắn vào đâu, và Spring quyết định commit hay rollback theo luật nào. Mọi hiện tượng trong bài đều được tái hiện bằng test chạy trên PostgreSQL thật, với log của transaction manager làm bằng chứng. Học xong bài này, bạn giải thích được:
+
+- Vì sao bạn đã `catch` exception mà method vẫn ném `UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only`.
+- Vì sao method ném `PaymentDeclinedException` mà đơn hàng vẫn nằm trong database.
+- Vì sao một đợt import tạo đủ đơn hàng nhưng kho không bị trừ đồng nào.
+- Vì sao `REQUIRES_NEW` làm service treo rồi báo `Connection is not available` khi tải tăng.
+
+</Goal>
+
+<Knowledge>
+
+### Từ một lời gọi method tới BEGIN và COMMIT
+
+Bài SB1.1 đã nói `@Transactional` hoạt động nhờ một **proxy** do BeanPostProcessor tạo ra, và bài SB3.3 vẽ proxy đó ở mức "mở transaction, gọi method, commit". Bài này mở hộp đen ra. Bean `OrderService` mà bạn inject thực chất là `OrderService$$SpringCGLIB$$0`, một lớp con sinh lúc chạy. Mỗi method public của nó chuyển lời gọi qua chuỗi sau:
+
+```text
+ OrderImporter: orders.place("an", "BOOK-JAVA", 2)
+        |
+        v
+ OrderService$$SpringCGLIB$$0            proxy (lớp con do CGLIB sinh lúc chạy)
+        |
+        v
+ TransactionInterceptor                  advice của Spring cho @Transactional
+   1. Đọc @Transactional của method thành TransactionAttribute:
+      propagation, isolation, readOnly, timeout, rollbackFor, noRollbackFor
+   2. Gọi PlatformTransactionManager.getTransaction(attribute)
+      Spring Boot có JPA nên đây là JpaTransactionManager
+        - thread này đã có transaction?  -> xử lý theo propagation
+        - chưa có -> mở EntityManager, mượn connection từ HikariCP,
+          setAutoCommit(false), gắn cả hai vào ThreadLocal
+          (TransactionSynchronizationManager)
+   3. Gọi method thật ------------------------>  OrderService.place()
+                                                    ProductRepository, JdbcClient...
+                                                    tìm EntityManager và connection
+                                                    trong ThreadLocal rồi dùng chung
+   4a. Method trả về bình thường -> commit (Hibernate flush trước)
+   4b. Method ném exception      -> luật rollback khớp? rollback : commit
+   5. Gỡ khỏi ThreadLocal, đóng EntityManager, trả connection về pool
+```
+
+Ba hệ quả quan trọng của sơ đồ này:
+
+- **Transaction gắn với thread.** Repository và `JdbcClient` không nhận transaction qua tham số; chúng tìm nó trong `ThreadLocal`. Code chạy trên thread khác (`@Async`, `CompletableFuture.supplyAsync`, `parallelStream()`, một virtual thread bạn tự tạo) không thấy transaction của thread gọi, và tự mở transaction riêng hoặc chạy không có transaction.
+- **Chỉ lời gọi đi qua proxy mới được chặn.** Proxy CGLIB chặn method `public`, và từ Spring Framework 6.0 cả `protected` lẫn package-private. Nó không chặn được method `private` hay `final` (lớp con không ghi đè được), và không chặn được lời gọi `this.method()` từ bên trong bean (phần "Tự gọi" ở dưới).
+- **Log của transaction manager là bằng chứng.** Bật `logging.level.org.springframework.orm.jpa.JpaTransactionManager=debug`, mỗi transaction để lại các dòng `Creating new transaction with name [vn.masteva.shop.OrderService.place]`, `Participating in existing transaction`, `Committing JPA transaction`, `Rolling back JPA transaction`. Tên transaction là `class.method` nơi nó được mở, nên đọc log là biết ranh giới transaction thật nằm ở đâu.
+
+Đặt `@Transactional` ở tầng service, trên method biểu diễn một use case ("đặt hàng", "huỷ đơn"). Không đặt ở controller: transaction sẽ kéo dài qua cả lúc serialize JSON. Không trông vào repository: mỗi method repository chỉ là một bước, và method truy vấn tự khai báo như `findBySku` mặc định không có transaction nào.
+
+<Check id="sb4.1.proxy-chain">Vẽ được đường đi từ lời gọi method qua proxy, `TransactionInterceptor`, `JpaTransactionManager` tới connection trong `ThreadLocal`, và giải thích vì sao code trên thread khác không thấy transaction.</Check>
+
+### Propagation: khi đã có transaction thì sao
+
+**Propagation** (lan truyền) trả lời câu hỏi: method `@Transactional` được gọi khi thread **đã** có transaction thì làm gì. Spring phân biệt transaction **vật lý** (một `BEGIN ... COMMIT` thật trên một connection) với transaction **logic** (phạm vi của từng method có `@Transactional`). Với `REQUIRED`, nhiều phạm vi logic cùng ánh xạ vào một transaction vật lý.
+
+| Propagation | Chưa có transaction | Đã có transaction | Dùng khi |
+|---|---|---|---|
+| `REQUIRED` (mặc định) | Mở mới | Tham gia | Hầu hết mọi method nghiệp vụ |
+| `REQUIRES_NEW` | Mở mới | Tạm treo cái ngoài, mở cái mới trên **connection khác** | Việc phải còn lại dù nghiệp vụ rollback: audit, đếm số lần thử |
+| `NESTED` | Mở mới | Tạo **savepoint** trong cùng transaction | Huỷ một phần công việc mà vẫn đi tiếp; chỉ chạy với JDBC thuần |
+| `SUPPORTS` | Chạy không transaction | Tham gia | Method đọc chạy được cả hai cách; ít khi thật sự cần |
+| `MANDATORY` | Ném `IllegalTransactionStateException` | Tham gia | Method chỉ đúng khi nằm trong transaction của người gọi, ví dụ dựa vào khoá dòng đã lấy |
+| `NOT_SUPPORTED` | Chạy không transaction | Tạm treo cái ngoài | Việc không cần database; connection của cái ngoài **vẫn bị giữ** trong lúc treo |
+| `NEVER` | Chạy không transaction | Ném exception | Hầu như không dùng |
+
+Ba điều hay bị bỏ qua:
+
+- **Tham gia là nhận luôn đặc tính của transaction ngoài.** Method bên trong khai báo `readOnly = true`, `isolation` hay `timeout` riêng mà đang tham gia một transaction có sẵn thì các khai báo đó bị lờ đi trong im lặng. Chúng chỉ có tác dụng ở method **mở** transaction. Muốn sai lệch đó thành lỗi thay vì im lặng, gọi `setValidateExistingTransaction(true)` trên transaction manager (phương thức của `AbstractPlatformTransactionManager`, ví dụ qua một bean `TransactionManagerCustomizer<JpaTransactionManager>`): method tham gia khai báo isolation khác, hoặc method ghi tham gia transaction `readOnly`, sẽ ném `IllegalTransactionStateException`.
+- **`REQUIRES_NEW` cần thêm một connection** (bảng thuộc tính của SB3.3 đã nhắc). Phần mới ở đây là hệ quả khi tải cao: 10 thread cùng ở trong transaction ngoài với pool 10 connection thì cả 10 cùng chờ connection thứ hai mà không ai trả, tức pool deadlock. Tài liệu Spring yêu cầu pool lớn hơn số thread đồng thời ít nhất 1. Bước 6 tái hiện điều này với pool 1 connection.
+- **`NESTED` không chạy với JPA.** Savepoint là tính năng của JDBC. `JpaTransactionManager` từ chối `NESTED` theo mặc định, và kể cả khi bật `nestedTransactionAllowed`, Hibernate báo `JpaDialect does not support savepoints`. Với Spring Data JPA, chọn `REQUIRES_NEW` hoặc thiết kế lại; `NESTED` chỉ dùng được khi transaction manager là `DataSourceTransactionManager` hay `JdbcTransactionManager`.
+
+```text
+ placeWithIndependentAudit()  REQUIRED: mở T1, connection #1
+   |
+   |-- audit.recordIndependently()  REQUIRES_NEW
+   |      T1 bị treo (connection #1 vẫn bị giữ)
+   |      mở T2 trên connection #2 -> INSERT audit_log -> COMMIT T2
+   |      trả connection #2, tiếp tục T1
+   |
+   |-- place()  REQUIRED: tham gia T1 -> hết hàng -> ném OutOfStockException
+   v
+ ROLLBACK T1   đơn hàng biến mất, dòng audit của T2 vẫn còn
+```
+
+<Check id="sb4.1.propagation-choice">Chọn được propagation cho một việc cụ thể (audit, bước nghiệp vụ, method chỉ chạy trong transaction có sẵn), và giải thích được vì sao `readOnly` hay `isolation` của method tham gia transaction bị bỏ qua.</Check>
+
+### Quy tắc rollback
+
+Khi method ném exception ra khỏi proxy, `TransactionInterceptor` hỏi luật rollback:
+
+| Exception ném ra | Mặc định | Đổi bằng |
+|---|---|---|
+| `RuntimeException` và lớp con (`IllegalStateException`, `DataAccessException`...) | Rollback | `noRollbackFor = ...` |
+| `Error` (`OutOfMemoryError`...) | Rollback | |
+| Exception **checked** (`IOException`, `InterruptedException`, exception tự viết kế thừa `Exception`) | **Commit** | `rollbackFor = ...` trên method, hoặc đổi mặc định cho cả ứng dụng (bên dưới) |
+
+SB3.3 đã nêu luật exception checked làm commit; mặc định này kế thừa từ EJB, nơi exception checked được coi là kết quả nghiệp vụ người gọi xử lý được. Để đổi cho cả ứng dụng (từ Spring Framework 6.2), bạn tự khai báo `@EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)` trên một class `@Configuration`; khai báo đó thay cho cấu hình transaction mặc định mà Spring Boot tự bật. Phần mới ở bài này là đọc luật ngay trong log: transaction có `rollbackFor = PaymentDeclinedException.class` được tạo với chuỗi `PROPAGATION_REQUIRED,ISOLATION_DEFAULT,-vn.masteva.shop.PaymentDeclinedException`, dấu `-` nghĩa là "rollback khi gặp".
+
+**Rollback-only.** Khi method bên trong **tham gia** transaction (REQUIRED) ném exception cần rollback, nó không sở hữu transaction vật lý nên không rollback được. Nó chỉ **đánh dấu** transaction là rollback-only rồi để exception bay tiếp. Nếu method ngoài bắt exception đó và chạy tiếp như không có gì, tới lúc commit Spring thấy dấu và rollback tất cả:
+
+```text
+ placeWithAudit()       REQUIRED: mở T1
+   |-- place()          tham gia T1: trừ kho, INSERT đơn
+   |-- audit.record()   tham gia T1, ném IllegalArgumentException
+   |      TransactionInterceptor của record(): exception này cần rollback,
+   |      nhưng record() không sở hữu T1 -> chỉ đánh dấu T1 rollback-only
+   |   catch (IllegalArgumentException e) { log.warn(...) }   bạn nuốt exception
+   v
+ placeWithAudit() trả về bình thường -> Spring định commit T1
+   T1 đã bị đánh dấu -> rollback toàn bộ, kể cả đơn hàng
+   -> UnexpectedRollbackException: Transaction silently rolled back
+      because it has been marked as rollback-only
+```
+
+Spring cố ý ném `UnexpectedRollbackException` để người gọi không tưởng nhầm là đã commit. Cách sửa tuỳ ý định:
+
+| Ý định | Cách sửa |
+|---|---|
+| Lỗi bên trong làm hỏng cả nghiệp vụ | Đừng bắt ở ngoài; để exception bay ra và transaction rollback |
+| Việc phụ được phép thất bại riêng (audit, thống kê) | Cho method bên trong `REQUIRES_NEW` và bắt exception ở ngoài |
+| Exception là kết quả nghiệp vụ, dữ liệu vẫn đúng | `noRollbackFor` trên method bên trong |
+| Lỗi đoán trước được (dữ liệu vào quá dài) | Kiểm tra trước khi gọi, hoặc bỏ `@Transactional` khỏi method bên trong để nó là hàm thường, không đánh dấu gì |
+
+<Check id="sb4.1.rollback-rules">Dự đoán được một transaction commit hay rollback khi gặp exception checked, `RuntimeException` có và không có `rollbackFor`, `noRollbackFor`, và giải thích được chuỗi sự kiện dẫn tới `UnexpectedRollbackException`.</Check>
+
+### Tự gọi: lời gọi không đi qua proxy
+
+SB3.3 đã thấy vòng retry đặt trong cùng class bỏ qua `@Transactional`, vì `this.place(...)` (hoặc `place(...)`) đi thẳng vào đối tượng thật, không qua proxy:
+
+```text
+ OrderImporter --- orders.place() ---> [proxy] --> TransactionInterceptor --> place()   có transaction
+
+ OrderService.importOrders()  (không có @Transactional)
+        |
+        +--- this.place() ------------------------------------------> place()   KHÔNG có transaction
+             @Transactional trên place() chỉ là chữ, không ai đọc nó
+```
+
+Với JPA, hậu quả là mất cập nhật: `Product` trả về từ `findBySku` đã detached nên `take()` không sinh `UPDATE`, trong khi `orders.save(...)` vẫn tự commit. Đơn hàng có, kho không trừ, không exception nào.
+
+Cách nhận ra trong log: tên transaction là method của repository (`SimpleJpaRepository.save`) thay vì method nghiệp vụ của bạn, và đầu dò `TxProbe` in `transaction=false`. Cách sửa:
+
+| Cách | Viết | Ưu | Nhược |
+|---|---|---|---|
+| Tách sang bean khác | `OrderImporter` gọi `orderService.place(...)` | Rõ ràng, test dễ, ranh giới đúng tầng | Thêm một class |
+| `TransactionTemplate` | `tx.execute(status -> place(...))` | Ranh giới transaction hiện ngay trong code, không phụ thuộc proxy | Code dài hơn annotation |
+| Tự inject chính mình | Tham số constructor `@Lazy OrderService self`, gọi `self.place(...)` | Sửa ít dòng | Khó đọc, người sau dễ "dọn" mất `self` |
+| AspectJ weaving | `@EnableTransactionManagement(mode = AdviceMode.ASPECTJ)` | Chặn cả `this` và `private` | Cần weaver lúc build hoặc lúc nạp class; ít đội dùng |
+
+Mọi annotation dựa trên proxy đều chịu cùng luật: `@Async`, `@Cacheable`, `@Retryable`, `@PreAuthorize`.
+
+<Callout kind="production">
+
+Job đêm import đơn từ file đối tác đặt `@Transactional` trên `importOne()` và gọi nó trong vòng lặp của `importAll()` cùng class, để "mỗi dòng một transaction". Test dùng mock nên xanh. Trên production, đơn được tạo đủ nhưng không dòng nào trừ kho; hai ngày sau kho lệch hàng trăm sản phẩm. Manh mối duy nhất là log transaction chỉ có `SimpleJpaRepository.save`. Bước 10 tái hiện đúng lỗi này.
+
+</Callout>
+
+<Check id="sb4.1.self-invocation">Giải thích được vì sao `this.method()` bỏ qua `@Transactional`, vì sao với JPA nó làm mất cập nhật của entity, và chọn được một trong bốn cách sửa cho tình huống cụ thể.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Understanding the Spring Framework's Declarative Transaction Implementation](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/tx-decl-explained.html): sơ đồ proxy và `TransactionInterceptor`, đọc để đối chiếu với sơ đồ ở trên.
+- [Transaction Propagation](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/tx-propagation.html): transaction vật lý và logic, cảnh báo pool deadlock của `REQUIRES_NEW`, giới hạn của `NESTED`.
+- [Rolling Back a Declarative Transaction](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/rolling-back.html): luật rollback mặc định, `rollbackFor` theo kiểu và theo mẫu tên, và bẫy của mẫu tên quá ngắn.
+- [Using @Transactional](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html): bảng thuộc tính, phạm vi method được chặn, đoạn "self-invocation" và chế độ AspectJ.
+- [Proxying Mechanisms](https://docs.spring.io/spring-framework/reference/core/aop/proxying.html): khác nhau giữa proxy JDK và CGLIB, và vì sao method `final` không được chặn.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker đang chạy (Testcontainers dùng nó để khởi động PostgreSQL 18 cho mỗi lần chạy test), JDK 25, `curl` và `unzip`. Bài này không cần mở cổng nào: mọi thí nghiệm là test chạy với PostgreSQL trong container ở cổng ngẫu nhiên. Lần chạy test đầu tiên tải image `postgres:18-alpine` và thư viện Maven, mất vài phút.
+
+### 1. Tạo project
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-sb4 && cd ~/masteva-sb4
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=shop \
+  -d name=shop -d packageName=vn.masteva.shop \
+  -d dependencies=web,data-jpa,flyway,postgresql,testcontainers -o shop.zip
+unzip -q shop.zip -d shop && cd shop
+perl -pi -e 's/postgres:latest/postgres:18-alpine/' src/test/java/vn/masteva/shop/TestcontainersConfiguration.java
+grep -B1 -A3 '@ServiceConnection' src/test/java/vn/masteva/shop/TestcontainersConfiguration.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+	@Bean
+	@ServiceConnection
+	PostgreSQLContainer postgresContainer() {
+		return new PostgreSQLContainer(DockerImageName.parse("postgres:18-alpine"));
+	}
+```
+
+</Expected>
+
+start.spring.io sinh sẵn `TestcontainersConfiguration`: một bean `PostgreSQLContainer` có `@ServiceConnection`, nên Spring Boot tự lấy URL, user, mật khẩu của container làm `DataSource` trong test (SB2 giải thích cơ chế này). Lệnh `perl` ghim image về `postgres:18-alpine` thay vì `latest` để kết quả lặp lại được. Dependency `web` chưa dùng ở bài này; bài SB4.2 cần nó.
+
+### 2. Schema, entity và repository
+
+<Terminal where="mac" title="Cấu hình, migration, entity, repository">
+
+```bash
+cd ~/masteva-sb4/shop
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=shop
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+logging.pattern.console=%5p [%-8.8t] %-24.24logger{0} : %m%n
+logging.level.org.springframework.orm.jpa.JpaTransactionManager=debug
+EOF
+mkdir -p src/main/resources/db/migration
+cat > src/main/resources/db/migration/V1__schema.sql <<'EOF'
+CREATE TABLE products (
+    id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku   text NOT NULL UNIQUE,
+    stock int  NOT NULL CHECK (stock >= 0)
+);
+
+CREATE TABLE orders (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer   text NOT NULL,
+    sku        text NOT NULL REFERENCES products (sku),
+    quantity   int  NOT NULL CHECK (quantity > 0),
+    coupon     text,
+    status     text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE audit_log (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    action     text NOT NULL,
+    detail     text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO products (sku, stock) VALUES ('BOOK-JAVA', 10), ('MUG', 5);
+EOF
+P=src/main/java/vn/masteva/shop
+cat > $P/Product.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+
+@Entity
+@Table(name = "products")
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String sku;
+    private int stock;
+
+    protected Product() {
+    }
+
+    public String getSku() { return sku; }
+    public int getStock() { return stock; }
+
+    public void take(int quantity) {
+        if (quantity > stock) {
+            throw new OutOfStockException(sku + ": need " + quantity + ", have " + stock);
+        }
+        stock -= quantity;
+    }
+}
+EOF
+cat > $P/PurchaseOrder.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+
+@Entity
+@Table(name = "orders")
+public class PurchaseOrder {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String customer;
+    private String sku;
+    private int quantity;
+    private String coupon;
+    private String status = "NEW";
+
+    protected PurchaseOrder() {
+    }
+
+    public PurchaseOrder(String customer, String sku, int quantity, String coupon) {
+        this.customer = customer;
+        this.sku = sku;
+        this.quantity = quantity;
+        this.coupon = coupon;
+    }
+
+    public Long getId() { return id; }
+    public String getCustomer() { return customer; }
+}
+EOF
+cat > $P/AuditEntry.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+
+@Entity
+@Table(name = "audit_log")
+public class AuditEntry {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String action;
+    private String detail;
+
+    protected AuditEntry() {
+    }
+
+    public AuditEntry(String action, String detail) {
+        this.action = action;
+        this.detail = detail;
+    }
+}
+EOF
+cat > $P/OutOfStockException.java <<'EOF'
+package vn.masteva.shop;
+
+public class OutOfStockException extends RuntimeException {
+    public OutOfStockException(String message) {
+        super(message);
+    }
+}
+EOF
+cat > $P/PaymentDeclinedException.java <<'EOF'
+package vn.masteva.shop;
+
+public class PaymentDeclinedException extends Exception {
+    public PaymentDeclinedException(String message) {
+        super(message);
+    }
+}
+EOF
+cat > $P/ProductRepository.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.Optional;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProductRepository extends JpaRepository<Product, Long> {
+    Optional<Product> findBySku(String sku);
+}
+EOF
+cat > $P/OrderRepository.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface OrderRepository extends JpaRepository<PurchaseOrder, Long> {
+    long countByCustomerAndCoupon(String customer, String coupon);
+}
+EOF
+cat > $P/AuditRepository.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface AuditRepository extends JpaRepository<AuditEntry, Long> {
+}
+EOF
+```
+
+</Terminal>
+
+- `logging.pattern.console` rút gọn mỗi dòng log còn mức log, tên thread, tên logger và nội dung, để output dễ đọc. Dòng `JpaTransactionManager=debug` là thứ bạn sẽ đọc suốt bài.
+- `OutOfStockException` kế thừa `RuntimeException`, còn `PaymentDeclinedException` kế thừa `Exception` (checked). Sự khác nhau đó quyết định commit hay rollback ở bước 8.
+- Cột `coupon` và `countByCustomerAndCoupon` dành cho bài SB4.2.
+
+### 3. Service và một "đầu dò" transaction
+
+`TxProbe` in ra ba điều ở đúng chỗ nó được gọi: thread hiện tại có transaction thật không, tên transaction, và số connection HikariCP đang cho mượn.
+
+<Terminal where="mac" title="TxProbe, AuditService, OrderService, OrderImporter">
+
+```bash
+cd ~/masteva-sb4/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/TxProbe.java <<'EOF'
+package vn.masteva.shop;
+
+import com.zaxxer.hikari.HikariDataSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+@Component
+public class TxProbe {
+    private static final Logger log = LoggerFactory.getLogger(TxProbe.class);
+    private final HikariDataSource dataSource;
+
+    public TxProbe(HikariDataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+
+    public void log(String where) {
+        log.info("{}: transaction={}, name={}, busy connections={}", where,
+                TransactionSynchronizationManager.isActualTransactionActive(),
+                TransactionSynchronizationManager.getCurrentTransactionName(),
+                dataSource.getHikariPoolMXBean().getActiveConnections());
+    }
+}
+EOF
+cat > $P/AuditService.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class AuditService {
+    private final AuditRepository audits;
+    private final TxProbe probe;
+
+    public AuditService(AuditRepository audits, TxProbe probe) {
+        this.audits = audits;
+        this.probe = probe;
+    }
+
+    @Transactional
+    public void record(String action, String detail) {
+        probe.log("audit.record");
+        if (detail.length() > 30) {
+            throw new IllegalArgumentException("audit detail too long: " + detail.length());
+        }
+        audits.save(new AuditEntry(action, detail));
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void recordIndependently(String action, String detail) {
+        probe.log("audit.recordIndependently");
+        audits.save(new AuditEntry(action, detail));
+    }
+
+    @Transactional(propagation = Propagation.NESTED)
+    public void recordNested(String action, String detail) {
+        audits.save(new AuditEntry(action, detail));
+    }
+}
+EOF
+cat > $P/OrderService.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OrderService {
+    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+    private final ProductRepository products;
+    private final OrderRepository orders;
+    private final AuditService audit;
+    private final TxProbe probe;
+
+    public OrderService(ProductRepository products, OrderRepository orders, AuditService audit, TxProbe probe) {
+        this.products = products;
+        this.orders = orders;
+        this.audit = audit;
+        this.probe = probe;
+    }
+
+    public record OrderLine(String customer, String sku, int quantity) {
+    }
+
+    @Transactional
+    public long place(String customer, String sku, int quantity) {
+        probe.log("place");
+        Product product = products.findBySku(sku).orElseThrow();
+        product.take(quantity);
+        return orders.save(new PurchaseOrder(customer, sku, quantity, null)).getId();
+    }
+
+    @Transactional
+    public long placeAndCharge(String customer, String sku, int quantity) throws PaymentDeclinedException {
+        long id = place(customer, sku, quantity);
+        throw new PaymentDeclinedException("card declined for order " + id);
+    }
+
+    @Transactional(rollbackFor = PaymentDeclinedException.class)
+    public long placeAndChargeStrict(String customer, String sku, int quantity) throws PaymentDeclinedException {
+        long id = place(customer, sku, quantity);
+        throw new PaymentDeclinedException("card declined for order " + id);
+    }
+
+    @Transactional
+    public long placeWithAudit(String customer, String sku, int quantity, String note) {
+        long id = place(customer, sku, quantity);
+        try {
+            audit.record("PLACE", note);
+        } catch (IllegalArgumentException e) {
+            log.warn("audit failed, ignore: {}", e.getMessage());
+        }
+        return id;
+    }
+
+    @Transactional
+    public long placeWithIndependentAudit(String customer, String sku, int quantity) {
+        probe.log("placeWithIndependentAudit");
+        audit.recordIndependently("ATTEMPT", customer + " " + sku + " x" + quantity);
+        return place(customer, sku, quantity);
+    }
+
+    @Transactional
+    public long placeWithNestedAudit(String customer, String sku, int quantity) {
+        audit.recordNested("ATTEMPT", customer + " " + sku + " x" + quantity);
+        return place(customer, sku, quantity);
+    }
+
+    public void importOrders(List<OrderLine> lines) {
+        for (OrderLine line : lines) {
+            try {
+                place(line.customer(), line.sku(), line.quantity());
+            } catch (OutOfStockException e) {
+                log.warn("skip line: {}", e.getMessage());
+            }
+        }
+    }
+}
+EOF
+cat > $P/OrderImporter.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+@Service
+public class OrderImporter {
+    private static final Logger log = LoggerFactory.getLogger(OrderImporter.class);
+    private final OrderService orders;
+
+    public OrderImporter(OrderService orders) {
+        this.orders = orders;
+    }
+
+    public void importOrders(List<OrderService.OrderLine> lines) {
+        for (OrderService.OrderLine line : lines) {
+            try {
+                orders.place(line.customer(), line.sku(), line.quantity());
+            } catch (OutOfStockException e) {
+                log.warn("skip line: {}", e.getMessage());
+            }
+        }
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Mỗi method của `OrderService` là một thí nghiệm. Nhiều method gọi `place(...)`, tức `this.place(...)`: ở các method đã có `@Transactional`, việc đó vô hại vì transaction đã được mở ở method ngoài, `place` chỉ chạy bên trong nó. Riêng `importOrders` không có `@Transactional`: đó là cái bẫy của bước 10. `OrderImporter` làm cùng việc nhưng từ một bean khác; bước 10 dùng nó để sửa lỗi.
+
+### 4. Test đầu tiên: proxy và log transaction
+
+Test class chứa mọi thí nghiệm; mỗi bước sau chạy một method của nó. `reset()` đưa dữ liệu về trạng thái đầu trước mỗi test, `report()` in số đơn, số dòng audit và tồn kho sách Java.
+
+<Terminal where="mac" title="Tạo TransactionRulesTest và chạy test proxy">
+
+```bash
+cd ~/masteva-sb4/shop
+cat > src/test/java/vn/masteva/shop/TransactionRulesTest.java <<'EOF'
+package vn.masteva.shop;
+
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import java.util.List;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.aop.support.AopUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.simple.JdbcClient;
+
+@Import(TestcontainersConfiguration.class)
+@SpringBootTest
+class TransactionRulesTest {
+    @Autowired OrderService orders;
+    @Autowired OrderImporter importer;
+    @Autowired JdbcClient jdbc;
+
+    @BeforeEach
+    void reset() {
+        jdbc.sql("TRUNCATE orders, audit_log RESTART IDENTITY").update();
+        jdbc.sql("UPDATE products SET stock = CASE sku WHEN 'BOOK-JAVA' THEN 10 ELSE 5 END").update();
+    }
+
+    void report(String label) {
+        System.out.printf(">> %s: orders=%d, audit=%d, BOOK-JAVA stock=%d%n", label,
+                jdbc.sql("SELECT count(*) FROM orders").query(Long.class).single(),
+                jdbc.sql("SELECT count(*) FROM audit_log").query(Long.class).single(),
+                jdbc.sql("SELECT stock FROM products WHERE sku = 'BOOK-JAVA'").query(Integer.class).single());
+    }
+
+    @Test
+    void proxy() {
+        System.out.println(">> bean class: " + orders.getClass().getName());
+        System.out.println(">> is CGLIB proxy: " + AopUtils.isCglibProxy(orders));
+        orders.place("an", "BOOK-JAVA", 1);
+        report("after place");
+    }
+
+    @Test
+    void requiresNew() {
+        orders.placeWithIndependentAudit("an", "BOOK-JAVA", 1);
+        report("ok");
+        assertThrows(OutOfStockException.class, () -> orders.placeWithIndependentAudit("binh", "BOOK-JAVA", 99));
+        report("out of stock");
+    }
+
+    @Test
+    void nested() {
+        var e = assertThrows(Exception.class, () -> orders.placeWithNestedAudit("an", "BOOK-JAVA", 1));
+        System.out.println(">> thrown: " + e);
+    }
+
+    @Test
+    void checkedException() {
+        var e = assertThrows(PaymentDeclinedException.class, () -> orders.placeAndCharge("an", "BOOK-JAVA", 2));
+        System.out.println(">> thrown: " + e);
+        report("checked, default rules");
+    }
+
+    @Test
+    void checkedExceptionWithRollbackFor() {
+        assertThrows(PaymentDeclinedException.class, () -> orders.placeAndChargeStrict("an", "BOOK-JAVA", 2));
+        report("checked, rollbackFor");
+    }
+
+    @Test
+    void rollbackOnly() {
+        var e = assertThrows(Exception.class,
+                () -> orders.placeWithAudit("an", "BOOK-JAVA", 1, "note from the mobile app, v7.3.1"));
+        System.out.println(">> thrown: " + e);
+        report("rollback-only");
+    }
+
+    @Test
+    void selfInvocation() {
+        orders.importOrders(List.of(
+                new OrderService.OrderLine("an", "BOOK-JAVA", 2),
+                new OrderService.OrderLine("binh", "BOOK-JAVA", 3)));
+        report("import via this.place");
+    }
+
+    @Test
+    void selfInvocationFixed() {
+        importer.importOrders(List.of(
+                new OrderService.OrderLine("an", "BOOK-JAVA", 2),
+                new OrderService.OrderLine("binh", "BOOK-JAVA", 30),
+                new OrderService.OrderLine("chi", "BOOK-JAVA", 3)));
+        report("import via OrderImporter");
+    }
+}
+EOF
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+txtest() { ./mvnw -q test -Dtest="$1" 2>&1 | grep -E '^>>|TxProbe|WARN.*Order|Creating new|Creating nested|Participating|Suspending|Resuming|Committing|Rolling back|rollback-only'; }
+txtest 'TransactionRulesTest#proxy'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+>> bean class: vn.masteva.shop.OrderService$$SpringCGLIB$$0
+>> is CGLIB proxy: true
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.place]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+ INFO [main    ] TxProbe                  : place: transaction=true, name=vn.masteva.shop.OrderService.place, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Participating in existing transaction
+DEBUG [main    ] JpaTransactionManager    : Committing JPA transaction on EntityManager [SessionImpl(201214457<open>)]
+>> after place: orders=1, audit=0, BOOK-JAVA stock=9
+```
+
+</Expected>
+
+- Hàm `txtest` chạy một test và lọc output, chỉ giữ dòng bắt đầu bằng `>>` của test và các dòng quan trọng của `JpaTransactionManager`. Bỏ phần `| grep ...` nếu muốn xem toàn bộ log. Hàm chỉ sống trong tab Terminal hiện tại; mở tab mới thì chạy lại hai dòng `export` và `txtest() ...`.
+- Bean được inject là `OrderService$$SpringCGLIB$$0`, không phải `OrderService`.
+- Transaction mang tên `OrderService.place` và đã mượn 1 connection trước khi dòng đầu tiên của method chạy. `orders.save(...)` bên trong in `Participating in existing transaction`: method `save` của Spring Data cũng có `@Transactional` (REQUIRED), nên nó tham gia thay vì mở mới. `findBySku` không để lại dòng nào vì method truy vấn tự khai báo không có `@Transactional`; nó vẫn dùng chung EntityManager của transaction qua `ThreadLocal`.
+- Số trong `SessionImpl(...)` khác nhau mỗi lần chạy.
+
+<Check id="sb4.1.lab-proxy-log">Chạy được test, chỉ ra trong log dòng mở transaction, dòng tham gia và dòng commit, và giải thích vì sao `findBySku` không có dòng nào.</Check>
+
+### 5. REQUIRES_NEW: hai transaction, hai connection
+
+<Terminal where="mac">
+
+```bash
+txtest 'TransactionRulesTest#requiresNew'
+```
+
+</Terminal>
+
+<Predict question="Lần gọi thứ hai đặt 99 cuốn, kho chỉ có 9. Sau đó bảng audit_log có mấy dòng?">
+
+```text
+>> ok: orders=1, audit=1, BOOK-JAVA stock=9
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.placeWithIndependentAudit]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+ INFO [main    ] TxProbe                  : placeWithIndependentAudit: transaction=true, name=vn.masteva.shop.OrderService.placeWithIndependentAudit, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Suspending current transaction, creating new transaction with name [vn.masteva.shop.AuditService.recordIndependently]
+ INFO [main    ] TxProbe                  : audit.recordIndependently: transaction=true, name=vn.masteva.shop.AuditService.recordIndependently, busy connections=2
+DEBUG [main    ] JpaTransactionManager    : Participating in existing transaction
+DEBUG [main    ] JpaTransactionManager    : Committing JPA transaction on EntityManager [SessionImpl(897736886<open>)]
+DEBUG [main    ] JpaTransactionManager    : Resuming suspended transaction after completion of inner transaction
+ INFO [main    ] TxProbe                  : place: transaction=true, name=vn.masteva.shop.OrderService.placeWithIndependentAudit, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Rolling back JPA transaction on EntityManager [SessionImpl(1669259232<open>)]
+>> out of stock: orders=1, audit=2, BOOK-JAVA stock=9
+```
+
+Hai dòng (output trên chỉ giữ phần của lần gọi thứ hai; lần đầu in giống hệt nhưng kết thúc bằng hai lần `Committing`). Transaction ngoài của lần gọi thứ hai rollback (không thêm đơn, kho vẫn 9), nhưng dòng audit "binh BOOK-JAVA x99" đã được commit bởi transaction riêng từ trước đó. Ba chi tiết đáng nhìn kỹ:
+
+- `busy connections=2` bên trong `recordIndependently`: thread `main` đang giữ cùng lúc connection của transaction bị treo và connection của transaction mới.
+- Hai `SessionImpl` khác nhau ở hai dòng `Committing`: hai EntityManager, hai persistence context. Entity đã tải ở transaction ngoài không có mặt trong transaction trong.
+- `Resuming suspended transaction`: sau khi transaction trong commit, transaction ngoài được gắn lại vào thread và đi tiếp.
+
+</Predict>
+
+### 6. Khi pool chỉ còn một connection
+
+Test này chạy cùng thí nghiệm với pool HikariCP **1** connection và thời gian chờ 1 giây, như tình huống mọi connection đều đang bận vì tải cao.
+
+<Terminal where="mac" title="Tạo SmallPoolTest và chạy">
+
+```bash
+cd ~/masteva-sb4/shop
+cat > src/test/java/vn/masteva/shop/SmallPoolTest.java <<'EOF'
+package vn.masteva.shop;
+
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+
+@Import(TestcontainersConfiguration.class)
+@SpringBootTest(properties = {
+        "spring.datasource.hikari.maximum-pool-size=1",
+        "spring.datasource.hikari.connection-timeout=1000"})
+class SmallPoolTest {
+    @Autowired OrderService orders;
+
+    @Test
+    void requiresNewNeedsSecondConnection() {
+        long start = System.nanoTime();
+        var e = assertThrows(Exception.class, () -> orders.placeWithIndependentAudit("an", "BOOK-JAVA", 1));
+        System.out.printf(">> after %d ms: %s%n", (System.nanoTime() - start) / 1_000_000, e);
+        System.out.println(">> cause: " + e.getCause().getMessage());
+    }
+}
+EOF
+txtest SmallPoolTest
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.placeWithIndependentAudit]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+ INFO [main    ] TxProbe                  : placeWithIndependentAudit: transaction=true, name=vn.masteva.shop.OrderService.placeWithIndependentAudit, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Suspending current transaction, creating new transaction with name [vn.masteva.shop.AuditService.recordIndependently]
+DEBUG [main    ] JpaTransactionManager    : Rolling back JPA transaction on EntityManager [SessionImpl(1047235367<open>)]
+>> after 1023 ms: org.springframework.transaction.CannotCreateTransactionException: Could not open JPA EntityManager for transaction
+>> cause: Unable to acquire JDBC Connection [HikariPool-1 - Connection is not available, request timed out after 1006ms (total=1, active=1, idle=0, waiting=0)] [n/a]
+```
+
+</Expected>
+
+Thread `main` giữ connection duy nhất trong transaction ngoài và chờ connection thứ hai cho `REQUIRES_NEW`; không ai trả connection nên nó chờ hết 1 giây. `active=1` chính là connection của chính nó. Trên production với pool 10, cảnh này xảy ra khi khoảng 10 request cùng nằm trong transaction ngoài: tất cả chờ nhau tới `connectionTimeout` (mặc định 30 giây), rồi cùng lỗi. Cách phòng: pool lớn hơn số thread đồng thời có thể vào transaction ngoài, hoặc đưa việc cần `REQUIRES_NEW` ra trước hay sau transaction ngoài.
+
+<Check id="sb4.1.lab-requires-new">Chỉ ra được trong log rằng `REQUIRES_NEW` treo transaction ngoài và giữ hai connection, giải thích vì sao audit còn khi nghiệp vụ rollback, và tái hiện được pool deadlock với pool 1 connection.</Check>
+
+### 7. NESTED với JPA
+
+<Terminal where="mac">
+
+```bash
+txtest 'TransactionRulesTest#nested'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.placeWithNestedAudit]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+DEBUG [main    ] JpaTransactionManager    : Rolling back JPA transaction on EntityManager [SessionImpl(1601393216<open>)]
+>> thrown: org.springframework.transaction.NestedTransactionNotSupportedException: Transaction manager does not allow nested transactions by default - specify 'nestedTransactionAllowed' property with value 'true'
+```
+
+</Expected>
+
+`JpaTransactionManager` chặn `NESTED` ngay từ đầu. Nếu bạn bật `nestedTransactionAllowed = true` (ví dụ bằng một bean `TransactionManagerCustomizer<JpaTransactionManager>`), lỗi chỉ đổi thành `NestedTransactionNotSupportedException: JpaDialect does not support savepoints - check your JPA provider's capabilities`. Savepoint chỉ có ở JDBC; với Spring Data JPA, đừng dùng `NESTED`.
+
+### 8. Exception checked và rollbackFor
+
+<Terminal where="mac">
+
+```bash
+txtest 'TransactionRulesTest#checkedException'
+txtest 'TransactionRulesTest#checkedExceptionWithRollbackFor'
+```
+
+</Terminal>
+
+<Predict question="placeAndCharge ghi đơn rồi ném PaymentDeclinedException. Đơn hàng và kho ra sao?">
+
+```text
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.placeAndCharge]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+ INFO [main    ] TxProbe                  : place: transaction=true, name=vn.masteva.shop.OrderService.placeAndCharge, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Participating in existing transaction
+DEBUG [main    ] JpaTransactionManager    : Committing JPA transaction on EntityManager [SessionImpl(1601393216<open>)]
+>> thrown: vn.masteva.shop.PaymentDeclinedException: card declined for order 1
+>> checked, default rules: orders=1, audit=0, BOOK-JAVA stock=8
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.placeAndChargeStrict]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT,-vn.masteva.shop.PaymentDeclinedException
+ INFO [main    ] TxProbe                  : place: transaction=true, name=vn.masteva.shop.OrderService.placeAndChargeStrict, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Participating in existing transaction
+DEBUG [main    ] JpaTransactionManager    : Rolling back JPA transaction on EntityManager [SessionImpl(878783401<open>)]
+>> checked, rollbackFor: orders=0, audit=0, BOOK-JAVA stock=10
+```
+
+Người gọi nhận exception "thẻ bị từ chối", nhưng `Committing`: đơn hàng 1 và việc trừ 2 cuốn đã nằm trong database. Với `rollbackFor`, chuỗi thuộc tính có thêm `-vn.masteva.shop.PaymentDeclinedException` và transaction rollback, kho về 10.
+
+</Predict>
+
+### 9. Rollback-only
+
+`placeWithAudit` gọi `audit.record(...)` với ghi chú dài 32 ký tự; `record` từ chối chuỗi dài hơn 30 và ném `IllegalArgumentException`. `placeWithAudit` bắt nó, ghi cảnh báo, rồi trả về bình thường.
+
+<Terminal where="mac">
+
+```bash
+txtest 'TransactionRulesTest#rollbackOnly'
+```
+
+</Terminal>
+
+<Predict question="Exception đã bị bắt. Method trả về id đơn hàng hay ném lỗi, và đơn có được lưu không?">
+
+```text
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.placeWithAudit]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+ INFO [main    ] TxProbe                  : place: transaction=true, name=vn.masteva.shop.OrderService.placeWithAudit, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Participating in existing transaction
+DEBUG [main    ] JpaTransactionManager    : Participating in existing transaction
+ INFO [main    ] TxProbe                  : audit.record: transaction=true, name=vn.masteva.shop.OrderService.placeWithAudit, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Participating transaction failed - marking existing transaction as rollback-only
+DEBUG [main    ] JpaTransactionManager    : Setting JPA transaction on EntityManager [SessionImpl(1601393216<open>)] rollback-only
+ WARN [main    ] OrderService             : audit failed, ignore: audit detail too long: 32
+DEBUG [main    ] JpaTransactionManager    : Committing JPA transaction on EntityManager [SessionImpl(1601393216<open>)]
+>> thrown: org.springframework.transaction.UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only
+>> rollback-only: orders=0, audit=0, BOOK-JAVA stock=10
+```
+
+Ném lỗi, và không có đơn nào. Đọc log theo thứ tự: `audit.record` tham gia transaction của `placeWithAudit` (cùng `name`), exception ra khỏi proxy của `record` làm Spring in `Participating transaction failed - marking existing transaction as rollback-only`, rồi dòng `WARN` cho thấy bạn đã nuốt exception. Dòng `Committing` vẫn xuất hiện vì Spring giao việc commit cho JPA; JPA thấy cờ rollback-only, rollback, và Spring đổi kết quả thành `UnexpectedRollbackException`. Sửa theo bảng ở phần Kiến thức; với audit, cách hợp nhất là `REQUIRES_NEW` như bước 5.
+
+</Predict>
+
+<Check id="sb4.1.lab-rollback-only">Tái hiện được exception checked làm transaction commit và `UnexpectedRollbackException` do rollback-only, và chỉ ra trong log dòng đánh dấu rollback-only.</Check>
+
+### 10. Tự gọi, rồi sửa
+
+<Terminal where="mac">
+
+```bash
+txtest 'TransactionRulesTest#selfInvocation'
+```
+
+</Terminal>
+
+<Predict question="importOrders đặt 2 cuốn cho an và 3 cuốn cho binh qua this.place(). Kho còn bao nhiêu?">
+
+```text
+ INFO [main    ] TxProbe                  : place: transaction=false, name=null, busy connections=0
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [org.springframework.data.jpa.repository.support.SimpleJpaRepository.save]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+DEBUG [main    ] JpaTransactionManager    : Committing JPA transaction on EntityManager [SessionImpl(606633566<open>)]
+ INFO [main    ] TxProbe                  : place: transaction=false, name=null, busy connections=0
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [org.springframework.data.jpa.repository.support.SimpleJpaRepository.save]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+DEBUG [main    ] JpaTransactionManager    : Committing JPA transaction on EntityManager [SessionImpl(720811350<open>)]
+>> import via this.place: orders=2, audit=0, BOOK-JAVA stock=10
+```
+
+Vẫn 10. `place` chạy với `transaction=false`: annotation của nó không được đọc. Transaction duy nhất là của `SimpleJpaRepository.save`, chỉ bao quanh lệnh `INSERT` đơn hàng. `Product` trả về từ `findBySku` đã detached, nên `take()` không sinh `UPDATE`. Hai đơn, không trừ kho, không exception.
+
+</Predict>
+
+Sửa bằng `OrderImporter` đã tạo ở bước 3: vòng lặp nằm ở bean khác, nên mỗi lời gọi `place` đi qua proxy và có transaction riêng. Dòng thứ hai cố tình đặt 30 cuốn để thấy một dòng hỏng không kéo các dòng khác theo:
+
+<Terminal where="mac">
+
+```bash
+txtest 'TransactionRulesTest#selfInvocationFixed'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.place]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+ INFO [main    ] TxProbe                  : place: transaction=true, name=vn.masteva.shop.OrderService.place, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Participating in existing transaction
+DEBUG [main    ] JpaTransactionManager    : Committing JPA transaction on EntityManager [SessionImpl(1093131483<open>)]
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.place]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+ INFO [main    ] TxProbe                  : place: transaction=true, name=vn.masteva.shop.OrderService.place, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Rolling back JPA transaction on EntityManager [SessionImpl(808696726<open>)]
+ WARN [main    ] OrderImporter            : skip line: BOOK-JAVA: need 30, have 8
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.OrderService.place]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+ INFO [main    ] TxProbe                  : place: transaction=true, name=vn.masteva.shop.OrderService.place, busy connections=1
+DEBUG [main    ] JpaTransactionManager    : Participating in existing transaction
+DEBUG [main    ] JpaTransactionManager    : Committing JPA transaction on EntityManager [SessionImpl(1445073744<open>)]
+>> import via OrderImporter: orders=2, audit=0, BOOK-JAVA stock=5
+```
+
+</Expected>
+
+Ba transaction tên `OrderService.place`, mỗi dòng một cái. Dòng 30 cuốn rollback riêng, hai dòng còn lại commit: kho 10 - 2 - 3 = 5. `OrderService.importOrders` giờ là code chết; trong code thật, xoá nó đi.
+
+<Check id="sb4.1.lab-self-invocation">Tái hiện được lỗi tự gọi làm đơn được tạo mà kho không trừ, nhận ra nó qua tên transaction `SimpleJpaRepository.save` trong log, và sửa bằng bean riêng có transaction cho từng dòng.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Could not find a valid Docker environment`: Docker Desktop chưa chạy. Mở Docker rồi chạy lại; `docker ps` phải trả về không lỗi.
+- `txtest` không in gì: test lỗi biên dịch, và dòng lỗi bị `grep` lọc mất. Chạy `./mvnw -q test -Dtest=TransactionRulesTest#proxy` không có `grep` để xem lỗi.
+- `release version 25 not supported`: `./mvnw` đang chạy trên JDK cũ; chạy lại dòng `export JAVA_HOME=...`.
+- `command not found: txtest`: bạn đang ở tab Terminal mới; định nghĩa lại hàm như bước 4.
+- `Schema validation: missing column`: entity không khớp `V1__schema.sql`, thường do gõ sai tên field. Sửa entity, không đổi `ddl-auto`.
+- Không thấy dòng `JpaTransactionManager`: thiếu dòng `logging.level.org.springframework.orm.jpa.JpaTransactionManager=debug` trong `application.properties`.
+
+</Callout>
+
+### Dọn dẹp
+
+Testcontainers tự xoá container PostgreSQL khi test kết thúc; `docker ps` không còn container `postgres:18-alpine` nào của bài này. Giữ nguyên `~/masteva-sb4/shop`: bài SB4.2 làm tiếp trên chính project này.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Bắt lỗi SQL bên trong một transaction PostgreSQL rồi chạy tiếp có được không?">
+
+Không. Khi một câu lệnh lỗi ở phía database (vi phạm `UNIQUE`, `CHECK`), PostgreSQL đặt **cả transaction** vào trạng thái aborted: mọi câu lệnh sau đó nhận `ERROR: current transaction is aborted, commands ignored until end of transaction block` cho tới khi rollback. Bắt `DataIntegrityViolationException` trong Java không gỡ được trạng thái đó. Muốn thử chèn rồi xử lý trùng lặp, dùng `INSERT ... ON CONFLICT DO NOTHING` để lỗi không xảy ra, hoặc đặt câu lệnh trong savepoint bằng JDBC thuần. Driver pgJDBC có tham số `autosave`: với `autosave=always`, driver tự đặt savepoint trước mỗi câu lệnh và lùi về đó khi câu lệnh lỗi, đổi lại thêm một lượt savepoint cho mỗi câu; `autosave=conservative` chỉ lùi lại cho vài lỗi hiếm về cached statement, không cứu được vi phạm ràng buộc. Với Hibernate, sau một lỗi như vậy persistence context cũng không còn đáng tin, nên cách an toàn vẫn là rollback. Một số database khác cho phép chạy tiếp sau lỗi; PostgreSQL thì không.
+
+</Reveal>
+
+<Reveal title="Mở transaction trong method @Transactional rồi gọi @Async hay parallelStream thì sao?">
+
+Transaction nằm trong `ThreadLocal` của thread gọi. Thread của `@Async`, của `ForkJoinPool` (dùng bởi `parallelStream` và `CompletableFuture.supplyAsync` không truyền executor) hay một virtual thread mới đều không thấy nó. Code ở đó mở transaction riêng hoặc chạy không có transaction, không thấy dữ liệu chưa commit của thread gọi, và không bị rollback theo. Tệ hơn, thread gọi có thể commit trước hay sau khi thread kia đọc dữ liệu. Nếu cần song song, chia dữ liệu trước, để mỗi thread tự có transaction của nó qua một bean có `@Transactional`, và chấp nhận rằng chúng commit độc lập. Bài SB4.2 gặp lại chuyện này với `@Async @EventListener`.
+
+</Reveal>
+
+<Reveal title="REQUIRES_NEW cập nhật cùng dòng mà transaction ngoài đã khoá thì sao?">
+
+Treo. Transaction ngoài đã `UPDATE products ... WHERE sku = 'MUG'` và giữ khoá dòng đó, rồi bị treo để mở transaction trong. Transaction trong (connection khác, với PostgreSQL là một phiên khác) cũng `UPDATE` dòng đó, nên chờ khoá. Nhưng transaction ngoài chỉ chạy tiếp và commit khi transaction trong xong. PostgreSQL không phát hiện được vòng chờ này vì một nửa của nó nằm trong ứng dụng, không phải giữa hai phiên database, nên lời gọi chờ mãi, hoặc tới `lock_timeout` nếu bạn có đặt. Quy tắc: transaction `REQUIRES_NEW` không được đụng vào dòng mà transaction ngoài có thể đã ghi.
+
+</Reveal>
+
+<Reveal title="Có nên bật rollbackOn = ALL_EXCEPTIONS cho cả ứng dụng?">
+
+Với ứng dụng mới, đó là mặc định dễ đoán hơn: exception nào bay ra khỏi method `@Transactional` cũng làm rollback, không ai phải nhớ luật exception checked. Cái giá là bạn mất cách nói "exception này là kết quả nghiệp vụ, hãy commit": phải khai báo rõ bằng `noRollbackFor`, mà trường hợp đó hiếm và nên hiện rõ. Với ứng dụng có sẵn, đổi mặc định toàn cục có thể biến những method đang commit (cố ý hay vô tình) thành rollback; hãy tìm mọi method `@Transactional` khai báo `throws` exception checked và kiểm tra từng cái trước.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI rà một service để tìm method `@Transactional` gọi nhau bằng `this`, method `private` hay `final` có `@Transactional`, method khai báo `throws` exception checked mà không có `rollbackFor`, và `try/catch` bao quanh lời gọi tới method `@Transactional` khác. AI hay đề xuất `@Transactional` trên method `private`, hay "sửa" `UnexpectedRollbackException` bằng cách thêm `REQUIRES_NEW` ở khắp nơi mà không tính connection, và hay khẳng định `NESTED` dùng được với JPA. Kiểm tra lại bằng đúng cách của bài: bật log `JpaTransactionManager` mức debug, chạy test, đọc tên transaction, các dòng `Participating`, `Suspending` và kết quả trong database.
+
+</Callout>
+
+<Callout kind="link">
+
+SB1.1 giới thiệu BeanPostProcessor và proxy; SB3.3 dùng `@Transactional` cho khoá lạc quan, khoá bi quan và tính kích thước pool, kích thước pool đó phải tính thêm `REQUIRES_NEW`. SB4.2 đi tiếp với `readOnly`, isolation, transaction dài và sự kiện sau commit. SB5 đi sâu vào persistence context và flush mà bài này chỉ chạm tới. SB7 đặt `@Retryable` cạnh `@Transactional`, nơi thứ tự hai proxy quyết định retry có đúng không.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb4.1.mastery-review">Đọc một service lạ và chỉ ra được mọi chỗ `@Transactional` không có tác dụng hoặc cho kết quả bất ngờ (tự gọi, method `private`, exception checked, bắt exception của method tham gia transaction), kèm cách sửa.</Check>
+
+<Check id="sb4.1.mastery-design">Thiết kế được ranh giới transaction cho một use case có bước phụ được phép thất bại, chọn đúng propagation và luật rollback, và chứng minh hành vi bằng test có log transaction.</Check>
+
+</Mastery>

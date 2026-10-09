@@ -1,0 +1,818 @@
+---
+title: Retry, giới hạn đồng thời và circuit breaker
+description: Thử lại đúng lỗi tạm thời bằng @Retryable của Spring Framework 7 với backoff và jitter, giới hạn số lời gọi đồng thời bằng @ConcurrencyLimit, ngắt mạch bằng Resilience4j và quan sát nó chuyển trạng thái qua Actuator, rồi ghép timeout, retry và circuit breaker theo đúng thứ tự.
+id: sb7.2
+step: sb7
+prerequisites: [sb7.1]
+topics: [sb7.retryable, sb7.circuit-breaker]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    spring-framework: 7.0.9
+    resilience4j: 2.4.0
+    curl: 8.4.0
+---
+
+<Goal>
+
+Làm cho `shop` của bài SB7.1 chịu được một `stock` chập chờn: thử lại khi lỗi chỉ thoáng qua, không dồn thêm tải khi `stock` đang chết, và vẫn trả được câu trả lời hợp lý trong lúc đó. Học xong bài này, bạn giải thích được:
+
+- Vì sao retry làm một sự cố nhỏ ở service dưới cùng thành sự cố lớn của cả hệ thống, và vì sao jitter quan trọng không kém backoff.
+- Vì sao circuit breaker phải nằm **bên trong** retry, và điều gì xảy ra khi mạch mở giữa chừng một chuỗi retry.
+- Vì sao fallback chỉ nên bắt đúng trường hợp mạch đang mở, không bắt mọi exception.
+
+</Goal>
+
+<Knowledge>
+
+### Retry: chỉ cho lỗi tạm thời và thao tác idempotent
+
+Một lời gọi thất bại vì `stock` vừa khởi động lại, vì một kết nối bị reset, hay vì một pod đang được thay: gọi lại sau vài trăm mili giây thường thành công. Đó là **lỗi tạm thời** (transient). Nhưng retry có hai điều kiện:
+
+| Điều kiện | Vì sao | Ví dụ sai |
+|---|---|---|
+| **Lỗi có khả năng tự hết** | Lỗi cố định thì lần thử sau cho cùng kết quả, chỉ tốn thêm thời gian | Retry 404, 400, 422, lỗi xác thực |
+| **Thao tác idempotent** | Lời gọi "timeout" có thể đã thành công ở phía server; gọi lại là làm hai lần | Retry `POST /payments` không có `Idempotency-Key` (bài J10.2): khách bị trừ tiền hai lần |
+
+Retry còn một cái giá nằm ngoài service của bạn: **khuếch đại tải**. Mỗi lần thử lại là thêm một request cho đúng service đang gặp khó.
+
+```text
+ user -> gateway (thử 4 lần) -> shop (thử 4 lần) -> stock (thử 4 lần) -> database chậm
+ 1 request của người dùng = tới 4 x 4 x 4 = 64 request vào database đang chậm
+```
+
+Quy tắc: retry ở **đúng một tầng**, tầng gần lỗi nhất; số lần thử nhỏ; và có thời gian tổng.
+
+### Backoff và jitter
+
+Gọi lại ngay lập tức hiếm khi giúp được service đang quá tải. **Backoff** giãn khoảng chờ theo cấp số nhân. **Jitter** thêm một lượng ngẫu nhiên, để một nghìn client cùng gặp lỗi lúc 10:00:00 không cùng thử lại đúng lúc 10:00:00.200 (thundering herd, "đàn bò giẫm đạp").
+
+```text
+ delay = 200 ms, multiplier = 2, jitter = 100 ms, maxDelay = 1000 ms
+
+ lần 1   lỗi
+  |-- chờ 200..300 ms --|
+                        lần 2   lỗi
+                         |------ chờ 200..600 ms ------|
+                                                       lần 3   lỗi
+                                                        |--------- chờ 400..1000 ms ---------|
+                                                                                             lần 4
+```
+
+Trong Spring Framework 7, khoảng chờ cơ bản lần lượt là `delay`, `delay * multiplier`, ... (tối đa `maxDelay`). Jitter cũng nhân theo cùng tỉ lệ đó, và khoảng chờ thực tế không bao giờ nhỏ hơn `delay` gốc: lần 2 có cơ sở 400 ms, jitter 200 ms, nhưng chặn dưới ở 200 ms.
+
+### @Retryable của Spring Framework 7
+
+Từ Spring Framework 7, retry nằm sẵn trong `spring-context` (gói `org.springframework.resilience`), không cần thư viện Spring Retry. Bật bằng `@EnableResilientMethods` trên một class `@Configuration`.
+
+```java
+@Retryable(includes = StockUnavailableException.class,
+        maxRetries = 3, delay = 200, multiplier = 2, jitter = 100, maxDelay = 1000,
+        timeout = 2000)
+public Availability check(String sku) { ... }
+```
+
+| Thuộc tính | Mặc định | Ý nghĩa |
+|---|---|---|
+| `includes` / `value` | rỗng: mọi exception | Chỉ retry những exception này (so cả với cause lồng bên trong) |
+| `excludes` | rỗng | Không retry những exception này |
+| `maxRetries` | 3 | Số lần **thử lại**; tổng số lần gọi = 1 + `maxRetries` |
+| `delay` | 1000 ms | Khoảng chờ cơ bản |
+| `multiplier` | 1.0 | Hệ số nhân, 1.0 là chờ cố định |
+| `jitter` | 0 | Biên độ ngẫu nhiên |
+| `maxDelay` | không giới hạn | Trần của một khoảng chờ |
+| `timeout` | 0 (không) | Thời gian tổng cho mọi lần thử và khoảng chờ; có từ 7.0.2 |
+
+- Khi hết lượt, method ném lại **exception gốc của lần thử cuối**, nên `@ExceptionHandler` bắt được như không có retry.
+- `timeout` không cắt ngang một lần gọi đang chạy. Trước mỗi khoảng chờ, Spring tính "nếu chờ thêm thì có vượt không", và dừng sớm nếu có. Hạn chót của từng lần gọi vẫn là read timeout của HTTP client.
+- Mỗi lần thất bại, Spring phát một `MethodRetryEvent`; lab dùng `@EventListener` để ghi log. Muốn retry trong code thay vì annotation, dùng `RetryTemplate` với `RetryPolicy.builder()`.
+- `@Retryable` hoạt động qua **proxy**, như `@Transactional` ở bài SB3.3 và SB4.1: gọi `this.check(...)` từ chính class đó thì không có retry. Thư viện Spring Retry cũ có annotation cùng tên trong gói `org.springframework.retry.annotation`; kiểm tra import.
+
+<Check id="sb7.2.retry-concept">Giải thích được khi nào được retry (lỗi tạm thời, thao tác idempotent), vì sao retry nhiều tầng khuếch đại tải, và vai trò của backoff, jitter, timeout tổng.</Check>
+
+### @ConcurrencyLimit: giới hạn số lời gọi cùng lúc
+
+Khi `stock` chậm, mỗi request vào `shop` giữ một thread chờ nó. Với virtual thread (bài J11.3), số thread gần như không giới hạn, nên không còn pool nào chặn hộ: một nghìn request vào `shop` thành một nghìn request đồng thời vào `stock`. `@ConcurrencyLimit(n)` cho tối đa `n` lời gọi chạy cùng lúc qua method, giống vách ngăn (**bulkhead**) trên tàu: một khoang ngập không làm chìm cả tàu.
+
+| `policy` | Khi đã đủ `n` lời gọi |
+|---|---|
+| `BLOCK` (mặc định) | Lời gọi mới chờ tới khi có chỗ, **không có giới hạn thời gian chờ** |
+| `REJECT` | Ném `InvocationRejectedException` ngay (lớp con của `RejectedExecutionException`) |
+
+Thuộc tính `policy` có từ Spring Framework 7.0.3; khi dùng nó, ghi rõ tên thuộc tính giới hạn: `@ConcurrencyLimit(limit = 2, policy = ConcurrencyLimit.ThrottlePolicy.REJECT)`. Với `BLOCK`, thời gian chờ chỗ cộng thêm vào thời gian của request mà read timeout không đo được. Chọn `REJECT` khi thà trả lỗi nhanh còn hơn để người dùng chờ.
+
+### Circuit breaker
+
+Retry giúp với lỗi thoáng qua. Khi `stock` chết hẳn trong 5 phút, retry chỉ làm mỗi request của `shop` chậm thêm và dội thêm tải vào `stock`. **Circuit breaker** (cầu dao) theo dõi tỉ lệ lỗi của các lời gọi gần đây; khi vượt ngưỡng, nó "nhảy": các lời gọi sau bị từ chối ngay, không chạm tới mạng, cho tới khi hết thời gian chờ.
+
+```text
+                 tỉ lệ lỗi >= failure-rate-threshold
+                 (sau ít nhất minimum-number-of-calls lời gọi)
+     +--------+  ------------------------------------------>  +--------+
+     | CLOSED |                                               |  OPEN  |  mọi lời gọi: CallNotPermittedException,
+     | gọi    |  <----------+                                 | từ chối|  không chạm mạng
+     | bình   |             |                                 +--------+
+     | thường |             | đủ permitted-number-of-calls         |
+     +--------+             | lời gọi thử, tỉ lệ lỗi dưới ngưỡng   | hết wait-duration-in-open-state
+                            |                                      v
+                         +-----------+   lời gọi thử lỗi quá ngưỡng
+                         | HALF_OPEN |  --------------------------------> quay lại OPEN
+                         | cho vài   |
+                         | lời gọi   |
+                         | thử       |
+                         +-----------+
+```
+
+Lab dùng **Resilience4j**, thư viện chuyên cho fault tolerance trên Java. Với Spring Boot 4 cần `resilience4j-spring-boot4` và `spring-boot-starter-aspectj` (annotation `@CircuitBreaker` chạy bằng aspect). Cấu hình theo tên instance:
+
+| Property dưới `resilience4j.circuitbreaker.instances.stock.` | Mặc định | Lab đặt | Ý nghĩa |
+|---|---|---|---|
+| `sliding-window-size` | 100 | 6 | Xét N lời gọi gần nhất (`COUNT_BASED`) hoặc N giây (`TIME_BASED`) |
+| `minimum-number-of-calls` | 100 | 4 | Chưa đủ số lời gọi này thì chưa tính tỉ lệ |
+| `failure-rate-threshold` | 50 | 50 | Phần trăm lỗi để nhảy sang OPEN |
+| `wait-duration-in-open-state` | 60 s | 5 s | Thời gian ở OPEN trước khi thử lại |
+| `permitted-number-of-calls-in-half-open-state` | 10 | 2 | Số lời gọi thử ở HALF_OPEN |
+| `automatic-transition-from-open-to-half-open-enabled` | false | true | Tự chuyển sang HALF_OPEN khi hết giờ, không chờ lời gọi kế tiếp |
+| `record-exceptions` | rỗng: mọi exception | `StockUnavailableException` | Exception tính là lỗi; khi đã khai báo, exception khác tính là **thành công** |
+| `slow-call-duration-threshold` | 60 s | | Lời gọi chậm hơn mức này tính là chậm; `slow-call-rate-threshold` làm mạch mở vì chậm |
+
+Giá trị của lab cố ý nhỏ để thấy chuyển trạng thái trong vài giây. Trên production, cửa sổ vài chục lời gọi và thời gian chờ vài chục giây là điểm khởi đầu hợp lý, rồi chỉnh theo lưu lượng thật. 404 và các 4xx khác (`ProductNotFoundException`, `IllegalStateException`) không nằm trong `record-exceptions`: `stock` vẫn trả lời bình thường, lỗi nằm ở request, không phải dấu hiệu `stock` hỏng.
+
+**Fallback** là method thay thế khi lời gọi thất bại. Resilience4j chọn fallback theo **kiểu exception** trong tham số cuối:
+
+```java
+@CircuitBreaker(name = "stock", fallbackMethod = "fromCache")
+public Availability get(String sku) { ... }
+
+Availability fromCache(String sku, CallNotPermittedException e) { ... }
+```
+
+Fallback trên nhận đúng `CallNotPermittedException` (mạch đang mở). Exception khác, như `StockUnavailableException`, đi thẳng ra ngoài, để retry ở tầng trên còn thấy và xử lý. Nếu fallback khai báo tham số `Exception`, nó nuốt mọi lỗi, và retry phía trên không bao giờ chạy.
+
+Resilience4j đăng ký health indicator (bật bằng `management.health.circuitbreakers.enabled=true`), các endpoint Actuator `circuitbreakers`, `circuitbreakerevents`, và metric Micrometer `resilience4j.circuitbreaker.state`, `.calls`, `.failure.rate`, `.not.permitted.calls`. Đặt cảnh báo trên metric trạng thái (bài SB8.2): mạch mở là tin quan trọng cho người trực.
+
+<Check id="sb7.2.circuit-breaker">Vẽ được ba trạng thái của circuit breaker cùng điều kiện chuyển, cấu hình được Resilience4j với `record-exceptions` và fallback theo kiểu exception, và biết đọc trạng thái qua Actuator.</Check>
+
+### Ghép timeout, retry, circuit breaker theo đúng thứ tự
+
+```text
+ ProductController
+   |
+   v
+ AvailabilityService.check     @Retryable: thử lại StockUnavailableException,
+   |                           timeout tổng 2 s; không thử lại CallNotPermittedException
+   v
+ StockClient.get (proxy)
+   |  @ConcurrencyLimit(2)     tối đa 2 lời gọi tới stock cùng lúc
+   |  @CircuitBreaker("stock") mạch mở -> fallback fromCache (giá trị gần nhất)
+   v
+ StockApi (HTTP Service Client)  read timeout 800 ms cho từng lần gọi
+   |
+   v
+ stock
+```
+
+| Lớp | Vị trí | Vì sao ở đó |
+|---|---|---|
+| Timeout | Trong cùng, mỗi lần gọi | Mọi lớp bên ngoài cần biết một lần gọi kết thúc trong bao lâu |
+| Circuit breaker | Quanh từng lần gọi | Đếm **từng lần** gọi thật; khi mạch mở, các lần thử còn lại của retry bị chặn ngay |
+| Retry | Ngoài circuit breaker | Không retry `CallNotPermittedException`: mạch mở nghĩa là đã quyết định ngừng gọi |
+| Fallback | Ngoài cùng, hoặc chỉ cho trường hợp mạch mở | Fallback bọc retry sẽ nuốt lỗi trước khi retry kịp thấy |
+
+Nếu đặt retry bên trong circuit breaker, mạch chỉ thấy một lỗi sau khi cả 4 lần thử đều hỏng: mạch phản ứng chậm gấp 4 lần, và trong lúc đó `stock` nhận đủ 4 lần tải. Mặc định của Resilience4j khi bạn dùng cả `@Retry` lẫn `@CircuitBreaker` của nó cũng theo thứ tự này: Retry bọc ngoài CircuitBreaker. Lab đặt `@Retryable` và `@CircuitBreaker` ở hai bean khác nhau để thứ tự hiện rõ trong code, không phụ thuộc vào thứ tự aspect.
+
+Thời gian xấu nhất của một request vào `shop` với cấu hình lab: 4 lần gọi, mỗi lần tối đa 0,8 s, cộng 3 khoảng chờ tối đa 0,3 + 0,6 + 1,0 s: khoảng 5 s. `timeout = 2000` của `@Retryable` cắt nó còn khoảng 2 s. Con số đó **chưa tính thời gian chờ chỗ** của `@ConcurrencyLimit` với `BLOCK`: read timeout chỉ đo lúc đã gửi request, còn `timeout` của `@Retryable` không cắt ngang một lần gọi đang chờ chỗ, nên khi `stock` chậm và nhiều request dồn lại, phần chờ này có thể lớn hơn cả phần gọi. Khi cần hạn chót cứng, dùng `REJECT`.
+
+<Callout kind="production">
+
+Một service đặt hàng gọi service giá với `@Retryable` mặc định: 3 lần thử lại, chờ cố định 1 giây, cho **mọi** exception. Service giá chậm lại vì một truy vấn thiếu index. Các lời gọi timeout, rồi được thử lại sau đúng 1 giây, cùng lúc, từ mọi pod; tải lên service giá tăng gấp 4, nó chậm hơn nữa, nhiều lời gọi timeout hơn nữa. Đồng thời, các request `POST` tạo đơn có retry cũng gửi lại, và vì không có khoá idempotency, một số khách có hai đơn. Sự cố hết hẳn chỉ khi tắt retry. Bài học: retry phải có `includes` rõ ràng, jitter, timeout tổng, và chỉ cho thao tác idempotent; còn khi service đích chết hẳn, circuit breaker mới là thứ giảm tải cho nó.
+
+</Callout>
+
+<Check id="sb7.2.thu-tu">Sắp xếp được timeout, circuit breaker, retry, fallback theo đúng thứ tự, giải thích được vì sao, và tính được thời gian xấu nhất của một request từ cấu hình.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Resilience Features (Spring Framework)](https://docs.spring.io/spring-framework/reference/core/resilience.html): `@Retryable`, `@ConcurrencyLimit`, `@EnableResilientMethods` và `RetryTemplate`, kèm ví dụ backoff có jitter.
+- [CircuitBreaker (Resilience4j)](https://resilience4j.readme.io/docs/circuitbreaker): bảng cấu hình đầy đủ với giá trị mặc định, sliding window theo số lời gọi và theo thời gian, cách đếm slow call.
+- [Getting Started (Resilience4j)](https://resilience4j.readme.io/docs/getting-started-3): annotation, fallback, thứ tự aspect và endpoint Actuator. Trang chỉ nhắc module cho Spring Boot 2 và 3; với Spring Boot 4 dùng `resilience4j-spring-boot4`, cấu hình giống hệt.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm xong bài SB7.1; thư mục `~/masteva-sb7` có hai project `stock` và `shop`. Ba tab như bài trước: tab 1 chạy `stock` (`./mvnw spring-boot:run` trong `~/masteva-sb7/stock`), tab 2 chạy `shop`, tab 3 tạo file và gửi request. Mỗi khi bài nói "chạy lại `shop`", dừng nó bằng Ctrl+C ở tab 2 rồi chạy lại lệnh đó. Log dưới đây đã bỏ phần ngày, PID và tên thread, chỉ giữ giờ.
+
+### 1. Retry với backoff và jitter
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/Availability.java <<'EOF'
+package vn.masteva.shop;
+
+public record Availability(String sku, int available, String source) {
+}
+EOF
+cat > $P/StockClient.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
+
+@Component
+public class StockClient {
+    private final StockApi api;
+
+    public StockClient(StockApi api) {
+        this.api = api;
+    }
+
+    public Availability get(String sku) {
+        try {
+            StockLevel level = api.get(sku);
+            return new Availability(level.sku(), level.available(), "stock");
+        } catch (ResourceAccessException e) {
+            throw new StockUnavailableException(
+                    "stock unreachable: " + e.getMostSpecificCause().getClass().getSimpleName(), e);
+        }
+    }
+}
+EOF
+cat > $P/AvailabilityService.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.resilience.annotation.Retryable;
+import org.springframework.stereotype.Service;
+
+@Service
+public class AvailabilityService {
+    private final StockClient stock;
+
+    public AvailabilityService(StockClient stock) {
+        this.stock = stock;
+    }
+
+    @Retryable(includes = StockUnavailableException.class,
+            maxRetries = 3, delay = 200, multiplier = 2, jitter = 100, maxDelay = 1000,
+            timeout = 2000)
+    public Availability check(String sku) {
+        return stock.get(sku);
+    }
+}
+EOF
+cat > $P/ResilienceConfig.java <<'EOF'
+package vn.masteva.shop;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.event.EventListener;
+import org.springframework.resilience.annotation.EnableResilientMethods;
+import org.springframework.resilience.retry.MethodRetryEvent;
+
+@Configuration
+@EnableResilientMethods
+class ResilienceConfig {
+    private static final Logger log = LoggerFactory.getLogger(ResilienceConfig.class);
+
+    @EventListener
+    void onRetry(MethodRetryEvent event) {
+        String method = event.getMethod().getName();
+        if (event.isRetryAborted()) {
+            log.warn("{}: giving up ({})", method, event.getFailure().getMessage());
+        } else {
+            log.warn("{} failed: {}", method, event.getFailure().getMessage());
+        }
+    }
+}
+EOF
+cat > $P/ProductController.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProductController {
+    private final AvailabilityService availability;
+
+    public ProductController(AvailabilityService availability) {
+        this.availability = availability;
+    }
+
+    @GetMapping("/products/{sku}/availability")
+    public Availability availability(@PathVariable String sku) {
+        return availability.check(sku);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `StockClient` giờ trả `Availability`, record dùng chung cho mọi nguồn dữ liệu (`stock`, cache, gRPC); `ProductController` không còn tự dựng nó.
+- `@Retryable` đặt ở `AvailabilityService`, một bean khác `StockClient`, để lời gọi đi qua proxy.
+- Chỉ `StockUnavailableException` được thử lại: `ProductNotFoundException` (404) thì không.
+
+Chạy `stock` ở tab 1 và `shop` ở tab 2 nếu chúng chưa chạy. Cho `stock` lỗi đúng 2 lần:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -X POST 'localhost:8187/chaos?failNext=2'; echo
+curl -s -w " [%{http_code} %{time_total}s]\n" localhost:8087/products/MUG/availability
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"failNext":2,"delayMs":0}
+{"sku":"MUG","available":40,"source":"stock"} [200 0.911539s]
+```
+
+</Expected>
+
+Tab 2 và tab 1, xếp theo thời gian:
+
+<Expected>
+
+```text
+stock  11:04:39.883  GET /stock/MUG from shop (in flight: 1)
+stock  11:04:39.884  GET /stock/MUG -> 503 (simulated)
+shop   11:04:39.903  check failed: stock answered 503 SERVICE_UNAVAILABLE
+stock  11:04:40.197  GET /stock/MUG from shop (in flight: 1)
+stock  11:04:40.197  GET /stock/MUG -> 503 (simulated)
+shop   11:04:40.199  check failed: stock answered 503 SERVICE_UNAVAILABLE
+stock  11:04:40.590  GET /stock/MUG from shop (in flight: 1)
+```
+
+</Expected>
+
+Lần 2 cách lần 1 khoảng 310 ms: khoảng chờ 200 đến 300 ms cộng thời gian xử lý lỗi. Lần 3 cách lần 2 khoảng 390 ms, trong khoảng 200 đến 600 ms. Mỗi lần chạy một khác vì jitter; có lần khoảng chờ sau còn ngắn hơn khoảng chờ trước. Lần 3 thành công, người dùng nhận 200 sau chưa tới 1 giây và không biết đã có hai lỗi. Giờ thử hai lỗi không nên retry (sku không có, sku sai định dạng), và một `stock` lỗi liên tục:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -w " [%{http_code} %{time_total}s]\n" localhost:8087/products/NOPE/availability
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" localhost:8087/products/mug/availability
+curl -s -X POST 'localhost:8187/chaos?failNext=10' > /dev/null
+curl -s -w " [%{http_code} %{time_total}s]\n" localhost:8087/products/MUG/availability
+curl -s -X POST 'localhost:8187/chaos' > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"detail":"Không có sản phẩm này","instance":"/products/NOPE/availability","status":404,"title":"Not Found"} [404 0.027068s]
+500 0.017862s
+{"detail":"Chưa kiểm tra được tồn kho, vui lòng thử lại sau","instance":"/products/MUG/availability","status":503,"title":"Service Unavailable"} [503 1.656145s]
+```
+
+</Expected>
+
+Tab 2:
+
+<Expected>
+
+```text
+11:04:40.744  check failed: product NOPE not found
+11:04:40.744  check: giving up (Retry policy for operation 'vn.masteva.shop.AvailabilityService.check' exhausted; aborting execution)
+11:04:40.767  check failed: stock rejected request: 400 BAD_REQUEST
+11:04:40.767  check: giving up (Retry policy for operation 'vn.masteva.shop.AvailabilityService.check' exhausted; aborting execution)
+11:04:40.811  check failed: stock answered 503 SERVICE_UNAVAILABLE
+11:04:41.076  check failed: stock answered 503 SERVICE_UNAVAILABLE
+11:04:41.614  check failed: stock answered 503 SERVICE_UNAVAILABLE
+11:04:42.452  check failed: stock answered 503 SERVICE_UNAVAILABLE
+11:04:42.452  check: giving up (Retry policy for operation 'vn.masteva.shop.AvailabilityService.check' exhausted; aborting execution)
+11:04:42.453  ApiErrors: stock answered 503 SERVICE_UNAVAILABLE
+```
+
+</Expected>
+
+404 và 400 dừng ngay sau lần đầu (cùng mili giây): `ProductNotFoundException` và `IllegalStateException` không nằm trong `includes`. Dòng "check failed" rồi "giving up" vẫn xuất hiện vì Spring phát `MethodRetryEvent` cho **mọi** exception ra khỏi method, kể cả exception không được retry; "giving up" ở đây nghĩa là chính sách retry từ chối, không phải đã thử hết lượt. Với `stock` lỗi liên tục, đúng 4 lần gọi (1 + `maxRetries`), rồi exception gốc của lần cuối tới `ApiErrors` như không có retry.
+
+<Check id="sb7.2.lab-retry">Đọc được thời điểm từng lần thử trong log và đối chiếu với `delay`, `multiplier`, `jitter`; chứng minh được 404 và 400 không bị retry và retry dừng sau `1 + maxRetries` lần.</Check>
+
+### 2. Timeout tổng
+
+Mỗi lần gọi `stock` có read timeout 800 ms. Cho `stock` chậm 1 giây, để mọi lần gọi đều timeout:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -X POST 'localhost:8187/chaos?delayMs=1000' > /dev/null
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" localhost:8087/products/MUG/availability
+curl -s -X POST 'localhost:8187/chaos' > /dev/null
+```
+
+</Terminal>
+
+<Predict question="maxRetries là 3. Có bao nhiêu lần gọi tới stock, và request mất bao lâu?">
+
+```text
+503 1.843497s
+```
+
+Tab 2:
+
+```text
+11:04:43.328  check failed: stock unreachable: HttpTimeoutException
+11:04:44.362  check failed: stock unreachable: HttpTimeoutException
+11:04:44.363  check: giving up (Retry policy for operation 'vn.masteva.shop.AvailabilityService.check' would exceed timeout (2000ms) due to pending sleep time (379ms); preemptively aborting execution)
+```
+
+Chỉ 2 lần. Sau lần thứ hai, đã trôi qua khoảng 1,84 s; chờ thêm 379 ms sẽ vượt `timeout = 2000`, nên Spring dừng luôn thay vì chờ rồi mới bỏ cuộc. Không có `timeout`, request này mất khoảng 4 đến 5 giây.
+
+</Predict>
+
+### 3. Giới hạn đồng thời
+
+Thêm `@ConcurrencyLimit(2)` cho `StockClient.get`:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+P=src/main/java/vn/masteva/shop/StockClient.java
+perl -0pi -e 's/(import org.springframework.stereotype.Component;)/import org.springframework.resilience.annotation.ConcurrencyLimit;\n$1/' $P
+perl -0pi -e 's/(    public Availability get\(String sku\) \{)/    \@ConcurrencyLimit(2)\n$1/' $P
+grep -n -B1 'public Availability get' $P
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+15-    @ConcurrencyLimit(2)
+16:    public Availability get(String sku) {
+```
+
+</Expected>
+
+Chạy lại `shop`. Cho `stock` chậm 500 ms, rồi gửi 6 request song song:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -X POST 'localhost:8187/chaos?delayMs=500' > /dev/null
+for s in BOOK-JAVA MUG BOOK-SQL BOOK-JAVA MUG BOOK-SQL; do
+  curl -s -o /dev/null -w "$s %{http_code} %{time_total}s\n" localhost:8087/products/$s/availability &
+done; wait
+curl -s -X POST 'localhost:8187/chaos' > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+MUG 200 0.707040s
+BOOK-SQL 200 0.701631s
+BOOK-JAVA 200 1.200355s
+BOOK-SQL 200 1.200329s
+MUG 200 1.716613s
+BOOK-JAVA 200 1.709895s
+```
+
+</Expected>
+
+Tab 1:
+
+<Expected>
+
+```text
+11:05:18.526  GET /stock/BOOK-SQL from shop (in flight: 1)
+11:05:18.527  GET /stock/MUG from shop (in flight: 2)
+11:05:19.077  GET /stock/BOOK-SQL from shop (in flight: 1)
+11:05:19.078  GET /stock/BOOK-JAVA from shop (in flight: 2)
+11:05:19.590  GET /stock/BOOK-JAVA from shop (in flight: 1)
+11:05:19.590  GET /stock/MUG from shop (in flight: 2)
+```
+
+</Expected>
+
+Ba đợt, mỗi đợt hai request, cách nhau 0,5 s: `stock` không bao giờ nhận quá 2 request cùng lúc từ `shop`. Request cuối mất 1,72 s dù `stock` chỉ cần 0,5 s: khoảng một giây là thời gian chờ chỗ, và read timeout 800 ms không đo phần đó.
+
+<Check id="sb7.2.lab-concurrency">Dùng được `@ConcurrencyLimit` để giới hạn số lời gọi đồng thời tới một service, và chỉ ra được thời gian chờ chỗ trong số đo.</Check>
+
+### 4. Circuit breaker với Resilience4j
+
+Thêm hai dependency vào `pom.xml` của `shop`:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+perl -0pi -e 's|(\t<dependencies>\n)|$1\t\t<dependency>\n\t\t\t<groupId>io.github.resilience4j</groupId>\n\t\t\t<artifactId>resilience4j-spring-boot4</artifactId>\n\t\t\t<version>2.4.0</version>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-starter-aspectj</artifactId>\n\t\t</dependency>\n|' pom.xml
+grep -E '<artifactId>(resilience4j|spring-boot-starter-aspectj)' pom.xml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+			<artifactId>resilience4j-spring-boot4</artifactId>
+			<artifactId>spring-boot-starter-aspectj</artifactId>
+```
+
+</Expected>
+
+Spring Boot không quản lý phiên bản Resilience4j, nên phải ghi `2.4.0`. Viết lại `StockClient` với circuit breaker và fallback, thêm handler cho mạch mở, và cấu hình:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/StockClient.java <<'EOF'
+package vn.masteva.shop;
+
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.resilience.annotation.ConcurrencyLimit;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
+
+@Component
+public class StockClient {
+    private static final Logger log = LoggerFactory.getLogger(StockClient.class);
+    private final StockApi api;
+    private final Map<String, Availability> lastKnown = new ConcurrentHashMap<>();
+
+    public StockClient(StockApi api) {
+        this.api = api;
+    }
+
+    @ConcurrencyLimit(2)
+    @CircuitBreaker(name = "stock", fallbackMethod = "fromCache")
+    public Availability get(String sku) {
+        try {
+            StockLevel level = api.get(sku);
+            Availability result = new Availability(level.sku(), level.available(), "stock");
+            lastKnown.put(sku, result);
+            return result;
+        } catch (ResourceAccessException e) {
+            throw new StockUnavailableException(
+                    "stock unreachable: " + e.getMostSpecificCause().getClass().getSimpleName(), e);
+        }
+    }
+
+    // Only called when the circuit is open; other exceptions reach the caller unchanged.
+    Availability fromCache(String sku, CallNotPermittedException e) {
+        Availability cached = lastKnown.get(sku);
+        if (cached == null) {
+            throw e;
+        }
+        log.info("circuit open, serving cached {}", sku);
+        return new Availability(sku, cached.available(), "cache");
+    }
+}
+EOF
+cat > $P/ApiErrors.java <<'EOF'
+package vn.masteva.shop;
+
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class ApiErrors {
+    private static final Logger log = LoggerFactory.getLogger(ApiErrors.class);
+
+    @ExceptionHandler
+    ProblemDetail notFound(ProductNotFoundException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, "Không có sản phẩm này");
+    }
+
+    @ExceptionHandler({StockUnavailableException.class, CallNotPermittedException.class})
+    ProblemDetail stockUnavailable(RuntimeException e) {
+        log.warn("{}", e.getMessage());
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                "Chưa kiểm tra được tồn kho, vui lòng thử lại sau");
+    }
+}
+EOF
+cat >> src/main/resources/application.properties <<'EOF'
+
+resilience4j.circuitbreaker.instances.stock.sliding-window-size=6
+resilience4j.circuitbreaker.instances.stock.minimum-number-of-calls=4
+resilience4j.circuitbreaker.instances.stock.failure-rate-threshold=50
+resilience4j.circuitbreaker.instances.stock.wait-duration-in-open-state=5s
+resilience4j.circuitbreaker.instances.stock.automatic-transition-from-open-to-half-open-enabled=true
+resilience4j.circuitbreaker.instances.stock.permitted-number-of-calls-in-half-open-state=2
+resilience4j.circuitbreaker.instances.stock.record-exceptions=vn.masteva.shop.StockUnavailableException
+resilience4j.circuitbreaker.instances.stock.register-health-indicator=true
+
+management.endpoints.web.exposure.include=health,metrics,circuitbreakers,circuitbreakerevents
+management.endpoint.health.show-details=always
+management.health.circuitbreakers.enabled=true
+EOF
+```
+
+</Terminal>
+
+- `lastKnown` giữ kết quả thành công gần nhất cho mỗi sku: "còn khoảng 40 cốc, số liệu cách đây ít phút" hữu ích hơn một trang lỗi. `source: "cache"` cho phía gọi biết số liệu có thể cũ. Với dữ liệu mà sai lệch gây hại (giá, số dư), không dùng fallback kiểu này.
+- Fallback không có cache thì ném lại `CallNotPermittedException`. Exception đó không nằm trong `includes` của `@Retryable`, nên không bị retry, và `ApiErrors` đổi nó thành 503.
+- `show-details=always` chỉ để học; trên production, chi tiết health chỉ nên lộ cho người có quyền (bài SB8.3).
+
+Chạy lại `shop` và xem trạng thái ban đầu:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:8087/actuator/circuitbreakers; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"circuitBreakers":{"stock":{"bufferedCalls":0,"failedCalls":0,"failureRate":"-1.0%","failureRateThreshold":"50.0%","notPermittedCalls":0,"slowCallRate":"-1.0%","slowCallRateThreshold":"100.0%","slowCalls":0,"slowFailedCalls":0,"state":"CLOSED"}}}
+```
+
+</Expected>
+
+`failureRate` là `-1.0%` khi chưa đủ `minimum-number-of-calls` để tính. Giờ chạy cả kịch bản: một lời gọi thành công để có cache, rồi `stock` chết hẳn, rồi `stock` sống lại.
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+CB='localhost:8087/actuator/circuitbreakers'
+curl -s localhost:8087/products/MUG/availability; echo
+curl -s -X POST 'localhost:8187/chaos?failNext=100' > /dev/null
+curl -s -w " [%{http_code} %{time_total}s]\n" localhost:8087/products/MUG/availability
+curl -s $CB | grep -o '"failedCalls":[0-9]*\|"failureRate":"[^"]*"\|"state":"[A-Z_]*"' | paste -sd' ' -
+curl -s -w " [%{http_code} %{time_total}s]\n" localhost:8087/products/MUG/availability
+curl -s -w " [%{http_code} %{time_total}s]\n" localhost:8087/products/BOOK-JAVA/availability
+sleep 6
+curl -s $CB | grep -o '"state":"[A-Z_]*"'
+curl -s -X POST 'localhost:8187/chaos' > /dev/null
+curl -s localhost:8087/products/MUG/availability; echo
+curl -s localhost:8087/products/BOOK-JAVA/availability; echo
+curl -s $CB | grep -o '"state":"[A-Z_]*"'
+```
+
+</Terminal>
+
+<Predict question="Lời gọi đầu tiên khi stock chết sẽ thử 4 lần rồi trả 503, đúng không?">
+
+```text
+{"sku":"MUG","available":40,"source":"stock"}
+{"sku":"MUG","available":40,"source":"cache"} [200 1.676130s]
+"failedCalls":3 "failureRate":"75.0%" "state":"OPEN"
+{"sku":"MUG","available":40,"source":"cache"} [200 0.002802s]
+{"detail":"Chưa kiểm tra được tồn kho, vui lòng thử lại sau","instance":"/products/BOOK-JAVA/availability","status":503,"title":"Service Unavailable"} [503 0.007627s]
+"state":"HALF_OPEN"
+{"sku":"MUG","available":40,"source":"stock"}
+{"sku":"BOOK-JAVA","available":12,"source":"stock"}
+"state":"CLOSED"
+```
+
+Không. Cửa sổ đã có 1 lời gọi thành công; sau 3 lần lỗi của retry, mạch có 4 lời gọi với tỉ lệ lỗi 75%, vượt 50%, và **mở ngay giữa chuỗi retry**. Lần thử thứ tư gặp mạch mở, nhận `CallNotPermittedException`, fallback trả giá trị trong cache: người dùng nhận 200 với `source: "cache"`.
+
+Lời gọi MUG kế tiếp mất 3 ms: mạch mở, không chạm mạng. BOOK-JAVA chưa có trong cache nên nhận 503 ngay, cũng không chạm mạng và không retry. Sau 5 giây mạch tự sang `HALF_OPEN`; hai lời gọi thử thành công đưa nó về `CLOSED`.
+
+</Predict>
+
+Endpoint sự kiện giữ 100 sự kiện gần nhất; metric trạng thái là thứ bạn đặt cảnh báo:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+E=$(curl -s localhost:8087/actuator/circuitbreakerevents/stock)
+echo "$E" | grep -o '"type":"[A-Z_]*"' | uniq -c
+echo "$E" | grep -o '"stateTransition":"[^"]*"'
+curl -s 'localhost:8087/actuator/metrics/resilience4j.circuitbreaker.state?tag=name:stock&tag=state:closed' \
+  | grep -o '"measurements":[^]]*]'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   1 "type":"SUCCESS"
+   3 "type":"ERROR"
+   1 "type":"FAILURE_RATE_EXCEEDED"
+   1 "type":"STATE_TRANSITION"
+   3 "type":"NOT_PERMITTED"
+   1 "type":"STATE_TRANSITION"
+   2 "type":"SUCCESS"
+   1 "type":"STATE_TRANSITION"
+"stateTransition":"State transition from CLOSED to OPEN"
+"stateTransition":"State transition from OPEN to HALF_OPEN"
+"stateTransition":"State transition from HALF_OPEN to CLOSED"
+"measurements":[{"statistic":"VALUE","value":1.0}]
+```
+
+</Expected>
+
+Chuỗi sự kiện khớp kịch bản: 1 thành công, 3 lỗi, vượt ngưỡng, mở mạch, 3 lời gọi bị từ chối (lần thử thứ tư của retry, MUG và BOOK-JAVA), sang `HALF_OPEN`, 2 lời gọi thử thành công, đóng mạch. Metric `resilience4j.circuitbreaker.state` có giá trị 1 cho trạng thái hiện tại (`closed`), 0 cho các trạng thái khác; cảnh báo kiểu "`state=open` bằng 1 quá 1 phút" bắt được sự cố của `stock` từ phía `shop`, kể cả khi `stock` không tự báo gì.
+
+<Check id="sb7.2.lab-circuit">Quan sát được circuit breaker chuyển CLOSED, OPEN, HALF_OPEN rồi CLOSED qua log, `/actuator/circuitbreakerevents` và metric, và giải thích được vì sao mạch mở giữa chừng một chuỗi retry.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Không thấy dòng `check failed` nào dù `stock` trả 503: thiếu `@EnableResilientMethods`, hoặc `@Retryable` đặt trên method được gọi bằng `this.` trong cùng class.
+- Import nhầm `org.springframework.retry.annotation.Retryable` (thư viện Spring Retry cũ): không có trong classpath nên không biên dịch được, hoặc nếu có thì cần `@EnableRetry` riêng.
+- `/actuator/circuitbreakers` trả 404: thiếu `circuitbreakers` trong `management.endpoints.web.exposure.include`.
+- Mạch không bao giờ mở: chưa đủ `minimum-number-of-calls`, hoặc exception ném ra không nằm trong `record-exceptions` (khi đã khai báo danh sách này, exception khác tính là thành công).
+- `No fallback method match found`: tham số cuối của fallback phải là kiểu exception, các tham số trước phải khớp method gốc.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng `shop` và `stock` bằng Ctrl+C. Không có container hay dữ liệu nào cần xoá. Giữ `~/masteva-sb7` nếu bạn học tiếp bài SB7.3 (gRPC, tuỳ chọn); nếu không, xoá lab:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá toàn bộ code của hai bài SB7.1 và SB7.2 trong `~/masteva-sb7`.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+rm -rf ~/masteva-sb7
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Retry một POST tạo đơn thì làm thế nào cho an toàn?">
+
+Gửi kèm `Idempotency-Key` (bài J10.2): client sinh khoá một lần cho mỗi thao tác và dùng lại đúng khoá đó ở mọi lần thử; server lưu kết quả theo khoá và trả lại kết quả cũ khi gặp lại. Khi đó POST thành idempotent về mặt hiệu ứng, và retry an toàn. Với `@Retryable`, khoá phải được tạo **bên ngoài** method có annotation (ví dụ ở controller), nếu không mỗi lần thử sẽ sinh khoá mới và mất hết tác dụng.
+
+</Reveal>
+
+<Reveal title="Circuit breaker đặt ở mỗi instance của shop hay dùng chung?">
+
+Resilience4j giữ trạng thái trong bộ nhớ của từng instance: mười pod `shop` có mười cầu dao độc lập, mỗi cái tự học từ lưu lượng của mình. Điều đó thường là đủ, vì mỗi pod chỉ cần tự bảo vệ mình và giảm tải cho `stock`. Cái giá: pod ít lưu lượng có thể chưa đủ `minimum-number-of-calls` để mạch mở, và mỗi pod gửi lời gọi thử riêng ở `HALF_OPEN`. Cầu dao dùng chung qua Redis hay service mesh phức tạp hơn nhiều và hiếm khi đáng; ở mức kiến trúc, mesh như Istio có outlier detection làm việc tương tự cho mọi service (chặng M9).
+
+</Reveal>
+
+<Reveal title="Vì sao fallback trả dữ liệu cũ lại nguy hiểm?">
+
+Vì người dùng không biết dữ liệu đã cũ. Tồn kho cũ 5 phút có thể làm bán quá số hàng; giá cũ có thể bán lỗ; quyền truy cập cũ có thể cho người đã bị khoá vào hệ thống. Fallback tốt khi phía gọi biết đó là fallback (`source: "cache"`, header `Warning`, giao diện ghi "số liệu có thể chưa cập nhật"), và khi nghiệp vụ chấp nhận được độ cũ đó. Với thao tác ghi, fallback thường là "nhận yêu cầu, xử lý sau" qua hàng đợi (bài SB9), không phải giả vờ thành công.
+
+</Reveal>
+
+<Reveal title="@ConcurrencyLimit khác gì bulkhead của Resilience4j?">
+
+Cùng ý tưởng. `@ConcurrencyLimit` của Spring Framework 7 đơn giản: một con số, chặn hoặc từ chối, không có thời gian chờ tối đa. Bulkhead của Resilience4j có `maxWaitDuration` (chờ có giới hạn rồi mới từ chối), metric riêng, và loại `ThreadPoolBulkhead` chạy lời gọi trên pool riêng. Khi đã dùng Resilience4j cho circuit breaker và cần thời gian chờ có giới hạn, bulkhead của nó hợp hơn; khi chỉ cần chặn số lời gọi đồng thời, annotation của Spring đủ và không thêm dependency.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI đề xuất cấu hình circuit breaker từ số liệu lưu lượng thật, hay viết vòng retry bằng `RetryTemplate` cho một trường hợp đặc biệt. AI hay đặt `@Retryable` không có `includes` (retry cả 404 và lỗi validation), hay quên jitter, hay viết fallback nhận `Exception` làm retry phía trên vô dụng, và hay dùng tên module `resilience4j-spring-boot3` hoặc annotation của thư viện Spring Retry cũ cho dự án Spring Boot 4. Kiểm tra bằng lab: cho service đích lỗi N lần rồi đếm số request nó nhận trong log, và xem `/actuator/circuitbreakerevents` có đúng chuỗi chuyển trạng thái bạn mong đợi không.
+
+</Callout>
+
+<Callout kind="link">
+
+SB3.3 và SB4.1 giải thích proxy và self-invocation, cùng cơ chế mà `@Retryable` dùng. J10.2 làm POST retry an toàn bằng `Idempotency-Key`. J11.3 dạy virtual thread, lý do `@ConcurrencyLimit` cần thiết. SB8.2 đưa metric của Resilience4j vào Prometheus và đặt cảnh báo. SB9 xử lý bất đồng bộ qua hàng đợi khi không thể chờ service khác. SB7.3 (tuỳ chọn) gọi cùng service bằng gRPC. Chặng M9 bàn resilience ở mức kiến trúc: timeout budget qua nhiều service, service mesh, outlier detection.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb7.2.mastery-resilience">Tự cấu hình được timeout, `@Retryable` có backoff, jitter và timeout tổng, và circuit breaker có fallback cho một lời gọi giữa hai service, đúng thứ tự, và chứng minh hành vi bằng log và metric.</Check>
+
+<Check id="sb7.2.mastery-chon">Quyết định được cho một lời gọi cụ thể: có retry không, retry lỗi nào, có fallback không và fallback trả gì, và giải thích được lựa chọn cho đồng đội.</Check>
+
+</Mastery>

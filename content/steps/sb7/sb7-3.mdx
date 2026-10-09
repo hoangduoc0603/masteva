@@ -1,0 +1,434 @@
+---
+title: gRPC giữa hai service Spring Boot
+description: Mô tả service bằng file .proto, sinh code bằng protobuf-maven-plugin, dựng gRPC server và client với Spring Boot 4.1, đặt deadline, đổi mã status gRPC thành lỗi nghiệp vụ, và quyết định khi nào gRPC đáng để thay REST.
+id: sb7.3
+step: sb7
+prerequisites: [sb7.2]
+topics: [sb7.grpc]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    spring-grpc: 1.1.1
+    grpc-java: 1.83.1
+    protobuf: 4.35.1
+    curl: 8.4.0
+---
+
+<Goal>
+
+Gọi `stock` từ `shop` bằng gRPC thay cho REST, trên cùng nghiệp vụ của hai bài trước, để so hai cách bằng code thật thay vì bằng lời quảng cáo. Bài này tuỳ chọn. Học xong, bạn giải thích được:
+
+- Vì sao đổi tên một trường trong `.proto` không làm hỏng client cũ, còn đổi số hiệu của nó thì có.
+- Vì sao deadline của gRPC khác read timeout của HTTP client.
+- Vì sao mười pod server mà mọi lời gọi gRPC của một client chỉ rơi vào một pod.
+
+</Goal>
+
+<Knowledge>
+
+### gRPC là gì
+
+**gRPC** là framework gọi hàm từ xa (RPC, remote procedure call) chạy trên HTTP/2. Bạn mô tả service và message bằng file `.proto` (**Protocol Buffers**, định dạng nhị phân có schema), rồi trình biên dịch `protoc` cùng plugin của từng ngôn ngữ sinh code client (**stub**) và khung server.
+
+```text
+ stock.proto  --protoc + plugin grpc-java-->  StockServiceGrpc (stub), GetStockRequest, StockReply
+     |                                              |                        |
+     | dùng chung giữa hai service                  v                        v
+     |                                  shop: StockServiceBlockingStub   stock: StockServiceImplBase
+     |                                        |                                ^
+     |                                        +--- HTTP/2, protobuf, :8287 ----+
+```
+
+Một message protobuf trên đường truyền không chứa tên trường, chỉ chứa **số hiệu trường** và giá trị. Đó là lý do nó nhỏ hơn JSON, và cũng là luật quan trọng nhất khi sửa `.proto`:
+
+| Thay đổi | Client và server cũ |
+|---|---|
+| Đổi tên trường, giữ số hiệu | Vẫn chạy: tên chỉ có trong code sinh ra |
+| Thêm trường với số hiệu mới | Vẫn chạy: bên cũ bỏ qua trường lạ, bên mới thấy giá trị mặc định khi thiếu |
+| Xoá trường | Vẫn chạy, nhưng phải `reserved` số hiệu cũ để không ai dùng lại |
+| Đổi số hiệu hoặc kiểu của trường | Hỏng: bên kia đọc sai dữ liệu mà không báo lỗi |
+
+<Check id="sb7.3.proto">Giải thích được vai trò của file `.proto`, stub sinh ra, và các luật giữ tương thích khi sửa message.</Check>
+
+### Deadline và mã lỗi
+
+Ở REST, mỗi client tự đặt read timeout; server không biết client còn chờ bao lâu. gRPC gửi **deadline** (thời điểm hết hạn) kèm request: server đọc được thời gian còn lại, có thể bỏ việc khi client đã thôi chờ, và khi gọi tiếp service khác thì truyền phần còn lại đi tiếp. Một lời gọi gRPC không có deadline chờ vô hạn, giống `RestClient` không có timeout.
+
+Lỗi gRPC dùng mã status riêng, không phải HTTP status:
+
+| Tình huống | Mã gRPC | Gần với HTTP | Retry? |
+|---|---|---|---|
+| Không tìm thấy | `NOT_FOUND` | 404 | Không |
+| Request sai | `INVALID_ARGUMENT` | 400 | Không |
+| Service tạm không phục vụ | `UNAVAILABLE` | 503 | Có, nếu idempotent |
+| Hết deadline | `DEADLINE_EXCEEDED` | 504 | Có, nếu còn thời gian và idempotent |
+| Bị giới hạn | `RESOURCE_EXHAUSTED` | 429 | Có, có backoff |
+
+Phía client, stub ném `StatusRuntimeException`; phía server, bạn trả lỗi bằng `responseObserver.onError(Status.X.withDescription(...).asRuntimeException())`. `description` đi tới client, nên đừng đặt chi tiết nội bộ vào đó.
+
+### REST hay gRPC
+
+| | REST + JSON | gRPC |
+|---|---|---|
+| Hợp đồng | OpenAPI, thường viết sau | `.proto` là nguồn sự thật, sinh code hai phía |
+| Dữ liệu | JSON, đọc được bằng mắt | Nhị phân, nhỏ và nhanh hơn để mã hoá |
+| Streaming | Hạn chế | Một chiều và hai chiều, có sẵn |
+| Gọi từ trình duyệt | Trực tiếp | Cần gRPC-Web và proxy |
+| Gỡ lỗi | `curl` | `grpcurl`, cần reflection hoặc file `.proto` |
+| Timeout | Mỗi client tự đặt | Deadline gửi kèm request |
+| Lỗi | HTTP status + Problem Details | Mã status gRPC |
+
+Chọn gRPC cho lời gọi nội bộ giữa các service do bạn kiểm soát cả hai phía, khi cần hiệu năng, streaming hay hợp đồng chặt giữa nhiều ngôn ngữ. Giữ REST cho API công khai, cho trình duyệt, và khi đội chưa có công cụ cho protobuf.
+
+### gRPC trong Spring Boot 4.1
+
+Spring Boot 4.1 tự cấu hình gRPC qua dự án Spring gRPC:
+
+| Thành phần | Việc |
+|---|---|
+| `spring-boot-starter-grpc-server` | Chạy server Netty (cổng mặc định 9090, đổi bằng `spring.grpc.server.port`), đăng ký mọi bean `BindableService`; class có `@GrpcService` là một bean như vậy |
+| `spring-boot-starter-grpc-client` | Tạo bean stub khi bạn khai báo `@ImportGrpcClients(target = "...", types = ...)` |
+| `spring.grpc.client.channel.<tên>.target` | Địa chỉ của kênh, ví dụ `static://localhost:8287` |
+| `io.github.ascopes:protobuf-maven-plugin` | Sinh code từ `src/main/proto`; Spring Boot quản lý phiên bản `protoc` và cấu hình |
+
+Server gRPC chạy cạnh Tomcat trong cùng tiến trình, trên cổng riêng, nên một service có thể phục vụ cả REST lẫn gRPC trong lúc chuyển đổi.
+
+<Callout kind="production">
+
+Một đội chuyển lời gọi giữa hai service từ REST sang gRPC để giảm độ trễ, và mở rộng service đích từ 3 lên 10 pod khi tải tăng. CPU của một pod lên 90%, chín pod còn lại gần như rảnh. Nguyên nhân: HTTP/2 giữ một kết nối lâu dài và gửi mọi lời gọi qua đó, còn `Service` mặc định của Kubernetes cân bằng tải ở tầng 4, theo kết nối TCP, nên mọi lời gọi của một pod client rơi vào đúng một pod server. Cách sửa: cân bằng tải ở phía client (target `dns:///` trỏ vào một headless Service, kèm policy `round_robin`), hoặc load balancer tầng 7 hiểu HTTP/2 như Envoy, Istio.
+
+</Callout>
+
+<Check id="sb7.3.grpc-vs-rest">So sánh được gRPC với REST theo hợp đồng, hiệu năng, streaming, deadline và khả năng gọi từ trình duyệt, và chọn được giữa hai cách cho một lời gọi cụ thể.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [gRPC (Spring Boot)](https://docs.spring.io/spring-boot/reference/io/grpc.html): starter cho server và client, `@ImportGrpcClients`, property `spring.grpc.*`, test với `@AutoConfigureTestGrpcTransport`.
+- [Deadlines (gRPC)](https://grpc.io/docs/guides/deadlines/): vì sao mọi lời gọi gRPC nên có deadline, và deadline truyền qua nhiều service ra sao.
+- [Error handling (gRPC)](https://grpc.io/docs/guides/error/): bảng mã status và cách trả lỗi có chi tiết.
+- [Language Guide (proto 3)](https://protobuf.dev/programming-guides/proto3/): cú pháp, số hiệu trường, `reserved` và các luật cập nhật message.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm xong bài SB7.2; lab bắt đầu từ trạng thái cuối của nó trong `~/masteva-sb7` (`shop` có `AvailabilityService`, `StockClient` với circuit breaker, record `Availability`). Ba tab như hai bài trước: tab 1 chạy `stock`, tab 2 chạy `shop`, tab 3 tạo file và gửi request. Cổng gRPC của `stock` là **8287**. Lần build đầu, Maven tải `protoc` và thư viện gRPC, cần Internet.
+
+### 1. gRPC server trong stock
+
+`stock` sẽ phục vụ thêm gRPC ở cổng 8287, dùng lại đúng logic của `StockController` (kể cả `/chaos` và kiểm tra định dạng sku). Thêm starter, plugin sinh code và file `.proto`:
+
+<Terminal where="mac" title="Tab 3: gRPC server trong stock">
+
+```bash
+cd ~/masteva-sb7/stock
+perl -0pi -e 's|(\t<dependencies>\n)|$1\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-starter-grpc-server</artifactId>\n\t\t</dependency>\n|' pom.xml
+perl -0pi -e 's|(\t\t<plugins>\n)|$1\t\t\t<plugin>\n\t\t\t\t<groupId>io.github.ascopes</groupId>\n\t\t\t\t<artifactId>protobuf-maven-plugin</artifactId>\n\t\t\t</plugin>\n|' pom.xml
+mkdir -p src/main/proto
+cat > src/main/proto/stock.proto <<'EOF'
+syntax = "proto3";
+
+package masteva.stock.v1;
+
+option java_multiple_files = true;
+option java_package = "vn.masteva.stock.grpc";
+
+service StockService {
+  rpc GetStock (GetStockRequest) returns (StockReply);
+}
+
+message GetStockRequest {
+  string sku = 1;
+}
+
+message StockReply {
+  string sku = 1;
+  int32 available = 2;
+}
+EOF
+cat > src/main/java/vn/masteva/stock/StockGrpcService.java <<'EOF'
+package vn.masteva.stock;
+
+import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
+import org.springframework.grpc.server.service.GrpcService;
+import org.springframework.web.ErrorResponseException;
+import vn.masteva.stock.grpc.GetStockRequest;
+import vn.masteva.stock.grpc.StockReply;
+import vn.masteva.stock.grpc.StockServiceGrpc;
+
+@GrpcService
+public class StockGrpcService extends StockServiceGrpc.StockServiceImplBase {
+    private final StockController stock;
+
+    public StockGrpcService(StockController stock) {
+        this.stock = stock;
+    }
+
+    @Override
+    public void getStock(GetStockRequest request, StreamObserver<StockReply> reply) {
+        try {
+            StockController.StockLevel level = stock.get(request.getSku(), "grpc");
+            reply.onNext(StockReply.newBuilder()
+                    .setSku(level.sku())
+                    .setAvailable(level.available())
+                    .build());
+            reply.onCompleted();
+        } catch (ErrorResponseException e) {
+            Status status = switch (e.getStatusCode().value()) {
+                case 404 -> Status.NOT_FOUND;
+                case 400 -> Status.INVALID_ARGUMENT;
+                default -> Status.UNAVAILABLE;
+            };
+            reply.onError(status.withDescription(e.getBody().getDetail()).asRuntimeException());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            reply.onError(Status.CANCELLED.asRuntimeException());
+        }
+    }
+}
+EOF
+echo "spring.grpc.server.port=8287" >> src/main/resources/application.properties
+```
+
+</Terminal>
+
+- Số sau mỗi trường (`= 1`, `= 2`) là **số hiệu trường** trên đường truyền, không phải giá trị. Đổi tên trường thì client cũ vẫn đọc được; đổi số hiệu thì hỏng tương thích. Không bao giờ dùng lại số hiệu của trường đã xoá.
+- Lỗi gRPC không phải HTTP status: 404 thành `NOT_FOUND`, 400 thành `INVALID_ARGUMENT`, 503 thành `UNAVAILABLE`. `description` đi tới client, nên trong code thật đừng đặt chi tiết nội bộ vào đó; ở đây giữ lại để bạn thấy nó đi qua mạng.
+
+Dừng `stock` ở tab 1 rồi chạy lại. Lần đầu, Maven tải `protoc` và sinh code. Log có thêm:
+
+<Expected>
+
+```text
+o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 8187 (http) with context path '/'
+o.s.grpc.server.NettyGrpcServerFactory   : Registered gRPC service: masteva.stock.v1.StockService
+o.s.grpc.server.NettyGrpcServerFactory   : Registered gRPC service: grpc.reflection.v1.ServerReflection
+o.s.grpc.server.NettyGrpcServerFactory   : Registered gRPC service: grpc.health.v1.Health
+o.s.g.s.lifecycle.GrpcServerLifecycle    : gRPC Server started, listening on address: [/[0:0:0:0:0:0:0:0]:8287], port: 8287
+```
+
+</Expected>
+
+Một tiến trình, hai cổng: Tomcat 8187 cho REST, Netty 8287 cho gRPC. Starter tự đăng ký thêm dịch vụ reflection (để công cụ như `grpcurl` khám phá API) và health chuẩn của gRPC.
+
+### 2. gRPC client trong shop
+
+Phía `shop`: thêm starter client, plugin, **cùng file `.proto`**, và một client nhỏ:
+
+<Terminal where="mac" title="Tab 3: gRPC client trong shop">
+
+```bash
+cd ~/masteva-sb7/shop
+perl -0pi -e 's|(\t<dependencies>\n)|$1\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-starter-grpc-client</artifactId>\n\t\t</dependency>\n|' pom.xml
+perl -0pi -e 's|(\t\t<plugins>\n)|$1\t\t\t<plugin>\n\t\t\t\t<groupId>io.github.ascopes</groupId>\n\t\t\t\t<artifactId>protobuf-maven-plugin</artifactId>\n\t\t\t</plugin>\n|' pom.xml
+mkdir -p src/main/proto
+cp ../stock/src/main/proto/stock.proto src/main/proto/
+P=src/main/java/vn/masteva/shop
+cat > $P/StockGrpcClient.java <<'EOF'
+package vn.masteva.shop;
+
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import java.util.concurrent.TimeUnit;
+import org.springframework.stereotype.Component;
+import vn.masteva.stock.grpc.GetStockRequest;
+import vn.masteva.stock.grpc.StockReply;
+import vn.masteva.stock.grpc.StockServiceGrpc.StockServiceBlockingStub;
+
+@Component
+public class StockGrpcClient {
+    private final StockServiceBlockingStub stub;
+
+    public StockGrpcClient(StockServiceBlockingStub stub) {
+        this.stub = stub;
+    }
+
+    public Availability get(String sku) {
+        try {
+            StockReply reply = stub.withDeadlineAfter(800, TimeUnit.MILLISECONDS)
+                    .getStock(GetStockRequest.newBuilder().setSku(sku).build());
+            return new Availability(reply.getSku(), reply.getAvailable(), "stock-grpc");
+        } catch (StatusRuntimeException e) {
+            Status.Code code = e.getStatus().getCode();
+            switch (code) {
+                case NOT_FOUND -> throw new ProductNotFoundException(sku);
+                case INVALID_ARGUMENT -> throw new IllegalStateException("stock rejected request: " + code);
+                default -> throw new StockUnavailableException("stock grpc: " + code, e);
+            }
+        }
+    }
+}
+EOF
+perl -0pi -e 's/(import org.springframework.context.annotation.Configuration;\n)/$1import org.springframework.grpc.client.ImportGrpcClients;\n/; s/(import tools.jackson.databind.json.JsonMapper;\n)/$1import vn.masteva.stock.grpc.StockServiceGrpc;\n/; s/(\@ImportHttpServices\(group = "stock", types = StockApi.class\)\n)/$1\@ImportGrpcClients(target = "stock", types = StockServiceGrpc.StockServiceBlockingStub.class)\n/' $P/HttpClientsConfig.java
+cat > $P/ProductController.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProductController {
+    private final AvailabilityService availability;
+    private final StockGrpcClient grpc;
+
+    public ProductController(AvailabilityService availability, StockGrpcClient grpc) {
+        this.availability = availability;
+        this.grpc = grpc;
+    }
+
+    @GetMapping("/products/{sku}/availability")
+    public Availability availability(@PathVariable String sku) {
+        return availability.check(sku);
+    }
+
+    @GetMapping("/products/{sku}/availability-grpc")
+    public Availability availabilityGrpc(@PathVariable String sku) {
+        return grpc.get(sku);
+    }
+}
+EOF
+cat >> src/main/resources/application.properties <<'EOF'
+
+spring.grpc.client.channel.stock.target=static://localhost:8287
+EOF
+grep -n '^@\|^import org.springframework.grpc\|^import vn' $P/HttpClientsConfig.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+7:import org.springframework.grpc.client.ImportGrpcClients;
+14:import vn.masteva.stock.grpc.StockServiceGrpc;
+16:@Configuration
+17:@ImportHttpServices(group = "stock", types = StockApi.class)
+18:@ImportGrpcClients(target = "stock", types = StockServiceGrpc.StockServiceBlockingStub.class)
+```
+
+</Expected>
+
+- `@ImportGrpcClients(target = "stock", ...)` tạo bean `StockServiceBlockingStub` trên kênh tên `stock`; `spring.grpc.client.channel.stock.target` cho kênh đó biết địa chỉ. `static://` là địa chỉ cố định; kênh mặc định không dùng TLS, chỉ chấp nhận được trong lab.
+- `withDeadlineAfter(800, MILLISECONDS)` là timeout của gRPC. Deadline được gửi kèm request, nên server biết client còn chờ bao lâu và có thể bỏ việc khi hết hạn.
+- Trong thực tế, file `.proto` nằm ở một chỗ dùng chung (một repo hoặc artifact riêng) thay vì chép tay; chép ở đây để lab ngắn.
+
+### 3. Gọi thử và đặt deadline
+
+Chạy lại `shop`, rồi:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:8087/products/BOOK-JAVA/availability-grpc; echo
+curl -s localhost:8087/products/NOPE/availability-grpc; echo
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8087/products/mug/availability-grpc
+curl -s -X POST 'localhost:8187/chaos?delayMs=1000' > /dev/null
+curl -s -w " [%{http_code} %{time_total}s]\n" localhost:8087/products/MUG/availability-grpc
+curl -s -X POST 'localhost:8187/chaos' > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"sku":"BOOK-JAVA","available":12,"source":"stock-grpc"}
+{"detail":"Không có sản phẩm này","instance":"/products/NOPE/availability-grpc","status":404,"title":"Not Found"}
+500
+{"detail":"Chưa kiểm tra được tồn kho, vui lòng thử lại sau","instance":"/products/MUG/availability-grpc","status":503,"title":"Service Unavailable"} [503 0.808748s]
+```
+
+</Expected>
+
+Tab 1 in `GET /stock/BOOK-JAVA from grpc`, `GET /stock/NOPE from grpc`, `GET /stock/mug from grpc`. Tab 2 in `IllegalStateException: stock rejected request: INVALID_ARGUMENT` cho sku viết thường, và `ApiErrors: stock grpc: DEADLINE_EXCEEDED` sau 0,8 s cho lời gọi chậm. Cùng nghiệp vụ, cùng cách đổi lỗi, chỉ khác giao thức: lớp `StockGrpcClient` làm đúng việc của `StockClient`. Lời gọi gRPC này chưa có retry hay circuit breaker; muốn có, đặt chúng quanh `StockGrpcClient` y như bước 1 và 4 của bài SB7.2, retry `UNAVAILABLE` và `DEADLINE_EXCEEDED`, không retry `NOT_FOUND` hay `INVALID_ARGUMENT`.
+
+<Check id="sb7.3.lab-grpc">Dựng được một gRPC server và client bằng Spring Boot 4.1 từ một file `.proto`, đặt được deadline, và đổi được mã status gRPC thành exception nghiệp vụ.</Check>
+
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `shop` báo `stock grpc: UNAVAILABLE` cho mọi request: `stock` chưa chạy lại sau khi thêm gRPC, hoặc cổng 8287 bị chiếm (`lsof -i :8287`).
+- `cannot find symbol: class StockServiceGrpc`: chưa thêm plugin `protobuf-maven-plugin`, hoặc file `.proto` không nằm trong `src/main/proto`.
+- `No qualifying bean of type '...StockServiceBlockingStub'`: thiếu `@ImportGrpcClients`, hoặc `types` trỏ nhầm sang stub khác (`StockServiceStub`, `StockServiceFutureStub`).
+- Log có `WARNING: sun.misc.Unsafe::arrayBaseOffset has been called by com.google.protobuf.UnsafeUtil`: cảnh báo của protobuf-java 4.35.1 khi chạy trên JDK 25, không ảnh hưởng lab.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng `shop` và `stock` bằng Ctrl+C. Không có container hay dữ liệu nào cần xoá. Khi không cần lab nữa:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá toàn bộ code của ba bài SB7.1, SB7.2 và SB7.3 trong `~/masteva-sb7`.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+rm -rf ~/masteva-sb7
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Deadline 800 ms ở shop, stock lại gọi tiếp một service khác. Stock nên đợi bao lâu?">
+
+Không quá phần còn lại của 800 ms. Trong grpc-java, deadline của request đến nằm trong `Context` hiện tại; stub tạo trong cùng context tự mang deadline đó sang lời gọi tiếp theo. Nếu `stock` gọi tiếp bằng REST, nó phải tự đọc `Context.current().getDeadline()` và đặt timeout không vượt quá thời gian còn lại. Không làm vậy, `stock` tiếp tục làm việc cho một request mà `shop` đã bỏ, đúng vấn đề "timeout của client không dừng công việc ở server" của bài SB7.1.
+
+</Reveal>
+
+<Reveal title="gRPC có retry sẵn, sao không dùng luôn?">
+
+grpc-java hỗ trợ retry khai báo trong service config của kênh: số lần thử, backoff, và danh sách mã status được retry, ví dụ chỉ `UNAVAILABLE`. Nó chạy ở tầng transport nên nhẹ và biết rõ request đã gửi đi hay chưa. Nhưng nó không biết nghiệp vụ: không phân biệt thao tác idempotent, không có circuit breaker, không có fallback. Dùng một trong hai, không dùng cả hai: retry ở kênh gRPC cộng thêm `@Retryable` ở trên là nhân số lần thử, đúng kiểu khuếch đại tải của bài SB7.2.
+
+</Reveal>
+
+<Reveal title="Test một gRPC client mà không cần chạy stock thì làm thế nào?">
+
+Spring Boot có `@AutoConfigureTestGrpcTransport`: các kênh được thay bằng kênh in-process, nên test khởi động server gRPC giả (một `@GrpcService` viết trong test) và client trong cùng JVM, không mở cổng nào. Kết hợp với `spring.grpc.server.port=0` và `@LocalGrpcServerPort` khi muốn test qua mạng thật. Cách tiếp cận giống `MockRestServiceServer` cho `RestClient`.
+
+</Reveal>
+
+<Reveal title="Đổi một API REST đang chạy sang gRPC thế nào cho an toàn?">
+
+Như lab: phục vụ cả hai giao thức song song từ cùng một logic (`StockGrpcService` gọi lại `StockController`), chuyển từng client sang gRPC sau một cờ cấu hình, theo dõi tỉ lệ lỗi và độ trễ của từng đường, rồi mới tắt REST khi không còn ai gọi. File `.proto` đặt ở một repo hoặc artifact dùng chung có review, vì từ đó nó là hợp đồng của mọi client.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết file `.proto` từ một API REST có sẵn, hay viết code chuyển đổi giữa message protobuf và record Java. AI hay dùng thư viện `net.devh:grpc-spring-boot-starter` (dự án cộng đồng cũ) thay cho starter chính thức của Spring Boot 4.1, hay quên deadline, hay đánh số lại trường khi "dọn dẹp" `.proto`, và hay đưa thông báo lỗi nội bộ vào `description`. Kiểm tra bằng lab: so `pom.xml` với tên starter trong bài, đặt `stock` chậm để xem deadline có hiệu lực không, và so số hiệu trường trước và sau mỗi lần sửa `.proto`.
+
+</Callout>
+
+<Callout kind="link">
+
+SB7.1 dựng `StockClient` và cách đổi lỗi mà `StockGrpcClient` làm lại cho gRPC. SB7.2 cung cấp retry và circuit breaker có thể đặt quanh lời gọi gRPC. SB8.2 đọc metric và trace; Spring Boot tự gắn observation cho client gRPC khi có Micrometer. Chặng M9 bàn resilience giữa nhiều service, gồm cả cân bằng tải ở tầng 7.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb7.3.mastery-grpc">Tự dựng được gRPC server và client bằng Spring Boot từ một file `.proto`, có deadline và ánh xạ mã lỗi, và sửa được `.proto` mà không làm hỏng client cũ.</Check>
+
+<Check id="sb7.3.mastery-chon">Quyết định được REST hay gRPC cho một lời gọi giữa hai service và giải thích được lựa chọn cho đồng đội, kể cả cái giá về cân bằng tải và công cụ gỡ lỗi.</Check>
+
+</Mastery>

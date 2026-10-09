@@ -1,0 +1,730 @@
+---
+title: Migration không downtime với Flyway
+description: Đổi tên một cột trong khi hai phiên bản ứng dụng cùng chạy bằng expand/contract qua ba bản phát hành, đo cái giá của thêm cột và tạo index trên bảng 2 triệu dòng, và chạy CREATE INDEX CONCURRENTLY qua Flyway mà không treo.
+id: sb5.5
+step: sb5
+prerequisites: [sb5.4]
+topics: [sb5.migration-khong-downtime]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    spring-data-jpa: 4.1.1
+    flyway: 12.4.0
+    testcontainers: 2.0.5
+    docker: 29.8.0
+    postgresql: "18.6"
+---
+
+<Goal>
+
+Khi deploy kiểu rolling, phiên bản cũ và mới của ứng dụng cùng chạy trên một database trong vài phút. Bài này đổi schema trong đúng khoảng thời gian đó, với ứng dụng thật trên PostgreSQL. Học xong bài này, bạn giải thích được:
+
+- Vì sao một migration `RENAME COLUMN` chạy thành công lại làm phiên bản ứng dụng đang chạy trả lỗi 500 ngay lập tức, và cách đổi tên cột qua ba bản phát hành.
+- Vì sao thêm một cột `NOT NULL` có default lúc mất 3 ms, lúc mất hơn 4 giây khoá cả bảng.
+- Vì sao `CREATE INDEX CONCURRENTLY` trong Flyway có thể treo mãi mãi, và vì sao một câu `SET lock_timeout` ở migration trước có thể làm nó thất bại.
+
+</Goal>
+
+<Knowledge>
+
+### Migration không downtime
+
+Khi deploy kiểu **rolling** (thay dần từng instance) hoặc blue-green, có một khoảng thời gian phiên bản cũ và mới **cùng chạy trên cùng database**. Flyway chạy migration khi instance mới đầu tiên khởi động, tức là trong lúc instance cũ vẫn đang nhận request:
+
+```text
+ thời gian ------------------------------------------------------------->
+ instance v1  [=========== đang chạy =============]  (bị thay dần)
+ instance v2                 [== khởi động: Flyway chạy V8 ==][===== chạy =====]
+                             ^
+                             từ đây schema là V8, nhưng v1 vẫn đang phục vụ
+```
+
+Quy tắc: **mỗi migration phải tương thích với cả phiên bản code đang chạy lẫn phiên bản sắp chạy.** Đổi tên cột thẳng bằng `RENAME COLUMN` vi phạm quy tắc này: v1 vẫn `select full_name` và nhận lỗi ngay khi migration commit. Cách làm là **expand/contract** (mở rộng rồi thu hẹp), trải qua nhiều bản phát hành:
+
+```text
+ Bản phát hành   Migration (expand -> contract)                    Code
+ -------------   -----------------------------------------------   ------------------------------------
+ v1              (schema cũ: full_name)                             đọc, ghi full_name
+ v2  EXPAND      thêm display_name (nullable)                       đọc, ghi display_name
+                 trigger đồng bộ hai cột khi v1 hoặc v2 ghi        (v1 vẫn chạy song song, vẫn đúng)
+                 backfill: display_name = full_name
+ v3  CONTRACT    bỏ trigger, display_name SET NOT NULL,             như v2
+                 DROP COLUMN full_name                              (chỉ khi KHÔNG còn instance v1 nào)
+```
+
+Với thay đổi đơn giản hơn, quy tắc cụ thể trên PostgreSQL:
+
+| Thay đổi | Cách an toàn | Vì sao |
+|---|---|---|
+| Thêm cột nullable | `ADD COLUMN` | Chỉ sửa metadata |
+| Thêm cột `NOT NULL` có default | `ADD COLUMN ... NOT NULL DEFAULT 'web'` | Từ PostgreSQL 11, default **không volatile** chỉ ghi vào metadata. Default volatile như `gen_random_uuid()` thì ghi lại toàn bảng dưới khoá `ACCESS EXCLUSIVE` |
+| Đặt `NOT NULL` cho cột có sẵn | PostgreSQL 18: `ADD CONSTRAINT c_nn NOT NULL c NOT VALID`, rồi `VALIDATE CONSTRAINT c_nn`. Bản cũ hơn: `ADD CONSTRAINT ... CHECK (c IS NOT NULL) NOT VALID`, rồi `VALIDATE CONSTRAINT`, rồi `SET NOT NULL` | `SET NOT NULL` trực tiếp quét cả bảng khi giữ khoá chặn mọi thứ; `VALIDATE` quét với khoá nhẹ, và `SET NOT NULL` dùng lại ràng buộc đã kiểm |
+| Tạo index | `CREATE INDEX CONCURRENTLY` | `CREATE INDEX` thường giữ khoá `SHARE`, chặn mọi `INSERT`/`UPDATE`/`DELETE` tới khi xong |
+| Đổi tên cột hoặc bảng | Expand/contract | Code cũ còn dùng tên cũ |
+| Xoá cột | Bỏ khỏi code trước (một bản phát hành), xoá ở bản sau | Code cũ còn đọc cột đó; Hibernate `select` mọi cột có trong entity |
+| Backfill bảng lớn | Chia lô vài nghìn dòng, ngoài migration hoặc nhiều migration | Một `UPDATE` cả bảng giữ khoá dòng lâu và sinh WAL lớn |
+
+**Lock queue.** `ALTER TABLE` cần khoá `ACCESS EXCLUSIVE`. Nếu một truy vấn báo cáo dài đang đọc bảng, `ALTER` phải chờ, và **mọi truy vấn tới sau xếp hàng sau `ALTER`**, kể cả `SELECT` đơn giản. Đặt `SET LOCAL lock_timeout = '5s'` ở đầu migration: chờ quá 5 giây thì migration thất bại và deploy dừng, thay vì cả hệ thống đứng. Phải có `LOCAL`: Flyway chạy mỗi migration trong một transaction, và `SET LOCAL` chỉ sống tới hết transaction đó. `SET` thường đổi cả **session**: kết nối của Flyway giữ timeout đó cho mọi migration chạy sau trong cùng lượt, và nếu migration chạy qua kết nối của pool thì kết nối đó mang timeout về lại pool cho ứng dụng dùng.
+
+**`CONCURRENTLY` trong Flyway.** `CREATE INDEX CONCURRENTLY` không chạy được trong transaction. Flyway 12 tự nhận ra và chạy migration đó ngoài transaction (log ghi `[non-transactional]`). Nhưng mặc định Flyway giữ một khoá advisory trong một **transaction đang mở** trên kết nối riêng (`postgresql.transactional.lock=true`), và `CONCURRENTLY` phải chờ mọi transaction đang mở kết thúc, gồm cả transaction đó của chính Flyway: migration treo mãi. Khi viết bài này, `pg_stat_activity` cho thấy đúng cảnh đó: một kết nối `idle in transaction` của Flyway và câu `CREATE INDEX CONCURRENTLY` chờ `virtualxid`. Đặt `spring.flyway.postgresql.transactional-lock=false` trước khi dùng `CONCURRENTLY`. Ngược lại, nếu một migration trước trong cùng lượt đã `SET lock_timeout` không có `LOCAL`, câu `CONCURRENTLY` kế thừa timeout đó: nó thất bại sau 5 giây với lỗi `55P03` khi phải chờ một transaction khác. Dù vì lý do gì, `CONCURRENTLY` thất bại giữa chừng để lại một index `INVALID` phải `DROP` rồi tạo lại.
+
+<Callout kind="production">
+
+Một migration thêm cột vào bảng `orders` lúc 10 giờ sáng. Câu `ALTER TABLE ... ADD COLUMN note text` chỉ sửa metadata, lẽ ra xong trong vài mili giây. Nhưng đúng lúc đó một truy vấn báo cáo chạy 4 phút đang đọc `orders`. `ALTER` xếp hàng chờ khoá `ACCESS EXCLUSIVE`, và trong 4 phút đó mọi request đọc hay ghi `orders` xếp hàng sau nó, pool kết nối cạn, health check thất bại, Kubernetes khởi động lại các pod. Sửa: `SET LOCAL lock_timeout = '5s'` trong migration, cho deploy thất bại sạch sẽ và thử lại, và đưa truy vấn báo cáo sang replica.
+
+</Callout>
+
+<Check id="sb5.5.zero-downtime">Giải thích được vì sao migration phải tương thích với cả hai phiên bản code, lập được kế hoạch expand/contract cho việc đổi tên cột, và chọn được cách an toàn để thêm cột `NOT NULL` và tạo index trên bảng lớn.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [PostgreSQL: ALTER TABLE](https://www.postgresql.org/docs/current/sql-altertable.html): khoá của từng thao tác, `ADD COLUMN` có default, `SET NOT NULL` và ràng buộc `NOT VALID`.
+- [PostgreSQL: CREATE INDEX](https://www.postgresql.org/docs/current/sql-createindex.html): mục "Building Indexes Concurrently", gồm cả index `INVALID` khi build thất bại.
+- [Flyway PostgreSQL Transactional Lock Setting](https://documentation.red-gate.com/flyway/reference/configuration/flyway-namespace/flyway-postgresql-namespace/flyway-postgresql-transactional-lock-setting): vì sao cần tắt khoá transaction khi dùng `CONCURRENTLY`.
+- [PostgreSQL: Explicit Locking](https://www.postgresql.org/docs/current/explicit-locking.html): bảng các mức khoá bảng và mức nào chặn mức nào.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài SB5.4, project ở `~/masteva-sb5/shop` với migration `V1` tới `V7`. Docker Desktop đang chạy. Bài này chạy ứng dụng thật với PostgreSQL ở cổng **5445** và hai phiên bản ứng dụng ở cổng **8085** và **8185**; mở **ba tab Terminal**: tab 1 chạy phiên bản cũ, tab 3 chạy phiên bản mới, tab 2 gửi lệnh. Ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb5/shop
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+```
+
+</Terminal>
+
+### 1. Ứng dụng thật trên PostgreSQL cố định
+
+Từ đây ứng dụng chạy thật, với database sống qua nhiều lần khởi động, như production. Thêm API khách hàng và cấu hình kết nối:
+
+<Terminal where="mac" title="Tab 2: sb5-pg, CustomerController, cấu hình">
+
+```bash
+docker run -d --name sb5-pg -e POSTGRES_PASSWORD=masteva -e POSTGRES_DB=shop -p 5445:5432 postgres:18-alpine
+until docker exec sb5-pg pg_isready -q -h 127.0.0.1 -U postgres; do sleep 1; done
+shopsql() { docker exec -i sb5-pg psql -U postgres -d shop "$@"; }
+cd ~/masteva-sb5/shop
+P=src/main/java/vn/masteva/shop
+cat >> src/main/resources/application.properties <<'EOF'
+spring.datasource.url=jdbc:postgresql://localhost:5445/shop
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+EOF
+perl -0pi -e 's/(    protected Customer\(\) \{\n    \}\n)/$1\n    public Customer(String email, String fullName) {\n        this.email = email;\n        this.fullName = fullName;\n    }\n/; s/(    public String getFullName\(\) \{ return fullName; \})/$1\n    public void setFullName(String fullName) { this.fullName = fullName; }/' $P/Customer.java
+cat > $P/CustomerController.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/customers")
+public class CustomerController {
+    private final CustomerRepository customers;
+
+    public CustomerController(CustomerRepository customers) {
+        this.customers = customers;
+    }
+
+    public record CustomerView(Long id, String email, String fullName) {
+        static CustomerView of(Customer c) {
+            return new CustomerView(c.getId(), c.getEmail(), c.getFullName());
+        }
+    }
+
+    public record NewCustomer(String email, String fullName) {
+    }
+
+    @GetMapping("/{id}")
+    public CustomerView get(@PathVariable Long id) {
+        return CustomerView.of(customers.findById(id).orElseThrow());
+    }
+
+    @PostMapping
+    public CustomerView create(@RequestBody NewCustomer body) {
+        return CustomerView.of(customers.save(new Customer(body.email(), body.fullName())));
+    }
+
+    @PutMapping("/{id}/name")
+    @Transactional
+    public CustomerView rename(@PathVariable Long id, @RequestBody String name) {
+        Customer c = customers.findById(id).orElseThrow();
+        c.setFullName(name);
+        return CustomerView.of(c);
+    }
+}
+EOF
+./mvnw -q package -DskipTests && cp target/shop-0.0.1-SNAPSHOT.jar ../shop-v1.jar && ls -lh ../shop-v1.jar | awk '{print $5, $9}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0cd0b0bd09c9912a2cb430e09725a3f28e33e42ad07f2ed39bc8676af0855851
+50M ../shop-v1.jar
+```
+
+</Expected>
+
+- Dòng đầu là id container do `docker run -d` in ra, khác nhau mỗi lần.
+- `until ... pg_isready -h 127.0.0.1` chờ PostgreSQL nhận kết nối TCP. Trong lúc khởi tạo, image postgres chạy một server tạm chỉ nghe qua socket, nên kiểm tra qua TCP mới chắc.
+- Test vẫn dùng Testcontainers: `@ServiceConnection` ghi đè `spring.datasource.*`. `-DskipTests` chỉ để đóng gói nhanh.
+- `shop-v1.jar` là bản phát hành 1, giữ riêng để chạy song song với bản sau.
+
+Chạy v1 ở tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb5
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+"$JAVA_HOME/bin/java" -jar shop-v1.jar --server.port=8085
+```
+
+</Terminal>
+
+Log của Flyway (đã bỏ phần đầu mỗi dòng):
+
+<Expected>
+
+```text
+Migrating schema "public" to version "1 - schema"
+Migrating schema "public" to version "2 - seed"
+Migrating schema "public" to version "3 - orders status created idx"
+Migrating schema "public" to version "4 - product audit"
+Migrating schema "public" to version "5 - product soft delete"
+Migrating schema "public" to version "6 - product sku unique active"
+Migrating schema "public" to version "7 - order items sequence"
+Successfully applied 7 migrations to schema "public", now at version v7 (execution time 00:00.046s)
+Tomcat started on port 8085 (http) with context path '/'
+```
+
+</Expected>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s localhost:8085/customers/1; echo
+curl -s -H 'Content-Type: application/json' -d '{"email":"chi@example.com","fullName":"Lê Chi"}' localhost:8085/customers; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":1,"email":"an@example.com","fullName":"Nguyễn An"}
+{"id":3,"email":"chi@example.com","fullName":"Lê Chi"}
+```
+
+</Expected>
+
+### 2. Đổi tên cột, cách sai
+
+Yêu cầu mới: đổi `full_name` thành `display_name`. Cách nhanh nhất là một câu `RENAME COLUMN`. Giả lập việc bản phát hành mới chạy migration đó trong khi v1 vẫn phục vụ:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c 'ALTER TABLE customers RENAME COLUMN full_name TO display_name'
+curl -s localhost:8085/customers/1; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ALTER TABLE
+{"timestamp":"2026-10-09T04:42:19.737Z","status":500,"error":"Internal Server Error","path":"/customers/1"}
+```
+
+</Expected>
+
+Tab 1 in `ERROR: column c1_0.full_name does not exist`. Migration thành công, và v1 hỏng ngay từ request tiếp theo. Trong rolling deploy, đó là mọi instance cũ, trong suốt thời gian deploy. Trả lại tên cũ:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c 'ALTER TABLE customers RENAME COLUMN display_name TO full_name'
+curl -s localhost:8085/customers/1; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ALTER TABLE
+{"id":1,"email":"an@example.com","fullName":"Nguyễn An"}
+```
+
+</Expected>
+
+### 3. Expand: bản v2 chạy song song với v1
+
+Migration `V8` thêm cột mới, dựng trigger giữ hai cột đồng bộ cho cả hai phiên bản, và backfill. Code v2 đổi ánh xạ sang `display_name`:
+
+<Terminal where="mac" title="Tab 2: V8 và Customer của v2">
+
+```bash
+cd ~/masteva-sb5/shop
+P=src/main/java/vn/masteva/shop
+cat > src/main/resources/db/migration/V8__customers_display_name_expand.sql <<'EOF'
+SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE customers ADD COLUMN display_name text;
+
+CREATE FUNCTION customers_sync_name() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.display_name := coalesce(NEW.display_name, NEW.full_name);
+        NEW.full_name := coalesce(NEW.full_name, NEW.display_name);
+    ELSIF NEW.display_name IS DISTINCT FROM OLD.display_name THEN
+        NEW.full_name := NEW.display_name;
+    ELSIF NEW.full_name IS DISTINCT FROM OLD.full_name THEN
+        NEW.display_name := NEW.full_name;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER customers_sync_name
+    BEFORE INSERT OR UPDATE ON customers
+    FOR EACH ROW EXECUTE FUNCTION customers_sync_name();
+
+UPDATE customers SET display_name = full_name WHERE display_name IS NULL;
+EOF
+perl -0pi -e 's/    private String fullName;/    \@Column(name = "display_name")\n    private String fullName;/; s/import jakarta.persistence.Entity;/import jakarta.persistence.Column;\nimport jakarta.persistence.Entity;/' $P/Customer.java
+./mvnw -q package -DskipTests && cp target/shop-0.0.1-SNAPSHOT.jar ../shop-v2.jar
+```
+
+</Terminal>
+
+- v1 ghi `full_name`, `display_name` để trống: trigger chép sang `display_name`. v2 ghi `display_name`, không biết `full_name`: trigger chép ngược lại, nên `full_name NOT NULL` vẫn thoả. Trigger `BEFORE` chạy trước khi PostgreSQL kiểm `NOT NULL`.
+- Khi `UPDATE`, mỗi phiên bản chỉ gửi cột nó biết: v1 gửi `full_name`, v2 gửi `display_name`, và cột còn lại giữ giá trị cũ. Trigger nhìn cột nào vừa đổi so với `OLD` để chép theo đúng hướng.
+- `display_name` để nullable ở bước này: v1 chưa biết cột này, đặt `NOT NULL` lúc này chỉ an toàn nhờ trigger, và bước contract sẽ làm điều đó.
+- Backfill bằng một câu `UPDATE` được với bảng nhỏ. Với hàng triệu khách, chạy theo lô bên ngoài migration.
+
+Chạy v2 ở **tab 3**, trong khi v1 vẫn chạy ở tab 1:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb5
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+"$JAVA_HOME/bin/java" -jar shop-v2.jar --server.port=8185
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Current version of schema "public": 7
+Migrating schema "public" to version "8 - customers display name expand"
+Successfully applied 1 migration to schema "public", now at version v8 (execution time 00:00.014s)
+```
+
+</Expected>
+
+Ghi bằng một phiên bản, đọc bằng phiên bản kia:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+J='Content-Type: application/json'; T='Content-Type: text/plain'
+echo "# v1 tạo, v2 đọc"
+curl -s -H "$J" -d '{"email":"dung@example.com","fullName":"Phạm Dũng"}' localhost:8085/customers; echo
+curl -s localhost:8185/customers/4; echo
+echo "# v2 tạo, v1 đọc"
+curl -s -H "$J" -d '{"email":"em@example.com","fullName":"Võ Em"}' localhost:8185/customers; echo
+curl -s localhost:8085/customers/5; echo
+echo "# v2 đổi tên, v1 đọc"
+curl -s -X PUT -H "$T" -d 'Phạm Văn Dũng' localhost:8185/customers/4/name; echo
+curl -s localhost:8085/customers/4; echo
+echo "# v1 đổi tên, v2 đọc"
+curl -s -X PUT -H "$T" -d 'Võ Thị Em' localhost:8085/customers/5/name; echo
+curl -s localhost:8185/customers/5; echo
+shopsql -c 'SELECT id, full_name, display_name FROM customers ORDER BY id'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+# v1 tạo, v2 đọc
+{"id":4,"email":"dung@example.com","fullName":"Phạm Dũng"}
+{"id":4,"email":"dung@example.com","fullName":"Phạm Dũng"}
+# v2 tạo, v1 đọc
+{"id":5,"email":"em@example.com","fullName":"Võ Em"}
+{"id":5,"email":"em@example.com","fullName":"Võ Em"}
+# v2 đổi tên, v1 đọc
+{"id":4,"email":"dung@example.com","fullName":"Phạm Văn Dũng"}
+{"id":4,"email":"dung@example.com","fullName":"Phạm Văn Dũng"}
+# v1 đổi tên, v2 đọc
+{"id":5,"email":"em@example.com","fullName":"Võ Thị Em"}
+{"id":5,"email":"em@example.com","fullName":"Võ Thị Em"}
+ id |   full_name   | display_name  
+----+---------------+---------------
+  1 | Nguyễn An     | Nguyễn An
+  2 | Trần Bình     | Trần Bình
+  3 | Lê Chi        | Lê Chi
+  4 | Phạm Văn Dũng | Phạm Văn Dũng
+  5 | Võ Thị Em     | Võ Thị Em
+(5 rows)
+```
+
+</Expected>
+
+Hai phiên bản cùng chạy, mọi tổ hợp ghi và đọc đều đúng. Giờ giả lập một instance v1 khởi động lại giữa lúc deploy (ví dụ bị autoscaler thay): dừng v1 ở tab 1 bằng **Ctrl+C**, rồi chạy lại đúng lệnh `"$JAVA_HOME/bin/java" -jar shop-v1.jar --server.port=8085`.
+
+<Expected>
+
+```text
+Successfully validated 8 migrations (execution time 00:00.022s)
+Current version of schema "public": 8
+Schema "public" has a version (8) that is newer than the latest available migration (7) !
+Schema "public" is up to date. No migration necessary.
+```
+
+</Expected>
+
+v1 chỉ biết tới V7 nhưng vẫn khởi động: Flyway mặc định bỏ qua migration "của tương lai" và chỉ cảnh báo. Điều đó chỉ an toàn vì V8 tương thích với code v1. Đây cũng là đường rollback: nếu v2 có lỗi, quay về v1 mà không phải đảo ngược migration.
+
+<Check id="sb5.5.lab-expand">Tái hiện được việc `RENAME COLUMN` làm hỏng phiên bản đang chạy, viết được migration expand có trigger đồng bộ, và chứng minh được hai phiên bản cùng đọc ghi đúng.</Check>
+
+### 4. Thêm cột và tạo index trên bảng lớn
+
+Nạp 2 triệu đơn vào `orders` để thấy khác biệt. Lệnh mất khoảng nửa phút:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c '\timing on' -c "INSERT INTO orders (customer_id, status, created_at) SELECT 1 + g % 5, 'PAID', now() - g * interval '1 second' FROM generate_series(1, 2000000) AS g" -c 'ANALYZE orders'
+shopsql -c '\timing on' -c "ALTER TABLE orders ADD COLUMN channel text NOT NULL DEFAULT 'web'" -c "ALTER TABLE orders ADD COLUMN ref uuid NOT NULL DEFAULT gen_random_uuid()"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Timing is on.
+INSERT 0 2000000
+Time: 26471.442 ms (00:26.471)
+ANALYZE
+Time: 425.904 ms
+Timing is on.
+ALTER TABLE
+Time: 3.401 ms
+ALTER TABLE
+Time: 5140.510 ms (00:05.141)
+```
+
+</Expected>
+
+Cùng là "thêm cột `NOT NULL` có default", nhưng 3 ms so với hơn 5 giây. `'web'` là hằng số: PostgreSQL ghi nó vào metadata và trả về cho mọi dòng cũ khi đọc. `gen_random_uuid()` là hàm volatile, mỗi dòng một giá trị, nên PostgreSQL phải ghi lại cả 2 triệu dòng, suốt thời gian đó giữ khoá `ACCESS EXCLUSIVE`: không ai đọc được bảng `orders`. Xoá hai cột thử:
+
+<Callout kind="danger">
+
+Lệnh sau xoá hai cột `channel` và `ref` cùng dữ liệu trong đó. Chỉ chạy trên `sb5-pg` của lab.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c 'ALTER TABLE orders DROP COLUMN channel, DROP COLUMN ref'
+```
+
+</Terminal>
+
+Giờ tạo index trong một migration chạy trong transaction, như Flyway làm mặc định. Phần `pg_sleep(5)` đóng vai các câu lệnh khác của cùng migration. Trong lúc đó, một request của ứng dụng chèn đơn mới, với `lock_timeout` 2 giây:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c 'BEGIN' -c 'CREATE INDEX orders_created_idx ON orders (created_at)' -c 'SELECT pg_sleep(5)' -c 'COMMIT' > /dev/null &
+sleep 2
+shopsql -c '\timing on' -c "SET lock_timeout = '2s'" -c "INSERT INTO orders (customer_id, status, created_at) VALUES (1, 'NEW', now())"
+wait
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Timing is on.
+SET
+Time: 0.149 ms
+Time: 2007.717 ms (00:02.008)
+ERROR:  canceling statement due to lock timeout
+LINE 1: INSERT INTO orders (customer_id, status, created_at) VALUES ...
+                    ^
+```
+
+</Expected>
+
+`CREATE INDEX` giữ khoá `SHARE` trên `orders` tới khi transaction commit. Khoá đó cho đọc nhưng chặn mọi ghi, nên `INSERT` chờ và bị huỷ sau 2 giây. Không có `lock_timeout`, nó sẽ chờ tới hết migration. Làm lại bằng `CONCURRENTLY` (không chạy được trong transaction):
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c 'DROP INDEX orders_created_idx'
+shopsql -c 'CREATE INDEX CONCURRENTLY orders_created_idx ON orders (created_at)' > /dev/null &
+sleep 0.3
+shopsql -c '\timing on' -c "SET lock_timeout = '2s'" -c "INSERT INTO orders (customer_id, status, created_at) VALUES (1, 'NEW', now())"
+wait
+shopsql -c 'DROP INDEX orders_created_idx'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+DROP INDEX
+Timing is on.
+SET
+Time: 0.107 ms
+INSERT 0 1
+Time: 14.098 ms
+DROP INDEX
+```
+
+</Expected>
+
+`INSERT` chạy xong trong khoảng 10 mili giây trong khi index đang được dựng. Cái giá: `CONCURRENTLY` quét bảng hai lần, lâu hơn, và nếu thất bại để lại index `INVALID`. Lệnh cuối xoá index thử để bước sau tạo nó bằng Flyway.
+
+<Check id="sb5.5.lab-locks">Đo được khác biệt giữa default hằng số và default volatile khi thêm cột, và tái hiện được việc `CREATE INDEX` chặn ghi trong khi `CREATE INDEX CONCURRENTLY` thì không.</Check>
+
+### 5. Contract: bản v3 bỏ cột cũ
+
+Contract chỉ được chạy khi **không còn instance v1 nào**. Dừng v1 ở tab 1 bằng **Ctrl+C**. v2 ở tab 3 vẫn chạy. Bản v3 có cùng code với v2, thêm hai migration: `V9` bỏ cột cũ, `V10` tạo index bằng `CONCURRENTLY`, kèm cấu hình để Flyway không giữ transaction mở.
+
+<Callout kind="danger">
+
+`V9` xoá cột `full_name` cùng dữ liệu trong đó. Chỉ chạy khi chắc chắn mọi instance đã dùng `display_name` và backfill đã xong. Trên production, sao lưu hoặc giữ cột vài ngày trước khi xoá.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2: V9, V10 và bản v3">
+
+```bash
+cd ~/masteva-sb5/shop
+cat > src/main/resources/db/migration/V9__customers_display_name_contract.sql <<'EOF'
+SET LOCAL lock_timeout = '5s';
+
+DROP TRIGGER customers_sync_name ON customers;
+DROP FUNCTION customers_sync_name();
+ALTER TABLE customers ALTER COLUMN display_name SET NOT NULL;
+ALTER TABLE customers DROP COLUMN full_name;
+EOF
+cat > src/main/resources/db/migration/V10__orders_created_idx.sql <<'EOF'
+CREATE INDEX CONCURRENTLY orders_created_idx ON orders (created_at);
+EOF
+echo 'spring.flyway.postgresql.transactional-lock=false' >> src/main/resources/application.properties
+sed -i '' 's/INSERT INTO customers (email, full_name)/INSERT INTO customers (email, display_name)/' src/test/resources/db/testdata/V100__bulk_orders.sql
+./mvnw test 2>&1 | grep -E 'Tests run:|BUILD' | tail -2
+./mvnw -q package -DskipTests && cp target/shop-0.0.1-SNAPSHOT.jar ../shop-v3.jar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[INFO] Tests run: 25, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+</Expected>
+
+- `SET NOT NULL` trực tiếp ở đây chấp nhận được vì `customers` nhỏ. Với bảng lớn, dùng ràng buộc `NOT VALID` rồi `VALIDATE` như mục Kiến thức.
+- `SET LOCAL` giữ `lock_timeout` trong transaction của từng migration. Nếu `V9` dùng `SET` thường, timeout 5 giây sẽ đi theo kết nối của Flyway sang `V10`.
+- `V10` chỉ có một câu `CONCURRENTLY`: Flyway không cho trộn câu cần transaction và câu không chạy được trong transaction trong cùng một file.
+- Dữ liệu test `V100` của SB5.3 chèn vào `full_name`, cột mà `V9` vừa xoá. Migration test chạy lại từ đầu mỗi lần, nên sửa thẳng file đó là đúng; migration chính thì không bao giờ sửa (SB3.2). Chạy lại toàn bộ test của cả chặng để chắc không gì hỏng, kể cả `V10` chạy trong Testcontainers.
+
+Chạy v3 ở tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb5
+"$JAVA_HOME/bin/java" -jar shop-v3.jar --server.port=8085
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Current version of schema "public": 8
+Migrating schema "public" to version "9 - customers display name contract"
+Migrating schema "public" to version "10 - orders created idx" [non-transactional]
+Successfully applied 2 migrations to schema "public", now at version v10 (execution time 00:00.678s)
+```
+
+</Expected>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s localhost:8085/customers/5; echo
+curl -s localhost:8185/customers/5; echo
+curl -s -H 'Content-Type: application/json' -d '{"email":"giang@example.com","fullName":"Hà Giang"}' localhost:8185/customers; echo
+shopsql -c '\d customers' | sed -n '1,8p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":5,"email":"em@example.com","fullName":"Võ Thị Em"}
+{"id":5,"email":"em@example.com","fullName":"Võ Thị Em"}
+{"id":6,"email":"giang@example.com","fullName":"Hà Giang"}
+                            Table "public.customers"
+    Column    |  Type  | Collation | Nullable |             Default              
+--------------+--------+-----------+----------+----------------------------------
+ id           | bigint |           | not null | generated by default as identity
+ email        | text   |           | not null | 
+ display_name | text   |           | not null | 
+Indexes:
+    "customers_pkey" PRIMARY KEY, btree (id)
+```
+
+</Expected>
+
+v2 vẫn đọc ghi bình thường sau contract, vì nó chưa bao giờ dùng `full_name`. `V10` chạy với nhãn `[non-transactional]` và không treo nhờ `transactional-lock=false`. Ba bản phát hành, không request nào lỗi do schema.
+
+<Check id="sb5.5.lab-contract">Hoàn tất được contract khi không còn phiên bản cũ, và chạy được `CREATE INDEX CONCURRENTLY` qua Flyway với `transactional-lock=false`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Migration có `CONCURRENTLY` treo mãi lúc khởi động: thiếu `spring.flyway.postgresql.transactional-lock=false`. Dừng ứng dụng, xem `shopsql -c "select pid, state, wait_event, left(query, 60) from pg_stat_activity where datname = 'shop'"`, thêm cấu hình rồi chạy lại.
+- `V10` thất bại, ví dụ `canceling statement due to lock timeout` (mã `55P03`): `CONCURRENTLY` chạy ngoài transaction, nên Flyway ghi một dòng `success = false` vào `flyway_schema_history` và từ chối khởi động cho tới khi bạn dọn, còn PostgreSQL để lại index ở trạng thái `INVALID`. Dọn theo hai bước ở dưới.
+- Migration chạy trong transaction (như `V8`, `V9`) thất bại: PostgreSQL rollback cả migration và Flyway 12 không ghi dòng nào vào lịch sử. Chỉ cần sửa file rồi khởi động lại.
+- `Port 8085 was already in use`: một lần chạy trước chưa tắt. `lsof -ti tcp:8085` cho PID, dừng bằng `kill <PID>`.
+- `Connection to localhost:5445 refused`: `sb5-pg` chưa chạy hoặc chưa sẵn sàng. `docker start sb5-pg` rồi đợi `pg_isready`.
+- `curl` ở cổng 8085 trả `500` sau bước 5 với `column ... full_name does not exist`: tab 1 vẫn đang chạy v1, chưa phải v3.
+
+</Callout>
+
+Dọn sau khi `V10` thất bại. Bước 1, nếu `\d orders` ghi `orders_created_idx` là `INVALID`, xoá index đó để migration tạo lại từ đầu:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c '\d orders' | grep orders_created_idx
+shopsql -c 'DROP INDEX IF EXISTS orders_created_idx'
+```
+
+</Terminal>
+
+Bước 2, xoá dòng thất bại khỏi lịch sử của Flyway. `flyway repair` của Flyway CLI làm đúng việc này; không có CLI thì xoá bằng SQL:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá dòng khỏi `flyway_schema_history`, bảng Flyway dựa vào để biết migration nào đã chạy. Chỉ xoá dòng `success = false` của migration bạn đã dọn xong, và chỉ khi không instance nào đang khởi động. Xoá nhầm dòng thành công làm Flyway chạy lại migration đó.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+shopsql -c 'DELETE FROM flyway_schema_history WHERE success = false'
+```
+
+</Terminal>
+
+Rồi khởi động lại ứng dụng: Flyway chạy lại `V10`.
+
+### Dọn dẹp
+
+Dừng v3 ở tab 1 và v2 ở tab 3 bằng **Ctrl+C**.
+
+<Callout kind="danger">
+
+Hai lệnh dưới xoá container `sb5-pg` cùng toàn bộ dữ liệu trong đó, và xoá thư mục lab `~/masteva-sb5` gồm project của cả chặng và ba file jar. Chỉ chạy khi không cần project này nữa.
+
+</Callout>
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker rm -f sb5-pg
+rm -rf ~/masteva-sb5
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Rollback một bản phát hành có migration thì sao?">
+
+Flyway Community không có "down migration" chạy tự động, và kể cả có, đảo ngược một `DROP COLUMN` không lấy lại được dữ liệu. Expand/contract biến rollback thành việc chạy lại code cũ: vì mỗi migration tương thích với phiên bản trước, bạn quay về v(n-1) mà giữ nguyên schema, như bước 3. Đó là lý do contract luôn tách ra một bản phát hành sau, khi đã chắc không cần quay lại.
+
+</Reveal>
+
+<Reveal title="Chạy migration lúc ứng dụng khởi động hay tách thành bước riêng?">
+
+Spring Boot chạy Flyway khi khởi động: đơn giản, nhưng với 20 instance, instance nào lên trước chạy migration (Flyway dùng khoá để chỉ một instance chạy), và migration lâu làm health check của instance đó thất bại. Nhiều team tách migration thành một bước riêng trong pipeline deploy (một job Kubernetes hoặc lệnh `flyway migrate`) chạy xong mới cuộn instance mới, và tắt `spring.flyway.enabled` ở ứng dụng. Chặng SB11 bàn cách đóng gói và phát hành.
+
+</Reveal>
+
+<Reveal title="Đổi kiểu một cột trên bảng lớn, ví dụ int sang bigint, thì sao?">
+
+`ALTER COLUMN ... TYPE bigint` ghi lại toàn bảng và mọi index trên cột đó dưới khoá `ACCESS EXCLUSIVE`: với bảng trăm triệu dòng, đó là hàng chục phút không ai đọc ghi được. Chỉ vài đổi kiểu tương thích nhị phân được miễn, như nới `varchar(50)` thành `varchar(100)` hay `text`. Cách không downtime lại là expand/contract: thêm cột `bigint` mới, trigger chép giá trị khi ghi, backfill theo lô, tạo index `CONCURRENTLY`, chuyển code sang cột mới, rồi mới bỏ cột cũ. Với khoá chính, việc đổi còn kéo theo mọi khoá ngoại trỏ tới nó, nên chọn `bigint` ngay từ đầu rẻ hơn nhiều.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết kế hoạch expand/contract cho một thay đổi schema cụ thể, viết trigger đồng bộ hai cột, hoặc rà một file migration xem có khoá nặng không. AI hay viết `RENAME COLUMN` hay `ALTER COLUMN TYPE` thẳng trong một migration, hay quên `lock_timeout` hoặc viết `SET lock_timeout` không có `LOCAL`, và hay đặt `CREATE INDEX CONCURRENTLY` chung file với câu lệnh khác. Kiểm tra bằng cách chạy migration trên bản sao dữ liệu có kích thước thật trong khi một phiên bản cũ đang chạy, như bước 3 và 4.
+
+</Callout>
+
+<Callout kind="link">
+
+SB3.2 giới thiệu Flyway và quy tắc không sửa migration đã chạy; bài này thêm quy tắc tương thích hai phiên bản. SB4.2 đo transaction dài giữ khoá dòng; bài này là phiên bản của cùng vấn đề ở mức khoá bảng. Chặng SB11 đưa migration vào pipeline phát hành.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb5.5.mastery-migration">Lập và thực hiện được kế hoạch migration không downtime cho một thay đổi schema có rủi ro (đổi tên cột, thêm `NOT NULL`, tạo index trên bảng lớn), và chứng minh phiên bản cũ vẫn chạy trong suốt quá trình.</Check>
+
+<Check id="sb5.5.mastery-locks">Viết được migration có `SET LOCAL lock_timeout`, giải thích được vì sao `SET` không `LOCAL` lan sang migration sau, và dọn được một migration `CONCURRENTLY` thất bại.</Check>
+
+</Mastery>

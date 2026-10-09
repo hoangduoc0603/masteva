@@ -1,0 +1,807 @@
+---
+title: Auditing, soft delete và batch insert
+description: Tự ghi ai sửa gì lúc nào bằng auditing của Spring Data, đo cái giá thật của soft delete với Hibernate 7, đưa batch insert từ 1.002 xuống 23 câu lệnh JDBC bằng SEQUENCE, và biết khi nào Spring Data JDBC hợp hơn JPA.
+id: sb5.4
+step: sb5
+prerequisites: [sb5.3]
+topics: [sb5.auditing-soft-delete, sb5.batch, sb5.spring-data-jdbc]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    spring-data-jpa: 4.1.1
+    testcontainers: 2.0.5
+    docker: 29.8.0
+    postgresql: "18.6"
+---
+
+<Goal>
+
+Bài này gom ba việc hay gặp khi một service JPA đã chạy trên production: ghi vết thay đổi, xoá mềm và ghi hàng loạt, cùng một lựa chọn thay thế JPA cho aggregate nhỏ. Học xong bài này, bạn giải thích được:
+
+- Vì sao thêm `@SoftDelete` vào `Product` làm ứng dụng không khởi động được, và vì sao sau đó một đơn hàng cũ không mở được nữa.
+- Vì sao xoá mềm một sản phẩm rồi tạo lại đúng mã SKU đó vi phạm ràng buộc `UNIQUE`.
+- Vì sao bật `hibernate.jdbc.batch_size=50` mà lưu 1.000 dòng hàng vẫn là 1.000 câu `INSERT` gửi riêng lẻ.
+
+</Goal>
+
+<Knowledge>
+
+### Auditing: ai tạo, ai sửa, lúc nào
+
+**Auditing** (ghi vết) là điền tự động bốn cột cho mỗi dòng: tạo lúc nào, bởi ai, sửa lần cuối lúc nào, bởi ai. Spring Data JPA làm việc này bằng một entity listener:
+
+```java
+@Entity
+@EntityListeners(AuditingEntityListener.class)
+public class Product {
+    @CreatedDate      private Instant createdAt;
+    @LastModifiedDate private Instant updatedAt;
+    @CreatedBy        private String createdBy;
+    @LastModifiedBy   private String updatedBy;
+}
+
+@Configuration
+@EnableJpaAuditing
+class AuditConfig {
+    @Bean
+    AuditorAware<String> auditor() {          // "ai": lấy từ SecurityContext ở SB6
+        return () -> CurrentUser.get().or(() -> Optional.of("system"));
+    }
+}
+```
+
+```text
+ products.save(p) / flush
+        |
+        v
+ Hibernate gọi callback @PrePersist / @PreUpdate
+        |
+        v
+ AuditingEntityListener ---> DateTimeProvider: Instant hiện tại
+        |               ---> AuditorAware.getCurrentAuditor(): "binh"
+        v
+ gán createdAt/createdBy (chỉ khi persist), updatedAt/updatedBy (mọi lần)
+        |
+        v
+ INSERT / UPDATE chứa các cột audit
+```
+
+Auditing chỉ chạy khi entity đi qua vòng đời của JPA. Các đường sau **bỏ qua** nó: `UPDATE` hàng loạt bằng JPQL (`@Modifying @Query`), `JdbcClient`, migration, và người sửa bằng psql. Nếu cần chắc chắn tuyệt đối, đặt `DEFAULT now()` và trigger ở database.
+
+| Nhu cầu | Cách | Ghi chú |
+|---|---|---|
+| Ai sửa lần cuối, lúc nào | Bốn cột audit của Spring Data | Chỉ giữ trạng thái mới nhất |
+| Toàn bộ lịch sử từng thay đổi | Bảng lịch sử: Hibernate Envers, trigger, hoặc sự kiện | Chặng SB10 (lịch sử thay đổi) và SB13 (audit trail) |
+| Không ai sửa được dấu vết | Audit trail ghi vào nơi chỉ thêm, không sửa | SB13 |
+
+<Check id="sb5.4.auditing">Cấu hình được auditing với `@EnableJpaAuditing` và `AuditorAware`, và kể được những đường ghi dữ liệu không đi qua auditing.</Check>
+
+### Soft delete và cái giá của nó
+
+**Soft delete** (xoá mềm) đổi `DELETE` thành `UPDATE ... SET deleted_at = now()`, và mọi truy vấn tự thêm `deleted_at IS NULL`. Lý do hay gặp: khôi phục khi xoá nhầm, giữ tham chiếu từ dữ liệu lịch sử, yêu cầu lưu trữ.
+
+Hibernate 7 có `@SoftDelete` với ba chiến lược:
+
+| `strategy` | Cột mặc định | Giá trị khi đã xoá |
+|---|---|---|
+| `DELETED` (mặc định) | `deleted` (boolean) | `true` |
+| `ACTIVE` | `active` (boolean) | `false` |
+| `TIMESTAMP` | `deleted` (đặt lại bằng `columnName`) | Thời điểm xoá |
+
+Cái giá, phần lớn bạn sẽ gặp thật ở lab:
+
+- **Mọi truy vấn có thêm điều kiện**, và index phải tính tới nó. Index thường nên là partial index (chỉ mục một phần) `WHERE deleted_at IS NULL`.
+- **Ràng buộc `UNIQUE` vẫn tính cả dòng đã xoá.** Xoá SKU `PENCIL` rồi tạo lại `PENCIL` sẽ vi phạm `UNIQUE (sku)`. Thay bằng partial unique index `CREATE UNIQUE INDEX ... (sku) WHERE deleted_at IS NULL`.
+- **Quan hệ to-one tới entity xoá mềm không được LAZY.** Hibernate cần biết ngay lúc tải entity cha rằng entity con có còn "tồn tại" không, nên nó từ chối khởi động nếu `@ManyToOne(fetch = LAZY)` trỏ tới entity có `@SoftDelete`.
+- **Dữ liệu lịch sử trỏ tới dòng đã xoá thì vỡ.** Đơn hàng cũ có dòng hàng trỏ tới sản phẩm đã xoá mềm: Hibernate lọc sản phẩm đó đi và ném `FetchNotFoundException` khi tải đơn.
+- **Bảng nối của collection cũng bị xoá mềm**, nên `product_tags` cũng cần cột `deleted_at`. Khoá chính `(product_id, tag_code)` của bảng nối vẫn tính dòng đã xoá mềm: gỡ một tag rồi gắn lại đúng tag đó vi phạm khoá chính. Khoá chính không thể là partial index, nên muốn gắn lại được thì bảng nối cần id riêng và một partial unique index, hoặc không xoá mềm bảng nối.
+- **Xoá mềm không phải xoá.** Yêu cầu xoá dữ liệu cá nhân (như GDPR) vẫn đòi xoá thật hoặc ẩn danh hoá.
+
+Vì vậy với entity được dữ liệu lịch sử tham chiếu (sản phẩm, khách hàng), một cột trạng thái rõ ràng như `archived_at`, được lọc **có chủ đích** ở màn hình danh mục và không lọc ở màn hình đơn hàng, thường đúng hơn `@SoftDelete` áp lên mọi truy vấn.
+
+<Check id="sb5.4.soft-delete">Kể được ít nhất bốn cái giá của soft delete, sửa được xung đột `UNIQUE` bằng partial unique index, và chọn được giữa `@SoftDelete` và cột trạng thái cho một entity cụ thể.</Check>
+
+### Batch insert và update
+
+Mỗi câu SQL gửi riêng là một lượt đi về qua mạng. **JDBC batching** gom nhiều lần thực thi của **cùng một câu lệnh** với tham số khác nhau rồi gửi một lần:
+
+```text
+ không batch                               batch_size = 50
+ app ---- INSERT (dòng 1) ----> PG         app ---- INSERT x50 (một lượt) ----> PG
+ app <--- OK ------------------ PG         app <--- 50 x OK -------------------- PG
+ app ---- INSERT (dòng 2) ----> PG         ... 20 lượt cho 1.000 dòng
+ ... 1.000 lượt đi về
+```
+
+| Thuộc tính (`spring.jpa.properties.` + ...) | Tác dụng |
+|---|---|
+| `hibernate.jdbc.batch_size=50` | Gom tối đa 50 câu cùng loại vào một batch |
+| `hibernate.order_inserts=true` | Sắp xếp `INSERT` theo entity để câu cùng loại nằm liền nhau, nếu không batch bị cắt mỗi khi xen kẽ hai bảng |
+| `hibernate.order_updates=true` | Như trên cho `UPDATE` |
+
+**`GenerationType.IDENTITY` chặn batch insert.** Với `IDENTITY`, id chỉ có sau khi database chèn dòng, và Hibernate cần id ngay khi `persist()` để đưa entity vào persistence context. Nên nó chạy từng `INSERT` một, ngay lập tức (SB2.1 và SB5.1 đã thấy `INSERT` chạy ngay lúc `persist`, trước khi flush). `UPDATE` không bị ảnh hưởng vì entity đã có id.
+
+**`SEQUENCE` với pooled optimizer** giải quyết việc này. Với `allocationSize = 50` và sequence `INCREMENT BY 50`, mỗi lần gọi `nextval` Hibernate nhận một giá trị v và tự cấp các id trong khoảng `(v - 50, v]` trong bộ nhớ: 1.000 dòng cần 20 lần `nextval` thay vì 1.000, và các `INSERT` được dồn tới lúc flush để gom batch.
+
+Khi chuyển một bảng có sẵn từ `IDENTITY` sang `SEQUENCE`:
+
+- `setval` sequence lên trên `max(id)` hiện có, nếu không id mới đụng id cũ.
+- Đặt `DEFAULT nextval('...')` cho cột id, nếu không mọi `INSERT` không qua Hibernate (script dữ liệu, psql, service khác) vấp `NOT NULL`. Lab gặp đúng lỗi này với dữ liệu test của SB5.3.
+
+Ngoài batch của Hibernate còn có: tham số `reWriteBatchedInserts=true` của pgJDBC (gộp batch `INSERT` thành một câu nhiều dòng, nhanh hơn nữa), `JdbcClient`/`JdbcTemplate.batchUpdate` cho import thuần, `COPY` của PostgreSQL cho hàng triệu dòng, và `UPDATE ... WHERE` một câu bằng JPQL khi mọi dòng đổi theo cùng một quy tắc. Với job lớn trong một transaction, gọi `flush()` rồi `clear()` mỗi `batch_size` entity để persistence context không phình ra (Đào sâu của SB5.2).
+
+<Check id="sb5.4.batch">Cấu hình được batch insert và update cho Hibernate, giải thích được vì sao `IDENTITY` chặn batch insert, và chuyển được một bảng sang `SEQUENCE` với pooled optimizer an toàn.</Check>
+
+<Callout kind="production">
+
+Một job đêm đồng bộ 2 triệu sản phẩm từ ERP vào service catalog bằng JPA, chạy gần ba tiếng. Team bật `hibernate.jdbc.batch_size=100`, deploy, và thời gian không đổi: entity dùng `GenerationType.IDENTITY`, nên mọi `INSERT` vẫn đi riêng lẻ, và log metrics của Hibernate ghi `0 JDBC batches`. Chuyển sang `SEQUENCE` với `allocationSize = 100`, thêm `order_inserts`, và `flush()`/`clear()` mỗi 100 entity đưa job xuống dưới 20 phút. Bài học: đo số batch thật thay vì tin vào cấu hình.
+
+</Callout>
+
+### Spring Data JDBC: khi nào chọn thay JPA (tuỳ chọn)
+
+**Spring Data JDBC** dùng cùng kiểu repository với Spring Data JPA nhưng bỏ hẳn persistence context: không lazy loading, không dirty checking, không proxy, không cache cấp một. Mỗi `findById` chạy SQL, mỗi `save` ghi xuống ngay.
+
+Nó xây trên khái niệm **aggregate** của Domain-Driven Design: một gốc (`PurchaseOrder`) cùng các entity con thuộc trọn về nó (`OrderItem`). Repository chỉ có cho gốc; tham chiếu sang aggregate khác (khách hàng, sản phẩm) là **id**, không phải đối tượng.
+
+```java
+@Table("orders")
+record PurchaseOrder(@Id Long id, AggregateReference<Customer, Long> customer,
+                     String status, Set<OrderItem> items) { }
+
+@Table("order_items")
+record OrderItem(Long productId, int quantity, long unitPrice) { }
+```
+
+Theo tài liệu chính thức, khi `save()` một aggregate không mới, Spring Data JDBC **xoá mọi entity con rồi chèn lại**, vì nó không biết trạng thái trước đó. Với aggregate nhỏ, đó là cái giá chấp nhận được để đổi lấy mô hình đơn giản.
+
+| | Spring Data JPA | Spring Data JDBC |
+|---|---|---|
+| Persistence context, dirty checking | Có | Không: `save()` mới ghi |
+| Lazy loading, N+1 ẩn | Có | Không: tải cả aggregate, hoặc chỉ id |
+| Quan hệ giữa aggregate | Đối tượng (`@ManyToOne`) | Id (`AggregateReference`) |
+| Sửa một con trong collection | `UPDATE` một dòng | Xoá rồi chèn lại mọi con |
+| Hợp với | Đồ thị đối tượng phức tạp, nhiều màn hình sửa | Aggregate nhỏ, rõ ranh giới; team muốn SQL dễ đoán |
+
+Bài này không có lab cho Spring Data JDBC; các khẳng định trên lấy từ tài liệu ở mục Tài liệu.
+
+<Check id="sb5.4.spring-data-jdbc">So sánh được Spring Data JDBC với JPA theo persistence context, cách lưu collection con và cách tham chiếu giữa aggregate, và nêu được một tình huống nên chọn nó.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Auditing (Spring Data JPA)](https://docs.spring.io/spring-data/jpa/reference/auditing.html): annotation audit, `AuditorAware` lấy người dùng từ Spring Security, và `@EnableJpaAuditing`.
+- [Hibernate ORM User Guide: Soft Delete](https://docs.hibernate.org/orm/current/userguide/html_single/#soft-delete): các chiến lược, cột chỉ thị, và soft delete cho collection.
+- [Hibernate ORM User Guide: Batching](https://docs.hibernate.org/orm/current/userguide/html_single/#batch): `hibernate.jdbc.batch_size`, batch trong session và DML hàng loạt bằng HQL.
+- [Spring Data JDBC: Persisting Entities](https://docs.spring.io/spring-data/relational/reference/jdbc/entity-persistence.html): cách lưu aggregate, việc xoá rồi chèn lại entity con, và `@Version`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài SB5.3, project ở `~/masteva-sb5/shop`, Docker Desktop đang chạy. Cả ba bước đều chạy bằng test như các bài trước. Định nghĩa lại hàm `lab` nếu mở terminal mới:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-sb5/shop
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+lab() { ./mvnw -q test -Dtest="$1" 2>&1 | grep -E '^(SQL|>>|\[ERROR\]   )|COMPILATION|\.java:\['; }
+```
+
+</Terminal>
+
+### 1. Auditing cho sản phẩm
+
+<Terminal where="mac" title="V4, CurrentUser, AuditConfig, Product">
+
+```bash
+cd ~/masteva-sb5/shop
+P=src/main/java/vn/masteva/shop
+cat > src/main/resources/db/migration/V4__product_audit.sql <<'EOF'
+ALTER TABLE products
+    ADD COLUMN created_at timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN created_by text NOT NULL DEFAULT 'system',
+    ADD COLUMN updated_by text NOT NULL DEFAULT 'system';
+EOF
+cat > $P/CurrentUser.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.Optional;
+
+/** Người dùng hiện tại của thread. Chặng SB6 thay bằng SecurityContext của Spring Security. */
+public final class CurrentUser {
+    private static final ThreadLocal<String> USER = new ThreadLocal<>();
+
+    private CurrentUser() {
+    }
+
+    public static void runAs(String user, Runnable action) {
+        USER.set(user);
+        try {
+            action.run();
+        } finally {
+            USER.remove();
+        }
+    }
+
+    static Optional<String> get() {
+        return Optional.ofNullable(USER.get());
+    }
+}
+EOF
+cat > $P/AuditConfig.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.Optional;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.domain.AuditorAware;
+import org.springframework.data.jpa.repository.config.EnableJpaAuditing;
+
+@Configuration
+@EnableJpaAuditing
+class AuditConfig {
+
+    @Bean
+    AuditorAware<String> auditor() {
+        return () -> CurrentUser.get().or(() -> Optional.of("system"));
+    }
+}
+EOF
+cat > $P/Product.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.EntityListeners;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.JoinTable;
+import jakarta.persistence.ManyToMany;
+import jakarta.persistence.Table;
+import java.time.Instant;
+import java.util.HashSet;
+import java.util.Set;
+import org.springframework.data.annotation.CreatedBy;
+import org.springframework.data.annotation.CreatedDate;
+import org.springframework.data.annotation.LastModifiedBy;
+import org.springframework.data.annotation.LastModifiedDate;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+@Entity
+@Table(name = "products")
+@EntityListeners(AuditingEntityListener.class)
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String sku;
+    private String name;
+    private long price;
+
+    @CreatedDate
+    private Instant createdAt;
+    @LastModifiedDate
+    private Instant updatedAt;
+    @CreatedBy
+    private String createdBy;
+    @LastModifiedBy
+    private String updatedBy;
+
+    @ManyToMany
+    @JoinTable(name = "product_tags",
+            joinColumns = @JoinColumn(name = "product_id"),
+            inverseJoinColumns = @JoinColumn(name = "tag_code"))
+    private Set<Tag> tags = new HashSet<>();
+
+    protected Product() {
+    }
+
+    public Product(String sku, String name, long price) {
+        this.sku = sku;
+        this.name = name;
+        this.price = price;
+    }
+
+    public Long getId() { return id; }
+    public String getSku() { return sku; }
+    public long getPrice() { return price; }
+    public void setPrice(long price) { this.price = price; }
+    public Set<Tag> getTags() { return tags; }
+}
+EOF
+cat > src/test/java/vn/masteva/shop/AuditLabTest.java <<'EOF'
+package vn.masteva.shop;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.simple.JdbcClient;
+
+class AuditLabTest extends LabTest {
+    @Autowired
+    ProductRepository products;
+    @Autowired
+    JdbcClient jdbc;
+
+    void printRow(String sku) {
+        jdbc.sql("select id, sku, price, created_by, updated_by, updated_at > created_at as changed from products where sku = ?")
+                .param(sku).query().listOfRows()
+                .forEach(r -> System.out.println(">> " + r));
+    }
+
+    @Test
+    void auditing() {
+        step("an tạo sản phẩm PEN");
+        Long[] id = new Long[1];
+        CurrentUser.runAs("an", () -> id[0] = tx.execute(s -> products.save(new Product("PEN", "Bút", 20000)).getId()));
+        printRow("PEN");
+        step("binh sửa giá");
+        CurrentUser.runAs("binh", () -> tx.executeWithoutResult(s -> products.findById(id[0]).orElseThrow().setPrice(25000)));
+        printRow("PEN");
+        step("sản phẩm có từ V2");
+        printRow("MUG");
+    }
+}
+EOF
+lab 'AuditLabTest'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+>> an tạo sản phẩm PEN
+SQL: insert into products (created_at,created_by,name,price,sku,updated_at,updated_by) values (?,?,?,?,?,?,?)
+>> {id=4, sku=PEN, price=20000, created_by=an, updated_by=an, changed=false}
+>> binh sửa giá
+SQL: select p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_at,p1_0.updated_by from products p1_0 where p1_0.id=?
+SQL: update products set created_at=?,created_by=?,name=?,price=?,sku=?,updated_at=?,updated_by=? where id=?
+>> {id=4, sku=PEN, price=25000, created_by=an, updated_by=binh, changed=true}
+>> sản phẩm có từ V2
+>> {id=3, sku=MUG, price=90000, created_by=system, updated_by=system, changed=false}
+```
+
+</Expected>
+
+- Không dòng code nghiệp vụ nào gán `createdBy` hay `updatedAt`: listener làm việc đó trước `INSERT` và `UPDATE`.
+- `created_by` vẫn là `an` sau khi `binh` sửa: `@CreatedBy` chỉ được gán khi persist.
+- `V4` thêm bốn cột `NOT NULL` có default không volatile (`now()` là hàm `STABLE`, chỉ tính một lần cho cả câu lệnh): PostgreSQL chỉ ghi metadata, các dòng cũ đọc ra giá trị default. Đây là quy tắc ở mục Kiến thức, áp vào migration thật.
+
+<Check id="sb5.4.lab-auditing">Thấy được các cột audit được điền tự động khi tạo và sửa, với người dùng khác nhau, và giải thích được vì sao `created_by` không đổi.</Check>
+
+### 2. Soft delete, và các cái giá của nó
+
+<Terminal where="mac" title="V5, @SoftDelete, SoftDeleteLabTest">
+
+```bash
+cd ~/masteva-sb5/shop
+P=src/main/java/vn/masteva/shop
+cat > src/main/resources/db/migration/V5__product_soft_delete.sql <<'EOF'
+ALTER TABLE products ADD COLUMN deleted_at timestamptz;
+ALTER TABLE product_tags ADD COLUMN deleted_at timestamptz;
+EOF
+perl -0pi -e 's/\@EntityListeners\(AuditingEntityListener.class\)\n/\@EntityListeners(AuditingEntityListener.class)\n\@SoftDelete(strategy = SoftDeleteType.TIMESTAMP, columnName = "deleted_at")\n/; s/import org.springframework.data.annotation.CreatedBy;/import org.hibernate.annotations.SoftDelete;\nimport org.hibernate.annotations.SoftDeleteType;\nimport org.springframework.data.annotation.CreatedBy;/' $P/Product.java
+perl -pi -e 's/(    public int getQuantity\(\) \{ return quantity; \})/$1\n    public Product getProduct() { return product; }/' $P/OrderItem.java
+cat > src/test/java/vn/masteva/shop/SoftDeleteLabTest.java <<'EOF'
+package vn.masteva.shop;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.NestedExceptionUtils;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.simple.JdbcClient;
+
+class SoftDeleteLabTest extends LabTest {
+    @Autowired
+    ProductRepository products;
+    @Autowired
+    OrderRepository orders;
+    @Autowired
+    CustomerRepository customers;
+    @Autowired
+    JdbcClient jdbc;
+
+    void printRow(String sku) {
+        jdbc.sql("select id, sku, price, deleted_at is not null as deleted from products where sku = ? order by id")
+                .param(sku).query().listOfRows()
+                .forEach(r -> System.out.println(">> " + r));
+    }
+
+    @Test
+    void softDelete() {
+        Long id = tx.execute(s -> products.save(new Product("PENCIL", "Bút chì", 5000)).getId());
+        step("xoá sản phẩm PENCIL");
+        tx.executeWithoutResult(s -> products.deleteById(id));
+        step("đọc lại qua repository");
+        System.out.println(">> findById: " + products.findById(id).isPresent() + ", count: " + products.count());
+        printRow("PENCIL");
+        step("tạo lại sản phẩm PENCIL");
+        try {
+            tx.executeWithoutResult(s -> products.save(new Product("PENCIL", "Bút chì 2B", 6000)));
+            printRow("PENCIL");
+        } catch (DataAccessException e) {
+            System.out.println(">> " + e.getMostSpecificCause().getMessage().lines().findFirst().orElseThrow());
+        }
+    }
+
+    @Test
+    void deletedProductInOldOrder() {
+        Long[] ids = tx.execute(s -> {
+            Product cup = products.save(new Product("CUP", "Cốc giấy", 3000));
+            PurchaseOrder o = new PurchaseOrder(customers.getReferenceById(1L));
+            o.addItem(cup, 1);
+            return new Long[] {orders.save(o).getId(), cup.getId()};
+        });
+        tx.executeWithoutResult(s -> products.deleteById(ids[1]));
+        step("đọc đơn cũ có sản phẩm đã xoá");
+        try {
+            tx.executeWithoutResult(s -> {
+                OrderItem item = orders.findById(ids[0]).orElseThrow().getItems().getFirst();
+                System.out.println(">> sku: " + item.getProduct().getSku());
+            });
+        } catch (RuntimeException e) {
+            System.out.println(">> " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    @Test
+    void retagAfterRemove() {
+        step("gỡ tag 'sale' khỏi sản phẩm 1");
+        tx.executeWithoutResult(s -> products.findById(1L).orElseThrow().getTags().removeIf(t -> t.getCode().equals("sale")));
+        step("gắn lại tag 'sale'");
+        try {
+            tx.executeWithoutResult(s -> products.findById(1L).orElseThrow().getTags().add(em.find(Tag.class, "sale")));
+        } catch (RuntimeException e) {
+            System.out.println(">> " + NestedExceptionUtils.getMostSpecificCause(e).getMessage().lines().findFirst().orElseThrow());
+        }
+    }
+}
+EOF
+./mvnw -q test -Dtest='SoftDeleteLabTest' 2>&1 | grep -o 'UnsupportedMappingException: .*' | sort -u
+```
+
+</Terminal>
+
+<Predict question="Chỉ thêm một annotation vào Product. Test có chạy không?">
+
+```text
+UnsupportedMappingException: To-one attribute (vn.masteva.shop.OrderItem.product) cannot be mapped as LAZY as its associated entity is defined with @SoftDelete
+```
+
+Không: Spring không khởi động được `EntityManagerFactory`. `OrderItem.product` là `@ManyToOne(fetch = LAZY)`. Với proxy lazy, Hibernate chỉ có `product_id` và phải hứa rằng sản phẩm tồn tại; với soft delete, sản phẩm có thể "không tồn tại" dù dòng vẫn còn, nên Hibernate đòi tải nó ngay để kiểm tra. Đây là cái giá đầu tiên: mọi quan hệ trỏ tới entity xoá mềm phải EAGER.
+
+</Predict>
+
+Đổi `OrderItem.product` sang EAGER (bỏ `fetch = LAZY`), rồi chạy thí nghiệm xoá:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-sb5/shop
+P=src/main/java/vn/masteva/shop
+perl -0pi -e 's/\@ManyToOne\(fetch = FetchType.LAZY, optional = false\)\n    private Product product;/\@ManyToOne(optional = false)\n    private Product product;/' $P/OrderItem.java
+lab 'SoftDeleteLabTest#softDelete'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+SQL: insert into products (created_at,created_by,name,price,sku,updated_at,updated_by,deleted_at) values (?,?,?,?,?,?,?,null)
+>> xoá sản phẩm PENCIL
+SQL: select p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_at,p1_0.updated_by from products p1_0 where p1_0.deleted_at is null and p1_0.id=?
+SQL: update product_tags set deleted_at=localtimestamp where product_id=? and deleted_at is null
+SQL: update products set deleted_at=localtimestamp where id=? and deleted_at is null
+>> đọc lại qua repository
+SQL: select p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_at,p1_0.updated_by from products p1_0 where p1_0.deleted_at is null and p1_0.id=?
+SQL: select count(*) from products p1_0 where p1_0.deleted_at is null
+>> findById: false, count: 3
+>> {id=4, sku=PENCIL, price=5000, deleted=true}
+>> tạo lại sản phẩm PENCIL
+SQL: insert into products (created_at,created_by,name,price,sku,updated_at,updated_by,deleted_at) values (?,?,?,?,?,?,?,null)
+>> ERROR: duplicate key value violates unique constraint "products_sku_key"
+```
+
+</Expected>
+
+- Test dùng SKU `PENCIL` và `CUP`, khác `PEN` của bước 1, để các test không giẫm lên dữ liệu của nhau khi chạy chung một database ở lần chạy toàn bộ test của SB5.5.
+- `deleteById` thành hai câu `update`: một cho bảng nối `product_tags`, một cho `products`. Mọi `select` có thêm `deleted_at is null`.
+- Dòng vẫn còn trong bảng (`deleted=true`), và ràng buộc `UNIQUE (sku)` từ `V1` vẫn tính nó: không tạo lại được `PENCIL`.
+
+Thay ràng buộc bằng partial unique index, bằng một migration mới:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-sb5/shop
+cat > src/main/resources/db/migration/V6__product_sku_unique_active.sql <<'EOF'
+ALTER TABLE products DROP CONSTRAINT products_sku_key;
+CREATE UNIQUE INDEX products_sku_active_key ON products (sku) WHERE deleted_at IS NULL;
+EOF
+lab 'SoftDeleteLabTest#softDelete' | tail -3
+lab 'SoftDeleteLabTest#deletedProductInOldOrder' | sed -n '/đọc đơn cũ/,$p'
+lab 'SoftDeleteLabTest#retagAfterRemove'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+SQL: insert into products (created_at,created_by,name,price,sku,updated_at,updated_by,deleted_at) values (?,?,?,?,?,?,?,null)
+>> {id=4, sku=PENCIL, price=5000, deleted=true}
+>> {id=5, sku=PENCIL, price=6000, deleted=false}
+>> đọc đơn cũ có sản phẩm đã xoá
+SQL: select po1_0.id,po1_0.created_at,po1_0.customer_id,po1_0.status from orders po1_0 where po1_0.id=?
+SQL: select i1_0.order_id,i1_0.id,i1_0.product_id,p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_at,p1_0.updated_by,i1_0.quantity,i1_0.unit_price from order_items i1_0 left join products p1_0 on p1_0.id=i1_0.product_id and p1_0.deleted_at is null where i1_0.order_id=? order by i1_0.id
+>> FetchNotFoundException: Entity `vn.masteva.shop.Product` with identifier value `4` does not exist
+>> gỡ tag 'sale' khỏi sản phẩm 1
+SQL: select p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_at,p1_0.updated_by from products p1_0 where p1_0.deleted_at is null and p1_0.id=?
+SQL: select t1_0.product_id,t1_1.code,t1_1.label from product_tags t1_0 join tags t1_1 on t1_1.code=t1_0.tag_code where t1_0.product_id=? and t1_0.deleted_at is null
+SQL: update product_tags set deleted_at=localtimestamp where product_id=? and tag_code=? and deleted_at is null
+>> gắn lại tag 'sale'
+SQL: select p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_at,p1_0.updated_by from products p1_0 where p1_0.deleted_at is null and p1_0.id=?
+SQL: select t1_0.code,t1_0.label from tags t1_0 where t1_0.code=?
+SQL: select t1_0.product_id,t1_1.code,t1_1.label from product_tags t1_0 join tags t1_1 on t1_1.code=t1_0.tag_code where t1_0.product_id=? and t1_0.deleted_at is null
+SQL: insert into product_tags (product_id,tag_code,deleted_at) values (?,?,null)
+>> ERROR: duplicate key value violates unique constraint "product_tags_pkey"
+```
+
+</Expected>
+
+- Partial unique index chỉ tính dòng chưa xoá: `PENCIL` mới (id 5) cùng tồn tại với `PENCIL` đã xoá (id 4).
+- Test `deletedProductInOldOrder` tạo sản phẩm `CUP` (id 4), một đơn hàng mua nó, rồi xoá mềm `CUP`; `sed` chỉ giữ phần từ bước đọc lại. Mở lại đơn đó: Hibernate join `products` với điều kiện `deleted_at is null`, không thấy sản phẩm 4, và ném `FetchNotFoundException`. Màn hình lịch sử đơn hàng hỏng vì một thao tác ở màn hình danh mục.
+
+Thí nghiệm cuối gỡ tag `sale` khỏi sản phẩm 1, rồi gắn lại. Gỡ thành `update product_tags set deleted_at=...`: dòng vẫn còn. Gắn lại là một `insert` cùng cặp `(1, 'sale')`, và khoá chính của bảng nối vẫn tính dòng đã xoá mềm: `duplicate key ... product_tags_pkey`. Khoá chính không thể có điều kiện `WHERE` như partial index, nên với soft delete trên collection, bảng nối cần id riêng cộng partial unique index, hoặc không xoá mềm bảng nối.
+
+Kết luận cho dự án thật: `Product` được dữ liệu lịch sử tham chiếu, nên một cột `archived_at` lọc có chủ đích hợp hơn `@SoftDelete`. Lab giữ nguyên `@SoftDelete` để bạn quan sát; các bước sau không bị ảnh hưởng.
+
+<Check id="sb5.4.lab-soft-delete">Tái hiện được bốn cái giá của `@SoftDelete`: lỗi khởi động với quan hệ LAZY, vi phạm `UNIQUE` khi tạo lại, `FetchNotFoundException` ở đơn hàng cũ, vi phạm khoá chính khi gắn lại tag, và sửa được cái thứ hai bằng partial unique index.</Check>
+
+### 3. Batch insert: IDENTITY, rồi SEQUENCE
+
+Test lưu một đơn với 1.000 dòng hàng, rồi tăng số lượng của cả 1.000 dòng. Bật thêm log `org.hibernate.session.metrics` để Hibernate in số câu lệnh và số batch JDBC của mỗi session:
+
+<Terminal where="mac" title="BatchLabTest">
+
+```bash
+cd ~/masteva-sb5/shop
+P=src/main/java/vn/masteva/shop
+perl -pi -e 's/(    void unlink\(\) \{)/    void increase() {\n        quantity++;\n    }\n\n$1/' $P/OrderItem.java
+cat > src/test/java/vn/masteva/shop/BatchLabTest.java <<'EOF'
+package vn.masteva.shop;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.test.context.TestPropertySource;
+
+@TestPropertySource(properties = "logging.level.org.hibernate.session.metrics=debug")
+class BatchLabTest extends LabTest {
+    @Autowired
+    OrderRepository orders;
+    @Autowired
+    CustomerRepository customers;
+    @Autowired
+    ProductRepository products;
+
+    @Test
+    void insertThenUpdate() {
+        step("lưu 1 đơn với 1000 dòng hàng");
+        long start = System.nanoTime();
+        Long id = tx.execute(s -> {
+            PurchaseOrder order = new PurchaseOrder(customers.getReferenceById(1L));
+            Product book = products.getReferenceById(1L);
+            for (int i = 0; i < 1000; i++) {
+                order.addItem(book, 1);
+            }
+            orders.save(order);
+            System.out.println(">> id dòng hàng: " + order.getItems().getFirst().getId()
+                    + " .. " + order.getItems().getLast().getId());
+            return order.getId();
+        });
+        System.out.println(">> " + (System.nanoTime() - start) / 1_000_000 + " ms");
+        count();
+        step("tăng số lượng của 1000 dòng hàng");
+        start = System.nanoTime();
+        tx.executeWithoutResult(s -> orders.findById(id).orElseThrow().getItems().forEach(OrderItem::increase));
+        System.out.println(">> " + (System.nanoTime() - start) / 1_000_000 + " ms");
+        count();
+    }
+}
+EOF
+batch() { ./mvnw -q test -Dtest=BatchLabTest 2>&1 | grep -E '^(>>|SQL)|JDBC (statements|batches)' | grep -v ' 0 JDBC' | uniq -c | cut -c1-100; }
+batch
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   1 >> lưu 1 đơn với 1000 dòng hàng
+   1 SQL: select p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_
+   1 SQL: insert into orders (created_at,customer_id,status) values (?,?,?)
+1000 SQL: insert into order_items (order_id,product_id,quantity,unit_price) values (?,?,?,?)
+   1 >> id dòng hàng: 1 .. 1000
+   1 	7355163 ns preparing 1002 JDBC statements
+   1 	328271268 ns executing 1002 JDBC statements
+   1 >> 567 ms
+   1 >> 1002 câu SQL
+   1 >> tăng số lượng của 1000 dòng hàng
+   1 SQL: select po1_0.id,po1_0.created_at,po1_0.customer_id,po1_0.status from orders po1_0 where po
+   1 SQL: select i1_0.order_id,i1_0.id,i1_0.product_id,p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.
+1000 SQL: update order_items set order_id=?,product_id=?,quantity=?,unit_price=? where id=?
+   1 	2642894 ns preparing 1002 JDBC statements
+   1 	236351615 ns executing 1002 JDBC statements
+   1 >> 329 ms
+   1 >> 1002 câu SQL
+```
+
+</Expected>
+
+`batch` đếm các dòng SQL giống nhau liên tiếp bằng `uniq -c`. Số mili giây khác nhau mỗi lần chạy; số câu lệnh thì không. 1.000 `INSERT` và 1.000 `UPDATE`, mỗi câu một lượt đi về. Bật batch:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-sb5/shop
+cat >> src/main/resources/application.properties <<'EOF'
+spring.jpa.properties.hibernate.jdbc.batch_size=50
+spring.jpa.properties.hibernate.order_inserts=true
+spring.jpa.properties.hibernate.order_updates=true
+EOF
+batch
+```
+
+</Terminal>
+
+<Predict question="Insert và update có được gom batch không?">
+
+```text
+   1 >> lưu 1 đơn với 1000 dòng hàng
+   1 SQL: select p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_
+   1 SQL: insert into orders (created_at,customer_id,status) values (?,?,?)
+1000 SQL: insert into order_items (order_id,product_id,quantity,unit_price) values (?,?,?,?)
+   1 >> id dòng hàng: 1 .. 1000
+   1 	7380824 ns preparing 1002 JDBC statements
+   1 	320312600 ns executing 1002 JDBC statements
+   1 >> 563 ms
+   1 >> 1002 câu SQL
+   1 >> tăng số lượng của 1000 dòng hàng
+   1 SQL: select po1_0.id,po1_0.created_at,po1_0.customer_id,po1_0.status from orders po1_0 where po
+   1 SQL: select i1_0.order_id,i1_0.id,i1_0.product_id,p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.
+1000 SQL: update order_items set order_id=?,product_id=?,quantity=?,unit_price=? where id=?
+   1 	155417 ns preparing 3 JDBC statements
+   1 	2772000 ns executing 2 JDBC statements
+   1 	30670459 ns executing 20 JDBC batches
+   1 >> 104 ms
+   1 >> 3 câu SQL
+```
+
+Chỉ `UPDATE` được gom: 20 batch, mỗi batch 50 câu, và chỉ chuẩn bị 3 câu lệnh (2 câu `select`, 1 câu `update` dùng cho mọi batch). `INSERT` vẫn 1.000 câu riêng lẻ vì `OrderItem` dùng `IDENTITY`: id hiện ra ngay khi `persist` (`1 .. 1000`), tức Hibernate đã phải chèn từng dòng để biết id. Log `SQL:` của Hibernate vẫn in đủ 1.000 câu `update` vì nó in mỗi lần thêm vào batch; phần metrics cho biết thật sự có bao nhiêu lượt gửi.
+
+</Predict>
+
+Chuyển `order_items` sang `SEQUENCE` với bước 50:
+
+<Terminal where="mac" title="V7 và @SequenceGenerator">
+
+```bash
+cd ~/masteva-sb5/shop
+P=src/main/java/vn/masteva/shop
+cat > src/main/resources/db/migration/V7__order_items_sequence.sql <<'EOF'
+ALTER TABLE order_items ALTER COLUMN id DROP IDENTITY;
+CREATE SEQUENCE order_items_seq INCREMENT BY 50 OWNED BY order_items.id;
+SELECT setval('order_items_seq', coalesce(max(id), 0) + 50) FROM order_items;
+ALTER TABLE order_items ALTER COLUMN id SET DEFAULT nextval('order_items_seq');
+EOF
+perl -0pi -e 's/    \@Id\n    \@GeneratedValue\(strategy = GenerationType.IDENTITY\)\n    private Long id;/    \@Id\n    \@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "order_items_seq")\n    \@SequenceGenerator(name = "order_items_seq", sequenceName = "order_items_seq", allocationSize = 50)\n    private Long id;/; s/import jakarta.persistence.Table;/import jakarta.persistence.SequenceGenerator;\nimport jakarta.persistence.Table;/' $P/OrderItem.java
+batch
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   1 >> lưu 1 đơn với 1000 dòng hàng
+   1 SQL: select p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.name,p1_0.price,p1_0.sku,p1_0.updated_
+   1 SQL: insert into orders (created_at,customer_id,status) values (?,?,?)
+  20 SQL: select nextval('order_items_seq')
+   1 >> id dòng hàng: 51 .. 1050
+1000 SQL: insert into order_items (order_id,product_id,quantity,unit_price,id) values (?,?,?,?,?)
+   1 	589503 ns preparing 23 JDBC statements
+   1 	18994081 ns executing 22 JDBC statements
+   1 	58184835 ns executing 20 JDBC batches
+   1 >> 219 ms
+   1 >> 23 câu SQL
+   1 >> tăng số lượng của 1000 dòng hàng
+   1 SQL: select po1_0.id,po1_0.created_at,po1_0.customer_id,po1_0.status from orders po1_0 where po
+   1 SQL: select i1_0.order_id,i1_0.id,i1_0.product_id,p1_0.id,p1_0.created_at,p1_0.created_by,p1_0.
+1000 SQL: update order_items set order_id=?,product_id=?,quantity=?,unit_price=? where id=?
+   1 	168417 ns preparing 3 JDBC statements
+   1 	6395250 ns executing 2 JDBC statements
+   1 	46029288 ns executing 20 JDBC batches
+   1 >> 120 ms
+   1 >> 3 câu SQL
+```
+
+</Expected>
+
+- 20 câu `nextval` cấp đủ 1.000 id. Sequence đã được `setval(..., 50)`, nên `nextval` đầu tiên trả 100 và Hibernate dùng khoảng 51 tới 100; id `51 .. 1050` khớp đúng phép tính đó.
+- Id có sẵn khi `persist`, nên các `INSERT` được dồn tới lúc flush và đi thành 20 batch. Thời gian lưu giảm hơn một nửa trên máy này; qua mạng thật tới database, mỗi lượt đi về tốn hơn nhiều so với Docker trên cùng máy, nên mức giảm còn lớn hơn.
+- Dòng `ALTER COLUMN id SET DEFAULT nextval(...)` không thừa: thiếu nó, file `V100` của SB5.3 (chèn bằng SQL thuần) vấp `null value in column "id"`. Chạy `lab 'FetchPlanLabTest#graphPage'` để chắc chắn dữ liệu test vẫn nạp được.
+
+<Check id="sb5.4.lab-batch">Đo được số câu lệnh và số batch JDBC bằng session metrics, chỉ ra được vì sao `IDENTITY` không gom được `INSERT`, và chuyển được bảng sang `SEQUENCE` để gom.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Context không khởi động với `UnsupportedMappingException ... cannot be mapped as LAZY`: đúng điều bước 2 muốn cho thấy. Làm tiếp lệnh `perl` đổi `OrderItem.product` sang EAGER.
+- `Schema validation: missing column [deleted_at] in table [product_tags]`: thiếu dòng thứ hai của `V5`. Entity có `@SoftDelete` thì Hibernate xoá mềm cả bảng nối của collection.
+- `batch` không in dòng `JDBC batches` nào: log `org.hibernate.session.metrics` chưa ở mức `debug`, hoặc thiếu `generate_statistics=true` trong `LabTest`.
+- `null value in column "id" of relation "order_items"` khi chạy test của SB5.3 (fetch plan, keyset): `V7` thiếu dòng `SET DEFAULT nextval(...)`.
+- `Schema-validation: missing sequence [order_items_seq]`: `V7` chưa chạy hoặc tên sequence trong `@SequenceGenerator` khác tên trong migration.
+
+</Callout>
+
+### Dọn dẹp
+
+Testcontainers tự xoá container sau mỗi lần chạy. Giữ `~/masteva-sb5/shop` nếu học tiếp: bài SB5.5 chạy ứng dụng thật trên project này.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Có nên ghi lịch sử thay đổi bằng trigger database thay vì code Java?">
+
+Trigger bắt được mọi đường ghi: Hibernate, `JdbcClient`, migration, người sửa tay bằng psql. Code Java (listener, sự kiện) chỉ thấy những gì đi qua nó, nhưng biết ngữ cảnh nghiệp vụ: người dùng nào, request nào, lý do gì. Một cách kết hợp phổ biến: ứng dụng đặt `SET LOCAL app.user = 'binh'` đầu mỗi transaction, trigger đọc `current_setting('app.user')` khi ghi bảng lịch sử. Chặng SB10 và SB13 đi tiếp chủ đề này.
+
+</Reveal>
+
+<Reveal title="Vì sao không dùng UUID làm id để khỏi lo IDENTITY và SEQUENCE?">
+
+UUID sinh trong code nên có id ngay, batch insert chạy được, và không cần đi database để lấy id. Cái giá: 16 byte thay vì 8, và UUID ngẫu nhiên (phiên bản 4) rải dòng mới khắp B-tree, làm index phân mảnh và ghi chậm dần trên bảng lớn. UUID phiên bản 7 có tiền tố thời gian nên chèn gần như tuần tự, khắc phục phần lớn vấn đề đó. Ngoài ra, id tự gán làm `save()` đi đường `merge` như SB5.2, nên cần `Persistable` hoặc `@Version`.
+
+</Reveal>
+
+<Reveal title="Khi nào bỏ batch của Hibernate để dùng JdbcClient hay COPY?">
+
+Batch của Hibernate vẫn đi qua persistence context: mỗi dòng là một entity, có ảnh chụp, có callback auditing. Với import thuần (đọc file, ghi bảng, không logic nghiệp vụ trên từng entity), `JdbcClient` hoặc `JdbcTemplate.batchUpdate` bỏ được toàn bộ chi phí đó, và tham số `reWriteBatchedInserts=true` của pgJDBC gộp batch thành câu `INSERT` nhiều dòng. Với hàng triệu dòng, lệnh `COPY` của PostgreSQL (qua `CopyManager` của pgJDBC) nhanh hơn thêm một bậc. Cái giá: không còn auditing, cascade hay validation của entity, nên giữ JPA cho luồng nghiệp vụ và chỉ dùng đường thấp cho import.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI cấu hình auditing, viết migration chuyển bảng sang `SEQUENCE`, hoặc rà một thiết kế soft delete. AI hay khẳng định "Hibernate tự batch insert khi bật batch_size" mà bỏ qua `IDENTITY`, hay quên `setval` và `DEFAULT nextval` khi đổi sang sequence, và hay đề xuất `@SoftDelete` mà không nhắc tới ràng buộc `UNIQUE`, khoá chính của bảng nối hay dữ liệu lịch sử. Kiểm tra bằng session metrics (số `JDBC batches`), và bằng test xoá rồi tạo lại cùng một bản ghi.
+
+</Callout>
+
+<Callout kind="link">
+
+SB2.1 và SB5.1 cho thấy `IDENTITY` chèn ngay khi `persist`; bài này cho thấy hệ quả với batch. Chặng SB6 thay `CurrentUser` bằng người dùng thật từ Spring Security. SB10 làm lịch sử thay đổi đầy đủ; SB13 dựng audit trail không sửa được. SB5.5 dùng tiếp project này để đổi schema khi ứng dụng đang chạy.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb5.4.mastery-audit-delete">Tự thêm được auditing cho một entity, và quyết định được có dùng soft delete hay không sau khi đã xét ràng buộc `UNIQUE`, quan hệ tới entity đó và yêu cầu xoá dữ liệu.</Check>
+
+<Check id="sb5.4.mastery-batch">Tăng tốc được một luồng ghi hàng loạt bằng batch JDBC và `SEQUENCE`, có số câu lệnh và số batch trước và sau.</Check>
+
+</Mastery>

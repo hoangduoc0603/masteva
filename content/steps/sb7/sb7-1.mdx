@@ -1,0 +1,1170 @@
+---
+title: RestClient, HTTP Service Client, timeout và chống SSRF
+description: Gọi một service khác bằng RestClient rồi bằng interface @HttpExchange, đặt connect và read timeout, đổi lỗi của service kia thành lỗi nghiệp vụ của mình mà không lộ chi tiết bên trong, và chặn SSRF bằng InetAddressFilter của Spring Boot 4.1.
+id: sb7.1
+step: sb7
+prerequisites: [j13.3]
+topics: [sb7.restclient, sb7.http-service-client, sb7.timeout-loi, sb7.ssrf]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    spring-framework: 7.0.9
+    curl: 8.4.0
+---
+
+<Goal>
+
+Dựng hai service Spring Boot: `shop` hỏi tồn kho từ `stock` qua HTTP. Bạn gọi `stock` bằng `RestClient`, rồi chuyển sang HTTP Service Client (một interface có `@HttpExchange`), đặt timeout, biến mọi lỗi của `stock` thành lỗi của chính `shop`, và chặn một lỗ SSRF có thật. Học xong bài này, bạn giải thích được:
+
+- Vì sao `stock` chậm 10 giây thì `shop` cũng chậm đúng 10 giây, dù không ai viết dòng code nào để chờ.
+- Vì sao mặc định một lỗi 404 của service kia thành lỗi 500 của bạn, kèm nguyên văn body của nó trong log.
+- Vì sao chức năng "xem trước đường link" có thể đọc được mật khẩu database của một service nội bộ, và vì sao bật bộ lọc địa chỉ rồi vẫn chưa đủ.
+
+</Goal>
+
+<Knowledge>
+
+### Gọi qua mạng không giống gọi hàm
+
+Bài J9.3 đã gọi API bằng `HttpClient` của JDK. Khi service của bạn gọi một service khác trên production, lời gọi đó có thêm ba tính chất mà một lời gọi hàm không có:
+
+| Tính chất | Hậu quả nếu bỏ qua |
+|---|---|
+| **Có thể chậm tuỳ ý** | Thread của bạn chờ theo. Một service phụ chậm làm cạn thread pool của service chính |
+| **Có thể lỗi theo nhiều kiểu** | 404, 503, timeout, connection refused là bốn tình huống khác nhau, cần bốn cách xử lý khác nhau |
+| **Đích đến là một URL** | Nếu URL lấy từ người dùng, server của bạn thành công cụ để họ gõ cửa mạng nội bộ |
+
+Bài này xử lý cả ba ở phía **client** (bên gọi). Bài SB7.2 thêm retry và circuit breaker lên trên.
+
+### Các HTTP client trong Spring
+
+| Client | Kiểu | Dùng khi |
+|---|---|---|
+| `RestTemplate` | Đồng bộ, API kiểu template | Code cũ; Spring không thêm tính năng mới cho nó |
+| `WebClient` | Reactive, trả `Mono`/`Flux` | Ứng dụng WebFlux (bài SB1.4) |
+| `RestClient` | Đồng bộ, API fluent | Ứng dụng Spring MVC, mặc định cho code mới |
+| HTTP Service Client | Interface có `@HttpExchange`, Spring sinh phần cài đặt | Gọi một API có nhiều endpoint, muốn khai báo thay vì viết từng lời gọi |
+
+HTTP Service Client không phải một client thứ năm: bên dưới nó vẫn là `RestClient` (hoặc `WebClient`). Vì vậy mọi thứ bạn học về `RestClient` dưới đây (status handler, timeout, request factory) dùng lại nguyên vẹn.
+
+### RestClient: đường đi của một lời gọi
+
+```text
+ shop: StockClient.get("MUG")
+   |
+   v
+ RestClient  (baseUrl, default header, status handler, message converter Jackson)
+   |   .get().uri("/stock/{sku}", "MUG")   -> GET http://localhost:8187/stock/MUG
+   v
+ ClientHttpRequestFactory  (connect timeout, read timeout, redirect, bộ lọc địa chỉ)
+   |   Spring Boot chọn: Apache HttpClient > Jetty > Reactor Netty > HttpClient của JDK
+   v
+ TCP ----------------------------------------------> stock :8187
+   |
+   v  response
+ status handler: 2xx -> đọc body thành StockLevel
+                 4xx/5xx -> handler bạn đăng ký, hoặc handler mặc định ném exception
+```
+
+- **Lấy `RestClient.Builder` mà Spring Boot đã cấu hình**, đừng dùng `RestClient.create()`. Builder của Boot mang sẵn message converter Jackson, observation cho metric và tracing (bài SB8.2), cùng timeout trong `spring.http.clients.*`. `RestClient.create()` bỏ qua tất cả.
+- Builder là bean scope **prototype**: mỗi chỗ inject nhận một builder mới. Builder có trạng thái, nên đừng giữ một builder rồi dựng nhiều client khác nhau từ nó; dùng `builder.clone()` nếu cần.
+- `.uri("/stock/{sku}", sku)` mã hoá biến đường dẫn cho bạn. Ghép chuỗi `"/stock/" + sku` thì một sku như `../internal/config` đi thẳng vào URL.
+- `retrieve()` xử lý status rồi đọc body. `exchange((request, response) -> ...)` giao cho bạn toàn bộ response, dùng khi cần đọc header hay body của cả trường hợp lỗi theo cách riêng.
+
+### Status lỗi: mặc định và onStatus
+
+Mặc định, `retrieve()` ném `HttpClientErrorException` cho 4xx và `HttpServerErrorException` cho 5xx. Message của chúng chứa **nguyên văn body** của service kia. Nếu bạn không bắt, nó thành lỗi 500 của bạn; nếu bạn bắt rồi trả `e.getMessage()` ra API, bạn vừa đưa chi tiết nội bộ của `stock` cho người dùng của `shop`.
+
+`onStatus(predicate, handler)` cho bạn quyết định từng loại status; bước 4 của lab viết đủ ba handler: 404, các 4xx còn lại, và 5xx.
+
+- Các handler được thử **theo thứ tự đăng ký**, handler đầu tiên khớp được chạy. Đặt điều kiện hẹp (404) trước điều kiện rộng (`is4xxClientError`).
+- Handler `onStatus` gắn vào từng request luôn được thử **trước** handler mặc định của client (`defaultStatusHandler` trên builder, dùng ở bước 5). Nhờ vậy một lời gọi đặc biệt vẫn ghi đè được quy tắc chung của client.
+- Handler phải **ném exception**. Nếu nó trả về bình thường, `RestClient` coi như lỗi đã được xử lý và tiếp tục đọc body như một response thành công.
+- `stock` trả lỗi theo **Problem Details** (RFC 9457, bài J10.3): JSON có `title`, `status`, `detail` và các trường riêng. Bên trong handler, `response.getBody()` là stream thô, nên bạn tự đọc bằng `JsonMapper` (Jackson 3, bài J9.3). Đọc để **ghi log và ra quyết định**, không để chuyển tiếp nguyên văn.
+
+<Check id="sb7.1.restclient">Dựng được `RestClient` từ builder của Spring Boot với base URL và default header, và giải thích được vì sao không nên dùng `RestClient.create()` hay ghép chuỗi URL.</Check>
+
+### HTTP Service Client với @HttpExchange
+
+Khi gọi nhiều endpoint của cùng một service, viết `rest.get().uri(...).retrieve()...` lặp lại nhiều lần. HTTP Service Client cho bạn khai báo API bằng một interface:
+
+```java
+@HttpExchange("/stock")
+public interface StockApi {
+
+    @GetExchange("/{sku}")
+    StockLevel get(@PathVariable String sku);
+}
+```
+
+Spring Boot 4 tự tạo bean cho interface này khi bạn khai báo nó trong một **group** bằng `@ImportHttpServices`. Mỗi group có một `RestClient` riêng, cấu hình bằng property:
+
+```java
+@Configuration
+@ImportHttpServices(group = "stock", types = StockApi.class)
+class HttpClientsConfig { }
+```
+
+| Property dưới `spring.http.serviceclient.stock.` | Ý nghĩa |
+|---|---|
+| `base-url` | URL gốc của group |
+| `default-header.X-Caller` | Header gửi kèm mọi request |
+| `connect-timeout`, `read-timeout` | Ghi đè giá trị chung `spring.http.clients.*` cho riêng group này |
+| `redirects`, `ssl.bundle`, `apiversion.*` | Redirect, SSL bundle, version API (bài J10.2) |
+
+Những gì property không làm được, như status handler, bạn thêm bằng một bean `RestClientHttpServiceGroupConfigurer`: nó nhận `RestClient.Builder` của từng group và gọi `defaultStatusHandler(...)` trên đó (bước 5 của lab).
+
+Interface `StockApi` mô tả **hợp đồng HTTP** của `stock`. Code nghiệp vụ của `shop` không nên gọi thẳng nó, mà gọi qua một lớp `StockClient` nhỏ, nơi lỗi kỹ thuật (timeout, connection refused) được đổi thành exception của `shop`. Khi `stock` đổi API, chỉ hai file này phải sửa. Trong DDD, lớp như `StockClient` gọi là anti-corruption layer: mô hình của `stock` dừng lại ở đây, và bài SB7.2 đặt retry, circuit breaker lên chính nó.
+
+<Check id="sb7.1.http-service-client">Khai báo được một HTTP Service Client bằng `@HttpExchange`, `@ImportHttpServices` và property `spring.http.serviceclient.<group>.*`, và thêm được status handler cho group bằng `RestClientHttpServiceGroupConfigurer`.</Check>
+
+### Timeout: connect, read và tổng
+
+Bài J9.3 đã phân biệt connect timeout (chờ mở kết nối TCP) với timeout chờ response, và vì sao thiếu timeout thì thread bị treo. Với Spring Boot, hai giá trị đó đặt chung cho mọi client bằng `spring.http.clients.connect-timeout` và `spring.http.clients.read-timeout`, hoặc riêng một group bằng `spring.http.serviceclient.<group>.*`. **Mặc định không có timeout nào**: lab sẽ cho bạn thấy `shop` chờ đủ 10 giây khi `stock` chậm 10 giây, và khi mọi thread của Tomcat đều chờ `stock`, `shop` ngừng trả lời cả những request không liên quan tới kho.
+
+"Read timeout" có nghĩa khác nhau tuỳ thư viện HTTP mà Spring Boot chọn làm **request factory**:
+
+| Request factory | Có khi classpath có | Read timeout nghĩa là |
+|---|---|---|
+| HttpClient của JDK | Không có thư viện nào khác (lab này) | Hạn chót cho cả lời gọi: từ lúc gửi tới khi đọc xong body |
+| Apache HttpClient 5 | `httpclient5` | Socket timeout: thời gian tối đa **giữa hai lần nhận dữ liệu**. Server nhỏ giọt mỗi giây một byte thì không bao giờ hết hạn |
+| Jetty HttpClient | `jetty-client` | Hạn chót cho cả request |
+
+Đổi factory bằng `spring.http.clients.imperative.factory` (`http-components`, `jetty`, `reactor`, `jdk`, `simple`). Apache HttpClient có connection pool cấu hình được, nhưng mặc định của nó chỉ **5 kết nối mỗi host và 25 tổng**: dưới tải, request xếp hàng chờ kết nối dù service đích còn khoẻ.
+
+Timeout của client **không dừng công việc ở phía server**. Khi `shop` bỏ cuộc sau 2 giây, `stock` vẫn chạy nốt 10 giây của nó. Thêm retry (bài SB7.2) thì mỗi lần thử lại là thêm một request nữa cho một service đang quá tải. Vì vậy cần một **timeout tổng** cho cả thao tác: tổng thời gian các lần thử và các khoảng chờ phải nhỏ hơn thời gian người gọi `shop` sẵn sàng chờ.
+
+### Lỗi từ service khác: phân loại rồi mới xử lý
+
+| Tình huống | Exception khi dùng `RestClient` | `shop` nên trả | Thử lại được? |
+|---|---|---|---|
+| `stock` trả 404 cho sku | `HttpClientErrorException.NotFound` | 404 của `shop`, lời của `shop` | Không: kết quả sẽ y hệt |
+| `stock` trả 400, 401, 422 | `HttpClientErrorException` | Thường là lỗi lập trình hay cấu hình của `shop`: log, trả 500 | Không |
+| `stock` trả 429 | `HttpClientErrorException.TooManyRequests` | 503 | Có, sau thời gian trong header `Retry-After` |
+| `stock` trả 500, 502, 503, 504 | `HttpServerErrorException` | 503 kèm thông điệp chung | Có, nếu thao tác idempotent |
+| Timeout, connection refused | `ResourceAccessException` | 503 kèm thông điệp chung | Có, nếu thao tác idempotent |
+
+Hai nguyên tắc:
+
+- **Đổi lỗi kỹ thuật thành exception nghiệp vụ ở ranh giới.** Phía trên `StockClient` chỉ biết `ProductNotFoundException` và `StockUnavailableException`, không biết HTTP. `@RestControllerAdvice` (bài SB1.3) đổi chúng thành Problem Details của `shop`.
+- **Không chuyển tiếp lỗi của service khác ra ngoài.** Body lỗi của `stock` trong lab chứa tên máy `wh-pg-03.internal:5432`. Người dùng của `shop` chỉ cần biết "chưa kiểm tra được tồn kho"; chi tiết vào log.
+
+<Check id="sb7.1.timeout-loi">Phân biệt được connect timeout và read timeout, biết read timeout của request factory đang dùng nghĩa là gì, và phân loại được lỗi từ service khác thành "không tồn tại", "lỗi lập trình" và "tạm thời không phục vụ được".</Check>
+
+### SSRF: khi server của bạn gọi URL do người khác chọn
+
+**SSRF** (Server-Side Request Forgery, giả mạo request từ phía server) xảy ra khi ứng dụng tải một URL do người dùng cung cấp: xem trước đường link, tải ảnh đại diện từ URL, gửi thử webhook, nhập dữ liệu từ URL. Kẻ tấn công không gửi URL trỏ ra Internet, mà trỏ vào chỗ chỉ server của bạn với tới:
+
+```text
+ kẻ tấn công                shop (có IP nội bộ)                    mạng nội bộ
+     |  GET /link-preview?url=http://localhost:8187/internal/config
+     | ----------------------> |
+     |                         | --- GET /internal/config -------> stock :8187
+     |                         | <-- {"db.password":"kho-S3cret!"}
+     | <---- snippet ----------|
+     |
+     |  url=http://169.254.169.254/latest/meta-data/   -> dịch vụ metadata của máy cloud
+     |  url=http://10.0.3.7:6379/                       -> dò cổng: thời gian trả lời cho biết cổng nào mở
+```
+
+Địa chỉ `169.254.169.254` là dịch vụ metadata của AWS, GCP, Azure. Mức nguy hiểm tuỳ cấu hình: GCP đòi header `Metadata-Flavor: Google`, Azure đòi `Metadata: true`, AWS với IMDSv2 đòi lấy token bằng một request `PUT` trước; một SSRF chỉ gửi được `GET` không kèm header thì không qua được các cửa đó. Máy AWS còn bật **IMDSv1** thì khác: một `GET` là đủ để đọc credential IAM tạm thời của máy.
+
+OWASP xếp SSRF vào A01 Broken Access Control trong bản 2025 (bài SB6.3). Các lớp phòng thủ, từ mạnh tới yếu:
+
+| Lớp | Làm gì | Ghi chú |
+|---|---|---|
+| **Allowlist đích** | Chỉ cho gọi những host đã biết trước | Mạnh nhất. Dùng khi đích có hạn: webhook chỉ tới domain khách hàng đã xác minh, ảnh chỉ từ CDN của bạn |
+| Allowlist scheme và cổng | Chỉ `http`, `https`, cổng 80 và 443 | Chặn `file:`, `gopher:` và dò cổng |
+| **Lọc theo địa chỉ IP đã phân giải** | Sau khi DNS trả IP, từ chối nếu IP là loopback, private, link-local | Chặn được cả tên miền trỏ về `127.0.0.1`. Spring Boot 4.1 có sẵn `InetAddressFilter` |
+| Không theo redirect | Trả 3xx về cho bạn quyết định | URL bên ngoài có thể redirect vào trong |
+| Mạng | Service tải URL nằm trong subnet không có đường vào mạng nội bộ, hoặc đi qua egress proxy | Ngoài phạm vi code, nhưng là lớp cuối cùng. Khi đi qua egress proxy, lọc địa chỉ ở chính proxy: client chỉ thấy địa chỉ của proxy (Spring Boot ghi giới hạn này trong issue #51863) |
+| Phía cloud | Bắt buộc IMDSv2, đặt hop limit của response metadata là 1 | Container và SSRF qua proxy không tới được metadata |
+
+Kiểm tra chuỗi URL bằng tay (`host.startsWith("10.")`) không đủ: IPv6 `[::1]`, `[::ffff:127.0.0.1]`, hay một tên miền do kẻ tấn công đăng ký và trỏ về `127.0.0.1` đều lọt. Phải kiểm tra **IP sau khi phân giải**, đúng lúc client sắp mở kết nối.
+
+`InetAddressFilter` (gói `org.springframework.boot.http.client`) làm việc đó, gắn vào `HttpClientSettings` của từng client:
+
+```java
+HttpClientSettings settings = HttpClientSettings.defaults()
+        .withTimeouts(Duration.ofSeconds(1), Duration.ofSeconds(3))
+        .withRedirects(HttpRedirects.DONT_FOLLOW)
+        .withInetAddressFilter(InetAddressFilter.externalAddresses());
+RestClient web = builder
+        .requestFactory(ClientHttpRequestFactoryBuilder.jdk().build(settings))
+        .build();
+```
+
+`externalAddresses()` chỉ cho địa chỉ công khai (không loopback, private, link-local, multicast hay dải dành riêng); `internalAddresses()` thì ngược lại; `of("10.20.0.0/16")` tạo filter theo dải CIDR, nối thêm bằng `and`, `or`, `andNot`.
+
+IP bị chặn làm client ném `FilteredHostException` trước khi mở kết nối. Bạn cũng có thể khai báo một bean `InetAddressFilter` để áp cho **mọi** client do Spring Boot cấu hình; nhưng khi đó cả lời gọi hợp lệ tới `stock` trên `localhost` cũng bị chặn. Service vừa gọi service nội bộ vừa tải URL của người dùng nên dùng filter riêng cho client tải URL. Client `simple` (`HttpURLConnection`) không hỗ trợ filter và báo lỗi nếu bạn gắn.
+
+<Callout kind="production">
+
+Một tính năng "gửi thử webhook" cho khách hàng nhập URL, và đội phát triển đã chặn sẵn `localhost` cùng các dải private bằng cách kiểm tra chuỗi URL. Kẻ tấn công nhập một URL trên server của chính họ, server đó trả `302 Location: http://169.254.169.254/latest/meta-data/iam/security-credentials/`. HttpClient theo redirect; máy là EC2 còn bật IMDSv1, nên một `GET` là đủ để đọc credential IAM tạm thời, và response được hiển thị trong màn hình "kết quả gửi thử". Bước 8 của lab tái hiện đúng kiểu tấn công này với `InetAddressFilter`: với HttpClient của JDK trong Spring Boot 4.1.1, bộ lọc kiểm tra host của URL ban đầu nhưng **không kiểm tra lại host sau redirect** (đã thử; khi đổi sang Apache HttpClient thì bước redirect bị chặn). Ví dụ chính thức trong mục "InetAddress Filtering and SSRF Protection" của tài liệu Spring Boot dùng `ClientHttpRequestFactoryBuilder.jdk()` với redirect mặc định, nên dính đúng lỗ hổng này. Cách sửa không phụ thuộc thư viện: client tải URL của người dùng luôn đặt `DONT_FOLLOW`; phía hạ tầng, bắt buộc IMDSv2.
+
+</Callout>
+
+<Check id="sb7.1.ssrf">Giải thích được SSRF qua ví dụ metadata cloud và redirect, kể được các lớp phòng thủ theo thứ tự từ allowlist tới mạng, và gắn được `InetAddressFilter` cho riêng một client.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Calling REST Services (Spring Boot)](https://docs.spring.io/spring-boot/reference/io/rest-client.html): mục "HTTP Service Interface Clients" cho `@ImportHttpServices` và property `spring.http.serviceclient.*`; mục "Global Configuration" cho timeout, chọn request factory và `InetAddressFilter`.
+- [REST Clients (Spring Framework)](https://docs.spring.io/spring-framework/reference/integration/rest-clients.html): `RestClient` với `retrieve`, `onStatus`, `exchange`, và phần "HTTP Service Client" với các annotation `@GetExchange`, `@PostExchange`.
+- [Server Side Request Forgery Prevention Cheat Sheet (OWASP)](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html): hai trường hợp "đích biết trước" và "đích bất kỳ", và vì sao phải kiểm tra IP sau khi phân giải.
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457.html): ý nghĩa của `type`, `title`, `detail` và trường mở rộng khi đọc lỗi của service khác.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** JDK 25, `curl`, `unzip`, có Internet (tải project từ start.spring.io và thử với `example.com`, `httpbin.org`). Mở **ba tab Terminal**: tab 1 chạy `stock` ở cổng **8187**, tab 2 chạy `shop` ở cổng **8087**, tab 3 tạo file và gửi request. Trong log ở dưới, phần ngày, PID và tên thread ở đầu mỗi dòng đã được bỏ bớt; thời gian và các con số đo được sẽ khác trên máy bạn.
+
+### 1. Tạo hai project
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+mkdir -p ~/masteva-sb7 && cd ~/masteva-sb7
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=stock \
+  -d name=stock -d packageName=vn.masteva.stock -d dependencies=web -o stock.zip
+curl -s https://start.spring.io/starter.zip -d type=maven-project -d language=java \
+  -d bootVersion=4.1.1 -d javaVersion=25 -d groupId=vn.masteva -d artifactId=shop \
+  -d name=shop -d packageName=vn.masteva.shop -d dependencies=web,spring-restclient,actuator -o shop.zip
+unzip -q stock.zip -d stock && unzip -q shop.zip -d shop && rm stock.zip shop.zip
+grep -E '<artifactId>spring-boot-starter' shop/pom.xml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+		<artifactId>spring-boot-starter-parent</artifactId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+			<artifactId>spring-boot-starter-restclient</artifactId>
+			<artifactId>spring-boot-starter-webmvc</artifactId>
+			<artifactId>spring-boot-starter-actuator-test</artifactId>
+			<artifactId>spring-boot-starter-restclient-test</artifactId>
+			<artifactId>spring-boot-starter-webmvc-test</artifactId>
+```
+
+</Expected>
+
+`spring-boot-starter-restclient` cung cấp bean `RestClient.Builder` và auto-configuration cho HTTP Service Client. Classpath không có Apache HttpClient, Jetty hay Reactor Netty, nên Spring Boot dùng HttpClient của JDK.
+
+### 2. Service kho giả lập chậm và lỗi
+
+`stock` trả tồn kho theo sku, trả lỗi theo Problem Details, và có endpoint `/chaos` để bạn làm nó chậm (`delayMs`) hoặc trả 503 cho N request kế tiếp (`failNext`). Endpoint `/internal/config` giả lập một trang quản trị chỉ được truy cập trong mạng nội bộ.
+
+<Terminal where="mac" title="Tab 3: code của stock">
+
+```bash
+cd ~/masteva-sb7/stock
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=stock
+server.port=8187
+spring.mvc.problemdetails.enabled=true
+EOF
+cat > src/main/java/vn/masteva/stock/StockController.java <<'EOF'
+package vn.masteva.stock;
+
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.ErrorResponseException;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class StockController {
+    private static final Logger log = LoggerFactory.getLogger(StockController.class);
+
+    public record StockLevel(String sku, int available) {
+    }
+
+    private final Map<String, Integer> stock = Map.of("BOOK-JAVA", 12, "BOOK-SQL", 0, "MUG", 40);
+    private final AtomicInteger inFlight = new AtomicInteger();
+    private final AtomicInteger failNext = new AtomicInteger();
+    private volatile long delayMs;
+
+    // Lab only: make the next calls slow or failing.
+    @PostMapping("/chaos")
+    public Map<String, Object> chaos(@RequestParam(defaultValue = "0") long delayMs,
+                                     @RequestParam(defaultValue = "0") int failNext) {
+        this.delayMs = delayMs;
+        this.failNext.set(failNext);
+        log.info("chaos: delayMs={} failNext={}", delayMs, failNext);
+        return Map.of("delayMs", delayMs, "failNext", failNext);
+    }
+
+    @GetMapping("/stock/{sku}")
+    public StockLevel get(@PathVariable String sku,
+                          @RequestHeader(value = "X-Caller", required = false) String caller)
+            throws InterruptedException {
+        log.info("GET /stock/{} from {} (in flight: {})", sku, caller, inFlight.incrementAndGet());
+        try {
+            if (!sku.matches("[A-Z0-9-]+")) {
+                throw problem(HttpStatus.BAD_REQUEST, "sku must be upper case", sku);
+            }
+            Thread.sleep(delayMs);
+            if (failNext.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                log.warn("GET /stock/{} -> 503 (simulated)", sku);
+                throw problem(HttpStatus.SERVICE_UNAVAILABLE,
+                        "connection to wh-pg-03.internal:5432 refused", sku);
+            }
+            Integer available = stock.get(sku);
+            if (available == null) {
+                throw problem(HttpStatus.NOT_FOUND, "SKU " + sku + " is not stocked", sku);
+            }
+            return new StockLevel(sku, available);
+        } finally {
+            inFlight.decrementAndGet();
+        }
+    }
+
+    // Must never be reachable from outside the internal network.
+    @GetMapping("/internal/config")
+    public Map<String, String> internalConfig() {
+        return Map.of("db.url", "jdbc:postgresql://wh-pg-03.internal:5432/stock",
+                "db.password", "kho-S3cret!");
+    }
+
+    private static ErrorResponseException problem(HttpStatus status, String detail, String sku) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(status, detail);
+        pd.setProperty("sku", sku);
+        return new ErrorResponseException(status, pd, null);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `spring.mvc.problemdetails.enabled=true` cho Spring MVC trả `ErrorResponseException` dưới dạng `application/problem+json`; thiếu nó, lỗi đi qua trang lỗi mặc định của Spring Boot.
+- sku viết thường bị từ chối bằng 400: một lỗi do bên gọi gửi sai, khác với 404 "không có sản phẩm".
+- `inFlight` đếm số request đang xử lý cùng lúc, hữu ích ở bài SB7.2. `X-Caller` cho biết ai đang gọi.
+
+Chạy `stock` ở tab 1:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb7/stock
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw spring-boot:run
+```
+
+</Terminal>
+
+Khi thấy `Started StockApplication`, thử ở tab 3:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:8187/stock/BOOK-JAVA; echo
+curl -si localhost:8187/stock/NOPE | grep -E '^Content-Type|^\{'
+curl -s -X POST 'localhost:8187/chaos?failNext=1'; echo
+curl -s localhost:8187/stock/MUG; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"sku":"BOOK-JAVA","available":12}
+Content-Type: application/problem+json
+{"detail":"SKU NOPE is not stocked","instance":"/stock/NOPE","status":404,"title":"Not Found","sku":"NOPE"}
+{"delayMs":0,"failNext":1}
+{"detail":"connection to wh-pg-03.internal:5432 refused","instance":"/stock/MUG","status":503,"title":"Service Unavailable","sku":"MUG"}
+```
+
+</Expected>
+
+Thứ tự các trường trong `{"delayMs":0,"failNext":1}` có thể khác vì `Map.of` không giữ thứ tự. Chú ý body của 503: nó chứa tên máy database nội bộ. Đây là loại chi tiết `shop` không được để lọt ra ngoài.
+
+### 3. Shop gọi kho bằng RestClient, chưa xử lý gì
+
+<Terminal where="mac" title="Tab 3: code của shop, phiên bản đầu">
+
+```bash
+cd ~/masteva-sb7/shop
+P=src/main/java/vn/masteva/shop
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=shop
+server.port=8087
+spring.mvc.problemdetails.enabled=true
+stock.base-url=http://localhost:8187
+EOF
+cat > $P/StockLevel.java <<'EOF'
+package vn.masteva.shop;
+
+public record StockLevel(String sku, int available) {
+}
+EOF
+cat > $P/StockClient.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+
+@Component
+public class StockClient {
+    private final RestClient rest;
+
+    public StockClient(RestClient.Builder builder, @Value("${stock.base-url}") String baseUrl) {
+        this.rest = builder.baseUrl(baseUrl)
+                .defaultHeader("X-Caller", "shop")
+                .build();
+    }
+
+    public StockLevel get(String sku) {
+        return rest.get()
+                .uri("/stock/{sku}", sku)
+                .retrieve()
+                .body(StockLevel.class);
+    }
+}
+EOF
+cat > $P/ProductController.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProductController {
+    private final StockClient stock;
+
+    public ProductController(StockClient stock) {
+        this.stock = stock;
+    }
+
+    public record Availability(String sku, int available, String source) {
+    }
+
+    @GetMapping("/products/{sku}/availability")
+    public Availability availability(@PathVariable String sku) {
+        StockLevel level = stock.get(sku);
+        return new Availability(level.sku(), level.available(), "stock");
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Chạy `shop` ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb7/shop
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw spring-boot:run
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:8087/products/BOOK-JAVA/availability; echo
+curl -s localhost:8087/products/NOPE/availability; echo
+```
+
+</Terminal>
+
+<Predict question="BOOK-JAVA chạy được. Còn NOPE, mà stock trả 404 rõ ràng, thì shop trả gì?">
+
+```text
+{"sku":"BOOK-JAVA","available":12,"source":"stock"}
+{"timestamp":"2026-10-09T04:00:10.809Z","status":500,"error":"Internal Server Error","path":"/products/NOPE/availability"}
+```
+
+Tab 2 in:
+
+```text
+o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed: org.springframework.web.client.HttpClientErrorException$NotFound: 404 Not Found: "{"detail":"SKU NOPE is not stocked","instance":"/stock/NOPE","status":404,"title":"Not Found","sku":"NOPE"}"] with root cause
+```
+
+`retrieve()` gặp 404 thì ném `HttpClientErrorException$NotFound`; không ai bắt nên nó thành 500. Message của exception chứa nguyên body của `stock`. Người dùng hỏi một sản phẩm không có, nhận về "lỗi server".
+
+</Predict>
+
+Giờ làm `stock` chậm 10 giây:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s -X POST 'localhost:8187/chaos?delayMs=10000'; echo
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" localhost:8087/products/MUG/availability
+curl -s -X POST 'localhost:8187/chaos'; echo
+```
+
+</Terminal>
+
+<Predict question="shop không có dòng code nào chờ. Request tới shop mất bao lâu?">
+
+```text
+{"failNext":0,"delayMs":10000}
+200 10.032002s
+{"failNext":0,"delayMs":0}
+```
+
+Đúng 10 giây: `RestClient` không có timeout mặc định, thread của Tomcat trong `shop` nằm chờ suốt thời gian đó. Nếu `stock` treo hẳn, thread đó không bao giờ được trả lại. Lệnh cuối đưa `stock` về bình thường.
+
+</Predict>
+
+<Check id="sb7.1.lab-mac-dinh">Tái hiện được hai hành vi mặc định của `RestClient`: 404 của service kia thành 500 của mình kèm body lỗi trong log, và không có timeout.</Check>
+
+### 4. Đổi lỗi thành exception nghiệp vụ, đặt timeout
+
+Dừng `shop` (Ctrl+C ở tab 2). Thêm hai exception, viết lại `StockClient` với `onStatus`, và một `@RestControllerAdvice`:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/ProductNotFoundException.java <<'EOF'
+package vn.masteva.shop;
+
+public class ProductNotFoundException extends RuntimeException {
+    public ProductNotFoundException(String sku) {
+        super("product " + sku + " not found");
+    }
+}
+EOF
+cat > $P/StockUnavailableException.java <<'EOF'
+package vn.masteva.shop;
+
+public class StockUnavailableException extends RuntimeException {
+    public StockUnavailableException(String message, Throwable cause) {
+        super(message, cause);
+    }
+}
+EOF
+cat > $P/StockClient.java <<'EOF'
+package vn.masteva.shop;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ProblemDetail;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
+import org.springframework.web.client.RestClient;
+import tools.jackson.databind.json.JsonMapper;
+
+@Component
+public class StockClient {
+    private static final Logger log = LoggerFactory.getLogger(StockClient.class);
+    private final RestClient rest;
+    private final JsonMapper json;
+
+    public StockClient(RestClient.Builder builder, JsonMapper json,
+                       @Value("${stock.base-url}") String baseUrl) {
+        this.json = json;
+        this.rest = builder.baseUrl(baseUrl)
+                .defaultHeader("X-Caller", "shop")
+                .build();
+    }
+
+    public StockLevel get(String sku) {
+        try {
+            return rest.get()
+                    .uri("/stock/{sku}", sku)
+                    .retrieve()
+                    .onStatus(status -> status.value() == 404, (request, response) -> {
+                        ProblemDetail problem = json.readValue(response.getBody(), ProblemDetail.class);
+                        log.info("stock 404: {}", problem.getDetail());
+                        throw new ProductNotFoundException(sku);
+                    })
+                    .onStatus(status -> status.is5xxServerError() || status.value() == 429, (request, response) -> {
+                        throw new StockUnavailableException("stock answered " + response.getStatusCode(), null);
+                    })
+                    .onStatus(HttpStatusCode::is4xxClientError, (request, response) -> {
+                        throw new IllegalStateException("stock rejected request: " + response.getStatusCode());
+                    })
+                    .body(StockLevel.class);
+        } catch (ResourceAccessException e) {
+            throw new StockUnavailableException(
+                    "stock unreachable: " + e.getMostSpecificCause().getClass().getSimpleName(), e);
+        }
+    }
+}
+EOF
+cat > $P/ApiErrors.java <<'EOF'
+package vn.masteva.shop;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class ApiErrors {
+    private static final Logger log = LoggerFactory.getLogger(ApiErrors.class);
+
+    @ExceptionHandler
+    ProblemDetail notFound(ProductNotFoundException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, "Không có sản phẩm này");
+    }
+
+    @ExceptionHandler
+    ProblemDetail stockUnavailable(StockUnavailableException e) {
+        log.warn("{}", e.getMessage());
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                "Chưa kiểm tra được tồn kho, vui lòng thử lại sau");
+    }
+}
+EOF
+cat >> src/main/resources/application.properties <<'EOF'
+spring.http.clients.connect-timeout=1s
+spring.http.clients.read-timeout=2s
+EOF
+```
+
+</Terminal>
+
+- Ba handler theo đúng bảng phân loại ở phần Kiến thức: 404 thành `ProductNotFoundException`; 5xx và 429 là "tạm thời", thành `StockUnavailableException`; các 4xx còn lại nghĩa là `shop` gửi sai, thành `IllegalStateException` và lỗi 500 mặc định. Bài SB7.2 chỉ retry `StockUnavailableException`, nên một request sai không bị gửi lại bốn lần.
+- Timeout, connection refused và lỗi DNS đều đến dưới dạng `ResourceAccessException`, bọc một `IOException`. `getMostSpecificCause()` lấy exception gốc để log cho rõ.
+- `JsonMapper` là bean Spring Boot cấu hình sẵn cho Jackson 3. Ở đây nó đọc Problem Details của `stock` chỉ để ghi log.
+- `ApiErrors` là nơi duy nhất quyết định người dùng của `shop` thấy gì. `StockUnavailableException` mang thông tin kỹ thuật vào log, còn response chỉ có câu chung.
+
+Chạy lại `shop` ở tab 2 (`./mvnw spring-boot:run`), rồi thử bốn tình huống: sku không có, sku sai định dạng, `stock` lỗi, `stock` chậm:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:8087/products/NOPE/availability; echo
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8087/products/mug/availability
+curl -s -X POST 'localhost:8187/chaos?failNext=1' > /dev/null
+curl -s localhost:8087/products/MUG/availability; echo
+curl -s -X POST 'localhost:8187/chaos?delayMs=10000' > /dev/null
+curl -s -w "\n%{http_code} %{time_total}s\n" localhost:8087/products/MUG/availability
+curl -s -X POST 'localhost:8187/chaos' > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"detail":"Không có sản phẩm này","instance":"/products/NOPE/availability","status":404,"title":"Not Found"}
+500
+{"detail":"Chưa kiểm tra được tồn kho, vui lòng thử lại sau","instance":"/products/MUG/availability","status":503,"title":"Service Unavailable"}
+{"detail":"Chưa kiểm tra được tồn kho, vui lòng thử lại sau","instance":"/products/MUG/availability","status":503,"title":"Service Unavailable"}
+503 2.009133s
+```
+
+</Expected>
+
+Tab 2:
+
+<Expected>
+
+```text
+vn.masteva.shop.StockClient              : stock 404: SKU NOPE is not stocked
+o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() ... threw exception [Request processing failed: java.lang.IllegalStateException: stock rejected request: 400 BAD_REQUEST] with root cause
+vn.masteva.shop.ApiErrors                : stock answered 503 SERVICE_UNAVAILABLE
+vn.masteva.shop.ApiErrors                : stock unreachable: HttpTimeoutException
+```
+
+</Expected>
+
+Tab 1 của `stock` chỉ in `GET /stock/MUG from shop (in flight: 1)` rồi không báo gì thêm: nó vẫn ngủ nốt 10 giây và trả response cho một kết nối mà `shop` đã bỏ đi. Timeout giải phóng thread của `shop`, không giải phóng công việc của `stock`.
+
+<Check id="sb7.1.lab-onstatus-timeout">Viết được `onStatus` đổi 404, các 4xx khác và 5xx của service khác thành exception nghiệp vụ, đặt được connect và read timeout, và kiểm chứng response của `shop` không chứa chi tiết nội bộ của `stock`.</Check>
+
+### 5. Chuyển sang HTTP Service Client
+
+Dừng `shop`. Khai báo `StockApi`, chuyển status handler sang cấu hình của group, và để `StockClient` chỉ còn là lớp đổi lỗi kỹ thuật:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/StockApi.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.service.annotation.GetExchange;
+import org.springframework.web.service.annotation.HttpExchange;
+
+@HttpExchange("/stock")
+public interface StockApi {
+
+    @GetExchange("/{sku}")
+    StockLevel get(@PathVariable String sku);
+}
+EOF
+cat > $P/HttpClientsConfig.java <<'EOF'
+package vn.masteva.shop;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ProblemDetail;
+import org.springframework.util.StringUtils;
+import org.springframework.web.client.support.RestClientHttpServiceGroupConfigurer;
+import org.springframework.web.service.registry.ImportHttpServices;
+import tools.jackson.databind.json.JsonMapper;
+
+@Configuration
+@ImportHttpServices(group = "stock", types = StockApi.class)
+class HttpClientsConfig {
+    private static final Logger log = LoggerFactory.getLogger(HttpClientsConfig.class);
+
+    @Bean
+    RestClientHttpServiceGroupConfigurer stockErrorMapping(JsonMapper json) {
+        return groups -> groups.filterByName("stock").forEachClient((group, builder) -> builder
+                .defaultStatusHandler(status -> status.value() == 404, (request, response) -> {
+                    ProblemDetail problem = json.readValue(response.getBody(), ProblemDetail.class);
+                    log.info("stock 404: {}", problem.getDetail());
+                    throw new ProductNotFoundException(StringUtils.getFilename(request.getURI().getPath()));
+                })
+                .defaultStatusHandler(status -> status.is5xxServerError() || status.value() == 429, (request, response) -> {
+                    throw new StockUnavailableException("stock answered " + response.getStatusCode(), null);
+                })
+                .defaultStatusHandler(HttpStatusCode::is4xxClientError, (request, response) -> {
+                    throw new IllegalStateException("stock rejected request: " + response.getStatusCode());
+                }));
+    }
+}
+EOF
+cat > $P/StockClient.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
+
+@Component
+public class StockClient {
+    private final StockApi api;
+
+    public StockClient(StockApi api) {
+        this.api = api;
+    }
+
+    public StockLevel get(String sku) {
+        try {
+            return api.get(sku);
+        } catch (ResourceAccessException e) {
+            throw new StockUnavailableException(
+                    "stock unreachable: " + e.getMostSpecificCause().getClass().getSimpleName(), e);
+        }
+    }
+}
+EOF
+cat > src/main/resources/application.properties <<'EOF'
+spring.application.name=shop
+server.port=8087
+spring.mvc.problemdetails.enabled=true
+
+spring.http.clients.connect-timeout=1s
+spring.http.clients.read-timeout=2s
+
+spring.http.serviceclient.stock.base-url=http://localhost:8187
+spring.http.serviceclient.stock.read-timeout=800ms
+spring.http.serviceclient.stock.default-header.X-Caller=shop
+EOF
+```
+
+</Terminal>
+
+- `stock.base-url` và header `X-Caller` chuyển từ code sang property của group `stock`. Group này có read timeout 800 ms, ngắn hơn giá trị chung 2 giây: `stock` bình thường trả lời trong vài mili giây, chờ lâu hơn chỉ giữ thread vô ích.
+- `ProductController` và `ApiErrors` không đổi. Đó là lợi ích của lớp `StockClient`.
+
+Chạy lại `shop`, rồi:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s localhost:8087/products/BOOK-JAVA/availability; echo
+curl -s localhost:8087/products/NOPE/availability; echo
+curl -s -X POST 'localhost:8187/chaos?delayMs=1000' > /dev/null
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" localhost:8087/products/MUG/availability
+curl -s -X POST 'localhost:8187/chaos' > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"sku":"BOOK-JAVA","available":12,"source":"stock"}
+{"detail":"Không có sản phẩm này","instance":"/products/NOPE/availability","status":404,"title":"Not Found"}
+503 0.817036s
+```
+
+</Expected>
+
+Tab 1 vẫn in `GET /stock/BOOK-JAVA from shop`: header lấy từ property. 503 sau khoảng 0,8 giây: timeout của group thắng timeout chung.
+
+<Check id="sb7.1.lab-http-service">Chuyển được một lời gọi `RestClient` sang HTTP Service Client mà controller không phải sửa, và chứng minh được read timeout của group ghi đè giá trị chung.</Check>
+
+### 6. Một lỗ SSRF
+
+`shop` thêm tính năng xem trước đường link mà người dùng dán vào mô tả sản phẩm. Phiên bản đầu, viết như phần lớn code ngoài kia:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+cat > src/main/java/vn/masteva/shop/LinkPreviewController.java <<'EOF'
+package vn.masteva.shop;
+
+import java.net.URI;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.client.RestClient;
+
+@RestController
+public class LinkPreviewController {
+    private final RestClient web;
+
+    public LinkPreviewController(RestClient.Builder builder) {
+        this.web = builder.build();
+    }
+
+    public record Preview(String url, int status, String snippet) {
+    }
+
+    @GetMapping("/link-preview")
+    public Preview preview(@RequestParam URI url) {
+        ResponseEntity<String> response = web.get().uri(url).retrieve().toEntity(String.class);
+        String body = response.getBody() == null ? "" : response.getBody();
+        return new Preview(url.toString(), response.getStatusCode().value(),
+                body.substring(0, Math.min(100, body.length())));
+    }
+}
+EOF
+```
+
+</Terminal>
+
+Chạy lại `shop`, rồi đóng vai người dùng bình thường, sau đó là kẻ tấn công:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s 'localhost:8087/link-preview?url=https://example.com'; echo
+curl -s 'localhost:8087/link-preview?url=http://localhost:8187/internal/config'; echo
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" 'localhost:8087/link-preview?url=http://169.254.169.254/latest/meta-data/'
+```
+
+</Terminal>
+
+<Predict question="Endpoint /internal/config của stock không có route nào từ Internet. Kẻ tấn công có đọc được nó không?">
+
+```text
+{"url":"https://example.com","status":200,"snippet":"<!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewpor"}
+{"url":"http://localhost:8187/internal/config","status":200,"snippet":"{\"db.password\":\"kho-S3cret!\",\"db.url\":\"jdbc:postgresql://wh-pg-03.internal:5432/stock\"}"}
+500 0.024213s
+```
+
+Đọc được. Request tới `/internal/config` không xuất phát từ kẻ tấn công mà từ `shop`, nằm trong mạng nội bộ. Thứ tự hai trường trong snippet có thể khác trên máy bạn. Trên máy Mac không có gì ở `169.254.169.254`: tab 2 báo `ResourceAccessException`, hoặc sau đúng 1 giây connect timeout (lần chạy đầu khi viết bài: `500 1.014902s`), hoặc ngay lập tức với `Host is down` khi macOS đã ghi nhớ địa chỉ này không trả lời. Trên một máy AWS còn bật IMDSv1, cùng request đó trả về metadata của máy. Khác biệt về thời gian và thông báo lỗi giữa các địa chỉ cũng đủ để kẻ tấn công dò xem máy và cổng nào trong mạng nội bộ đang mở.
+
+</Predict>
+
+### 7. Chặn bằng allowlist scheme, cổng và InetAddressFilter
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+cat > src/main/java/vn/masteva/shop/LinkPreviewController.java <<'EOF'
+package vn.masteva.shop;
+
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
+import org.springframework.boot.http.client.FilteredHostException;
+import org.springframework.boot.http.client.HttpClientSettings;
+import org.springframework.boot.http.client.InetAddressFilter;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.client.RestClient;
+
+@RestController
+public class LinkPreviewController {
+    private static final Logger log = LoggerFactory.getLogger(LinkPreviewController.class);
+    private static final Set<String> SCHEMES = Set.of("http", "https");
+    private static final Set<Integer> PORTS = Set.of(-1, 80, 443);
+    private final RestClient web;
+
+    public LinkPreviewController(RestClient.Builder builder) {
+        HttpClientSettings settings = HttpClientSettings.defaults()
+                .withTimeouts(Duration.ofSeconds(1), Duration.ofSeconds(3))
+                .withInetAddressFilter(InetAddressFilter.externalAddresses());
+        this.web = builder
+                .requestFactory(ClientHttpRequestFactoryBuilder.jdk().build(settings))
+                .build();
+    }
+
+    public record Preview(String url, int status, String snippet) {
+    }
+
+    @GetMapping("/link-preview")
+    public Preview preview(@RequestParam URI url) {
+        if (url.getScheme() == null || !SCHEMES.contains(url.getScheme())
+                || !PORTS.contains(url.getPort())) {
+            throw new UrlNotAllowedException("bad scheme or port: " + url);
+        }
+        // exchange: any status is a valid preview, and we read at most 100 bytes of the body
+        return web.get().uri(url).exchange((request, response) -> {
+            byte[] head = response.getBody().readNBytes(100);
+            return new Preview(url.toString(), response.getStatusCode().value(),
+                    new String(head, StandardCharsets.UTF_8));
+        });
+    }
+
+    static class UrlNotAllowedException extends RuntimeException {
+        UrlNotAllowedException(String message) {
+            super(message);
+        }
+    }
+
+    @ExceptionHandler({FilteredHostException.class, UrlNotAllowedException.class})
+    ProblemDetail notAllowed(RuntimeException e) {
+        log.warn("blocked: {}", e.getMessage());
+        return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "URL không được phép");
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `PORTS` chứa `-1` vì `URI.getPort()` trả `-1` khi URL không ghi cổng (dùng cổng mặc định của scheme). URL tương đối như `abc` có scheme `null`, nên phải kiểm tra `null` trước khi tra `Set.of(...)` (nó ném `NullPointerException` với `null`).
+- `exchange` thay cho `retrieve`: trang ngoài trả 404 hay 500 vẫn là một bản xem trước hợp lệ, không thành lỗi 500 của `shop` kèm body của trang lạ trong log. `readNBytes(100)` chỉ đọc tối đa 100 byte, nên một URL trỏ tới file vài GB không làm đầy bộ nhớ.
+- Client này có `HttpClientSettings` riêng: timeout chặt hơn và bộ lọc chỉ cho địa chỉ công khai. Client gọi `stock` không bị ảnh hưởng.
+- Cả hai loại từ chối trả cùng một câu, để kẻ tấn công không phân biệt được "bị chặn vì cổng" với "bị chặn vì IP".
+
+Chạy lại `shop`:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+for u in https://example.com http://localhost/internal/config http://localhost:8187/internal/config \
+         http://169.254.169.254/latest/meta-data/ file:///etc/passwd abc; do
+  curl -s -w " [%{http_code} %{time_total}s]\n" "localhost:8087/link-preview?url=$u"
+done
+curl -s 'localhost:8087/link-preview?url=https://example.com/nope'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"url":"https://example.com","status":200,"snippet":"<!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewpor"} [200 0.334835s]
+{"detail":"URL không được phép","instance":"/link-preview","status":400,"title":"Bad Request"} [400 0.014201s]
+{"detail":"URL không được phép","instance":"/link-preview","status":400,"title":"Bad Request"} [400 0.002545s]
+{"detail":"URL không được phép","instance":"/link-preview","status":400,"title":"Bad Request"} [400 0.003214s]
+{"detail":"URL không được phép","instance":"/link-preview","status":400,"title":"Bad Request"} [400 0.002496s]
+{"detail":"URL không được phép","instance":"/link-preview","status":400,"title":"Bad Request"} [400 0.002432s]
+{"url":"https://example.com/nope","status":404,"snippet":"<!doctype html><html lang=en><head><meta charset=utf-8><link rel=icon href=data:,><meta name=viewpor"}
+```
+
+</Expected>
+
+Tab 2:
+
+<Expected>
+
+```text
+vn.masteva.shop.LinkPreviewController    : blocked: Filtered host 'localhost'
+vn.masteva.shop.LinkPreviewController    : blocked: bad scheme or port: http://localhost:8187/internal/config
+vn.masteva.shop.LinkPreviewController    : blocked: Filtered host '169.254.169.254'
+vn.masteva.shop.LinkPreviewController    : blocked: bad scheme or port: file:///etc/passwd
+vn.masteva.shop.LinkPreviewController    : blocked: bad scheme or port: abc
+```
+
+</Expected>
+
+`http://localhost/...` qua được kiểm tra cổng (cổng mặc định), nhưng `localhost` phân giải ra `127.0.0.1`, nằm ngoài `externalAddresses()`: bị chặn trước khi mở kết nối. Địa chỉ metadata bị chặn trước khi chạm mạng, nên mọi địa chỉ nội bộ cho cùng một câu trả lời, hết đường dò bằng thời gian. Trang ngoài trả 404 thành một bản xem trước có `"status":404`, không thành lỗi của `shop`.
+
+### 8. Redirect đi vòng qua bộ lọc
+
+`httpbin.org/redirect-to` là dịch vụ công khai trả `302` tới URL bạn chọn: đúng vai server của kẻ tấn công. Kiểm tra trước là máy bạn tới được nó:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -sI 'http://httpbin.org/redirect-to?url=http://example.com' | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HTTP/1.1 302 FOUND
+```
+
+</Expected>
+
+Nếu lệnh trên không in `302`, mạng của bạn chặn `httpbin.org`: đọc tiếp phần dưới như một ví dụ. Kết luận của bước này đã được kiểm bằng log khi viết bài và bằng mã nguồn JDK (xem Đào sâu). Gửi một URL công khai, cổng 80, redirect vào `localhost:8187`:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s 'localhost:8087/link-preview?url=http://httpbin.org/redirect-to?url=http%3A%2F%2Flocalhost%3A8187%2Finternal%2Fconfig'; echo
+```
+
+</Terminal>
+
+<Predict question="Bộ lọc chặn localhost, kiểm tra cổng chặn 8187. Lần này thì sao?">
+
+```text
+{"url":"http://httpbin.org/redirect-to?url=http://localhost:8187/internal/config","status":200,"snippet":"{\"db.password\":\"kho-S3cret!\",\"db.url\":\"jdbc:postgresql://wh-pg-03.internal:5432/stock\"}"}
+```
+
+Lọt. Kiểm tra cổng của bạn chỉ nhìn URL ban đầu. Bản thân HttpClient của JDK mặc định không theo redirect (`Redirect.NEVER`), nhưng Spring Boot dựng nó với `Redirect.NORMAL` khi bạn không đặt `redirects` (tương đương `FOLLOW_WHEN_POSSIBLE`: theo mọi redirect trừ từ HTTPS xuống HTTP). Và với Spring Boot 4.1.1, bộ lọc gắn vào HttpClient của JDK không kiểm tra lại host của bước redirect. Kết quả: `shop` gọi `localhost:8187` dù cả hai lớp kiểm tra đều "đã có".
+
+</Predict>
+
+Tắt redirect cho client này:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+cd ~/masteva-sb7/shop
+P=src/main/java/vn/masteva/shop/LinkPreviewController.java
+perl -0pi -e 's/(import org.springframework.boot.http.client.HttpClientSettings;\n)/$1import org.springframework.boot.http.client.HttpRedirects;\n/' $P
+perl -0pi -e 's/(                .withTimeouts\(Duration.ofSeconds\(1\), Duration.ofSeconds\(3\)\)\n)/$1                .withRedirects(HttpRedirects.DONT_FOLLOW)\n/' $P
+grep -n 'with' $P
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+31:                .withTimeouts(Duration.ofSeconds(1), Duration.ofSeconds(3))
+32:                .withRedirects(HttpRedirects.DONT_FOLLOW)
+33:                .withInetAddressFilter(InetAddressFilter.externalAddresses());
+```
+
+</Expected>
+
+Chạy lại `shop` và gửi lại đúng request đó:
+
+<Terminal where="mac" title="Tab 3">
+
+```bash
+curl -s 'localhost:8087/link-preview?url=http://httpbin.org/redirect-to?url=http%3A%2F%2Flocalhost%3A8187%2Finternal%2Fconfig'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"url":"http://httpbin.org/redirect-to?url=http://localhost:8187/internal/config","status":302,"snippet":""}
+```
+
+</Expected>
+
+`shop` nhận `302` và dừng ở đó. Nếu tính năng thật cần theo redirect, tự đọc header `Location`, đưa URL mới qua đúng các bước kiểm tra như URL ban đầu, và giới hạn số lần.
+
+<Check id="sb7.1.lab-ssrf">Tái hiện được SSRF đọc endpoint nội bộ, chặn được bằng allowlist scheme, cổng và `InetAddressFilter`, và chứng minh được vì sao còn phải tắt redirect.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `shop` báo `stock unreachable: ConnectException` cho mọi request: `stock` chưa chạy ở tab 1, hoặc đã dừng.
+- Ứng dụng không khởi động, báo `required a bean of type 'org.springframework.web.client.RestClient$Builder'`: `pom.xml` thiếu `spring-boot-starter-restclient`.
+- `No qualifying bean of type 'vn.masteva.shop.StockApi'`: thiếu `@ImportHttpServices` hoặc class cấu hình nằm ngoài package `vn.masteva.shop`.
+- 404 của `stock` vẫn thành 500: handler 404 được đăng ký sau handler `is4xxClientError`, hoặc handler không ném exception.
+- Bước 8 trả `"status":502` hay lỗi timeout thay vì nội dung: mạng chặn hoặc `httpbin.org` đang lỗi. Bỏ qua bước này, kết luận vẫn đúng.
+- `Port 8087 was already in use`: một lần chạy trước chưa tắt. Tìm bằng `lsof -i :8087` rồi dừng tiến trình đó.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng `shop` và `stock` bằng Ctrl+C ở tab 2 và tab 1. Giữ thư mục `~/masteva-sb7`: bài SB7.2 thêm retry và circuit breaker, bài SB7.3 (tuỳ chọn) thêm gRPC, trên chính hai project này.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Read timeout nên đặt bao nhiêu?">
+
+Bắt đầu từ số đo, không từ cảm giác. Lấy p99 thời gian trả lời của service đích từ metric `http.client.requests` (bài SB8.2), cộng một biên, ví dụ p99 là 120 ms thì đặt 500 ms. Sau đó kiểm tra ngược từ phía trên: request của người dùng vào `shop` có thời hạn bao lâu (load balancer, gateway thường 30 đến 60 giây, người dùng thường kiên nhẫn ít hơn nhiều). Tổng timeout của mọi lời gọi tuần tự, nhân với số lần retry, cộng các khoảng chờ, phải nằm gọn trong thời hạn đó. Timeout lớn hơn thời hạn của người gọi chỉ có nghĩa là bạn tiếp tục làm việc cho một request mà không ai còn chờ.
+
+</Reveal>
+
+<Reveal title="Vì sao không dùng một bean InetAddressFilter cho toàn ứng dụng?">
+
+Bean `InetAddressFilter` áp cho mọi client lấy cấu hình từ Spring Boot, gồm cả HTTP Service Client gọi `stock`. Với `externalAddresses()`, lời gọi tới `localhost:8187` (hay một service nội bộ trong Kubernetes, vốn có IP private) bị chặn với `FilteredHostException: Filtered host 'localhost'`. Bean toàn cục hợp với service chỉ gọi ra Internet, hoặc với filter dạng allowlist nội bộ như `InetAddressFilter.of("10.20.0.0/16")` cho service chỉ được gọi vào một dải cụ thể. Service vừa gọi nội bộ vừa tải URL người dùng thì tách client như lab.
+
+</Reveal>
+
+<Reveal title="Vì sao bộ lọc với HttpClient của JDK để lọt redirect, còn DNS rebinding thì sao?">
+
+Với HttpClient của JDK, Spring Boot gắn bộ lọc vào `ProxySelector`: trước mỗi request, nó phân giải host bằng `InetAddress.getByName` và từ chối nếu địa chỉ không khớp. Có hai giới hạn. Một: khi theo redirect, `HttpRequestImpl` của JDK 25 tạo request mới với `this.proxy = other.proxy`, tức dùng lại kết quả chọn proxy của request đầu và **không gọi lại `ProxySelector`** cho host mới; đó là lỗ ở bước 8. Hai: `getByName` chỉ trả địa chỉ đầu tiên, nên bộ lọc chỉ kiểm địa chỉ đó trong khi một tên miền có thể có nhiều bản ghi.
+
+DNS rebinding (tên miền trả IP công khai lúc kiểm tra, rồi `127.0.0.1` lúc kết nối) khó hơn nhiều với JDK: cả bộ lọc lẫn HttpClient đều phân giải qua `InetAddress`, dùng chung cache của JVM (`networkaddress.cache.ttl`, mặc định 30 giây), nên TTL ngắn ở phía DNS thường không tạo được khác biệt giữa hai lần. Với Apache HttpClient, Jetty và Reactor Netty, bộ lọc nằm ngay trong bước phân giải của client, và lab đã thấy bước redirect bị chặn với Apache. Nếu SSRF là rủi ro chính của service, dùng Apache HttpClient cho client tải URL, luôn `DONT_FOLLOW`, và đặt lớp mạng (egress proxy, network policy) làm hàng rào cuối.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết interface `@HttpExchange` từ một đặc tả OpenAPI, hay viết status handler cho từng mã lỗi. AI hay dùng `RestTemplate` hoặc `WebClient` kèm `.block()` trong ứng dụng MVC, hay gọi `RestClient.create()` làm mất observation và timeout, hay đưa tên property của Spring Boot 3 (`spring.http.client.*`, không có chữ "s"), và gần như luôn quên timeout. Với SSRF, AI hay đề xuất kiểm tra chuỗi URL bằng regex. Kiểm tra lại bằng lab: cho service đích chậm 10 giây và xem `shop` có trả lời trong thời hạn bạn đặt không; thử `http://localhost/` và một redirect như bước 8.
+
+</Callout>
+
+<Callout kind="link">
+
+J9.3 dùng `HttpClient` của JDK trực tiếp; bài này để Spring Boot cấu hình nó. J10.3 và SB1.3 định nghĩa Problem Details mà bài này vừa đọc vừa trả. SB6.3 xếp SSRF trong OWASP Top 10. SB7.2 thêm `@Retryable`, `@ConcurrencyLimit` và circuit breaker lên `StockClient`. SB8.2 đọc metric `http.client.requests` mà `RestClient` sinh ra. Chặng M9 bàn resilience ở mức kiến trúc giữa nhiều service.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb7.1.mastery-client">Tự viết được client cho một service khác bằng HTTP Service Client, có timeout theo số đo, đổi lỗi thành exception nghiệp vụ và không để lộ lỗi của service kia ra API.</Check>
+
+<Check id="sb7.1.mastery-ssrf">Rà được một tính năng nhận URL từ người dùng, chỉ ra đường SSRF qua IP nội bộ, metadata cloud và redirect, và sửa được bằng allowlist, `InetAddressFilter` và tắt redirect.</Check>
+
+</Mastery>

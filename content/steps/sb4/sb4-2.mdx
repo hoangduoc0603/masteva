@@ -1,0 +1,1143 @@
+---
+title: readOnly, isolation, transaction dài và sự kiện sau commit
+description: Đo tác dụng thật của readOnly trên Hibernate, JDBC và PostgreSQL, tái hiện write skew và lỗi serialization rồi retry đúng chỗ, thấy một lời gọi HTTP trong transaction giữ khoá dòng qua pg_stat_activity, và chọn đúng loại listener để sự kiện không bị gửi nhầm hay mất.
+id: sb4.2
+step: sb4
+prerequisites: [sb4.1]
+topics: [sb4.readonly-isolation, sb4.transaction-dai, sb4.su-kien-sau-commit]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    spring-framework: 7.0.9
+    hibernate: 7.4.5
+    postgresql-jdbc: 42.7.13
+    testcontainers: 2.0.5
+    docker: 29.8.0
+    postgresql: "18.6"
+    curl: 8.4.0
+---
+
+<Goal>
+
+Đi tiếp từ SB4.1 sang những thuộc tính và tình huống của transaction mà lỗi chỉ lộ ra khi có tải hoặc khi có sự cố: `readOnly` thật ra làm gì, mức isolation nào chặn được lỗi nào trên PostgreSQL, vì sao một transaction dài làm cả hệ thống chờ, và làm sao gửi email hay message đúng lúc dữ liệu đã thật sự tồn tại. Học xong bài này, bạn giải thích được:
+
+- Vì sao đổi entity trong method `readOnly = true` không báo lỗi mà cũng không ghi gì xuống database.
+- Vì sao hai request cùng dùng mã WELCOME đều thành công ở cả Read Committed lẫn Repeatable Read.
+- Vì sao cổng thanh toán chậm 3 giây làm request khác trên cùng sản phẩm chờ thêm 3 giây, và vì sao `@Transactional(timeout = 2)` không cứu được mà còn tệ hơn.
+- Vì sao email "đơn đã đặt" được gửi cho một đơn không tồn tại, hoặc không bao giờ được gửi.
+
+</Goal>
+
+<Knowledge>
+
+### readOnly làm gì, ở từng tầng
+
+`@Transactional(readOnly = true)` chỉ là một gợi ý mà Spring chuyển xuống các tầng bên dưới. Với Spring Boot, JPA và PostgreSQL, từng tầng phản ứng thế nào:
+
+| Tầng | Tác dụng của `readOnly = true` | Hệ quả |
+|---|---|---|
+| Spring (`JpaTransactionManager`) | Ghi cờ vào transaction; log có chữ `readOnly` sau tên transaction | Chỉ có tác dụng ở method **mở** transaction; method tham gia transaction có sẵn thì bị bỏ qua |
+| Hibernate | Đặt flush mode `MANUAL` và cho session mặc định chỉ đọc | Entity tải lên không có ảnh chụp để so (bớt bộ nhớ, không dirty checking); đổi field **không sinh `UPDATE`** và không báo lỗi |
+| Driver pgJDBC | `Connection.setReadOnly(true)`; với `readOnlyMode=transaction` (mặc định) driver gửi `BEGIN READ ONLY` | Transaction ở PostgreSQL thật sự chỉ đọc |
+| PostgreSQL | `transaction_read_only = on` | `INSERT`, `UPDATE`, `DELETE` bị từ chối với `ERROR: cannot execute UPDATE in a read-only transaction` |
+
+Vì vậy `readOnly` có ích thật: method báo cáo tải hàng nghìn entity tiết kiệm bộ nhớ và thời gian flush, và một câu SQL ghi lỡ tay bị database chặn. Nhưng nó không phải hàng rào bảo vệ dữ liệu: đổi entity trong method `readOnly` chỉ bị **lờ đi trong im lặng**, nên một bug "lưu không được" có thể nằm đó rất lâu. Hai điều nữa:
+
+- Spring Data JPA: các method có sẵn của `JpaRepository` như `findById`, `findAll` chạy với `readOnly = true`; method truy vấn bạn tự khai báo trong interface (`findBySku`) không có transaction nào trừ khi bạn thêm `@Transactional`. Method `@Transactional(readOnly = true)` ở service là nơi đặt cờ đúng nhất.
+- Định tuyến đọc sang replica: `LazyConnectionDataSourceProxy` của Spring có `setReadOnlyDataSource(...)`, dùng `DataSource` của replica cho transaction `readOnly`. Khi đó dữ liệu đọc có thể trễ so với primary vài mili giây tới vài giây; đừng đọc lại thứ vừa ghi qua đường này.
+
+<Check id="sb4.2.readonly-layers">Kể được tác dụng của `readOnly = true` ở Spring, Hibernate, driver và PostgreSQL, và giải thích được vì sao đổi entity trong transaction `readOnly` không lỗi mà cũng không được lưu.</Check>
+
+### Isolation trong Spring trên PostgreSQL
+
+Bài SB3.1 đã dùng hai phiên psql để thấy Read Committed, Repeatable Read, Serializable khác nhau. Trong Spring, bạn chọn mức cho từng transaction bằng `@Transactional(isolation = Isolation.SERIALIZABLE)`. `JpaTransactionManager` đặt mức đó lên connection khi mở transaction và trả về mức cũ khi trả connection cho pool. `Isolation.DEFAULT` nghĩa là mức mặc định của database, với PostgreSQL là Read Committed. Như `readOnly`, `isolation` của method tham gia transaction có sẵn bị bỏ qua.
+
+Đào sâu của SB3.1 đã nêu **write skew** (hai bên đọc chung một điều kiện, mỗi bên ghi một dòng khác nhau) và bảng hiện tượng của từng mức. Ở đây bạn tái hiện nó trong Spring, với quy tắc "mỗi khách chỉ dùng mã WELCOME một lần":
+
+```text
+ T1 (an, WELCOME)                         T2 (an, WELCOME)
+ SELECT count(*) ... coupon='WELCOME' -> 0
+                                          SELECT count(*) ... coupon='WELCOME' -> 0
+ tính giá, phí ship (200 ms)              tính giá, phí ship (200 ms)
+ INSERT đơn WELCOME (dòng mới #1)
+                                          INSERT đơn WELCOME (dòng mới #2)
+ COMMIT                                   COMMIT
+ -> an có 2 đơn WELCOME.
+    Hai bên không sửa chung dòng nào, nên Read Committed và Repeatable Read
+    không có xung đột nào để phát hiện.
+    Serializable theo dõi "T1 đọc thứ T2 ghi và ngược lại" và huỷ một bên.
+```
+
+Phía Spring cần biết hai thông báo lỗi: Repeatable Read báo `could not serialize access due to concurrent update` khi hai bên sửa **cùng một dòng**; Serializable báo `could not serialize access due to read/write dependencies among transactions`, có thể ngay lúc `COMMIT`. Cả hai có SQLSTATE `40001`, Spring dịch thành `CannotAcquireLockException`, lớp con của `ConcurrencyFailureException` (cùng họ với `ObjectOptimisticLockingFailureException` của SB3.3). PostgreSQL ghi kèm gợi ý `The transaction might succeed if retried`, và đó là cách xử lý duy nhất: **chạy lại cả transaction từ đầu**. Retry phải nằm **ngoài** proxy transaction, ở một bean khác hoặc quanh `TransactionTemplate`: retry bên trong method `@Transactional` là lặp lại trong một transaction đã hỏng. Việc bên trong transaction được retry phải lặp lại an toàn: không gửi email, không gọi thanh toán ở đó.
+
+Serializable không phải lựa chọn duy nhất, và thường không phải lựa chọn rẻ nhất:
+
+| Cách | Viết thế nào | Hợp khi |
+|---|---|---|
+| Ràng buộc trong database | `CREATE UNIQUE INDEX ... ON orders (customer) WHERE coupon = 'WELCOME'` | Quy tắc diễn đạt được bằng `UNIQUE`, `CHECK`, khoá ngoại. Rẻ và chắc nhất |
+| Khoá một dòng đại diện | `SELECT ... FROM customers WHERE id = ? FOR UPDATE` trước khi kiểm tra | Quy tắc gói gọn trong một "chủ thể" (một khách, một tài khoản) |
+| `SERIALIZABLE` + retry | `@Transactional(isolation = Isolation.SERIALIZABLE)` và vòng retry ở ngoài | Quy tắc trải trên nhiều dòng, khó biểu diễn bằng ràng buộc |
+
+<Check id="sb4.2.isolation-retry">Giải thích được write skew bằng một ví dụ, nói được mức isolation nào của PostgreSQL chặn nó, và đặt được vòng retry cho `ConcurrencyFailureException` ở đúng chỗ.</Check>
+
+### Transaction dài và khoá dòng
+
+Đào sâu của SB3.1 đã liệt kê những gì một phiên `idle in transaction` giữ: khoá dòng, connection, và cản `VACUUM` (ở Repeatable Read và Serializable vì snapshot; ở Read Committed vì transaction đã ghi giữ mã transaction của nó tới khi kết thúc). Bài này tập trung vào khoá dòng: câu `UPDATE` đầu method lấy khoá ngay, và giữ nó suốt lời gọi HTTP phía sau.
+
+```text
+ thời gian (giây)   0        0.5                3.1               6.1
+ request an         UPDATE MUG (lấy khoá dòng)
+                    |--- gọi thanh toán 3 s ---| INSERT, COMMIT (nhả khoá)
+ request binh                UPDATE MUG ... chờ khoá của an ...|
+                                                 lấy khoá, gọi thanh toán 3 s ---| COMMIT
+ binh gửi ở 0,5 s, xong ở khoảng 6,1 s: mất 5,6 s thay vì 3 s.
+ Request thứ 10 trên cùng sản phẩm mất khoảng 30 s.
+```
+
+**`@Transactional(timeout = 2)` không ngắt được lời gọi HTTP.** Spring chuyển hạn chót xuống Hibernate và JDBC; hạn chót chỉ được kiểm tra khi **một câu SQL bắt đầu**, và dùng làm timeout cho chính câu đó. Lời gọi HTTP 3 giây vẫn chạy hết, rồi câu `INSERT` sau đó thấy đã quá hạn và ném `Transaction timeout expired`, transaction rollback. Tiền đã bị trừ ở cổng thanh toán, còn đơn hàng biến mất. Hạn chót cũng **không được kiểm lúc commit**: nếu sau lời gọi chậm không còn câu SQL nào (không có gì để flush), transaction vẫn commit dù đã quá giờ. Spring Boot có `spring.transaction.default-timeout` để đặt mặc định cho mọi transaction; nó hữu ích để chặn truy vấn chạy quá lâu, không phải để chặn việc chậm ngoài database.
+
+Phía PostgreSQL có các hàng rào riêng, nên đặt cho user của ứng dụng (ví dụ `ALTER ROLE app SET idle_in_transaction_session_timeout = '30s'`):
+
+| Tham số | Chặn | Khi vượt |
+|---|---|---|
+| `lock_timeout` | Một câu lệnh chờ khoá quá lâu | Câu lệnh lỗi, transaction phải rollback |
+| `statement_timeout` | Một câu lệnh chạy quá lâu | Câu lệnh bị huỷ |
+| `idle_in_transaction_session_timeout` | Phiên `idle in transaction` quá lâu | Phiên bị **ngắt**, transaction rollback; HikariCP loại connection hỏng. Đặt ngưỡng vài chục giây cho user của service web; job batch có transaction dài hợp lệ dùng user khác |
+| `transaction_timeout` (từ PostgreSQL 17) | Cả transaction kéo dài quá lâu | Phiên bị ngắt |
+
+Cách sửa tận gốc là **chia nhỏ**: việc chậm không cần database thì đặt ngoài transaction, và nghiệp vụ trở thành vài transaction ngắn nối nhau, có bước **bù trừ** khi bước giữa thất bại:
+
+```text
+ tx1 (vài ms):   UPDATE kho -1, INSERT đơn PENDING          COMMIT, nhả khoá
+ ngoài tx:       gọi thanh toán (3 s)                        không giữ connection, không giữ khoá
+ tx2 (vài ms):   thành công -> UPDATE đơn PAID
+                 thất bại   -> UPDATE đơn CANCELLED, kho +1  (bù trừ)
+```
+
+| | Một transaction dài | Chia nhỏ có bù trừ |
+|---|---|---|
+| Khoá dòng, connection | Giữ suốt lời gọi chậm | Giữ vài mili giây |
+| Trạng thái trung gian | Không ai thấy | Đơn `PENDING` hiện ra; giao diện và báo cáo phải hiểu nó |
+| Tiến trình chết giữa chừng | Rollback sạch | Đơn kẹt ở `PENDING`; cần job dọn hoặc đối soát với cổng thanh toán |
+| Gọi lại thanh toán khi retry | Dễ trừ tiền hai lần | Cần idempotency key gửi kèm cổng thanh toán |
+
+`TransactionTemplate` (Spring Boot tạo sẵn bean) là cách gọn để viết các transaction ngắn ngay trong một method: `tx.execute(status -> ...)` mở, chạy, commit; ném exception trong lambda thì rollback.
+
+<Callout kind="production">
+
+Đợt flash sale, mọi người cùng mua một mã sản phẩm. Service trừ kho bằng `UPDATE products ... WHERE sku = ?` rồi gọi cổng thanh toán trong cùng một method `@Transactional`. Đơn của các sản phẩm khác vẫn chạy bình thường, nhưng mọi request trên mã đang sale xếp hàng sau đúng một khoá dòng: cái thứ hai chờ 3 giây, cái thứ hai mươi chờ cả phút. CPU database gần như không đổi, vì database chỉ đang chờ, nên dashboard tài nguyên không báo gì. Thứ cần chạy là truy vấn `pg_stat_activity` của bước 6: một phiên `idle in transaction` đứng đầu, sau nó một chuỗi phiên `active` chờ `Lock`, cột `blocked_by` của phiên nào cũng trỏ về phiên đứng trước.
+
+</Callout>
+
+<Check id="sb4.2.long-transaction">Giải thích được vì sao một câu `UPDATE` đầu transaction làm request khác trên cùng dòng phải chờ suốt lời gọi chậm, giải thích được vì sao `@Transactional(timeout)` không chặn được lời gọi HTTP, và chia được một use case có gọi dịch vụ ngoài thành các transaction ngắn có bù trừ.</Check>
+
+### Sự kiện sau commit
+
+`ApplicationEventPublisher.publishEvent(...)` mặc định **đồng bộ**: mọi `@EventListener` chạy ngay trong lời gọi đó, trên cùng thread, tức là **bên trong** transaction đang mở và **trước** commit. Nếu listener gửi email "đơn đã đặt" mà sau đó transaction rollback, email đã đi cho một đơn không tồn tại. Nếu listener ném exception, exception bay ngược về method nghiệp vụ và làm rollback đơn hàng chỉ vì máy chủ mail lỗi.
+
+`@TransactionalEventListener` giải quyết bằng cách không chạy ngay, mà đăng ký listener vào transaction hiện tại và chạy ở một **pha**:
+
+```text
+ placeAndNotify()                      transaction T đang mở
+   place(): UPDATE kho, INSERT đơn
+   publishEvent(OrderPlaced)
+     |-- @EventListener                 chạy ngay, trong T, trước commit
+     |-- @Async @EventListener          chạy ngay trên thread khác, chạy đua với commit:
+     |                                  đọc trước commit thì không thấy đơn
+     |-- @TransactionalEventListener    chỉ đăng ký vào T, chưa chạy
+   ... phần việc còn lại của T
+ kết thúc T
+     |-- BEFORE_COMMIT                  chạy trước commit, vẫn trong T
+     |-- COMMIT hoặc ROLLBACK
+     |-- AFTER_COMMIT (mặc định)        chỉ khi T commit thành công
+     |-- AFTER_ROLLBACK                 chỉ khi T rollback
+     |-- AFTER_COMPLETION               sau commit hoặc rollback
+```
+
+Những trường hợp sự kiện bị gửi nhầm hoặc mất; bốn dòng đầu được tái hiện ở bước 4:
+
+| Tình huống | `@EventListener` | `@Async @EventListener` | `@TransactionalEventListener` (AFTER_COMMIT) |
+|---|---|---|---|
+| Transaction commit | Gửi, nhưng trước commit | **Có thể** đọc không thấy đơn (chạy đua với commit) và bỏ email | Gửi sau commit |
+| Transaction rollback | **Gửi cho đơn không tồn tại** | Không thấy đơn (nó chưa từng được commit), bỏ | Không gửi (đúng) |
+| `publishEvent` ngoài transaction | Gửi | Gửi | **Bỏ qua**, chỉ có một dòng log DEBUG; đặt `fallbackExecution = true` nếu muốn chạy |
+| Listener ném exception | Bay về, rollback nghiệp vụ | Chỉ log ở thread kia | Spring **log rồi nuốt**; người gọi vẫn nhận kết quả thành công, email mất |
+| Tiến trình chết ngay sau commit | | | **Mất**, không có gì để chạy lại |
+
+Hai quy tắc khi viết listener sau commit:
+
+- Listener `AFTER_COMMIT` cần ghi database thì phải mở transaction mới: `@Transactional(propagation = Propagation.REQUIRES_NEW)`. Transaction cũ đã commit xong, ghi vào nó không bao giờ được commit lại; Spring từ chối khởi động nếu listener `@TransactionalEventListener` có `@Transactional` với propagation khác `REQUIRES_NEW` hay `NOT_SUPPORTED`.
+- Việc chậm (gửi email qua SMTP) nên thêm `@Async` để không giữ thread của request. Listener vẫn chỉ chạy sau commit.
+
+Chừng nào listener còn chạy trong bộ nhớ của tiến trình, sự kiện vẫn có thể mất khi tiến trình chết hoặc khi gửi đi thất bại. Với sự kiện không được phép mất (trừ kho ở service khác, phát hành hoá đơn), ghi sự kiện vào bảng `outbox` **trong cùng transaction** với dữ liệu nghiệp vụ, rồi một tiến trình khác đọc bảng đó và gửi đi, chấp nhận gửi lặp và bên nhận phải idempotent. Đó là mẫu transactional outbox của SB9.2 và chặng M7.
+
+<Check id="sb4.2.event-phases">Chọn được giữa `@EventListener`, `@Async @EventListener` và `@TransactionalEventListener` cho một việc cụ thể, kể được các pha, và nói được ba cách một sự kiện sau commit có thể mất.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [PostgreSQL: Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html): mục Serializable Isolation Level có ví dụ write skew và lời khuyên về retry, đọc để đối chiếu với bước 2 và 3.
+- [Initializing the Driver | pgJDBC](https://jdbc.postgresql.org/documentation/use/): bảng tham số kết nối, tìm `readOnlyMode` để biết vì sao `readOnly` thành `BEGIN READ ONLY`.
+- [PostgreSQL: Client Connection Defaults](https://www.postgresql.org/docs/current/runtime-config-client.html): `lock_timeout`, `statement_timeout`, `idle_in_transaction_session_timeout`, `transaction_timeout` và cách chúng ưu tiên nhau.
+- [Transaction-bound Events](https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html): các pha của `@TransactionalEventListener` và `fallbackExecution`.
+- [Programmatic Transaction Management](https://docs.spring.io/spring-framework/reference/data-access/transaction/programmatic.html): `TransactionTemplate` cho các transaction ngắn ở bước 8.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm xong bài SB4.1, project `~/masteva-sb4/shop` còn nguyên. Docker đang chạy, JDK 25, `curl`. Bước 1 tới 4 là test với Testcontainers, như SB4.1. Bước 5 tới 8 chạy ứng dụng thật ở cổng **8084** với PostgreSQL trong container `sb4-pg` ở cổng **5444**; cần **hai tab Terminal**: tab 1 chạy ứng dụng, tab 2 gửi request và chạy psql.
+
+### 1. readOnly ở ba tầng
+
+<Terminal where="mac" title="Tạo StockReport, ReadOnlyTest và chạy">
+
+```bash
+cd ~/masteva-sb4/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/StockReport.java <<'EOF'
+package vn.masteva.shop;
+
+import jakarta.persistence.EntityManager;
+import org.hibernate.Session;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class StockReport {
+    private final ProductRepository products;
+    private final EntityManager em;
+    private final JdbcClient jdbc;
+
+    public StockReport(ProductRepository products, EntityManager em, JdbcClient jdbc) {
+        this.products = products;
+        this.em = em;
+        this.jdbc = jdbc;
+    }
+
+    @Transactional(readOnly = true)
+    public String touchReadOnly(String sku) {
+        return touch(sku);
+    }
+
+    @Transactional
+    public String touchReadWrite(String sku) {
+        return touch(sku);
+    }
+
+    private String touch(String sku) {
+        Product product = products.findBySku(sku).orElseThrow();
+        product.take(1); // đổi entity đang managed
+        Session session = em.unwrap(Session.class);
+        return "flushMode=" + session.getHibernateFlushMode()
+                + ", entityReadOnly=" + session.isReadOnly(product)
+                + ", transaction_read_only="
+                + jdbc.sql("SHOW transaction_read_only").query(String.class).single();
+    }
+
+    @Transactional(readOnly = true)
+    public int sqlUpdateInReadOnly(String sku) {
+        return jdbc.sql("UPDATE products SET stock = stock - 1 WHERE sku = :sku").param("sku", sku).update();
+    }
+}
+EOF
+cat > src/test/java/vn/masteva/shop/ReadOnlyTest.java <<'EOF'
+package vn.masteva.shop;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.simple.JdbcClient;
+
+@Import(TestcontainersConfiguration.class)
+@SpringBootTest
+class ReadOnlyTest {
+    @Autowired StockReport report;
+    @Autowired JdbcClient jdbc;
+
+    @BeforeEach
+    void reset() {
+        jdbc.sql("UPDATE products SET stock = 10 WHERE sku = 'BOOK-JAVA'").update();
+    }
+
+    int stock() {
+        return jdbc.sql("SELECT stock FROM products WHERE sku = 'BOOK-JAVA'").query(Integer.class).single();
+    }
+
+    @Test
+    void readOnlyEffects() {
+        System.out.println(">> readOnly=true : " + report.touchReadOnly("BOOK-JAVA") + " -> stock " + stock());
+        System.out.println(">> readOnly=false: " + report.touchReadWrite("BOOK-JAVA") + " -> stock " + stock());
+        try {
+            report.sqlUpdateInReadOnly("BOOK-JAVA");
+        } catch (DataAccessException e) {
+            System.out.println(">> SQL UPDATE in readOnly: " + e.getClass().getSimpleName());
+            System.out.println(">>   " + e.getMostSpecificCause().getMessage());
+        }
+    }
+}
+EOF
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw -q test -Dtest=ReadOnlyTest 2>&1 | grep -E '^>>|Creating new'
+```
+
+</Terminal>
+
+<Predict question="Cả hai method đều gọi product.take(1) trên entity đang managed. Tồn kho sau mỗi lần là bao nhiêu?">
+
+```text
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.StockReport.touchReadOnly]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT,readOnly
+>> readOnly=true : flushMode=MANUAL, entityReadOnly=true, transaction_read_only=on -> stock 10
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.StockReport.touchReadWrite]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+>> readOnly=false: flushMode=AUTO, entityReadOnly=false, transaction_read_only=off -> stock 9
+DEBUG [main    ] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.StockReport.sqlUpdateInReadOnly]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT,readOnly
+>> SQL UPDATE in readOnly: UncategorizedSQLException
+>>   ERROR: cannot execute UPDATE in a read-only transaction
+```
+
+Vẫn 10 sau method `readOnly`, rồi 9 sau method thường. Ba tầng hiện đủ trong một dòng: Hibernate ở flush mode `MANUAL` và coi entity là chỉ đọc nên không sinh `UPDATE`; PostgreSQL báo `transaction_read_only=on` vì driver đã gửi `BEGIN READ ONLY`. Câu SQL viết tay thì không lọt qua: PostgreSQL từ chối nó, và Spring gói lỗi thành `UncategorizedSQLException`.
+
+</Predict>
+
+<Check id="sb4.2.lab-readonly">Chứng minh được bằng test rằng đổi entity trong transaction `readOnly` không được lưu còn `UPDATE` viết tay bị PostgreSQL từ chối, và đọc được flush mode, cờ chỉ đọc của entity, `transaction_read_only`.</Check>
+
+### 2. Write skew ở ba mức isolation
+
+`CouponService` có ba method giống hệt nhau, chỉ khác mức isolation; phần thân kiểm tra mã WELCOME chưa dùng, nghỉ 200 ms giả lập phần tính giá, rồi chèn đơn. `WelcomeOrders` bọc bản Serializable bằng vòng retry, dùng ở bước 3. Test chạy hai thread cùng lúc cho cùng khách `an`.
+
+<Terminal where="mac" title="Tạo CouponService, WelcomeOrders, IsolationTest và chạy">
+
+```bash
+cd ~/masteva-sb4/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/CouponAlreadyUsedException.java <<'EOF'
+package vn.masteva.shop;
+
+public class CouponAlreadyUsedException extends RuntimeException {
+    public CouponAlreadyUsedException(String customer) {
+        super("WELCOME already used by " + customer);
+    }
+}
+EOF
+cat > $P/CouponService.java <<'EOF'
+package vn.masteva.shop;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class CouponService {
+    private static final Logger log = LoggerFactory.getLogger(CouponService.class);
+    private final OrderRepository orders;
+    private final JdbcClient jdbc;
+
+    public CouponService(OrderRepository orders, JdbcClient jdbc) {
+        this.orders = orders;
+        this.jdbc = jdbc;
+    }
+
+    @Transactional
+    public long welcomeReadCommitted(String customer) {
+        return useWelcome(customer);
+    }
+
+    @Transactional(isolation = Isolation.REPEATABLE_READ)
+    public long welcomeRepeatableRead(String customer) {
+        return useWelcome(customer);
+    }
+
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public long welcomeSerializable(String customer) {
+        return useWelcome(customer);
+    }
+
+    private long useWelcome(String customer) {
+        String level = jdbc.sql("SHOW transaction_isolation").query(String.class).single();
+        long used = orders.countByCustomerAndCoupon(customer, "WELCOME");
+        log.info("{}: WELCOME used {} time(s)", level, used);
+        if (used > 0) {
+            throw new CouponAlreadyUsedException(customer);
+        }
+        pause(); // phần việc còn lại: tính giá, phí ship...
+        return orders.save(new PurchaseOrder(customer, "MUG", 1, "WELCOME")).getId();
+    }
+
+    private static void pause() {
+        try {
+            Thread.sleep(200);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+    }
+}
+EOF
+cat > $P/WelcomeOrders.java <<'EOF'
+package vn.masteva.shop;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.ConcurrencyFailureException;
+import org.springframework.stereotype.Service;
+
+@Service
+public class WelcomeOrders {
+    private static final Logger log = LoggerFactory.getLogger(WelcomeOrders.class);
+    private final CouponService coupons;
+
+    public WelcomeOrders(CouponService coupons) {
+        this.coupons = coupons;
+    }
+
+    public long place(String customer) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return coupons.welcomeSerializable(customer);
+            } catch (ConcurrencyFailureException e) {
+                if (attempt == 3) {
+                    throw e;
+                }
+                log.warn("attempt {} failed ({}), retrying", attempt, e.getClass().getSimpleName());
+            }
+        }
+    }
+}
+EOF
+cat > src/test/java/vn/masteva/shop/IsolationTest.java <<'EOF'
+package vn.masteva.shop;
+
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.function.Function;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.simple.JdbcClient;
+
+@Import(TestcontainersConfiguration.class)
+@SpringBootTest
+class IsolationTest {
+    @Autowired CouponService coupons;
+    @Autowired WelcomeOrders welcome;
+    @Autowired JdbcClient jdbc;
+
+    @BeforeEach
+    void reset() {
+        jdbc.sql("TRUNCATE orders RESTART IDENTITY").update();
+    }
+
+    void race(String label, Function<String, Long> call) throws Exception {
+        reset();
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            List<Future<Long>> results = List.of(
+                    pool.submit(() -> call.apply("an")), pool.submit(() -> call.apply("an")));
+            for (Future<Long> f : results) {
+                try {
+                    System.out.println(">> " + label + ": order " + f.get());
+                } catch (Exception e) {
+                    System.out.println(">> " + label + ": " + e.getCause());
+                }
+            }
+        }
+        System.out.println(">> " + label + ": WELCOME orders for an = " + jdbc.sql(
+                "SELECT count(*) FROM orders WHERE customer = 'an' AND coupon = 'WELCOME'")
+                .query(Long.class).single());
+    }
+
+    @Test
+    void writeSkew() throws Exception {
+        race("READ COMMITTED", coupons::welcomeReadCommitted);
+        race("REPEATABLE READ", coupons::welcomeRepeatableRead);
+        race("SERIALIZABLE", coupons::welcomeSerializable);
+    }
+
+    @Test
+    void serializableWithRetry() throws Exception {
+        race("SERIALIZABLE + retry", welcome::place);
+    }
+}
+EOF
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw -q test -Dtest='IsolationTest#writeSkew' 2>&1 | grep -E '^>>| INFO .*CouponService'
+```
+
+</Terminal>
+
+<Predict question="Ở mỗi mức isolation, an có mấy đơn WELCOME?">
+
+```text
+ INFO [thread-2] CouponService            : read committed: WELCOME used 0 time(s)
+ INFO [thread-1] CouponService            : read committed: WELCOME used 0 time(s)
+>> READ COMMITTED: order 1
+>> READ COMMITTED: order 2
+>> READ COMMITTED: WELCOME orders for an = 2
+ INFO [thread-2] CouponService            : repeatable read: WELCOME used 0 time(s)
+ INFO [thread-1] CouponService            : repeatable read: WELCOME used 0 time(s)
+>> REPEATABLE READ: order 1
+>> REPEATABLE READ: order 2
+>> REPEATABLE READ: WELCOME orders for an = 2
+ INFO [thread-2] CouponService            : serializable: WELCOME used 0 time(s)
+ INFO [thread-1] CouponService            : serializable: WELCOME used 0 time(s)
+>> SERIALIZABLE: org.springframework.dao.CannotAcquireLockException: Hibernate transaction: Unable to commit against JDBC Connection; ERROR: could not serialize access due to read/write dependencies among transactions
+>> SERIALIZABLE: order 2
+>> SERIALIZABLE: WELCOME orders for an = 1
+```
+
+Hai, hai, rồi một. `SHOW transaction_isolation` xác nhận mức Spring đã đặt. Ở cả ba mức, cả hai thread đều đếm được 0: không mức nào chặn việc **đọc**. Khác nhau ở lúc ghi: Read Committed và Repeatable Read không thấy xung đột vì hai bên chèn hai dòng khác nhau; Serializable phát hiện vòng phụ thuộc đọc và ghi, huỷ một bên ngay lúc commit (`Unable to commit`). Thread nào thắng và số đơn được giữ lại có thể khác trên máy bạn.
+
+</Predict>
+
+### 3. Retry ngoài transaction
+
+<Terminal where="mac">
+
+```bash
+./mvnw -q test -Dtest='IsolationTest#serializableWithRetry' 2>&1 | grep -E '^>>| INFO .*CouponService| WARN .*WelcomeOrders'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ INFO [thread-1] CouponService            : serializable: WELCOME used 0 time(s)
+ INFO [thread-2] CouponService            : serializable: WELCOME used 0 time(s)
+ WARN [thread-1] WelcomeOrders            : attempt 1 failed (CannotAcquireLockException), retrying
+ INFO [thread-1] CouponService            : serializable: WELCOME used 1 time(s)
+>> SERIALIZABLE + retry: vn.masteva.shop.CouponAlreadyUsedException: WELCOME already used by an
+>> SERIALIZABLE + retry: order 2
+>> SERIALIZABLE + retry: WELCOME orders for an = 1
+```
+
+</Expected>
+
+Bên thua chạy lại **cả** transaction: lần thứ hai nó thấy mã đã dùng 1 lần và trả lỗi nghiệp vụ đúng nghĩa, `CouponAlreadyUsedException`, thay vì một lỗi kỹ thuật. Đó là mục đích của retry: biến xung đột đồng thời thành kết quả như thể hai request chạy lần lượt. Vòng retry đặt ở `WelcomeOrders`, một bean khác, nên mỗi lần gọi `coupons.welcomeSerializable(...)` đi qua proxy và có transaction mới.
+
+<Check id="sb4.2.lab-write-skew">Tái hiện được write skew ở Read Committed và Repeatable Read, lỗi serialization ở Serializable, và retry ngoài transaction cho ra lỗi nghiệp vụ đúng.</Check>
+
+### 4. Bốn listener cho một sự kiện
+
+`OrderEmails` có ba listener cho cùng sự kiện `OrderPlaced`. Listener sau commit ném lỗi khi khách là `smtp-down`, giả lập máy chủ mail hỏng. `CheckoutService.placeAndNotify` đặt hàng, phát sự kiện, làm thêm 100 ms việc khác, rồi tuỳ tham số mà rollback. Test chạy bốn tình huống: commit, rollback, mail hỏng, và phát sự kiện ngoài transaction.
+
+<Terminal where="mac" title="Tạo sự kiện, listener, CheckoutService, EventsTest và chạy">
+
+```bash
+cd ~/masteva-sb4/shop
+P=src/main/java/vn/masteva/shop
+cat > $P/OrderPlaced.java <<'EOF'
+package vn.masteva.shop;
+
+public record OrderPlaced(long orderId, String customer) {
+}
+EOF
+cat > $P/AsyncConfig.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableAsync;
+
+@Configuration
+@EnableAsync
+class AsyncConfig {
+}
+EOF
+cat > $P/OrderEmails.java <<'EOF'
+package vn.masteva.shop;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.event.TransactionalEventListener;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+@Component
+public class OrderEmails {
+    private static final Logger log = LoggerFactory.getLogger(OrderEmails.class);
+    private final OrderRepository orders;
+
+    public OrderEmails(OrderRepository orders) {
+        this.orders = orders;
+    }
+
+    @EventListener
+    public void sync(OrderPlaced e) {
+        log.info("[sync] email for order {} (in transaction: {})", e.orderId(),
+                TransactionSynchronizationManager.isActualTransactionActive());
+    }
+
+    @Async
+    @EventListener
+    public void async(OrderPlaced e) {
+        orders.findById(e.orderId()).ifPresentOrElse(
+                o -> log.info("[async] email for order {}", e.orderId()),
+                () -> log.warn("[async] order {} not found, email dropped", e.orderId()));
+    }
+
+    @TransactionalEventListener
+    public void afterCommit(OrderPlaced e) {
+        if (e.customer().equals("smtp-down")) {
+            throw new IllegalStateException("SMTP server unavailable");
+        }
+        log.info("[after-commit] email for order {}", e.orderId());
+    }
+}
+EOF
+cat > $P/CheckoutService.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class CheckoutService {
+    private final OrderService orders;
+    private final ApplicationEventPublisher events;
+
+    public CheckoutService(OrderService orders, ApplicationEventPublisher events) {
+        this.orders = orders;
+        this.events = events;
+    }
+
+    @Transactional
+    public long placeAndNotify(String customer, boolean failLater) throws InterruptedException {
+        long id = orders.place(customer, "BOOK-JAVA", 1);
+        events.publishEvent(new OrderPlaced(id, customer));
+        Thread.sleep(100); // phần việc còn lại của transaction
+        if (failLater) {
+            throw new IllegalStateException("loyalty points failed for order " + id);
+        }
+        return id;
+    }
+}
+EOF
+cat > src/test/java/vn/masteva/shop/EventsTest.java <<'EOF'
+package vn.masteva.shop;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.simple.JdbcClient;
+
+@Import(TestcontainersConfiguration.class)
+@SpringBootTest(properties = "logging.level.org.springframework.transaction.event=debug")
+class EventsTest {
+    @Autowired CheckoutService checkout;
+    @Autowired ApplicationEventPublisher events;
+    @Autowired JdbcClient jdbc;
+
+    void run(String label, boolean failLater) throws InterruptedException {
+        System.out.println(">> --- " + label);
+        try {
+            System.out.println(">> returned order " + checkout.placeAndNotify(label, failLater));
+        } catch (IllegalStateException e) {
+            System.out.println(">> thrown: " + e.getMessage());
+        }
+        Thread.sleep(300); // chờ listener @Async
+    }
+
+    @Test
+    void listeners() throws InterruptedException {
+        jdbc.sql("TRUNCATE orders RESTART IDENTITY").update();
+        run("commit", false);
+        run("rollback", true);
+        run("smtp-down", false);
+        System.out.println(">> --- no transaction");
+        events.publishEvent(new OrderPlaced(1, "an"));
+        Thread.sleep(300);
+        System.out.println(">> orders in database: " + jdbc.sql("SELECT count(*) FROM orders").query(Long.class).single());
+    }
+}
+EOF
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw -q test -Dtest=EventsTest 2>&1 | grep -E '^>>|\] OrderEmails|skipping|threw exception|SMTP' | cut -c1-160
+```
+
+</Terminal>
+
+<Predict question="Với mỗi tình huống, listener nào gửi email, và email đó có đúng không?">
+
+```text
+>> --- commit
+ INFO [main    ] OrderEmails              : [sync] email for order 1 (in transaction: true)
+ WARN [task-1  ] OrderEmails              : [async] order 1 not found, email dropped
+ INFO [main    ] OrderEmails              : [after-commit] email for order 1
+>> returned order 1
+>> --- rollback
+ INFO [main    ] OrderEmails              : [sync] email for order 2 (in transaction: true)
+ WARN [task-2  ] OrderEmails              : [async] order 2 not found, email dropped
+>> thrown: loyalty points failed for order 2
+>> --- smtp-down
+ INFO [main    ] OrderEmails              : [sync] email for order 3 (in transaction: true)
+ WARN [task-3  ] OrderEmails              : [async] order 3 not found, email dropped
+ERROR [main    ] tionSynchronizationUtils : TransactionSynchronization.afterCompletion threw exception
+java.lang.IllegalStateException: SMTP server unavailable
+>> returned order 3
+>> --- no transaction
+DEBUG [main    ] ionListenerMethodAdapter : No transaction is active - skipping org.springframework.context.PayloadApplicationEvent[source=org.springframework.w
+ INFO [main    ] OrderEmails              : [sync] email for order 1 (in transaction: false)
+ INFO [task-4  ] OrderEmails              : [async] email for order 1
+>> orders in database: 2
+```
+
+Đọc theo từng listener:
+
+- `[sync]` luôn gửi, kể cả cho đơn 2 đã rollback: khách nhận email xác nhận một đơn không có trong database (chỉ còn đơn 1 và 3).
+- `[async]` chạy trên thread `task-N` và chạy đua với commit. Trong lab, `Thread.sleep(100)` sau `publishEvent` giữ transaction mở đủ lâu nên lần nào nó cũng đọc trước commit, không thấy đơn và bỏ email, kể cả đơn 1 và 3 đã commit thành công. Trên production, kết quả phụ thuộc thời điểm: phần lớn lần chạy có thể đúng, thỉnh thoảng mất email, và lỗi kiểu đó rất khó lần ra. Nó chỉ chắc chắn đúng khi không có transaction nào.
+- `[after-commit]` gửi cho đơn 1, im lặng với đơn 2 (đúng). Với đơn 3, exception của nó bị Spring log rồi nuốt: `placeAndNotify` vẫn trả về `order 3` như không có gì, email mất. Ở tình huống cuối, nó bị bỏ qua hẳn, chỉ để lại một dòng DEBUG mà mức log mặc định không hiện; test này bật DEBUG cho `org.springframework.transaction.event` để bạn thấy nó.
+
+</Predict>
+
+<Check id="sb4.2.lab-events">Tái hiện được email gửi cho đơn đã rollback với `@EventListener`, email bị bỏ với `@Async @EventListener`, và hai cách `@TransactionalEventListener` làm mất sự kiện (không có transaction, listener ném lỗi).</Check>
+
+### 5. PostgreSQL và ứng dụng thật
+
+Từ bước này, ứng dụng chạy thật và gọi một "cổng thanh toán" giả: endpoint `/fake-payment/charge` của chính nó, ngủ 3 giây rồi trả lời, luôn từ chối khách tên `declined` với `402`. `StoreService` có ba cách checkout, chọn bằng đường dẫn: một transaction dài (`/checkout/slow`), một transaction dài có `timeout = 2` (`/checkout/timeout`), và chia nhỏ có bù trừ (`/checkout/split`).
+
+<Terminal where="mac" title="Tab 2: container, cấu hình, code">
+
+```bash
+docker run -d --name sb4-pg -e POSTGRES_PASSWORD=masteva -e POSTGRES_DB=shop \
+  -p 5444:5432 postgres:18-alpine
+cd ~/masteva-sb4/shop
+cat >> src/main/resources/application.properties <<'EOF'
+server.port=8084
+spring.datasource.url=jdbc:postgresql://localhost:5444/shop
+spring.datasource.username=postgres
+spring.datasource.password=masteva
+payment.url=http://localhost:8084
+EOF
+P=src/main/java/vn/masteva/shop
+cat > $P/PaymentClient.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+
+@Component
+public class PaymentClient {
+    private final RestClient http;
+
+    public PaymentClient(@Value("${payment.url}") String url) {
+        this.http = RestClient.create(url);
+    }
+
+    public String charge(String customer) {
+        return http.post().uri("/fake-payment/charge?customer={c}", customer)
+                .retrieve().body(String.class);
+    }
+}
+EOF
+cat > $P/StoreService.java <<'EOF'
+package vn.masteva.shop;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
+
+@Service
+public class StoreService {
+    private static final Logger log = LoggerFactory.getLogger(StoreService.class);
+    private final JdbcClient jdbc;
+    private final OrderRepository orders;
+    private final PaymentClient payment;
+    private final TransactionTemplate tx;
+
+    public StoreService(JdbcClient jdbc, OrderRepository orders, PaymentClient payment, TransactionTemplate tx) {
+        this.jdbc = jdbc;
+        this.orders = orders;
+        this.payment = payment;
+        this.tx = tx;
+    }
+
+    @Transactional
+    public long checkoutSlow(String customer, String sku) {
+        return reserveChargeSave(customer, sku);
+    }
+
+    @Transactional(timeout = 2)
+    public long checkoutWithTimeout(String customer, String sku) {
+        return reserveChargeSave(customer, sku);
+    }
+
+    private long reserveChargeSave(String customer, String sku) {
+        reserve(sku);
+        log.info("{}: {}", customer, payment.charge(customer));
+        return orders.save(new PurchaseOrder(customer, sku, 1, null)).getId();
+    }
+
+    private void reserve(String sku) {
+        int updated = jdbc.sql("UPDATE products SET stock = stock - 1 WHERE sku = :sku AND stock > 0")
+                .param("sku", sku).update();
+        if (updated == 0) {
+            throw new OutOfStockException(sku);
+        }
+    }
+
+    public long checkoutSplit(String customer, String sku) {
+        long id = tx.execute(status -> {
+            reserve(sku);
+            return jdbc.sql("INSERT INTO orders (customer, sku, quantity, status) "
+                            + "VALUES (:customer, :sku, 1, 'PENDING') RETURNING id")
+                    .param("customer", customer).param("sku", sku).query(Long.class).single();
+        });
+        try {
+            log.info("{}: {}", customer, payment.charge(customer));
+        } catch (RuntimeException e) {
+            tx.executeWithoutResult(status -> {
+                jdbc.sql("UPDATE orders SET status = 'CANCELLED' WHERE id = :id").param("id", id).update();
+                jdbc.sql("UPDATE products SET stock = stock + 1 WHERE sku = :sku").param("sku", sku).update();
+            });
+            throw e;
+        }
+        tx.executeWithoutResult(status ->
+                jdbc.sql("UPDATE orders SET status = 'PAID' WHERE id = :id").param("id", id).update());
+        return id;
+    }
+}
+EOF
+cat > $P/StoreController.java <<'EOF'
+package vn.masteva.shop;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+class StoreController {
+    private final StoreService store;
+
+    StoreController(StoreService store) {
+        this.store = store;
+    }
+
+    @PostMapping("/checkout/{mode}")
+    long checkout(@PathVariable String mode, @RequestParam String customer, @RequestParam String sku) {
+        return switch (mode) {
+            case "slow" -> store.checkoutSlow(customer, sku);
+            case "timeout" -> store.checkoutWithTimeout(customer, sku);
+            case "split" -> store.checkoutSplit(customer, sku);
+            default -> throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+        };
+    }
+
+    @PostMapping("/fake-payment/charge") // cổng thanh toán giả
+    String charge(@RequestParam String customer) throws InterruptedException {
+        Thread.sleep(3000); // đang chậm
+        if (customer.equals("declined")) {
+            throw new ResponseStatusException(HttpStatus.PAYMENT_REQUIRED, "card declined");
+        }
+        return "charged " + customer;
+    }
+}
+EOF
+```
+
+</Terminal>
+
+- `reserve` trừ kho bằng một câu `UPDATE ... WHERE stock > 0` nguyên tử như SB3.3. Câu đó lấy khoá dòng ngay lập tức và giữ tới khi transaction kết thúc.
+- `JdbcClient` và `orders.save(...)` dùng chung một transaction: `JpaTransactionManager` đưa connection của transaction JPA ra cho code JDBC.
+- `checkoutSplit` dùng `TransactionTemplate` để có hai, hoặc ba, transaction ngắn trong cùng một method, với lời gọi thanh toán nằm giữa và không thuộc transaction nào.
+- Mật khẩu trong `application.properties` chỉ chấp nhận được cho lab trên máy bạn. Test vẫn dùng Testcontainers: `@ServiceConnection` ghi đè `spring.datasource.*`.
+
+Ở tab 1, chạy ứng dụng:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb4/shop
+export JAVA_HOME=$(/usr/libexec/java_home -v 25)
+./mvnw spring-boot:run
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ INFO [main    ] TomcatWebServer          : Tomcat started on port 8084 (http) with context path '/'
+```
+
+</Expected>
+
+### 6. Transaction dài giữ khoá dòng
+
+Ở tab 2, định nghĩa hai hàm: `pgsql` chạy psql trong container, `activity` liệt kê các phiên đang bận của database `shop` cùng thời gian transaction và phiên đang chặn chúng. Rồi gửi hai request mua cốc cách nhau nửa giây, và chụp `pg_stat_activity` khi cả hai còn đang chạy:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+pgsql() { docker exec -i sb4-pg psql -U postgres -d shop "$@"; }
+activity() {
+  pgsql -c "SELECT pid, state, wait_event_type AS wait, pg_blocking_pids(pid) AS blocked_by,
+                   round(extract(epoch FROM now() - xact_start), 1) AS xact_s, left(query, 50) AS query
+            FROM pg_stat_activity
+            WHERE datname = 'shop' AND state <> 'idle' AND pid <> pg_backend_pid()"
+}
+curl -s -w ' (%{time_total}s)\n' -X POST 'localhost:8084/checkout/slow?customer=an&sku=MUG' &
+sleep 0.5
+curl -s -w ' (%{time_total}s)\n' -X POST 'localhost:8084/checkout/slow?customer=binh&sku=MUG' &
+sleep 1
+activity
+wait
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ pid |        state        |  wait  | blocked_by | xact_s |                       query
+-----+---------------------+--------+------------+--------+----------------------------------------------------
+  72 | idle in transaction | Client | {}         |    1.6 | UPDATE products SET stock = stock - 1 WHERE sku =
+  73 | active              | Lock   | {72}       |    1.2 | UPDATE products SET stock = stock - 1 WHERE sku =
+(2 rows)
+
+1 (3.166139s)
+2 (5.670742s)
+```
+
+</Expected>
+
+zsh in thêm các dòng `[1] 12345` và `[1]  + done ...` cho hai lệnh chạy nền; bỏ qua chúng. Số `pid` và thời gian khác trên máy bạn.
+
+- Phiên 72 (request của `an`) đã chạy xong câu `UPDATE` và đang `idle in transaction`, `wait = Client`: PostgreSQL chờ ứng dụng gửi lệnh tiếp, trong lúc ứng dụng chờ cổng thanh toán. Khoá dòng `MUG` vẫn nằm trong tay nó.
+- Phiên 73 (request của `binh`) `active` nhưng `wait = Lock`, `blocked_by = {72}`: câu `UPDATE` của nó đứng chờ.
+- `binh` mất 5,7 giây: khoảng 2,6 giây chờ khoá cộng 3 giây thanh toán của chính nó. Với phiên `active`, cột `query` là câu đang chạy; với phiên `idle` hay `idle in transaction`, nó là câu **cuối cùng** đã chạy, ở đây chính là câu lấy khoá.
+
+<Check id="sb4.2.lab-lock-wait">Tái hiện được một request chờ khoá dòng của transaction đang gọi HTTP, và đọc được `state`, `wait_event_type`, `pg_blocking_pids` trong `pg_stat_activity` để chỉ ra phiên đang chặn.</Check>
+
+### 7. timeout không ngắt lời gọi HTTP
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+pgsql -c "SELECT stock FROM products WHERE sku = 'MUG'"
+curl -s -w ' (%{http_code}, %{time_total}s)\n' -X POST 'localhost:8084/checkout/timeout?customer=chi&sku=MUG'
+pgsql -c "SELECT stock FROM products WHERE sku = 'MUG'" -c "SELECT id, customer, status FROM orders ORDER BY id"
+```
+
+</Terminal>
+
+<Predict question="Transaction có timeout 2 giây, lời gọi thanh toán mất 3 giây. Request trả về sau 2 giây hay 3 giây? Khách chi có bị trừ tiền, có đơn hàng không?">
+
+```text
+ stock
+-------
+     3
+(1 row)
+
+{"timestamp":"2026-10-09T04:05:37.540Z","status":500,"error":"Internal Server Error","path":"/checkout/timeout"} (500, 3.034575s)
+ stock
+-------
+     3
+(1 row)
+
+ id | customer | status
+----+----------+--------
+  1 | an       | NEW
+  2 | binh     | NEW
+(2 rows)
+```
+
+Trong tab 1:
+
+```text
+DEBUG [4-exec-7] JpaTransactionManager    : Creating new transaction with name [vn.masteva.shop.StoreService.checkoutWithTimeout]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT,timeout_2
+ INFO [4-exec-7] StoreService             : chi: charged chi
+ERROR [4-exec-7] [dispatcherServlet]      : Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed: org.springframework.orm.jpa.JpaSystemException: Transaction timeout expired] with root cause
+```
+
+Ba giây, không phải hai: không ai ngắt lời gọi HTTP. Cổng thanh toán đã trả `charged chi`, tức tiền đã bị trừ. Sau đó câu `INSERT` của `orders.save(...)` là câu SQL đầu tiên bắt đầu sau hạn chót, Hibernate ném `Transaction timeout expired`, transaction rollback: kho trả về 3, không có đơn của `chi`. Đây là kết quả tệ nhất: khách mất tiền mà không có đơn.
+
+</Predict>
+
+<Check id="sb4.2.lab-timeout">Tái hiện được việc `@Transactional(timeout = 2)` không ngắt lời gọi HTTP 3 giây, chỉ ra trong log rằng thanh toán đã chạy xong trước khi transaction rollback vì `Transaction timeout expired`.</Check>
+
+### 8. Chia nhỏ transaction, và bù trừ khi thất bại
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -w ' (%{time_total}s)\n' -X POST 'localhost:8084/checkout/split?customer=an&sku=MUG' &
+sleep 0.5
+curl -s -w ' (%{time_total}s)\n' -X POST 'localhost:8084/checkout/split?customer=binh&sku=MUG' &
+sleep 1
+activity
+pgsql -c "SELECT id, customer, status FROM orders WHERE id > 2 ORDER BY id"
+wait
+pgsql -c "SELECT id, customer, status FROM orders WHERE id > 2 ORDER BY id" -c "SELECT stock FROM products WHERE sku = 'MUG'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ pid | state | wait | blocked_by | xact_s | query
+-----+-------+------+------------+--------+-------
+(0 rows)
+
+ id | customer | status
+----+----------+---------
+  3 | an       | PENDING
+  4 | binh     | PENDING
+(2 rows)
+
+3 (3.023022s)
+4 (3.015976s)
+ id | customer | status
+----+----------+--------
+  3 | an       | PAID
+  4 | binh     | PAID
+(2 rows)
+
+ stock
+-------
+     1
+(1 row)
+```
+
+</Expected>
+
+Giữa lúc hai lời gọi thanh toán đang chạy, không phiên nào bận: không ai giữ khoá, không ai chờ. Cả hai đơn hiện `PENDING`, trạng thái trung gian mà phiên bản một transaction không bao giờ để lộ. Cả hai request mất 3 giây, không ai chờ ai. Đơn có id 3 và 4 vì lần thử ở bước 7 rollback trước khi chèn đơn, nên không tốn số nào của cột identity.
+
+Giờ một khách bị cổng thanh toán từ chối:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -w ' (%{http_code})\n' -X POST 'localhost:8084/checkout/split?customer=declined&sku=MUG'
+pgsql -c "SELECT id, customer, status FROM orders WHERE id > 4 ORDER BY id" -c "SELECT stock FROM products WHERE sku = 'MUG'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"timestamp":"2026-10-09T04:05:44.265Z","status":500,"error":"Internal Server Error","path":"/checkout/split"} (500)
+ id | customer |  status
+----+----------+-----------
+  5 | declined | CANCELLED
+(1 row)
+
+ stock
+-------
+     1
+(1 row)
+```
+
+</Expected>
+
+Transaction đầu đã commit việc trừ kho và đơn `PENDING`; khi `RestClient` ném `HttpClientErrorException: 402 Payment Required`, transaction bù trừ đổi đơn sang `CANCELLED` và cộng lại kho, nên kho vẫn là 1. API trả `500` vì lab không ánh xạ lỗi này; trong service thật, `@RestControllerAdvice` của SB1.3 nên trả `402` hoặc `422`.
+
+<Check id="sb4.2.lab-split">Chia được một checkout có gọi dịch vụ ngoài thành các transaction ngắn bằng `TransactionTemplate`, chứng minh bằng `pg_stat_activity` là không còn phiên chờ khoá, và thấy bước bù trừ chạy khi thanh toán bị từ chối.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `docker: Error response from daemon: Conflict. The container name "/sb4-pg" is already in use`: container từ lần chạy trước còn đó. `docker start sb4-pg` nếu muốn dùng lại, hoặc xoá theo phần Dọn dẹp rồi chạy lại.
+- `Bind for 0.0.0.0:5444 failed: port is already allocated` hoặc `Port 8084 was already in use`: một tiến trình khác đang giữ cổng. Tìm bằng `lsof -i :5444` hay `lsof -i :8084`.
+- `Connection to localhost:5444 refused` ở tab 1: container chưa sẵn sàng; chờ vài giây rồi chạy lại.
+- Bước 2 ra 1 đơn ở Read Committed: hai thread không chạy chồng lên nhau, thường vì máy đang rất bận. Chạy lại test; khoảng nghỉ 200 ms ở `pause()` là để chúng chồng nhau.
+- Bước 6 `activity` ra `(0 rows)`: request đầu chưa tới câu `UPDATE` hoặc đã xong. Lần chạy đầu sau khi khởi động chậm hơn; chạy lại cả khối lệnh.
+- `command not found: pgsql`: tab 2 vừa được mở lại; định nghĩa lại hai hàm ở bước 6.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng ứng dụng bằng Ctrl+C ở tab 1. Chặng SB4 kết thúc ở đây.
+
+<Callout kind="danger">
+
+Lệnh dưới đây xoá vĩnh viễn container `sb4-pg` cùng mọi dữ liệu trong database `shop` của nó, rồi xoá thư mục `~/masteva-sb4` gồm toàn bộ mã nguồn của hai bài SB4. Chỉ chạy khi chắc không cần nữa. Image `postgres:18-alpine` vẫn được giữ lại.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+docker rm -f sb4-pg
+rm -rf ~/masteva-sb4
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Khoá lạc quan với @Version có giữ khoá suốt lời gọi chậm không? Vậy có cần chia nhỏ transaction?">
+
+Không giữ khoá, nhưng vẫn cần chia nhỏ. Với `@Version` (SB3.3), câu `UPDATE ... WHERE id = ? AND version = ?` chỉ chạy lúc flush trước commit, nên khoá dòng chỉ bị giữ vài mili giây cuối; trong 3 giây gọi thanh toán, transaction chỉ giữ connection. Cái giá nằm ở chỗ khác: bên thua chỉ biết mình thua **sau khi** đã gọi thanh toán, tức thẻ đã bị trừ, và retry cả transaction có nguy cơ trừ tiền lần nữa. Ngược lại, khoá bi quan (`@Lock(PESSIMISTIC_WRITE)`) hay câu `UPDATE` nguyên tử ở đầu method như bài này lấy khoá ngay và giữ nó suốt lời gọi chậm, làm request khác phải chờ như bước 6. Một cách thì thất bại muộn sau tác dụng bên ngoài, một cách thì giữ khoá lâu; cả hai đều là lý do đưa lời gọi chậm ra ngoài transaction.
+
+</Reveal>
+
+<Reveal title="Lỗi serialization có thể xảy ra ở transaction chỉ đọc không?">
+
+Có, ở mức Serializable: một transaction chỉ đọc vẫn có thể là một mắt xích trong vòng phụ thuộc và bị huỷ, nên báo cáo chạy ở mức này cũng cần retry. PostgreSQL có `SERIALIZABLE READ ONLY DEFERRABLE`: transaction chờ tới khi lấy được một snapshot chắc chắn an toàn rồi mới chạy, đổi lại không bao giờ bị huỷ vì serialization. Hợp với báo cáo dài chạy định kỳ. Spring không có thuộc tính riêng cho `DEFERRABLE`; bạn chạy `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE` bằng `JdbcClient` làm câu lệnh đầu tiên trong transaction.
+
+</Reveal>
+
+<Reveal title="Vì sao không gửi email ngay trong method @Transactional, sau dòng cuối cùng?">
+
+Vì "dòng cuối cùng" của method chưa phải là commit. Commit chạy sau khi method trả về, bên trong proxy, và có thể thất bại: vi phạm ràng buộc khi flush, lỗi serialization như bước 2, mất kết nối. Email gửi ở dòng cuối vẫn là gửi trước commit. Muốn chắc dữ liệu đã tồn tại, phải chờ tới pha `AFTER_COMMIT`. Muốn chắc sự kiện không mất, phải ghi nó vào database cùng transaction (outbox) rồi gửi sau.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI rà các method `@Transactional` để tìm lời gọi HTTP, gửi email, đẩy message hay `Thread.sleep` bên trong transaction, và tìm `@EventListener` làm việc có tác dụng ra bên ngoài. AI hay khuyên tăng mức isolation lên Serializable mà quên vòng retry, hay đặt retry bên trong chính method `@Transactional`, hay tin rằng `@Transactional(timeout)` ngắt được lời gọi HTTP, và hay quên `@TransactionalEventListener` bỏ qua sự kiện khi không có transaction. Kiểm tra lại bằng cách tái hiện như bài: hai thread đồng thời cho isolation, `pg_stat_activity` cho transaction dài, và log của cả bốn tình huống cho listener.
+
+</Callout>
+
+<Callout kind="link">
+
+SB3.1 tái hiện các mức isolation bằng psql; SB3.3 dùng khoá lạc quan, khoá bi quan và tính pool mà bài này giả định. SB4.1 giải thích proxy mà retry và listener dựa vào. SB7 thêm timeout cho chính lời gọi HTTP, `@Retryable` và circuit breaker cho cổng thanh toán. SB8 đưa tuổi transaction và số phiên chờ khoá lên dashboard. SB9.2 gửi sự kiện qua Kafka và nêu mẫu outbox; chặng M7 đi sâu vào outbox và saga khi bước bù trừ trải trên nhiều service.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb4.2.mastery-isolation">Chọn được giữa ràng buộc database, khoá dòng đại diện và Serializable kèm retry cho một quy tắc nghiệp vụ trải trên nhiều dòng, và viết được test hai thread chứng minh lựa chọn đó.</Check>
+
+<Check id="sb4.2.mastery-readonly">Đặt được `readOnly = true` đúng chỗ trong một service (method mở transaction, không phải method tham gia), và viết được test chứng minh nó có tác dụng ở Hibernate và PostgreSQL.</Check>
+
+<Check id="sb4.2.mastery-long-tx">Tìm được transaction dài trong một service đang chạy bằng `pg_stat_activity`, chỉ ra nguyên nhân trong code, và chia nó thành các transaction ngắn có bù trừ.</Check>
+
+<Check id="sb4.2.mastery-events">Thiết kế được việc phát sự kiện sau khi ghi dữ liệu, nói rõ chấp nhận mất sự kiện ở trường hợp nào, và khi nào phải chuyển sang outbox.</Check>
+
+</Mastery>

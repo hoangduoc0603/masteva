@@ -1,0 +1,998 @@
+---
+title: Testcontainers, Docker Compose, RestTestClient và chiến lược test
+description: Thay H2 bằng PostgreSQL 18 thật trong test bằng @ServiceConnection, chạy ứng dụng khi phát triển với Docker Compose do Spring Boot tự quản lý, so sánh MockMvc với RestTestClient qua HTTP thật, rồi xếp mọi loại test của một service Spring vào một chiến lược có lý do.
+id: sb2.2
+step: sb2
+prerequisites: [sb2.1]
+topics: [sb2.service-connection, sb2.docker-compose, sb2.mockmvc-resttestclient, sb2.chien-luoc-test]
+status: verified
+verified:
+  date: 2026-10-09
+  os: macOS 14.4.1
+  tools:
+    java: 25.0.3
+    maven: 3.9.16
+    spring-boot: 4.1.1
+    hibernate: 7.4.5
+    flyway: 12.4.0
+    testcontainers: 2.0.5
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    postgresql: "18.6"
+    curl: 8.4.0
+---
+
+<Goal>
+
+Đưa service đơn hàng của SB2.1 lên PostgreSQL thật ở cả ba nơi: trong test (Testcontainers), khi chạy trên máy dev (Docker Compose), và trong test qua HTTP thật (`RestTestClient`), rồi sắp các loại test thành một chiến lược rõ ràng. Học xong bài này, bạn giải thích được:
+
+- Vì sao test lịch sử đơn hàng xanh trên H2 nhưng đỏ trên PostgreSQL, dù câu SQL giống hệt nhau.
+- Vì sao một test `@Transactional` gọi API qua `RestTestClient` để lại dữ liệu trong database, trong khi cùng test đó với MockMvc thì không.
+- Vì sao chạy `spring-boot:test-run` trong project có `compose.yaml` lại khởi động hai PostgreSQL và ứng dụng chỉ dùng một.
+
+</Goal>
+
+<Knowledge>
+
+### Vì sao bỏ H2
+
+J8.3 đã nói: test trên H2 chứng minh code chạy trên H2. SB2.1 có một ví dụ cụ thể. Luật nghiệp vụ "đơn chưa thanh toán nằm cuối danh sách" được kiểm bằng `order by paid_at desc` trên H2, và test xanh. Nhưng hai database xử lý `NULL` khi sắp xếp khác nhau:
+
+| Database | `NULL` được coi là | `ORDER BY paid_at DESC` | `ORDER BY paid_at ASC` |
+|---|---|---|---|
+| H2 (mặc định) | Nhỏ hơn mọi giá trị | `NULL` ở cuối | `NULL` ở đầu |
+| PostgreSQL | Lớn hơn mọi giá trị | `NULL` ở **đầu** | `NULL` ở cuối |
+
+Cùng một câu SQL, hai thứ tự khác nhau. Trên production, trang "lịch sử đơn" sẽ đẩy đơn chưa thanh toán lên trên cùng, và bộ test xanh không báo gì. Lỗi loại này còn nhiều: kiểu cột (`status enum(...)` mà Hibernate tạo trên H2 không có trên PostgreSQL), schema do Hibernate sinh thay vì migration thật, cú pháp riêng như `ON CONFLICT`, `DISTINCT ON`, `interval '7 days'` mà H2 không hiểu. Cách chắc chắn là test trên đúng database và đúng phiên bản của production.
+
+### @ServiceConnection: Testcontainers trong Spring Boot
+
+J8.3 dùng Testcontainers thuần: lấy `getJdbcUrl()` từ container rồi tự truyền cho repository. Trong Spring Boot, URL đó phải tới được `DataSource` mà auto-configuration tạo. Có ba cách, cách mới nhất gọn nhất:
+
+| Cách | Viết | Ai quản lý vòng đời container |
+|---|---|---|
+| `@DynamicPropertySource` | Method static thêm `spring.datasource.url`, `username`, `password` từ container | JUnit (`@Container`) |
+| `@ServiceConnection` trên field `@Container static` | Annotation trên field | JUnit, có rủi ro với context cache (xem Đào sâu) |
+| `@ServiceConnection` trên `@Bean` trong `@TestConfiguration` | Một method trả container | **Spring**: container là một bean |
+
+Lab dùng cách thứ ba, cũng là cách start.spring.io sinh ra khi chọn Testcontainers. Bên dưới:
+
+```text
+@Import(TestcontainersConfiguration.class)  trên class test
+   |
+   v
+TestcontainersConfiguration
+   @Bean @ServiceConnection PostgreSQLContainer postgres()
+   |
+   |  1. Spring Boot đọc KIỂU trả về (PostgreSQLContainer), chưa cần gọi method,
+   |     tìm ContainerConnectionDetailsFactory phù hợp
+   |  2. Đăng ký bean JdbcConnectionDetails trỏ tới container
+   |  3. Bean container được tạo và start() trước bean cần kết nối (DataSource)
+   |     -> Docker: postgres:18-alpine, cổng 5432 map ra cổng ngẫu nhiên
+   v
+DataSourceAutoConfiguration
+   có JdbcConnectionDetails -> dùng nó, BỎ QUA spring.datasource.url/username/password
+   |
+   v
+HikariCP -> Flyway chạy V1__orders.sql -> Hibernate validate schema -> repository, service...
+
+Context đóng (thường là khi JVM test kết thúc): bean khác bị huỷ trước, container stop sau cùng
+```
+
+Ba hệ quả cần nhớ:
+
+- **Không cần `spring.datasource.*` cho test.** `JdbcConnectionDetails` thắng mọi property kết nối. Cùng cơ chế "connection details" được Docker Compose dùng ở phần sau.
+- **`@DataJpaTest` không thay `DataSource` này bằng H2.** Mặc định `@AutoConfigureTestDatabase(replace = Replace.NON_TEST)` chỉ thay `DataSource` không do test khai báo; connection details từ `@ServiceConnection` được coi là của test. Bản Spring Boot cũ phải viết thêm `replace = Replace.NONE`.
+- **Mỗi context một container.** Container là bean, nên hai context khác nhau (một `@DataJpaTest`, một `@SpringBootTest`) mỗi cái có PostgreSQL riêng. Context nằm trong cache thì container cũng sống theo. Đây là thêm một lý do để giữ số context nhỏ như SB2.1.
+
+<Check id="sb2.2.service-connection">Giải thích được chuỗi từ `@Bean @ServiceConnection` tới `DataSource`, vì sao không cần `spring.datasource.url` trong test, và vì sao số container bằng số context dùng nó.</Check>
+
+### Docker Compose khi phát triển
+
+Test đã có PostgreSQL. Còn khi bạn chạy ứng dụng trên máy để thử bằng `curl` hay frontend? Cách cũ: README ghi "chạy `docker compose up -d` trước", và `application.properties` ghi cứng URL, user, password khớp với file compose. Hai nơi phải sửa cùng nhau, và người mới hay quên bước đầu.
+
+Module **`spring-boot-docker-compose`** gộp hai việc đó vào lúc khởi động:
+
+```text
+./mvnw spring-boot:run
+  |
+  1. Tìm compose.yaml (compose.yml, docker-compose.yaml...) trong thư mục làm việc
+  2. Chạy "docker compose up" (bỏ qua nếu các service đã chạy sẵn)
+  3. Chờ sẵn sàng: mặc định là mở được kết nối TCP tới cổng đã map
+  4. Đọc từng container đang chạy: image "postgres" -> tạo JdbcConnectionDetails
+     từ cổng map ra máy và POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+  5. Khởi động ứng dụng như bình thường; DataSource dùng connection details đó
+  ...
+Ctrl+C
+  6. Ứng dụng tắt -> "docker compose stop": container dừng nhưng KHÔNG bị xoá
+```
+
+| Thuộc tính | Mặc định | Ý nghĩa |
+|---|---|---|
+| `spring.docker.compose.enabled` | `true` | Tắt hẳn hỗ trợ Compose |
+| `spring.docker.compose.lifecycle-management` | `start-and-stop` | `start-only` để container chạy tiếp sau khi app tắt; `none` để tự quản lý |
+| `spring.docker.compose.stop.command` | `stop` | Đổi thành `down` để xoá container khi tắt (mất dữ liệu nếu không có volume) |
+| `spring.docker.compose.skip.in-tests` | `true` | Không chạy Compose khi test; test dùng Testcontainers |
+
+Dependency được khai báo `<optional>true</optional>`, và plugin Maven của Spring Boot loại nó khỏi file jar đóng gói (SB11): production không bao giờ tự chạy `docker compose`.
+
+Spring Boot còn một cách khác cho máy dev: **Testcontainers lúc phát triển**. Một class `main` trong `src/test` gọi `SpringApplication.from(OrdersApplication::main).with(TestcontainersConfiguration.class)`, chạy bằng `./mvnw spring-boot:test-run`. Ứng dụng dùng đúng container bean của test.
+
+| | Docker Compose | Testcontainers lúc phát triển |
+|---|---|---|
+| Khai báo service | `compose.yaml`, ai cũng đọc được, dùng được cả ngoài Java | Code Java trong `src/test` |
+| Dữ liệu sau khi tắt app | Còn (container chỉ bị `stop`) | Mất (container bị xoá) |
+| Cổng | Cố định, ví dụ 5442, nối `psql` hay DBeaver dễ | Ngẫu nhiên mỗi lần |
+| Hợp với | Làm việc hằng ngày, có dữ liệu thử lâu dài, nhiều service (PostgreSQL, Redis, Kafka) | Muốn môi trường sạch mỗi lần, dùng lại đúng cấu hình của test |
+
+Chọn một cho mỗi project. Lab sẽ cho thấy dùng cả hai cùng lúc sinh ra chuyện gì.
+
+<Check id="sb2.2.docker-compose">Kể được Spring Boot làm gì với `compose.yaml` lúc khởi động và lúc tắt, vì sao Compose không chạy trong test, và so sánh được nó với `spring-boot:test-run`.</Check>
+
+### MockMvc và RestTestClient
+
+SB1.3 và SB2.1 gọi API bằng `MockMvcTester`: request không qua mạng, không có Tomcat, `DispatcherServlet` được gọi thẳng trên một servlet giả. Spring Framework 7 thêm **`RestTestClient`**, một client test có cùng API cho mọi "đích":
+
+| Cách dựng | Đích | Khi nào |
+|---|---|---|
+| `@SpringBootTest` (MOCK) + `@AutoConfigureRestTestClient` | MockMvc bên dưới | Muốn API kiểu client nhưng không cần Tomcat |
+| `@SpringBootTest(webEnvironment = RANDOM_PORT)` + `@AutoConfigureRestTestClient` | Tomcat thật, cổng ngẫu nhiên | Test qua HTTP thật |
+| `RestTestClient.bindToController(...)` | Một controller, không có Spring Boot | Test rất nhỏ |
+| `RestTestClient.bindToServer().baseUrl(...)` | Server bất kỳ đang chạy | Smoke test sau khi deploy |
+
+Khác biệt quan trọng nhất không nằm ở API mà ở **thread**:
+
+```text
+MOCK (MockMvc)                                 RANDOM_PORT (Tomcat thật)
+-----------------------------------------      ------------------------------------------------
+thread main                                    thread main             thread http-nio-xxx-exec-1
+  @Transactional test: BEGIN                     @Transactional test:    (Tomcat)
+  mvc.post("/orders")                            BEGIN
+    -> DispatcherServlet                         client.post("/orders") --HTTP--> DispatcherServlet
+    -> OrderService.create (@Transactional:                                        OrderService.create
+       THAM GIA transaction của test)                                              BEGIN ... COMMIT
+  ROLLBACK -> đơn biến mất                       ROLLBACK (không có gì để huỷ)    đơn ĐÃ nằm trong DB
+```
+
+Với MockMvc, service tham gia transaction của test, nên rollback cuối test xoá mọi thứ. Với Tomcat thật, server xử lý request trong thread của nó, transaction riêng, commit thật; `@Transactional` trên test không có tác dụng gì với dữ liệu đó. Tài liệu Spring Boot ghi rõ điều này, và lab sẽ cho thấy nó.
+
+| | `MockMvcTester` / `RestTestClient` trên MOCK | `RestTestClient` trên RANDOM_PORT |
+|---|---|---|
+| Đi qua | `DispatcherServlet`, filter Spring, Jackson, advice | Thêm Tomcat, socket HTTP, header thật |
+| Exception không ai xử lý | Bay thẳng vào test dưới dạng `ServletException` | Thành `500` với body do `/error` của Spring Boot sinh: `timestamp`, `status`, `error`, `path` |
+| Rollback bằng `@Transactional` | Có | Không, phải tự dọn dữ liệu |
+| Persistence context mở suốt test | Có, nếu test `@Transactional` (che lỗi lazy loading) | Không, giống production |
+| Tốc độ | Nhanh hơn | Chậm hơn, thêm một context nếu cấu hình khác |
+
+<Callout kind="production">
+
+Một quan hệ **lazy** giữa hai entity chỉ được tải khi code chạm vào nó, và chỉ tải được khi persistence context còn mở; `spring.jpa.open-in-view=false` (đã đặt trong lab) đóng nó ngay khi transaction của service kết thúc, thay vì giữ tới hết request. SB3.2 sẽ đi sâu vào hai cơ chế này. Một controller trả entity có quan hệ lazy. Bộ test tích hợp đặt `@Transactional` trên mọi class "để tự rollback" và gọi API qua MockMvc. Vì request chạy trong transaction của test, persistence context còn mở khi Jackson ghi JSON, nên quan hệ lazy được tải bình thường và test xanh. Trên production, transaction của service đã đóng trước khi Jackson chạy (`open-in-view=false`), và endpoint trả `500` với `LazyInitializationException`. Test qua `RANDOM_PORT`, không `@Transactional`, tái hiện đúng điều kiện production và bắt được lỗi này. Đây là lý do chiến lược bên dưới giữ ít nhất một nhóm test HTTP thật cho các endpoint quan trọng.
+
+</Callout>
+
+<Check id="sb2.2.mockmvc-vs-resttestclient">Giải thích được vì sao `@Transactional` rollback được với MockMvc nhưng không với `RANDOM_PORT`, và nêu được loại lỗi chỉ test HTTP thật mới bắt được.</Check>
+
+### Chiến lược test cho một service Spring
+
+J8.2 đã dựng kim tự tháp test (unit, integration, E2E) và tách test cần hạ tầng sang Failsafe. Đây là bản cụ thể cho một service Spring, với hai tầng giữa được chia nhỏ theo những gì SB2.1 và bài này dạy:
+
+```text
+                 /\        E2E: nhiều service, ngoài repo này
+                /--\
+               /HTTP\      @SpringBootTest(RANDOM_PORT) + RestTestClient: vài test cho đường chính
+              /------\
+             /Tích hợp\    @SpringBootTest (MOCK) + MockMvc: luồng qua nhiều tầng, MỘT lớp cha chung
+            /----------\
+           /   Slice    \  @WebMvcTest (hợp đồng HTTP), @DataJpaTest (truy vấn, mapping, ràng buộc)
+          /--------------\
+         /Unit test thuần \  domain, luật nghiệp vụ: không Spring, không Docker, phần lớn số test
+        /__________________\
+```
+
+| Cần kiểm | Tầng | Lý do |
+|---|---|---|
+| `PurchaseOrder.pay()` từ chối đơn đã thanh toán | Unit | Logic thuần, không cần gì khác |
+| Body thiếu `customer` trả `422`, không gọi service | `@WebMvcTest` | Chỉ tầng web liên quan; mock service |
+| Lịch sử đơn sắp xếp đúng | `@DataJpaTest` + PostgreSQL thật | Hành vi phụ thuộc database |
+| Migration chạy được, entity khớp schema | Mọi test có database (Flyway + `ddl-auto=validate`) | Tự động có khi context khởi động |
+| Tạo, thanh toán, thanh toán lại trả `409` | Tích hợp (MOCK) | Qua controller, service, transaction, database |
+| Hệ thống ngoài lỗi: client nhận `500` từ `/error`, đơn không được lưu | HTTP thật (`RANDOM_PORT`) | MockMvc không có trang lỗi của servlet container |
+| Gọi service khác (SB7), gửi Kafka (SB9) | Mock ở tích hợp; test hợp đồng riêng | Không phụ thuộc hệ thống ngoài khi chạy CI |
+
+Năm quy tắc giữ bộ test nhanh và đáng tin khi nó lớn lên:
+
+1. **Một cấu hình cho mỗi tầng.** Một lớp cha cho test tích hợp, một cho test HTTP thật; mock hệ thống ngoài khai báo ở đó (SB2.1).
+2. **Database thật cho mọi thứ chạm tới SQL.** Không H2, không mock repository trong test tích hợp.
+3. **Tách test cần Docker như J8.2.** Đặt tên `*IT` (ví dụ `OrderHttpIT`) để Failsafe chạy chúng ở `./mvnw verify`, còn `./mvnw test` chỉ chạy unit test và `@WebMvcTest` trong vài giây. `spring-boot-starter-parent` đã cấu hình sẵn Failsafe, chỉ cần khai báo `maven-failsafe-plugin` trong `<build><plugins>`. Surefire và Failsafe chạy ở hai JVM khác nhau, nên mỗi bên có context cache riêng. Lab của bài giữ mọi class là `*Test` để một lệnh `./mvnw test` chạy hết và đếm context trong một log; project thật nên tách.
+4. **Không dựa vào thứ tự hay rollback để cô lập dữ liệu.** Mỗi test tạo dữ liệu riêng (khách hàng riêng, id lấy từ response) hoặc tự dọn.
+5. **Đo.** Thời gian bộ test và số context là chỉ số cần theo dõi như độ phủ (J8.3).
+
+<Check id="sb2.2.test-strategy">Xếp được một yêu cầu kiểm thử bất kỳ của service Spring vào đúng tầng của kim tự tháp và giải thích vì sao không đặt nó ở tầng thấp hơn hay cao hơn.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Testcontainers (Spring Boot)](https://docs.spring.io/spring-boot/reference/testing/testcontainers.html): container là bean, `@ServiceConnection`, và cảnh báo về `@Container` với context cache.
+- [Development-time Services](https://docs.spring.io/spring-boot/reference/features/dev-services.html): hỗ trợ Docker Compose (vòng đời, nhãn, readiness) và Testcontainers lúc phát triển.
+- [RestTestClient](https://docs.spring.io/spring-framework/reference/testing/resttestclient.html): các cách dựng client và API kiểm tra response, kể cả tích hợp AssertJ.
+- [Testing Spring Boot Applications](https://docs.spring.io/spring-boot/reference/testing/spring-boot-applications.html): mục "Testing With a Running Server" về `RANDOM_PORT` và đoạn cảnh báo về transaction.
+- [The Practical Test Pyramid](https://martinfowler.com/articles/practical-test-pyramid.html): bài kinh điển của Ham Vocke về kim tự tháp test, đọc phần về integration test và contract test.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm SB2.1, project `~/masteva-sb2/orders` còn nguyên. Docker Desktop đang chạy. Lần đầu Testcontainers tải `postgres:18-alpine` (khoảng 110 MB) và `testcontainers/ryuk`. Mở **hai tab Terminal**, ở mỗi tab chạy `export JAVA_HOME=$(/usr/libexec/java_home -v 25)`. Cổng dùng trong bài: ứng dụng 8082 và 8182, PostgreSQL của Compose 5442. Trong kết quả mong đợi, phần đầu mỗi dòng log (thời gian, PID, thread) được thay bằng `...`.
+
+### 1. Kiểm tra Docker
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker version --format '{{.Server.Version}}'
+docker compose version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+29.8.0
+Docker Compose version v5.5.1
+```
+
+</Expected>
+
+Spring Boot cần Docker Compose 2.2.0 trở lên. Phiên bản trên máy bạn có thể khác.
+
+### 2. Thay H2 bằng PostgreSQL, Flyway và Testcontainers
+
+<Terminal where="mac" title="Tab 2: sửa pom.xml">
+
+```bash
+cd ~/masteva-sb2/orders
+perl -0pi -e 's|\t\t<dependency>\n\t\t\t<groupId>com.h2database</groupId>\n\t\t\t<artifactId>h2</artifactId>\n\t\t\t<scope>test</scope>\n\t\t</dependency>\n||' pom.xml
+perl -0pi -e 's|\t</dependencies>|\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-starter-flyway</artifactId>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>org.flywaydb</groupId>\n\t\t\t<artifactId>flyway-database-postgresql</artifactId>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-docker-compose</artifactId>\n\t\t\t<scope>runtime</scope>\n\t\t\t<optional>true</optional>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>org.springframework.boot</groupId>\n\t\t\t<artifactId>spring-boot-testcontainers</artifactId>\n\t\t\t<scope>test</scope>\n\t\t</dependency>\n\t\t<dependency>\n\t\t\t<groupId>org.testcontainers</groupId>\n\t\t\t<artifactId>testcontainers-postgresql</artifactId>\n\t\t\t<scope>test</scope>\n\t\t</dependency>\n\t</dependencies>|' pom.xml
+sed -n '/<dependencies>/,/<\/dependencies>/p' pom.xml | grep -E '<artifactId>|<scope>|<optional>'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+			<artifactId>spring-boot-starter-data-jpa</artifactId>
+			<artifactId>spring-boot-starter-validation</artifactId>
+			<artifactId>spring-boot-starter-webmvc</artifactId>
+			<artifactId>postgresql</artifactId>
+			<scope>runtime</scope>
+			<artifactId>spring-boot-starter-data-jpa-test</artifactId>
+			<scope>test</scope>
+			<artifactId>spring-boot-starter-validation-test</artifactId>
+			<scope>test</scope>
+			<artifactId>spring-boot-starter-webmvc-test</artifactId>
+			<scope>test</scope>
+			<artifactId>spring-boot-starter-flyway</artifactId>
+			<artifactId>flyway-database-postgresql</artifactId>
+			<artifactId>spring-boot-docker-compose</artifactId>
+			<scope>runtime</scope>
+			<optional>true</optional>
+			<artifactId>spring-boot-testcontainers</artifactId>
+			<scope>test</scope>
+			<artifactId>testcontainers-postgresql</artifactId>
+			<scope>test</scope>
+```
+
+</Expected>
+
+- `h2` đã bị xoá: từ giờ không test nào có thể vô tình chạy trên H2.
+- `spring-boot-starter-flyway` và `flyway-database-postgresql`: **Flyway** chạy các file `V1__*.sql`, `V2__*.sql` trong `db/migration` theo thứ tự lúc ứng dụng khởi động, và ghi file nào đã chạy vào bảng `flyway_schema_history` để lần sau không chạy lại. Schema đến từ migration, không do Hibernate tự sinh. SB3.2 sẽ đi sâu vào Flyway.
+- `spring-boot-docker-compose` có scope `runtime` và `optional`: chỉ dùng khi chạy trên máy dev.
+- `spring-boot-testcontainers` mang `@ServiceConnection`; `testcontainers-postgresql` mang `PostgreSQLContainer`. Phiên bản Testcontainers do BOM của Spring Boot quản lý, không cần ghi.
+
+### 3. Schema bằng migration
+
+<Terminal where="mac" title="Tab 2: migration V1 và cấu hình">
+
+```bash
+cd ~/masteva-sb2/orders
+mkdir -p src/main/resources/db/migration
+cat > src/main/resources/db/migration/V1__orders.sql <<'EOF'
+CREATE TABLE orders (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer   TEXT        NOT NULL,
+    amount     BIGINT      NOT NULL CHECK (amount > 0),
+    status     TEXT        NOT NULL CHECK (status IN ('NEW', 'PAID')),
+    created_at TIMESTAMPTZ NOT NULL,
+    paid_at    TIMESTAMPTZ
+);
+CREATE INDEX orders_customer_idx ON orders (customer);
+EOF
+echo 'spring.jpa.hibernate.ddl-auto=validate' >> src/main/resources/application.properties
+cat src/main/resources/application.properties
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+spring.application.name=orders
+server.port=8082
+spring.jpa.open-in-view=false
+# Giả lập service thật khởi động chậm, để thấy chi phí của mỗi context trong test
+orders.startup-delay=1500ms
+spring.jpa.hibernate.ddl-auto=validate
+```
+
+</Expected>
+
+`ddl-auto=validate` bắt Hibernate so entity với bảng mà Flyway vừa tạo lúc khởi động, và dừng ngay nếu thiếu bảng, thiếu cột hay sai kiểu; Hibernate không tự sửa schema. Vẫn không có dòng `spring.datasource.url` nào: test lấy kết nối từ Testcontainers, máy dev lấy từ Docker Compose.
+
+### 4. Testcontainers với @ServiceConnection
+
+<Terminal where="mac" title="Tab 2: TestcontainersConfiguration và @Import">
+
+```bash
+cd ~/masteva-sb2/orders
+T=src/test/java/vn/masteva/orders
+cat > $T/TestcontainersConfiguration.java <<'EOF'
+package vn.masteva.orders;
+
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.context.annotation.Bean;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+
+@TestConfiguration(proxyBeanMethods = false)
+public class TestcontainersConfiguration {
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer postgres() {
+        return new PostgreSQLContainer("postgres:18-alpine");
+    }
+}
+EOF
+perl -0pi -e 's/import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;/import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;\nimport org.springframework.context.annotation.Import;/; s/\@AutoConfigureMockMvc\npublic abstract/\@AutoConfigureMockMvc\n\@Import(TestcontainersConfiguration.class)\npublic abstract/' $T/IntegrationTest.java
+perl -0pi -e 's/import org.springframework.context.ApplicationContext;/import org.springframework.context.ApplicationContext;\nimport org.springframework.context.annotation.Import;\nimport vn.masteva.orders.TestcontainersConfiguration;/; s/\@DataJpaTest\n/\@DataJpaTest\n\@Import(TestcontainersConfiguration.class)\n/' $T/order/OrderRepositoryTest.java
+grep -B1 -A1 '@Import' $T/IntegrationTest.java $T/order/OrderRepositoryTest.java
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+src/test/java/vn/masteva/orders/IntegrationTest.java-@AutoConfigureMockMvc
+src/test/java/vn/masteva/orders/IntegrationTest.java:@Import(TestcontainersConfiguration.class)
+src/test/java/vn/masteva/orders/IntegrationTest.java-public abstract class IntegrationTest {
+--
+src/test/java/vn/masteva/orders/order/OrderRepositoryTest.java-@DataJpaTest
+src/test/java/vn/masteva/orders/order/OrderRepositoryTest.java:@Import(TestcontainersConfiguration.class)
+src/test/java/vn/masteva/orders/order/OrderRepositoryTest.java-@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+```
+
+</Expected>
+
+`IntegrationTest` là lớp cha từ SB2.1, nên mọi test toàn ứng dụng nhận PostgreSQL qua một dòng. `OrderControllerTest` không đổi: slice web không cần database. Chạy cả bộ test:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb2/orders
+./mvnw test > ../run.log 2>&1
+grep -E 'postgres:18-alpine started|Started |Tests run:|BUILD' ../run.log
+grep -A6 'historyShowsLatestPaidFirstAndUnpaidLast -- Time' ../run.log
+```
+
+</Terminal>
+
+<Predict question="Không dòng code nào của repository hay test lịch sử đơn thay đổi. Kết quả có giống SB2.1 không?">
+
+```text
+... tc.postgres:18-alpine                    : Container postgres:18-alpine started in PT1.557396S
+... v.m.orders.order.OrderRepositoryTest     : Started OrderRepositoryTest in 5.145 seconds (process running for 5.854)
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 6.377 s <<< FAILURE! -- in vn.masteva.orders.order.OrderRepositoryTest
+... v.m.orders.web.OrderControllerTest       : Started OrderControllerTest in 0.529 seconds (process running for 7.413)
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.767 s -- in vn.masteva.orders.web.OrderControllerTest
+... tc.postgres:18-alpine                    : Container postgres:18-alpine started in PT1.648612S
+... vn.masteva.orders.OrderLookupTest        : Started OrderLookupTest in 4.037 seconds (process running for 11.638)
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.077 s -- in vn.masteva.orders.OrderLookupTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in vn.masteva.orders.OrdersApplicationTests
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.025 s -- in vn.masteva.orders.OrderNotificationTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.031 s -- in vn.masteva.orders.OrderFlowTest
+[ERROR] Tests run: 9, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+[ERROR] vn.masteva.orders.order.OrderRepositoryTest.historyShowsLatestPaidFirstAndUnpaidLast -- Time elapsed: 0.902 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: 
+
+Expecting actual:
+  [100L, 300L, 200L]
+to contain exactly (and in same order):
+  [300L, 200L, 100L]
+```
+
+Test lịch sử đơn đỏ: trên PostgreSQL, đơn chưa thanh toán (`100`, `paid_at` là `NULL`) đứng **đầu**, vì PostgreSQL coi `NULL` lớn hơn mọi giá trị và `DESC` đặt nó lên trước. Đây đúng là lỗi production mà H2 đã che ở SB2.1. Các test khác xanh, kể cả test toàn ứng dụng: Flyway đã tạo bảng trên PostgreSQL thật, Hibernate validate entity với bảng đó.
+
+Đếm dòng `postgres:18-alpine started`: hai container. Một cho context của `@DataJpaTest`, một cho context của `IntegrationTest`; `OrderControllerTest` không import cấu hình nên không có. Cổng ngẫu nhiên trên máy bạn sẽ khác.
+
+</Predict>
+
+<Check id="sb2.2.lab-h2-hides-bug">Tái hiện được việc test lịch sử đơn xanh trên H2 nhưng đỏ trên PostgreSQL, và giải thích bằng cách hai database sắp xếp `NULL`.</Check>
+
+### 5. Sửa truy vấn
+
+Derived query không có cách diễn đạt `NULLS LAST`. Viết JPQL với `@Query`; Hibernate hỗ trợ `nulls last` và dịch nó cho từng database:
+
+<Terminal where="mac" title="Tab 2: sửa OrderRepository và chạy lại">
+
+```bash
+cd ~/masteva-sb2/orders
+cat > src/main/java/vn/masteva/orders/order/OrderRepository.java <<'EOF'
+package vn.masteva.orders.order;
+
+import java.util.List;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+
+public interface OrderRepository extends JpaRepository<PurchaseOrder, Long> {
+
+    /** Lịch sử đơn của một khách: đơn thanh toán gần nhất lên đầu, đơn chưa thanh toán xuống cuối. */
+    @Query("""
+            select o from PurchaseOrder o
+            where o.customer = :customer
+            order by o.paidAt desc nulls last, o.id
+            """)
+    List<PurchaseOrder> historyOf(String customer);
+}
+EOF
+perl -pi -e 's/findByCustomerOrderByPaidAtDescIdAsc/historyOf/' src/main/java/vn/masteva/orders/order/OrderService.java src/test/java/vn/masteva/orders/order/OrderRepositoryTest.java
+./mvnw test > ../run.log 2>&1
+grep -E 'order by|Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+$|BUILD' ../run.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Hibernate: select po1_0.id,po1_0.amount,po1_0.created_at,po1_0.customer,po1_0.paid_at,po1_0.status from orders po1_0 where po1_0.customer=? order by po1_0.paid_at desc nulls last,po1_0.id
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+</Expected>
+
+Câu SQL giờ có `nulls last`, và cả bộ test xanh trên PostgreSQL 18. Khi có `@Query`, Spring Data không còn phân tích tên method, nên method được đổi tên thành `historyOf` cho gọn; lệnh `perl` sửa hai chỗ gọi trong service và test.
+
+<Check id="sb2.2.lab-service-connection">Chạy được `@DataJpaTest` và `@SpringBootTest` trên PostgreSQL thật qua `@ServiceConnection`, không có `spring.datasource.url` nào, và chỉ ra trong log có bao nhiêu container được tạo.</Check>
+
+### 6. Docker Compose khi phát triển
+
+<Terminal where="mac" title="Tab 2: compose.yaml">
+
+```bash
+cd ~/masteva-sb2/orders
+cat > compose.yaml <<'EOF'
+name: sb2-orders
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+    ports:
+      - "5442:5432"
+EOF
+```
+
+</Terminal>
+
+`name: sb2-orders` đặt tên project Compose, nên container có tên `sb2-orders-postgres-1` thay vì lấy theo tên thư mục. Cổng 5442 cố định để bạn nối `psql` hay công cụ đồ hoạ vào được. Chạy ứng dụng:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb2/orders && ./mvnw -q spring-boot:run
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+... .s.b.d.c.l.DockerComposeLifecycleManager : Using Docker Compose file /Users/hoangduoc/masteva-sb2/orders/compose.yaml
+... o.s.boot.docker.compose.core.DockerCli   :  Network sb2-orders_default Created 
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Created 
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Starting 
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Started 
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Waiting 
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Healthy 
+... org.flywaydb.core.FlywayExecutor         : Database: jdbc:postgresql://127.0.0.1:5442/orders?ApplicationName=orders (PostgreSQL 18.6)
+... o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "1 - orders"
+... o.f.core.internal.command.DbMigrate      : Successfully applied 1 migration to schema "public", now at version v1 (execution time 00:00.013s)
+... o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 8082 (http) with context path '/'
+... vn.masteva.orders.OrdersApplication      : Started OrdersApplication in 7.219 seconds (process running for 7.396)
+```
+
+</Expected>
+
+Kết quả đã lược các dòng khác. Ứng dụng tự chạy `docker compose up`, chờ PostgreSQL nhận kết nối, rồi lấy URL `jdbc:postgresql://127.0.0.1:5442/orders` từ chính container: cổng từ phần `ports`, database và user từ biến môi trường. Flyway tạo bảng trong database `orders`. Thử API ở tab 2:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+curl -s -i -w '\n' -X POST localhost:8082/orders -H 'Content-Type: application/json' -d '{"customer":"An","amount":120000}' | grep -vE '^(Date|Transfer-Encoding|Keep-Alive|Connection):'
+curl -s -w '\n' -X POST localhost:8082/orders/1/pay
+curl -s -w '\n' 'localhost:8082/orders?customer=An'
+docker ps --filter name=sb2- --format '{{.Names}} {{.Ports}}'
+docker exec sb2-orders-postgres-1 psql -U orders -d orders -c 'select id, customer, status, paid_at is not null as paid from orders'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HTTP/1.1 201 
+Location: /orders/1
+Content-Type: application/json
+
+{"id":1,"customer":"An","amount":120000,"status":"NEW"}
+{"id":1,"customer":"An","amount":120000,"status":"PAID"}
+[{"id":1,"customer":"An","amount":120000,"status":"PAID"}]
+sb2-orders-postgres-1 0.0.0.0:5442->5432/tcp, [::]:5442->5432/tcp
+ id | customer | status | paid 
+----+----------+--------+------
+  1 | An       | PAID   | t
+(1 row)
+```
+
+</Expected>
+
+Bấm Ctrl+C ở tab 1, rồi xem container:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+docker ps -a --filter name=sb2- --format '{{.Names}} {{.Status}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+sb2-orders-postgres-1 Exited (0) 10 seconds ago
+```
+
+</Expected>
+
+Container bị `stop`, không bị xoá. Chạy lại lệnh ở tab 1 rồi gọi `curl -s -w '\n' 'localhost:8082/orders?customer=An'`: đơn số 1 vẫn còn, và log có `Schema "public" is up to date. No migration necessary.` Dữ liệu thử của bạn sống qua các lần khởi động lại, cho tới khi bạn tự `docker compose down`. Bấm Ctrl+C ở tab 1 trước khi sang bước sau.
+
+<Check id="sb2.2.lab-compose">Chạy được ứng dụng với PostgreSQL do Spring Boot tự khởi động từ `compose.yaml`, không cấu hình URL, và giải thích vì sao dữ liệu còn sau khi tắt ứng dụng.</Check>
+
+### 7. Testcontainers lúc phát triển, và một cái bẫy
+
+start.spring.io sinh sẵn class này khi chọn Testcontainers. Thêm nó:
+
+<Terminal where="mac" title="Tab 2: TestOrdersApplication">
+
+```bash
+cd ~/masteva-sb2/orders
+cat > src/test/java/vn/masteva/orders/TestOrdersApplication.java <<'EOF'
+package vn.masteva.orders;
+
+import org.springframework.boot.SpringApplication;
+
+/** Chạy ứng dụng với PostgreSQL do Testcontainers dựng: ./mvnw spring-boot:test-run */
+public class TestOrdersApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.from(OrdersApplication::main)
+                .with(TestcontainersConfiguration.class)
+                .run(args);
+    }
+}
+EOF
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb2/orders && ./mvnw -q spring-boot:test-run -Dspring-boot.run.arguments="--server.port=8182 --logging.level.org.springframework.boot.testcontainers=debug" 2>&1 | grep -E 'compose.core.DockerCli|Skipping registration|postgres:18-alpine started|Flyway.*Database:|Started Orders'
+```
+
+</Terminal>
+
+<Predict question="Project có cả compose.yaml lẫn TestcontainersConfiguration. Ứng dụng dùng PostgreSQL nào?">
+
+```text
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Starting 
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Started 
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Waiting 
+... o.s.boot.docker.compose.core.DockerCli   :  Container sb2-orders-postgres-1 Healthy 
+... o.s.b.t.s.c.ConnectionDetailsRegistrar   : Skipping registration of @ServiceConnection source for Bean 'postgres' defined in vn.masteva.orders.TestcontainersConfiguration due to existing beans [jdbcConnectionDetailsForSb2OrdersPostgres1]
+... o.s.b.t.s.c.ConnectionDetailsRegistrar   : Skipping registration of @ServiceConnection source for Bean 'postgres' defined in vn.masteva.orders.TestcontainersConfiguration due to existing beans [flywayConnectionDetailsForSb2OrdersPostgres1]
+... org.flywaydb.core.FlywayExecutor         : Database: jdbc:postgresql://127.0.0.1:5442/orders?ApplicationName=orders (PostgreSQL 18.6)
+... tc.postgres:18-alpine                    : Container postgres:18-alpine started in PT1.101815S
+... vn.masteva.orders.OrdersApplication      : Started OrdersApplication in 8.111 seconds (process running for 8.392)
+```
+
+Cả hai được khởi động: `spring-boot-docker-compose` nằm trên classpath và `spring.docker.compose.skip.in-tests` chỉ áp dụng cho test JUnit, không cho một `main` trong `src/test`. Thứ tự quyết định ai thắng: Docker Compose chạy sớm, ngay khi ứng dụng khởi động, và đăng ký bean `JdbcConnectionDetails` (cùng `FlywayConnectionDetails`) cho container `sb2-orders-postgres-1`. Khi tới lượt `@ServiceConnection`, `ConnectionDetailsRegistrar` của Testcontainers thấy đã có bean cùng kiểu và bỏ qua, như hai dòng DEBUG `Skipping registration ... due to existing beans`. Nhưng container vẫn là một bean trong `TestcontainersConfiguration`, nên nó vẫn được tạo và `start()`. Dòng `Flyway ... Database:` xác nhận ứng dụng dùng PostgreSQL của Compose ở cổng 5442; container của Testcontainers chạy mà không ai dùng. `curl -s -w '\n' 'localhost:8182/orders?customer=An'` trả về đơn số 1 của bước 6, bằng chứng rằng đây không phải database mới. Người dùng `test-run` để có "môi trường sạch" sẽ ngạc nhiên vì dữ liệu cũ.
+
+</Predict>
+
+Bấm Ctrl+C ở tab 1, rồi chạy lại với Compose tắt:
+
+<Terminal where="mac" title="Tab 1">
+
+```bash
+cd ~/masteva-sb2/orders && ./mvnw -q spring-boot:test-run -Dspring-boot.run.arguments="--server.port=8182 --spring.docker.compose.enabled=false" 2>&1 | grep -E 'compose.core.DockerCli|postgres:18-alpine started|Flyway.*Database:|Started Orders'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+... tc.postgres:18-alpine                    : Container postgres:18-alpine started in PT1.662433S
+... org.flywaydb.core.FlywayExecutor         : Database: jdbc:postgresql://localhost:53404/test?loggerLevel=OFF (PostgreSQL 18.6)
+... vn.masteva.orders.OrdersApplication      : Started OrdersApplication in 8.25 seconds (process running for 8.469)
+```
+
+</Expected>
+
+Giờ chỉ có container của Testcontainers, cổng ngẫu nhiên. `curl -s -w '\n' 'localhost:8182/orders?customer=An'` ở tab 2 trả `[]`: database mới tinh. Bấm Ctrl+C ở tab 1; container tự bị xoá. Trong project thật, chọn một trong hai cách và xoá cách kia, hoặc ghi rõ cờ này trong README.
+
+<Check id="sb2.2.lab-test-run">Chạy được `spring-boot:test-run`, nhận ra khi Compose và Testcontainers cùng khởi động, và chỉ ra ứng dụng đang dùng database nào qua log Flyway.</Check>
+
+### 8. RestTestClient qua HTTP thật
+
+Một test HTTP thật, viết theo thói quen "đặt `@Transactional` để tự rollback". Test thứ hai kiểm rằng dữ liệu của test thứ nhất đã biến mất:
+
+<Terminal where="mac" title="Tab 2: OrderHttpTest với @Transactional">
+
+```bash
+cd ~/masteva-sb2/orders
+cat > src/test/java/vn/masteva/orders/OrderHttpTest.java <<'EOF'
+package vn.masteva.orders;
+
+import java.util.Map;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.resttestclient.autoconfigure.AutoConfigureRestTestClient;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.web.servlet.client.RestTestClient;
+import org.springframework.transaction.annotation.Transactional;
+import vn.masteva.orders.order.OrderNotifier;
+
+@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
+@AutoConfigureRestTestClient
+@Import(TestcontainersConfiguration.class)
+@Transactional
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+class OrderHttpTest {
+    @Autowired
+    RestTestClient client;
+
+    @MockitoBean
+    OrderNotifier notifier;
+
+    @Test
+    @Order(1)
+    void createOverHttp() {
+        client.post().uri("/orders").contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("customer", "Giang", "amount", 70_000))
+                .exchange()
+                .expectStatus().isCreated()
+                .expectBody().jsonPath("$.status").isEqualTo("NEW");
+    }
+
+    @Test
+    @Order(2)
+    void previousTestWasRolledBack() {
+        client.get().uri("/orders?customer=Giang")
+                .exchange()
+                .expectStatus().isOk()
+                .expectBody().json("[]");
+    }
+}
+EOF
+./mvnw test -Dtest=OrderHttpTest > ../run.log 2>&1
+grep -E 'Tomcat started|Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+$|Expected [0-9]+ values|BUILD' ../run.log
+```
+
+</Terminal>
+
+<Predict question="Test có @Transactional. Test thứ hai thấy danh sách rỗng không?">
+
+```text
+... o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 53490 (http) with context path '/'
+java.lang.AssertionError: []: Expected 0 values but got 1
+[ERROR]   OrderHttpTest.previousTestWasRolledBack:47 []: Expected 0 values but got 1
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
+
+Không. `Tomcat started on port ...`: có server thật, và request `POST` được xử lý trong thread của Tomcat, với transaction của `OrderService` commit thật. Transaction mà `@Transactional` mở cho test nằm ở thread `main`, không chứa thao tác nào của server, nên rollback không huỷ gì. Đơn của Giang còn trong database khi test thứ hai chạy.
+
+</Predict>
+
+Đổi đúng một chữ, `RANDOM_PORT` thành `MOCK`, giữ nguyên mọi thứ khác:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+cd ~/masteva-sb2/orders
+perl -pi -e 's/WebEnvironment.RANDOM_PORT/WebEnvironment.MOCK/' src/test/java/vn/masteva/orders/OrderHttpTest.java
+./mvnw test -Dtest=OrderHttpTest > ../run.log 2>&1
+grep -E 'Tomcat started|Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+$|BUILD' ../run.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+</Expected>
+
+Không còn dòng `Tomcat started`: với `MOCK`, `@AutoConfigureRestTestClient` nối `RestTestClient` vào MockMvc. Request chạy trong thread `main`, service tham gia transaction của test, và rollback xoá đơn. Cùng một API client, hai hành vi khác nhau về dữ liệu.
+
+Bản cuối giữ HTTP thật (lý do của class này), bỏ `@Transactional`, tự dọn bảng sau mỗi test, và thêm một kiểm tra mà chỉ HTTP thật làm được: khi hệ thống ngoài lỗi (`OrderNotifier` ném exception), client nhận gì và đơn có được lưu không.
+
+<Terminal where="mac" title="Tab 2: bản cuối của OrderHttpTest">
+
+```bash
+cd ~/masteva-sb2/orders
+cat > src/test/java/vn/masteva/orders/OrderHttpTest.java <<'EOF'
+package vn.masteva.orders;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.BDDMockito.willThrow;
+
+import java.util.Map;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.resttestclient.autoconfigure.AutoConfigureRestTestClient;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.web.servlet.client.RestTestClient;
+import vn.masteva.orders.order.OrderNotifier;
+import vn.masteva.orders.order.OrderRepository;
+
+/** Gọi qua HTTP thật. Không dựa vào rollback: server commit trong thread của nó, test tự dọn. */
+@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT)
+@AutoConfigureRestTestClient
+@Import(TestcontainersConfiguration.class)
+class OrderHttpTest {
+    @Autowired
+    RestTestClient client;
+
+    @Autowired
+    OrderRepository repository;
+
+    @MockitoBean
+    OrderNotifier notifier;
+
+    @AfterEach
+    void cleanUp() {
+        repository.deleteAll();
+    }
+
+    @Test
+    void createThenListOverHttp() {
+        client.post().uri("/orders").contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("customer", "Giang", "amount", 70_000))
+                .exchange()
+                .expectStatus().isCreated()
+                .expectHeader().exists("Location");
+
+        client.get().uri("/orders?customer=Giang")
+                .exchange()
+                .expectStatus().isOk()
+                .expectBody().jsonPath("$.length()").isEqualTo(1);
+    }
+
+    @Test
+    void notifierFailureIs500FromErrorPage() {
+        willThrow(new IllegalStateException("broker down")).given(notifier).orderCreated(any());
+
+        client.post().uri("/orders").contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("customer", "Hà", "amount", 50_000))
+                .exchange()
+                .expectStatus().isEqualTo(500)
+                .expectBody()
+                .jsonPath("$.path").isEqualTo("/orders")
+                .jsonPath("$.error").isEqualTo("Internal Server Error");
+
+        assertThat(repository.count()).isZero();
+    }
+}
+EOF
+```
+
+</Terminal>
+
+`IllegalStateException` không có `@ExceptionHandler` nào, nên nó ra khỏi `DispatcherServlet`; Tomcat chuyển request tới `/error`, và `BasicErrorController` của Spring Boot sinh body `{"timestamp":...,"status":500,"error":"Internal Server Error","path":"/orders"}`, không lộ thông điệp `broker down`. Transaction của `create` bị rollback, nên bảng trống. Cùng request đó qua MockMvc không có tầng `/error`: `exchange()` ném thẳng vào test một `IllegalStateException: Request failed with unresolved exception`, bọc `ServletException: Request processing failed`. Còn JSON hỏng thì cả hai cách đều trả `400` Problem Details giống nhau, vì `ApiErrors` kế thừa `ResponseEntityExceptionHandler` xử lý nó từ bên trong Spring MVC.
+
+`repository.deleteAll()` an toàn ở đây vì context này có PostgreSQL riêng (bước 4: mỗi context một container). Nếu nhiều class dùng chung context, dọn theo dữ liệu của chính test (ví dụ xoá theo `customer`) thay vì xoá cả bảng.
+
+<Check id="sb2.2.lab-resttestclient">Viết được test `RANDOM_PORT` với `RestTestClient`, tái hiện việc `@Transactional` không rollback dữ liệu do server ghi, sửa bằng cách tự dọn dữ liệu, và kiểm được body `500` do `/error` sinh ra.</Check>
+
+### 9. Cả bộ test và chiến lược
+
+<Terminal where="mac" title="Tab 2: chạy cả bộ test">
+
+```bash
+cd ~/masteva-sb2/orders
+./mvnw test -Dlogging.level.org.springframework.test.context.cache=debug > ../run.log 2>&1
+grep -E 'postgres:18-alpine started|Started |Tests run:|BUILD|Total time' ../run.log
+grep 'cache statistics' ../run.log | tail -1 | grep -oE 'size = [0-9]+|missCount = [0-9]+'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+... tc.postgres:18-alpine                    : Container postgres:18-alpine started in PT1.18968S
+... v.m.orders.order.OrderRepositoryTest     : Started OrderRepositoryTest in 4.668 seconds (process running for 5.408)
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 5.417 s -- in vn.masteva.orders.order.OrderRepositoryTest
+... v.m.orders.web.OrderControllerTest       : Started OrderControllerTest in 0.516 seconds (process running for 6.407)
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.715 s -- in vn.masteva.orders.web.OrderControllerTest
+... tc.postgres:18-alpine                    : Container postgres:18-alpine started in PT1.245419S
+... vn.masteva.orders.OrderLookupTest        : Started OrderLookupTest in 3.414 seconds (process running for 10.014)
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.467 s -- in vn.masteva.orders.OrderLookupTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in vn.masteva.orders.OrdersApplicationTests
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.052 s -- in vn.masteva.orders.OrderNotificationTest
+... tc.postgres:18-alpine                    : Container postgres:18-alpine started in PT1.534218S
+... vn.masteva.orders.OrderHttpTest          : Started OrderHttpTest in 4.224 seconds (process running for 14.357)
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.432 s -- in vn.masteva.orders.OrderHttpTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.038 s -- in vn.masteva.orders.OrderFlowTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+[INFO] Total time:  17.384 s
+size = 4
+missCount = 4
+```
+
+</Expected>
+
+Mười một test, bốn context, ba container PostgreSQL. Xếp chúng vào kim tự tháp:
+
+| Class | Tầng | Context | Container |
+|---|---|---|---|
+| `OrderControllerTest` | Slice web | Riêng (`@WebMvcTest`) | Không |
+| `OrderRepositoryTest` | Slice dữ liệu | Riêng (`@DataJpaTest`) | Có |
+| `OrdersApplicationTests`, `OrderLookupTest`, `OrderNotificationTest`, `OrderFlowTest` | Tích hợp, MockMvc | Một, dùng chung qua `IntegrationTest` | Có |
+| `OrderHttpTest` | HTTP thật | Riêng (`RANDOM_PORT`) | Có |
+
+Còn thiếu đáy kim tự tháp: unit test thuần cho `PurchaseOrder.pay()`. Đó là bài tập ở phần Dấu hiệu đã nắm chắc. Khi project lớn lên, nếu cần nhiều test HTTP thật, tạo lớp cha thứ hai cho chúng, như `IntegrationTest` cho MockMvc, để chúng cũng dùng chung một context.
+
+Testcontainers đã dọn sạch sau khi JVM test thoát:
+
+<Terminal where="mac" title="Tab 2">
+
+```bash
+sleep 15; docker ps -a --filter label=org.testcontainers --filter ancestor=postgres:18-alpine --format '{{.Names}}' | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+       0
+```
+
+</Expected>
+
+<Check id="sb2.2.lab-suite">Chạy được cả bộ test trên PostgreSQL thật, đếm được context và container, và xếp từng class vào đúng tầng của kim tự tháp.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Could not find a valid Docker environment`: Docker Desktop chưa chạy. Mở nó rồi chạy lại.
+- `Schema-validation: missing table [orders]`: Flyway chưa chạy. Thường do thiếu `spring-boot-starter-flyway`: chỉ có `flyway-core` thì Spring Boot 4 không bật auto-configuration của Flyway. Cũng kiểm tra file migration nằm trong `src/main/resources/db/migration`.
+- `Unsupported Database: PostgreSQL 18.6`: thiếu dependency `flyway-database-postgresql`.
+- `Failed to replace DataSource with an embedded database for tests`: một class `@DataJpaTest` chưa có `@Import(TestcontainersConfiguration.class)`, nên Spring Boot vẫn tìm database nhúng mà H2 đã bị xoá.
+- `Bind for 0.0.0.0:5442 failed: port is already allocated`: một PostgreSQL khác đang dùng cổng 5442. Tìm bằng `docker ps --filter publish=5442` hoặc `lsof -i :5442`.
+- Ứng dụng báo `Port 8082 was already in use`: lần chạy trước chưa tắt. Tìm bằng `lsof -i :8082` rồi dừng tiến trình đó.
+- `zsh: no matches found` với URL có `?`: đặt URL trong dấu nháy đơn.
+
+</Callout>
+
+### Dọn dẹp
+
+Container của Testcontainers đã tự bị xoá. Container `sb2-orders-postgres-1` của Compose vẫn còn (đã dừng), giữ dữ liệu của bước 6.
+
+<Callout kind="danger">
+
+`docker compose down` xoá container `sb2-orders-postgres-1` cùng toàn bộ dữ liệu trong đó, vì `compose.yaml` không khai báo volume. `rm -rf ~/masteva-sb2` xoá vĩnh viễn project của cả chặng SB2. Chỉ chạy khi bạn không cần chúng nữa. Image `postgres:18-alpine` vẫn được giữ cho các chặng sau.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-sb2/orders && docker compose down
+rm -rf ~/masteva-sb2
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Ba container cho một bộ test nhỏ là nhiều. Dùng chung một container cho mọi context được không?">
+
+Được, bằng cách cho mọi context trỏ tới cùng một đối tượng container: khai báo nó là field `static` trong một interface, đánh dấu `@Container @ServiceConnection`, rồi đưa vào context bằng `@ImportTestcontainers` thay vì `@Bean`. Container khởi động một lần và dùng cho mọi context. Cái giá: các context giờ chia sẻ dữ liệu, nên việc dọn dữ liệu phải chặt hơn (`deleteAll` ở bước 8 sẽ xoá dữ liệu của context khác). Tài liệu Spring Boot cảnh báo thêm: nếu dùng `@Testcontainers` của JUnit để quản lý container, JUnit dừng container sau class, trong khi context vẫn nằm trong cache và lần sau dùng lại sẽ lỗi kết nối. Với bộ test cỡ vừa, gom số context (SB2.1) thường được lợi nhiều hơn và ít rủi ro hơn.
+
+</Reveal>
+
+<Reveal title="Có nên bật withReuse(true) để container sống qua nhiều lần chạy test?">
+
+J8.3 đã nêu cái giá chung: dữ liệu của lần trước còn đó và Ryuk không dọn container. Với Spring Boot có thêm một bẫy: Flyway thấy `flyway_schema_history` đã ghi các migration, nên không chạy lại, và nếu bạn vừa sửa một file migration cũ trên máy, test chạy trên schema mà bộ migration hiện tại không còn tạo ra được. Muốn nhanh hơn trên máy dev, giảm số context trước, rồi cân nhắc `spring.testcontainers.beans.startup=parallel` khi có nhiều container.
+
+</Reveal>
+
+<Reveal title="Khi nào cần test HTTP thật nếu MockMvc đã đi qua controller?">
+
+Khi điều bạn muốn kiểm nằm ngoài `DispatcherServlet`: cấu hình Tomcat (giới hạn kích thước body, nén), filter của servlet container, trang lỗi `/error` cho exception không được xử lý, serialization thật qua mạng, và quan trọng nhất là điều kiện transaction giống production như callout ở phần Kiến thức. Quy tắc gọn: mỗi endpoint quan trọng có một test HTTP thật cho đường chính; các nhánh lỗi chi tiết để ở `@WebMvcTest`.
+
+</Reveal>
+
+<Reveal title="Compose cho nhiều service (PostgreSQL, Redis, Kafka) thì cấu hình thế nào?">
+
+Thêm service vào `compose.yaml`; Spring Boot nhận diện theo tên image (`redis`, `apache/kafka`...) và tạo connection details tương ứng. Image tự build hay qua registry riêng thì thêm nhãn `org.springframework.boot.service-connection: redis` cho container đó. Container không liên quan tới ứng dụng (ví dụ pgAdmin) thì gắn `org.springframework.boot.ignore: true`. Nếu một service khởi động lâu và cổng TCP mở trước khi nó thật sự sẵn sàng, khai báo `healthcheck` trong compose: `docker compose up --wait` mà Spring Boot gọi sẽ chờ tới khi container healthy.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI chuyển test từ H2 sang Testcontainers, viết `compose.yaml` cho các service mà ứng dụng cần, hoặc sinh test `RestTestClient` từ đặc tả OpenAPI. AI hay thêm `@DynamicPropertySource` khi `@ServiceConnection` đã đủ, ghi `spring.datasource.url` vào cấu hình test, dùng `TestRestTemplate` (vẫn có trong Spring Boot 4.1 qua `@AutoConfigureTestRestTemplate`) khi `RestTestClient` gọn hơn, để cả `compose.yaml` lẫn `TestOrdersApplication` trong cùng project, và đặt `@Transactional` lên test `RANDOM_PORT` như thể nó rollback được. Kiểm tra bằng cách đọc log: dòng `Flyway ... Database:` trỏ tới đâu, có bao nhiêu dòng `started`, và sau test có dữ liệu sót lại không.
+
+</Callout>
+
+<Callout kind="link">
+
+J8.3 là nền Testcontainers và lý do không dùng H2; SB2.1 là nền của context cache mà bài này dựa vào để đếm container. SB3 dùng Testcontainers để test JDBC, JPA, migration Flyway và khoá trên PostgreSQL thật; SB3.2 sẽ đi sâu vào Flyway, `ddl-auto=validate` và lazy loading. SB6 thêm xác thực, và test tầng web lẫn HTTP thật phải tính tới nó. SB7 gọi service khác, thứ cần mock hoặc giả lập trong test tích hợp. SB9 thêm Redis và Kafka; cách khai báo container và service connection của bài này áp dụng y nguyên cho chúng. SB11 đóng gói ứng dụng, nơi `spring-boot-docker-compose` bị loại khỏi jar.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="sb2.2.mastery-real-database">Tự chuyển được bộ test của một service Spring Boot từ H2 sang PostgreSQL thật bằng `@ServiceConnection`, với schema từ migration và không có URL kết nối nào trong cấu hình test.</Check>
+
+<Check id="sb2.2.mastery-dev-environment">Tự dựng được môi trường chạy trên máy dev bằng `compose.yaml` mà một người mới clone repo chỉ cần Docker và `./mvnw spring-boot:run`.</Check>
+
+<Check id="sb2.2.mastery-strategy">Viết được unit test cho `PurchaseOrder.pay()`, rồi trình bày được cho đồng đội chiến lược test của một service: tầng nào kiểm gì, mỗi tầng dùng cấu hình nào, và vì sao.</Check>
+
+</Mastery>
