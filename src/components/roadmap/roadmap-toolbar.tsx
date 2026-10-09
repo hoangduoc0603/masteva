@@ -7,6 +7,7 @@ import { skippedLevels, tallyTopics, type RoadmapLite } from '@/lib/progress/roa
 import { useMessages } from '@/components/messages-provider';
 import { Icon } from '@/components/icons';
 import { HIDE_KEY, VIEW_KEY } from './roadmap-prefs';
+import { useHideHeaderOnScroll } from './headroom';
 
 /**
  * Thanh cấp dính của trang roadmap (spec 2026-10-05 §5.2): tab từng cấp kèm tiến độ, cấp đang xem
@@ -24,6 +25,7 @@ export function RoadmapToolbar({ lite, levels }: { lite: RoadmapLite; levels: { 
   const toggle = useRef<HTMLButtonElement>(null);
   const known = skippedLevels(progress, lite);
   const toolsId = `rm-tools-${lite.id}`;
+  useHideHeaderOnScroll(nav);
 
   // Cấp đang xem: cấp đầu tiên (theo thứ tự trang) có phần nằm trong dải ngay dưới thanh dính.
   useEffect(() => {

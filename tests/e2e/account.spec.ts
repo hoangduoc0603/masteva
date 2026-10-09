@@ -124,7 +124,8 @@ test.describe('tài khoản', () => {
       },
       { session: SESSION, userId: USER.id },
     );
-    await page.goto(LESSON);
+    // Chunk bị treo làm sự kiện `load` không bao giờ tới nếu `import()` bắt đầu trước đó; chỉ chờ DOM.
+    await page.goto(LESSON, { waitUntil: 'domcontentloaded' });
     await expect(page.locator('[data-check-id="d1.1.exit-code"]')).toBeChecked();
   });
 

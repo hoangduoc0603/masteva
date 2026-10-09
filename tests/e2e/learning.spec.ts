@@ -1,6 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
-import fs from 'node:fs/promises';
 
 const LESSON = '/vi/learn/d1/d1-1';
 const CHECK = '[data-check-id="d1.1.exit-code"]';
@@ -163,24 +162,6 @@ test('bài chưa dịch hiển thị bản tiếng Việt kèm thông báo', asy
   await page.goto('/en/learn/d1/d1-1');
   await expect(page.getByTestId('untranslated-notice')).toBeVisible();
   await expect(page.locator('link[rel="canonical"]')).toHaveAttribute('href', /\/vi\/learn\/d1\/d1-1$/);
-});
-
-test('xuất rồi nhập tiến độ', async ({ page }, testInfo) => {
-  await page.goto(LESSON);
-  await page.locator(CHECK).check();
-  await page.goto('/vi/roadmaps/devops');
-  const downloadPromise = page.waitForEvent('download');
-  await page.getByRole('button', { name: 'Xuất tiến độ' }).click();
-  const file = testInfo.outputPath('progress.json');
-  await (await downloadPromise).saveAs(file);
-  expect(Object.keys(JSON.parse(await fs.readFile(file, 'utf8')).items)).toContain('d1.1.exit-code');
-
-  await page.evaluate(() => localStorage.clear());
-  await page.reload();
-  await page.getByTestId('progress-import').setInputFiles(file);
-  await expect(page.getByRole('status')).toContainText('Đã nhập 1 mục');
-  await page.goto(LESSON);
-  await expect(page.locator(CHECK)).toBeChecked();
 });
 
 const DEVOPS = '/vi/roadmaps/devops';

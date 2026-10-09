@@ -181,7 +181,7 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 - **Nhiều tab:** lắng nghe sự kiện `storage` để các tab đồng bộ với nhau.
 - **Nâng cấp schema:** khi phiên bản trong máy cũ hơn, chạy hàm chuyển đổi rồi ghi lại.
 - **Lỗi lưu trữ** (chế độ ẩn danh, bị chặn, đầy): vẫn cho tích trong phiên hiện tại và hiện cảnh báo "tiến độ sẽ không được lưu".
-- **Xuất và nhập:** file JSON v2 (nhận cả v1). Khi nhập thì **gộp**: mục lấy hợp và giữ thời điểm sớm hơn, chủ đề giữ trạng thái đặt sau cùng, cấp bắt đầu giữ bản hiện có (FR-PROGRESS-003).
+- **Xuất và nhập:** đã bỏ khỏi giao diện ngày 09/10/2026 theo yêu cầu người dùng (đồng bộ theo tài khoản thay thế việc chuyển tiến độ giữa các máy). `mergeProgress` vẫn dùng khi gộp tiến độ khách vào tài khoản; `importData`/`exportData` của `ProgressStore` còn trong code nhưng không có nút gọi.
 - **Hiệu năng:** tích một mục chỉ ghi `localStorage` và cập nhật giao diện ngay, không có I/O mạng.
 
 ### 7.2 Đồng bộ theo tài khoản
@@ -268,7 +268,7 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 | Unit | Lưu và nạp tiến độ, nâng cấp schema, gộp khi nhập file, ánh xạ mã thay thế, tính tổng từ manifest, tokenizer tiếng Việt (có dấu, không dấu, chữ `đ`); đồng bộ tài khoản (hàng đợi, bản mới nhất thắng, gộp lần đầu, chia lô) |
 | Database (`pnpm test:db`) | pgTAP cho RLS và hàm; adapter Supabase với database local (phân trang quá 1.000 dòng, con trỏ, người khác không thấy dữ liệu) |
 | Script nội dung | File khoá: thêm mã mới, xoá mã không có thay thế (phải lỗi), mã trùng (phải lỗi) |
-| E2E (Playwright) | Mở bài, tích mục, tải lại trang vẫn còn; hai tab đồng bộ; tìm "tien trinh" ra bài D1.1; mở `/en/...` của bài chưa dịch thấy thông báo; trang `/` chuyển sang `/vi/`; xuất rồi nhập tiến độ; tài khoản với Supabase giả lập (khách không tải supabase-js, kéo và đẩy tiến độ, đăng xuất, callback lỗi) |
+| E2E (Playwright) | Mở bài, tích mục, tải lại trang vẫn còn; hai tab đồng bộ; tìm "tien trinh" ra bài D1.1; mở `/en/...` của bài chưa dịch thấy thông báo; trang `/` chuyển sang `/vi/`; tài khoản với Supabase giả lập (khách không tải supabase-js, kéo và đẩy tiến độ, đăng xuất, callback lỗi) |
 | Hiệu năng | Lighthouse CI theo ngân sách ở mục 1 |
 | Khả năng truy cập | Kiểm tra tự động bằng axe trong E2E; điều hướng bàn phím trên trang bài học |
 

@@ -1,12 +1,17 @@
 'use client';
 import { useEffect, useId, useRef, useState } from 'react';
-import { UserRound } from 'lucide-react';
+import { LogIn, UserRound } from 'lucide-react';
 import { useMessages } from '@/components/messages-provider';
 import { format } from '@/lib/format';
 import { deleteAccount, initAccount, signIn, signOut, useAccount } from '@/lib/account/controller';
 
-/** Nút Đăng nhập hoặc menu tài khoản trên header (spec 2026-10-07 §6). */
-export function AccountMenu({ lang }: { lang: string }) {
+/**
+ * Nút Đăng nhập hoặc menu tài khoản (spec 2026-10-07 §6).
+ * `header`: nút tròn trên header trang chủ, trang roadmap. `sidebar`: hàng rộng ở đáy thanh bên trang bài học,
+ * cùng kiểu với thanh đổi theme; menu mở lên trên.
+ */
+export function AccountMenu({ lang, variant = 'header' }: { lang: string; variant?: 'header' | 'sidebar' }) {
+  const row = variant === 'sidebar';
   const t = useMessages();
   const account = useAccount();
   const [open, setOpen] = useState(false);
@@ -35,14 +40,14 @@ export function AccountMenu({ lang }: { lang: string }) {
 
   if (account.status === 'disabled') return null;
   // Giữ chỗ để header không xô khi trạng thái tới.
-  if (account.status === 'loading') return <span className="am-slot" aria-hidden="true" />;
+  if (account.status === 'loading') return <span className={row ? 'am-slot am-slot-row' : 'am-slot'} aria-hidden="true" />;
 
   if (account.status === 'guest') {
     return (
-      <div className="am">
+      <div className={row ? 'am am-sidebar' : 'am'}>
         <button
           type="button"
-          className="am-btn"
+          className={row ? 'am-row' : 'am-btn'}
           title={t.account.signInTitle}
           disabled={busy}
           onClick={async () => {
@@ -56,6 +61,7 @@ export function AccountMenu({ lang }: { lang: string }) {
             }
           }}
         >
+          {row ? <LogIn aria-hidden="true" size={16} /> : null}
           {t.account.signIn}
         </button>
         {error ? <span role="alert" className="am-error">{error}</span> : null}
@@ -88,20 +94,25 @@ export function AccountMenu({ lang }: { lang: string }) {
   }
 
   return (
-    <div className="am" ref={rootRef}>
+    <div className={row ? 'am am-sidebar' : 'am'} ref={rootRef}>
       <button
         type="button"
-        className="am-btn am-avatar"
+        className={row ? 'am-row' : 'am-btn am-avatar'}
         aria-label={format(t.account.menu, { email: account.email })}
         aria-expanded={open}
         aria-controls={panelId}
         onClick={() => setOpen((v) => !v)}
       >
-        <UserRound aria-hidden="true" size={18} />
+        <UserRound aria-hidden="true" size={row ? 16 : 18} />
+        {row ? (
+          <span className="am-row-label" aria-hidden="true">
+            {account.email}
+          </span>
+        ) : null}
         {account.sync === 'error' ? <span className="am-dot" aria-hidden="true" /> : null}
       </button>
       {open ? (
-        <div id={panelId} className="am-panel">
+        <div id={panelId} className={row ? 'am-panel am-panel-up' : 'am-panel'}>
           <p className="am-email">{account.email}</p>
           <p className="am-sync" role="status">{syncText}</p>
           <button type="button" className="am-item" disabled={busy} onClick={onSignOut}>
