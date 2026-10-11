@@ -1,0 +1,769 @@
+---
+title: Volume, RBAC và ServiceAccount
+description: Dữ liệu sống lâu hơn pod bằng PersistentVolume, và pod chỉ có đúng quyền nó cần trên API server với RBAC và ServiceAccount; vì sao PVC chờ pod, xoá PVC mất gì, token trong pod sống tới khi nào.
+id: k2.3
+step: k2
+prerequisites: [k2.2]
+topics: [k2.persistent-volume, k2.rbac-serviceaccount]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    local-path-provisioner: v20260820-69b56db7
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+Hai bài trước lo đường đi của request. Bài này lo hai thứ pod cần ngoài mạng: **chỗ để dữ liệu** sống lâu hơn nó, và **danh tính** để nói chuyện với API server với đúng quyền cần thiết. Học xong, bạn giải thích được:
+
+- Vì sao PVC đứng ở `Pending` cho tới khi có pod dùng nó.
+- Vì sao xoá một PVC, hoặc cả namespace, có thể xoá luôn dữ liệu, và cấu hình nào giữ dữ liệu lại.
+- Vì sao pod gọi API server nhận `403`, còn token đã chép ra ngoài nhận `401` sau khi pod bị xoá.
+- Vì sao quyền "tạo pod" nguy hiểm ngang quyền "đọc mọi Secret".
+
+</Goal>
+
+<Knowledge>
+
+### Volume: dữ liệu sống lâu hơn container
+
+Filesystem của container mất khi container khởi động lại. **Volume** là thư mục được gắn từ ngoài vào, và loại volume quyết định dữ liệu sống tới đâu:
+
+| Loại | Dữ liệu sống tới khi | Dùng cho |
+|---|---|---|
+| `emptyDir` | Pod bị xoá (container restart thì vẫn còn) | File tạm, cache, chia sẻ giữa các container trong pod |
+| `configMap`, `secret` | Object nguồn còn tồn tại | Cấu hình và bí mật dạng file (K1.2) |
+| `hostPath` | Thư mục trên node còn | Agent hệ thống đọc file của node. Tránh dùng cho ứng dụng: pod sang node khác là mất, và mở đường đọc file của node |
+| `persistentVolumeClaim` | Bạn (hoặc reclaim policy) xoá | Database, file người dùng tải lên |
+
+K1.4 đã dùng loại cuối qua `volumeClaimTemplates` của StatefulSet và thấy mỗi pod có một PVC riêng. Bài này mở ra cơ chế phía sau: nó tách **nhu cầu** khỏi **nguồn cung** bằng ba object:
+
+- **PersistentVolumeClaim (PVC):** đội ứng dụng xin "10 GiB, một node đọc ghi". Thuộc một namespace.
+- **PersistentVolume (PV):** một ổ lưu trữ cụ thể: đĩa cloud, thư mục trên node, export NFS. Thuộc cả cụm.
+- **StorageClass:** công thức tạo PV tự động. Ghi dùng provisioner nào, tham số gì, xoá PVC thì làm gì với dữ liệu.
+
+```text
+ (1) Bạn tạo PVC "data" (1Gi, ReadWriteOnce, StorageClass standard)
+        |  volumeBindingMode: WaitForFirstConsumer  ->  PVC đứng ở Pending
+        v
+ (2) Bạn tạo pod dùng claimName: data
+        |  scheduler chọn node cho pod TRƯỚC, rồi mới báo provisioner
+        v
+ (3) Provisioner (rancher.io/local-path trên kind) tạo thư mục trên node đó,
+     ghi object PV "pvc-5a11…", gắn cứng PV với node (nodeAffinity)
+        v
+ (4) PVC và PV chuyển sang Bound; kubelet mount thư mục vào container
+        v
+ (5) Pod bị xoá: PVC và PV vẫn Bound. Pod mới dùng lại claimName: data
+     sẽ được xếp về đúng node đang giữ dữ liệu.
+```
+
+`WaitForFirstConsumer` tồn tại vì ổ đĩa thường gắn với một vị trí (một node, một zone). Tạo đĩa trước khi biết pod chạy ở đâu thì có thể tạo nhầm zone, và pod không bao giờ xếp lịch được.
+
+**Access mode** nói ai được mount cùng lúc, và tính theo **node**, không theo pod:
+
+| Mode | Viết tắt | Ý nghĩa |
+|---|---|---|
+| `ReadWriteOnce` | RWO | Một node mount đọc ghi. Nhiều pod **trên cùng node đó** vẫn dùng chung được |
+| `ReadOnlyMany` | ROX | Nhiều node mount chỉ đọc |
+| `ReadWriteMany` | RWX | Nhiều node mount đọc ghi. Cần hệ lưu trữ chia sẻ (NFS, CephFS); đĩa block thông thường không có |
+| `ReadWriteOncePod` | RWOP | Đúng một pod trong cả cụm |
+
+**Reclaim policy** quyết định số phận dữ liệu khi PVC bị xoá:
+
+| Policy | Khi xoá PVC | Dùng khi |
+|---|---|---|
+| `Delete` (mặc định của hầu hết StorageClass) | PV và dữ liệu bên dưới bị xoá theo | Dữ liệu tái tạo được |
+| `Retain` | PV chuyển sang `Released`, dữ liệu còn nguyên; người vận hành tự xử lý | Database, mọi dữ liệu không tái tạo được |
+
+<Callout kind="production">
+
+Một tình huống minh hoạ, dựng từ đúng cơ chế mà mục [Reclaiming](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#reclaiming) của tài liệu Kubernetes mô tả: một đội dọn môi trường thử bằng `kubectl delete namespace staging`. Namespace đó có một StatefulSet PostgreSQL với PVC thuộc StorageClass mặc định của cloud, reclaim policy `Delete`. Xoá namespace xoá PVC, xoá PVC xoá PV, và provisioner xoá luôn đĩa cloud bên dưới: không có thùng rác nào. Với dữ liệu quan trọng, dùng StorageClass có `Retain`, và coi backup nằm ngoài cụm mới là lưới an toàn thật (D20). Cũng nhớ rằng `kubectl delete -f` trên một thư mục manifest có chứa PVC gây ra đúng chuỗi này.
+
+</Callout>
+
+<Check id="k2.3.pv-pvc-storageclass">Giải thích được vai trò của PVC, PV và StorageClass, và vì sao PVC `WaitForFirstConsumer` đứng ở `Pending` cho tới khi có pod.</Check>
+
+<Check id="k2.3.access-reclaim">Chọn được access mode và reclaim policy cho một loại dữ liệu, và nói được chuyện gì xảy ra với dữ liệu khi xoá PVC ở từng policy.</Check>
+
+### RBAC: ai được làm gì trên API server
+
+Mọi thao tác trên cụm là một request tới API server, đi qua hai câu hỏi: **bạn là ai** (authentication) và **bạn có được làm việc này không** (authorization). RBAC (role-based access control) trả lời câu thứ hai bằng bốn loại object:
+
+```text
+   AI (subject)                   GẮN (binding)                 ĐƯỢC LÀM GÌ (role)
+   -------------                  ----------------              ----------------------------
+   User, Group             <----  RoleBinding            ---->  Role
+   ServiceAccount                 (trong 1 namespace)           rules:
+                                                                  apiGroups: [""]
+                                                                  resources: ["pods"]
+                                                                  verbs: ["get","list","watch"]
+
+                           <----  ClusterRoleBinding     ---->  ClusterRole
+                                  (cả cụm)                      (cùng cấu trúc; thêm được tài
+                                                                 nguyên cấp cụm như nodes)
+```
+
+| Kết hợp | Phạm vi quyền | Ví dụ |
+|---|---|---|
+| Role + RoleBinding | Một namespace | Đội shop đọc pod trong `shop` |
+| ClusterRole + RoleBinding | Một namespace, dùng lại định nghĩa chung | Gắn ClusterRole `view` có sẵn cho một đội trong namespace của họ |
+| ClusterRole + ClusterRoleBinding | Cả cụm | Công cụ giám sát đọc pod ở mọi namespace |
+
+Ba tính chất cần nhớ:
+
+- **Chỉ có cho phép, không có cấm.** Quyền của một subject là hợp của mọi binding trỏ tới nó. Không có rule nào kiểu "trừ secret này".
+- **Mặc định là không có quyền gì.** ServiceAccount mới tạo chỉ gọi được vài endpoint khám phá API.
+- **Vài quyền tương đương quyền quản trị** dù trông vô hại: `list` hoặc `get` trên `secrets` (đọc mọi mật khẩu); `create` trên `pods` (tạo pod mount bất kỳ Secret hay ServiceAccount nào trong namespace); `bind`, `escalate`, `impersonate`; và mọi rule có `"*"`.
+
+Kubernetes có sẵn bốn ClusterRole cho người dùng: `view` (đọc, **không** gồm Secret), `edit`, `admin` và `cluster-admin`.
+
+### ServiceAccount: danh tính của pod
+
+Người dùng đăng nhập bằng chứng chỉ hoặc OIDC. Pod đăng nhập bằng **ServiceAccount**. Mỗi namespace có sẵn một ServiceAccount `default`; pod không ghi `serviceAccountName` sẽ dùng nó.
+
+kubelet xin cho mỗi pod một **token** (JWT) và mount vào `/var/run/secrets/kubernetes.io/serviceaccount/token`. Token này khác hẳn loại token vĩnh viễn nằm trong Secret của các bản Kubernetes cũ, ở ba điểm:
+
+- **Có thời hạn.** kubelet tự xin token mới và ghi đè file trước khi hết hạn.
+- **Gắn với pod.** Pod bị xoá thì token mất hiệu lực sau vài giây, dù chưa tới hạn (API server nhớ đệm kết quả xác thực khoảng 10 giây).
+- **Có đối tượng nhận (`aud`).** Chỉ có giá trị với API server, trừ khi bạn xin cho audience khác.
+
+```text
+ (1) Pod được xếp vào node
+        kubelet gọi API TokenRequest:  "cho ServiceAccount pod-reader, gắn với pod api-client,
+                                        audience = API server, hạn 3607 giây"
+ (2) API server ký một JWT, kubelet ghi vào projected volume của pod:
+        /var/run/secrets/kubernetes.io/serviceaccount/token   (kèm ca.crt, namespace)
+ (3) Ứng dụng gửi  Authorization: Bearer <token>
+        API server kiểm: chữ ký, hạn, audience, và pod ghi trong token CÒN TỒN TẠI không
+        -> biết "bạn là system:serviceaccount:<ns>:pod-reader"  -> RBAC quyết định 200 hay 403
+ (4) Khi token đã qua 80% thời hạn, kubelet xin token mới và ghi đè file
+ (5) Pod bị xoá  ->  bước kiểm ở (3) thất bại  ->  401, dù token chưa hết hạn
+```
+
+Hệ quả cho ứng dụng: đọc lại file token định kỳ, không đọc một lần lúc khởi động rồi giữ mãi (các client chính thức đã làm sẵn). Pod không gọi API server, tức phần lớn ứng dụng nghiệp vụ, nên đặt `automountServiceAccountToken: false` để kẻ chiếm được pod không có gì để dùng.
+
+<Callout kind="production">
+
+Năm 2018, công ty bảo mật RedLock tìm thấy bảng điều khiển Kubernetes của Tesla mở ra Internet không cần mật khẩu ([WIRED tường thuật](https://www.wired.com/story/cryptojacking-tesla-amazon-cloud/)). Qua đó kẻ tấn công vào được một pod, lấy **thông tin đăng nhập AWS nằm sẵn trong pod đó** và dùng hạ tầng của Tesla để đào tiền mã hoá. Chuỗi "một thành phần lộ ra ngoài → thứ có giá trị nằm sẵn bên trong → đi sang hệ thống khác" lặp lại trong nhiều sự cố sau này. Bài học cho bài này có giới hạn rõ: RBAC tối thiểu và không mount token chỉ đóng **đường đi qua API server**. Trong vụ Tesla, thứ bị lấy không phải token ServiceAccount mà là bí mật đặt trong pod; bí mật trong pod và đường mạng ra vào pod là hai lớp phòng thủ khác (quản lý bí mật ở D15, NetworkPolicy ở K2.4).
+
+</Callout>
+
+<Check id="k2.3.rbac-mo-hinh">Kể được bốn loại object RBAC, ba cách kết hợp chúng, và ít nhất ba quyền nguy hiểm ngang quyền quản trị.</Check>
+
+<Check id="k2.3.serviceaccount-token">Giải thích được token của ServiceAccount trong pod có thời hạn, gắn với pod và được kubelet tự xoay như thế nào.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Persistent Volumes | Kubernetes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/): vòng đời PV và PVC, bảng access mode, mục "Reclaiming" cho các bước xử lý PV `Released`.
+- [Storage Classes | Kubernetes](https://kubernetes.io/docs/concepts/storage/storage-classes/): các trường của StorageClass, gồm `volumeBindingMode` và `reclaimPolicy`.
+- [Using RBAC Authorization | Kubernetes](https://kubernetes.io/docs/reference/access-authn-authz/rbac/): cú pháp đầy đủ của rule, các ClusterRole có sẵn, và mục "Privilege escalation prevention".
+- [Role Based Access Control Good Practices | Kubernetes](https://kubernetes.io/docs/concepts/security/rbac-good-practices/): danh sách quyền nguy hiểm kèm lý do, đọc trước khi cấp quyền cho một công cụ.
+- [Configure Service Accounts for Pods | Kubernetes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/): token được cấp, mount và xoay thế nào; cách tắt automount.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Cụm `k2-lab` của K2.1 đang chạy (kind, Kubernetes 1.37). Bài này **chỉ dùng lại cụm và thư mục `~/masteva-k2`**; không cần ứng dụng `echo` hay Gateway của K2.2. Nếu đã xoá cụm, làm lại bước 1 của K2.1.
+- **Profile máy:** các pod của bài rất nhẹ; `docker stats` báo hai node dùng tổng cộng khoảng 1,5 GiB RAM. Máy 8 GB: Docker Desktop 4 GB là đủ.
+- Có `jq`, `yq`. Tên PV, IP và cổng API server trong output của bạn sẽ khác.
+
+### 1. PVC, PV và dynamic provisioning
+
+<Terminal where="mac" title="~/masteva-k2/pvc.yaml">
+
+```bash
+cd ~/masteva-k2
+kubectl get storageclass
+kubectl create namespace k2-store
+cat > pvc.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: k2-store
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+  # không ghi storageClassName: dùng StorageClass mặc định (standard)
+EOF
+kubectl apply -f pvc.yaml && sleep 3
+kubectl -n k2-store get pvc data
+kubectl -n k2-store get events --field-selector involvedObject.name=data \
+  -o custom-columns=REASON:.reason,MESSAGE:.message
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  12m
+namespace/k2-store created
+persistentvolumeclaim/data created
+NAME   STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+data   Pending                                      standard       <unset>                 4s
+REASON                 MESSAGE
+WaitForFirstConsumer   waiting for first consumer to be created before binding
+```
+
+</Expected>
+
+kind cài sẵn StorageClass `standard` dùng `local-path-provisioner`: mỗi PV là một thư mục trên node. PVC `Pending` không phải lỗi; nó đang chờ một pod. Tạo pod ghi một dòng vào volume mỗi lần khởi động:
+
+<Terminal where="mac" title="~/masteva-k2/writer.yaml">
+
+```bash
+cat > writer.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+  namespace: k2-store
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      # mỗi lần container khởi động, ghi thêm một dòng vào volume
+      command: ["sh", "-c", "echo \"ghi bởi $(hostname)\" >> /data/log.txt; sleep infinity"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: data
+EOF
+kubectl apply -f writer.yaml
+kubectl -n k2-store wait --for=condition=Ready pod/writer --timeout=120s
+kubectl get pv
+kubectl get pv -o yaml | yq '.items[0].spec | {"hostPath": .hostPath.path,
+  "node": .nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0],
+  "reclaim": .persistentVolumeReclaimPolicy}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM           STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
+pvc-5a11d2da-b626-4864-8e02-997d716e636c   1Gi        RWO            Delete           Bound    k2-store/data   standard       <unset>                          6s
+hostPath: /var/local-path-provisioner/pvc-5a11d2da-b626-4864-8e02-997d716e636c_k2-store_data
+node: k2-lab-worker
+reclaim: Delete
+```
+
+</Expected>
+
+Bạn không tạo PV nào; provisioner tạo nó ngay khi pod được xếp vào `k2-lab-worker`, và gắn cứng PV với node đó. Giờ xoá pod, tạo lại, rồi đọc file:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-store delete pod writer --now
+kubectl apply -f writer.yaml
+kubectl -n k2-store wait --for=condition=Ready pod/writer --timeout=120s
+kubectl -n k2-store exec writer -- cat /data/log.txt
+kubectl -n k2-store exec writer -- df -h /data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ghi bởi writer
+ghi bởi writer
+Filesystem                Size      Used Available Use% Mounted on
+/dev/vda1               117.8G     81.9G     29.9G  73% /data
+```
+
+</Expected>
+
+Hai dòng: pod thứ hai thấy dữ liệu của pod thứ nhất. Dòng `df` cho thấy một điều dễ bỏ sót: PVC xin `1Gi` nhưng volume thấy cả ổ đĩa của node. `local-path` chỉ là một thư mục, **không ép dung lượng**. Đĩa cloud và các hệ lưu trữ ở K7 thì có.
+
+<Check id="k2.3.lab-pvc">Tạo được PVC, thấy nó chuyển từ `Pending` sang `Bound` khi có pod, và chứng minh được dữ liệu còn sau khi xoá pod.</Check>
+
+### 2. Access mode: RWO tính theo node
+
+<Predict question="PVC `data` là ReadWriteOnce và pod `writer` đang dùng nó. Tạo thêm pod `reader` cũng mount `data`. Pod `reader` có chạy được không?">
+
+Chạy được. `ReadWriteOnce` giới hạn số **node** mount volume, không giới hạn số pod. PV gắn với `k2-lab-worker` nên `reader` được xếp về đúng node đó và hai pod cùng đọc ghi một thư mục. (Cụm lab chỉ có một worker nhận pod thường, nhưng kể cả cụm nhiều worker, `nodeAffinity` của PV vẫn kéo `reader` về node đang giữ dữ liệu.) Muốn đúng một pod thì dùng `ReadWriteOncePod`.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+sed 's/name: writer/name: reader/' writer.yaml | kubectl apply -f -
+kubectl -n k2-store wait --for=condition=Ready pod/reader --timeout=120s
+kubectl -n k2-store exec reader -- cat /data/log.txt
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ghi bởi writer
+ghi bởi writer
+ghi bởi reader
+```
+
+</Expected>
+
+Hai ứng dụng cùng ghi một file mà không phối hợp là cách hỏng dữ liệu nhanh nhất; RWO không bảo vệ bạn khỏi việc đó.
+
+Access mode cũng không phải thứ tự chọn tuỳ ý: hệ lưu trữ bên dưới phải làm được. Xin thử một PVC `ReadWriteMany`:
+
+<Terminal where="mac">
+
+```bash
+yq '.metadata.name = "shared" | .spec.accessModes = ["ReadWriteMany"]' pvc.yaml | kubectl apply -f -
+sed -e 's/name: writer/name: shared-user/' -e 's/claimName: data/claimName: shared/' writer.yaml \
+  | kubectl apply -f -
+sleep 10
+kubectl -n k2-store get pvc shared
+kubectl -n k2-store get events --field-selector involvedObject.name=shared,reason=ProvisioningFailed \
+  -o custom-columns=REASON:.reason,MESSAGE:.message | head -2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+persistentvolumeclaim/shared created
+pod/shared-user created
+NAME     STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+shared   Pending                                      standard       <unset>                 10s
+REASON               MESSAGE
+ProvisioningFailed   failed to provision volume with StorageClass "standard": NodePath only supports ReadWriteOnce and ReadWriteOncePod (1.22+) access modes
+```
+
+</Expected>
+
+Một thư mục trên một node không thể cho nhiều node mount, nên `local-path` từ chối. PVC đứng ở `Pending` và pod `shared-user` `Pending` theo. Thấy PVC và pod cùng `Pending`, đọc event của PVC trước tiên.
+
+<Check id="k2.3.lab-access-mode">Chứng minh được hai pod cùng node dùng chung một PVC RWO, và đọc được lý do PVC RWX không cấp được trên `local-path`.</Check>
+
+### 3. Reclaim policy: `Delete` và `Retain`
+
+<Callout kind="danger">
+
+Lệnh dưới xoá PVC `data`. StorageClass `standard` có reclaim policy `Delete`, nên **thư mục dữ liệu trên node bị xoá theo, không khôi phục được**. Trên cụm thật, cùng lệnh này xoá đĩa cloud.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-store delete pod writer reader shared-user --now
+kubectl -n k2-store delete pvc data shared
+kubectl wait --for=delete pv --all --timeout=60s
+kubectl get pv
+docker exec k2-lab-worker ls /var/local-path-provisioner/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "writer" deleted from k2-store namespace
+pod "reader" deleted from k2-store namespace
+pod "shared-user" deleted from k2-store namespace
+persistentvolumeclaim "data" deleted from k2-store namespace
+persistentvolumeclaim "shared" deleted from k2-store namespace
+persistentvolume/pvc-5a11d2da-b626-4864-8e02-997d716e636c condition met
+No resources found
+```
+
+</Expected>
+
+`kubectl wait --for=delete` chờ tới khi PV biến mất thật. Không còn PV, và thư mục trên node trống (lệnh `ls` không in gì). Giờ làm lại với một StorageClass có `Retain`:
+
+<Terminal where="mac" title="~/masteva-k2/retain.yaml">
+
+```bash
+cat > retain.yaml <<'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-retain
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: orders
+  namespace: k2-store
+spec:
+  storageClassName: local-retain
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+kubectl apply -f retain.yaml
+sed -e 's/name: writer/name: orders-writer/' -e 's/claimName: data/claimName: orders/' writer.yaml \
+  > orders-writer.yaml
+kubectl apply -f orders-writer.yaml
+kubectl -n k2-store wait --for=condition=Ready pod/orders-writer --timeout=120s
+kubectl -n k2-store delete pod orders-writer --now
+kubectl -n k2-store delete pvc orders
+kubectl wait --for=jsonpath='{.status.phase}'=Released pv --all --timeout=60s
+kubectl get pv
+docker exec k2-lab-worker sh -c 'cat /var/local-path-provisioner/*_k2-store_orders/log.txt'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+persistentvolume/pvc-562e66dd-8307-4b9a-a9c2-04fb5b284288 condition met
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS     CLAIM             STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE
+pvc-562e66dd-8307-4b9a-a9c2-04fb5b284288   1Gi        RWO            Retain           Released   k2-store/orders   local-retain   <unset>                          5s
+ghi bởi orders-writer
+```
+
+</Expected>
+
+PVC đã xoá nhưng PV còn, ở trạng thái `Released`, và file vẫn nằm trên node. PV `Released` **không tự gắn lại** cho PVC mới, kể cả PVC trùng tên: nó còn giữ `claimRef` trỏ về PVC cũ, để dữ liệu của người này không vô tình rơi vào tay người khác. Người vận hành phải chủ động gỡ `claimRef` rồi tạo PVC chỉ đích danh PV đó:
+
+<Terminal where="mac">
+
+```bash
+PV=$(kubectl get pv -o jsonpath='{.items[0].metadata.name}')
+kubectl patch pv "$PV" --type json -p '[{"op":"remove","path":"/spec/claimRef"}]'
+kubectl get pv "$PV" -o jsonpath='{.status.phase}{"\n"}'
+yq "select(.kind == \"PersistentVolumeClaim\") | .spec.volumeName = \"$PV\"" retain.yaml \
+  | kubectl apply -f -
+kubectl -n k2-store wait --for=jsonpath='{.status.phase}'=Bound pvc/orders --timeout=60s
+kubectl -n k2-store get pvc orders
+kubectl apply -f orders-writer.yaml
+kubectl -n k2-store wait --for=condition=Ready pod/orders-writer --timeout=120s
+kubectl -n k2-store exec orders-writer -- cat /data/log.txt
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+persistentvolume/pvc-562e66dd-8307-4b9a-a9c2-04fb5b284288 patched
+Available
+persistentvolumeclaim/orders created
+persistentvolumeclaim/orders condition met
+NAME     STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+orders   Bound    pvc-562e66dd-8307-4b9a-a9c2-04fb5b284288   1Gi        RWO            local-retain   <unset>                 0s
+pod/orders-writer created
+pod/orders-writer condition met
+ghi bởi orders-writer
+ghi bởi orders-writer
+```
+
+</Expected>
+
+Dòng thứ nhất của file là từ trước khi xoá PVC: dữ liệu đã qua được một lần xoá PVC. Cái giá của `Retain` là phần dọn dẹp thuộc về bạn: PV và dữ liệu không dùng nữa sẽ nằm đó tốn chỗ cho tới khi có người xoá.
+
+<Check id="k2.3.lab-reclaim">Quan sát được dữ liệu mất khi xoá PVC `Delete`, còn khi xoá PVC `Retain`, và gắn lại được một PV `Released` cho PVC mới.</Check>
+
+### 4. RBAC: cấp đúng một quyền cho một ServiceAccount
+
+<Terminal where="mac" title="~/masteva-k2/rbac.yaml">
+
+```bash
+cat > rbac.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: {name: k2-rbac}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: pod-reader, namespace: k2-rbac}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: read-pods, namespace: k2-rbac}
+rules:
+  - apiGroups: [""]            # "" là core API group (pods, services, secrets...)
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: pod-reader-read-pods, namespace: k2-rbac}
+subjects:
+  - kind: ServiceAccount
+    name: pod-reader
+    namespace: k2-rbac
+roleRef:
+  kind: Role
+  name: read-pods
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: api-client, namespace: k2-rbac}
+spec:
+  serviceAccountName: pod-reader
+  containers:
+    - name: curl
+      image: curlimages/curl:8.22.0
+      command: ["sleep", "infinity"]
+EOF
+kubectl apply -f rbac.yaml
+kubectl -n k2-rbac wait --for=condition=Ready pod/api-client --timeout=120s
+SA=system:serviceaccount:k2-rbac:pod-reader
+kubectl auth can-i list pods    -n k2-rbac --as=$SA
+kubectl auth can-i delete pods  -n k2-rbac --as=$SA
+kubectl auth can-i list secrets -n k2-rbac --as=$SA
+kubectl auth can-i list pods    -n default --as=$SA
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+yes
+no
+no
+no
+```
+
+</Expected>
+
+`kubectl auth can-i … --as=…` hỏi API server "nếu là subject này thì có được không" mà không cần token của nó. Tên đầy đủ của một ServiceAccount luôn có dạng `system:serviceaccount:<namespace>:<tên>`. Bốn câu trả lời khớp với Role: chỉ `list` (cùng `get`, `watch`) trên `pods`, chỉ trong `k2-rbac`. Thêm `--list` để in toàn bộ quyền của một subject khi rà soát.
+
+Thường bạn không tự viết Role mà gắn một ClusterRole có sẵn vào namespace:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-rbac create serviceaccount viewer
+kubectl -n k2-rbac create rolebinding viewer-view --clusterrole=view --serviceaccount=k2-rbac:viewer
+SA=system:serviceaccount:k2-rbac:viewer
+kubectl auth can-i list configmaps -n k2-rbac --as=$SA
+kubectl auth can-i list secrets    -n k2-rbac --as=$SA
+kubectl auth can-i list configmaps -n default --as=$SA
+```
+
+</Terminal>
+
+Kết quả lần lượt là `yes`, `no`, `no`. `view` là ClusterRole, nhưng vì gắn bằng **RoleBinding** nên quyền chỉ có trong `k2-rbac`. Và `view` cố ý không đọc được Secret.
+
+<Check id="k2.3.lab-rbac">Viết được Role và RoleBinding cho một ServiceAccount, và kiểm quyền bằng `kubectl auth can-i --as`.</Check>
+
+### 5. Token của ServiceAccount: gọi API từ trong pod
+
+Pod `api-client` chạy bằng ServiceAccount `pod-reader`. Từ trong pod, gọi thẳng API server bằng token được mount sẵn:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-rbac exec api-client -- sh -c '
+cd /var/run/secrets/kubernetes.io/serviceaccount; ls
+API=https://kubernetes.default.svc/api/v1
+for p in namespaces/k2-rbac/pods namespaces/k2-rbac/secrets namespaces/default/pods; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" --cacert ca.crt -H "Authorization: Bearer $(cat token)" $API/$p)
+  printf "%-28s %s\n" $p $code
+done
+curl -s --cacert ca.crt -H "Authorization: Bearer $(cat token)" $API/namespaces/k2-rbac/secrets | grep message'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ca.crt
+namespace
+token
+namespaces/k2-rbac/pods      200
+namespaces/k2-rbac/secrets   403
+namespaces/default/pods      403
+  "message": "secrets is forbidden: User \"system:serviceaccount:k2-rbac:pod-reader\" cannot list resource \"secrets\" in API group \"\" in the namespace \"k2-rbac\"",
+```
+
+</Expected>
+
+`403` nghĩa là API server **biết bạn là ai** nhưng không cho. Thông báo ghi đủ bốn thứ cần để sửa: subject, verb, resource, namespace. Giờ mở token ra xem (JWT gồm ba phần cách nhau bằng dấu chấm; phần giữa là JSON mã hoá base64):
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-rbac exec api-client -- cat /var/run/secrets/kubernetes.io/serviceaccount/token \
+  | jq -R -c 'split(".")[1] | @base64d | fromjson
+      | {sub, aud, pod: .["kubernetes.io"].pod.name,
+         warnafter_sau_giay: (.["kubernetes.io"].warnafter - .iat),
+         exp_sau_ngay: ((.exp - .iat) / 86400)}'
+kubectl -n k2-rbac create token pod-reader --duration=10m \
+  | jq -R -c 'split(".")[1] | @base64d | fromjson | {sub, exp_sau_giay: (.exp - .iat)}'
+kubectl -n k2-rbac get secrets
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"sub":"system:serviceaccount:k2-rbac:pod-reader","aud":["https://kubernetes.default.svc.cluster.local"],"pod":"api-client","warnafter_sau_giay":3607,"exp_sau_ngay":365}
+{"sub":"system:serviceaccount:k2-rbac:pod-reader","exp_sau_giay":600}
+No resources found in k2-rbac namespace.
+```
+
+</Expected>
+
+- Token trong pod ghi tên pod (`api-client`) và audience của API server.
+- kubelet xin token hạn 3.607 giây và sẽ thay file trước mốc đó. Nhưng `exp` lại là **365 ngày**: cờ `--service-account-extend-token-expiration` của kube-apiserver mặc định là `true`, kéo dài hạn của token do kubelet xin lên một năm để ứng dụng cũ không đọc lại file khỏi gãy. Sau mốc `warnafter`, mỗi lần token cũ được dùng, API server ghi cảnh báo vào audit log. Đừng dựa vào một năm đó.
+- `kubectl create token` xin token theo yêu cầu, hạn đúng 10 phút như đã đặt: cách đúng để cấp quyền tạm cho một script.
+- Không có Secret nào: Kubernetes hiện nay không tự tạo token vĩnh viễn cho ServiceAccount.
+
+<Predict question="Chép token ra khỏi pod, rồi xoá pod. Token còn hạn gần một năm. Gọi API bằng token đó từ máy bạn thì nhận mã gì?">
+
+`401 Unauthorized`. Token gắn với pod: khi xác thực token, API server kiểm pod ghi trong token còn tồn tại không. Pod bị xoá thì token chết theo, bất kể `exp`. Có một độ trễ nhỏ: API server nhớ đệm kết quả xác thực thành công khoảng 10 giây, nên lab chờ 15 giây sau khi xoá pod rồi mới thử lại; gọi ngay lập tức có thể vẫn nhận `200`. Đây là khác biệt lớn nhất so với token nằm trong Secret kiểu cũ, vốn sống mãi cho tới khi có người xoá Secret.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+TOKEN=$(kubectl -n k2-rbac exec api-client -- cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+API=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+  | base64 -d > ca.crt
+URL=$API/api/v1/namespaces/k2-rbac/pods
+curl -s -o /dev/null -w '%{http_code}\n' --cacert ca.crt -H "Authorization: Bearer $TOKEN" $URL
+kubectl -n k2-rbac delete pod api-client --now
+sleep 15   # API server nhớ đệm kết quả xác thực token trong khoảng 10 giây
+curl -s -o /dev/null -w '%{http_code}\n' --cacert ca.crt -H "Authorization: Bearer $TOKEN" $URL
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200
+pod "api-client" deleted from k2-rbac namespace
+401
+```
+
+</Expected>
+
+<Check id="k2.3.lab-token">Gọi được API server từ trong pod bằng token của ServiceAccount, phân biệt được `401` với `403`, và chứng minh được token mất hiệu lực khi pod bị xoá.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| PVC `Pending` dù đã có pod | Access mode hoặc StorageClass mà provisioner không hỗ trợ | `kubectl describe pvc`, đọc event `ProvisioningFailed` |
+| Pod `Pending` sau khi node cũ mất | PV `local-path` gắn cứng với node đã mất | `kubectl get pv -o yaml`, xem `nodeAffinity` |
+| PVC mới không gắn được vào PV `Released` | PV còn `claimRef` của PVC cũ | Gỡ `claimRef` như bước 3, tạo PVC có `volumeName` |
+| `403` khi gọi API | Thiếu rule, hoặc binding trỏ sai namespace của ServiceAccount | `kubectl auth can-i <verb> <resource> --as=system:serviceaccount:<ns>:<sa> -n <ns>` |
+| `401` khi gọi API | Token hết hạn, sai audience, hoặc pod sở hữu token đã bị xoá | Giải mã token, xem `exp` và tên pod |
+| `can-i` trả `yes` mà ứng dụng vẫn `403` | Pod chạy bằng ServiceAccount khác (thường là `default`) | `kubectl get pod <tên> -o jsonpath='{.spec.serviceAccountName}'` |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá hai namespace của bài cùng mọi thứ trong đó, xoá PV giữ lại ở bước 3 và **xoá thư mục dữ liệu của nó trên node** (reclaim policy `Retain` nên Kubernetes không tự xoá). Khối lệnh thứ hai xoá cả cụm và thư mục lab; chỉ chạy nó khi không học tiếp K2.4.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K2.4">
+
+```bash
+PV=$(kubectl -n k2-store get pvc orders -o jsonpath='{.spec.volumeName}')
+kubectl delete namespace k2-store k2-rbac
+kubectl delete pv "$PV"
+kubectl delete storageclass local-retain
+docker exec k2-lab-worker sh -c 'rm -rf /var/local-path-provisioner/*_k2-store_orders'
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k2-lab
+rm -rf ~/masteva-k2
+```
+
+</Terminal>
+
+K2.4 dùng tiếp cụm `k2-lab`, không dùng lại namespace nào của bài này.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao tạo được pod lại nguy hiểm ngang đọc được Secret?">
+
+Người có quyền `create pods` trong một namespace viết được pod spec tuỳ ý: mount bất kỳ Secret nào trong namespace làm volume, hoặc đặt `serviceAccountName` là một ServiceAccount quyền cao rồi đọc token của nó từ trong pod. RBAC chỉ kiểm "được tạo pod không", không kiểm nội dung pod. Quyền tạo Deployment, Job, CronJob cũng vậy vì chúng tạo pod thay bạn. Muốn giới hạn nội dung pod thì cần lớp khác: Pod Security Admission và admission policy ở K8.
+
+</Reveal>
+
+<Reveal title="Trong Kubernetes có object User không? Người dùng thật được quản lý ở đâu?">
+
+Không có. ServiceAccount là object trong cụm, còn người dùng thì không: API server chỉ **tin một nguồn bên ngoài** nói "request này của ai, thuộc nhóm nào". Nguồn đó là chứng chỉ client (tên lấy từ trường CN, nhóm từ O, như file kubeconfig quản trị của kind), hoặc token OIDC từ hệ thống đăng nhập của công ty. RBAC rồi gắn quyền cho tên `User` hay `Group` dưới dạng chuỗi. Hệ quả: không "xoá user" trong cụm được. Chứng chỉ client đã cấp có giá trị tới khi hết hạn và không thu hồi riêng lẻ được, nên với con người, dùng OIDC với token ngắn hạn và gắn quyền theo **nhóm**, không theo từng tên. K4 xem các chứng chỉ của cụm; K8 ghi lại ai đã gọi gì bằng audit log.
+
+</Reveal>
+
+<Reveal title="StatefulSet 3 replica dùng volumeClaimTemplates. Xoá StatefulSet thì dữ liệu ra sao?">
+
+Còn nguyên. `volumeClaimTemplates` (K1.4) tạo một PVC riêng cho mỗi pod (`data-db-0`, `data-db-1`…), và mặc định StatefulSet **không xoá** các PVC đó khi bị xoá hay scale xuống, chính là để tránh mất dữ liệu do lỡ tay. Trường `persistentVolumeClaimRetentionPolicy` cho phép đổi thành `Delete` cho từng trường hợp. Lưu ý chuỗi còn lại vẫn như bài này: nếu sau đó bạn xoá PVC (hoặc xoá cả namespace) và StorageClass là `Delete`, dữ liệu mất.
+
+</Reveal>
+
+<Reveal title="Node đang giữ một PV local-path chết hẳn. Pod và dữ liệu ra sao?">
+
+Pod không chạy lại được ở đâu khác. PV có `nodeAffinity` trỏ đúng node đã chết (bước 1 đã in trường này), nên scheduler không tìm ra node nào hợp lệ và pod đứng ở `Pending` cho tới khi node đó quay lại. Dữ liệu nằm trên đĩa của node, mất theo node. Đó là bản chất của lưu trữ cục bộ: nhanh và đơn giản, nhưng không có tính sẵn sàng. Đĩa mạng của cloud gắn lại được sang node khác trong cùng zone; các hệ lưu trữ phân tán nhân bản dữ liệu qua nhiều node. K7 so sánh các lựa chọn, và D20 lo phần sao lưu, thứ cần có với mọi loại lưu trữ.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI sinh Role và manifest PVC rất nhanh, và sai theo những cách khó thấy bằng mắt. Hay gặp: Role dùng `verbs: ["*"]` hoặc `resources: ["*"]` "cho chắc chạy"; ClusterRoleBinding ở chỗ chỉ cần RoleBinding; subject ghi thiếu `namespace` của ServiceAccount; gợi ý tạo Secret chứa token vĩnh viễn cho ServiceAccount theo cách của các bản Kubernetes cũ; PVC `ReadWriteMany` cho một StorageClass không hỗ trợ; bỏ qua reclaim policy khi viết lệnh dọn dẹp. Đừng duyệt bằng cách đọc YAML. Yêu cầu AI viết kèm phép thử rồi tự chạy: `kubectl auth can-i --as` cho từng quyền cần có **và** từng quyền không được có, và `kubectl get storageclass` để biết xoá PVC sẽ làm gì với dữ liệu.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.4 siết tiếp hai lớp còn lại của pod: tiến trình bên trong (SecurityContext) và mạng (NetworkPolicy). K1.4 đã dùng PVC qua StatefulSet. K5 giới hạn tài nguyên theo namespace bằng ResourceQuota. K7 đi sâu CSI, snapshot và các hệ lưu trữ có RWX. K8 ghi lại mọi lời gọi API bằng audit log và ép chính sách bằng admission. D15 quản lý bí mật; D20 sao lưu dữ liệu trong PV ra ngoài cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k2.3.mastery-storage">Nhìn một PVC `Pending`, tìm được nguyên nhân từ event, và nói được dữ liệu sẽ ra sao khi xoá PVC đó dựa vào reclaim policy.</Check>
+
+<Check id="k2.3.mastery-rbac">Tự viết được Role, RoleBinding và ServiceAccount cho một ứng dụng chỉ cần đọc một loại tài nguyên, rồi chứng minh bằng `kubectl auth can-i` rằng nó không có quyền nào khác.</Check>
+
+<Check id="k2.3.mastery-token">Giải thích được vòng đời token của ServiceAccount trong pod, và phân biệt được nguyên nhân của `401` với `403` khi gọi API server.</Check>
+
+</Mastery>

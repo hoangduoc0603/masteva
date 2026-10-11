@@ -1,0 +1,874 @@
+---
+title: Image, layer, container và những gì nằm dưới lớp vỏ
+description: Mổ một image thành index, manifest, config và layer, khôi phục file "đã xoá" từ layer cũ, rồi nhìn một container từ phía kernel - namespace, cgroup v2, overlayfs và file config.json theo chuẩn OCI mà runc thật sự chạy.
+id: d6.1
+step: d6
+prerequisites: [d1.5]
+topics: [d6.image-layer-container, d6.namespace-cgroup-oci]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (Docker Desktop, VM LinuxKit kernel 7.0.12)
+  tools:
+    docker: 29.8.0
+    containerd: 2.3.5
+    runc: 1.5.1 (OCI runtime-spec 1.3.0)
+    alpine: 3.24.2
+    jq: 1.8.2
+---
+
+<Goal>
+
+Biết chính xác image là gì trên đĩa và container là gì trong kernel, để các chặng sau (Dockerfile, registry, Kubernetes) không còn là hộp đen. Học xong bài này, bạn giải thích được:
+
+- Vì sao `RUN rm secret.env` không gỡ được secret khỏi image, và không làm image nhỏ đi.
+- Vì sao `ps` trong container chỉ thấy vài tiến trình với PID 1, trong khi máy chủ thấy cùng tiến trình đó với PID năm chữ số.
+- Vì sao một container bị giới hạn 20 tiến trình có thể "kẹt cứng", `docker exec` cũng không vào được, dù bên trong chỉ còn một tiến trình đang chạy.
+- Vì sao "root trong container" vẫn là root của máy chủ, và Docker, containerd, runc chia việc với nhau thế nào.
+
+</Goal>
+
+<Knowledge>
+
+### Image là gì: index, manifest, config, layer
+
+Một **image** không phải một file. Nó là một cây các **blob**, mỗi blob được gọi tên bằng **digest**, tức SHA-256 của chính nội dung nó (cùng ý tưởng với kho đối tượng của Git ở D4.1). Định dạng do **OCI Image Specification** quy định, nên image build bằng Docker chạy được trên containerd, Podman hay Kubernetes.
+
+```text
+ tag  alpine:3.24.2
+   │  (tên dễ đọc, có thể bị trỏ sang nội dung khác)
+   ▼
+ index (manifest list)            sha256:294b683c…   JSON: danh sách manifest theo nền tảng
+   ├─ linux/amd64  ─▶ manifest d56c381f…
+   ├─ linux/arm64  ─▶ manifest 260479a1…             JSON: 1 config + danh sách layer
+   │                    ├─ config  33bee74c…         JSON: Cmd, Env, User, kiến trúc, diff_ids
+   │                    └─ layer   a9986cd6…         tar+gzip: các file của một lớp
+   └─ … (arm/v7, riscv64, s390x…)
+```
+
+| Thành phần | Là gì | Dùng để |
+|---|---|---|
+| **Tag** | Tên trỏ tới một digest, như branch trong Git | Con người gọi tên: `alpine:3.24.2` |
+| **Index** | Danh sách manifest, mỗi cái cho một hệ điều hành và kiến trúc CPU | Một tên image chạy được trên cả máy Intel lẫn ARM; client tự chọn manifest hợp máy mình |
+| **Manifest** | Digest và kích thước của config và từng layer | Biết phải tải những blob nào |
+| **Config** | Cấu hình chạy mặc định (`Cmd`, `Entrypoint`, `Env`, `User`, `WorkingDir`), lịch sử build và `diff_ids` | Runtime đọc để biết chạy lệnh gì, bằng user nào |
+| **Layer** | Một file tar (thường nén gzip) chứa các file được thêm, sửa hay đánh dấu xoá so với layer dưới | Ghép lại thành hệ thống file gốc của container |
+
+Mỗi layer có hai mã: **digest** trong manifest là hash của file **đã nén** (thứ truyền qua mạng), **diff_id** trong config là hash của tar **chưa nén** (thứ nằm trên đĩa sau khi giải nén). Vì mọi thứ đánh địa chỉ theo nội dung, hai image dùng chung base chỉ lưu và chỉ tải layer chung một lần.
+
+Docker 29 mặc định dùng **containerd image store**: Docker lưu image đúng theo cấu trúc trên, và `IMAGE ID` mà `docker image ls` in ra chính là digest của index. Bản Docker cũ hơn (hoặc máy nâng cấp từ bản cũ, chưa chuyển store) dùng digest của config làm ID, nên cùng một image có thể hiện hai ID khác nhau trên hai máy.
+
+<Check id="d6.1.image-anatomy">Kể được đường đi từ tag tới index, manifest, config và layer, và phân biệt được digest với diff_id của một layer.</Check>
+
+### Layer và hệ thống file của container
+
+Khi tạo container, runtime không chép image. Nó dùng **overlayfs** của kernel để xếp chồng các thư mục:
+
+```text
+ container thấy:   /  (merged)                      một cây thư mục bình thường
+                   ▲
+ upperdir   lớp ghi của riêng container (rỗng lúc đầu)      ◀── mọi thay đổi rơi vào đây
+ lowerdir   layer N của image   (chỉ đọc)
+            …
+            layer 1 của image   (chỉ đọc)                   ◀── dùng chung cho mọi container
+```
+
+- **Đọc** một file: kernel tìm từ trên xuống, lấy bản đầu tiên gặp.
+- **Sửa** một file của image: kernel chép file đó lên `upperdir` rồi mới sửa (copy-on-write). Layer bên dưới không đổi.
+- **Xoá** một file của image: không xoá được ở lớp dưới, nên kernel tạo một dấu **whiteout** ở lớp trên để che nó đi. Trong file tar của layer, whiteout là file rỗng tên `.wh.<tên file>`.
+
+Hệ quả cho người viết Dockerfile: **mỗi lệnh `RUN`, `COPY`, `ADD` tạo một layer, và layer đã tạo thì không bao giờ mất**. Xoá file ở lệnh sau chỉ thêm một whiteout; file gốc vẫn nằm nguyên trong layer trước, ai có image cũng lấy ra được bằng `tar`.
+
+<Callout kind="production">
+
+Năm 2023, nhóm nghiên cứu của Đại học RWTH Aachen quét 337.171 image trên Docker Hub cùng 8.076 registry riêng mở ra Internet và thấy **8,5% image chứa secret**: 52.107 private key và 3.158 API secret, trong đó có key đang được 275.269 máy chủ TLS và SSH trên Internet dùng để xác thực (bài "Secrets Revealed in Container Images", arXiv 2307.03958). Theo chính nghiên cứu đó, secret vào image bằng hai đường. Private key chủ yếu do lệnh `RUN` **sinh ra** trong lúc build: 30% nằm ở layer cài OpenSSH server (trình cài tự tạo host key, và mọi container từ image đó dùng chung key), thêm 8,1% do gọi thẳng `ssh-keygen`. API secret thì chủ yếu được **chép vào** bằng thao tác file (`COPY`, `ADD`) từ máy người build; bước 2 của lab tái hiện đường thứ hai này. Secret đã vào một layer đã push thì coi như đã lộ: phải thu hồi và đổi nó, không chỉ build lại image. D5.2 dùng `.dockerignore`, multi-stage và secret mount của BuildKit để secret không chạm vào layer nào.
+
+</Callout>
+
+Lớp ghi của container mất khi `docker rm`. Dữ liệu cần sống lâu hơn container phải nằm trong volume (D5.3).
+
+<Check id="d6.1.layers">Giải thích được overlayfs ghép layer thế nào, copy-on-write và whiteout là gì, và vì sao xoá file ở layer sau không gỡ nó khỏi image.</Check>
+
+### Container là một tiến trình được kernel "che mắt"
+
+D1.5 đã dạy namespace và cgroup v2 ở mức kernel: tám loại namespace, tạo namespace bằng `unshare`, đọc `cpu.max` và `cpu.stat`. Bài này không dạy lại, chỉ trả lời câu hỏi của riêng container: Docker bật những cơ chế đó **thế nào** cho tiến trình của bạn, và từ máy chủ nhìn vào thì thấy gì.
+
+Một container là một tiến trình bình thường (và con cháu của nó), được runtime khởi động kèm ba thứ: một bộ **namespace**, một **cgroup**, và hệ thống file gốc riêng (overlayfs ở trên) cùng các hàng rào bảo mật: bỏ bớt capability, lọc syscall bằng seccomp.
+
+| Namespace | Docker mặc định có tạo riêng không | Điều cần nhớ với container |
+|---|---|---|
+| `pid`, `mnt`, `net`, `uts`, `ipc`, `cgroup` | Có, mỗi container một bộ | Tắt từng cái bằng cờ: `--pid=host`, `--network=host`, `--cgroupns=host`… Mỗi cờ như vậy gỡ một lớp cô lập |
+| `time` | Có (runc tạo, ít khi dùng tới) | |
+| `user` | **Không** | uid 0 trong container là uid 0 của máy chủ, trừ khi daemon chạy rootless (D0.1) hoặc bật `userns-remap` |
+
+Bộ namespace của một tiến trình xem được qua `/proc/<pid>/ns/`: hai tiến trình ở cùng namespace thì hai symlink cùng trỏ một số inode. Tiến trình trong container vẫn hiện trong `ps` của máy chủ, với một PID khác, vì mỗi PID namespace đánh số riêng và namespace cha thấy được tiến trình của namespace con. Lab so từng inode giữa container và máy chủ.
+
+Dòng `user` của bảng là điều hay bị hiểu sai nhất. "Root trong container" bị giới hạn bởi capability (Docker giữ 14 trên khoảng 40), seccomp và các đường dẫn `/proc`, `/sys` bị che, nhưng về danh tính nó **vẫn là uid 0 của kernel máy chủ**. Container và máy chủ dùng chung một kernel; đây là khác biệt căn bản với máy ảo.
+
+<Callout kind="production">
+
+Ngày 31/01/2024, runc công bố lỗ hổng CVE-2024-21626 (thuộc nhóm "Leaky Vessels"): runc 1.1.11 trở xuống để rò một file descriptor trỏ vào hệ thống file của máy chủ sang tiến trình trong container. Một image độc hại đặt `WORKDIR` vào `/proc/self/fd/<số>` là có thư mục làm việc nằm **ngoài** container, từ đó đọc ghi được file của máy chủ với quyền root, khi chạy lẫn khi build. Lỗi ảnh hưởng mọi thứ đứng trên runc: Docker, containerd, Kubernetes, và được sửa ở runc 1.1.12. Hai bài học: namespace là hàng rào bằng phần mềm trong một kernel dùng chung, nên phải vá runtime như vá kernel; và chạy tiến trình bằng user thường (D5.2) cắt bớt thiệt hại khi hàng rào thủng.
+
+</Callout>
+
+<Check id="d6.1.namespaces">Nói được Docker mặc định tạo riêng namespace nào và không tạo namespace nào, giải thích được vì sao cùng một tiến trình có hai PID, và vì sao root trong container vẫn là uid 0 của máy chủ.</Check>
+
+### cgroup v2: cờ của Docker thành file của kernel
+
+D1.5 đã dạy cgroup v2 (`cpu.max`, `cpu.stat`, `memory.max`, `pids.max`). Ở đây chỉ cần mối nối: mỗi container có một cgroup riêng (với Docker là `/sys/fs/cgroup/docker/<id>` khi dùng driver `cgroupfs`, hoặc `system.slice/docker-<id>.scope` khi dùng driver `systemd`), và mỗi cờ giới hạn của `docker run` là một file trong thư mục đó:
+
+| Cờ `docker run` | File cgroup v2 | Khi chạm trần |
+|---|---|---|
+| `--memory 64m` | `memory.max = 67108864` | Kernel OOM-kill tiến trình trong cgroup, exit 137 (SB11.3 đã tái hiện với JVM) |
+| `--cpus 0.5` | `cpu.max = 50000 100000`: 50 ms CPU mỗi chu kỳ 100 ms | Tiến trình bị **throttle**: tạm dừng tới chu kỳ sau. Không chết, chỉ chậm |
+| `--pids-limit 20` | `pids.max = 20` | `fork()` trả lỗi `EAGAIN`: "Resource temporarily unavailable" |
+
+Kubernetes dùng đúng cơ chế này: `resources.limits.memory` và `limits.cpu` của pod thành `memory.max` và `cpu.max` (chặng K1).
+
+Hai điểm dễ vấp:
+
+- **Throttle CPU** tính theo từng chu kỳ 100 ms, như D1.5 đã đo trên một service systemd. Với container, số liệu nằm ở `cpu.stat` trong cgroup của nó (`nr_throttled`, `throttled_usec`), và đó là thứ cần xem đầu tiên khi một service trong container chậm mà biểu đồ CPU trung bình không cao.
+- **`pids.max` đếm cả zombie.** D1.1 đã nói PID 1 phải gọi `wait()` để dọn zombie. Nếu PID 1 của container không làm việc đó (đa số ứng dụng không làm), mỗi tiến trình con mồ côi chết đi để lại một zombie vẫn chiếm một suất. Đủ zombie là container không `fork()` được nữa. `docker run --init` đặt một init nhỏ (`tini`, trong Docker là `docker-init`) làm PID 1 để dọn.
+
+<Check id="d6.1.cgroups">Ánh xạ được `--memory`, `--cpus`, `--pids-limit` sang file cgroup v2, đọc được `cpu.stat`, và giải thích được vì sao zombie làm cạn `pids.max`.</Check>
+
+### OCI và chuỗi runtime
+
+**OCI** (Open Container Initiative) có ba đặc tả, tách "container" khỏi riêng Docker:
+
+| Đặc tả | Chuẩn hoá | Bạn gặp ở đâu |
+|---|---|---|
+| Image spec | Index, manifest, config, layer | Bước 1 của lab |
+| Runtime spec | Thư mục **bundle**: `config.json` cộng rootfs, và các thao tác create, start, kill, delete | Bước 6 của lab |
+| Distribution spec | API HTTP để push, pull blob và manifest | Registry ở D5.2 |
+
+Lệnh `docker run` đi qua một chuỗi chương trình, mỗi cái một việc:
+
+```text
+ docker (CLI) ──REST──▶ dockerd ──gRPC──▶ containerd ──▶ containerd-shim-runc-v2 ──▶ runc ──▶ tiến trình của bạn
+                        mạng, volume,     image, snapshot,   một shim cho mỗi container:   tạo namespace, cgroup,
+                        API, build        vòng đời           giữ stdio, nhận exit code      pivot_root, exec rồi THOÁT
+```
+
+1. `dockerd` chuẩn bị mạng, volume.
+2. `dockerd` soạn cấu hình theo runtime spec (lệnh chạy, user, namespace cần tạo, giới hạn cgroup, capability, seccomp); `containerd` dựng snapshot overlayfs từ các layer và ghi cấu hình đó thành `config.json` trong thư mục bundle.
+3. `containerd-shim` gọi `runc create` rồi `runc start`. runc tạo namespace và cgroup, đổi root sang rootfs, `exec` lệnh của bạn, rồi thoát.
+4. Shim ở lại làm cha của tiến trình container. Nhờ vậy khởi động lại `dockerd` hay `containerd` không giết container.
+
+Kubernetes bỏ hai mắt xích đầu: kubelet nói chuyện thẳng với containerd (hoặc CRI-O) qua CRI, không cần Docker. Và runc thay được bằng runtime khác cùng hiểu `config.json`: `crun` (viết bằng C, nhẹ hơn), gVisor (kernel ở user space), Kata Containers (mỗi container một máy ảo nhỏ).
+
+<Check id="d6.1.oci">Kể được ba đặc tả của OCI và vai trò của dockerd, containerd, shim, runc trong một lần `docker run`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [OCI Image Format Specification](https://github.com/opencontainers/image-spec/blob/main/spec.md): mở lần lượt `image-index.md`, `manifest.md`, `config.md`, `layer.md` để đối chiếu với các file JSON của bước 1; `layer.md` có phần whiteout.
+- [namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html): bảng các loại namespace và thư mục `/proc/pid/ns`; từ đó đi tiếp `pid_namespaces(7)`, `user_namespaces(7)`.
+- [Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html): tài liệu kernel; đọc mục CPU, Memory và PID để hiểu từng file ở bước 5.
+- [OCI Runtime Specification: config.md](https://github.com/opencontainers/runtime-spec/blob/main/config.md): ý nghĩa từng trường của `config.json` ở bước 6.
+- [runc advisory GHSA-xr7r-f8xq-vfvv](https://github.com/opencontainers/runc/security/advisories/GHSA-xr7r-f8xq-vfvv): mô tả gốc của CVE-2024-21626 trong callout, kèm các kịch bản tấn công.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker Desktop (hoặc Docker Engine 29 trên Linux) đang chạy, có `jq`, máy có mạng để tải image `alpine` (4 MB). Lab không mở cổng nào. **Profile máy:** các container trong bài chỉ chạy `sleep`, dùng vài MB RAM; chạy được trên máy 8 GB với Docker VM 2 GB.
+
+**Lab cần daemon Docker rootful** và được kiểm chứng trên Docker Desktop. Docker rootless trong Lima mà D0.1 dựng (`template:docker`) chạy được bước 1 và 2 y nguyên; từ bước 3 thì khác, và những khác biệt sau **chưa được kiểm chứng** trong bài này:
+
+- Hàm `vm` (container `--privileged --pid=host` rồi `nsenter` vào PID 1) không có quyền vào namespace của máy chủ, vì daemon rootless chỉ là một user thường. Các lệnh "nhìn từ máy chủ" phải chạy thẳng trong shell của VM với `sudo`.
+- cgroup của container nằm dưới `user.slice/user-<uid>.slice/…`, không phải `/sys/fs/cgroup/docker/<id>`; giới hạn CPU và số tiến trình chỉ có hiệu lực khi systemd đã uỷ quyền các controller đó cho user.
+- Ở bước 4, namespace `user` của container sẽ **khác** của máy chủ: đó chính là điểm rootless bảo vệ bạn.
+
+Muốn kết quả giống bài, dùng Docker Desktop hoặc một VM tạo từ `template:docker-rootful` (D0.1 có bảng so sánh hai template).
+
+Trên macOS và Windows, container không chạy trên hệ điều hành của bạn mà trong một **máy ảo Linux** do Docker Desktop quản lý. "Máy chủ" trong bài này là máy ảo đó. Từ bước 3, lab dùng một container đặc quyền để bước vào VM và nhìn container từ bên ngoài. Trên Linux, cùng các lệnh đó đưa bạn tới chính máy mình.
+
+<Terminal where="mac">
+
+```bash
+docker version --format 'client {{.Client.Version}}, server {{.Server.Version}}'
+docker info --format 'cgroup v{{.CgroupVersion}}, driver {{.CgroupDriver}}, kernel {{.KernelVersion}}, {{.OperatingSystem}}'
+docker info --format '{{.DriverStatus}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+client 29.8.0, server 29.8.0
+cgroup v2, driver cgroupfs, kernel 7.0.12-linuxkit, Docker Desktop
+[[driver-type io.containerd.snapshotter.v1]]
+```
+
+</Expected>
+
+Dòng cuối xác nhận Docker đang dùng containerd image store. Nếu bạn thấy `cgroup v1`, hệ điều hành của máy chủ đã quá cũ cho bài này. Driver `systemd` (mặc định trên Ubuntu) chỉ đổi đường dẫn cgroup ở bước 5.
+
+### 1. Mổ một image
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-d6 && cd ~/masteva-d6
+docker pull -q alpine:3.24.2
+docker image inspect alpine:3.24.2 --format '{{.Id}}
+{{.Os}}/{{.Architecture}} cmd={{json .Config.Cmd}}
+layers={{json .RootFS.Layers}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+docker.io/library/alpine:3.24.2
+sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+linux/arm64 cmd=["/bin/sh"]
+layers=["sha256:1b349a3334531b575b01d409540dd8aca14ef29abddacd50f36643d7c949db4b"]
+```
+
+</Expected>
+
+Trên máy Intel, dòng thứ ba là `linux/amd64` và digest của layer khác. Nếu dòng `sha256:294b…` khác, Alpine đã phát hành lại bản 3.24.2 (một tag có thể bị trỏ sang nội dung mới; D5.2 bàn kỹ); cấu trúc bên dưới vẫn y như vậy.
+
+`docker save` xuất image ra đúng cấu trúc "OCI image layout". Giải nén và lần theo từng tầng:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p alpine-oci
+docker save alpine:3.24.2 | tar -x -C alpine-oci
+cd alpine-oci && ls && cat oci-layout; echo
+IDX=$(jq -r '.manifests[0].digest' index.json | cut -d: -f2)
+echo "index: $IDX"
+jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == null)
+  | "\(.platform.os)/\(.platform.architecture)\(if .platform.variant then "/" + .platform.variant else "" end)  \(.digest[7:19])"' blobs/sha256/$IDX
+ls blobs/sha256 | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+blobs
+index.json
+manifest.json
+oci-layout
+{"imageLayoutVersion":"1.0.0"}
+index: 294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+linux/amd64  d56c381f961d
+linux/arm/v6  d3c3fda3e4d3
+linux/arm/v7  0a13654ecd9b
+linux/arm64/v8  260479a1cfaf
+linux/386  c54a80678a9e
+linux/ppc64le  f34b729ba6dc
+linux/riscv64  1320e86f9464
+linux/s390x  ce2789264b55
+       8
+```
+
+</Expected>
+
+Digest của index chính là `IMAGE ID` ở trên. Index liệt kê tám nền tảng (lệnh `jq` đã lọc bỏ các manifest "attestation" chứa thông tin nguồn gốc bản build), nhưng thư mục `blobs` chỉ có 8 file, trong đó đúng một layer: Docker chỉ tải manifest, config và layer của **kiến trúc máy bạn** (cùng vài file attestation nhỏ). Mở manifest của kiến trúc đó, rồi config:
+
+<Terminal where="mac">
+
+```bash
+ARCH=$(docker version -f '{{.Server.Arch}}')
+MAN=$(jq -r --arg a "$ARCH" '.manifests[] | select(.platform.os=="linux" and .platform.architecture==$a) | .digest' blobs/sha256/$IDX | cut -d: -f2)
+jq '{config: .config.digest[7:19], layers: [.layers[] | {mediaType, size, digest: .digest[7:19]}]}' blobs/sha256/$MAN
+CFG=$(jq -r .config.digest blobs/sha256/$MAN | cut -d: -f2)
+jq -c '{architecture, os, cmd: .config.Cmd, diff_ids: [.rootfs.diff_ids[] | .[7:19]]}' blobs/sha256/$CFG
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{
+  "config": "33bee74c45f3",
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 4187659,
+      "digest": "a9986cd6f37d"
+    }
+  ]
+}
+{"architecture":"arm64","os":"linux","cmd":["/bin/sh"],"diff_ids":["1b349a333453"]}
+```
+
+</Expected>
+
+Alpine chỉ có một layer 4,2 MB (đã nén). Layer đó có digest `a9986cd6…` trong manifest nhưng `diff_id` `1b349a33…` trong config. Tự kiểm bằng `shasum`:
+
+<Terminal where="mac">
+
+```bash
+LAYER=$(jq -r '.layers[0].digest' blobs/sha256/$MAN | cut -d: -f2)
+shasum -a 256 blobs/sha256/$LAYER | cut -c1-12
+gunzip -c blobs/sha256/$LAYER | shasum -a 256 | cut -c1-12
+tar -tzf blobs/sha256/$LAYER | head -5
+tar -tzf blobs/sha256/$LAYER | wc -l
+cd ..
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+a9986cd6f37d
+1b349a333453
+bin/
+bin/arch
+bin/ash
+bin/base64
+bin/bbconfig
+     514
+```
+
+</Expected>
+
+Hash của file nén là digest, hash của tar sau khi giải nén là diff_id. Bên trong chỉ là 514 file và thư mục của một bản Alpine tối thiểu. Trên Linux, thay `shasum -a 256` bằng `sha256sum`.
+
+<Check id="d6.1.lab-dissect">Xuất được một image bằng `docker save`, lần được từ index tới manifest, config, layer, và tự tính lại được digest và diff_id.</Check>
+
+### 2. File đã xoá vẫn nằm trong layer
+
+Build một image mà Dockerfile tạo file 5 MB, chép một file secret vào, rồi xoá cả hai ở lệnh cuối. Giá trị trong `secret.env` là giả, chỉ dùng cho lab.
+
+<Terminal where="mac">
+
+```bash
+mkdir -p layers && cd layers
+printf 'DB_PASSWORD=lab-chi-de-hoc\n' > secret.env
+cat > Dockerfile <<'EOF'
+FROM alpine:3.24.2
+RUN head -c 5000000 /dev/urandom > /big.bin
+COPY secret.env /secret.env
+RUN rm /big.bin /secret.env
+EOF
+docker build -q -t d5-layers:demo .
+docker history --format 'table {{.Size}}\t{{.CreatedBy}}' d5-layers:demo
+docker image ls d5-layers:demo
+docker run --rm d5-layers:demo ls /big.bin /secret.env
+```
+
+</Terminal>
+
+<Predict question="Lệnh cuối của Dockerfile đã xoá big.bin. Image nặng bao nhiêu so với alpine gốc (4,2 MB nén)?">
+
+```text
+sha256:3d5828a76dd8c1802228e3ccb8b107d94f12b89b841ffbf996177fc2b56066fa
+SIZE      CREATED BY
+4.1kB     RUN /bin/sh -c rm /big.bin /secret.env # bui…
+8.19kB    COPY secret.env /secret.env # buildkit
+5.01MB    RUN /bin/sh -c head -c 5000000 /dev/urandom …
+0B        CMD ["/bin/sh"]
+9.31MB    ADD alpine-minirootfs-3.24.2-aarch64.tar.gz …
+IMAGE            ID             DISK USAGE   CONTENT SIZE   EXTRA
+d5-layers:demo   3d5828a76dd8       23.5MB         9.19MB        
+ls: /big.bin: No such file or directory
+ls: /secret.env: No such file or directory
+```
+
+9,19 MB: nặng hơn alpine đúng 5 MB. Container không thấy hai file (`ls` báo lỗi), nhưng layer 5,01 MB vẫn nằm trong image và vẫn được push, pull mỗi lần. ID image trên máy bạn sẽ khác vì `big.bin` là dữ liệu ngẫu nhiên.
+
+</Predict>
+
+Giờ đóng vai người lấy được image này. Xuất ra, liệt kê nội dung từng layer, rồi đọc file secret:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p oci && docker save d5-layers:demo | tar -x -C oci && cd oci
+IDX=$(jq -r '.manifests[0].digest' index.json | cut -d: -f2)
+MAN=$(jq -r '.manifests[] | select(.platform.os=="linux") | .digest' blobs/sha256/$IDX | cut -d: -f2)
+for d in $(jq -r '.layers[].digest' blobs/sha256/$MAN | cut -d: -f2); do
+  echo "== layer ${d:0:12} ($(wc -c < blobs/sha256/$d | tr -d ' ') byte)"; tar -tzf blobs/sha256/$d | head -3
+done
+L3=$(jq -r '.layers[2].digest' blobs/sha256/$MAN | cut -d: -f2)
+tar -xzOf blobs/sha256/$L3 secret.env
+cd ~/masteva-d6
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+== layer a9986cd6f37d (4187659 byte)
+bin/
+bin/arch
+bin/ash
+== layer 3a7900a25547 (5001728 byte)
+big.bin
+== layer d25923d250aa (135 byte)
+secret.env
+== layer 235b89ff7047 (103 byte)
+.wh.big.bin
+.wh.secret.env
+DB_PASSWORD=lab-chi-de-hoc
+```
+
+</Expected>
+
+Layer đầu trùng digest với alpine ở bước 1: nó được dùng chung, không lưu lại. Layer cuối chỉ chứa hai file whiteout `.wh.*`. Secret nằm nguyên trong layer thứ ba, đọc được bằng một lệnh `tar`. Digest của layer thứ hai trên máy bạn sẽ khác.
+
+<Check id="d6.1.lab-whiteout">Chỉ ra được file whiteout trong layer và lấy lại được một file "đã xoá" từ layer trước đó.</Check>
+
+### 3. Container: lớp ghi và overlayfs
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name d5-box --hostname box alpine:3.24.2 sleep 3600
+docker exec d5-box sh -c 'echo xin-chao > /hello; rm /etc/motd'
+docker diff d5-box
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+43510b6d6e47c17a2dcd7722aea52507bfa019597956b5a6a9ab145a1dd93f62
+A /hello
+C /etc
+D /etc/motd
+```
+
+</Expected>
+
+`docker diff` liệt kê lớp ghi của container: `A` thêm, `C` đổi, `D` xoá (một whiteout). Image `alpine:3.24.2` không hề đổi.
+
+Bây giờ nhìn từ phía máy chủ. Hàm `vm` chạy một container có đủ đặc quyền rồi dùng `nsenter` nhập vào các namespace của PID 1 trên máy chủ, tức là "đứng trên máy chủ" để chạy lệnh:
+
+<Callout kind="danger">
+
+Hàm `vm` kết hợp `--privileged` và `--pid=host`: container đó có toàn quyền root trên máy chủ, đọc ghi được mọi file và giết được mọi tiến trình. Nó hợp để học trên máy mình. Không bao giờ chạy container như vậy trên server chung hay production, và coi mọi yêu cầu "cần `--privileged`" trong tài liệu cài đặt của phần mềm lạ là dấu hiệu phải xem xét kỹ.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+vm() { docker run --rm -i --privileged --pid=host --cgroupns=host alpine:3.24.2 nsenter -t 1 -m -u -n -i -- "$@"; }
+ID=$(docker inspect -f '{{.Id}}' d5-box)
+PID=$(docker inspect -f '{{.State.Pid}}' d5-box)
+echo "PID trong VM: $PID"
+vm sh -s "$ID" <<'EOF'
+mount | grep "overlayfs/$1" | sed 's/.*(//; s/,/\n/g' | grep dir= | sed 's|/var/lib[a-z/.-]*containerd[a-zA-Z0-9/.-]*/snapshots|…/snapshots|g'
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PID trong VM: 60959
+lowerdir=…/snapshots/3851/fs:…/snapshots/85/fs
+upperdir=…/snapshots/3852/fs
+workdir=…/snapshots/3852/work
+```
+
+</Expected>
+
+PID và số snapshot trên máy bạn sẽ khác. Hệ thống file gốc của container là một mount overlayfs: `lowerdir` gồm layer của alpine (`85`) và một lớp mỏng Docker thêm vào để đặt `/etc/hosts`, `/etc/resolv.conf`; `upperdir` là lớp ghi, nơi `/hello` vừa được tạo. Lệnh `sed` cuối chỉ rút gọn đường dẫn dài của containerd.
+
+### 4. Namespace: cùng một tiến trình, hai cách nhìn
+
+Bên trong container:
+
+<Terminal where="mac">
+
+```bash
+docker exec d5-box sh -c 'echo "hostname=$(hostname)"; ps -o pid,ppid,args'
+docker exec d5-box sh -c 'for n in pid net mnt uts ipc user cgroup; do echo "$n $(readlink /proc/1/ns/$n)"; done'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+hostname=box
+PID   PPID  COMMAND
+    1     0 sleep 3600
+   12     0 ps -o pid,ppid,args
+pid pid:[4026535267]
+net net:[4026535269]
+mnt mnt:[4026535264]
+uts uts:[4026535265]
+ipc ipc:[4026535266]
+user user:[4026531837]
+cgroup cgroup:[4026535268]
+```
+
+</Expected>
+
+Container chỉ thấy `sleep` (PID 1) và chính lệnh `ps`. Các số trong ngoặc là inode của từng namespace; trên máy bạn sẽ khác. Từ máy chủ:
+
+<Terminal where="mac">
+
+```bash
+vm sh -s "$PID" <<'EOF'
+echo "hostname=$(hostname)"
+SHIM=$(awk '{print $4}' /proc/$1/stat)
+ps -o pid,ppid,args | awk -v c=$1 -v s=$SHIM 'NR==1 || $1==c || $1==s' | cut -c1-90
+for n in pid net mnt uts ipc user cgroup; do
+  echo "$n VM=$(readlink /proc/1/ns/$n) container=$(readlink /proc/$1/ns/$n)"
+done
+EOF
+```
+
+</Terminal>
+
+<Predict question="Trong bảy namespace, cái nào của container trùng với của máy chủ?">
+
+```text
+hostname=docker-desktop
+  PID  PPID COMMAND
+60935     1 /usr/bin/containerd-shim-runc-v2 -namespace moby -id 43510b6d6e47c17a2dcd7722a
+60959 60935 sleep 3600
+pid VM=pid:[4026531836] container=pid:[4026535267]
+net VM=net:[4026531833] container=net:[4026535269]
+mnt VM=mnt:[4026531832] container=mnt:[4026535264]
+uts VM=uts:[4026531838] container=uts:[4026535265]
+ipc VM=ipc:[4026531839] container=ipc:[4026535266]
+user VM=user:[4026531837] container=user:[4026531837]
+cgroup VM=cgroup:[4026531835] container=cgroup:[4026535268]
+```
+
+Chỉ có `user`: hai bên cùng `4026531837`, tức Docker không tạo user namespace, và root trong container là root của máy chủ. Sáu namespace còn lại đều riêng. Cùng tiến trình `sleep 3600` đó, trong container là PID 1, trên máy chủ là PID 60959, và cha của nó là `containerd-shim-runc-v2`, không phải `dockerd`.
+
+</Predict>
+
+Docker không có gì độc quyền ở đây: D1.5 đã tạo đúng những namespace này bằng tay với `unshare`. runc làm việc đó, cộng thêm rootfs, cgroup và các hàng rào bảo mật.
+
+<Check id="d6.1.lab-namespaces">So được namespace của container với máy chủ qua `/proc/<pid>/ns`, tìm được PID thật của container trên máy chủ và chỉ ra tiến trình cha của nó là shim.</Check>
+
+### 5. cgroup v2: giới hạn, throttle và zombie
+
+Thay container bằng một cái có giới hạn bộ nhớ, CPU và số tiến trình:
+
+<Callout kind="danger">
+
+`docker rm -f` dừng và xoá vĩnh viễn container cùng lớp ghi của nó. Trong bước này nó chỉ được dùng cho hai container của lab: `d5-box` ngay dưới đây và `d5-lim` khi chạy lại với `--init`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker rm -f d5-box
+docker run -d --name d5-lim --memory 64m --cpus 0.5 --pids-limit 20 alpine:3.24.2 sleep 3600
+docker exec d5-lim sh -c 'cd /sys/fs/cgroup; for f in memory.max cpu.max pids.max; do echo "$f = $(cat $f)"; done'
+ID=$(docker inspect -f '{{.Id}}' d5-lim)
+vm sh -s "$ID" <<'EOF'
+cd /sys/fs/cgroup/docker/$1 && pwd | cut -c1-40 && cat memory.max cpu.max pids.max
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d5-box
+36f206aab56b55bc0f7ae02afa303c7e2df6df04dbf025c4d3b66cb7b280c9d7
+memory.max = 67108864
+cpu.max = 50000 100000
+pids.max = 20
+/sys/fs/cgroup/docker/36f206aab56b55bc0f
+67108864
+50000 100000
+20
+```
+
+</Expected>
+
+Ba cờ thành ba file: 64 MiB, 50 ms CPU mỗi 100 ms, 20 tiến trình. Container đọc chúng ở `/sys/fs/cgroup` của mình (nhờ cgroup namespace); máy chủ thấy cùng những file đó dưới `/sys/fs/cgroup/docker/<id>`. Với driver `systemd`, đường dẫn là `/sys/fs/cgroup/system.slice/docker-<id>.scope`.
+
+D1.5 đã đo throttle trên một service systemd. Kiểm nhanh rằng `--cpus 0.5` cho đúng hiện tượng đó trong container: chạy một vòng lặp bận 3 giây và đọc `cpu.stat` trước, sau:
+
+<Terminal where="mac">
+
+```bash
+docker exec d5-lim sh -c 'grep -E "^(usage_usec|nr_periods|nr_throttled|throttled_usec)" /sys/fs/cgroup/cpu.stat
+timeout 3 sh -c "while :; do :; done"; echo "--- sau 3 giây chạy vòng lặp bận"
+grep -E "^(usage_usec|nr_periods|nr_throttled|throttled_usec)" /sys/fs/cgroup/cpu.stat'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+usage_usec 57448
+nr_periods 4
+nr_throttled 0
+throttled_usec 0
+Terminated
+--- sau 3 giây chạy vòng lặp bận
+usage_usec 1596112
+nr_periods 34
+nr_throttled 30
+throttled_usec 1462513
+```
+
+</Expected>
+
+Số cụ thể trên máy bạn sẽ khác, nhưng tỉ lệ thì giống: trong 3 giây, vòng lặp chỉ được chạy khoảng 1,5 giây CPU (`usage_usec` tăng 1,54 triệu micro giây), bị dừng ở 30 trên 30 chu kỳ, tổng thời gian bị dừng 1,46 giây. Tiến trình không lỗi, không chết, chỉ chậm đi một nửa. Đây là thứ cần xem đầu tiên khi một service "chậm bất thường mà CPU không cao".
+
+Giờ thử chạm trần số tiến trình: tạo 25 tiến trình `sleep 3` chạy nền.
+
+<Terminal where="mac">
+
+```bash
+docker exec d5-lim sh -c 'for i in $(seq 1 25); do sleep 3 & done; wait'; echo "exit=$?"
+sleep 5
+docker exec d5-lim cat /sys/fs/cgroup/pids.events; echo "exit=$?"
+```
+
+</Terminal>
+
+<Predict question="Các tiến trình sleep 3 đã kết thúc từ lâu khi lệnh docker exec thứ hai chạy. Nó có đọc được pids.events không?">
+
+```text
+sh: can't fork: Resource temporarily unavailable
+exit=2
+OCI runtime exec failed: exec failed: unable to start container process: error executing setns process: exit status 1; runc init error(s): nsexec-0[62868]: unable to spawn stage-1: Resource temporarily unavailable
+exit=128
+```
+
+Không. Lệnh đầu chạm trần 20 đúng như mong đợi: `fork()` thứ mười mấy thất bại và shell thoát. Nhưng 5 giây sau, khi mọi `sleep 3` đã xong, `docker exec` vẫn không tạo nổi **một** tiến trình trong container. Container đã kẹt.
+
+</Predict>
+
+Nhìn từ máy chủ để biết ai đang chiếm 20 suất:
+
+<Terminal where="mac">
+
+```bash
+PID=$(docker inspect -f '{{.State.Pid}}' d5-lim)
+vm sh -s "$PID" "$ID" <<'EOF'
+ps -o pid,ppid,stat,args | awk -v p=$1 '$2==p' | head -3
+echo "số tiến trình con của PID $1: $(ps -o ppid | grep -c "^ *$1$")"
+echo "pids.current = $(cat /sys/fs/cgroup/docker/$2/pids.current)"
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+61863 61600 Zs   [timeout] <defunct>
+62004 61600 Z    [sleep] <defunct>
+62005 61600 Z    [sleep] <defunct>
+số tiến trình con của PID 61600: 18
+pids.current = 19
+```
+
+</Expected>
+
+Mười tám **zombie** (`Z`), cộng `sleep 3600` là 19 trên trần 20, và `docker exec` cần tạo nhiều hơn một tiến trình để vào được container. Khi shell của `docker exec` thoát, các `sleep 3` đang chạy thành mồ côi và được PID 1 của container nhận nuôi. PID 1 ở đây là `sleep 3600`, không bao giờ gọi `wait()`, nên chúng chết đi thành zombie và giữ suất mãi mãi. Zombie `[timeout]` là di tích của bước đo CPU trước đó: chỉ cần chạy lệnh bình thường qua `docker exec` cũng đủ để tích zombie. Đây là lý do thực tế của lời khuyên "PID 1 phải dọn zombie" ở D1.1.
+
+Chạy lại với `--init`:
+
+<Terminal where="mac">
+
+```bash
+docker rm -f d5-lim
+docker run -d --name d5-lim --init --memory 64m --cpus 0.5 --pids-limit 20 alpine:3.24.2 sleep 3600
+docker exec d5-lim sh -c 'for i in $(seq 1 25); do sleep 3 & done; wait'; echo "exit=$?"
+sleep 5
+docker exec d5-lim sh -c 'cat /sys/fs/cgroup/pids.events; echo "pids.current = $(cat /sys/fs/cgroup/pids.current)"; ps -o pid,ppid,stat,args'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d5-lim
+2f7ac404fc8897d66c123cb7f40c35043ee15153684b772f0d9fbadf596ff559
+sh: can't fork: Resource temporarily unavailable
+exit=2
+max 1
+pids.current = 4
+PID   PPID  STAT COMMAND
+    1     0 S    /sbin/docker-init -- sleep 3600
+    6     1 S    sleep 3600
+   31     0 R    ps -o pid,ppid,stat,args
+```
+
+</Expected>
+
+Trần vẫn chặn được đợt `fork()` quá tay (`pids.events` ghi `max 1`: một lần chạm trần), nhưng lần này `docker-init` là PID 1 và dọn sạch zombie, nên container trở lại 4 tiến trình và vẫn dùng được. Lab làm kết quả tất định bằng cách chờ `sleep 5`, dài hơn tuổi thọ 3 giây của các tiến trình con.
+
+<Check id="d6.1.lab-cgroup">Đọc được giới hạn của container từ cả hai phía, đo được CPU throttle bằng `cpu.stat`, tái hiện được container kẹt vì zombie và sửa bằng `--init`.</Check>
+
+### 6. config.json: thứ runc thật sự nhận
+
+Mọi quyết định của `docker run` được `dockerd` soạn thành một cấu hình theo OCI runtime spec, và containerd ghi nó ra file `config.json` trong thư mục bundle của container. Lấy file đó ra và xem những trường chính:
+
+<Terminal where="mac">
+
+```bash
+ID=$(docker inspect -f '{{.Id}}' d5-lim)
+vm sh -s "$ID" > config.json <<'EOF'
+cat $(find /run -name config.json -path "*moby/$1*" | head -1)
+EOF
+jq '{ociVersion, args: .process.args, uid: .process.user.uid, namespaces: [.linux.namespaces[].type],
+     memory: .linux.resources.memory, cpu: .linux.resources.cpu, pids: .linux.resources.pids,
+     cgroupsPath: (.linux.cgroupsPath | sub("[0-9a-f]{64}"; "<id>")),
+     capabilities: (.process.capabilities.bounding | length), seccomp: .linux.seccomp.defaultAction}' config.json
+vm sh -c 'runc --version | head -3; containerd --version | cut -d" " -f1-3'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{
+  "ociVersion": "1.3.0",
+  "args": [
+    "/sbin/docker-init",
+    "--",
+    "sleep",
+    "3600"
+  ],
+  "uid": 0,
+  "namespaces": [
+    "mount",
+    "network",
+    "time",
+    "uts",
+    "pid",
+    "ipc",
+    "cgroup"
+  ],
+  "memory": {
+    "limit": 67108864,
+    "swap": 134217728
+  },
+  "cpu": {
+    "quota": 50000,
+    "period": 100000
+  },
+  "pids": {
+    "limit": 20
+  },
+  "cgroupsPath": "/docker/<id>",
+  "capabilities": 14,
+  "seccomp": "SCMP_ACT_ERRNO"
+}
+runc version 1.5.1
+commit: v1.5.1-0-g8f2685a4
+spec: 1.3.0
+containerd containerd v2.3.5
+```
+
+</Expected>
+
+Mọi thứ bạn vừa quan sát đều nằm ở đây dưới dạng dữ liệu: `--init` thành `args`, bảy namespace cần tạo (không có `user`), ba giới hạn cgroup, 14 capability được giữ, và seccomp mặc định từ chối (`SCMP_ACT_ERRNO`) những syscall không nằm trong danh sách cho phép. `swap: 134217728` là tổng bộ nhớ cộng swap: Docker mặc định cho swap bằng đúng `--memory`. Trên Docker Desktop file nằm dưới `/run/desktop-containerd/…`, trên Docker Engine thường là `/run/containerd/io.containerd.runtime.v2.task/moby/<id>/config.json`; lệnh `find` xử lý cả hai. Với file này và thư mục rootfs, bạn có thể tự gọi `runc run` mà không cần Docker.
+
+<Check id="d6.1.lab-oci">Lấy được `config.json` của một container đang chạy và chỉ ra trong đó lệnh chạy, namespace, giới hạn cgroup, capability và seccomp.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`jq: error … Cannot iterate over null`** ở bước 1 hoặc 2: `index.json` không có cấu trúc lồng như bài. Docker của bạn chưa dùng containerd image store (dòng `DriverStatus` ở phần Chuẩn bị không có `io.containerd.snapshotter.v1`), nên `docker save` xuất định dạng cũ. Bật "Use containerd for pulling and storing images" trong Docker Desktop, hoặc đọc file `manifest.json` ở gốc thay cho index.
+- **`nsenter` báo lỗi quyền** (`Permission denied` hoặc `Operation not permitted`): hàm `vm` thiếu `--privileged` hoặc `--pid=host`. Docker chạy ở chế độ rootless cũng không cho phép việc này.
+- **Bước 5 không thấy thư mục `/sys/fs/cgroup/docker/<id>`:** máy chủ dùng cgroup driver `systemd`. Tìm bằng `find /sys/fs/cgroup -name "docker-<id>*"`.
+- **`docker exec` báo `unable to spawn stage-1: Resource temporarily unavailable`** ở lần chạy `--init`: bạn chạy lệnh đọc trước khi các `sleep 3` kết thúc. Chờ thêm vài giây.
+- **`pull access denied` hoặc treo ở `docker pull`:** kiểm tra mạng và proxy; image `alpine` nằm trên Docker Hub, có giới hạn số lần tải khi không đăng nhập.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá container `d5-lim`, image `d5-layers:demo` và các thư mục đã giải nén trong `~/masteva-d6`. Giữ lại thư mục `~/masteva-d6` và image `alpine:3.24.2`: D5.2 và D5.3 dùng tiếp.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+docker rm -f d5-lim
+docker rmi d5-layers:demo
+cd ~/masteva-d6 && rm -rf alpine-oci layers config.json
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Trên Mac, container thật ra chạy ở đâu, và điều đó đổi gì?">
+
+Container cần kernel Linux, nên Docker Desktop (cũng như Colima, OrbStack, Podman machine) chạy một máy ảo Linux nhỏ và đặt `dockerd`, containerd ở trong đó. Lệnh `docker` trên Mac chỉ là client nói chuyện với VM. Ba hệ quả thực tế: giới hạn RAM và CPU của mọi container cộng lại không vượt được cấu hình của VM; bind mount thư mục của Mac đi qua một lớp chia sẻ file (chậm hơn, quyền file khác Linux, D5.3 sẽ thấy); và "máy chủ" mà container chia sẻ kernel là VM, không phải macOS, nên một container thoát được ra ngoài thì mới tới VM.
+
+</Reveal>
+
+<Reveal title="Root trong container là root của máy chủ. Vậy có những lớp nào chặn nó, và lớp nào thêm được?">
+
+Mặc định có bốn lớp: capability bị cắt còn 14 (không có `CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_NET_ADMIN`…), seccomp chặn vài chục syscall nguy hiểm, một số đường dẫn `/proc`, `/sys` bị che hoặc chỉ đọc, và AppArmor hay SELinux nếu máy chủ có bật. `--privileged` gỡ hết cả bốn. Thêm được: chạy bằng user thường (`USER` trong Dockerfile, D5.2), `--cap-drop=ALL`, hệ thống file gốc chỉ đọc, `no-new-privileges`, và user namespace (chế độ rootless của Docker hoặc `userns-remap`) để uid 0 trong container ánh xạ thành một uid không có quyền gì trên máy chủ. Podman (D5.3) chạy rootless mặc định.
+
+</Reveal>
+
+<Reveal title="Hai container từ cùng một image có dùng chung bộ nhớ không?">
+
+Có, một phần. Chúng dùng chung các `lowerdir` trên đĩa, và vì cùng đọc một file trên cùng hệ thống file, kernel chỉ giữ một bản trong page cache. Mã thực thi và thư viện được ánh xạ chỉ đọc nên cũng chia sẻ. Phần riêng của mỗi container là heap, stack và các trang đã ghi. Vì thế 50 container cùng một image tốn ít RAM hơn 50 lần một container, và cũng vì thế `memory.current` của từng cgroup không cộng lại đúng bằng RAM đã dùng của máy.
+
+</Reveal>
+
+<Reveal title="Vì sao service bị throttle CPU dù biểu đồ CPU trung bình chỉ 30%?">
+
+Giới hạn tính theo từng chu kỳ 100 ms. `--cpus 0.5` cho 50 ms CPU mỗi chu kỳ, **cộng trên mọi thread**. Một ứng dụng 8 thread cùng chạy sẽ tiêu hết 50 ms đó chỉ sau khoảng 6 ms thời gian thực, rồi cả 8 thread đứng im 94 ms còn lại. Biểu đồ lấy trung bình mỗi phút không thấy những khoảng dừng này; `nr_throttled` và `throttled_usec` thì thấy. Cách xử lý thường là nâng limit, giảm số thread cho khớp limit (JVM đã tự làm, SB11.3), hoặc với Kubernetes là cân nhắc bỏ CPU limit và chỉ giữ request (chặng K1).
+
+</Reveal>
+
+<Reveal title="Nếu container chỉ là tiến trình, vì sao kill -9 tiến trình đó trên máy chủ lại không phải cách dừng container?">
+
+Về kỹ thuật thì dừng được: PID 1 của container chết, kernel giết nốt mọi tiến trình còn lại trong PID namespace đó, và shim báo exit code 137 về containerd. Nhưng bạn bỏ qua mọi thứ D1.1 đã dạy về dừng êm: không có `SIGTERM`, không có thời gian chờ, ứng dụng không kịp đóng kết nối hay ghi dữ liệu. Ngoài ra Docker hay Kubernetes sẽ thấy "container chết bất thường" và khởi động lại theo restart policy. Dùng `docker stop` (hoặc xoá pod) để đi đúng chuỗi `SIGTERM`, chờ, rồi mới `SIGKILL`.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI giải thích tốt một file `config.json`, một dòng `mount` overlayfs hay một bảng `cpu.stat` khi bạn dán vào. AI hay sai ở ba chỗ: mô tả container như "máy ảo nhẹ" có kernel riêng; đưa đường dẫn và tên file của cgroup v1 (`memory.limit_in_bytes`, `cpu.cfs_quota_us`, `/sys/fs/cgroup/memory/docker/…`) trong khi máy hiện nay dùng cgroup v2; và khẳng định "xoá file ở cuối Dockerfile là đủ để giảm kích thước". Kiểm lại bằng chính các lệnh của lab: `readlink /proc/<pid>/ns/*`, `cat /sys/fs/cgroup/…`, `docker history` và `docker save`.
+
+</Callout>
+
+<Callout kind="link">
+
+D5.2 dùng hiểu biết về layer để viết Dockerfile nhỏ, cache tốt, không chạy root và không lọt secret; D5.3 xử lý dữ liệu sống lâu hơn lớp ghi (volume) và network namespace (mạng giữa các container). SB11.3 đã cho thấy JVM đọc `memory.max` và `cpu.max` thế nào. Chặng K1 gặp lại cùng các khái niệm dưới tên pod, request, limit; K4 nhìn containerd và runc trên node của cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d6.1.mastery-image">Lấy một image bất kỳ, chỉ ra được nó gồm những layer nào, mỗi layer thêm gì, và kiểm tra được trong đó có file nhạy cảm đã "xoá" hay không.</Check>
+
+<Check id="d6.1.mastery-kernel-view">Từ máy chủ, tìm được tiến trình của một container, namespace và cgroup của nó, và đọc được giới hạn cùng số liệu throttle.</Check>
+
+<Check id="d6.1.mastery-explain">Giải thích được cho đồng nghiệp container khác máy ảo ở đâu, root trong container nguy hiểm tới mức nào, và dockerd, containerd, runc mỗi cái làm gì.</Check>
+
+</Mastery>

@@ -6,7 +6,7 @@ Nền tảng học dành cho lập trình viên nói chung: lộ trình đầy �
 
 ## Trạng thái
 
-Giai đoạn 0 (nền móng) và tách roadmap: năm roadmap Java, Spring Boot, DevOps, Kubernetes, Microservices (82 chặng, 560 chủ đề; Spring Boot tách khỏi Java và Kubernetes tách khỏi DevOps ngày 09/10/2026) có sơ đồ "trục giữa", khung chi tiết chủ đề, tiến độ theo chủ đề trên trình duyệt; hai trang dự án; tìm kiếm không dấu. Có một bài mẫu (D1.1); các chặng còn lại đang soạn bài. Giao diện theo hướng Night Lab, theme tối mặc định. Chưa deploy.
+Giai đoạn 0 (nền móng) và tách roadmap: năm roadmap Java, Spring Boot, DevOps, Kubernetes, Microservices (82 chặng, 560 chủ đề; Spring Boot tách khỏi Java và Kubernetes tách khỏi DevOps ngày 09/10/2026) có sơ đồ "trục giữa", khung chi tiết chủ đề, tiến độ theo chủ đề trên trình duyệt; hai trang dự án; tìm kiếm không dấu. Đã có 118 bài (Java, Spring Boot đủ bài; DevOps D0–D5 và Kubernetes K1–K3); các chặng còn lại đang soạn bài. Giao diện theo hướng Night Lab, theme tối mặc định. Chưa deploy.
 
 ## Chạy
 

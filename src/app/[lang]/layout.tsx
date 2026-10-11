@@ -4,7 +4,7 @@ import type { Metadata } from 'next';
 import { i18nProvider } from 'fumadocs-ui/i18n';
 import { Provider } from '@/components/provider';
 import { ProgressReplacements } from '@/components/progress/progress-replacements';
-import { getReplacements } from '@/lib/content/manifest';
+import { getReplacements, getSearchScope } from '@/lib/content/manifest';
 import { i18n, isLanguage } from '@/lib/i18n';
 import { translations } from '@/lib/layout.shared';
 import { getMessages } from '@/lib/messages';
@@ -39,7 +39,7 @@ export default async function LangLayout(props: LayoutProps<'/[lang]'>) {
   return (
     <html lang={lang} className={`${bricolage.variable} ${beVietnam.variable} ${jetbrains.variable}`} suppressHydrationWarning>
       <body className="flex min-h-screen flex-col">
-        <Provider lang={lang} i18n={i18nProvider(translations, lang)} messages={getMessages(lang)}>
+        <Provider lang={lang} i18n={i18nProvider(translations, lang)} messages={getMessages(lang)} searchScope={getSearchScope()}>
           <ProgressReplacements replacements={getReplacements()} />
           {props.children}
         </Provider>

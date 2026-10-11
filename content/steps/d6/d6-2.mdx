@@ -1,0 +1,888 @@
+---
+title: Dockerfile tốt, registry, tag và quét lỗ hổng
+description: Đưa một service Go từ image 118 MB chạy root xuống 3,8 MB chạy user thường bằng multi-stage, distroless và cache mount; đẩy lên registry cục bộ để thấy tag bị ghi đè còn digest thì không, build đa kiến trúc, rồi quét và vá lỗ hổng bằng Trivy đã ghim phiên bản.
+id: d6.2
+step: d6
+prerequisites: [d6.1]
+topics: [d6.dockerfile-tot, d6.registry-tag, d6.quet-lo-hong-image]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    buildx: 0.37.1 (BuildKit 0.33.0)
+    golang-image: 1.27.2-alpine
+    distroless: static-debian13:nonroot
+    registry: 3.1.2
+    trivy: 0.75.0
+    jq: 1.8.2
+---
+
+<Goal>
+
+Viết được Dockerfile cho một service bất kỳ sao cho image nhỏ, build nhanh, không chạy root, rồi phát hành và kiểm tra image đó như một artifact có định danh rõ ràng. Học xong bài này, bạn giải thích được:
+
+- Vì sao sửa một dòng code mà `docker build` tải lại toàn bộ dependency, và sửa thế nào.
+- Vì sao hai máy cùng chạy `price-api:1.0.0` lại ra hai phiên bản khác nhau, và digest giải quyết chuyện đó ra sao.
+- Vì sao image build trên Mac chip M chạy được trên server x86, và khi nào thì không.
+- Vì sao image distroless "0 lỗ hổng hệ điều hành" vẫn dính CVE mức HIGH, và máy quét biết điều đó từ đâu.
+
+</Goal>
+
+<Knowledge>
+
+### Dockerfile là công thức tạo layer
+
+D5.1 cho thấy mỗi lệnh `RUN`, `COPY`, `ADD` tạo một layer và layer không bao giờ mất. Hai hệ quả quyết định mọi thứ trong bài này:
+
+- **Kích thước và bề mặt tấn công**: thứ gì đã vào một layer của image cuối thì đi theo image mãi, kể cả compiler, mã nguồn, file tạm.
+- **Cache**: BuildKit (bộ build mặc định của Docker) dùng lại layer cũ nếu lệnh và đầu vào của nó không đổi. Với `COPY`, đầu vào là nội dung các file được chép. Một layer bị làm lại thì **mọi layer sau nó cũng bị làm lại**.
+
+SB11.1 đã áp hai ý này cho Spring Boot: multi-stage, base JRE, `USER`, `ENTRYPOINT` dạng exec, và xếp layer theo tần suất thay đổi. Bài này tổng quát hoá cho mọi ngôn ngữ, với ví dụ Go, và thêm những thứ SB11.1 chưa dùng: base distroless, cache mount, `.dockerignore` kiểu danh sách cho phép, health check không cần shell, build đa kiến trúc.
+
+| Quyết định | Làm gì | Vì sao |
+|---|---|---|
+| Multi-stage | Stage `build` có compiler; stage cuối chỉ `COPY --from=build` file chạy | Compiler, mã nguồn, cache build không vào image cuối |
+| Base tối thiểu | `distroless`, `-slim`, `alpine` hoặc `scratch` | Ít gói thì ít CVE, ít công cụ cho kẻ tấn công, kéo image nhanh |
+| Không chạy root | `USER` là uid khác 0, tốt nhất là số | Root trong container là uid 0 của máy chủ (D5.1); user thường giảm thiệt hại khi ứng dụng bị khai thác |
+| Thứ tự theo tần suất đổi | Chép file khai báo dependency, tải dependency, **rồi mới** chép mã nguồn | Sửa code không làm mất layer dependency |
+| `.dockerignore` | Chỉ gửi cho BuildKit những file build cần | `.git`, `.env`, `node_modules`, file tải về không lọt vào image qua `COPY . .`; build context nhỏ |
+| `ENTRYPOINT` dạng exec | `ENTRYPOINT ["/app"]`, không qua `sh -c` | Ứng dụng là PID 1 và nhận `SIGTERM` (D1.1 đã giải thích) |
+| Ghim phiên bản | `FROM golang:1.27.2-alpine`, không `FROM golang` | Build hôm nay và tháng sau ra cùng một thứ; nâng cấp là thay đổi có chủ đích |
+
+Chọn base image:
+
+| Base | Có gì | Kích thước nén | Hợp với | Lưu ý |
+|---|---|---|---|---|
+| `scratch` | Không gì cả | 0 | Binary tĩnh hoàn toàn | Không có CA certificate, múi giờ, `/etc/passwd`; phải tự chép |
+| `gcr.io/distroless/static` | CA cert, tzdata, `/etc/passwd` có user `nonroot` (65532) | khoảng 2 MB | Go, Rust build tĩnh | **Không shell, không trình quản lý gói** |
+| `gcr.io/distroless/base`, `java`, `python`, `nodejs` | Thêm glibc, hoặc runtime của ngôn ngữ | 10–100 MB | Ứng dụng cần libc hay runtime | Vẫn không có shell (trừ tag `:debug`) |
+| `alpine` | BusyBox, `apk`, thư viện C musl | khoảng 4 MB | Cần shell và vài gói nhỏ | musl khác glibc: thư viện native có thể lỗi lúc chạy (SB11.1 đã nêu với JVM) |
+| `debian:*-slim`, `ubuntu` | apt, glibc, bash | 30–80 MB | Cần nhiều gói hệ thống | Nhiều gói hơn thì nhiều CVE phải theo dõi hơn |
+
+Không có shell là tính năng bảo mật, nhưng đổi lại `docker exec … sh` không dùng được. Hai hệ quả: gỡ lỗi bằng container phụ dùng chung namespace (`docker run --pid=container:<tên> --network=container:<tên> …`, hoặc `kubectl debug` trên Kubernetes), và `HEALTHCHECK` không gọi được `curl` nên ứng dụng phải tự kiểm chính nó, như cờ `-healthcheck` của lab.
+
+<Check id="d6.2.dockerfile-decisions">Kể được bảy quyết định của một Dockerfile tốt cùng lý do, và chọn được base image cho một ứng dụng cụ thể.</Check>
+
+### Hai loại cache của BuildKit
+
+```text
+ Dockerfile "ngây thơ"                     Dockerfile tốt
+ FROM golang                               FROM golang AS build
+ COPY . .          ◀─ sửa 1 dòng code      COPY go.mod go.sum ./      ◀─ chỉ đổi khi đổi dependency
+ RUN go build         là layer này đổi     RUN go mod download           (layer cache: CACHED)
+   └─ tải lại mọi dependency,              COPY *.go ./               ◀─ sửa code: làm lại từ đây
+      biên dịch lại từ đầu                 RUN --mount=type=cache… go build
+                                             └─ cache mount: thư mục cache của compiler
+                                                sống qua các lần build, KHÔNG nằm trong layer
+```
+
+- **Layer cache**: dùng lại nguyên một layer khi lệnh và đầu vào không đổi. Tận dụng bằng cách xếp lệnh ít đổi lên trước.
+- **Cache mount** (`RUN --mount=type=cache,target=<thư mục>`): gắn một thư mục bền vào lúc chạy `RUN`. Trình quản lý gói và compiler (Go, Maven, npm, pip, apt) để cache ở đó, nên ngay cả khi layer phải làm lại, chúng chỉ tải và biên dịch phần đã đổi. Thư mục này không vào image.
+
+Cache mount chỉ sống trên máy build. Runner CI dùng một lần thì mất nó sau mỗi job; khi đó dùng `--cache-to` và `--cache-from` để gửi layer cache lên registry (chặng D6).
+
+**Secret lúc build** cũng dùng cơ chế mount (bước 9 của lab chạy thử): `RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci` cùng `docker build --secret id=npmrc,src=$HOME/.npmrc`. File chỉ tồn tại trong lúc lệnh đó chạy, không vào layer nào. Đừng truyền secret qua `ARG` hay `ENV`: giá trị nằm lại trong `docker history` và trong config của image, như file `secret.env` ở D5.1.
+
+<Check id="d6.2.cache">Phân biệt được layer cache với cache mount, giải thích được vì sao `COPY . .` đặt trước lệnh tải dependency làm hỏng cache, và biết cách đưa secret vào lúc build mà không để lại trong layer.</Check>
+
+### Một image, nhiều kiến trúc
+
+D5.1 đã thấy index của `alpine` trỏ tới tám manifest. Image bạn build mặc định chỉ có một: kiến trúc của máy build. Build trên Mac chip M (arm64) rồi chạy trên server x86 (amd64) sẽ báo `exec format error`, hoặc chạy rất chậm qua giả lập (SB11.2 đã gặp với Jib).
+
+`docker buildx build --platform linux/amd64,linux/arm64` build từng kiến trúc rồi gói vào một index. Có hai cách tạo ra binary của kiến trúc khác:
+
+| Cách | Hoạt động | Tốc độ |
+|---|---|---|
+| Giả lập (QEMU) | Chạy cả stage build dưới giả lập CPU đích | Chậm hơn nhiều lần; không cần sửa Dockerfile |
+| Cross-compile | Stage build chạy trên kiến trúc **máy build** (`FROM --platform=$BUILDPLATFORM`), compiler xuất binary cho `$TARGETARCH` | Gần như không chậm hơn; cần ngôn ngữ hỗ trợ (Go, Rust, .NET), và Java, Python, Node thuần thì không cần biên dịch lại |
+
+<Check id="d6.2.multi-arch">Giải thích được image đa kiến trúc là gì, và khác biệt giữa build bằng giả lập với cross-compile qua `BUILDPLATFORM`, `TARGETARCH`.</Check>
+
+### Registry, tag và digest
+
+**Registry** là một máy chủ HTTP lưu blob và manifest theo OCI Distribution Spec: `GET /v2/<repo>/manifests/<tag hoặc digest>`, `GET /v2/<repo>/blobs/<digest>`. Tên đầy đủ của image là `<registry>/<repo>:<tag>`; thiếu registry thì Docker hiểu là Docker Hub.
+
+```text
+ localhost:9510/price-api:1.0.0 ──▶ sha256:2d4f8da9…   hôm nay
+                          :1.0.0 ──▶ sha256:a29f1587…   sau khi ai đó push đè
+ localhost:9510/price-api@sha256:2d4f8da9…              luôn là đúng nội dung đó, hoặc không tải được
+```
+
+**Tag có thể bị ghi đè.** Nó là con trỏ, giống branch và tag của Git ở D4.1. `latest` không có gì đặc biệt: nó chỉ là tag mặc định khi bạn không ghi tag, và trỏ tới lần push cuối không kèm tag, chưa chắc là bản mới nhất hay ổn định nhất. **Digest thì bất biến**: nó là hash của nội dung, đổi một byte là đổi digest.
+
+| Cách đặt tag | Ví dụ | Dùng khi | Rủi ro |
+|---|---|---|---|
+| `latest` hoặc tên nhánh | `app:latest`, `app:main` | Thử nhanh trên máy mình | Không biết đang chạy bản nào; rollback không được; hai node kéo ở hai thời điểm ra hai bản |
+| Phiên bản | `app:1.4.2` | Phát hành có số phiên bản | Vẫn bị ghi đè được nếu registry cho phép |
+| Git SHA | `app:9ddedf5` | Mỗi commit trên nhánh chính một image (CI/CD) | Tên khó đọc; nên kèm tag phiên bản |
+| Digest | `app@sha256:2d4f…` | Manifest triển khai, `FROM` trong Dockerfile | Không tự nhận bản vá; cần công cụ mở PR khi có digest mới (Renovate, Dependabot) |
+
+Thực hành tốt: CI đặt tag không trùng lặp (phiên bản hoặc Git SHA), registry bật **tag bất biến** (ECR và Harbor đều có tuỳ chọn này; `registry:3` dùng trong lab thì không), và nơi triển khai ghi nhận hoặc ghim digest. Kubernetes ghi digest thật của image đang chạy trong `status.containerStatuses[].imageID` (chặng K1).
+
+<Callout kind="production">
+
+Ngày 19/03/2026, kẻ tấn công dùng thông tin xác thực đánh cắp từ trước của dự án Trivy để force-push **76 trên 77 tag** phiên bản của `aquasecurity/trivy-action` và cả 7 tag của `setup-trivy` sang commit chứa mã đánh cắp secret, đồng thời phát hành Trivy v0.69.4 độc hại (binary và image); ngày 22/03, image `aquasec/trivy` tag 0.69.5 và 0.69.6 độc hại xuất hiện trên Docker Hub trong khoảng mười giờ (số liệu theo advisory GHSA-69fq-xp46-6x23 của dự án, CVE-2026-33634). Pipeline nào ghi `uses: aquasecurity/trivy-action@<tag>` tiếp tục chạy "bình thường": mã độc thu token cloud, khoá SSH, token Kubernetes trong runner rồi mới chạy bước quét thật, nên log vẫn xanh. Khuyến nghị của advisory: ghim action theo commit SHA đầy đủ thay vì tag, và coi mọi secret mà pipeline bị ảnh hưởng đọc được là đã lộ. Ghim cũng có điều kiện: ai ghim `trivy-action` vào một commit trước 09/04/2025 vẫn có thể dính, vì bản action cũ đó tự kéo `setup-trivy` **theo tag**. Một mắt xích không ghim là đủ. Với image cũng vậy: lab ghim Trivy theo digest, không chỉ theo tag. Chặng D6 ghim action theo SHA; D14 xác minh chữ ký của image.
+
+</Callout>
+
+<Check id="d6.2.tags-digests">Giải thích được tag khác digest thế nào, vì sao `latest` không nên dùng để triển khai, và chọn được chiến lược đặt tag cho CI.</Check>
+
+### Quét lỗ hổng: máy quét biết gì và không biết gì
+
+Máy quét như Trivy hay Grype làm hai việc: **liệt kê thành phần** trong image (gói hệ điều hành từ cơ sở dữ liệu của `dpkg`, `apk`, `rpm`; thư viện của ứng dụng từ `go.mod`, thông tin build nhúng trong binary Go, file JAR, `package-lock.json`…), rồi **đối chiếu** tên và phiên bản với cơ sở dữ liệu lỗ hổng (NVD, GitHub Advisory, bản tin của từng bản phân phối).
+
+| Máy quét biết | Máy quét không biết |
+|---|---|
+| Gói X phiên bản Y có CVE đã công bố, và bản nào đã vá | Lỗ hổng chưa công bố, lỗi logic trong code của bạn |
+| Mức nghiêm trọng theo nhà cung cấp hoặc NVD | Ứng dụng có thật sự gọi tới đoạn code lỗi không |
+| Secret, cấu hình sai (các scanner khác của Trivy) | Thứ không có trong danh mục: binary tự tải bằng `curl`, thư viện chép tay |
+
+Dùng trong pipeline:
+
+- **Chặn theo ngưỡng**: `--severity HIGH,CRITICAL --exit-code 1` làm lệnh trả mã lỗi để CI dừng. Thêm `--ignore-unfixed` nếu không muốn chặn vì lỗ hổng chưa có bản vá.
+- **Ngoại lệ có thời hạn**: file `.trivyignore` liệt kê CVE đã đánh giá là không ảnh hưởng, kèm lý do và ngày xem lại. Ngoại lệ không hạn là nợ bị quên.
+- **Quét lại định kỳ**: image không đổi nhưng cơ sở dữ liệu đổi mỗi ngày. Image sạch hôm nay có thể có CVE nghiêm trọng tuần sau, nên phải quét cả image đang chạy, không chỉ lúc build.
+- **Giảm từ gốc**: base nhỏ có ít gói để dính CVE. Phần còn lại là dependency của ứng dụng, sửa bằng cách nâng phiên bản.
+
+<Check id="d6.2.scanning">Giải thích được máy quét tìm lỗ hổng bằng cách nào, nó không thấy được gì, và đặt được ngưỡng chặn trong pipeline.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Building best practices (Docker Docs)](https://docs.docker.com/build/building/best-practices/): danh sách khuyến nghị cho từng lệnh Dockerfile; đọc phần multi-stage, `.dockerignore`, ghim base image.
+- [Optimize cache usage in builds (Docker Docs)](https://docs.docker.com/build/cache/optimize/): thứ tự layer, cache mount, bind mount và cache ngoài cho CI.
+- [Multi-platform builds (Docker Docs)](https://docs.docker.com/build/building/multi-platform/): ba chiến lược build đa kiến trúc và các biến `BUILDPLATFORM`, `TARGETARCH`.
+- [Open Container Initiative Distribution Specification](https://github.com/opencontainers/distribution-spec/blob/main/spec.md): API mà bước 4 gọi bằng `curl`; đọc phần "Pulling manifests" và "Pushing manifests".
+- [Trivy ecosystem supply chain temporarily compromised (GHSA-69fq-xp46-6x23)](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23): advisory chính thức của vụ việc trong callout: phiên bản bị ảnh hưởng, khoảng thời gian, điều kiện với người đã ghim SHA và việc phải làm.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D5.1 (thư mục `~/masteva-d6`), Docker Desktop hoặc Docker Engine 29 đang chạy, có `curl`, `jq`, máy có mạng. Lab tải image Go (khoảng 72 MB), distroless (2 MB), registry (19 MB), Trivy (59 MB) và cơ sở dữ liệu lỗ hổng của nó: tải về khoảng 100 MB dạng nén, giải ra chiếm khoảng 1,4 GB trong volume `d5-trivy-cache` (bước 7 đo lại), nên Docker cần còn chừng 2 GB đĩa trống. Dùng các cổng **9510** (registry) và **9520–9524**. Không cần cài Go: mọi lệnh Go chạy trong container. **Profile máy:** build Go cần khoảng 1 GB RAM trong vài chục giây; máy 8 GB với Docker VM 4 GB là đủ, build từng image một.
+
+### 0. Ứng dụng mẫu
+
+`price-api` là một service HTTP nhỏ viết bằng Go: `/price` trả giá đã định dạng kiểu Việt Nam cùng phiên bản, kiến trúc CPU và uid đang chạy; `/healthz` để kiểm tra sức khoẻ; nhận `SIGTERM` thì dừng êm. Nó dùng thư viện `golang.org/x/text` ở một phiên bản cũ có chủ đích, để bước 7 có thứ mà quét.
+
+<Terminal where="mac" title="~/masteva-d6/price-api">
+
+```bash
+mkdir -p ~/masteva-d6/price-api && cd ~/masteva-d6/price-api
+cat > main.go <<'EOF'
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"syscall"
+	"time"
+
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
+)
+
+var (
+	version = "dev" // ghi đè lúc build: -ldflags "-X main.version=..."
+	mux     = http.NewServeMux()
+	printer = message.NewPrinter(language.Vietnamese)
+)
+
+func main() {
+	healthcheck := flag.Bool("healthcheck", false, "gọi /healthz của chính nó rồi thoát với mã 0 hoặc 1")
+	flag.Parse()
+	if *healthcheck {
+		os.Exit(checkHealth())
+	}
+
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("GET /price", func(w http.ResponseWriter, r *http.Request) {
+		host, _ := os.Hostname()
+		json.NewEncoder(w).Encode(map[string]string{
+			"price":   printer.Sprintf("%d đ", 1250000),
+			"version": version,
+			"arch":    runtime.GOARCH,
+			"uid":     strconv.Itoa(os.Getuid()),
+			"host":    host,
+		})
+	})
+
+	srv := &http.Server{Addr: ":8080", Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	log.Printf("price-api %s listening on :8080", version)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	log.Printf("got %s, shutting down", <-stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+	log.Print("bye")
+}
+
+func checkHealth() int {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:8080/healthz")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
+}
+EOF
+cat > go.mod <<'EOF'
+module example.com/price-api
+
+go 1.27
+
+require golang.org/x/text v0.3.7
+EOF
+cat > go.sum <<'EOF'
+golang.org/x/text v0.3.7 h1:olpwvP2KacW1ZWvsR7uQhoyTYvKAupfQrRGBFM352Gk=
+golang.org/x/text v0.3.7/go.mod h1:u+2+/6zg+i71rQMx5EYifcz6MCKuco9NR6JIITiCfzQ=
+EOF
+docker pull -q golang:1.27.2-alpine
+docker pull -q gcr.io/distroless/static-debian13:nonroot
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+docker.io/library/golang:1.27.2-alpine
+gcr.io/distroless/static-debian13:nonroot
+```
+
+</Expected>
+
+`go.sum` chứa hash của module, để Go từ chối nếu nội dung tải về khác với lần đầu: cùng ý tưởng "địa chỉ theo nội dung" của digest.
+
+### 1. Dockerfile ngây thơ
+
+Viết Dockerfile theo cách đầu tiên ai cũng nghĩ tới: lấy image có Go, chép hết vào, build, chạy.
+
+<Terminal where="mac">
+
+```bash
+cat > Dockerfile.naive <<'EOF'
+FROM golang:1.27.2-alpine
+WORKDIR /src
+COPY . .
+RUN go build -o /usr/local/bin/price-api .
+EXPOSE 8080
+CMD ["price-api"]
+EOF
+docker build -q -f Dockerfile.naive -t d5-price-api:naive .
+docker run -d --name d5-naive -p 9520:8080 d5-price-api:naive
+sleep 2; curl -s localhost:9520/price
+docker image ls d5-price-api
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+sha256:a447e8170b373d42ecc4de34396fe42603687ff4c1a751d19ce5c40e4225df65
+38c441211fcfe57adf1fdbc23372b28a46aff171981540c4d07c78ab825d7bba
+{"arch":"arm64","host":"38c441211fcf","price":"1.250.000 đ","uid":"0","version":"dev"}
+IMAGE                ID             DISK USAGE   CONTENT SIZE   EXTRA
+d5-price-api:naive   a447e8170b37        581MB          118MB   U    
+```
+
+</Expected>
+
+Nó chạy, và đó là lý do Dockerfile kiểu này tồn tại khắp nơi. Nhưng: image nặng **118 MB** nén (581 MB trên đĩa) cho một binary vài MB, vì mang theo cả bộ công cụ Go và mã nguồn; tiến trình chạy bằng **uid 0**; và `COPY . .` chép mọi thứ trong thư mục, kể cả chính các Dockerfile. ID và hostname trên máy bạn sẽ khác; máy Intel in `"arch":"amd64"`.
+
+### 2. Dockerfile tốt
+
+<Terminal where="mac" title="Dockerfile và .dockerignore">
+
+```bash
+cat > Dockerfile <<'EOF'
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY *.go ./
+ARG TARGETOS TARGETARCH VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/price-api .
+
+FROM gcr.io/distroless/static-debian13:nonroot
+COPY --from=build /out/price-api /price-api
+USER 65532:65532
+EXPOSE 8080
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["/price-api", "-healthcheck"]
+ENTRYPOINT ["/price-api"]
+EOF
+cat > .dockerignore <<'EOF'
+*
+!go.mod
+!go.sum
+!*.go
+EOF
+docker build -q --build-arg VERSION=1.0.0 -t d5-price-api:1.0.0 .
+docker image ls d5-price-api
+docker history --format 'table {{.Size}}\t{{.CreatedBy}}' d5-price-api:1.0.0 | head -7
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+sha256:2d4f8da9bdc551a94fc59056c97544d051a8240de9972ae32a756278478dee0f
+IMAGE                ID             DISK USAGE   CONTENT SIZE   EXTRA
+d5-price-api:1.0.0   2d4f8da9bdc5       16.5MB         3.79MB        
+d5-price-api:naive   a447e8170b37        581MB          118MB   U    
+SIZE      CREATED BY
+0B        ENTRYPOINT ["/price-api"]
+0B        HEALTHCHECK {Test:[CMD /price-api -healthche…
+0B        EXPOSE [8080/tcp]
+0B        USER 65532:65532
+6.89MB    COPY /out/price-api /price-api # buildkit
+319kB     bazel build //common:cacerts_debian13_arm64_…
+```
+
+</Expected>
+
+Từ 118 MB xuống **3,79 MB**. Từng dòng đáng chú ý:
+
+- `# syntax=docker/dockerfile:1`: dùng bản mới nhất của cú pháp Dockerfile dòng 1.x, không phụ thuộc phiên bản Docker trên máy build.
+- `FROM --platform=$BUILDPLATFORM … AS build`: stage build luôn chạy trên kiến trúc của máy build; `GOOS`, `GOARCH` lấy từ `TARGETOS`, `TARGETARCH` để cross-compile (dùng ở bước 6).
+- `COPY go.mod go.sum` rồi `go mod download`, sau đó mới `COPY *.go`: layer dependency chỉ làm lại khi đổi dependency.
+- Hai cache mount: thư mục module và cache biên dịch của Go sống qua các lần build.
+- `CGO_ENABLED=0` cho binary tĩnh, không cần libc, nên chạy được trên `distroless/static`. `-trimpath` bỏ đường dẫn máy build khỏi binary; `-s -w` bỏ bảng ký hiệu debug; `-X main.version` ghi phiên bản vào binary.
+- `USER 65532:65532` ghi uid và gid bằng **số** (chính là user `nonroot` của distroless). Tên user chỉ có nghĩa khi `/etc/passwd` của image có nó, còn số thì runtime và Kubernetes (`runAsNonRoot`) kiểm được mà không cần mở image.
+- Stage cuối chỉ có một layer của bạn: file `/price-api` 6,89 MB. Các dòng `bazel build …` là layer của distroless.
+- `.dockerignore` viết kiểu **danh sách cho phép**: loại tất cả (`*`), rồi mở lại đúng những gì build cần. File mới thêm vào thư mục (key, `.env`, file tải về) mặc định không vào build context.
+
+Chạy nó và kiểm tra ba thứ: uid, shell, health check.
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name d5-api -p 9521:8080 d5-price-api:1.0.0
+sleep 7
+curl -s localhost:9521/price
+docker ps --filter name=d5-api --format '{{.Names}}  {{.Status}}'
+docker exec d5-api sh -c id
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+049641ae7842eedfa3c3fc3e68ef1bb301bcc76011073b821d97898946722da7
+{"arch":"arm64","host":"049641ae7842","price":"1.250.000 đ","uid":"65532","version":"1.0.0"}
+d5-api  Up 7 seconds (healthy)
+OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH
+```
+
+</Expected>
+
+Ứng dụng chạy bằng uid 65532. `(healthy)` xuất hiện sau lần kiểm đầu tiên, nên lệnh chờ 7 giây; Docker chạy `/price-api -healthcheck` trong container mỗi 5 giây và đọc exit code. Không có `sh` để `exec` vào: kẻ tấn công chiếm được tiến trình cũng không có shell, `curl` hay trình quản lý gói để dùng tiếp.
+
+<Callout kind="danger">
+
+`docker rm` xoá vĩnh viễn container cùng log và lớp ghi của nó. Trong bài này, lệnh `docker rm` và `docker rm -f` chỉ dùng cho các container tên `d5-…` do lab vừa tạo; image vẫn được giữ.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+s=$(date +%s); docker stop d5-naive d5-api; echo "dừng mất $(( $(date +%s) - s )) giây"
+docker logs d5-api
+docker rm d5-naive d5-api
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d5-naive
+d5-api
+dừng mất 0 giây
+2026/10/10 02:03:30 price-api 1.0.0 listening on :8080
+2026/10/10 02:03:37 got terminated, shutting down
+2026/10/10 02:03:37 bye
+d5-naive
+d5-api
+```
+
+</Expected>
+
+Cả hai dừng tức thì (bạn có thể thấy 0 hoặc 1 giây) vì binary là PID 1 và tự xử lý `SIGTERM`, đúng chuỗi dừng êm của D1.1; giờ trong log là UTC và sẽ khác trên máy bạn.
+
+<Check id="d6.2.lab-dockerfile">Viết được Dockerfile multi-stage với distroless, user thường, health check không cần shell, và chứng minh được bằng số liệu: kích thước, uid, trạng thái healthy.</Check>
+
+### 3. Sửa một dòng code, build lại
+
+Sửa một dòng log rồi build lại cả hai Dockerfile. `--progress=plain` in log dạng văn bản để lọc được:
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/listening on :8080"/listening on :8080, uid %d"/; s/version\)$/version, os.Getuid())/' main.go
+grep -n 'listening' main.go
+s=$(date +%s); docker build --progress=plain -f Dockerfile.naive -t d5-price-api:naive . 2>&1 | grep -E 'downloading'; echo "naive: $(( $(date +%s) - s )) giây"
+s=$(date +%s); docker build --progress=plain --build-arg VERSION=1.0.1 -t d5-price-api:1.0.1 . 2>&1 | grep -A1 -E '^#[0-9]+ \[build [3-6]/6\]' | grep -v -e '^--'; echo "tốt: $(( $(date +%s) - s )) giây"
+```
+
+</Terminal>
+
+<Predict question="Bản naive có tải lại golang.org/x/text không, dù go.mod không đổi? Ở bản tốt, bước nào được CACHED?">
+
+```text
+53:	log.Printf("price-api %s listening on :8080, uid %d", version, os.Getuid())
+#8 0.212 go: downloading golang.org/x/text v0.3.7
+naive: 19 giây
+#11 [build 3/6] COPY go.mod go.sum ./
+#11 CACHED
+#12 [build 4/6] RUN --mount=type=cache,target=/go/pkg/mod go mod download
+#12 CACHED
+#13 [build 5/6] COPY *.go ./
+#13 DONE 0.0s
+#14 [build 6/6] RUN --mount=type=cache,target=/go/pkg/mod     --mount=type=cache,target=/root/.cache/go-build     CGO_ENABLED=0 GOOS=linux GOARCH=arm64     go build -trimpath -ldflags="-s -w -X main.version=1.0.1" -o /out/price-api .
+#14 DONE 1.0s
+tốt: 3 giây
+```
+
+Bản naive tải lại module và biên dịch lại cả thư viện chuẩn: `COPY . .` đổi vì `main.go` đổi, nên layer `go build` phía sau không dùng lại được, và nó không có cache nào khác. Bản tốt giữ nguyên hai bước dependency (`CACHED`), chỉ chép lại mã nguồn và biên dịch lại đúng package đã đổi trong 1,0 giây nhờ cache mount. Số giây trên máy bạn sẽ khác; tỉ lệ thì tương tự, và với project thật có vài trăm dependency thì khoảng cách là vài phút mỗi lần build. Nếu bạn chạy lại cả lab lần thứ hai với đúng nội dung này, cả hai bản build đều `CACHED` toàn bộ và xong trong vài giây: BuildKit nhận ra đã từng build đúng đầu vào đó. Muốn đo lại, sửa dòng log thành một chuỗi khác.
+
+</Predict>
+
+<Check id="d6.2.lab-cache">Chứng minh được bằng log `CACHED` và thời gian build rằng thứ tự `COPY` cùng cache mount giữ được cache khi chỉ sửa code.</Check>
+
+### 4. Registry cục bộ
+
+Chạy một registry (bản tham chiếu của CNCF Distribution) và đẩy image lên:
+
+<Terminal where="mac">
+
+```bash
+docker network create d5-net
+docker run -d --name d5-registry --network d5-net -p 9510:5000 -v d5-registry-data:/var/lib/registry registry:3.1.2
+sleep 2
+docker tag d5-price-api:1.0.0 localhost:9510/price-api:1.0.0
+docker push localhost:9510/price-api:1.0.0 | tail -1
+curl -s localhost:9510/v2/_catalog
+curl -s localhost:9510/v2/price-api/tags/list
+curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' localhost:9510/v2/price-api/manifests/1.0.0 | grep -i -E '^(content-type|docker-content-digest)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2a1578c5690b004ee5756014b2987d67b496c5d3a594ed19f13a898dc9cd601d
+d3867cecddedffcdce8b2f1897754b6905ed4ba368fd314adeaa80e058671e96
+1.0.0: digest: sha256:2d4f8da9bdc551a94fc59056c97544d051a8240de9972ae32a756278478dee0f size: 856
+{"repositories":["price-api"]}
+{"name":"price-api","tags":["1.0.0"]}
+Content-Type: application/vnd.oci.image.index.v1+json
+Docker-Content-Digest: sha256:2d4f8da9bdc551a94fc59056c97544d051a8240de9972ae32a756278478dee0f
+```
+
+</Expected>
+
+`docker tag` không chép gì, chỉ thêm một tên cho cùng image; tên bắt đầu bằng `localhost:9510/` cho Docker biết đẩy đi đâu. Ba lệnh `curl` gọi thẳng API của Distribution Spec: danh sách repo, danh sách tag, và manifest của tag `1.0.0`, mà digest trùng với `IMAGE ID` ở bước 2. Digest trên máy bạn sẽ khác, vì binary của bạn được build ở thời điểm khác với base có thể khác. Docker cho phép HTTP không mã hoá với `localhost`; registry thật luôn cần TLS và xác thực.
+
+### 5. Tag bị ghi đè, digest thì không
+
+Một đồng nghiệp build bản `1.0.1` nhưng đẩy lên với tag `1.0.0`:
+
+<Terminal where="mac">
+
+```bash
+OLD=$(curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' localhost:9510/v2/price-api/manifests/1.0.0 | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tr -d '\r')
+echo "OLD=$OLD"
+docker tag d5-price-api:1.0.1 localhost:9510/price-api:1.0.0
+docker push -q localhost:9510/price-api:1.0.0
+curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' localhost:9510/v2/price-api/manifests/1.0.0 | grep -i docker-content-digest
+docker rmi localhost:9510/price-api:1.0.0 >/dev/null
+docker run -d --name d5-tag -p 9522:8080 localhost:9510/price-api:1.0.0 >/dev/null 2>&1
+docker run -d --name d5-digest -p 9523:8080 localhost:9510/price-api@$OLD >/dev/null 2>&1
+sleep 2
+curl -s localhost:9522/price
+curl -s localhost:9523/price
+docker rm -f d5-tag d5-digest >/dev/null
+```
+
+</Terminal>
+
+<Predict question="Hai container cùng chạy 'price-api 1.0.0': một cái gọi theo tag, một cái theo digest cũ. Trường version của mỗi cái là gì?">
+
+```text
+OLD=sha256:2d4f8da9bdc551a94fc59056c97544d051a8240de9972ae32a756278478dee0f
+localhost:9510/price-api:1.0.0
+Docker-Content-Digest: sha256:a29f1587a4b34188f238df17de0283f1c18e0160497be8f194bba10846505f5c
+{"arch":"arm64","host":"e7e025dede75","price":"1.250.000 đ","uid":"65532","version":"1.0.1"}
+{"arch":"arm64","host":"a0640e8a9f82","price":"1.250.000 đ","uid":"65532","version":"1.0.0"}
+```
+
+Theo tag: `1.0.1`. Registry nhận lần push thứ hai không một lời cảnh báo, và tag `1.0.0` giờ trỏ tới digest khác. Máy nào đã kéo `1.0.0` từ trước vẫn chạy bản cũ; máy kéo sau chạy bản mới: cùng một tên, hai hành vi. Theo digest: vẫn đúng `1.0.0`, vì manifest cũ còn trong registry dù không còn tag nào trỏ tới (cho tới khi registry dọn rác).
+
+</Predict>
+
+`docker rmi` ở giữa chỉ xoá tên cục bộ, để lệnh `docker run` buộc phải kéo từ registry như một máy khác.
+
+<Check id="d6.2.lab-tag-digest">Tái hiện được việc một tag bị ghi đè làm hai lần pull ra hai phiên bản, và chạy được đúng phiên bản cũ bằng digest.</Check>
+
+### 6. Một tag, hai kiến trúc
+
+<Terminal where="mac">
+
+```bash
+s=$(date +%s)
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION=1.0.2 \
+  -t localhost:9510/price-api:1.0.2 --push . 2>&1 | grep -E 'ERROR|manifest list'
+echo "mất $(( $(date +%s) - s )) giây"
+curl -s -H 'Accept: application/vnd.oci.image.index.v1+json' localhost:9510/v2/price-api/manifests/1.0.2 \
+  | jq -c '.manifests[] | {platform: (.platform.os + "/" + .platform.architecture), size, type: .annotations["vnd.docker.reference.type"]}'
+docker run -d --name d5-amd64 --platform linux/amd64 -p 9524:8080 localhost:9510/price-api:1.0.2 >/dev/null 2>&1
+sleep 3; curl -s localhost:9524/price
+docker rm -f d5-amd64 >/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+#20 exporting manifest list sha256:dd9acad73db8b04b10d3226cfbd49d481d9691eed2f402a0f7f94df1e485f31a 0.0s done
+mất 6 giây
+{"platform":"linux/amd64","size":2939,"type":null}
+{"platform":"linux/arm64","size":2939,"type":null}
+{"platform":"unknown/unknown","size":837,"type":"attestation-manifest"}
+{"platform":"unknown/unknown","size":837,"type":"attestation-manifest"}
+{"arch":"amd64","host":"bc323c6bd339","price":"1.250.000 đ","uid":"65532","version":"1.0.2"}
+```
+
+</Expected>
+
+Build cả hai kiến trúc chỉ mất 6 giây vì Go cross-compile ngay trên CPU của máy build; không có bước nào chạy dưới giả lập. Tag `1.0.2` giờ là một index có hai manifest (và hai attestation ghi nguồn gốc bản build, D14 dùng tới). `docker run --platform linux/amd64` trên Mac chip M kéo bản amd64 và chạy nó qua lớp giả lập của Docker Desktop: `"arch":"amd64"`. Trên máy Intel, thử ngược lại với `--platform linux/arm64`; nếu Docker báo `exec format error`, máy chưa cài giả lập QEMU, và đó chính là lỗi bạn sẽ gặp khi đưa image sai kiến trúc lên server.
+
+<Check id="d6.2.lab-multi-arch">Build và push được image hai kiến trúc bằng cross-compile, và đọc được index của nó từ registry.</Check>
+
+### 7. Quét lỗ hổng bằng Trivy
+
+Trivy chạy bằng chính image của nó, ghim cả tag lẫn **digest**. Lấy digest sau khi kéo, rồi dùng dạng `tag@digest` cho mọi lần chạy:
+
+<Terminal where="mac">
+
+```bash
+docker pull -q aquasec/trivy:0.75.0
+docker image inspect aquasec/trivy:0.75.0 --format '{{index .RepoDigests 0}}'
+TRIVY=aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+docker run --rm --network d5-net -v d5-trivy-cache:/root/.cache/ $TRIVY \
+  image --insecure --scanners vuln --quiet d5-registry:5000/price-api:1.0.2 | sed -n '/Report Summary/,/^Legend/p'
+docker run --rm --network d5-net -v d5-trivy-cache:/root/.cache/ $TRIVY \
+  image --insecure --scanners vuln --quiet --format json d5-registry:5000/price-api:1.0.2 \
+  | jq -r '.Results[] | select(.Vulnerabilities) | .Vulnerabilities[] | "\(.Severity)  \(.VulnerabilityID)  \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion)"'
+docker run --rm -v d5-trivy-cache:/c alpine:3.24.2 du -sh /c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+docker.io/aquasec/trivy:0.75.0
+aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+Report Summary
+
+┌────────────────────────────────────────────────┬──────────┬─────────────────┐
+│                     Target                     │   Type   │ Vulnerabilities │
+├────────────────────────────────────────────────┼──────────┼─────────────────┤
+│ d5-registry:5000/price-api:1.0.2 (debian 13.7) │  debian  │        0        │
+├────────────────────────────────────────────────┼──────────┼─────────────────┤
+│ price-api                                      │ gobinary │        3        │
+└────────────────────────────────────────────────┴──────────┴─────────────────┘
+Legend:
+HIGH  CVE-2022-32149  golang.org/x/text v0.3.7 -> 0.3.8
+HIGH  CVE-2026-56852  golang.org/x/text v0.3.7 -> 0.39.0
+UNKNOWN  CVE-2026-56851  golang.org/x/text v0.3.7 -> 0.41.0
+1.4G	/c
+```
+
+</Expected>
+
+Nếu digest của `aquasec/trivy:0.75.0` trên máy bạn **khác** dòng thứ hai, dừng lại và tìm hiểu trước khi chạy: hoặc tag đã bị trỏ sang nội dung khác, hoặc bài đã cũ. Đó chính là kiểm tra mà ghim digest làm tự động.
+
+Trivy kéo image thẳng từ registry qua mạng `d5-net` (tên `d5-registry:5000` chỉ phân giải được trong mạng đó; D5.3 giải thích), `--insecure` vì registry lab không có TLS, volume `d5-trivy-cache` giữ cơ sở dữ liệu lỗ hổng cho lần chạy sau; dòng cuối cho thấy nó chiếm 1,4 GB sau khi giải nén, nên lần quét đầu tiên mất vài chục giây tới vài phút tuỳ mạng. Kết quả có hai phần:
+
+- **Hệ điều hành** (debian 13.7, tức distroless): 0 lỗ hổng. Base tối thiểu gần như không có gói nào để dính CVE.
+- **Binary Go**: 3 lỗ hổng, đều ở `golang.org/x/text v0.3.7`. Trivy đọc danh sách module trong thông tin build (buildinfo) nhúng sẵn trong binary Go, nên không cần mã nguồn.
+
+Số lượng và mã CVE phụ thuộc cơ sở dữ liệu ngày bạn chạy; có thể nhiều hơn bài. Giờ đóng vai CI: chặn khi có lỗ hổng HIGH trở lên, và so với image naive:
+
+<Terminal where="mac">
+
+```bash
+docker run --rm --network d5-net -v d5-trivy-cache:/root/.cache/ $TRIVY \
+  image --insecure --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --quiet \
+  d5-registry:5000/price-api:1.0.2 > /dev/null
+echo "exit=$?"
+docker save d5-price-api:naive -o ../naive.tar
+docker run --rm -v ~/masteva-d6:/work:ro -v d5-trivy-cache:/root/.cache/ $TRIVY \
+  image --scanners vuln --quiet --input /work/naive.tar | sed -n '/Report Summary/,/^Legend/p' | head -12
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+exit=1
+Report Summary
+
+┌──────────────────────────────────────────────┬──────────┬─────────────────┐
+│                    Target                    │   Type   │ Vulnerabilities │
+├──────────────────────────────────────────────┼──────────┼─────────────────┤
+│ /work/naive.tar (alpine 3.24.2)              │  alpine  │        1        │
+├──────────────────────────────────────────────┼──────────┼─────────────────┤
+│ usr/local/bin/price-api                      │ gobinary │        3        │
+├──────────────────────────────────────────────┼──────────┼─────────────────┤
+│ usr/local/go/bin/go                          │ gobinary │        0        │
+├──────────────────────────────────────────────┼──────────┼─────────────────┤
+│ usr/local/go/bin/gofmt                       │ gobinary │        0        │
+```
+
+</Expected>
+
+`exit=1` là thứ làm pipeline dừng. Image naive được quét từ file tar (`--input`), cách dùng khi image chưa lên registry: ngoài 3 lỗ hổng của ứng dụng còn thêm lỗ hổng của Alpine, và danh sách mục phải quét dài hơn nhiều (bảng đã cắt bớt) vì cả bộ công cụ Go nằm trong image.
+
+<Check id="d6.2.lab-scan">Quét được một image từ registry và từ file tar bằng Trivy đã ghim digest, đọc được phần hệ điều hành và phần thư viện ứng dụng, và dùng được `--exit-code` để chặn.</Check>
+
+### 8. Vá và quét lại
+
+Lỗ hổng nằm ở dependency của ứng dụng, nên cách sửa là nâng phiên bản, build lại, quét lại. `go get` chạy trong container Go, sửa `go.mod` và `go.sum` trên máy bạn qua bind mount:
+
+<Terminal where="mac">
+
+```bash
+docker run --rm -v "$PWD":/src -w /src golang:1.27.2-alpine go get golang.org/x/text@v0.42.0
+cat go.mod
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION=1.0.3 \
+  -t localhost:9510/price-api:1.0.3 --push . 2>&1 | grep -E 'ERROR'
+docker run --rm --network d5-net -v d5-trivy-cache:/root/.cache/ $TRIVY \
+  image --insecure --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --quiet \
+  d5-registry:5000/price-api:1.0.3
+echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+go: downloading golang.org/x/text v0.42.0
+go: upgraded golang.org/x/text v0.3.7 => v0.42.0
+module example.com/price-api
+
+go 1.27
+
+require golang.org/x/text v0.42.0
+
+Report Summary
+
+┌────────────────────────────────────────────────┬──────────┬─────────────────┐
+│                     Target                     │   Type   │ Vulnerabilities │
+├────────────────────────────────────────────────┼──────────┼─────────────────┤
+│ d5-registry:5000/price-api:1.0.3 (debian 13.7) │  debian  │        0        │
+├────────────────────────────────────────────────┼──────────┼─────────────────┤
+│ price-api                                      │ gobinary │        0        │
+└────────────────────────────────────────────────┴──────────┴─────────────────┘
+Legend:
+- '-': Not scanned
+- '0': Clean (no security findings detected)
+
+exit=0
+```
+
+</Expected>
+
+Bản vá là một phiên bản **mới** (`1.0.3`) với digest mới, không phải ghi đè `1.0.2`. Lệnh `grep ERROR` không in gì nghĩa là build và push thành công.
+
+<Check id="d6.2.lab-fix">Vá được lỗ hổng bằng cách nâng dependency, phát hành thành phiên bản mới và chứng minh bằng lần quét có `exit=0`.</Check>
+
+### 9. Secret lúc build: ARG để lại dấu, secret mount thì không
+
+D5.1 đã lấy lại một file secret từ layer cũ. Giờ so hai cách đưa một token vào lúc build: qua `ARG`, và qua secret mount của BuildKit. Token là giá trị giả, nằm **ngoài** build context:
+
+<Terminal where="mac">
+
+```bash
+printf 'lab-token-khong-co-that\n' > ../token.txt
+cat > Dockerfile.secret <<'EOF'
+# syntax=docker/dockerfile:1
+FROM alpine:3.24.2
+ARG LEAKY_TOKEN
+RUN echo "ARG: dùng token dài ${#LEAKY_TOKEN} ký tự"
+RUN --mount=type=secret,id=token \
+    echo "secret mount: đọc được $(wc -c < /run/secrets/token) byte" && \
+    sha256sum /run/secrets/token | cut -c1-12 > /token.sha
+EOF
+docker build --progress=plain -f Dockerfile.secret -t d5-secret:demo \
+  --build-arg LEAKY_TOKEN="$(cat ../token.txt)" --secret id=token,src=../token.txt . 2>&1 | grep -E 'ARG: |secret mount: '
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+#7 [stage-0 2/3] RUN echo "ARG: dùng token dài ${#LEAKY_TOKEN} ký tự"
+#7 0.130 ARG: dùng token dài 23 ký tự
+#8 [stage-0 3/3] RUN --mount=type=secret,id=token     echo "secret mount: đọc được $(wc -c < /run/secrets/token) byte" &&     sha256sum /run/secrets/token | cut -c1-12 > /token.sha
+#8 0.113 secret mount: đọc được 24 byte
+```
+
+</Expected>
+
+Cả hai lệnh `RUN` đều dùng được token trong lúc build (24 byte là 23 ký tự cộng dấu xuống dòng). Khác biệt nằm ở thứ còn lại sau đó:
+
+<Terminal where="mac">
+
+```bash
+docker history --no-trunc --format '{{.CreatedBy}}' d5-secret:demo | grep -c 'lab-token-khong-co-that'
+docker run --rm d5-secret:demo sh -c 'cat /token.sha; ls -A /run/secrets | wc -l'
+mkdir -p ../secret-oci && docker save d5-secret:demo | tar -x -C ../secret-oci
+for b in ../secret-oci/blobs/sha256/*; do gunzip -c "$b" 2>/dev/null; done | grep -a -c 'lab-token-khong-co-that'
+grep -l 'lab-token-khong-co-that' ../secret-oci/blobs/sha256/* | wc -l
+```
+
+</Terminal>
+
+<Predict question="Token có xuất hiện trong docker history không? Trong layer nào không?">
+
+```text
+3
+0fb1b78da3af
+ls: /run/secrets: No such file or directory
+0
+0
+       1
+```
+
+- `docker history` có **3 dòng** chứa nguyên văn token: BuildKit ghi giá trị của `ARG` vào lịch sử của mọi lệnh đứng sau nó. Ai kéo được image là đọc được.
+- Container có file `/token.sha` (kết quả của việc dùng secret) nhưng không có `/run/secrets`: file secret chỉ được gắn vào trong lúc lệnh `RUN` đó chạy.
+- Giải nén mọi layer rồi tìm token: `0` lần. Secret mount không để lại gì trong layer.
+- Dòng cuối tìm trong các blob chưa giải nén và thấy đúng `1` file chứa token: đó là blob **config** của image, nơi lưu lịch sử build, tức vẫn là lỗi của `ARG`.
+
+</Predict>
+
+Bỏ dòng `ARG` đi thì image không còn dấu vết nào của token. Trong CI, token đến từ kho secret của pipeline và được truyền bằng `--secret id=token,env=TEN_BIEN` thay vì file.
+
+<Check id="d6.2.lab-secret">Chứng minh được giá trị truyền qua `ARG` nằm lại trong lịch sử image còn secret mount thì không có trong layer nào.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`failed to solve: … "/go.sum": not found`:** `.dockerignore` đã loại file, hoặc bạn chưa tạo `go.sum`. Kiểm bằng `ls go.*`.
+- **`missing go.sum entry for module providing package golang.org/x/text/…`:** nội dung `go.sum` khác bài một ký tự. Tạo lại bằng `docker run --rm -v "$PWD":/src -w /src golang:1.27.2-alpine go mod tidy`.
+- **`http: server gave HTTP response to HTTPS client`** khi push: tên registry không phải `localhost`. Docker chỉ tự cho phép HTTP với `localhost` và `127.0.0.0/8`; registry khác phải có TLS hoặc khai báo `insecure-registries` (chỉ cho lab).
+- **`ERROR: Multi-platform build is not supported for the docker driver`:** Docker chưa bật containerd image store (xem phần Chuẩn bị của D5.1). Bật nó, hoặc tạo builder riêng bằng `docker buildx create --use`.
+- **Trivy báo `FATAL … failed to download vulnerability DB`:** mạng chặn `mirror.gcr.io` hay `ghcr.io`, hoặc bị giới hạn tốc độ. Chạy lại sau ít phút; volume `d5-trivy-cache` giữ phần đã tải.
+- **`curl` in rỗng ngay sau `docker run`:** ứng dụng chưa kịp lắng nghe. Chờ thêm một giây rồi gọi lại.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá container registry, volume `d5-registry-data` (mọi image đã push) và `d5-trivy-cache`, mạng `d5-net`, mọi image `d5-price-api`, `d5-secret` và `localhost:9510/price-api` trên máy, cùng các file `naive.tar`, `token.txt` và thư mục `secret-oci`. Giữ lại thư mục `~/masteva-d6/price-api` và các base image: D5.3 dùng tiếp.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+docker rm -f d5-registry
+docker network rm d5-net
+docker volume rm d5-registry-data d5-trivy-cache
+docker rmi -f $(docker images -q --filter reference='d5-price-api' --filter reference='d5-secret' --filter reference='localhost:9510/price-api' | sort -u)
+cd ~/masteva-d6 && rm -rf naive.tar token.txt secret-oci
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Distroless, alpine hay scratch: chọn theo tiêu chí nào?">
+
+Hỏi theo thứ tự. Ứng dụng có phải binary tĩnh hoàn toàn không (Go với `CGO_ENABLED=0`, Rust với musl)? Có thì `distroless/static`: nó hơn `scratch` ở CA certificate, tzdata và user `nonroot` có sẵn, với giá khoảng 2 MB. Cần glibc hay runtime (JVM, Python, Node)? Dùng biến thể distroless tương ứng hoặc `-slim` chính thức của ngôn ngữ. Cần shell và cài thêm gói lúc build image? `alpine` hoặc `debian-slim`, và cân nhắc để công cụ đó ở stage build thay vì stage cuối. Khác biệt vài MB giữa các lựa chọn ít quan trọng hơn hai câu hỏi: image cuối có bao nhiêu gói phải theo dõi CVE, và đội có quy trình gỡ lỗi khi không có shell chưa.
+
+</Reveal>
+
+<Reveal title="Ghim base image theo digest thì ai cập nhật bản vá?">
+
+SB11.1 đã nêu đánh đổi này với `eclipse-temurin:25-jre`. Tóm lại: tag `1.27.2-alpine` vẫn có thể được build lại (khi Alpine vá gói), nên hai lần build cách nhau một tháng ra hai image khác nhau; ghim `FROM golang:1.27.2-alpine@sha256:…` cho build tái lập. Việc cập nhật giao cho công cụ: Renovate hoặc Dependabot theo dõi tag, mở pull request đổi digest, CI build và quét, người review merge. Như vậy bản vá của base vẫn tới, nhưng qua một thay đổi có review (D4.2) thay vì âm thầm. Chặng D6 dựng quy trình đó.
+
+</Reveal>
+
+<Reveal title="Image sạch 0 CVE có nghĩa là an toàn không?">
+
+Không. Nó chỉ có nghĩa: không thành phần nào **máy quét nhận ra** có CVE **đã công bố** tính tới **ngày cơ sở dữ liệu được tải**. Code của bạn có thể có SQL injection; một binary tải bằng `curl` trong Dockerfile không nằm trong danh mục nào; và CVE mới được công bố mỗi ngày. Ngược lại, 50 CVE cũng chưa chắc là nguy hiểm: nhiều cái nằm ở code ứng dụng không bao giờ gọi tới. Quét là một lớp kiểm tra rẻ và nên có, bên cạnh ghim và xác minh nguồn gốc (D14), quyền tối thiểu lúc chạy (D5.1, K8) và quét lại định kỳ.
+
+</Reveal>
+
+<Reveal title="Vì sao ghim Trivy theo digest mà vụ 03/2026 vẫn ảnh hưởng nhiều pipeline?">
+
+Vì đa số pipeline không ghim. Người dùng `trivy-action@<tag>` nhận ngay commit độc khi tag bị force-push; người kéo `aquasec/trivy:latest` hay tag mới nhất trong mấy ngày đó nhận image độc. Ghim theo commit SHA và theo digest của một bản trước sự cố thì nội dung **bạn tham chiếu trực tiếp** không đổi được, nhưng chưa đủ để nói "không bị ảnh hưởng": advisory ghi rõ các commit `trivy-action` trước 09/04/2025 gọi `setup-trivy` theo tag, nên ghim vào đó vẫn kéo mã độc về trong khoảng thời gian tag kia bị chiếm. Phải ghim cả chuỗi phụ thuộc, hoặc dùng bản đã tự ghim các bước bên trong. Ghim cũng không cứu nếu bạn ghim đúng vào bản độc, nên vẫn cần cập nhật có kiểm soát: đợi vài ngày sau khi phát hành, đọc thay đổi, và giới hạn secret mà bước quét đọc được. Máy quét bảo mật chạy trong CI có quyền đọc mã nguồn và thường cả secret, nên chính nó là mục tiêu giá trị cao.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết nháp Dockerfile cho một ngôn ngữ bạn chưa quen, hoặc giải thích một dòng báo cáo của Trivy, là cách dùng tốt. AI hay sai theo kiểu cũ: `FROM golang:latest` hay base không ghim phiên bản, `COPY . .` trước bước tải dependency, không có `USER`, `apt-get install` không dọn cache, `ADD` thay cho `COPY`, và ví dụ multi-arch dùng lệnh `docker manifest` thủ công thay cho `buildx`. AI cũng có thể bịa digest hay số phiên bản. Kiểm lại bằng các lệnh của lab: `docker image ls` (kích thước), `curl …/price` (uid), `docker history`, build lại sau khi sửa một dòng để xem `CACHED`, và chạy Trivy. Digest và phiên bản luôn lấy từ registry, không lấy từ câu trả lời của AI.
+
+</Callout>
+
+<Callout kind="link">
+
+D5.3 chạy `price-api` cùng các service khác bằng Compose, với volume và network. Chặng D6 đưa build, push và quét vào pipeline, dùng cache qua registry và ghim action theo SHA. D14 ký image bằng cosign, tạo SBOM và dùng registry có tag bất biến. SB11.1 và SB11.2 áp cùng nguyên tắc cho Spring Boot bằng layered JAR, Jib và Buildpacks.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d6.2.mastery-dockerfile">Tự viết được Dockerfile cho một service của mình: multi-stage, base tối thiểu, user thường, cache giữ được khi sửa code, và đo được kết quả bằng kích thước, uid, thời gian build lại.</Check>
+
+<Check id="d6.2.mastery-release">Phát hành được image với tag không trùng lặp, đọc được digest của nó từ registry, và giải thích được vì sao nơi triển khai nên tham chiếu digest.</Check>
+
+<Check id="d6.2.mastery-scan">Thêm được bước quét có ngưỡng chặn vào quy trình build, phân biệt lỗ hổng của base với của dependency, và vá bằng một phiên bản mới.</Check>
+
+</Mastery>

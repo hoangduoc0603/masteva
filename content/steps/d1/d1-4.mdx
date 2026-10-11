@@ -1,0 +1,733 @@
+---
+title: Theo dõi tài nguyên và chẩn đoán sự cố
+description: Đọc CPU, bộ nhớ, đĩa bằng uptime, free, vmstat, iostat và PSI, rồi chẩn đoán bốn sự cố dựng sẵn theo một phương pháp có thứ tự. CPU bão hoà, dịch vụ bị OOM kill liên tục, đĩa đầy vì file đã xoá còn mở, và tiến trình treo vì chờ khoá.
+id: d1.4
+step: d1
+prerequisites: [d1.3]
+topics: [d1.theo-doi-tai-nguyen, d1.chan-doan-su-co]
+status: verified
+verified:
+  date: 2026-10-10
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    kernel: 7.0.0-28-generic
+    systemd: '259'
+    procps: 4.0.4
+    sysstat: 12.7.7
+    stress-ng: 0.20.01
+    strace: '6.19'
+    lsof: 4.99.4
+---
+
+<Goal>
+
+Khi một máy Linux "có vấn đề", biết nhìn vào đâu trước và đi theo thứ tự nào để tới nguyên nhân. Học xong bài này, bạn giải thích và xử lý được:
+
+- Vì sao load average cao không có nghĩa là CPU bận, và nên so nó với cái gì.
+- Vì sao `free` chỉ còn vài chục MB không phải là hết RAM.
+- Vì sao một dịch vụ "đang chạy" theo `systemctl status` nhưng thật ra cứ vài giây lại bị giết, và tìm bằng chứng OOM ở đâu.
+- Vì sao lỗi hiện ở dịch vụ này mà nguyên nhân nằm ở dịch vụ khác, và một tiến trình treo không tốn tài nguyên thì tìm bằng gì.
+
+</Goal>
+
+<Knowledge>
+
+### Nhìn một máy qua bốn tài nguyên
+
+Mọi sự cố hiệu năng rốt cuộc là một trong bốn tài nguyên bị dùng hết hoặc phải xếp hàng: CPU, bộ nhớ, đĩa (I/O), mạng (D2). Với mỗi tài nguyên, hỏi ba câu, gọi là phương pháp **USE** của Brendan Gregg:
+
+- **Utilization:** đang bận bao nhiêu phần trăm?
+- **Saturation:** có việc phải xếp hàng chờ không?
+- **Errors:** có lỗi không?
+
+| Tài nguyên | Mức dùng | Xếp hàng (bão hoà) | Lỗi |
+|---|---|---|---|
+| CPU | `vmstat` cột `us`+`sy`; `top` | `vmstat` cột `r` lớn hơn số CPU; PSI `cpu` | Hiếm |
+| Bộ nhớ | `free` cột `available` | `vmstat` cột `si`/`so`; PSI `memory` | OOM trong `journalctl -k` |
+| Đĩa | `iostat` cột `%util`; `df` | `iostat` cột `aqu-sz`, `await`; `vmstat` cột `b`, `wa`; PSI `io` | Lỗi I/O trong `journalctl -k` |
+| Mạng | `sar -n DEV`, `ss` (D2) | Hàng đợi socket, retransmit | `ip -s link` |
+
+Bão hoà quan trọng hơn mức dùng: CPU 100% mà không ai phải chờ là máy đang làm việc hết công suất; CPU 60% mà có hàng chờ dài là có vấn đề.
+
+### Load average không phải là CPU
+
+`uptime` in ba số load average cho 1, 5 và 15 phút. Trên Linux, load đếm số tiến trình đang ở một trong hai trạng thái mà D1.1 đã giới thiệu: `R` (đang chạy hoặc chờ CPU) **và** `D` (chờ I/O không ngắt được). Vì vậy:
+
+- Load phải so với **số CPU** (`nproc`). Load 2 trên máy 2 CPU là vừa khít; load 2 trên máy 16 CPU là rảnh.
+- Load cao có thể do CPU, hoặc do đĩa chậm, NFS treo: hàng chục tiến trình ở trạng thái `D` đẩy load lên trong khi CPU rảnh 90%. Nhìn `vmstat`: cột `r` cao là chờ CPU, cột `b` và `wa` cao là chờ I/O.
+- Load là trung bình có trễ: số 1 phút cần khoảng một phút mới phản ánh thay đổi.
+
+**PSI** (Pressure Stall Information) trả lời thẳng câu hỏi load chỉ gợi ý: bao nhiêu phần trăm thời gian có việc bị **đứng chờ** vì thiếu tài nguyên. Kernel xuất ba file `/proc/pressure/cpu`, `memory`, `io`, mỗi file hai dòng:
+
+```text
+ some avg10=11.47 avg60=2.36 avg300=1.14 total=14474219
+ full avg10=11.28 avg60=2.26 avg300=0.69 total=8529013
+ │    └ % thời gian trong 10 giây, 60 giây, 300 giây gần nhất        └ tổng micro giây từ lúc khởi động
+ ├ some: ít nhất một tiến trình bị đứng chờ tài nguyên này
+ └ full: MỌI tiến trình (không tính đang rảnh) cùng đứng chờ, tức máy không làm được việc gì có ích
+```
+
+PSI có cho cả máy và cho từng cgroup, tức từng dịch vụ systemd hay từng container (file `cpu.pressure`, `memory.pressure`, `io.pressure` trong thư mục cgroup; D1.5 dùng tới), nên biết được dịch vụ nào đang bị đói.
+
+<Check id="d1.4.load-psi">Giải thích được load average đếm gì và so với cái gì, phân biệt được load do CPU với load do I/O bằng `vmstat`, và đọc được một dòng PSI.</Check>
+
+### Bộ nhớ và OOM killer
+
+`free -h` có sáu cột, và cột hay bị đọc sai nhất là `free`:
+
+| Cột | Nghĩa | Lưu ý |
+|---|---|---|
+| `total` | RAM của máy | |
+| `used` | Tiến trình đang dùng | |
+| `free` | Chưa dùng vào việc gì | Thấp là **bình thường** |
+| `buff/cache` | Kernel dùng làm cache cho file | Trả lại ngay khi tiến trình cần |
+| `available` | Ước lượng còn cấp được cho tiến trình mới mà không phải swap | **Nhìn cột này** |
+
+Linux cố ý dùng RAM rảnh làm page cache để đọc file nhanh hơn. Máy chạy lâu có `free` vài chục MB và `available` vài GB là máy khoẻ.
+
+Khi bộ nhớ thật sự hết và không còn gì để thu hồi, kernel gọi **OOM killer**: chọn một tiến trình (điểm `oom_score` cao nhất, đại ý là tiến trình dùng nhiều bộ nhớ nhất) và gửi `SIGKILL`. D1.1 đã nói exit code 137 là chết vì `SIGKILL`; SB11.3 đã cho thấy container Java bị `OOMKilled`. Phần mới ở đây là có **hai loại** OOM và chỗ tìm bằng chứng. **cgroup** là cơ chế kernel gom tiến trình thành nhóm để đo và giới hạn tài nguyên; mỗi dịch vụ systemd và mỗi container là một cgroup (D1.5 đi vào chi tiết):
+
+| | OOM toàn máy | OOM trong cgroup |
+|---|---|---|
+| Khi nào | RAM (và swap) của máy hết | Một cgroup chạm `memory.max` |
+| Nạn nhân | Tiến trình bất kỳ trên máy, có thể là database | Chỉ tiến trình trong cgroup đó |
+| Log kernel | `Out of memory: Killed process …` | `Memory cgroup out of memory: Killed process …` |
+| Gặp ở | Máy không đặt giới hạn cho dịch vụ | Container có limit, unit systemd có `MemoryMax` |
+
+Tiến trình bị OOM kill **không ghi được dòng log nào** về cái chết của nó: `SIGKILL` không bắt được. Bằng chứng chỉ có ở log kernel (`journalctl -k`, `dmesg`) và ở bộ quản lý dịch vụ (`systemctl status` ghi `Result: oom-kill`, Kubernetes ghi `OOMKilled`).
+
+<Check id="d1.4.memory-oom">Đọc được `free` mà không nhầm `free` với `available`, phân biệt được OOM toàn máy với OOM trong cgroup, và biết tìm bằng chứng OOM ở đâu.</Check>
+
+### Chẩn đoán có phương pháp
+
+Chẩn đoán kém thường là đoán: thấy chậm thì khởi động lại, thấy lỗi thì tăng RAM. Cách làm có phương pháp đi theo một vòng cố định, và chỉ thay đổi hệ thống ở bước gần cuối:
+
+```text
+ 1. Triệu chứng   Ai thấy gì, từ khi nào, cái gì vừa thay đổi?  (deploy, cấu hình, lưu lượng)
+        ▼
+ 2. Đo nhanh      60 giây đầu: uptime, journalctl -k, vmstat 1, free -h, iostat -xz 1, df -hT, top
+        ▼
+ 3. Khoanh vùng   Tài nguyên nào bão hoà hoặc có lỗi?  CPU / bộ nhớ / đĩa / mạng / không cái nào
+        ▼
+ 4. Tìm thủ phạm  Tiến trình nào?  →  thuộc unit, container, user nào?  (ps -o unit, systemctl status PID)
+        ▼
+ 5. Đọc bằng chứng  journalctl -u <unit>, log kernel, strace, lsof, /proc/<PID>
+        ▼
+ 6. Giả thuyết    Một câu, kiểm chứng được: "cache bị kill vì chạm MemoryMax 150M"
+        ▼
+ 7. Sửa nhỏ nhất  Giảm thiệt hại trước (dừng thủ phạm, nới giới hạn), sửa gốc sau
+        ▼
+ 8. Xác nhận      Triệu chứng hết chưa? Số đo về bình thường chưa?  Chưa → quay lại bước 3
+        ▼
+ 9. Ghi lại       Nguyên nhân, cách phát hiện, cách sửa, việc phòng ngừa  (D17 dạy postmortem)
+```
+
+Bộ lệnh ở bước 2 đáng thuộc lòng. Nó dựa trên danh sách "60 giây đầu tiên" mà nhóm hiệu năng của Netflix công bố:
+
+| Lệnh | Trả lời câu hỏi |
+|---|---|
+| `uptime` | Load bao nhiêu, đang tăng hay giảm (so ba số)? |
+| `journalctl -k -n 20` (hoặc `dmesg -T`) | Kernel có báo OOM, lỗi đĩa, lỗi mạng không? |
+| `vmstat 1 5` | Chờ CPU (`r`), chờ I/O (`b`, `wa`), đang swap (`si`, `so`)? |
+| `free -h` | `available` còn bao nhiêu? |
+| `iostat -xz 1 3` | Đĩa nào bận (`%util`), chậm (`await`), có hàng chờ (`aqu-sz`)? |
+| `df -hT`, `df -i` | Filesystem nào đầy (D1.3)? |
+| `top` (hoặc `htop`) | Tiến trình nào dùng CPU, RAM nhiều nhất? |
+| `cat /proc/pressure/*` | Có ai đang phải đứng chờ tài nguyên không? |
+
+<Callout kind="production">
+
+Năm 2018, Facebook công bố **oomd** kèm một quan sát từ hạ tầng của họ: OOM killer của kernel thường ra tay **quá muộn**. Kernel chỉ giết tiến trình khi không còn cấp phát nổi nữa; trước đó rất lâu, máy đã rơi vào trạng thái thrashing: bộ nhớ gần hết nên kernel liên tục vứt page cache rồi lại đọc từ đĩa lên, mọi tiến trình đứng chờ I/O, load average tăng vọt, SSH không vào được. Họ ghi nhận những lần máy "sống mà như chết" kéo dài tới 30 phút trước khi OOM killer chạy. Triệu chứng nhìn từ ngoài là **load cao và `wa` cao**, dễ bị đọc nhầm thành sự cố đĩa trong khi gốc là thiếu bộ nhớ. PSI ra đời từ chính bài toán này: `memory` pressure tăng sớm hơn nhiều so với lúc OOM, và oomd (nay là `systemd-oomd`) dựa vào nó để giết đúng nhóm tiến trình trước khi máy đơ. Khi chẩn đoán: thấy `wa` cao thì nhìn thêm `si`/`so` của `vmstat`, cột `available` của `free` và `/proc/pressure/memory` trước khi kết luận là do đĩa.
+
+</Callout>
+
+<Check id="d1.4.method">Kể được các bước chẩn đoán theo thứ tự và bộ lệnh của "60 giây đầu tiên", và nói được vì sao chỉ thay đổi hệ thống sau khi có giả thuyết.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [The USE Method](https://www.brendangregg.com/usemethod.html) của Brendan Gregg: phương pháp và bảng kiểm cho từng tài nguyên; đọc phần "Linux Performance Checklist" đi kèm.
+- [Linux Load Averages: Solving the Mystery](https://www.brendangregg.com/blog/2017-08-08/linux-load-averages.html) của Brendan Gregg: vì sao load của Linux tính cả tiến trình chờ I/O, và nên dùng số đo nào thay thế.
+- [PSI - Pressure Stall Information (Linux kernel)](https://docs.kernel.org/accounting/psi.html): định nghĩa `some`, `full` và cách đặt ngưỡng theo dõi.
+- [Open-sourcing oomd, a new approach to handling OOMs](https://engineering.fb.com/2018/07/19/production-engineering/oomd/) của Facebook: vì sao OOM killer của kernel ra tay muộn, nguồn của callout production.
+- [SadServers](https://sadservers.com/): máy chủ hỏng sẵn để luyện chẩn đoán, cùng kiểu với bước 3 tới 6 của bài.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:**
+
+- VM `ubuntu` của D0.1 đang chạy, vào bằng `cd ~ && limactl shell ubuntu`. Mọi lệnh chạy trong VM.
+- **Profile máy:** VM 2 CPU, 2 GiB. Sự cố 1 dùng hết 2 CPU của VM trong khoảng một phút, sự cố 2 dùng tối đa 150 MiB; Mac không bị ảnh hưởng ngoài quạt chạy. Máy 8 GB: tắt Docker khi làm.
+- Cài hai công cụ:
+
+<Terminal where="vm">
+
+```bash
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng strace >/dev/null
+stress-ng --version; strace -V | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+stress-ng, version 0.20.01 (gcc 15.2.0, aarch64 Linux 7.0.0-28-generic)
+strace -- version 6.19
+```
+
+</Expected>
+
+Lệnh cài chỉ bỏ stdout nên có thể in vài dòng báo cáo của `needrestart` (D1.2 đã gặp); nếu thấy `Could not get lock`, đợt vá tự động đang chạy, chờ vài phút rồi chạy lại. Phiên bản kernel trong dòng đầu sẽ mới hơn nếu VM của bạn đã tự vá và khởi động lại.
+
+Các số đo (load, phần trăm, PID, giờ) trên máy bạn sẽ khác; điều cần khớp là **hình dạng**: cột nào cao, dòng log nào xuất hiện.
+
+### 1. Sáu mươi giây đầu tiên trên một máy khoẻ
+
+Chạy bộ lệnh khi máy rảnh để biết "bình thường" trông thế nào:
+
+<Terminal where="vm">
+
+```bash
+uptime; nproc
+free -h
+vmstat 1 3
+cat /proc/pressure/cpu
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ 08:27:34 up  1:37,  1 user,  load average: 0.27, 0.10, 0.22
+2
+               total        used        free      shared  buff/cache   available
+Mem:           1.9Gi       431Mi       782Mi       1.0Mi       830Mi       1.5Gi
+Swap:             0B          0B          0B
+procs -----------memory---------- ---swap-- -----io---- -system-- -------cpu-------
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu
+ 0  0      0 801128 104288 745864    0    0   367  2542  696    5  6  4 90  0  0  0
+ 0  0      0 809200 104288 745884    0    0     0     0   84   64  0  0 100  0  0  0
+ 0  0      0 817188 104288 745884    0    0     0     0   36   31  0  0 100  0  0  0
+some avg10=1.44 avg60=0.45 avg300=0.41 total=78377205
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+```
+
+</Expected>
+
+Cách đọc: load dưới số CPU (2). `available` 1,5 GiB dù `free` chỉ 782 MiB, phần chênh là cache. Dòng đầu của `vmstat` là trung bình **từ lúc khởi động**, bỏ qua; các dòng sau là từng giây: `r`=0 không ai chờ CPU, `b`=0 không ai chờ I/O, `id`=100. PSI `cpu` gần 0.
+
+Giờ tạo tải ghi đĩa trong 15 giây để thấy các cột I/O thay đổi thế nào. `iostat -x` in hơn hai mươi cột, lệnh `awk` chỉ giữ năm cột đáng nhìn nhất của đĩa `vda`:
+
+<Terminal where="vm">
+
+```bash
+sudo systemd-run --quiet --unit=lab-io stress-ng --hdd 1 --hdd-bytes 256M --timeout 15s --temp-path /var/tmp --quiet
+sleep 4
+vmstat 1 3 | tail -2
+iostat -dxz vda 1 2 | awk '/^vda/ {print "w/s="$8, "wkB/s="$9, "w_await="$12, "aqu-sz="$(NF-1), "%util="$NF}' | tail -1
+cat /proc/pressure/io
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ 0  1      0 645688 105088 949176    0    0     0 704512  633  279  4 11 49 37  0  0
+ 0  1      0 613688 105240 982004    0    0     4 786432  687  290  7 10 48 36  0  0
+w/s=186.00 wkB/s=761856.00 w_await=123.36 aqu-sz=22.94 %util=68.10
+some avg10=14.61 avg60=2.99 avg300=0.90 total=32449106
+full avg10=14.61 avg60=2.96 avg300=0.83 total=24375799
+```
+
+</Expected>
+
+`vmstat`: `b`=1 (một tiến trình đang chờ I/O), `bo` hàng trăm nghìn block ghi ra mỗi giây, `wa` 36 tới 37% thời gian CPU ngồi chờ đĩa, trong khi `us`+`sy` chỉ khoảng 15%. `iostat`: đĩa bận 68% (`%util`), mỗi lệnh ghi chờ trung bình 123 mili giây (`w_await`), hàng chờ dài gần 23 yêu cầu (`aqu-sz`). PSI `io` có dòng `full` khác 0: có những lúc mọi tiến trình đang hoạt động đều đứng chờ đĩa. Đây là hình dạng của bão hoà **I/O**, khác hẳn bão hoà CPU ở sự cố 1. Tải tự dừng sau 15 giây.
+
+<Check id="d1.4.lab-baseline">Chạy được bộ lệnh 60 giây và đọc được load, `available`, các cột `r`, `b`, `wa`, `id` của `vmstat`, PSI, và các cột `%util`, `w_await`, `aqu-sz` của `iostat`, trên máy rảnh và khi đĩa bị ghi nặng.</Check>
+
+### 2. Dựng các sự cố
+
+Script dưới đây tạo một trong bốn sự cố bằng các unit systemd tạm thời (`systemd-run`). Chép nguyên vào VM. Ở mỗi sự cố, hãy tự chẩn đoán theo vòng chín bước trước khi đọc lời giải.
+
+<Terminal where="vm" title="~/masteva-d1/break.sh">
+
+```bash
+mkdir -p ~/masteva-d1 && cat > ~/masteva-d1/break.sh <<'EOF'
+#!/usr/bin/env bash
+# Tạo một sự cố cho lab D1.4. Dùng: sudo bash break.sh <1|2|3|4>
+set -euo pipefail
+case "${1:-}" in
+1) # Máy chậm
+  systemd-run --quiet --unit=bao-cao stress-ng --cpu 2 --quiet ;;
+2) # Dịch vụ cứ chết rồi sống lại
+  systemd-run --quiet --unit=cache -p MemoryMax=150M -p Restart=always -p RestartSec=5 \
+    python3 -c "import time; b = bytearray(300 * 1024 * 1024); time.sleep(3600)" ;;
+3) # Không ghi được đơn hàng
+  mkdir -p /srv/spool && mount -t tmpfs -o size=32M tmpfs /srv/spool
+  systemd-run --quiet --unit=xuat-bao-cao bash -c \
+    "exec 3>/srv/spool/.export.tmp; head -c 32M /dev/zero >&3; rm /srv/spool/.export.tmp; sleep infinity"
+  sleep 1
+  systemd-run --quiet --unit=ghi-don bash -c \
+    "while sleep 2; do head -c 512K /dev/urandom > /srv/spool/don-\$(date +%s).dat || echo \"ghi đơn lỗi\"; done" ;;
+4) # Sao lưu không chạy xong
+  systemd-run --quiet --unit=don-dep-cu flock /run/lock/sao-luu.lock sleep infinity
+  sleep 1
+  systemd-run --quiet --unit=sao-luu flock /run/lock/sao-luu.lock bash -c "echo bắt đầu sao lưu; sleep 5; echo xong" ;;
+*) echo "Dùng: sudo bash break.sh <1|2|3|4>"; exit 1 ;;
+esac
+echo "Đã tạo sự cố $1."
+EOF
+bash -n ~/masteva-d1/break.sh && echo "cú pháp ổn"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cú pháp ổn
+```
+
+</Expected>
+
+### 3. Sự cố 1: "máy chậm quá"
+
+<Terminal where="vm">
+
+```bash
+sudo bash ~/masteva-d1/break.sh 1
+```
+
+</Terminal>
+
+Chờ khoảng **một phút** để load average kịp phản ánh, rồi đo:
+
+<Terminal where="vm">
+
+```bash
+uptime
+vmstat 1 3 | tail -2
+top -b -n 1 -o %CPU | sed -n '7,9p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ 08:28:37 up  1:38,  1 user,  load average: 1.36, 0.45, 0.34
+ 2  0      0 861788 104308 746128    0    0     0     0 2007   48 100  0  0  0  0  0
+ 2  0      0 861788 104308 746128    0    0     0     0 2005   27 100  0  0  0  0  0
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 487814 root      20   0   28412   7612   4944 R  90.9   0.4   1:01.77 stress-+
+ 487815 root      20   0   28412   7684   5016 R  90.9   0.4   1:01.92 stress-+
+```
+
+</Expected>
+
+Khoanh vùng: load 1 phút đang leo về phía 2 (ba số tăng dần từ phải sang trái nghĩa là tải đang tăng); `vmstat` có `r`=2, `us`=100, `id`=0, `b` và `wa` bằng 0. Đây là bão hoà **CPU**, không phải I/O. `top` chỉ ra hai tiến trình `stress-ng`. Câu hỏi tiếp theo: chúng thuộc dịch vụ nào?
+
+<Terminal where="vm">
+
+```bash
+P=$(pgrep -o -f stress-ng-cpu)
+ps -o pid,unit,cmd -p $P
+systemctl status $P --no-pager | sed -n '1,2p;4p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    PID UNIT                            CMD
+ 487814 bao-cao.service                 stress-ng-cpu     .
+● bao-cao.service - [systemd-run] /usr/bin/stress-ng --cpu 2 --quiet
+     Loaded: loaded (/run/systemd/transient/bao-cao.service; transient)
+     Active: active (running) since Sat 2026-10-10 08:27:38 +07; 1min 2s ago
+```
+
+</Expected>
+
+`ps -o unit` và `systemctl status <PID>` đi từ một PID ngược về unit systemd chứa nó. Thủ phạm là `bao-cao.service`, bắt đầu chạy đúng lúc máy chậm. Giảm thiệt hại và xác nhận:
+
+<Terminal where="vm">
+
+```bash
+sudo systemctl stop bao-cao
+vmstat 1 2 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ 0  0      0 853344 104324 746000    0    0     0     0  140  176  0  0 100  0  0  0
+```
+
+</Expected>
+
+`r` về 0, `id` về 100. Load average sẽ tụt dần trong vài phút vì nó là trung bình. Ngoài đời, bước sửa gốc là hỏi vì sao job báo cáo chạy vào giờ cao điểm mà không có giới hạn CPU; D1.5 đặt giới hạn đó bằng cgroup.
+
+<Check id="d1.4.lab-cpu">Từ triệu chứng "máy chậm", xác định được là bão hoà CPU bằng `uptime` và `vmstat`, tìm ra tiến trình rồi unit gây ra, và xác nhận sau khi sửa.</Check>
+
+### 4. Sự cố 2: dịch vụ "đang chạy" mà không làm được việc
+
+<Terminal where="vm">
+
+```bash
+sudo bash ~/masteva-d1/break.sh 2
+```
+
+</Terminal>
+
+Chờ khoảng **20 giây**, rồi xem trạng thái:
+
+<Terminal where="vm">
+
+```bash
+systemctl status cache --no-pager | sed -n '4p'
+systemctl show cache -p NRestarts -p MemoryMax
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+     Active: activating (auto-restart) (Result: oom-kill) since Sat 2026-10-10 08:28:56 +07; 4s ago
+NRestarts=3
+MemoryMax=157286400
+```
+
+</Expected>
+
+Dòng `Active` phụ thuộc vào lúc bạn nhìn. Khoảng một nửa thời gian bạn sẽ thấy như trên, `activating (auto-restart) (Result: oom-kill)`: systemd đang chờ 5 giây trước khi khởi động lại. Nửa còn lại bạn thấy `active (running) since …; 2s ago`, trông như một dịch vụ khoẻ. Chạy lệnh vài lần để gặp cả hai.
+
+<Predict question="Giả sử bạn chỉ thấy active (running). Dấu hiệu nào vẫn cho biết dịch vụ có vấn đề?">
+
+Hai dấu hiệu: nó mới chạy được vài giây dù được bật từ lâu, và `NRestarts` khác 0 và **đang tăng** giữa các lần xem. Một dịch vụ khoẻ có thời gian chạy tính bằng ngày và `NRestarts=0`. Trạng thái "running" chỉ là ảnh chụp tại một thời điểm; thời gian chạy và số lần khởi động lại mới cho biết nó có ổn định không. Trên Kubernetes, cột `RESTARTS` của `kubectl get pods` và trạng thái `CrashLoopBackOff` đóng đúng vai trò này.
+
+</Predict>
+
+Đọc bằng chứng ở hai nơi: log của unit và log kernel.
+
+<Terminal where="vm">
+
+```bash
+journalctl -u cache --no-pager -o cat | grep -E "oom-kill|memory peak" | tail -2
+sudo journalctl -k --no-pager -o cat | grep "Memory cgroup out of memory" | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cache.service: Failed with result 'oom-kill'.
+cache.service: Consumed 73ms CPU time over 5.125s wall clock time, 150M memory peak.
+Memory cgroup out of memory: Killed process 487844 (python3) total-vm:327216kB, anon-rss:153208kB, file-rss:6252kB, shmem-rss:0kB, UID:0 pgtables:364kB oom_score_adj:0
+```
+
+</Expected>
+
+Giả thuyết giờ có đủ bằng chứng: tiến trình xin khoảng 320 MiB (`total-vm`) và đã dùng thật 153 MiB (`anon-rss`) lúc bị giết, cgroup của unit có trần `MemoryMax` 150 MiB (`157286400` byte, đỉnh đo được đúng `150M`), kernel giết nó (`Memory cgroup out of memory`), systemd ghi `oom-kill` và khởi động lại theo `Restart=always`, rồi vòng lặp tiếp diễn. Đây là OOM **trong cgroup**: không tiến trình nào khác trên máy bị ảnh hưởng. Bản thân chương trình không in được dòng nào trước khi chết.
+
+<Terminal where="vm">
+
+```bash
+sudo systemctl stop cache
+```
+
+</Terminal>
+
+Sửa gốc ngoài đời là một trong hai: giới hạn đặt quá thấp so với nhu cầu thật (nới `MemoryMax`, tức `limits.memory` của pod), hoặc chương trình rò rỉ bộ nhớ (J12 dạy tìm rò rỉ trong JVM).
+
+<Check id="d1.4.lab-oom">Nhận ra được một dịch vụ bị khởi động lại liên tục qua thời gian chạy và `NRestarts`, và chứng minh được nguyên nhân là OOM trong cgroup bằng log của unit và log kernel.</Check>
+
+### 5. Sự cố 3: "không ghi được đơn hàng"
+
+<Terminal where="vm">
+
+```bash
+sudo bash ~/masteva-d1/break.sh 3
+```
+
+</Terminal>
+
+Chờ vài giây rồi bắt đầu từ log của dịch vụ đang báo lỗi:
+
+<Terminal where="vm">
+
+```bash
+journalctl -u ghi-don --no-pager -o cat | tail -2
+df -h /srv/spool | tail -1; df -i /srv/spool | tail -1
+sudo du -sh /srv/spool
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+head: error writing 'standard output': No space left on device (os error 28)
+ghi đơn lỗi
+tmpfs            32M   32M     0 100% /srv/spool
+tmpfs          249579     4 249575    1% /srv/spool
+0	/srv/spool
+```
+
+</Expected>
+
+Filesystem đầy block (không phải inode), nhưng `du` nói thư mục trống. Theo bảng ở D1.3, đó là dấu hiệu của file đã xoá còn mở:
+
+<Terminal where="vm">
+
+```bash
+sudo lsof -nP +L1 | grep -E 'COMMAND|/srv/spool'
+P=$(sudo lsof -nP +L1 | awk '/srv\/spool/ {print $2; exit}')
+ps -o pid,unit,cmd -p $P
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+COMMAND      PID      USER  FD   TYPE DEVICE SIZE/OFF NLINK  NODE NAME
+sleep     487866      root   3w   REG   0,41 33554432     0     2 /srv/spool/.export.tmp (deleted)
+    PID UNIT                            CMD
+ 487866 xuat-bao-cao.service            sleep infinity
+```
+
+</Expected>
+
+Một file 32 MiB đã bị xoá nhưng `xuat-bao-cao.service` còn giữ mở. Dừng đúng unit đó, không đụng tới dịch vụ ghi đơn, rồi xác nhận:
+
+<Terminal where="vm">
+
+```bash
+sudo systemctl stop xuat-bao-cao
+df -h /srv/spool | tail -1
+sleep 3; journalctl -u ghi-don --no-pager -o cat | tail -1; ls /srv/spool | tail -1
+sudo systemctl stop ghi-don && sudo umount /srv/spool
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+tmpfs            32M     0   32M   0% /srv/spool
+ghi đơn lỗi
+don-1791595750.dat
+```
+
+</Expected>
+
+Dung lượng về 0%, và file đơn mới xuất hiện trở lại (dòng `ghi đơn lỗi` là dòng cũ còn trong log; tên file của bạn mang giờ của bạn). Dịch vụ ghi đơn chỉ là nạn nhân: lỗi hiện ở một nơi, nguyên nhân nằm ở nơi khác là chuyện thường gặp nhất khi chẩn đoán.
+
+<Check id="d1.4.lab-disk">Đi được từ lỗi "No space left on device" trong log của một dịch vụ tới đúng unit khác đang giữ file đã xoá, và lấy lại chỗ mà không dừng dịch vụ nạn nhân.</Check>
+
+### 6. Sự cố 4: bản sao lưu không bao giờ xong
+
+<Terminal where="vm">
+
+```bash
+sudo bash ~/masteva-d1/break.sh 4
+```
+
+</Terminal>
+
+Bản sao lưu lẽ ra mất 5 giây. Chờ **10 giây** rồi xem:
+
+<Terminal where="vm">
+
+```bash
+systemctl status sao-luu --no-pager | sed -n '4p'
+journalctl -u sao-luu --no-pager -o cat | tail -1 | cut -c1-60
+uptime | sed 's/.*load/load/'
+P=$(systemctl show sao-luu -p MainPID --value)
+ps -o pid,stat,etime,cmd -p $P
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+     Active: active (running) since Sat 2026-10-10 08:31:08 +07; 10s ago
+Started sao-luu.service - [systemd-run] /usr/bin/flock /run/
+load average: 0.19, 0.31, 0.30
+    PID STAT     ELAPSED CMD
+ 488262 Ss         00:10 /usr/bin/flock /run/lock/sao-luu.lock bash -c echo bắt đầu sao lưu; sleep 5; echo xong
+```
+
+</Expected>
+
+Dịch vụ chạy, không khởi động lại, nhưng dòng log cuối cùng vẫn là dòng `Started …` của systemd: chương trình chưa in được chữ "bắt đầu sao lưu" nào. Load thấp, không tài nguyên nào bão hoà. Tiến trình ở trạng thái `S` (ngủ): nó đang **chờ** một thứ gì đó. Hai công cụ cho biết nó chờ gì: `strace -p` xem system call đang dở, và `/proc/<PID>/stack` xem nó đứng ở đâu trong kernel.
+
+<Terminal where="vm">
+
+```bash
+sudo timeout 2 strace -p $P 2>&1 | head -2
+sudo head -2 /proc/$P/stack
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+strace: Process 488262 attached
+flock(3, LOCK_EXstrace: Process 488262 detached
+[<0>] locks_lock_inode_wait+0xb0/0x208
+[<0>] __do_sys_flock+0x1c4/0x248
+```
+
+</Expected>
+
+Tiến trình kẹt trong `flock(3, LOCK_EX`: nó xin khoá độc quyền trên file descriptor 3 và system call chưa trả về (dòng bị cắt giữa chừng vì thế). Ai đang giữ khoá đó?
+
+<Terminal where="vm">
+
+```bash
+sudo lsof -nP /run/lock/sao-luu.lock
+H=$(sudo lsof -nP /run/lock/sao-luu.lock | awk '$4 ~ /W$/ {print $2}')
+ps -o pid,unit,etime,cmd -p $H
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+COMMAND    PID USER FD   TYPE DEVICE SIZE/OFF NODE NAME
+flock   488258 root 3rW  REG   0,30        0 7762 /run/lock/sao-luu.lock
+sleep   488260 root 3r   REG   0,30        0 7762 /run/lock/sao-luu.lock
+flock   488262 root 3r   REG   0,30        0 7762 /run/lock/sao-luu.lock
+    PID UNIT                                ELAPSED CMD
+ 488258 don-dep-cu.service                    00:13 /usr/bin/flock /run/lock/sao-luu.lock sleep infinity
+```
+
+</Expected>
+
+Chữ `W` trong cột `FD` (`3rW`) đánh dấu tiến trình **đang giữ** khoá ghi trên cả file: PID 488258 thuộc `don-dep-cu.service`, một job cũ không bao giờ kết thúc. Dừng nó và xác nhận bản sao lưu chạy tiếp:
+
+<Terminal where="vm">
+
+```bash
+sudo systemctl stop don-dep-cu
+sleep 6; journalctl -u sao-luu --no-pager -o cat | tail -3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+bắt đầu sao lưu
+xong
+sao-luu.service: Deactivated successfully.
+```
+
+</Expected>
+
+Ngay khi khoá được nhả, `flock` của bản sao lưu lấy được khoá và chạy xong trong 5 giây. Kiểu treo này (chờ khoá, chờ kết nối, chờ một tiến trình khác) không hiện trên bất kỳ biểu đồ tài nguyên nào; chỉ có nhìn vào chính tiến trình mới thấy.
+
+<Check id="d1.4.lab-hang">Chẩn đoán được một tiến trình treo không tốn tài nguyên bằng `ps`, `strace -p` và `lsof`, tìm ra tiến trình đang giữ khoá và unit của nó.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Failed to start transient service unit: Unit bao-cao.service was already loaded`: sự cố đó đang chạy hoặc unit còn ở trạng thái failed. `sudo systemctl stop <unit>; sudo systemctl reset-failed <unit>` rồi chạy lại.
+- Load ở sự cố 1 chưa tới 1: bạn đo quá sớm. Load 1 phút cần khoảng một phút để leo; `vmstat` thì thấy ngay.
+- Sự cố 2 không thấy dòng `oom-kill`: chưa đủ 20 giây, mỗi vòng cấp phát rồi bị kill mất khoảng 5 tới 6 giây, cộng 5 giây chờ khởi động lại.
+- `strace: attach: ptrace(PTRACE_SEIZE, …): Operation not permitted`: thiếu `sudo`.
+- `lsof` ở sự cố 4 không có dòng nào có `W`: job giữ khoá chưa chạy hoặc đã bị dừng. `systemctl status don-dep-cu`.
+- `mount: /srv/spool: … already mounted` khi chạy lại sự cố 3: lần trước chưa `umount`. `sudo systemctl stop ghi-don xuat-bao-cao; sudo umount /srv/spool`.
+- `iostat` không in dòng `vda`: đĩa của VM bạn có tên khác. Xem `lsblk` và thay tên trong lệnh.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới đây dừng mọi unit của lab và xoá thư mục `/srv/spool` cùng `~/masteva-d1` (gồm `break.sh`). Chỉ chạy trong VM lab. `stress-ng` và `strace` được giữ lại cho D1.5.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+sudo systemctl stop bao-cao cache xuat-bao-cao ghi-don don-dep-cu sao-luu lab-io 2>/dev/null
+sudo systemctl reset-failed 2>/dev/null
+findmnt /srv/spool >/dev/null && sudo umount /srv/spool
+sudo rm -rf /srv/spool /run/lock/sao-luu.lock ~/masteva-d1
+systemctl list-units --all --no-legend 'bao-cao*' 'cache*' 'ghi-don*' 'xuat-bao-cao*' 'don-dep-cu*' 'sao-luu*' | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+```
+
+</Expected>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Máy 8 CPU có load average 40 nhưng CPU idle 90%. Chuyện gì đang xảy ra, và kiểm thế nào?">
+
+Khoảng 40 tiến trình đang ở trạng thái `D`: chờ I/O không ngắt được. Nguyên nhân hay gặp là một ổ đĩa mạng treo (NFS server mất kết nối), một đĩa sắp hỏng trả lời rất chậm, hoặc volume cloud đã hết burst credit. Kiểm: `vmstat 1` có cột `b` lớn và `wa` cao; `ps -eo stat,pid,cmd | grep '^D'` liệt kê các tiến trình đó, chúng thường cùng động vào một đường dẫn; `iostat -xz 1` cho thấy thiết bị nào có `await` hàng giây; PSI `io` có dòng `full` cao. Như D1.1 đã nói, `kill -9` không có tác dụng với trạng thái `D`; phải sửa nguồn I/O. Đây là ví dụ rõ nhất vì sao không được đọc load như "phần trăm CPU".
+
+</Reveal>
+
+<Reveal title="OOM killer chọn nạn nhân thế nào, và vì sao nạn nhân thường không phải thủ phạm?">
+
+Kernel chấm cho mỗi tiến trình một điểm `oom_score` (xem ở `/proc/<PID>/oom_score`), chủ yếu theo lượng bộ nhớ nó đang chiếm, rồi giết tiến trình điểm cao nhất. Tiến trình lớn nhất trên một máy chủ thường là database hoặc JVM của dịch vụ chính, trong khi thứ gây thiếu bộ nhớ có thể là một script nhỏ rò rỉ dần hay hàng trăm tiến trình con mỗi cái vài chục MB. Vì vậy sau một lần OOM toàn máy, câu hỏi đúng không phải "vì sao PostgreSQL chết" mà là "cái gì đã lấy phần bộ nhớ còn lại"; log kernel in kèm bảng mọi tiến trình và bộ nhớ của chúng tại thời điểm đó. Có hai cách chủ động. Một là chỉnh điểm: `OOMScoreAdjust=-900` trong unit systemd (hay ghi vào `/proc/<PID>/oom_score_adj`) để bảo vệ tiến trình quan trọng, giá trị dương để hiến tế tiến trình ít quan trọng. Hai là đặt giới hạn bộ nhớ cho từng dịch vụ, như sự cố 2: khi đó dịch vụ rò rỉ tự chạm trần của nó và chỉ nó bị giết, phần còn lại của máy không bị ảnh hưởng. Kubernetes làm cả hai: limit của container và điểm OOM theo lớp QoS của pod.
+
+</Reveal>
+
+<Reveal title="Vì sao strace không nên dùng tuỳ tiện trên production?">
+
+`strace` dùng `ptrace`: mỗi system call của tiến trình bị theo dõi phải dừng hai lần để `strace` ghi lại. Một dịch vụ gọi hàng chục nghìn system call mỗi giây có thể chậm đi nhiều lần trong lúc bị theo dõi, đủ để tự gây ra sự cố thứ hai. Ở sự cố 4, tiến trình đang đứng yên trong một system call nên `strace -p` trong 2 giây là an toàn. Với tiến trình đang bận, ưu tiên các cách không làm chậm: `/proc/<PID>/stack` và `/proc/<PID>/status` (chỉ đọc), `lsof -p`, `perf trace`, hoặc công cụ dựa trên eBPF. Nếu buộc phải `strace`, giới hạn thời gian bằng `timeout` và lọc loại system call bằng `-e trace=…`.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một đoạn output của `vmstat`, `iostat`, một dòng log OOM, hoặc gợi ý bước kiểm tiếp theo khi bạn đã dán số đo vào. AI hay sai ở: kết luận từ load average mà không hỏi số CPU, đọc cột `free` thay vì `available` rồi khuyên thêm RAM, thấy `wa` cao là đổ cho đĩa mà không kiểm bộ nhớ, khuyên `kill -9` và khởi động lại trước khi có bằng chứng, và gợi ý `rm` file log đang mở để lấy lại chỗ. Đòi AI nêu giả thuyết kèm lệnh kiểm chứng, tự chạy lệnh đó, và chỉ đổi hệ thống khi số đo ủng hộ.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.1 dạy trạng thái tiến trình, signal và systemd; D1.3 dạy quy trình đầy đĩa mà sự cố 3 dùng lại. D1.5 đi xuống tầng kernel: cgroup đứng sau `MemoryMax` của sự cố 2, cách đặt giới hạn CPU cho job của sự cố 1, và AppArmor. D2 chẩn đoán tài nguyên thứ tư là mạng. SB11.3 đã gặp OOM từ phía JVM trong container. D12 đưa các số đo của bài này lên dashboard và cảnh báo; D17 dạy quy trình sự cố và postmortem; D18 quay lại hiệu năng ở tầng hệ điều hành với tải thật.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d1.4.mastery-triage">Vào một máy lạ đang có vấn đề, trong vài phút nói được tài nguyên nào bão hoà (hoặc không tài nguyên nào), kèm số đo làm bằng chứng.</Check>
+
+<Check id="d1.4.mastery-root-cause">Đi được từ triệu chứng tới tiến trình, tới unit, tới bằng chứng trong log, phát biểu giả thuyết thành một câu, sửa bằng thay đổi nhỏ nhất và xác nhận lại bằng số đo.</Check>
+
+<Check id="d1.4.mastery-four-shapes">Phân biệt được bốn dạng sự cố của bài qua dấu hiệu đầu tiên: `r` cao, `NRestarts` tăng kèm `oom-kill`, `df` đầy mà `du` trống, và tiến trình ngủ trong một system call; nêu được lệnh kế tiếp cho từng dạng.</Check>
+
+</Mastery>

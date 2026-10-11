@@ -1,0 +1,843 @@
+---
+title: Đĩa, mount, LVM, RAID và xử lý đầy đĩa
+description: Đi từ một đĩa trống tới một thư mục dùng được, ghi /etc/fstab cho an toàn, mở rộng volume LVM khi dịch vụ đang ghi, thay đĩa hỏng trong RAID 1, và tìm ra thứ làm đầy đĩa khi df với du nói hai con số khác nhau.
+id: d1.3
+step: d1
+prerequisites: [d1.2]
+topics: [d1.dia-mount-dung-luong, d1.lvm-raid]
+status: verified
+verified:
+  date: 2026-10-10
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    kernel: 7.0.0-28-generic
+    util-linux: 2.41.3
+    e2fsprogs: 1.47.2
+    parted: '3.6'
+    lvm2: 2.03.31
+    mdadm: '4.5'
+    lsof: 4.99.4
+---
+
+<Goal>
+
+Hiểu dữ liệu đi từ một thiết bị đĩa tới một đường dẫn trong cây thư mục qua những lớp nào, và làm chủ từng lớp. Học xong bài này, bạn giải thích và xử lý được:
+
+- Vì sao một dòng sai trong `/etc/fstab` làm máy không khởi động lên được, và cách thử trước khi khởi động lại.
+- Làm sao nới một phân vùng đang đầy mà không dừng dịch vụ.
+- Một đĩa trong RAID 1 hỏng thì dữ liệu ra sao, và thay đĩa thế nào.
+- Vì sao `df` báo đĩa đầy 100% trong khi `du` cộng lại chỉ ra vài MB, và vì sao còn 85% dung lượng trống mà vẫn "No space left on device".
+
+</Goal>
+
+<Knowledge>
+
+### Từ đĩa tới thư mục: các lớp
+
+```text
+ /srv/app/data.bin                      đường dẫn bạn dùng
+      ▲  mount: gắn filesystem vào một thư mục (mount point)
+ filesystem (ext4, xfs)                 tổ chức block thành file, thư mục, inode
+      ▲  mkfs
+ logical volume  /dev/vgdata/app        (tuỳ chọn) LVM: gộp nhiều đĩa, co giãn được
+      ▲
+ RAID  /dev/md0                         (tuỳ chọn) ghép đĩa để chịu được đĩa hỏng
+      ▲
+ phân vùng  /dev/vdb1                   một khoảng liên tục trên đĩa, ghi trong bảng phân vùng GPT
+      ▲
+ block device  /dev/vdb                 đĩa thật, đĩa ảo của VM, volume của cloud, hoặc loop device
+```
+
+Mỗi lớp chỉ thấy lớp ngay dưới nó là "một dãy block". Nhờ vậy các lớp ghép tự do: filesystem đặt thẳng lên đĩa, lên phân vùng, lên LVM, hay LVM trên RAID đều được. Bài này dùng **loop device**: một file thường được kernel trình bày như một đĩa (`/dev/loop0`), để bạn có bao nhiêu "đĩa" tuỳ thích mà không cần phần cứng.
+
+Tên thiết bị cho biết loại đĩa: `/dev/sda` (SATA, SCSI, USB), `/dev/nvme0n1` (NVMe), `/dev/vda` (virtio trong VM), `/dev/xvda` (Xen, AWS đời cũ). Phân vùng thêm số: `sda1`, `nvme0n1p1`. Tên này **không ổn định**: thêm một đĩa hoặc đổi thứ tự cắm, `sdb` có thể thành `sdc`. Vì vậy mọi cấu hình lâu dài dùng **UUID** hoặc **LABEL** của filesystem.
+
+| Lệnh | Cho biết |
+|---|---|
+| `lsblk` | Cây thiết bị: đĩa, phân vùng, LVM, RAID, mount ở đâu |
+| `lsblk -f`, `blkid` | Loại filesystem, LABEL, UUID |
+| `df -hT` | Mỗi filesystem đang mount: dung lượng, đã dùng, còn trống |
+| `findmnt` | Cái gì mount ở đâu, với tuỳ chọn nào |
+
+### Filesystem
+
+Filesystem quyết định file được lưu thế nào trên dãy block. Ba lựa chọn hay gặp:
+
+| | ext4 | XFS | Btrfs |
+|---|---|---|---|
+| Mặc định ở | Ubuntu, Debian | RHEL, Rocky, Alma, Amazon Linux | openSUSE, Fedora desktop |
+| Nới khi đang mount | Được | Được | Được |
+| Thu nhỏ | Được, phải unmount | **Không** | Được, khi đang mount |
+| Số inode | Cố định lúc `mkfs` | Cấp động | Cấp động |
+| Hợp với | Mục đích chung | File lớn, ghi song song nhiều | Cần snapshot, checksum ở tầng filesystem |
+
+Mỗi file có một **inode**: bản ghi chứa quyền, chủ, kích thước và vị trí các block dữ liệu. Tên file chỉ là một mục trong thư mục trỏ tới inode. ext4 tạo sẵn một số inode cố định lúc `mkfs`; hết inode thì không tạo được file mới dù còn trống block.
+
+ext4 còn **giữ lại 5% block cho root** (reserved blocks): khi user thường gặp "đĩa đầy", root và dịch vụ hệ thống vẫn còn chỗ để ghi log và để bạn đăng nhập vào sửa.
+
+### mount và /etc/fstab
+
+`mount <thiết bị> <thư mục>` gắn filesystem vào cây thư mục cho tới khi unmount hoặc khởi động lại. Muốn tự mount mỗi lần khởi động, ghi một dòng vào `/etc/fstab`, sáu trường:
+
+```text
+ UUID=db1b525d-…   /mnt/data   ext4   defaults,nofail   0      2
+ └ cái gì            └ ở đâu     └ loại  └ tuỳ chọn        └ dump └ thứ tự fsck (0 = không kiểm, 1 = root, 2 = còn lại)
+```
+
+Tuỳ chọn mount hay dùng:
+
+| Tuỳ chọn | Tác dụng | Dùng khi |
+|---|---|---|
+| `defaults` | `rw,suid,dev,exec,auto,nouser,async` | Mặc định |
+| `nofail` | Thiết bị vắng mặt thì bỏ qua, máy vẫn khởi động | **Mọi đĩa dữ liệu không phải root** |
+| `noatime` | Không ghi thời điểm đọc file | Giảm ghi đĩa cho database, mail |
+| `ro` | Chỉ đọc | Dữ liệu tham chiếu, điều tra sự cố |
+| `noexec`, `nosuid`, `nodev` | Cấm chạy chương trình, bỏ qua setuid (D1.2), bỏ qua file thiết bị | `/tmp`, thư mục upload, đĩa của người dùng |
+| `discard` | Báo cho đĩa biết block đã trống (TRIM) | SSD, đĩa ảo cấp phát mỏng |
+
+Trên máy dùng systemd, mỗi dòng fstab được dịch thành một **mount unit** lúc khởi động (và mỗi lần `systemctl daemon-reload`). Nếu một mount không có `nofail` mà thất bại, systemd coi việc khởi động là hỏng và đưa máy vào **emergency mode**: không mạng, không SSH, chỉ có console.
+
+<Callout kind="pitfall">
+
+`findmnt --verify` kiểm được cú pháp fstab, thiết bị có tồn tại không, mount point có không, nhưng **không** kiểm được tuỳ chọn riêng của filesystem: bước 3 cho thấy `nofial` (gõ nhầm `nofail`) vẫn được báo "Success". Cách thử chắc chắn duy nhất là mount thật: `sudo umount <thư mục> && sudo mount -a`, rồi xem `findmnt`. Làm việc đó **trước khi** khởi động lại.
+
+</Callout>
+
+<Check id="d1.3.layers-fstab">Vẽ lại được các lớp từ block device tới thư mục, giải thích được vì sao fstab dùng UUID và `nofail`, và nêu được cách thử một dòng fstab trước khi khởi động lại.</Check>
+
+### LVM: đĩa co giãn được
+
+Phân vùng thường có kích thước cố định và nằm trên đúng một đĩa. **LVM** (Logical Volume Manager) chèn một lớp trung gian để gỡ hai giới hạn đó:
+
+```text
+ PV (physical volume)     /dev/loop1      /dev/loop2      /dev/loop3      đĩa hoặc phân vùng giao cho LVM
+                              └───────────────┼───────────────┘
+ VG (volume group)                       vgdata                           "bể" dung lượng, chia thành extent 4 MiB
+                              ┌───────────────┴──────┐
+ LV (logical volume)      vgdata/app            (chỗ trống)               "phân vùng ảo", lấy extent từ bể
+                              │
+ filesystem ext4  →  mount /srv/app
+```
+
+| Việc | Lệnh | Ghi chú |
+|---|---|---|
+| Giao đĩa cho LVM | `pvcreate /dev/X` | |
+| Tạo, mở rộng bể | `vgcreate vg /dev/X …`, `vgextend vg /dev/Y` | Thêm đĩa bất cứ lúc nào |
+| Tạo volume | `lvcreate -n tên -L 600M vg` | |
+| Nới volume **và** filesystem | `lvextend -r -L +400M vg/tên` | `-r` gọi luôn `resize2fs` hoặc `xfs_growfs`; làm được khi đang mount và đang ghi |
+| Xem | `pvs`, `vgs`, `lvs` | |
+
+Thiếu `-r` là lỗi kinh điển: LV to ra nhưng filesystem vẫn kích thước cũ, `df` không đổi. Chiều ngược lại, thu nhỏ, nguy hiểm hơn nhiều: phải thu filesystem trước rồi mới thu LV, sai thứ tự là mất dữ liệu, và XFS không thu được. Thực tế người ta cấp vừa đủ, để dành chỗ trống trong VG, rồi nới dần.
+
+Trên cloud, volume (như EBS của AWS) tự nới được từ phía nhà cung cấp, nên nhiều đội không dùng LVM mà chỉ nới volume rồi `growpart` và `resize2fs`. LVM vẫn hay gặp ở máy chủ vật lý, VM on-prem, và image của RHEL (mặc định cài trên LVM).
+
+<Check id="d1.3.lvm">Giải thích được PV, VG, LV và extent, và nói được vì sao `lvextend` cần `-r` và vì sao nới thì dễ còn thu nhỏ thì nguy hiểm.</Check>
+
+### RAID: chịu được đĩa hỏng
+
+**RAID** ghép nhiều đĩa thành một thiết bị để đổi lấy tốc độ, độ bền, hoặc cả hai. Trên Linux, RAID mềm do driver `md` của kernel làm, quản lý bằng `mdadm`.
+
+| Mức | Cách ghép | Đĩa tối thiểu | Chịu mất | Dung lượng dùng được | Ghi chú |
+|---|---|---|---|---|---|
+| RAID 0 | Chia dữ liệu ra các đĩa | 2 | 0 | 100% | Nhanh; hỏng một đĩa là mất hết |
+| RAID 1 | Mỗi đĩa một bản sao | 2 | n−1 đĩa | 1 đĩa | Đơn giản, hay dùng cho đĩa hệ điều hành |
+| RAID 5 | Chia dữ liệu, 1 đĩa parity | 3 | 1 | n−1 đĩa | Dựng lại lâu, dễ gặp lỗi thứ hai trong lúc dựng |
+| RAID 6 | 2 đĩa parity | 4 | 2 | n−2 đĩa | Cho mảng nhiều đĩa lớn |
+| RAID 10 | Các cặp RAID 1 ghép RAID 0 | 4 | 1 mỗi cặp | 50% | Database: nhanh và dựng lại nhanh |
+
+Trạng thái mảng đọc ở `/proc/mdstat`: `[2/2] [UU]` là hai trên hai đĩa đang hoạt động; `[2/1] [_U]` là mảng **degraded**, đang chạy trên một đĩa và không còn dự phòng. Mảng degraded vẫn đọc ghi bình thường, nên nếu không có giám sát, không ai biết cho tới khi đĩa thứ hai hỏng.
+
+<Callout kind="production">
+
+**RAID không phải backup**, và replica cũng vậy. Ngày 31/1/2017, một kỹ sư của GitLab.com định xoá thư mục dữ liệu trên máy database phụ để dựng lại replication, nhưng chạy `rm -rf` trên máy **chính**; khi kịp dừng lệnh thì khoảng 300 GB đã mất. Replication chép lệnh xoá sang mọi nơi một cách trung thành, y như RAID sẽ làm. Lúc tìm backup mới biết: bản `pg_dump` hằng ngày đã hỏng từ lâu vì sai phiên bản, và email báo lỗi của cron bị máy chủ thư từ chối nên không ai hay. Thứ cứu được dữ liệu là một **LVM snapshot** của volume database mà một kỹ sư tự tay chụp 6 giờ trước đó để nạp cho môi trường staging; GitLab.com mất 6 giờ dữ liệu và ngừng phục vụ khoảng 18 giờ. Bài học từ bản postmortem công khai của họ: RAID và replica chỉ bảo vệ trước hỏng phần cứng, không trước lệnh xoá nhầm, migration sai hay ransomware; backup chưa từng khôi phục thử thì chưa phải backup; và snapshot của LVM là một lớp phòng thủ rẻ. Hai việc phải có cùng RAID: cảnh báo khi mảng degraded hay job backup lỗi (D12), và backup ra nơi khác có diễn tập khôi phục (D20).
+
+</Callout>
+
+<Check id="d1.3.raid">So sánh được RAID 0, 1, 5, 6, 10 về số đĩa chịu mất và dung lượng, đọc được `/proc/mdstat`, và giải thích được vì sao RAID không thay được backup.</Check>
+
+### Đầy đĩa: df và du nói gì
+
+Hai lệnh đo hai thứ khác nhau:
+
+- `df` hỏi **filesystem**: bao nhiêu block đã cấp, bao nhiêu còn trống.
+- `du` đi bộ qua **cây thư mục** và cộng kích thước các file nó thấy.
+
+Bình thường hai con số gần nhau. Khi chúng lệch, lý do nằm trong bảng:
+
+| Triệu chứng | Nguyên nhân | Tìm bằng | Sửa |
+|---|---|---|---|
+| `df` đầy, `du` nhỏ | File đã xoá nhưng **còn tiến trình đang mở** | `lsof +L1` | Cho tiến trình đóng file: khởi động lại hoặc gửi tín hiệu mở lại log; gấp thì cắt file qua `/proc/<PID>/fd/<N>` |
+| `df` đầy, `du` nhỏ | File nằm **dưới một mount point**, bị filesystem khác che | Mount lại gốc ở chỗ khác (`mount --bind / /mnt/x`) rồi `du` | Dọn file bị che |
+| `df` còn trống, vẫn "No space left" | **Hết inode** | `df -i` | Xoá bớt file nhỏ; tìm thư mục nhiều file bằng `du --inodes` |
+| User thường hết chỗ, root vẫn ghi được | Chạm vùng **reserved** của ext4 | `tune2fs -l` | Dọn dữ liệu; đừng coi 5% đó là chỗ để dùng |
+| `du` lớn hơn `df` | File thưa (sparse), hard link đếm trùng | `du --apparent-size` | Không cần sửa |
+
+Vì sao file đã xoá vẫn chiếm chỗ: `rm` chỉ gỡ **tên** khỏi thư mục. Kernel chỉ giải phóng inode và block khi không còn tên nào **và** không còn tiến trình nào giữ file descriptor trỏ tới nó. Một dịch vụ mở file log lúc khởi động rồi ghi mãi vào descriptor đó sẽ tiếp tục ghi vào file "ma" sau khi bạn `rm`.
+
+Quy trình khi nhận cảnh báo đầy đĩa:
+
+```text
+ df -hT          filesystem nào đầy?  (đừng dọn nhầm filesystem khác)
+ df -i           đầy block hay đầy inode?
+ du -xh --max-depth=1 <mount> | sort -h      thư mục nào lớn?  (-x: không băng sang filesystem khác)
+ tổng du << df ?  →  lsof +L1                file đã xoá còn mở
+ tìm ra thủ phạm →  giải phóng an toàn (nén, chuyển đi, cắt log), rồi sửa nguyên nhân (logrotate, giới hạn, nới đĩa)
+```
+
+<Check id="d1.3.disk-full">Giải thích được vì sao `df` và `du` lệch nhau, vì sao file đã xoá vẫn chiếm chỗ, và kể được quy trình tìm thứ làm đầy đĩa.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [`fstab(5)`](https://man7.org/linux/man-pages/man5/fstab.5.html): ý nghĩa sáu trường; đọc kèm phần "FILESYSTEM-INDEPENDENT MOUNT OPTIONS" của [`mount(8)`](https://man7.org/linux/man-pages/man8/mount.8.html).
+- [`lvm(8)`](https://man7.org/linux/man-pages/man8/lvm.8.html): tổng quan các lệnh LVM và khái niệm PV, VG, LV; từ đây đi tới `lvextend(8)`.
+- [`mdadm(8)`](https://man7.org/linux/man-pages/man8/mdadm.8.html): các chế độ Create, Manage, Monitor; đọc phần "MANAGE MODE" trước khi thay đĩa thật.
+- [RAID arrays (Linux kernel)](https://docs.kernel.org/admin-guide/md.html): `/proc/mdstat` và các file trong `/sys/block/md*/md` nói gì.
+- [ext4 General Information (Linux kernel)](https://docs.kernel.org/admin-guide/ext4.html): các tuỳ chọn mount của ext4.
+- [Postmortem of database outage of January 31](https://about.gitlab.com/blog/postmortem-of-database-outage-of-january-31/) của GitLab: đọc phần "Broken recovery procedures" để thấy từng lớp backup hỏng thế nào.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:**
+
+- VM `ubuntu` của D0.1 đang chạy, vào bằng `cd ~ && limactl shell ubuntu`. Image Ubuntu 26.04 server đã có sẵn `parted`, `lvm2`, `mdadm`, `lsof`.
+- **Profile máy:** VM 2 CPU, 2 GiB. Lab tạo khoảng 3,6 GiB file đĩa ảo dạng sparse, thật sự chiếm khoảng 600 MB trên đĩa VM. Máy 8 GB: tắt Docker khi làm.
+- Làm **cả bài trong một phiên shell**, vì các bước dùng biến (`$D`, `$L1`…) giữ tên loop device. Nếu lỡ thoát shell, xem lại tên bằng `losetup -a` và gán lại biến.
+
+Tên loop device (`/dev/loop0`, `loop1`…) trên máy bạn có thể khác; UUID chắc chắn khác.
+
+### 1. Nhìn các đĩa đang có
+
+<Terminal where="vm">
+
+```bash
+lsblk
+df -hT -x tmpfs -x devtmpfs -x efivarfs
+grep -v '^#' /etc/fstab
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+vda     253:0    0   20G  0 disk
+├─vda1  253:1    0   19G  0 part /
+├─vda13 253:13   0  923M  0 part /boot
+└─vda15 253:15   0   99M  0 part /boot/efi
+vdb     253:16   0   19M  1 disk /mnt/lima-cidata
+Filesystem            Type      Size  Used Avail Use% Mounted on
+/dev/vda1             ext4       19G  3.2G   16G  18% /
+/dev/vda13            ext4      891M  196M  633M  24% /boot
+/dev/vda15            vfat       98M  6.5M   91M   7% /boot/efi
+lima-61c30cdd31537e9c virtiofs  927G  631G  297G  69% /Users/hoangduoc/masteva-d0
+/dev/vdb              iso9660    19M   19M     0 100% /mnt/lima-cidata
+LABEL=cloudimg-rootfs	/	 ext4	discard,commit=30,errors=remount-ro	0 1
+LABEL=BOOT	/boot	ext4	defaults	0 2
+LABEL=UEFI	/boot/efi	vfat	umask=0077	0 1
+lima-61c30cdd31537e9c	/Users/hoangduoc/masteva-d0	virtiofs	rw,nofail,comment=cloudconfig	0	0
+```
+
+</Expected>
+
+Một đĩa `vda` 20G (đúng số bạn đặt ở D0.1) chia ba phân vùng, và `vdb` là đĩa cloud-init chỉ đọc. fstab của image dùng `LABEL=` thay cho tên thiết bị; dòng mount thư mục từ Mac có `nofail`.
+
+<Callout kind="danger">
+
+Từ bước 2 trở đi, bài dùng những lệnh **xoá sạch thiết bị đích mà không hỏi lại**: `parted … mklabel` ghi đè bảng phân vùng, `mkfs` ghi đè filesystem, `pvcreate` và `mdadm --create` ghi đè phần đầu thiết bị. Trong bài, đích luôn là loop device (`/dev/loopN`) vừa tạo từ một file trống, giữ trong biến `$D`, `$L1`, `$R1`…; nếu một biến rỗng, lệnh sẽ lỗi chứ không ghi nhầm đĩa khác. Trên máy thật, trước mỗi lệnh loại này hãy chạy `lsblk -f` và đối chiếu tên, kích thước, mount point của thiết bị: gõ nhầm `/dev/sdb` thành `/dev/sda` là mất hệ điều hành hoặc dữ liệu, và không có bước hoàn tác.
+
+</Callout>
+
+### 2. Từ đĩa trống tới thư mục dùng được
+
+Tạo một file 1 GiB làm đĩa, gắn nó thành loop device, tạo bảng phân vùng GPT với một phân vùng, tạo filesystem và mount:
+
+<Terminal where="vm">
+
+```bash
+mkdir -p ~/masteva-d1/disks && cd ~/masteva-d1/disks
+truncate -s 1G disk1.img
+D=$(sudo losetup -fP --show disk1.img); echo $D
+sudo parted -s $D mklabel gpt mkpart data ext4 1MiB 100%
+sudo mkfs.ext4 -q -L data ${D}p1
+sudo mkdir -p /mnt/data && sudo mount ${D}p1 /mnt/data
+lsblk $D
+sudo blkid ${D}p1
+df -hT /mnt/data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/dev/loop0
+NAME      MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+loop0       7:0    0    1G  0 loop
+└─loop0p1 259:0    0 1022M  0 part /mnt/data
+/dev/loop0p1: LABEL="data" UUID="db1b525d-a359-43cb-b04d-2b9cf8c4e109" BLOCK_SIZE="4096" TYPE="ext4" PARTLABEL="data" PARTUUID="1bf3579b-7715-4625-aa77-c1316a06aa3b"
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/loop0p1   ext4  988M  276K  921M   1% /mnt/data
+```
+
+</Expected>
+
+`losetup -fP --show`: `-f` lấy loop device còn trống, `-P` cho kernel đọc bảng phân vùng bên trong, `--show` in tên thiết bị. Đĩa 1 GiB cho filesystem 988M, và chỉ 921M "Avail": phần chênh là cấu trúc của ext4 (bảng inode, journal) và 5% reserved.
+
+<Check id="d1.3.lab-mkfs-mount">Đi được từ một đĩa trống tới một thư mục đã mount: tạo bảng phân vùng, phân vùng, filesystem, mount, và đọc được UUID.</Check>
+
+### 3. Ghi fstab và thử trước khi khởi động lại
+
+<Terminal where="vm">
+
+```bash
+UUID=$(sudo blkid -s UUID -o value ${D}p1)
+echo "UUID=$UUID  /mnt/data  ext4  defaults,nofail  0  2" | sudo tee -a /etc/fstab
+sudo findmnt --verify | tail -3
+sudo systemctl daemon-reload
+sudo umount /mnt/data && sudo mount -a && findmnt /mnt/data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+UUID=db1b525d-a359-43cb-b04d-2b9cf8c4e109  /mnt/data  ext4  defaults,nofail  0  2
+
+0 parse errors, 0 errors, 1 warning
+   [W] your fstab has been modified, but systemd still uses the old version;
+       use 'systemctl daemon-reload' to reload
+TARGET    SOURCE       FSTYPE OPTIONS
+/mnt/data /dev/loop0p1 ext4   rw,relatime
+```
+
+</Expected>
+
+`findmnt --verify` nhắc `daemon-reload` để systemd sinh lại mount unit. `umount` rồi `mount -a` (mount mọi thứ trong fstab chưa được mount) là phép thử thật: nếu dòng mới sai, bạn biết ngay lúc này chứ không phải sau khi khởi động lại.
+
+Giờ thử một dòng có lỗi gõ, `nofial`, nhưng ghi ra file riêng để không làm hỏng fstab thật:
+
+<Terminal where="vm">
+
+```bash
+echo "UUID=$UUID  /mnt/data  ext4  defaults,nofial  0  2" > /tmp/fstab.bad
+sudo findmnt --verify --tab-file /tmp/fstab.bad | tail -1
+sudo umount /mnt/data
+sudo mount -T /tmp/fstab.bad /mnt/data; echo "exit=$?"
+sudo dmesg -t | tail -1
+sudo mount /mnt/data && findmnt -no SOURCE /mnt/data
+```
+
+</Terminal>
+
+<Predict question="findmnt --verify có bắt được chữ nofial không? Lệnh mount thì sao?">
+
+`findmnt --verify` báo `Success, no errors or warnings detected`: nó không biết tuỳ chọn nào hợp lệ với ext4. `mount` thì thất bại với exit code 32, và lý do thật nằm trong log kernel: `ext4: Unknown parameter 'nofial'`. Nếu dòng này nằm trong fstab thật, mất luôn tác dụng của `nofail`, mount thất bại lúc khởi động và máy vào emergency mode.
+
+</Predict>
+
+<Expected>
+
+```text
+Success, no errors or warnings detected
+mount: /mnt/data: wrong fs type, bad option, bad superblock on /dev/loop0p1, missing codepage or helper program, or other error.
+       dmesg(1) may have more information after failed mount system call.
+exit=32
+ext4: Unknown parameter 'nofial'
+/dev/loop0p1
+```
+
+</Expected>
+
+Thông báo của `mount` gộp nhiều nguyên nhân vào một câu; `dmesg` mới nói đúng lý do. `mount -T <file>` dùng một file fstab khác, tiện để thử. Lệnh cuối mount lại bằng dòng đúng trong fstab thật.
+
+<Check id="d1.3.lab-fstab">Thêm được một dòng fstab dùng UUID và `nofail`, thử nó bằng `umount` rồi `mount -a`, và đọc `dmesg` khi mount thất bại.</Check>
+
+### 4. LVM: nới volume khi đang ghi
+
+Tạo ba "đĩa" 512 MiB. Dùng hai cái đầu làm PV, gộp thành VG `vgdata`, cắt một LV 600 MiB:
+
+<Terminal where="vm">
+
+```bash
+for i in 1 2 3; do truncate -s 512M lvm$i.img; done
+L1=$(sudo losetup -f --show lvm1.img); L2=$(sudo losetup -f --show lvm2.img); L3=$(sudo losetup -f --show lvm3.img)
+echo $L1 $L2 $L3
+sudo pvcreate $L1 $L2
+sudo vgcreate vgdata $L1 $L2
+sudo lvcreate -n app -L 600M vgdata
+sudo mkfs.ext4 -q /dev/vgdata/app && sudo mkdir -p /srv/app && sudo mount /dev/vgdata/app /srv/app
+sudo pvs; sudo vgs
+lsblk $L1 $L2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/dev/loop1 /dev/loop2 /dev/loop3
+  Physical volume "/dev/loop1" successfully created.
+  Physical volume "/dev/loop2" successfully created.
+  Volume group "vgdata" successfully created
+  Logical volume "app" created.
+  PV         VG     Fmt  Attr PSize   PFree
+  /dev/loop1 vgdata lvm2 a--  508.00m      0
+  /dev/loop2 vgdata lvm2 a--  508.00m 416.00m
+  VG     #PV #LV #SN Attr   VSize    VFree
+  vgdata   2   1   0 wz--n- 1016.00m 416.00m
+NAME         MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+loop1          7:1    0  512M  0 loop
+└─vgdata-app 252:0    0  600M  0 lvm  /srv/app
+loop2          7:2    0  512M  0 loop
+└─vgdata-app 252:0    0  600M  0 lvm  /srv/app
+```
+
+</Expected>
+
+LV 600M lớn hơn một đĩa 512M: `lsblk` cho thấy `vgdata-app` nằm trên **cả hai** loop device. Mỗi PV 512M chỉ cho 508M: LVM dành 1 MiB đầu thiết bị cho metadata, và 511 MiB còn lại chỉ chia được thành 127 extent 4 MiB trọn vẹn (xem bằng `sudo pvs -o+pe_start,pv_mda_size`).
+
+Giả lập một dịch vụ đang chạy: lấp gần đầy volume, rồi cho một tiến trình nền ghi log 5 lần mỗi giây. Trong lúc đó, nới volume:
+
+<Terminal where="vm">
+
+```bash
+sudo dd if=/dev/zero of=/srv/app/data.bin bs=1M count=480 status=none
+df -h /srv/app | tail -1
+sudo bash -c 'while true; do date +%T.%N >> /srv/app/ghi.log; sleep 0.2; done' &
+sleep 1
+sudo lvextend -r -L +400M vgdata/app
+df -h /srv/app | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/dev/mapper/vgdata-app  574M  481M   52M  91% /srv/app
+  File system ext4 found on vgdata/app mounted at /srv/app.
+  Size of logical volume vgdata/app changed from 600.00 MiB (150 extents) to 1000.00 MiB (250 extents).
+  Extending file system ext4 to 1000.00 MiB (1048576000 bytes) on vgdata/app...
+resize2fs /dev/vgdata/app
+resize2fs 1.47.2 (1-Jan-2025)
+Filesystem at /dev/vgdata/app is mounted on /srv/app; on-line resizing required
+old_desc_blocks = 1, new_desc_blocks = 1
+The filesystem on /dev/vgdata/app is now 256000 (4k) blocks long.
+
+resize2fs done
+  Extended file system ext4 on vgdata/app.
+  Logical volume vgdata/app successfully resized.
+/dev/mapper/vgdata-app  968M  481M  431M  53% /srv/app
+```
+
+</Expected>
+
+Từ 91% xuống 53%, không unmount, không dừng tiến trình ghi. `-r` đã gọi `resize2fs` ("on-line resizing"). 600 MiB là 150 extent, mỗi extent 4 MiB.
+
+<Predict question="VG còn 16M trống. Chạy lvextend -r -L +400M lần nữa thì sao? Làm gì tiếp?">
+
+LVM từ chối: `Insufficient free space: 100 extents needed, but only 4 available`, exit code 5, không có gì thay đổi. Bể đã cạn thì thêm đĩa vào bể: `vgextend vgdata $L3` (tự `pvcreate` nếu đĩa chưa là PV), rồi `lvextend -r -l +100%FREE` để lấy hết chỗ trống.
+
+</Predict>
+
+<Terminal where="vm">
+
+```bash
+sudo lvextend -r -L +400M vgdata/app; echo "exit=$?"
+sudo vgextend vgdata $L3
+sudo lvextend -r -l +100%FREE vgdata/app | tail -1
+df -h /srv/app | tail -1
+sudo lvs -o lv_name,lv_size,devices vgdata
+sudo pkill -f 'ghi[.]log'; sudo wc -l /srv/app/ghi.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  File system ext4 found on vgdata/app mounted at /srv/app.
+  Insufficient free space: 100 extents needed, but only 4 available
+exit=5
+  Physical volume "/dev/loop3" successfully created.
+  Volume group "vgdata" successfully extended
+resize2fs 1.47.2 (1-Jan-2025)
+  Logical volume vgdata/app successfully resized.
+/dev/mapper/vgdata-app  1.5G  481M  928M  35% /srv/app
+  LV   LSize  Devices
+  app  <1.49g /dev/loop1(0)
+  app  <1.49g /dev/loop2(0)
+  app  <1.49g /dev/loop3(0)
+9 /srv/app/ghi.log
+```
+
+</Expected>
+
+Volume giờ trải trên ba đĩa. File `ghi.log` vẫn tăng đều suốt quá trình: 9 dòng khi cả chuỗi lệnh chạy liền nhau trong chưa tới 2 giây, số dòng của bạn tuỳ thời gian gõ lệnh. Cái giá của việc trải nhiều đĩa mà không có RAID: hỏng một trong ba đĩa là hỏng cả volume.
+
+<Check id="d1.3.lab-lvm">Tạo được PV, VG, LV, nới LV cùng filesystem khi đang mount, và thêm được đĩa vào VG khi bể hết chỗ.</Check>
+
+### 5. RAID 1: hỏng một đĩa, thay đĩa mới
+
+Tạo ba đĩa 256 MiB: hai cái làm mảng RAID 1, cái thứ ba để thay.
+
+<Terminal where="vm">
+
+```bash
+for i in 1 2 3; do truncate -s 256M raid$i.img; done
+R1=$(sudo losetup -f --show raid1.img); R2=$(sudo losetup -f --show raid2.img); R3=$(sudo losetup -f --show raid3.img)
+echo $R1 $R2 $R3
+sudo mdadm --create /dev/md0 --run --level=1 --raid-devices=2 $R1 $R2 2>&1 | tail -1
+until grep -q '\[UU\]' /proc/mdstat; do sleep 1; done; sed -n 2,3p /proc/mdstat
+sudo mkfs.ext4 -q /dev/md0 && sudo mkdir -p /mnt/raid && sudo mount /dev/md0 /mnt/raid
+sudo cp /etc/services /mnt/raid/ && sha256sum /mnt/raid/services
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/dev/loop4 /dev/loop5 /dev/loop6
+mdadm: array /dev/md0 started.
+md0 : active raid1 loop5[1] loop4[0]
+      261120 blocks super 1.2 [2/2] [UU]
+20c48954659cf753baa383ecde0e6f026fadc06c2c9fbe29d88d928188c3ec17  /mnt/raid/services
+```
+
+</Expected>
+
+`--run` bỏ câu hỏi xác nhận. Vòng `until` chờ tới khi `/proc/mdstat` có `[UU]`; `[2/2] [UU]` là cả hai đĩa đang hoạt động. Mã băm của file dùng để kiểm dữ liệu ở bước sau; mã của bạn có thể khác nếu `/etc/services` khác bản.
+
+Đánh dấu đĩa thứ nhất là hỏng (ngoài đời, kernel tự làm việc này khi đĩa trả lỗi I/O):
+
+<Terminal where="vm">
+
+```bash
+sudo mdadm /dev/md0 --fail $R1
+sed -n 2,3p /proc/mdstat
+sudo mdadm --detail /dev/md0 | grep -E 'State :|faulty|active sync'
+sha256sum /mnt/raid/services
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+md0 : active raid1 loop5[1] loop4[0](F)
+      261120 blocks super 1.2 [2/1] [_U]
+             State : active, degraded
+       0       7        4        0      faulty   /dev/loop4
+       1       7        5        1      active sync   /dev/loop5
+20c48954659cf753baa383ecde0e6f026fadc06c2c9fbe29d88d928188c3ec17  /mnt/raid/services
+```
+
+</Expected>
+
+`(F)` và `[_U]`: một đĩa hỏng, mảng degraded (dòng `State` có thể là `clean, degraded` hoặc `active, degraded`, đôi khi kèm `resyncing`, tuỳ lúc đó mảng đang làm gì; thứ tự hai dòng đĩa cũng có thể đảo). Filesystem vẫn mount, file vẫn đọc ra đúng mã băm cũ. Thay đĩa: gỡ đĩa hỏng, thêm đĩa mới, chờ dựng lại.
+
+<Terminal where="vm">
+
+```bash
+sudo mdadm /dev/md0 --remove $R1
+sudo mdadm /dev/md0 --add $R3
+until grep -q '\[UU\]' /proc/mdstat; do sleep 1; done; sed -n 2,3p /proc/mdstat
+sudo mdadm --detail /dev/md0 | grep -E 'State :|active sync'
+sha256sum /mnt/raid/services
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mdadm: hot removed /dev/loop4 from /dev/md0
+mdadm: added /dev/loop6
+md0 : active raid1 loop6[2] loop5[1]
+      261120 blocks super 1.2 [2/2] [UU]
+             State : clean
+       2       7        6        0      active sync   /dev/loop6
+       1       7        5        1      active sync   /dev/loop5
+20c48954659cf753baa383ecde0e6f026fadc06c2c9fbe29d88d928188c3ec17  /mnt/raid/services
+```
+
+</Expected>
+
+Đĩa mới vào mảng với vai trò spare, kernel chép toàn bộ dữ liệu sang (gọi là recovery), rồi mảng trở lại `[UU]`. Dòng `State` sau đó là `clean`, hoặc `active` nếu mảng vừa có thao tác ghi; cả hai đều là mảng khoẻ, điều cần nhìn là không còn chữ `degraded` và cả hai đĩa đều `active sync`. Vòng `until` chờ việc đó. Với đĩa 256 MiB, recovery mất từ dưới một giây tới khoảng một phút tuỳ tải của máy; nếu đọc `/proc/mdstat` đúng lúc đó bạn sẽ thấy thêm một dòng tiến độ, ví dụ `recovery =  1.5% (4544/261120) finish=0.9min speed=4544K/sec`. Trong lúc recovery, mảng vẫn chỉ có một bản dữ liệu đầy đủ. Với đĩa 16 TB quãng đó kéo dài nhiều giờ tới vài ngày, và là khoảng thời gian rủi ro nhất của một mảng RAID.
+
+<Check id="d1.3.lab-raid">Tạo được mảng RAID 1, nhận ra trạng thái degraded trong `/proc/mdstat`, và thay được đĩa hỏng mà dữ liệu vẫn nguyên.</Check>
+
+### 6. Ba kiểu "đầy đĩa"
+
+Tạo một filesystem nhỏ 64 MiB với chỉ 2048 inode để mọi thứ đầy nhanh:
+
+<Terminal where="vm">
+
+```bash
+truncate -s 64M small.img; S=$(sudo losetup -f --show small.img)
+sudo mkfs.ext4 -q -N 2048 -L small $S && sudo mkdir -p /mnt/small && sudo mount $S /mnt/small && sudo chown $USER /mnt/small
+df -h /mnt/small | tail -1; df -i /mnt/small | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/dev/loop7       60M  152K   55M   1% /mnt/small
+/dev/loop7       2048    12  2036    1% /mnt/small
+```
+
+</Expected>
+
+**Kiểu 1: file đã xoá còn mở.** Một "dịch vụ" mở file log 40 MiB ở descriptor số 3 và ghi thêm mỗi giây. Ai đó dọn đĩa bằng `rm`:
+
+<Terminal where="vm">
+
+```bash
+head -c 40M /dev/urandom > /mnt/small/app.log
+nohup bash -c 'exec 3>>/mnt/small/app.log; while sleep 1; do echo "$(date +%T) request ok" >&3; done' >/dev/null 2>&1 &
+P=$!; sleep 1
+rm /mnt/small/app.log
+df -h /mnt/small | tail -1; du -sh /mnt/small 2>/dev/null
+sudo lsof -nP +L1 | grep -E 'COMMAND|/mnt/small'
+```
+
+</Terminal>
+
+<Predict question="Sau rm, df báo bao nhiêu đã dùng? du thì sao?">
+
+`df` vẫn báo 41M đã dùng, `du` báo 20K. File không còn tên nên `du` và `ls` không thấy, nhưng tiến trình `bash` (và tiến trình con `sleep` thừa hưởng descriptor) vẫn giữ nó mở, nên kernel chưa giải phóng block nào. `lsof +L1` liệt kê đúng những file có số liên kết (NLINK) bằng 0 mà còn mở.
+
+</Predict>
+
+<Expected>
+
+```text
+/dev/loop7       60M   41M   15M  74% /mnt/small
+20K	/mnt/small
+COMMAND      PID      USER  FD   TYPE DEVICE SIZE/OFF NLINK  NODE NAME
+bash      478519 hoangduoc   3w   REG    7,7 41943060     0    13 /mnt/small/app.log (deleted)
+sleep     478526 hoangduoc   3w   REG    7,7 41943060     0    13 /mnt/small/app.log (deleted)
+```
+
+</Expected>
+
+Cột `FD` là `3w`: descriptor số 3, mở để ghi. Cách lấy lại chỗ mà không dừng dịch vụ là cắt file về 0 byte qua `/proc`:
+
+<Terminal where="vm">
+
+```bash
+: > /proc/$P/fd/3
+df -h /mnt/small | tail -1
+kill $P; sleep 2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/dev/loop7       60M  152K   55M   1% /mnt/small
+```
+
+</Expected>
+
+`/proc/<PID>/fd/3` là đường tắt tới chính file đang mở; `: >` cắt nó về rỗng. `sleep 2` sau `kill` để tiến trình con `sleep` cũng kịp thoát và nhả descriptor, trả lại inode của file trước bước sau. Cách sửa đúng lâu dài là để dịch vụ tự đóng và mở lại file log khi xoay vòng log.
+
+**Kiểu 2: hết inode.** Một ứng dụng tạo hàng nghìn file phiên nhỏ xíu:
+
+<Terminal where="vm">
+
+```bash
+mkdir /mnt/small/sessions && cd /mnt/small/sessions
+for i in $(seq 1 2100); do echo x > sess_$i 2>/dev/null || { echo "dừng ở file $i"; break; }; done
+echo x > one-more
+df -h /mnt/small | tail -1; df -i /mnt/small | tail -1
+sudo du --inodes -s /mnt/small/* | sort -n | tail -1
+cd ~/masteva-d1/disks && rm -rf /mnt/small/sessions
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+dừng ở file 2036
+bash: sess_2036: No space left on device
+bash: one-more: No space left on device
+/dev/loop7       60M  8.2M   47M  15% /mnt/small
+/dev/loop7       2048  2048     0  100% /mnt/small
+2036	/mnt/small/sessions
+```
+
+</Expected>
+
+"No space left on device" khi `df -h` báo mới dùng 15%. `df -i` cho câu trả lời: 2048 trên 2048 inode đã dùng. `du --inodes` chỉ ra thư mục chứa nhiều file nhất. Filesystem mới có sẵn 12 inode đã dùng, nên file thứ 2036 là file đầu tiên không tạo được.
+
+**Kiểu 3: vùng dành cho root.** User thường ghi tới khi đầy, rồi root ghi tiếp:
+
+<Terminal where="vm">
+
+```bash
+dd if=/dev/zero of=/mnt/small/big bs=1M status=none; echo "user exit=$?"
+df -h /mnt/small | tail -1
+sudo dd if=/dev/zero of=/mnt/small/root-big bs=1M count=2 status=none; echo "root exit=$?"
+df -h /mnt/small | tail -1
+sudo tune2fs -l $S | grep -E '^Block count|^Reserved block count'
+rm -f /mnt/small/big; sudo rm -f /mnt/small/root-big
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+dd: IO error: No space left on device
+user exit=1
+/dev/loop7       60M   55M  852K  99% /mnt/small
+root exit=0
+/dev/loop7       60M   57M     0 100% /mnt/small
+Block count:              16384
+Reserved block count:     819
+```
+
+</Expected>
+
+User thường bị chặn khi `Avail` chỉ còn vài trăm KB; root vẫn ghi thêm được 2 MiB vào phần 819 block (5%) để dành. Số `Avail` lúc user bị chặn dao động giữa các lần chạy (852K hoặc 340K trên máy kiểm chứng). Thông báo `dd: IO error: …` là của uutils; GNU `dd` viết `error writing '/mnt/small/big': No space left on device`.
+
+<Check id="d1.3.lab-disk-full">Tái hiện và phân biệt được ba kiểu đầy đĩa: file đã xoá còn mở, hết inode, chạm vùng reserved; dùng được `lsof +L1`, `df -i`, `du --inodes`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `losetup: cannot find an unused loop device` hoặc biến `$D`, `$L1` rỗng: bạn đã mở shell mới. Xem `losetup -a` rồi gán lại, ví dụ `D=/dev/loop0`.
+- `mount: /mnt/data: can't find UUID=…`: biến `$UUID` rỗng lúc ghi fstab. Xoá dòng hỏng bằng `sudo sed -i '\|/mnt/data|d' /etc/fstab` rồi làm lại bước 3.
+- `WARNING: ext4 signature detected on /dev/loopN at offset 1080. Wipe it? [y/n]` khi `pvcreate`: loop device còn chữ ký filesystem cũ, thường vì bạn dùng lại một file `.img` của lần làm trước. Trả lời `n`, kiểm lại đúng là loop device của lab, rồi xoá chữ ký bằng khối lệnh ngay dưới callout này.
+- `mdadm: cannot open /dev/loopN: Device or resource busy`: thiết bị đang thuộc một mảng hoặc VG khác. Kiểm bằng `lsblk`.
+- `umount: target is busy`: shell của bạn đang đứng trong thư mục đó, hoặc tiến trình nền của bước 4, 6 còn chạy. `cd ~`, rồi `sudo lsof +D <thư mục>` để tìm. Nếu không thấy ai giữ (kernel còn đang xoá file lớn vừa `rm`), chờ vài giây rồi `umount` lại và chạy tiếp các lệnh dọn dẹp còn lại.
+- Sau khi VM khởi động lại giữa bài: loop device biến mất, `/mnt/data` không mount (đúng vai trò của `nofail`), mảng và VG không còn. Làm phần Dọn dẹp rồi bắt đầu lại.
+
+</Callout>
+
+<Callout kind="danger">
+
+`wipefs -a` xoá mọi chữ ký filesystem, RAID, LVM trên thiết bị, khiến dữ liệu trên đó không còn mount được. Chỉ chạy với loop device của lab, sau khi `losetup -a` xác nhận nó trỏ tới file `.img` trong `~/masteva-d1/disks`. Thay `/dev/loopN` bằng tên thật.
+
+</Callout>
+
+<Terminal where="vm" title="Chỉ khi pvcreate hỏi về chữ ký cũ">
+
+```bash
+losetup -a
+sudo wipefs /dev/loopN
+sudo wipefs -a /dev/loopN
+```
+
+</Terminal>
+
+`wipefs` không có `-a` chỉ liệt kê chữ ký đang có (ví dụ một dòng `ext4` ở offset `0x438`); có `-a` thì xoá và in `2 bytes were erased at offset 0x00000438 (ext4)`. Sau đó `pvcreate` chạy bình thường.
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới đây huỷ mảng RAID, xoá volume group cùng toàn bộ dữ liệu trong `/srv/app`, `/mnt/raid`, `/mnt/data`, `/mnt/small`, gỡ dòng `/mnt/data` khỏi `/etc/fstab`, tháo **mọi** loop device không còn dùng và xoá thư mục `~/masteva-d1/disks`. Chỉ chạy trong VM lab, không bao giờ chép `vgremove`, `mdadm --zero-superblock` hay `losetup -D` sang máy thật.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+cd ~
+sudo umount /mnt/small /mnt/raid /srv/app /mnt/data
+sudo mdadm --stop /dev/md0
+sudo mdadm --zero-superblock $R1 $R2 $R3
+sudo vgremove -y vgdata
+sudo pvremove -y $L1 $L2 $L3
+sudo sed -i '\|/mnt/data|d' /etc/fstab && sudo systemctl daemon-reload
+sudo losetup -D
+sudo rmdir /mnt/small /mnt/raid /srv/app /mnt/data
+rm -rf ~/masteva-d1/disks /tmp/fstab.bad
+losetup -a; grep -c /mnt/data /etc/fstab
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mdadm: stopped /dev/md0
+  Logical volume "app" successfully removed.
+  Volume group "vgdata" successfully removed
+  Labels on physical volume "/dev/loop1" successfully wiped.
+  Labels on physical volume "/dev/loop2" successfully wiped.
+  Labels on physical volume "/dev/loop3" successfully wiped.
+0
+```
+
+</Expected>
+
+`losetup -a` không in gì và fstab không còn dòng `/mnt/data`.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao fstab nên dùng UUID thay vì /dev/sdb1, và khi nào LABEL tốt hơn?">
+
+Tên `/dev/sdX` do kernel gán theo thứ tự phát hiện thiết bị, và thứ tự đó đổi được: thêm một đĩa, đổi cổng, hay chỉ là driver nạp theo thứ tự khác ở lần khởi động này. Trên cloud, gắn thêm volume có thể đẩy tên các đĩa khác lên một chữ. Một dòng fstab trỏ `/dev/sdb1` khi đó hoặc không mount được, hoặc tệ hơn là mount **nhầm đĩa** vào thư mục dữ liệu. UUID được ghi trong superblock của filesystem lúc `mkfs` và đi theo filesystem bất kể nó nằm ở cổng nào. LABEL dễ đọc hơn (`LABEL=pgdata`) và giữ được khi bạn khôi phục dữ liệu sang đĩa mới rồi đặt lại nhãn, nhưng bạn phải tự bảo đảm không có hai filesystem trùng nhãn; image cloud của Ubuntu dùng LABEL vì mọi máy tạo từ image đó cần cùng một fstab. Với LVM, đường dẫn `/dev/vgdata/app` đã ổn định sẵn.
+
+</Reveal>
+
+<Reveal title="Một thư mục 30 GB 'biến mất' khỏi du nhưng df vẫn tính. Không có file nào bị xoá còn mở. Còn khả năng nào?">
+
+File nằm **dưới một mount point**. Ví dụ: dịch vụ ghi vào `/var/lib/app` khi đĩa dữ liệu chưa được mount (fstab lỗi, hoặc mount chậm lúc khởi động). 30 GB đó nằm trên filesystem gốc. Sau đó đĩa dữ liệu được mount đè lên `/var/lib/app`, che toàn bộ nội dung cũ: `du` chỉ thấy nội dung của đĩa mới, còn `df /` vẫn tính 30 GB bị che. Cách xem mà không cần unmount: `sudo mount --bind / /mnt/root-xem` rồi `du -sh /mnt/root-xem/var/lib/app`; bind mount của `/` không kéo theo các mount con nên bạn thấy đúng thứ nằm bên dưới. Phòng ngừa: cho dịch vụ phụ thuộc vào mount (`RequiresMountsFor=` trong unit systemd) để nó không khởi động khi đĩa chưa sẵn sàng.
+
+</Reveal>
+
+<Reveal title="Vì sao RAID 5 bị coi là rủi ro với đĩa dung lượng lớn?">
+
+Khi một đĩa trong RAID 5 hỏng, mảng phải đọc **toàn bộ** các đĩa còn lại để dựng lại đĩa thay thế. Với đĩa hàng chục TB việc này kéo dài nhiều giờ tới nhiều ngày, trong lúc mảng không còn dự phòng và các đĩa còn lại (thường cùng lô, cùng tuổi) chịu tải đọc liên tục. Chỉ cần thêm một đĩa hỏng, hoặc một sector không đọc được trên đĩa còn lại, là quá trình dựng lại thất bại. RAID 6 chịu được hai đĩa hỏng nên qua được tình huống đó; RAID 10 dựng lại nhanh hơn vì chỉ cần chép từ đĩa cặp đôi. Dù chọn mức nào, mảng cần được kiểm định kỳ (Ubuntu có sẵn timer `mdcheck` chạy hằng tháng) để phát hiện sector hỏng trước khi cần tới nó.
+
+</Reveal>
+
+<Reveal title="Trên cloud, volume đã được nhà cung cấp nhân bản. Còn cần RAID và LVM không?">
+
+Thường là không cần RAID: một volume như EBS đã được nhân bản bên trong một availability zone, và RAID 1 trên hai volume cùng zone chỉ tăng chi phí mà không chống được sự cố của cả zone. Người ta vẫn dùng RAID 0 trên nhiều volume khi cần IOPS vượt giới hạn một volume, chấp nhận rằng độ bền đến từ nhân bản ở tầng ứng dụng (replica của database) và snapshot. LVM cũng ít cần hơn vì volume tự nới được, nhưng vẫn có ích khi muốn gộp nhiều volume hoặc chụp snapshot nhất quán trước khi backup. Điều không đổi là phần đầu bài: filesystem, UUID, fstab với `nofail`, và quy trình nới (nới volume, `growpart`, `resize2fs`). D10 làm việc với volume trên AWS; K2 và K7 đưa chính những khái niệm này vào PersistentVolume.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI đọc output của `lsblk`, `/proc/mdstat`, `lvs`, hoặc lập kế hoạch nới một volume và liệt kê bước kiểm tra trước sau. AI hay sai ở: đưa lệnh thu nhỏ (`lvreduce`, `resize2fs` với kích thước nhỏ hơn) sai thứ tự, quên `-r` khi `lvextend`, quên `nofail`, dùng tên `/dev/sdX` trong fstab, khuyên `rm` file log đang mở để lấy lại chỗ, và viết lệnh với tên thiết bị của ví dụ thay vì của máy bạn. Với mọi lệnh ghi lên thiết bị (`mkfs`, `parted`, `pvcreate`, `mdadm --create`, `wipefs`), tự đối chiếu tên thiết bị với `lsblk` trước khi chạy, và thử trên loop device như bài này trước khi làm trên đĩa thật.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.2 dạy quyền và các tuỳ chọn `nosuid`, `noexec` xuất hiện lại ở mount. D1.4 dùng quy trình đầy đĩa của bài này trong một kịch bản chẩn đoán, và xem I/O bằng `iostat`. D5 dùng volume của Docker, vốn là thư mục trên filesystem của máy chủ. D10 làm việc với volume cloud. D12 đặt cảnh báo dung lượng, inode và trạng thái mảng. D20 dạy backup, thứ RAID không thay được. K2 và K7 đưa đĩa vào Kubernetes qua PersistentVolume và StorageClass.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d1.3.mastery-add-disk">Gắn được một đĩa mới vào máy thành một thư mục tự mount khi khởi động, với UUID và `nofail`, và đã thử bằng `mount -a` trước khi khởi động lại.</Check>
+
+<Check id="d1.3.mastery-grow">Nới được dung lượng cho một dịch vụ đang chạy trên LVM mà không dừng nó, kể cả khi volume group đã hết chỗ.</Check>
+
+<Check id="d1.3.mastery-raid">Nhìn `/proc/mdstat` nói được mảng đang khoẻ, degraded hay đang dựng lại, và thay được một đĩa hỏng trong RAID 1.</Check>
+
+<Check id="d1.3.mastery-full-disk">Nhận cảnh báo đầy đĩa, tìm được nguyên nhân trong vài phút bằng `df -hT`, `df -i`, `du`, `lsof +L1`, và lấy lại chỗ mà không làm mất dữ liệu.</Check>
+
+</Mastery>

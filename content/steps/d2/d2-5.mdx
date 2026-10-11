@@ -1,0 +1,717 @@
+---
+title: Reverse proxy, cân bằng tải, VLAN và bonding
+description: Đặt Nginx làm reverse proxy kết thúc TLS và cân bằng tải hai backend, rồi làm hỏng từng backend để thấy 502, 504 và chuyện một endpoint chậm hạ cả dịch vụ; dựng VLAN với port access, trunk và bonding active-backup bằng ip link.
+id: d2.5
+step: d2
+prerequisites: [d2.4]
+topics: [d2.nginx-caddy, d2.load-balancer-reverse-proxy, d2.vlan-bonding]
+status: verified
+verified:
+  date: 2026-10-10
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    nginx: 1.28.3
+    iproute2: 6.19.0
+    tcpdump: 4.99.6
+    curl: 8.18.0
+    python: 3.14.4
+---
+
+<Goal>
+
+Đưa traffic của người dùng tới nhiều bản của ứng dụng qua một reverse proxy, và hiểu hai mảnh của mạng máy chủ vật lý mà bạn sẽ gặp ở datacenter. Học xong bài này, bạn giải thích được:
+
+- Vì sao backend chỉ thấy IP của proxy, và header `X-Forwarded-For` sinh ra để làm gì.
+- Vì sao một endpoint chậm có thể khiến Nginx trả `502` cho **mọi** request trong khoảng 10 giây, và `502`, `503`, `504` khác nhau ở đâu.
+- Vì sao hai máy cắm cùng switch, đặt cùng subnet vẫn không thấy nhau khi khác VLAN.
+- Vì sao rút một dây mạng của máy chủ có bonding không làm rớt kết nối.
+
+</Goal>
+
+<Knowledge>
+
+### Web server, reverse proxy và load balancer
+
+Ba vai trò này thường do cùng một phần mềm đảm nhận:
+
+- **Web server:** trả file tĩnh.
+- **Reverse proxy:** đứng trước ứng dụng, nhận request thay nó: kết thúc TLS, nén, giới hạn tốc độ, ghi log, định tuyến theo `Host` và đường dẫn. Ứng dụng phía sau chỉ nghe HTTP ở mạng nội bộ.
+- **Load balancer:** chia request cho nhiều bản của ứng dụng và bỏ qua bản hỏng.
+
+| | Load balancer L4 | Load balancer L7 (reverse proxy) |
+|---|---|---|
+| Hiểu tới tầng | TCP/UDP: IP và port | HTTP: host, đường dẫn, header, cookie |
+| Quyết định theo | Kết nối | Từng request |
+| TLS | Chuyển nguyên (passthrough) | Kết thúc TLS, xem được nội dung |
+| Ví dụ | NLB, HAProxy mode tcp, IPVS, `stream` của Nginx | Nginx, Caddy, HAProxy mode http, Envoy, ALB |
+
+Vì reverse proxy mở kết nối mới tới backend, backend thấy IP của proxy. Proxy ghi IP client vào header `X-Forwarded-For` và giao thức gốc vào `X-Forwarded-Proto`. Ứng dụng chỉ được tin các header này khi request **chắc chắn** đi qua proxy của bạn, vì client tự gửi được header giả.
+
+Cấu hình Nginx có ba khối chính: `upstream` (danh sách backend), `server` (một virtual host, chọn theo `listen` và `server_name`), `location` (xử lý theo đường dẫn). Ba status code của proxy cần phân biệt:
+
+| Code | Nginx muốn nói | Kiểm tra gì |
+|---|---|---|
+| `502 Bad Gateway` | Không kết nối được backend, hoặc backend trả lời hỏng, hoặc không còn backend nào sống | Backend có chạy không, `error.log` |
+| `503 Service Unavailable` | Bị giới hạn (`limit_req`, `limit_conn`) hoặc chủ động bảo trì | Cấu hình giới hạn |
+| `504 Gateway Timeout` | Kết nối được nhưng backend trả lời quá `proxy_read_timeout` | Backend chậm ở đâu |
+
+**Nginx hay Caddy.** Bài này chạy Nginx vì nó phổ biến nhất ở hệ thống có sẵn. Caddy đáng chọn cho dự án mới cần HTTPS tự động:
+
+| | Nginx 1.28 | Caddy 2.11 |
+|---|---|---|
+| Cấu hình | Nhiều dòng, kiểm soát chi tiết | Caddyfile ngắn, mặc định hợp lý |
+| HTTPS | Tự khai báo chứng chỉ, gia hạn bằng công cụ ngoài (certbot) | Tự xin và gia hạn qua ACME; có CA nội bộ sẵn |
+| Health check chủ động | Chỉ có ở bản thương mại; bản mở chỉ có thụ động | Có sẵn |
+| Tải cấu hình mới | `nginx -s reload` | API hoặc `caddy reload` |
+
+Cấu hình tương đương bước 2 của lab viết bằng Caddyfile (đã kiểm cú pháp bằng `caddy adapt` của Caddy 2.11.7, bài không chạy nó):
+
+```text
+api.lab.internal {
+	tls /pki/api-chain.crt /pki/api.key
+	reverse_proxy 10.0.3.11:8080 10.0.3.12:8080 {
+		lb_policy round_robin
+		fail_duration 10s
+	}
+}
+```
+
+<Callout kind="production">
+
+Health check loại backend hỏng, nhưng chính nó cũng có thể hạ cả dịch vụ. Bài [Implementing health checks](https://aws.amazon.com/builders-library/implementing-health-checks/) trong Amazon Builders' Library mô tả tình huống mọi server cùng trượt health check một lúc, thường vì một phụ thuộc chung (database, dịch vụ xác thực) gặp vấn đề chứ không phải vì từng server hỏng. Nếu load balancer tin kết quả đó tuyệt đối, nó ngừng gửi traffic cho tất cả và một sự cố một phần thành sự cố toàn bộ. Vì vậy, theo bài viết, load balancer của AWS **fail open**: khi mọi server đều báo hỏng, nó gửi traffic cho tất cả. Bước 3 của lab cho bạn thấy phiên bản thu nhỏ với Nginx: một endpoint chậm làm cả hai backend bị đánh dấu hỏng, và Nginx trả `502` cho mọi request.
+
+</Callout>
+
+D9 đi sâu vận hành proxy trên production: worker, keepalive, buffer, giới hạn tốc độ, HAProxy với health check chủ động, Keepalived và VIP.
+
+<Check id="d2.5.reverse-proxy">Phân biệt được reverse proxy với load balancer L4, giải thích được `X-Forwarded-For`, và nói được `502`, `503`, `504` từ Nginx khác nhau ở đâu.</Check>
+
+### VLAN và bonding
+
+Hai khái niệm này thuộc tầng link, bạn gặp khi làm việc với máy chủ vật lý, hypervisor và switch. Trên cloud, nhà cung cấp lo phần này.
+
+**VLAN (802.1Q)** chia một switch vật lý thành nhiều mạng L2 tách biệt bằng cách chèn một **tag** 4 byte vào frame Ethernet, trong đó 12 bit là VLAN ID (1–4094). Port **access** thuộc một VLAN, frame ra vào không có tag, máy cắm vào không biết VLAN tồn tại. Port **trunk** chở nhiều VLAN, frame có tag; máy chủ ảo hoá cắm vào trunk và tạo card con cho từng VLAN (`eth0.10`, `eth0.20`). Hai máy khác VLAN không nói chuyện được ở tầng 2 dù có đặt cùng subnet; muốn thông phải đi qua router.
+
+```text
+                      switch (bridge có VLAN)
+              ┌──────────────────────────────────────┐
+   h10 ───────┤ port access, VLAN 10                 │
+   (frame     │   vào: gắn tag 10   ra: gỡ tag       │
+   không tag) │                                      │
+   h20 ───────┤ port access, VLAN 20                 ├─────── hv (máy chủ ảo hoá)
+              │                    port trunk 10, 20 │        eth0.10  192.168.10.1
+              └──────────────────────────────────────┘        eth0.20  192.168.20.1
+                                     frame trên dây trunk luôn có tag 10 hoặc 20
+   Frame của h10 chỉ ra ở port thuộc VLAN 10: tới được hv qua eth0.10, không bao giờ tới h20.
+```
+
+**Bonding** ghép nhiều card vật lý thành một card logic để chịu lỗi hoặc tăng băng thông:
+
+| Mode | Hoạt động | Cần gì ở switch |
+|---|---|---|
+| `active-backup` | Một card chạy, card kia chờ; đứt thì chuyển | Không cần gì. Lựa chọn an toàn mặc định |
+| `802.3ad` (LACP) | Các card cùng chạy, chia theo luồng | Switch cấu hình LACP; hai switch thì cần MLAG |
+| `balance-tlb` | Mọi card cùng gửi, chia theo tải; chỉ một card nhận | Không cần gì |
+| `balance-alb` | Như `balance-tlb`, thêm chia chiều nhận bằng cách sửa câu trả lời ARP | Không, nhưng khó chẩn đoán hơn |
+
+`miimon` là chu kỳ (ms) kiểm tra đường truyền của từng card. Trên máy thật, bonding và VLAN khai báo trong netplan; lab dùng `ip link` để thấy cơ chế.
+
+<Check id="d2.5.vlan-bonding">Giải thích được access port, trunk port và VLAN tag; chọn được mode bonding cho một máy chủ hai card mạng và nói được nó cần gì ở switch.</Check>
+</Knowledge>
+
+<Resources>
+
+- [nginx: Beginner's Guide](https://nginx.org/en/docs/beginners_guide.html): cấu trúc file cấu hình, `server`, `location`, proxy đơn giản và `nginx -s reload`.
+- [nginx: Using nginx as HTTP load balancer](https://nginx.org/en/docs/http/load_balancing.html): round robin, `least_conn`, `ip_hash` và health check thụ động.
+- [nginx: Module ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html): `max_fails`, `fail_timeout`, `keepalive` và các biến `$upstream_*`.
+- [Caddy: reverse_proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy): chính sách cân bằng tải, health check chủ động và thụ động, nếu bạn chọn Caddy.
+- [Linux Ethernet Bonding Driver HOWTO](https://docs.kernel.org/networking/bonding.html): mục 2 về các mode và `miimon`, mục 5 về yêu cầu ở switch.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** có `~/masteva-d2/topo.sh` của D2.1 và thư mục `~/masteva-d2/pki` của D2.3 với `root.crt`, `api-chain.crt`, `api.key` (chưa có thì làm lại bước 1 của D2.3). Bài không cần firewall hay sshd của D2.4. VM 2 CPU, 2 GiB; lab chạy Nginx và vài tiến trình Python, tốn khoảng 100 MB, máy 8 GB không cần thu gọn. Cài gói và dựng mạng:
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y nginx tcpdump
+sudo systemctl disable --now nginx     # lab chạy Nginx riêng trong namespace server
+sudo ~/masteva-d2/topo.sh up
+mkdir -p ~/masteva-d2/nginx && cd ~/masteva-d2
+ls pki/root.crt pki/api-chain.crt pki/api.key && nginx -v
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pki/api-chain.crt
+pki/api.key
+pki/root.crt
+nginx version: nginx/1.28.3 (Ubuntu)
+```
+
+</Expected>
+
+Gói `nginx` của Ubuntu tự bật một service nghe port 80 của VM; lab không dùng nó nên tắt đi. Sơ đồ của phần proxy, thêm hai backend sau server:
+
+```text
+ VM 10.0.1.10 ── router ── server 10.0.2.20 ── br-app 10.0.3.1 ─┬─ web1 10.0.3.11:8080
+     lan0        (chỉ       Nginx :80 :443                       └─ web2 10.0.3.12:8080
+                 chuyển tiếp)
+```
+
+Bước 4 và 5 (VLAN, bonding) dùng các namespace riêng, không liên quan tới sơ đồ này. Bước 4 dùng hai terminal.
+
+### 1. Hai backend sau một bridge
+
+Thêm hai "máy" `web1`, `web2` nối vào server qua một **bridge** (switch ảo), mỗi máy chạy một backend nhỏ in ra tên mình và những gì nó thấy về request:
+
+<Terminal where="vm" title="~/masteva-d2/backend.py">
+
+```bash
+cat > ~/masteva-d2/backend.py <<'EOF'
+#!/usr/bin/env python3
+"""Backend nhỏ cho lab D2.5. Cách chạy: backend.py <tên> <ip> [port]"""
+import http.server
+import sys
+import time
+
+NAME, IP = sys.argv[1], sys.argv[2]
+PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8080
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        if self.path == "/slow":
+            time.sleep(3)
+        body = (
+            f"backend={NAME} peer={self.client_address[0]} "
+            f"host={self.headers.get('Host')} xff={self.headers.get('X-Forwarded-For')} "
+            f"proto={self.headers.get('X-Forwarded-Proto')}\n"
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass  # im lặng: log đã có ở Nginx
+
+http.server.ThreadingHTTPServer((IP, PORT), Handler).serve_forever()
+EOF
+sudo ip -n server link add br-app type bridge
+sudo ip -n server addr add 10.0.3.1/24 dev br-app
+sudo ip -n server link set br-app up
+for n in 1 2; do
+  sudo ip netns add web$n
+  sudo ip -n server link add to-web$n type veth peer name eth0 netns web$n
+  sudo ip -n server link set to-web$n master br-app up
+  sudo ip -n web$n addr add 10.0.3.1$n/24 dev eth0
+  sudo ip -n web$n link set lo up; sudo ip -n web$n link set eth0 up
+  sudo ip netns exec web$n python3 ~/masteva-d2/backend.py web$n 10.0.3.1$n >/dev/null 2>&1 &
+done
+sleep 1; sudo ip netns exec server curl -s http://10.0.3.11:8080/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+backend=web1 peer=10.0.3.1 host=10.0.3.11:8080 xff=None proto=None
+```
+
+</Expected>
+
+Trong các vòng lặp của bài (`web$n`, `p-$h`, `eth$i`), biến chỉ nhận đúng những giá trị liệt kê sau `for`, không có dấu cách hay ký tự glob, nên được để không nháy cho dễ đọc. Với dữ liệu đến từ bên ngoài thì luôn nháy như D3.1 dạy.
+
+### 2. Nginx: virtual host, TLS, reverse proxy, cân bằng tải
+
+File cấu hình có biến của Nginx (`$host`, `$remote_addr`), nên heredoc phải có nháy (`<<'EOF'`) để shell không thay chúng; đường dẫn lab được điền sau bằng `sed`.
+
+<Terminal where="vm" title="~/masteva-d2/nginx/nginx.conf">
+
+```bash
+cat > ~/masteva-d2/nginx/nginx.conf <<'EOF'
+user www-data;
+worker_processes 1;
+pid LAB/nginx/nginx.pid;
+error_log LAB/nginx/error.log warn;
+
+events { worker_connections 256; }
+
+http {
+  log_format lab '$remote_addr "$request" $status $body_bytes_sent '
+                 'rt=$request_time up=$upstream_addr us=$upstream_status urt=$upstream_response_time';
+  access_log LAB/nginx/access.log lab;
+
+  upstream app {
+    server 10.0.3.11:8080 max_fails=1 fail_timeout=10s;
+    server 10.0.3.12:8080 max_fails=1 fail_timeout=10s;
+    keepalive 8;
+  }
+
+  # Request có Host lạ: đóng kết nối, không trả gì
+  server {
+    listen 10.0.2.20:80 default_server;
+    return 444;
+  }
+
+  # HTTP -> HTTPS
+  server {
+    listen 10.0.2.20:80;
+    server_name api.lab.internal;
+    return 301 https://$host$request_uri;
+  }
+
+  server {
+    listen 10.0.2.20:443 ssl;
+    http2 on;
+    server_name api.lab.internal;
+    ssl_certificate     LAB/pki/api-chain.crt;
+    ssl_certificate_key LAB/pki/api.key;
+
+    location / {
+      proxy_pass http://app;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_connect_timeout 1s;
+      proxy_read_timeout 2s;
+    }
+  }
+}
+EOF
+sed -i "s#LAB#$HOME/masteva-d2#g" ~/masteva-d2/nginx/nginx.conf
+sudo ip netns exec server nginx -t -c $HOME/masteva-d2/nginx/nginx.conf
+sudo ip netns exec server nginx -c $HOME/masteva-d2/nginx/nginx.conf
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+nginx: the configuration file /home/hoangduoc.guest/masteva-d2/nginx/nginx.conf syntax is ok
+nginx: configuration file /home/hoangduoc.guest/masteva-d2/nginx/nginx.conf test is successful
+```
+
+</Expected>
+
+`max_fails=1 fail_timeout=10s` chính là giá trị mặc định của Nginx, viết ra cho rõ. `ssl_certificate` trỏ tới file chain (lá kèm intermediate) của D2.3. `proxy_http_version 1.1` cùng `Connection ""` và `keepalive 8` để Nginx dùng lại kết nối tới backend thay vì mở mới cho mỗi request.
+
+Lab không chạy DNS của D2.2, nên dùng `--resolve` của curl để gán tên với IP cho từng lệnh. Các tuỳ chọn dùng chung nằm trong một **mảng** Bash, khai triển bằng `"${R[@]}"` để mỗi phần tử là đúng một tham số (D3.1):
+
+<Terminal where="vm">
+
+```bash
+cd ~/masteva-d2
+R=(--resolve api.lab.internal:443:10.0.2.20 --resolve api.lab.internal:80:10.0.2.20 --cacert pki/root.crt)
+curl -sS -i "${R[@]}" http://api.lab.internal/orders | head -1
+curl -sS -m3 http://10.0.2.20/
+for i in 1 2 3 4; do curl -sS "${R[@]}" https://api.lab.internal/; done
+curl -sS -o /dev/null -w 'http_version=%{http_version}\n' "${R[@]}" https://api.lab.internal/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HTTP/1.1 301 Moved Permanently
+curl: (52) Empty reply from server
+backend=web1 peer=10.0.3.1 host=api.lab.internal xff=10.0.1.10 proto=https
+backend=web2 peer=10.0.3.1 host=api.lab.internal xff=10.0.1.10 proto=https
+backend=web1 peer=10.0.3.1 host=api.lab.internal xff=10.0.1.10 proto=https
+backend=web2 peer=10.0.3.1 host=api.lab.internal xff=10.0.1.10 proto=https
+http_version=2
+```
+
+</Expected>
+
+- Cùng IP và port 80, `Host: api.lab.internal` vào virtual host có `server_name` khớp và nhận `301`; `Host: 10.0.2.20` rơi vào `default_server` và bị đóng kết nối (`444` là mã riêng của Nginx).
+- Request luân phiên giữa `web1` và `web2`: round robin là thuật toán mặc định.
+- Backend thấy `peer=10.0.3.1` (Nginx), còn IP của VM nằm trong `xff`. Client nói HTTP/2 qua TLS với Nginx; Nginx nói HTTP/1.1 không mã hoá với backend, `proto=https` báo cho backend giao thức gốc.
+
+<Check id="d2.5.lab-nginx">Cấu hình được Nginx với virtual host, chuyển hướng HTTPS, kết thúc TLS và `proxy_pass` tới một `upstream` hai backend, và giải thích được từng trường backend in ra.</Check>
+
+### 3. Backend chết, backend chậm
+
+Dừng `web2` rồi gửi bốn request:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns pids web2 | xargs -r sudo kill
+for i in 1 2 3 4; do curl -sS "${R[@]}" https://api.lab.internal/ | cut -d' ' -f1; done
+grep -c . nginx/access.log; tail -4 nginx/access.log | cut -d' ' -f5-
+sudo tail -2 nginx/error.log | cut -d' ' -f3- | cut -c1-110
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+backend=web1
+backend=web1
+backend=web1
+backend=web1
+11
+200 75 rt=0.041 up=10.0.3.12:8080, 10.0.3.11:8080 us=502, 200 urt=0.000, 0.041
+200 75 rt=0.042 up=10.0.3.11:8080 us=200 urt=0.042
+200 75 rt=0.041 up=10.0.3.11:8080 us=200 urt=0.041
+200 75 rt=0.042 up=10.0.3.11:8080 us=200 urt=0.042
+[error] 361773#361773: *10 connect() failed (111: Connection refused) while connecting to upstream, client: 10
+[warn] 361773#361773: *10 upstream server temporarily disabled while connecting to upstream, client: 10.0.1.10
+```
+
+</Expected>
+
+Không client nào thấy lỗi. Dòng log đầu kể lại chuyện: Nginx thử `10.0.3.12` trước, bị từ chối (`us=502`), thử tiếp `10.0.3.11` và trả `200`. Sau một lần lỗi (`max_fails=1`), `web2` bị loại trong khoảng 10 giây kể từ lúc lỗi (`fail_timeout`). Đây là **health check thụ động**: Nginx chỉ biết backend hỏng khi một request thật va vào nó. Số `11` là số dòng log, tuỳ số request bạn đã gửi; số sau `[error]` là PID của worker.
+
+Khởi động lại `web2`, chờ hết 10 giây, rồi gọi endpoint chậm (backend ngủ 3 giây, `proxy_read_timeout` là 2 giây):
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec web2 python3 ~/masteva-d2/backend.py web2 10.0.3.12 >/dev/null 2>&1 &
+sleep 11
+curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' "${R[@]}" https://api.lab.internal/slow
+```
+
+</Terminal>
+
+Ngay sau đó gọi hai lần endpoint nhanh `/`, rồi xem log:
+
+<Terminal where="vm">
+
+```bash
+for i in 1 2; do curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' "${R[@]}" https://api.lab.internal/; done
+tail -3 nginx/access.log | cut -d' ' -f2-
+```
+
+</Terminal>
+
+<Predict question="Request tới /slow mất bao lâu và trả mã gì? Hai request tới / ngay sau đó (cả hai backend đều đang chạy) trả mã gì?">
+
+```text
+504 4.033410s
+502 0.005234s
+502 0.002855s
+"GET /slow HTTP/2.0" 504 167 rt=4.006 up=10.0.3.11:8080, 10.0.3.12:8080 us=504, 504 urt=2.002, 2.005
+"GET / HTTP/2.0" 502 157 rt=0.000 up=app us=502 urt=0.000
+"GET / HTTP/2.0" 502 157 rt=0.000 up=app us=502 urt=0.000
+```
+
+`/slow` mất **4 giây**, không phải 2: sau khi backend đầu quá hạn, Nginx tự gửi lại request sang backend kia (mặc định `proxy_next_upstream error timeout`) và chờ thêm 2 giây. Tệ hơn, mỗi lần quá hạn tính là một lần lỗi, nên **cả hai backend bị đánh dấu hỏng**. Trong khoảng 10 giây kể từ lúc lỗi, mọi request nhận `502` với `no live upstreams` trong `error.log`, dù cả hai backend đều khoẻ.
+
+</Predict>
+
+Một endpoint chậm đã hạ cả dịch vụ. Trên production, chuyện này xảy ra khi một truy vấn báo cáo chạy lâu, hoặc database chậm làm mọi backend cùng chậm: Nginx loại hết backend, và phần traffic lẽ ra vẫn phục vụ được cũng chết theo. Ba hướng xử lý, thường dùng cùng nhau: đặt timeout theo từng `location` thay vì một con số chung, tắt gửi lại cho đường dẫn chậm hoặc không idempotent (`proxy_next_upstream off`), và đừng để quá hạn loại backend quá dễ (`max_fails` cao hơn, hoặc health check chủ động ở D9).
+
+Sửa cấu hình rồi nạp lại không gián đoạn:
+
+<Terminal where="vm">
+
+```bash
+sleep 10
+sed -i 's/proxy_read_timeout 2s;/proxy_read_timeout 5s;/' nginx/nginx.conf
+sudo ip netns exec server nginx -t -c $HOME/masteva-d2/nginx/nginx.conf 2>&1 | tail -1
+sudo ip netns exec server nginx -s reload -c $HOME/masteva-d2/nginx/nginx.conf
+sleep 1
+curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' "${R[@]}" https://api.lab.internal/slow
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+nginx: configuration file /home/hoangduoc.guest/masteva-d2/nginx/nginx.conf test is successful
+2026/10/10 08:15:21 [notice] 387549#387549: signal process started
+200 3.014859s
+```
+
+</Expected>
+
+`nginx -s reload` gửi `SIGHUP` cho tiến trình master (D1.1 đã nói về `SIGHUP`): master đọc cấu hình mới, tạo worker mới, và để worker cũ phục vụ nốt các request đang dở rồi mới thoát. Reload vì thế là **bất đồng bộ**: lệnh `nginx -s reload` trả về ngay khi gửi xong signal, lúc worker mới có thể chưa kịp nhận kết nối. `sleep 1` trong khối lệnh trên chờ việc đó; không có nó, request đầu tiên có thể vẫn rơi vào worker cũ với timeout 2 giây và nhận `504`. Luôn chạy `nginx -t` trước: reload với cấu hình lỗi thì Nginx giữ cấu hình cũ, nhưng lần khởi động lại kế tiếp sẽ không lên.
+
+<Check id="d2.5.lab-lb-failure">Tái hiện được Nginx tự chuyển sang backend còn sống, và sự cố một endpoint chậm làm mọi backend bị loại; đọc được `up=`, `us=`, `urt=` trong access log để giải thích.</Check>
+
+### 4. VLAN trên một switch ảo
+
+Phần này độc lập với mạng ở trên: một bridge biết VLAN đóng vai switch (`sw`), hai máy cắm port access (`h10` ở VLAN 10, `h20` ở VLAN 20) và một máy chủ ảo hoá `hv` cắm port trunk.
+
+<Terminal where="vm">
+
+```bash
+for ns in sw h10 h20 hv; do sudo ip netns add $ns; done
+sudo ip -n sw link add br0 type bridge vlan_filtering 1
+sudo ip -n sw link set br0 up
+for h in h10 h20 hv; do
+  sudo ip -n sw link add p-$h type veth peer name eth0 netns $h
+  sudo ip -n sw link set p-$h master br0 up
+  sudo ip -n $h link set lo up; sudo ip -n $h link set eth0 up
+  sudo ip netns exec sw bridge vlan del dev p-$h vid 1      # bỏ VLAN 1 mặc định
+done
+sudo ip netns exec sw bridge vlan add dev p-h10 vid 10 pvid untagged   # access VLAN 10
+sudo ip netns exec sw bridge vlan add dev p-h20 vid 20 pvid untagged   # access VLAN 20
+sudo ip netns exec sw bridge vlan add dev p-hv vid 10                  # trunk: có tag
+sudo ip netns exec sw bridge vlan add dev p-hv vid 20
+sudo ip netns exec sw bridge vlan show
+
+sudo ip -n h10 addr add 192.168.10.11/24 dev eth0
+sudo ip -n h20 addr add 192.168.20.21/24 dev eth0
+sudo ip -n hv link add link eth0 name eth0.10 type vlan id 10
+sudo ip -n hv link add link eth0 name eth0.20 type vlan id 20
+sudo ip -n hv addr add 192.168.10.1/24 dev eth0.10
+sudo ip -n hv addr add 192.168.20.1/24 dev eth0.20
+sudo ip -n hv link set eth0.10 up; sudo ip -n hv link set eth0.20 up
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+port              vlan-id
+br0               1 PVID Egress Untagged
+p-h10             10 PVID Egress Untagged
+p-h20             20 PVID Egress Untagged
+p-hv              10
+                  20
+```
+
+</Expected>
+
+`pvid untagged`: frame không tag đi vào port được gán VLAN đó, và frame ra khỏi port bị gỡ tag. Đó là port access. `p-hv` chỉ nhận và phát frame có tag 10 hoặc 20: port trunk. Xem tag trên dây trunk (terminal 2) trong lúc ping (terminal 1):
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec hv tcpdump -eni eth0 'vlan and icmp'
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec hv ping -c1 -W1 192.168.10.11 | sed -n 2p
+sudo ip netns exec hv ping -c1 -W1 192.168.20.21 | sed -n 2p
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+9a:47:a3:0f:41:1e > f6:77:71:ba:bb:9a, ethertype 802.1Q (0x8100), length 102: vlan 10, p 0, ethertype IPv4 (0x0800), 192.168.10.1 > 192.168.10.11: ICMP echo request, id 33295, seq 1, length 64
+f6:77:71:ba:bb:9a > 9a:47:a3:0f:41:1e, ethertype 802.1Q (0x8100), length 102: vlan 10, p 0, ethertype IPv4 (0x0800), 192.168.10.11 > 192.168.10.1: ICMP echo reply, id 33295, seq 1, length 64
+9a:47:a3:0f:41:1e > ce:12:fd:d2:e4:37, ethertype 802.1Q (0x8100), length 102: vlan 20, p 0, ethertype IPv4 (0x0800), 192.168.20.1 > 192.168.20.21: ICMP echo request, id 33298, seq 1, length 64
+ce:12:fd:d2:e4:37 > 9a:47:a3:0f:41:1e, ethertype 802.1Q (0x8100), length 102: vlan 20, p 0, ethertype IPv4 (0x0800), 192.168.20.21 > 192.168.20.1: ICMP echo reply, id 33298, seq 1, length 64
+```
+
+</Expected>
+
+Giữa lớp Ethernet và IP có thêm `802.1Q ... vlan 10`: đó là tag, 4 byte (frame dài 102 thay vì 98). Một sợi dây chở hai mạng. Giờ thử tính cô lập: cho `h20` thêm một địa chỉ thuộc **subnet của VLAN 10**.
+
+<Terminal where="vm">
+
+```bash
+sudo ip -n h20 addr add 192.168.10.22/24 dev eth0
+sudo ip netns exec h10 ping -c2 -W1 192.168.10.22 | tail -2 | head -1
+sudo ip netns exec h10 ping -c1 -W1 192.168.10.1 | sed -n 2p
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2 packets transmitted, 0 received, 100% packet loss, time 1046ms
+64 bytes from 192.168.10.1: icmp_seq=1 ttl=64 time=0.025 ms
+```
+
+</Expected>
+
+Cùng subnet, cùng switch, nhưng `h10` không tới được `h20`: ARP của `h10` chỉ được phát trong VLAN 10, và port của `h20` thuộc VLAN 20. Cô lập bằng VLAN nằm ở tầng 2, không phụ thuộc địa chỉ IP. Dừng tcpdump ở terminal 2.
+
+<Check id="d2.5.lab-vlan">Dựng được bridge có VLAN với port access và trunk, thấy tag 802.1Q bằng `tcpdump -e`, và chứng minh được hai máy khác VLAN không thông dù cùng subnet.</Check>
+
+### 5. Bonding active-backup
+
+Máy `b1` có hai card `eth1`, `eth2` cùng nối tới "switch" `b2`, ghép thành `bond0`:
+
+<Terminal where="vm">
+
+```bash
+sudo modprobe bonding
+sudo ip netns add b1; sudo ip netns add b2
+sudo ip -n b2 link add br0 type bridge; sudo ip -n b2 link set br0 up
+sudo ip -n b2 addr add 192.168.30.2/24 dev br0
+sudo ip -n b1 link add bond0 type bond mode active-backup miimon 100
+for i in 1 2; do
+  sudo ip -n b1 link add eth$i type veth peer name sw$i netns b2
+  sudo ip -n b2 link set sw$i master br0 up
+  sudo ip -n b1 link set eth$i master bond0
+done
+sudo ip -n b1 addr add 192.168.30.1/24 dev bond0
+sudo ip -n b1 link set bond0 up
+sleep 1; sudo ip netns exec b1 grep -E 'Bonding Mode|Currently Active|Slave Interface|MII Status' /proc/net/bonding/bond0
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Bonding Mode: fault-tolerance (active-backup)
+Currently Active Slave: eth1
+MII Status: up
+Slave Interface: eth1
+MII Status: up
+Slave Interface: eth2
+MII Status: up
+```
+
+</Expected>
+
+Ping liên tục 5 lần mỗi giây, và giữa chừng "rút dây" của card đang chạy bằng cách tắt đầu bên switch:
+
+<Terminal where="vm">
+
+```bash
+( sleep 2; sudo ip -n b2 link set sw1 down ) &
+sudo ip netns exec b1 ping -i 0.2 -c 25 -W1 192.168.30.2 | tail -2 | head -1
+sudo ip netns exec b1 grep -E 'Currently Active|Link Failure' /proc/net/bonding/bond0
+sudo dmesg | grep 'bond0: (slave' | tail -2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+25 packets transmitted, 24 received, 4% packet loss, time 4982ms
+Currently Active Slave: eth2
+Link Failure Count: 1
+Link Failure Count: 0
+bond0: (slave eth1): link status definitely down, disabling slave
+bond0: (slave eth2): making interface the new active one
+```
+
+</Expected>
+
+Bond chuyển sang `eth2` trong khoảng 100 ms (`miimon 100`), IP và MAC của `bond0` không đổi. Số gói mất phụ thuộc thời điểm card đứt rơi vào đâu giữa hai lần kiểm `miimon`: bài mẫu chạy bốn lần, hai lần mất 0 gói và hai lần mất 1 gói trong 25. Với máy chủ thật, đây là khác biệt giữa "đứt một dây mạng" là chuyện không ai để ý và là một sự cố.
+
+<Check id="d2.5.lab-bonding">Dựng được bond active-backup, làm đứt card đang chạy và đọc `/proc/net/bonding/bond0` để xác nhận đã chuyển card.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `nginx: [emerg] bind() to 10.0.2.20:80 failed (98: Address already in use)`: Nginx của lab đang chạy rồi. Dừng bằng `sudo ip netns exec server nginx -s quit -c $HOME/masteva-d2/nginx/nginx.conf`.
+- `nginx: [emerg] cannot load certificate`: chưa có `~/masteva-d2/pki`. Làm bước 1 của D2.3.
+- `curl: (60) ... unable to get local issuer certificate`: thiếu `--cacert pki/root.crt` (mảng `R` chưa được gán trong shell này), hoặc `pki` vừa được tạo lại nên Nginx đang giữ chứng chỉ cũ; reload Nginx.
+- Mọi request `502` với `no live upstreams`: bạn vừa gọi `/slow`. Chờ 10 giây.
+- `504` ở lệnh cuối bước 3 dù đã sửa timeout: request rơi vào worker cũ; chạy lại lệnh `curl`.
+- `curl: (28)` tới `10.0.2.20`: còn luật firewall của D2.4 trong namespace router, hoặc server mất default route. `sudo ~/masteva-d2/topo.sh up` dựng lại mạng sạch (rồi làm lại từ bước 1).
+- `RTNETLINK answers: File exists` ở bước 4 hoặc 5: namespace của lần chạy trước còn đó. Chạy phần dọn dẹp rồi làm lại.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới dừng mọi tiến trình trong các namespace của lab (kể cả Nginx của lab) và xoá các namespace. Thư mục `~/masteva-d2` (cấu hình, log, khoá và chứng chỉ lab) được giữ lại.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+kill $(jobs -p) 2>/dev/null
+for ns in web1 web2 server router sw h10 h20 hv b1 b2; do
+  sudo ip netns pids "$ns" 2>/dev/null | xargs -r sudo kill
+  sudo ip netns del "$ns" 2>/dev/null
+done
+sudo ~/masteva-d2/topo.sh down
+ip netns list | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+```
+
+</Expected>
+
+Giữ `~/masteva-d2/pki`: D9 dùng lại CA này. Xong chặng D2, tắt VM bằng `limactl stop <tên VM>` trên máy Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không nên tin X-Forwarded-For một cách mù quáng?">
+
+Client có thể tự gửi `X-Forwarded-For: 1.2.3.4`. Nginx với `$proxy_add_x_forwarded_for` **nối thêm** IP thật vào sau giá trị client gửi, nên phần tử đầu danh sách là thứ kẻ tấn công kiểm soát. Ứng dụng phải lấy IP từ phải sang trái, bỏ qua đúng số proxy mà mình tin, hoặc để Nginx ghi đè bằng `$remote_addr` ở lớp ngoài cùng. Rate limit hay danh sách chặn theo phần tử đầu của `X-Forwarded-For` là lỗ hổng. Spring Boot xử lý việc này bằng `server.forward-headers-strategy` và danh sách proxy tin cậy; SB13.3 cho thấy cấu hình sai chỗ này bị lợi dụng thế nào.
+
+</Reveal>
+
+<Reveal title="Khi nào chọn least_conn hay ip_hash thay cho round robin?">
+
+Round robin giả định mọi request tốn như nhau. Khi thời gian xử lý chênh nhiều (có request 10 ms, có request 5 giây), `least_conn` gửi request mới tới backend đang có ít kết nối nhất, tránh dồn việc nặng vào một chỗ. `ip_hash` gửi cùng một IP client tới cùng một backend, dùng khi ứng dụng giữ session trong bộ nhớ; nhưng nó chia lệch khi nhiều người dùng đi sau cùng một NAT, và mất session khi backend đó chết. Cách bền hơn là để session ở ngoài (Redis) và giữ backend không trạng thái.
+
+</Reveal>
+
+<Reveal title="Khi nào cần load balancer L4 thay vì reverse proxy L7?">
+
+Khi traffic không phải HTTP (PostgreSQL, Kafka, MQTT, gRPC muốn giữ TLS tới tận backend), khi cần chuyển nguyên TLS mà không giữ khoá ở lớp cân bằng tải, hoặc khi cần thông lượng rất lớn với chi phí thấp. Load balancer L4 quyết định một lần cho cả **kết nối**: nó không thấy từng request, nên không định tuyến theo đường dẫn, không thử lại request, và một kết nối sống lâu (HTTP/2, gRPC) dồn mọi request của nó vào một backend. Backend phía sau L4 cũng mất IP client theo kiểu của NAT; cách khôi phục là PROXY protocol, một dòng tiêu đề mà load balancer chèn vào đầu kết nối. Hệ thống thật thường xếp chồng cả hai: L4 ở ngoài cùng cho độ sẵn sàng, L7 phía sau cho logic HTTP.
+
+</Reveal>
+
+<Reveal title="Vì sao 802.3ad không tăng tốc cho một kết nối duy nhất?">
+
+LACP chia tải theo **luồng**: mọi gói của một kết nối (cùng bộ địa chỉ và port) luôn đi một card, để không bị đảo thứ tự. Hai card 10 Gb ghép lại cho tổng 20 Gb với nhiều kết nối, nhưng một lần sao chép dữ liệu qua một kết nối TCP vẫn chỉ được 10 Gb. Chính sách băm (`xmit_hash_policy`) quyết định trường nào được dùng để chia: mặc định chỉ theo MAC, nên traffic đi qua một gateway dồn hết vào một card; `layer3+4` chia theo IP và port, thường đều hơn. Và LACP đòi hai đầu cùng cấu hình: máy chủ bật `802.3ad` mà switch chưa bật thì tuỳ thiết bị, đường truyền có thể chập chờn hoặc đứt hẳn. Đó là lý do `active-backup` là lựa chọn an toàn khi bạn không kiểm soát switch.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết khối `server` và `upstream` của Nginx từ mô tả, chuyển cấu hình giữa Nginx và Caddy, hoặc viết netplan cho bond và VLAN. AI hay viết `proxy_pass` thiếu `proxy_set_header Host`, hay đưa cú pháp cũ `listen 443 ssl http2` (từ Nginx 1.25 là `http2 on;`), hay dùng directive `health_check` vốn chỉ có ở bản thương mại, và hay để timeout mặc định 60 giây cho mọi đường dẫn. Kiểm lại bằng `nginx -t`, rồi thử từ phía client với `curl -v`, và cố tình dừng một backend để xem log `up=`, `us=` như bước 3.
+
+</Callout>
+
+<Callout kind="link">
+
+D2.3 đã tạo chứng chỉ mà Nginx dùng ở đây; D2.4 giải thích vì sao NAT và proxy đều làm backend mất IP client. D3.2 đọc access log bằng grep, sed, awk và jq. D9 vận hành Nginx, HAProxy, Keepalived và TLS trên production. D10 có ALB và NLB, bản cloud của L7 và L4. K2.1 dùng Service và Gateway API, cùng ý tưởng ở quy mô cụm. SB13.3 xử lý `X-Forwarded-For` phía ứng dụng Spring Boot; SB8.3 dạy readiness và graceful shutdown, hai thứ quyết định một backend rời khỏi load balancer êm hay không.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d2.5.mastery-proxy">Nhìn một dòng access log có `502` hoặc `504` cùng `up=`, `us=`, `urt=` là nói được backend nào có vấn đề và nên chỉnh timeout, retry hay health check.</Check>
+
+<Check id="d2.5.mastery-config">Tự viết được cấu hình Nginx (hoặc Caddy) cho một service: chuyển hướng HTTPS, kết thúc TLS, `upstream` nhiều backend, header chuyển tiếp và timeout theo đường dẫn; kiểm bằng `nginx -t` và reload không gián đoạn.</Check>
+
+<Check id="d2.5.mastery-l2">Với một máy chủ vật lý hai card mạng cắm vào switch, đề xuất được mode bonding và cách chia VLAN, nói được cần gì ở phía switch, và kiểm được bằng `/proc/net/bonding/bond0` và `tcpdump -e`.</Check>
+
+</Mastery>

@@ -28,6 +28,27 @@ export function listRoadmapViews(lang: string): RoadmapView[] {
     .sort((a, b) => ROADMAP_ORDER.indexOf(a.id) - ROADMAP_ORDER.indexOf(b.id));
 }
 
+let searchScope: { files: string[]; steps: Record<string, string> } | undefined;
+
+/**
+ * Phạm vi tìm nội dung bài (ADR-009): mỗi roadmap có bài là một file `/<lang>/search/<roadmap>.json`;
+ * `steps` cho biết chặng thuộc roadmap nào, để hộp tìm ưu tiên file của roadmap đang xem.
+ */
+export function getSearchScope(): { files: string[]; steps: Record<string, string> } {
+  if (!searchScope) {
+    const steps: Record<string, string> = {};
+    const files: string[] = [];
+    for (const roadmap of listRoadmapViews('vi')) {
+      const all = roadmap.levels.flatMap((level) => level.steps);
+      if (!all.some((step) => step.lessons.length > 0)) continue;
+      files.push(roadmap.id);
+      for (const step of all) steps[step.id] = roadmap.id;
+    }
+    searchScope = { files, steps };
+  }
+  return searchScope;
+}
+
 export function getProjectView(projectId: string, lang: string): ProjectView | undefined {
   return buildProjectView(viewInput(lang), projectId);
 }

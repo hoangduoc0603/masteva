@@ -129,12 +129,13 @@ test('tìm kiếm không dấu ra bài có dấu', async ({ page }) => {
   await expect(page.getByRole('dialog')).toContainText('Tiến trình, signal, systemd và journald');
 });
 
-test('hộp ⌘K chỉ tải search.json khi mở và chỉ một lần', async ({ page }) => {
+test('hộp ⌘K chỉ tải file tìm kiếm khi mở, mỗi roadmap một file, roadmap đang xem trước', async ({ page }) => {
   const requests: string[] = [];
   page.on('request', (r) => {
-    if (r.url().includes('search.json')) requests.push(new URL(r.url()).pathname);
+    const path = new URL(r.url()).pathname;
+    if (/\/search\/.+\.json$/.test(path)) requests.push(path);
   });
-  await page.goto('/vi/roadmaps/java');
+  await page.goto('/vi/roadmaps/devops');
   await page.waitForLoadState('networkidle');
   expect(requests).toEqual([]);
   const trigger = page.getByRole('button', { name: 'Mở tìm kiếm' }).or(page.getByRole('button', { name: /^Tìm kiếm/ }));
@@ -143,18 +144,24 @@ test('hộp ⌘K chỉ tải search.json khi mở và chỉ một lần', async 
     await expect(page.getByRole('dialog')).toBeVisible({ timeout: 2000 });
   }).toPass();
   const input = page.getByRole('dialog').locator('input').first();
+  // Từ khoá chỉ có ở roadmap Java: kết quả tự hiện khi file của Java tải xong, không cần gõ lại.
+  await input.fill('jshell');
+  await expect(page.getByRole('dialog')).toContainText('JDK, javac, java và jshell');
   await input.fill('tien trinh');
   await expect(page.getByRole('dialog')).toContainText('Tiến trình, signal, systemd và journald');
-  await input.fill('jshell');
-  await expect(page.getByRole('dialog')).toContainText('Java');
-  expect(requests).toEqual(['/vi/search.json']);
+  expect(requests[0]).toBe('/vi/search/devops.json');
+  expect([...requests].sort()).toEqual(['/vi/search/devops.json', '/vi/search/java.json', '/vi/search/kubernetes.json', '/vi/search/spring-boot.json']);
 });
 
-test('file search.json gọn, /api/search không còn', async ({ request }) => {
-  const vi = await request.get('/vi/search.json');
-  expect(vi.ok()).toBe(true);
-  expect((await vi.body()).length).toBeLessThan(2 * 1024 * 1024);
-  expect((await request.get('/en/search.json')).ok()).toBe(true);
+test('mỗi file tìm kiếm dưới 2 MB, file gộp cũ và /api/search không còn', async ({ request }) => {
+  for (const id of ['java', 'spring-boot', 'devops', 'kubernetes']) {
+    const file = await request.get(`/vi/search/${id}.json`);
+    expect(file.ok(), id).toBe(true);
+    expect((await file.body()).length, id).toBeLessThan(2 * 1024 * 1024);
+  }
+  expect((await request.get('/en/search/java.json')).ok()).toBe(true);
+  expect((await request.get('/vi/search/microservices.json')).status()).toBe(404);
+  expect((await request.get('/vi/search.json')).status()).toBe(404);
   expect((await request.get('/api/search')).status()).toBe(404);
 });
 
@@ -212,8 +219,8 @@ test('khung chi tiết: nút Tiếp, Trước chuyển chủ đề và giữ foc
 });
 
 test('khung chi tiết chưa có bài vẫn có hướng đi tiếp', async ({ page }) => {
-  await page.goto('/vi/roadmaps/devops#d2.mo-hinh-tcp-ip');
-  const panel = page.locator('[data-panel="d2.mo-hinh-tcp-ip"]');
+  await page.goto('/vi/roadmaps/devops#d7.pipeline-stage');
+  const panel = page.locator('[data-panel="d7.pipeline-stage"]');
   await expect(panel.locator('.rm-empty')).toBeVisible();
   await expect(panel.locator('a[rel="next"]')).toBeVisible();
 

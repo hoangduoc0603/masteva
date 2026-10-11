@@ -1,0 +1,698 @@
+---
+title: ConfigMap, Secret, request, limit và QoS
+description: Đưa cấu hình và mật khẩu vào pod bằng ConfigMap và Secret, thấy tận mắt thứ gì đổi và thứ gì không khi cấu hình đổi, rồi khai request và limit để scheduler và kernel đối xử đúng với pod - kể cả lúc node thiếu tài nguyên.
+id: d11.2
+step: d11
+prerequisites: [d11.1]
+topics: [d11.configmap-secret, d11.request-limit-qos]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trên Docker Desktop)
+  tools:
+    kubernetes: 1.37.0
+    kind: 0.33.0
+    kubectl: 1.37.1
+    docker: 29.8.0
+    containerd: 2.3.4
+    metrics-server: 0.9.0
+    agnhost: '2.61'
+    busybox: 1.38.0
+    yq: 4.54.1
+---
+
+<Goal>
+
+K1.1 dừng ở một Deployment chỉ có image. Bài này thêm hai thứ mà mọi pod production đều có, cấu hình và tài nguyên, và xem tận mắt hành vi của chúng ở tầng kubelet và kernel. Học xong, bạn giải thích được:
+
+- Vì sao sửa ConfigMap xong ứng dụng vẫn đọc giá trị cũ, và vì sao "Secret" không bí mật như tên gọi.
+- Vì sao pod bị `OOMKilled` khi node còn thừa RAM, pod nào bị hy sinh trước khi node thiếu bộ nhớ, và có nên đặt CPU limit hay không.
+
+</Goal>
+
+<Knowledge>
+
+### ConfigMap và Secret: đưa cấu hình vào pod
+
+SB11.3 đã nêu nguyên tắc một image chạy ở mọi môi trường, cấu hình đến từ bên ngoài. Trên Kubernetes, "bên ngoài" là hai loại object: **ConfigMap** cho giá trị thường và **Secret** cho giá trị nhạy cảm. Cả hai chỉ là bảng key-value; pod nhận chúng theo hai đường:
+
+| | Biến môi trường | File trong volume |
+|---|---|---|
+| Khai báo | `env.valueFrom.configMapKeyRef` hoặc `envFrom` | `volumes.configMap` và `volumeMounts` |
+| Ứng dụng đọc | Một lần, lúc tiến trình khởi động | Mỗi lần mở file |
+| Khi ConfigMap đổi | **Không bao giờ đổi** trong pod đang chạy | File đổi theo sau một khoảng trễ, có thể hơn một phút (60 tới 90 giây) |
+| Hợp với | Giá trị ngắn, cờ, URL | File cấu hình, chứng chỉ, nhiều key |
+| Rủi ro riêng | Lộ qua `env`, `/proc`, log lúc crash | Mount đè lên thư mục có sẵn làm mất file cũ trong đó |
+
+Ba điều hay gây bất ngờ khi cập nhật:
+
+- **Không có gì tự khởi động lại pod.** File trong volume đổi, nhưng ứng dụng chỉ thấy nếu nó tự đọc lại file. Biến môi trường thì chắc chắn không đổi. Cách làm chuẩn là `kubectl rollout restart`, hoặc để công cụ đóng gói đổi pod template mỗi khi cấu hình đổi (K3) để một rollout bình thường diễn ra.
+- **Mount bằng `subPath` không bao giờ được cập nhật**, dù đó là volume.
+- kubelet cập nhật volume bằng cách đổi một symlink `..data` sang thư mục mới, nên ứng dụng không bao giờ đọc phải file dở dang.
+
+Thêm `immutable: true` nếu cấu hình không được phép sửa tại chỗ: muốn đổi phải tạo object tên mới, và kubelet khỏi phải theo dõi nó.
+
+**Secret không được mã hoá.** Giá trị trong `data` là base64, một cách viết lại byte thành chữ để đặt được dữ liệu nhị phân vào YAML. Ai đọc được object là giải ra được ngay. Kubernetes chỉ xử lý Secret cẩn thận hơn ConfigMap ở vài chỗ: không in giá trị trong `kubectl describe`, mount vào pod bằng `tmpfs` (bộ nhớ, không ghi xuống đĩa node), và chỉ gửi tới node có pod cần nó.
+
+Những ai đọc được một Secret:
+
+| Ai | Bằng cách nào |
+|---|---|
+| Người có quyền `get secrets` trong namespace | `kubectl get secret -o yaml` |
+| Người có quyền tạo pod trong namespace | Tạo pod mount Secret đó rồi đọc file |
+| Người đọc được etcd hoặc bản sao lưu etcd | Mặc định etcd lưu Secret dạng rõ |
+| Người đọc được repo Git | Nếu file Secret YAML bị commit |
+
+Vì vậy quy tắc tối thiểu là: không commit Secret vào Git, chia namespace và quyền (K2), bật mã hoá Secret trong etcd khi tự vận hành cụm (thuộc phần bảo mật cụm, K8). Đưa secret từ kho bên ngoài như Vault vào cụm là việc của D15.
+
+<Check id="d11.2.config-inject">Chọn được giữa biến môi trường và volume cho một giá trị cấu hình, và nói được sau khi sửa ConfigMap thì mỗi đường thấy gì.</Check>
+
+<Check id="d11.2.secret-base64">Giải thích được vì sao base64 không phải mã hoá, và kể được bốn đường một Secret có thể lộ.</Check>
+
+### Request và limit
+
+Mỗi container khai hai con số cho mỗi loại tài nguyên, và hai con số do hai thành phần khác nhau dùng:
+
+| | `requests` | `limits` |
+|---|---|---|
+| Ai dùng | **Scheduler**, lúc chọn node | **Kernel** của node, suốt lúc chạy |
+| Ý nghĩa | "Giữ chỗ cho tôi chừng này" | "Không cho tôi dùng quá chừng này" |
+| Luật | Tổng request của các pod trên node không vượt `allocatable` | Tổng limit được phép vượt node (overcommit) |
+| Thiếu thì | Coi như 0: scheduler nhét bao nhiêu pod cũng được | Dùng được tới hết node |
+| Khai một nửa | Chỉ khai limit thì request **tự bằng limit** | Chỉ khai request thì không có trần |
+
+Scheduler **không nhìn mức dùng thật**. Một node có các pod request hết CPU sẽ từ chối pod mới dù CPU thật đang rảnh; ngược lại một node đầy pod không khai request sẽ nhận thêm pod cho tới khi sập.
+
+Phần limit không có gì mới so với D5.1: `limits.cpu` và `limits.memory` của pod thành đúng hai file cgroup v2 mà `docker run --cpus` và `--memory` đã ghi. Phần mới là request, và đơn vị:
+
+| | CPU | Bộ nhớ |
+|---|---|---|
+| Đơn vị | `1` = 1 lõi, `200m` = 0,2 lõi | `128Mi` = 128 × 1024² byte (`M` là 1000²) |
+| Limit thành | `cpu.max`: thời gian CPU mỗi chu kỳ 100 ms | `memory.max` |
+| Vượt limit | **Throttle**: bị dừng tới chu kỳ sau, không lỗi gì | **OOM kill**: kernel giết tiến trình, exit 137 |
+| Request thành | `cpu.weight`: tỉ lệ chia CPU khi node tranh chấp | Ở cấu hình mặc định, không thành giới hạn nào trong kernel |
+
+Hai cách bị phạt khác nhau vì CPU **nén được** (bắt chờ) còn bộ nhớ thì không. D5.1 đã giải thích vì sao throttle tính theo từng chu kỳ 100 ms nên biểu đồ CPU trung bình 20% vẫn che được một service đang bị bóp, và đã đọc `nr_throttled` trong `cpu.stat`. Trên Kubernetes, câu hỏi còn lại là có nên đặt CPU limit hay không.
+
+<Callout kind="production">
+
+Giai đoạn 2018 tới 2019, nhiều đội thấy độ trễ p99 tăng vọt sau khi đặt CPU limit dù service dùng xa dưới limit; issue [kubernetes #67577](https://github.com/kubernetes/kubernetes/issues/67577) gom các báo cáo đó. Một phần là lỗi của bộ lập lịch CFS trong kernel, làm container nhiều thread bị throttle khi chưa dùng hết quota, đã sửa ở Linux 5.4 (commit `de53fd7aedb1`). Phần còn lại là bản chất của quota theo chu kỳ 100 ms, và vẫn còn nguyên.
+
+Từ đó có hai trường phái, cả hai đều hợp lệ nếu hiểu cái giá:
+
+| | Đặt CPU limit | Bỏ CPU limit, chỉ đặt request |
+|---|---|---|
+| Được | Hiệu năng dự đoán được, pod không lấn nhau, đạt QoS `Guaranteed` | Không bị throttle; lúc node rảnh pod dùng được phần dư |
+| Mất | Throttle làm tăng độ trễ đuôi, nhất là runtime nhiều thread như JVM lúc khởi động và lúc GC | Hiệu năng phụ thuộc hàng xóm; phải khai request đúng vì đó là thứ duy nhất chia CPU khi tranh chấp |
+
+Với bộ nhớ thì không có tranh luận: luôn đặt request và limit, và đặt **bằng nhau**, vì bộ nhớ đã cấp không đòi lại được nếu không giết tiến trình. SB11.3 đã dạy cách chia limit đó cho heap và phần ngoài heap của JVM. (Vài pod trong lab của bài này cố ý khai request khác limit để ra đủ ba hạng QoS.)
+
+</Callout>
+
+<Check id="d11.2.request-limit">Nói được request và limit do thành phần nào dùng, và vượt limit CPU khác vượt limit bộ nhớ thế nào.</Check>
+
+### QoS: ai bị hy sinh khi node thiếu tài nguyên
+
+Từ request và limit, Kubernetes tự xếp pod vào một trong ba hạng **QoS**. Bạn không khai hạng; nó là hệ quả:
+
+| Hạng | Điều kiện | Ví dụ | Khi node thiếu bộ nhớ (ước lượng) |
+|---|---|---|---|
+| `Guaranteed` | **Mọi** container có request bằng limit cho **cả** CPU và bộ nhớ | Khai cả hai bằng nhau, hoặc chỉ khai `limits` cho CPU và bộ nhớ (request tự bằng limit) | Thường đi sau cùng: không thể dùng vượt request |
+| `Burstable` | Có ít nhất một request hoặc limit, nhưng không đạt điều kiện trên | Request 32Mi, limit 128Mi; hoặc chỉ khai request CPU | Chỉ thành ứng viên khi đang dùng **vượt request**; còn dưới request thì đi sau, cùng nhóm với `Guaranteed` |
+| `BestEffort` | Không container nào khai gì | Không có `resources` | Request là 0 nên dùng bao nhiêu cũng là vượt: thường đi đầu |
+
+Hạng QoS được dùng ở hai chỗ, theo hai cách khác nhau.
+
+Khi node sắp hết bộ nhớ, kubelet **evict** (đuổi) pod để cứu node. Nó **không xếp theo hạng QoS**. Thứ tự là: pod đang dùng vượt request đi trước, rồi tới Pod Priority (K5), rồi tới mức vượt nhiều hay ít. Cột cuối của bảng là hệ quả thường thấy của luật đó, không phải bản thân luật: một pod `Burstable` dùng dưới request an toàn ngang một pod `Guaranteed`. Pod bị đuổi có trạng thái `Evicted` và được controller tạo lại ở node khác.
+
+Nếu kubelet không kịp, OOM killer của kernel ra tay, và ở đây hạng QoS được dùng trực tiếp: kubelet đã đặt sẵn `oom_score_adj` để `BestEffort` bị chọn trước, `Guaranteed` sau cùng.
+
+`Guaranteed` không miễn nhiễm: container vượt `memory.max` của chính nó vẫn bị giết, bất kể hạng. D1.1 đã giải thích 137 là 128 + 9; SB11.3 đã phân biệt nó với `OutOfMemoryError` của JVM.
+
+<Check id="d11.2.qos">Nhìn `resources` của một pod là nói được hạng QoS của nó, và nói được kubelet chọn pod để evict theo tiêu chí nào, OOM killer dùng hạng đó ra sao.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/): phần "Mounted ConfigMaps are updated automatically" nói rõ độ trễ và ngoại lệ `subPath`.
+- [Good practices for Kubernetes Secrets](https://kubernetes.io/docs/concepts/security/secrets-good-practices/): danh sách ngắn những việc phải làm, chia theo người vận hành cụm và người phát triển.
+- [Resource Management for Pods and Containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/): đơn vị, cách request và limit được áp dụng; đọc kèm [Pod Quality of Service Classes](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/).
+- [Node-pressure Eviction](https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/): phần "Pod selection for kubelet eviction" là nguồn của thứ tự evict trong bài.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k1-lab` và namespace `k1` của K1.1. Nếu đã xoá cụm, làm lại bước 1 của K1.1 (tạo cụm) và hai lệnh tạo namespace ở bước 3 của bài đó.
+
+**Profile máy.** Như K1.1: khoảng 1,3 GiB RAM của Docker. Bài này thêm metrics-server (khoảng 21 MiB) và vài pod nhỏ; pod thử OOM bị giới hạn 128 MiB nên không ảnh hưởng máy. Máy 8 GB chạy được với cụm 1 control plane và 1 worker.
+
+Mọi lệnh chạy trong **cùng một terminal** có biến `KUBECONFIG` của lab; mở terminal mới thì phải export lại:
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-d11/kubeconfig
+kubectl config current-context
+kubectl config set-context --current --namespace k1
+mkdir -p ~/masteva-d11/k1-2 && cd ~/masteva-d11/k1-2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k1-lab
+Context "kind-k1-lab" modified.
+```
+
+</Expected>
+
+### 1. Tạo ConfigMap và Secret, rồi đọc Secret theo hai đường
+
+<Terminal where="mac">
+
+```bash
+cat > app.properties <<'EOF'
+greeting=xin chao
+feature.new-checkout=false
+EOF
+kubectl create configmap web-config --from-literal=LOG_LEVEL=info --from-file=app.properties \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic db-cred --from-literal=username=app --from-literal=password='S3cret-K1'
+kubectl get secret db-cred -o yaml | yq '.data'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/web-config created
+secret/db-cred created
+password: UzNjcmV0LUsx
+username: YXBw
+```
+
+</Expected>
+
+`--dry-run=client -o yaml | kubectl apply -f -` là mẹo để dùng lại đúng lệnh này khi cập nhật: `kubectl create` chỉ sinh YAML, `apply` mới tạo hoặc sửa. Giờ đọc mật khẩu, lần lượt bằng quyền `get secrets` và bằng quyền đọc etcd:
+
+<Terminal where="mac">
+
+```bash
+kubectl get secret db-cred -o jsonpath='{.data.password}' | base64 -d; echo
+kubectl -n kube-system exec etcd-k1-lab-control-plane -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/secrets/k1/db-cred --print-value-only | strings | grep -A1 '^password$'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+S3cret-K1
+password
+S3cret-K1
+```
+
+</Expected>
+
+Dòng đầu: base64 giải ra trong một lệnh. Hai dòng sau: trong etcd, mật khẩu nằm ở dạng rõ, thậm chí không qua base64. Bản sao lưu etcd chứa mọi Secret của cụm ở dạng này.
+
+### 2. Một pod nhận cấu hình theo cả hai đường
+
+<Terminal where="mac" title="~/masteva-d11/k1-2/config-demo.yaml">
+
+```bash
+cat > config-demo.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: config-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sh", "-c", "sleep 3600"]
+      env:
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: web-config
+              key: LOG_LEVEL
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-cred
+              key: password
+      volumeMounts:
+        - name: config
+          mountPath: /etc/app
+        - name: config
+          mountPath: /etc/app-subpath/app.properties
+          subPath: app.properties
+        - name: db
+          mountPath: /etc/db
+          readOnly: true
+  volumes:
+    - name: config
+      configMap:
+        name: web-config
+    - name: db
+      secret:
+        secretName: db-cred
+        defaultMode: 0400
+EOF
+kubectl apply -f config-demo.yaml && kubectl wait --for=condition=Ready pod/config-demo --timeout=120s
+kubectl exec config-demo -- sh -c 'echo "LOG_LEVEL=$LOG_LEVEL DB_PASSWORD=$DB_PASSWORD"; ls -l /etc/app; cat /etc/db/password; echo; mount | grep -E "/etc/(db|app) "'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/config-demo created
+pod/config-demo condition met
+LOG_LEVEL=info DB_PASSWORD=S3cret-K1
+total 0
+lrwxrwxrwx    1 root     root            16 Oct 10 02:39 LOG_LEVEL -> ..data/LOG_LEVEL
+lrwxrwxrwx    1 root     root            21 Oct 10 02:39 app.properties -> ..data/app.properties
+S3cret-K1
+/dev/vda1 on /etc/app type ext4 (ro,relatime,discard)
+tmpfs on /etc/db type tmpfs (ro,relatime,size=8125028k,noswap)
+```
+
+</Expected>
+
+Mỗi key thành một file, và file là symlink qua `..data`. Volume của Secret nằm trên `tmpfs`; volume của ConfigMap nằm trên đĩa của node. Ngày giờ trên máy bạn sẽ khác.
+
+### 3. Sửa ConfigMap: ai thấy giá trị mới
+
+Đổi `LOG_LEVEL` thành `debug` và bật cờ `new-checkout`, rồi đo thời gian tới lúc file trong pod đổi:
+
+<Terminal where="mac">
+
+```bash
+sed -i.bak 's/new-checkout=false/new-checkout=true/' app.properties
+kubectl create configmap web-config --from-literal=LOG_LEVEL=debug --from-file=app.properties \
+  --dry-run=client -o yaml | kubectl apply -f -
+start=$(date +%s)
+until [ "$(kubectl exec config-demo -- cat /etc/app/LOG_LEVEL 2>/dev/null)" = "debug" ]; do sleep 2; done
+echo "file đổi sau $(( $(date +%s) - start )) giây"
+```
+
+</Terminal>
+
+<Predict question="Sau khi file đã đổi, biến môi trường `LOG_LEVEL` và file mount bằng `subPath` trong pod có giá trị gì?">
+
+Cả hai vẫn là giá trị cũ:
+
+```text
+env:     LOG_LEVEL=info
+volume:  LOG_LEVEL=debug
+subPath: feature.new-checkout=false
+```
+
+Biến môi trường được đặt một lần lúc tiến trình sinh ra. `subPath` gắn thẳng vào một file cụ thể của thư mục cũ, nên không đi theo symlink `..data` khi kubelet đổi nó.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl exec config-demo -- sh -c 'echo "env:     LOG_LEVEL=$LOG_LEVEL"; echo "volume:  LOG_LEVEL=$(cat /etc/app/LOG_LEVEL)"; echo "subPath: $(grep checkout /etc/app-subpath/app.properties)"'
+```
+
+</Terminal>
+
+Thời gian chờ **không cố định**: năm lần đo khi kiểm chứng bài này cho gần 0, 44, 57, 61 và 84 giây, tuỳ lúc cập nhật rơi vào đâu trong chu kỳ đồng bộ của kubelet (60 tới 90 giây), nên có thể hơn một phút. Đừng thiết kế gì dựa trên việc "ConfigMap có hiệu lực ngay". Với Deployment, cách làm cho mọi pod nhận cấu hình mới một cách có kiểm soát là `kubectl rollout restart deploy/TÊN`: một rollout bình thường như K1.1, có `maxSurge`, `maxUnavailable` và readiness.
+
+<Check id="d11.2.lab-config">Đọc được Secret qua base64 và qua etcd, và chỉ ra bằng lệnh rằng sau khi sửa ConfigMap thì volume đổi còn biến môi trường và `subPath` thì không.</Check>
+
+### 4. Ba hạng QoS và cgroup phía sau
+
+<Terminal where="mac" title="~/masteva-d11/k1-2/qos.yaml">
+
+```bash
+cat > qos.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-guaranteed
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sleep", "3600"]
+      resources:
+        requests: { cpu: 250m, memory: 64Mi }
+        limits:   { cpu: 250m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-burstable
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sleep", "3600"]
+      resources:
+        requests: { cpu: 100m, memory: 32Mi }
+        limits:   { memory: 128Mi }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-besteffort
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sleep", "3600"]
+EOF
+kubectl apply -f qos.yaml
+kubectl wait --for=condition=Ready pod/qos-guaranteed pod/qos-burstable pod/qos-besteffort --timeout=120s
+kubectl get pod qos-guaranteed qos-burstable qos-besteffort -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME             QOS
+qos-guaranteed   Guaranteed
+qos-burstable    Burstable
+qos-besteffort   BestEffort
+```
+
+</Expected>
+
+Mỗi container thấy cgroup của chính nó ở `/sys/fs/cgroup`. Đọc ba file ứng với ba dòng của bảng ở phần Kiến thức:
+
+<Terminal where="mac">
+
+```bash
+for p in qos-guaranteed qos-burstable qos-besteffort; do
+  kubectl exec $p -- sh -c 'echo "$(hostname): cpu.max=$(cat /sys/fs/cgroup/cpu.max) cpu.weight=$(cat /sys/fs/cgroup/cpu.weight) memory.max=$(cat /sys/fs/cgroup/memory.max)"'
+done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+qos-guaranteed: cpu.max=25000 100000 cpu.weight=35 memory.max=67108864
+qos-burstable: cpu.max=max 100000 cpu.weight=17 memory.max=134217728
+qos-besteffort: cpu.max=max 100000 cpu.weight=1 memory.max=max
+```
+
+</Expected>
+
+- `cpu.max=25000 100000`: limit `250m` thành 25 ms CPU mỗi chu kỳ 100 ms, đúng file D5.1 đã đọc với `docker run --cpus`. Không có CPU limit thì là `max`.
+- `cpu.weight`: request càng lớn thì trọng số càng cao; BestEffort nhận mức thấp nhất là 1. Con số chỉ có nghĩa khi so với nhau và khi node tranh chấp CPU; công thức đổi từ request sang weight phụ thuộc phiên bản runtime, đừng nhớ số tuyệt đối.
+- `memory.max`: 64 Mi là 67108864 byte. Ở cấu hình mặc định, memory **request** không xuất hiện ở đâu trong cgroup: `memory.min` của cả ba pod trong cụm lab là `0`. Tính năng MemoryQoS (beta từ Kubernetes 1.37) có thể đặt thêm `memory.min` và `memory.high` khi kubelet được cấu hình cho việc đó.
+
+Giờ xem scheduler nhìn node thế nào:
+
+<Terminal where="mac">
+
+```bash
+kubectl get nodes -o custom-columns=NAME:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory
+kubectl describe node $(kubectl get pod qos-burstable -o jsonpath='{.spec.nodeName}') | sed -n '/Non-terminated Pods/,/ephemeral-storage/p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME                   CPU   MEMORY
+k1-lab-control-plane   6     8125028Ki
+k1-lab-worker          6     8125028Ki
+k1-lab-worker2         6     8125028Ki
+Non-terminated Pods:          (5 in total)
+  Namespace                   Name                CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
+  ---------                   ----                ------------  ----------  ---------------  -------------  ---
+  k1                          config-demo         0 (0%)        0 (0%)      0 (0%)           0 (0%)         86s
+  k1                          qos-besteffort      0 (0%)        0 (0%)      0 (0%)           0 (0%)         1s
+  k1                          qos-burstable       100m (1%)     0 (0%)      32Mi (0%)        128Mi (1%)     1s
+  kube-system                 kindnet-7c69h       100m (1%)     0 (0%)      50Mi (0%)        0 (0%)         16m
+  kube-system                 kube-proxy-67gnq    0 (0%)        0 (0%)      0 (0%)           0 (0%)         16m
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests   Limits
+  --------           --------   ------
+  cpu                200m (3%)  0 (0%)
+  memory             82Mi (1%)  128Mi (1%)
+  ephemeral-storage  0 (0%)     0 (0%)
+```
+
+</Expected>
+
+Bảng `Allocated resources` là sổ của scheduler: nó cộng **request**, không đo mức dùng. 200m ở đây là 100m của `qos-burstable` cộng 100m của `kindnet`. Pod của bạn có thể nằm ở node khác và danh sách pod sẽ khác đôi chút.
+
+Như D0.2 đã lưu ý, ba node cùng báo 6 CPU vì cùng nhìn thấy một máy ảo Docker: cụm lab chỉ có 6 CPU thật. Scheduler tính theo con số trên giấy nên các bài tập về request vẫn đúng.
+
+### 5. Request quá lớn: pod `Pending`
+
+Lấy pod `qos-besteffort` trong file, đổi tên và cho nó xin 8 CPU:
+
+<Terminal where="mac">
+
+```bash
+yq 'select(.metadata.name == "qos-besteffort") | .metadata.name = "too-big" | .spec.containers[0].resources.requests.cpu = "8"' qos.yaml | kubectl apply -f -
+sleep 5
+kubectl events --for pod/too-big
+kubectl delete pod too-big
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/too-big created
+LAST SEEN   TYPE      REASON             OBJECT        MESSAGE
+5s          Warning   FailedScheduling   Pod/too-big   0/3 nodes are available: 1 node(s) had untolerated taint(s), 2 Insufficient cpu. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.
+pod "too-big" deleted from k1 namespace
+```
+
+</Expected>
+
+Scheduler nói rõ lý do từng node bị loại: hai worker không đủ 8 CPU chưa ai giữ chỗ, node control plane có **taint** mà pod không chấp nhận (K1.4 dùng tới). Pod nằm `Pending` cho tới khi có node vừa; không ai báo lỗi cho bạn.
+
+<Check id="d11.2.lab-qos">Tạo được pod thuộc ba hạng QoS, đọc được `cpu.max`, `cpu.weight`, `memory.max` trong container và nối chúng với `resources` đã khai.</Check>
+
+### 6. Vượt limit: OOMKilled và throttle
+
+Lệnh con `stress` của agnhost cấp phát bộ nhớ dần tới 200 Mi, trong khi limit là 128 Mi:
+
+<Terminal where="mac">
+
+```bash
+cat > oom.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-demo
+spec:
+  containers:
+    - name: app
+      image: registry.k8s.io/e2e-test-images/agnhost:2.61
+      args: ["stress", "--mem-total=200Mi", "--mem-alloc-size=10Mi", "--mem-alloc-sleep=100ms"]
+      resources:
+        requests: { memory: 64Mi }
+        limits:   { memory: 128Mi }
+EOF
+kubectl apply -f oom.yaml && sleep 30
+kubectl get pod oom-demo
+kubectl get pod oom-demo -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason} exitCode={.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'
+kubectl delete pod oom-demo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/oom-demo created
+NAME       READY   STATUS      RESTARTS      AGE
+oom-demo   0/1     OOMKilled   2 (27s ago)   30s
+OOMKilled exitCode=137
+pod "oom-demo" deleted from k1 namespace
+```
+
+</Expected>
+
+Node còn gần 8 GiB trống, nhưng container bị giết ở 128 Mi: giới hạn là của cgroup, không phải của node. kubelet khởi động lại, nó lại chết, và khoảng chờ giữa các lần tăng dần. Cột `STATUS` lúc bạn xem có thể là `OOMKilled` hoặc `CrashLoopBackOff`, số `RESTARTS` có thể là 1 tới 3; `lastState` thì luôn ghi `OOMKilled` và 137.
+
+Giờ tới CPU. D5.1 đã đo throttle bằng `cpu.stat`; ở đây chỉ cần một pod quay vòng lặp chiếm trọn 1 lõi với limit `200m`, để bước sau nhìn nó qua `kubectl top`:
+
+<Terminal where="mac">
+
+```bash
+cat > cpu.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-demo
+spec:
+  containers:
+    - name: app
+      image: registry.k8s.io/e2e-test-images/agnhost:2.61
+      args: ["stress", "--cpus=1"]
+      resources:
+        requests: { cpu: 100m, memory: 32Mi }
+        limits:   { cpu: 200m, memory: 128Mi }
+EOF
+kubectl apply -f cpu.yaml && kubectl wait --for=condition=Ready pod/cpu-demo --timeout=60s
+```
+
+</Terminal>
+
+Không có lỗi, không có event, pod `Running` và `Ready`. Khác với OOM, throttle hoàn toàn im lặng.
+
+### 7. `kubectl top` cần metrics-server
+
+Lúc này `kubectl top pod` trả `error: Metrics API not available`: như D0.2 đã lưu ý, kind không cài sẵn **metrics-server**, thành phần gom mức dùng CPU và bộ nhớ từ các kubelet để phục vụ `kubectl top` và autoscaler (K5). Cài bản 0.9.0 từ manifest chính thức, thêm cờ `--kubelet-insecure-tls` vì chứng chỉ kubelet của kind không có địa chỉ IP của node:
+
+<Terminal where="mac">
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.9.0/components.yaml
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server --timeout=180s
+until kubectl top pod cpu-demo >/dev/null 2>&1; do sleep 5; done
+kubectl top pod
+kubectl delete pod cpu-demo qos-guaranteed qos-burstable qos-besteffort config-demo --wait=false
+```
+
+</Terminal>
+
+Phần `kubectl top pod` của output:
+
+<Expected>
+
+```text
+NAME             CPU(cores)   MEMORY(bytes)   
+config-demo      0m           0Mi             
+cpu-demo         201m         5Mi             
+qos-guaranteed   0m           0Mi             
+```
+
+</Expected>
+
+Sau khi cài, phải chờ khoảng một phút để có mẫu đầu tiên; pod chưa có mẫu (ở đây là `qos-burstable` và `qos-besteffort`) tạm vắng mặt, chạy lại sau vài chục giây sẽ đủ. `cpu-demo` muốn dùng 1 lõi nhưng đứng ở khoảng 200m: nó dùng **đúng bằng limit**, dấu hiệu gián tiếp của throttle. Số liệu trực tiếp là `nr_throttled` trong `cpu.stat` như D5.1 đã đọc; trên production Prometheus thu nó qua metric `container_cpu_cfs_throttled_periods_total` (D12). Cờ `--kubelet-insecure-tls` chỉ dành cho lab; cụm thật cấp chứng chỉ đúng cho kubelet (K4).
+
+<Check id="d11.2.lab-oom-throttle">Tái hiện được OOMKilled với exit 137, thấy được qua `kubectl top` một pod bị giữ ở đúng CPU limit, và giải thích được vì sao cái đầu ồn ào còn cái sau im lặng.</Check>
+
+### Khi gặp lỗi
+
+- `The connection to the server localhost:8080 was refused`: terminal này chưa có `export KUBECONFIG=~/masteva-d11/kubeconfig`.
+- `strings: command not found` ở bước 1: máy chưa có công cụ dòng lệnh của Xcode. Thay `strings | grep -A1 '^password$'` bằng `grep -a -c 'S3cret-K1'`; kết quả `1` nghĩa là mật khẩu nằm ở dạng rõ.
+- Vòng `until` ở bước 3 chạy quá 2 phút: kiểm tra `kubectl get configmap web-config -o yaml` đã có `LOG_LEVEL: debug` chưa. Nếu chưa, lệnh `apply` trước đó lỗi.
+- `oom-demo` không bị giết: máy ảo Docker đang bật swap và cgroup cho container dùng swap. Kiểm bằng `kubectl exec` đọc `/sys/fs/cgroup/memory.swap.max`; lab giả định giá trị `0`.
+- `kubectl top` báo `Metrics API not available` mãi sau khi cài: xem `kubectl -n kube-system logs deploy/metrics-server`. Lỗi `x509: cannot validate certificate` nghĩa là lệnh `patch` thêm `--kubelet-insecure-tls` chưa chạy.
+
+### Dọn dẹp
+
+Các pod của bài đã được xoá ở bước 7. Nếu học tiếp K1.3 ngay, xoá nốt ConfigMap và Secret, giữ cụm:
+
+<Terminal where="mac">
+
+```bash
+kubectl delete configmap web-config && kubectl delete secret db-cred
+```
+
+</Terminal>
+
+metrics-server nằm trong `kube-system` và sẽ mất cùng cụm.
+
+<Callout kind="danger">
+
+Hai lệnh dưới xoá toàn bộ cụm `k1-lab` và thư mục lab `~/masteva-d11`, gồm cả file của K1.1 và kubeconfig của lab. Chỉ chạy khi bạn dừng học K1; kiểm tra lại tên cụm và đường dẫn trước khi nhấn Enter.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn hẳn">
+
+```bash
+kind delete cluster --name k1-lab
+rm -rf ~/masteva-d11
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao Kubernetes không tự khởi động lại pod khi ConfigMap đổi?">
+
+Vì đổi cấu hình cũng là một lần deploy, và cần cùng các hàng rào: thay từng nhóm pod, chờ readiness, dừng lại khi bản mới hỏng. Nếu kubelet tự khởi động lại mọi pod dùng một ConfigMap ngay khi nó đổi, một giá trị sai sẽ hạ toàn bộ pod cùng lúc, không còn bản cũ nào để phục vụ.
+
+Vì vậy cách làm phổ biến là biến "cấu hình đổi" thành "pod template đổi": Kustomize sinh tên ConfigMap kèm mã băm nội dung, Helm thêm annotation chứa checksum của ConfigMap vào template (K3). Template đổi thì Deployment tự rollout như K1.1, và `rollout undo` cũng đưa được cấu hình cũ về.
+
+</Reveal>
+
+<Reveal title="Bật mã hoá etcd rồi thì Secret đã an toàn chưa?">
+
+Mới chặn được một trong bốn đường ở phần Kiến thức: người đọc file dữ liệu hoặc bản sao lưu của etcd. API server giải mã trước khi trả lời, nên ai có quyền `get secrets` hoặc quyền tạo pod trong namespace vẫn đọc được như cũ, và file Secret trong Git vẫn là chữ rõ viết bằng base64.
+
+Vì vậy mã hoá etcd luôn đi cùng phân quyền chặt theo namespace (K2), và với hệ thống nhiều đội thì secret nên nằm ở kho bên ngoài, cụm chỉ nhận bản sao có thời hạn (D15). Lab bước 1 đọc được mật khẩu từ etcd vì cụm kind không bật mã hoá.
+
+</Reveal>
+
+<Reveal title="Pod Guaranteed có bao giờ bị giết vì bộ nhớ không?">
+
+Có, trong ba trường hợp. Một: nó vượt `memory.max` của chính nó; hạng QoS không liên quan tới giới hạn riêng. Hai: node hết bộ nhớ thật sự, các pod dùng vượt request đã bị đuổi hoặc bị giết hết mà vẫn chưa đủ. Ba: node thiếu thứ khác, ví dụ đĩa (`ephemeral-storage`), và kubelet evict theo mức dùng đĩa.
+
+Trường hợp hai xảy ra khi tổng **limit** bộ nhớ trên node vượt xa bộ nhớ thật và nhiều pod Burstable cùng dùng tới limit. Đó là lý do nên đặt request bằng limit cho bộ nhớ: tổng limit khi đó không vượt được node.
+
+</Reveal>
+
+<Reveal title="Vì sao tổng request quan trọng hơn mức dùng thật khi tính tiền cụm?">
+
+Scheduler xếp pod theo request, nên số node bạn cần do **tổng request** quyết định, không do mức dùng. Một service khai `cpu: 2` mà chỉ dùng 100m vẫn chiếm 2 lõi trên sổ của scheduler; đủ nhiều service như vậy thì cụm "đầy" trong khi CPU thật rảnh 80%.
+
+Ngược lại khai quá thấp thì nhiều pod bị xếp chung một node và giành nhau khi cùng bận. Request đúng là request gần mức dùng thật ở giờ cao điểm. K5 dạy VPA để đề xuất con số từ dữ liệu, và ResourceQuota, LimitRange để ép mọi pod trong namespace phải khai.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết khung manifest có `env`, `volumes` cho một ứng dụng cụ thể, đổi đơn vị `Mi`, `m`, giải thích một dòng `FailedScheduling` hay `OOMKilled` trong `kubectl describe`.
+
+**AI hay sai ở đâu:** viết Secret với trường `data` chứa chữ rõ (phải là base64, hoặc dùng `stringData`), hoặc gợi ý commit file Secret vào Git; nói ConfigMap "tự cập nhật vào pod" mà không phân biệt biến môi trường, volume và `subPath`; đặt CPU limit bằng request cho mọi thứ mà không nói tới throttle; bỏ hẳn request bộ nhớ; khẳng định kubelet evict "theo thứ tự BestEffort, Burstable, Guaranteed".
+
+**Cách kiểm tra:** `kubectl apply --dry-run=server` để bắt trường sai; `kubectl get pod -o jsonpath='{.status.qosClass}'` để xem hạng QoS thật; đọc `cpu.max`, `memory.max` trong container và `kubectl top` dưới tải; sửa thử ConfigMap rồi đọc lại giá trị từ trong pod trước khi tin nó đã có hiệu lực.
+
+</Callout>
+
+<Callout kind="link">
+
+D5.1 là nền cgroup v2 của limit và throttle; D1.1 là exit code 137; SB11.3 là nửa JVM của request và limit, cùng nguyên tắc cấu hình 12-factor. K1.3 thêm probe, cách tắt êm và sidecar vào cùng pod template. K2 phân quyền đọc Secret bằng RBAC. K3 đóng gói ConfigMap theo cách tự kích hoạt rollout. K5 dạy Pod Priority, ResourceQuota, LimitRange và autoscaling dựa trên request. D12 thu metric throttle và OOM. D15 quản lý secret bằng kho bên ngoài.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d11.2.mastery-config">Thiết kế được cách đưa một cờ tính năng, một file cấu hình và một mật khẩu database vào pod, nói được mỗi thứ cập nhật thế nào và ai đọc được mật khẩu đó.</Check>
+
+<Check id="d11.2.mastery-resources">Đặt được request và limit cho một service và bảo vệ được lựa chọn: hạng QoS nào, vì sao bộ nhớ đặt bằng nhau, có đặt CPU limit không, và nhìn vào đâu để biết pod đang bị throttle hay bị OOM.</Check>
+
+</Mastery>

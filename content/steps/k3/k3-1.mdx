@@ -1,0 +1,876 @@
+---
+title: Dùng chart có sẵn với Helm 4, và Kustomize cho nhiều môi trường
+description: Cài, nâng cấp và rollback một ứng dụng bằng Helm 4, hiểu server-side apply thay đổi gì khi có người sửa tay trên cụm, rồi dùng Kustomize để một bộ manifest phục vụ cả dev lẫn prod mà không cần template.
+id: k3.1
+step: k3
+prerequisites: [k2.2]
+topics: [k3.helm-dung-chart, k3.kustomize-overlay]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    helm: 4.3.0
+    kubectl: 1.37.1
+    kustomize: 5.8.1
+    kubernetes: 1.37.0
+    kind: 0.33.0
+    docker: 29.8.0
+    podinfo-chart: 6.15.0
+---
+
+<Goal>
+
+Tới đây bạn đã viết tay hàng chục file YAML. Một ứng dụng thật có ba môi trường, mỗi môi trường khác nhau vài con số, và phần mềm bên thứ ba như database hay gateway có hàng trăm tuỳ chọn. Bài này dạy hai công cụ chuẩn để quản lý sự lặp lại đó. Học xong, bạn giải thích được:
+
+- Vì sao `helm upgrade` báo `conflict` sau khi ai đó `kubectl scale` trên cụm, điều mà Helm 3 không báo.
+- Vì sao một lần nâng cấp hỏng không tự quay về bản cũ, và cờ nào làm việc đó.
+- Vì sao đổi một dòng cấu hình trong Kustomize làm pod tự khởi động lại, còn sửa ConfigMap bằng tay thì không.
+- Khi nào dùng Helm, khi nào Kustomize, khi nào cả hai.
+
+</Goal>
+
+<Knowledge>
+
+### Bài toán: cùng một ứng dụng, nhiều biến thể
+
+Manifest của `dev` và `prod` giống nhau 90%: khác số replica, tag image, giới hạn tài nguyên, vài biến cấu hình. Chép thư mục YAML cho từng môi trường thì ngày nào đó sửa một chỗ sẽ quên chỗ kia. Có hai cách tiếp cận, khác nhau từ gốc:
+
+| | Helm | Kustomize |
+|---|---|---|
+| Ý tưởng | **Template**: YAML có chỗ trống, điền bằng file values | **Patch**: YAML đầy đủ làm gốc, mỗi môi trường ghi phần khác đi |
+| Đơn vị đóng gói | Chart (có phiên bản, phát hành qua repo hoặc registry) | Thư mục trong Git |
+| Biết trạng thái trên cụm | Có: release, lịch sử revision, rollback | Không: chỉ sinh YAML, `kubectl apply` lo phần còn lại |
+| File nguồn | Không phải YAML hợp lệ (có `{{ }}`) | Luôn là YAML hợp lệ, đọc và kiểm được bằng công cụ thường |
+| Có sẵn ở đâu | Cài riêng (`helm`) | Nằm trong `kubectl` (`-k`) |
+
+### Helm: chart, values, release
+
+Ba khái niệm:
+
+- **Chart:** một gói gồm các template manifest và một file `values.yaml` chứa giá trị mặc định. Có `version` riêng.
+- **Values:** phần bạn ghi đè lên mặc định, bằng file (`-f`) hoặc cờ (`--set`).
+- **Release:** một lần cài chart vào cụm, có tên. Mỗi lần `upgrade` hoặc `rollback` tạo một **revision** mới.
+
+```text
+ chart podinfo 6.15.0        values-dev.yaml
+ (template + mặc định)       (phần bạn ghi đè)
+          \                      /
+           v                    v
+        (1) helm render trên máy bạn  ->  manifest hoàn chỉnh
+                     |
+        (2) gửi lên API server bằng server-side apply
+            (field manager "helm" sở hữu các trường chart khai báo)
+                     |
+        (3) ghi Secret sh.helm.release.v1.demo.v1 trong namespace:
+            chart + values + manifest của revision này, nén lại
+                     |
+        upgrade  ->  lặp lại (1)(2), ghi ...demo.v2
+        rollback ->  lấy manifest của revision cũ, apply lại, ghi revision MỚI
+```
+
+Helm không có thành phần nào chạy trong cụm. Mọi trạng thái nằm ở các Secret của bước (3), nên ai có quyền đọc Secret trong namespace là đọc được toàn bộ values đã dùng, kể cả mật khẩu truyền qua `--set`.
+
+Chart được phát hành theo hai cách:
+
+| | Repo HTTP | OCI registry |
+|---|---|---|
+| Địa chỉ | `helm repo add tên https://…` rồi `tên/chart` | `oci://registry/đường-dẫn/chart`, không cần `repo add` |
+| Bên dưới | Một file `index.yaml` liệt kê mọi phiên bản | Cùng registry với image container (GHCR, Docker Hub, Harbor…) |
+| Tìm kiếm | `helm search repo` | Không có; xem trên trang của registry |
+| Ghim | Theo `--version` | Theo `--version` hoặc **digest** `@sha256:…` |
+| Xu hướng | Chart cũ | Mặc định của chart mới; Envoy Gateway ở K2.2 chỉ phát hành qua OCI |
+
+Các lệnh dùng hằng ngày:
+
+| Việc | Lệnh |
+|---|---|
+| Xem chart có những tuỳ chọn gì | `helm show values <chart> --version X` |
+| Xem trước manifest, không đụng cụm | `helm template <release> <chart> -f values.yaml` |
+| Cài hoặc nâng cấp (chạy lại được nhiều lần) | `helm upgrade --install <release> <chart> --version X -f values.yaml` |
+| Lịch sử và quay lại | `helm history <release>`, `helm rollback <release> <revision>` |
+| Xem thứ đang chạy | `helm get values <release>`, `helm get manifest <release>` |
+| Gỡ | `helm uninstall <release>` |
+
+Luôn ghi `--version`. Không ghi thì Helm lấy bản mới nhất tại thời điểm chạy, và hai lần deploy cùng một commit cho ra hai kết quả khác nhau.
+
+<Check id="k3.1.chart-values-release">Phân biệt được chart, values, release, revision, và nói được Helm lưu trạng thái của release ở đâu.</Check>
+
+### Helm 4 đổi gì so với Helm 3
+
+Helm 4 phát hành tháng 11/2025. Helm 3 chỉ còn nhận bản vá bảo mật tới ngày 10/02/2027. Chart viết cho Helm 3 (`apiVersion: v2`) chạy nguyên trên Helm 4; thay đổi nằm ở cách Helm nói chuyện với cụm:
+
+| | Helm 3 | Helm 4 |
+|---|---|---|
+| Cách apply | Client tự so ba bản (manifest cũ, manifest mới, trạng thái thật) rồi gửi patch | **Server-side apply** cho release cài mới; release tạo từ Helm 3 giữ cách cũ cho tới khi bạn đặt `--server-side=true` |
+| Khi người khác đã sửa trường Helm quản lý | Ghi đè im lặng | Báo `conflict` và dừng; `--force-conflicts` để giành lại |
+| `--wait` | Tự kiểm vài loại tài nguyên | Dựa trên kstatus, hiểu trạng thái sẵn sàng của nhiều loại hơn, kể cả custom resource |
+| Tự rollback khi lỗi | `--atomic` | `--rollback-on-failure` (tên cũ còn chạy, kèm cảnh báo) |
+| Xoá rồi tạo lại | `--force` | `--force-replace` |
+| Chart từ OCI | Theo tag | Thêm cài theo digest `@sha256:…` |
+| Post-renderer | Trỏ tới một file thực thi | Phải là plugin |
+
+**Server-side apply** (SSA) là thay đổi đáng hiểu nhất. Với SSA, API server ghi lại **ai sở hữu trường nào** của mỗi object (`metadata.managedFields`). Helm apply với tên `helm` và sở hữu những trường chart khai báo. Khi một công cụ khác ghi vào đúng trường đó, quyền sở hữu chuyển sang công cụ ấy, và lần `helm upgrade` kế tiếp đụng trường đó sẽ bị từ chối thay vì âm thầm ghi đè.
+
+<Callout kind="production">
+
+Tài liệu Kubernetes có hẳn một mục cảnh báo việc này, [Migrating Deployments and StatefulSets to horizontal autoscaling](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling): khi đã bật HorizontalPodAutoscaler (K5) mà manifest vẫn ghi `spec.replicas`, mỗi lần apply sẽ kéo số pod về con số trong manifest. Với chart ghi `replicas: 3` và Helm 3, điều đó nghĩa là mỗi lần deploy giữa giờ cao điểm cắt số pod về 3, rồi HPA mất vài phút mới tăng lại: người dùng thấy lỗi đúng lúc deploy. Với Helm 4 và SSA, cùng cấu hình đó làm `helm upgrade` thất bại với `conflict … .spec.replicas`, vì HPA đã sở hữu trường này. Cả hai triệu chứng có chung một cách sửa: trường nào do controller khác quản lý thì chart **không được khai báo**. Chart viết tốt bọc `replicas` trong điều kiện "chỉ ghi khi không bật autoscaling". Đừng sửa bằng cách thêm `--force-conflicts` vào pipeline: cờ đó đưa bạn về đúng hành vi của Helm 3.
+
+</Callout>
+
+<Callout kind="pitfall">
+
+**Tránh chart và image Bitnami trong hệ thống mới.** Trong nhiều năm, `bitnami/postgresql`, `bitnami/redis`, `bitnami/kafka` là câu trả lời mặc định. Từ ngày 28/08/2025, Bitnami [chuyển mọi image có tag phiên bản](https://github.com/bitnami/charts/issues/35164) từ `docker.io/bitnami` sang `docker.io/bitnamilegacy`, nơi không còn được cập nhật; bản được vá tiếp nằm trong gói trả phí Bitnami Secure Images. Chart cũ trỏ vào đường dẫn cũ sẽ gặp `ImagePullBackOff` khi pod bị tạo lại, và trỏ sang `bitnamilegacy` nghĩa là chạy image không còn vá lỗi bảo mật. Với phần mềm có trạng thái, dùng chart hoặc operator do chính dự án phát hành (CloudNativePG cho PostgreSQL, Strimzi cho Kafka) cùng image chính thức. Bài học chung: trước khi `helm install` một chart, xem nó kéo image từ đâu (`helm template … | grep image:`) và ai đang bảo trì.
+
+</Callout>
+
+<Check id="k3.1.helm4-ssa">Giải thích được server-side apply khác cách apply của Helm 3 ở đâu, và vì sao trường do HPA quản lý không nên có trong chart.</Check>
+
+### Kustomize: base và overlay
+
+Kustomize không có template. Bạn viết manifest đầy đủ, chạy được, vào một thư mục **base**; mỗi môi trường là một **overlay** chỉ ghi phần khác đi. File `kustomization.yaml` trong mỗi thư mục nói phải làm gì:
+
+```text
+ kustomize/
+ ├── base/
+ │   ├── deployment.yaml          manifest đầy đủ, hợp lệ
+ │   ├── service.yaml
+ │   └── kustomization.yaml       resources: [deployment.yaml, service.yaml]
+ │                                configMapGenerator: web-config
+ └── overlays/
+     ├── dev/kustomization.yaml   resources: [../../base]
+     │                            namespace: k3-dev, đổi 1 giá trị cấu hình
+     └── prod/
+         ├── kustomization.yaml   resources: [../../base]
+         │                        namespace: k3-prod, replicas: 3, đổi tag image,
+         │                        patches: [resources.yaml]
+         └── resources.yaml       mảnh YAML chỉ chứa phần requests/limits
+
+ kubectl kustomize overlays/prod   ->  in YAML cuối cùng (không đụng cụm)
+ kubectl apply -k overlays/prod    ->  render rồi apply
+```
+
+Các phép biến đổi hay dùng trong `kustomization.yaml`:
+
+| Trường | Làm gì |
+|---|---|
+| `namespace`, `namePrefix`, `nameSuffix` | Đặt namespace hoặc thêm tiền tố, hậu tố cho mọi object, tự sửa cả các chỗ tham chiếu |
+| `labels` | Gắn label chung. Mặc định **không** chạm vào selector; đặt `includeSelectors: true` mới chạm |
+| `images` | Đổi tên, tag hoặc digest của image mà không sửa file Deployment |
+| `replicas` | Đổi số replica theo tên |
+| `patches` | Sửa bất kỳ trường nào: strategic merge (một mảnh YAML cùng cấu trúc) hoặc JSON Patch (đường dẫn và phép toán) |
+| `configMapGenerator`, `secretGenerator` | Sinh ConfigMap hoặc Secret từ literal hay file, **thêm hash nội dung vào tên** |
+
+Hash trong tên là mẹo quan trọng nhất của Kustomize. ConfigMap `web-config` thành `web-config-h6cdgtc5md`, và mọi chỗ tham chiếu trong Deployment được sửa theo. Đổi nội dung thì hash đổi, tên đổi, pod template đổi, và Deployment tự rollout. K1.2 đã nêu vấn đề gốc: sửa ConfigMap tại chỗ không làm pod đọc lại biến môi trường. ConfigMap cũ vẫn còn trên cụm, nên `kubectl rollout undo` quay về được cả code lẫn cấu hình.
+
+<Check id="k3.1.kustomize-mo-hinh">Giải thích được base, overlay, patch, và vì sao `configMapGenerator` thêm hash vào tên ConfigMap.</Check>
+
+### Chọn Helm, Kustomize hay cả hai
+
+| Tình huống | Nên dùng | Lý do |
+|---|---|---|
+| Cài phần mềm của bên khác (gateway, operator, công cụ giám sát) | Helm | Họ phát hành chart; bạn chỉ viết values và nâng version |
+| Phát hành phần mềm cho nhiều đội hoặc khách hàng cài | Helm | Cần đóng gói, phiên bản, tuỳ chọn có tài liệu và kiểm tra (K3.2) |
+| Ứng dụng của chính đội, vài môi trường khác nhau ít | Kustomize | Không cần học ngôn ngữ template; diff giữa môi trường đọc được ngay |
+| Chart của bên khác thiếu một tuỳ chọn bạn cần | Helm rồi Kustomize | Render chart, vá phần thiếu bằng patch, không phải fork chart |
+
+Hai công cụ không loại trừ nhau, và cả hai đều chỉ là bước "sinh manifest". Ai apply, khi nào, và cụm có khớp với Git không là việc của GitOps ở D13; Argo CD và Flux đọc được cả chart lẫn kustomization.
+
+<Check id="k3.1.chon-cong-cu">Chọn được Helm, Kustomize hoặc kết hợp cho một tình huống cụ thể và nêu được lý do.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Using Helm](https://helm.sh/docs/intro/using_helm/): vòng đời install, upgrade, rollback và thứ tự ưu tiên giữa `-f` với `--set`.
+- [Helm 4 Overview](https://helm.sh/docs/overview/): danh sách đầy đủ thay đổi so với Helm 3, gồm server-side apply và các cờ đổi tên.
+- [Use OCI-based registries](https://helm.sh/docs/topics/registries/): cú pháp `oci://`, đăng nhập registry, cài theo digest.
+- [Server-Side Apply | Kubernetes](https://kubernetes.io/docs/reference/using-api/server-side-apply/): field manager và conflict hoạt động thế nào, để đọc hiểu lỗi ở bước 3.
+- [The Kustomization File | SIG CLI](https://kubectl.docs.kubernetes.io/references/kustomize/kustomization/): tra cứu mọi trường của `kustomization.yaml` kèm ví dụ.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Một cụm kind bất kỳ chạy Kubernetes 1.37. Bài được kiểm trên cụm `k2-lab` của chặng K2 (kind mặc định, 1 control plane, 1 worker); bài không dùng lại namespace hay ứng dụng nào của K2.
+- Helm 4.3, kubectl 1.37 (có sẵn Kustomize 5.8), `jq`, `yq`. Cổng `9590` còn trống.
+- **Profile máy:** các ứng dụng của bài đều nhỏ (vài pod podinfo, mỗi pod xin 32 Mi ở nơi có đặt request). Máy 8 GB làm được với Docker Desktop 4 GB.
+- Chart mẫu là **podinfo**, một ứng dụng web nhỏ chuyên dùng để thử Kubernetes, phát hành cả qua repo HTTP lẫn OCI.
+
+### 1. Tìm chart và xem trước khi cài
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-k3 && cd ~/masteva-k3
+helm version --short
+helm repo add podinfo https://stefanprodan.github.io/podinfo
+helm search repo podinfo/podinfo --versions | head -4
+helm show chart oci://ghcr.io/stefanprodan/charts/podinfo --version 6.15.0 2>&1 | grep -E 'Digest|^name|^version|^appVersion'
+helm show values podinfo/podinfo --version 6.15.0 | sed -n '1,4p;17,20p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+v4.3.0+gbec5b06
+"podinfo" has been added to your repositories
+NAME           	CHART VERSION	APP VERSION	DESCRIPTION
+podinfo/podinfo	6.15.0       	6.15.0     	Podinfo Helm chart for Kubernetes
+podinfo/podinfo	6.14.1       	6.14.1     	Podinfo Helm chart for Kubernetes
+podinfo/podinfo	6.14.0       	6.14.0     	Podinfo Helm chart for Kubernetes
+Digest: sha256:ff3d3e14728f75476ed4d43c14f80d52d81d36bc16906843463d464c6146f0d8
+appVersion: 6.15.0
+name: podinfo
+version: 6.15.0
+# Default values for podinfo.
+
+replicaCount: 1
+logLevel: info
+ui:
+  color: "#34577c"
+  message: ""
+  logo: ""
+```
+
+</Expected>
+
+Cùng một chart, hai đường lấy: `podinfo/podinfo` qua repo vừa thêm, và `oci://ghcr.io/…` không cần thêm gì. Với OCI, Helm in luôn **digest** của gói. `helm show values` in toàn bộ file mặc định (309 dòng với chart này); đó là tài liệu chính xác nhất về những gì chart cho phép chỉnh.
+
+### 2. Viết values và render thử
+
+File values của bạn chỉ ghi những gì **khác** mặc định. Càng ngắn càng dễ thấy mình đã đổi gì.
+
+<Terminal where="mac" title="~/masteva-k3/values-dev.yaml">
+
+```bash
+cat > values-dev.yaml <<'EOF'
+# Chỉ ghi những gì khác mặc định
+replicaCount: 2
+ui:
+  message: "Xin chào từ K3.1"
+  color: "#2e7d32"
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 64Mi
+EOF
+helm template demo podinfo/podinfo --version 6.15.0 -n k3-helm -f values-dev.yaml > rendered.yaml
+grep -E '^# Source|^kind' rendered.yaml | paste - - | head -3
+yq 'select(.kind == "Deployment")
+    | (.spec.replicas, .spec.template.spec.containers[0].image, .spec.template.spec.containers[0].env)' rendered.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+# Source: podinfo/templates/service.yaml	kind: Service
+# Source: podinfo/templates/deployment.yaml	kind: Deployment
+# Source: podinfo/templates/tests/grpc.yaml	kind: Pod
+2
+ghcr.io/stefanprodan/podinfo:6.15.0
+- name: PODINFO_UI_MESSAGE
+  value: "Xin chào từ K3.1"
+- name: PODINFO_UI_COLOR
+  value: "#2e7d32"
+```
+
+</Expected>
+
+`helm template` chạy hoàn toàn trên máy bạn: không cần cụm, không tạo gì. Đây là cách kiểm một chart lạ trước khi tin nó: đọc `rendered.yaml`, xem nó tạo những loại object nào, image kéo từ đâu, có xin quyền RBAC rộng không. Dòng `# Source` cho biết mỗi object sinh từ template nào.
+
+<Check id="k3.1.lab-template">Đọc được values mặc định của một chart, viết được file values ngắn, và render ra manifest để xem trước khi cài.</Check>
+
+### 3. Cài, và xem Helm 4 sở hữu trường nào
+
+<Terminal where="mac">
+
+```bash
+helm upgrade --install demo podinfo/podinfo --version 6.15.0 \
+  -n k3-helm --create-namespace -f values-dev.yaml --wait | head -6
+helm list -n k3-helm
+kubectl -n k3-helm get secrets -l owner=helm
+kubectl -n k3-helm get deployment demo-podinfo -o yaml --show-managed-fields \
+  | yq '.metadata.managedFields[] | [.manager, .operation, .subresource // ""] | join(" ")'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Release "demo" does not exist. Installing it now.
+NAME: demo
+LAST DEPLOYED: Sat Oct 10 08:43:43 2026
+NAMESPACE: k3-helm
+STATUS: deployed
+REVISION: 1
+NAME	NAMESPACE	REVISION	UPDATED                             	STATUS  	CHART         	APP VERSION
+demo	k3-helm  	1       	2026-10-10 08:43:43.38622 +0700 +07	deployed	podinfo-6.15.0	6.15.0
+NAME                         TYPE                 DATA   AGE
+sh.helm.release.v1.demo.v1   helm.sh/release.v1   1      12s
+helm Apply
+kube-controller-manager Update status
+```
+
+</Expected>
+
+`upgrade --install` cài nếu chưa có, nâng cấp nếu đã có: một lệnh duy nhất cho pipeline. `--wait` giữ lệnh lại tới khi pod sẵn sàng. Secret `sh.helm.release.v1.demo.v1` là nơi revision 1 được lưu. Hai dòng cuối là `managedFields` của Deployment: `helm Apply` nghĩa là Helm đã dùng server-side apply và đang sở hữu các trường chart khai báo; `kube-controller-manager` chỉ sở hữu phần `status`.
+
+Xem ứng dụng qua `port-forward`:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k3-helm port-forward service/demo-podinfo 9590:9898 > /dev/null &
+sleep 2
+curl -s localhost:9590 | jq '{hostname, message, version}'
+kill %1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{
+  "hostname": "demo-podinfo-749db4cc54-vkvld",
+  "message": "Xin chào từ K3.1",
+  "version": "6.15.0"
+}
+```
+
+</Expected>
+
+<Predict question="Một đồng nghiệp chạy `kubectl scale deployment demo-podinfo --replicas=4` để chữa cháy. Sau đó bạn chạy lại đúng lệnh `helm upgrade --install` cũ, values vẫn ghi `replicaCount: 2`. Kết quả?">
+
+`helm upgrade` thất bại với lỗi conflict, Deployment vẫn 4 replica. `kubectl scale` ghi vào `.spec.replicas` nên field manager `kubectl` giành quyền sở hữu trường đó từ `helm`. Server-side apply từ chối để một bên âm thầm ghi đè bên kia. Helm 3 thì đặt lại về 2 mà không báo gì.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k3-helm scale deployment demo-podinfo --replicas=4
+kubectl -n k3-helm get deployment demo-podinfo -o yaml --show-managed-fields \
+  | yq '.metadata.managedFields[] | [.manager, .operation, .subresource // ""] | join(" ")'
+helm upgrade --install demo podinfo/podinfo --version 6.15.0 -n k3-helm -f values-dev.yaml 2>&1 | tail -1
+kubectl -n k3-helm get deployment demo-podinfo -o jsonpath='{.spec.replicas}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/demo-podinfo scaled
+helm Apply
+kubectl Update scale
+kube-controller-manager Update status
+Error: UPGRADE FAILED: conflict occurred while applying object k3-helm/demo-podinfo apps/v1, Kind=Deployment: Apply failed with 1 conflict: conflict with "kubectl" with subresource "scale" using apps/v1: .spec.replicas
+4
+```
+
+</Expected>
+
+Thông báo lỗi ghi đủ: object nào, ai đang giữ (`kubectl`, qua subresource `scale`), trường nào (`.spec.replicas`). Bạn có hai lựa chọn có chủ đích. Nếu thay đổi tay là đúng, đưa nó vào values (`replicaCount: 4`): Helm apply cùng giá trị thì không còn conflict. Nhưng quyền sở hữu `.spec.replicas` lúc đó vẫn **chia đôi** giữa `helm` và `kubectl`: trong lab, lần đổi `replicaCount` kế tiếp (sang 5) lại báo đúng conflict cũ. Tình trạng đó chỉ hết khi bạn chạy `--force-conflicts` một lần, hoặc khi chart thôi khai báo trường đó. Nếu Git mới là nguồn sự thật, giành lại ngay bằng `--force-conflicts`:
+
+<Terminal where="mac">
+
+```bash
+helm upgrade --install demo podinfo/podinfo --version 6.15.0 -n k3-helm -f values-dev.yaml \
+  --force-conflicts | grep -E 'STATUS|REVISION'
+kubectl -n k3-helm get deployment demo-podinfo -o jsonpath='{.spec.replicas}{"\n"}'
+helm history demo -n k3-helm -o json | jq -r '.[] | "\(.revision) \(.status) \(.description[0:60])"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+STATUS: deployed
+REVISION: 3
+2
+1 superseded Install complete
+2 failed Upgrade "demo" failed: conflict occurred while applying obje
+3 deployed Upgrade complete
+```
+
+</Expected>
+
+Lần thất bại cũng được ghi thành một revision (`2 failed`). Lịch sử của Helm là nhật ký mọi lần thử, không chỉ những lần thành công.
+
+<Check id="k3.1.lab-ssa-conflict">Tái hiện được conflict giữa `kubectl scale` và `helm upgrade`, đọc được thông báo lỗi, và chọn được cách xử lý phù hợp.</Check>
+
+### 4. Nâng cấp hỏng, tự rollback và rollback tay
+
+Nâng lên một tag image không tồn tại. `--rollback-on-failure` bảo Helm: nếu sau `--timeout` tài nguyên chưa sẵn sàng thì quay về revision tốt gần nhất.
+
+<Terminal where="mac">
+
+```bash
+helm upgrade demo podinfo/podinfo --version 6.15.0 -n k3-helm -f values-dev.yaml \
+  --set image.tag=9.9.9 --rollback-on-failure --timeout 45s 2>&1 | grep '^Error' | cut -c1-140
+helm history demo -n k3-helm -o json | jq -r '.[-3:][] | "\(.revision) \(.status) \(.description[0:40])"'
+kubectl -n k3-helm get deployment demo-podinfo \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{" ready="}{.status.readyReplicas}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Error: UPGRADE FAILED: release demo failed, and has been rolled back due to rollback-on-failure being set: resource Deployment/k3-helm/demo-
+3 superseded Upgrade complete
+4 failed Upgrade "demo" failed: resource Deployme
+5 deployed Rollback to 3
+ghcr.io/stefanprodan/podinfo:6.15.0 ready=2
+```
+
+</Expected>
+
+Lệnh mất khoảng 50 giây: Helm chờ hết 45 giây vì pod mới đứng ở `ImagePullBackOff`, rồi rollback. Trong thời gian đó người dùng không bị ảnh hưởng: rolling update của Deployment (K1.1) giữ pod cũ cho tới khi pod mới sẵn sàng. Không có `--rollback-on-failure`, release nằm lại ở trạng thái `failed` với pod mới treo, chờ người xử lý.
+
+Rollback tay về một revision bất kỳ cũng là một lệnh, và nó tạo revision mới chứ không xoá lịch sử:
+
+<Terminal where="mac">
+
+```bash
+helm rollback demo 1 -n k3-helm
+helm history demo -n k3-helm -o json | jq -r '.[-2:][] | "\(.revision) \(.status) \(.description)"'
+helm get values demo -n k3-helm | head -3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Rollback was a success! Happy Helming!
+5 superseded Rollback to 3
+6 deployed Rollback to 1
+USER-SUPPLIED VALUES:
+replicaCount: 2
+resources:
+```
+
+</Expected>
+
+Rollback của Helm chỉ quay lại **manifest**. Nó không hoàn tác migration database, không khôi phục dữ liệu trong PV, không gọi lại những gì hook đã làm. D13 bàn về rollback an toàn khi schema đã đổi.
+
+<Check id="k3.1.lab-rollback">Dùng được `--rollback-on-failure` cho một lần nâng cấp hỏng, đọc được `helm history`, và rollback tay về một revision.</Check>
+
+### 5. Cài từ OCI và ghim theo digest
+
+<Terminal where="mac">
+
+```bash
+OCI=oci://ghcr.io/stefanprodan/charts/podinfo
+DIGEST=sha256:ff3d3e14728f75476ed4d43c14f80d52d81d36bc16906843463d464c6146f0d8
+helm template t $OCI@$DIGEST | grep -c '^kind:'
+helm template t $OCI@sha256:0000000000000000000000000000000000000000000000000000000000000000 2>&1 | tail -1 | cut -c1-90
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Pulled: ghcr.io/stefanprodan/charts/podinfo@sha256:ff3d3e14728f75476ed4d43c14f80d52d81d36bc16906843463d464c6146f0d8
+Digest: sha256:ff3d3e14728f75476ed4d43c14f80d52d81d36bc16906843463d464c6146f0d8
+5
+Error: failed to perform "FetchReference" on source: ghcr.io/stefanprodan/charts/podinfo@s
+```
+
+</Expected>
+
+Tag `6.15.0` là một cái tên mà chủ registry có thể trỏ sang nội dung khác. Digest là hash của chính nội dung: sai một bit là Helm từ chối. Trong pipeline production, ghim chart bên ngoài theo digest (digest in ra ở bước 1) để lần deploy sau chắc chắn dùng đúng gói đã kiểm. K3.2 tự tay đẩy chart lên một registry và thấy tag bị ghi đè thế nào.
+
+<Check id="k3.1.lab-oci">Lấy được chart từ OCI registry không cần `repo add`, và ghim được theo digest.</Check>
+
+### 6. Kustomize: một base, hai overlay
+
+Giờ sang ứng dụng "của mình": cùng image podinfo nhưng bạn tự viết manifest, không dùng chart.
+
+<Terminal where="mac" title="~/masteva-k3/kustomize/base">
+
+```bash
+mkdir -p kustomize/base kustomize/overlays/dev kustomize/overlays/prod && cd kustomize
+cat > base/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:6.15.0
+          envFrom:
+            - configMapRef:
+                name: web-config   # Kustomize tự thay bằng tên có hash
+          ports:
+            - {name: http, containerPort: 9898}
+EOF
+cat > base/service.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector: {app: web}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+EOF
+cat > base/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+labels:
+  - pairs: {app.kubernetes.io/part-of: k3-shop}
+configMapGenerator:
+  - name: web-config
+    literals:
+      - PODINFO_UI_MESSAGE=base
+      - PODINFO_UI_COLOR=#34577c
+EOF
+```
+
+</Terminal>
+
+Base không ghi namespace: nó là khuôn chung. Hai overlay:
+
+<Terminal where="mac" title="~/masteva-k3/kustomize/overlays">
+
+```bash
+cat > overlays/dev/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k3-dev
+resources:
+  - ../../base
+configMapGenerator:
+  - name: web-config
+    behavior: merge          # gộp vào ConfigMap của base, ghi đè key trùng
+    literals:
+      - PODINFO_UI_MESSAGE=dev
+EOF
+cat > overlays/prod/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k3-prod
+resources:
+  - ../../base
+replicas:
+  - name: web
+    count: 3
+images:
+  - name: ghcr.io/stefanprodan/podinfo
+    newTag: 6.14.1           # prod còn chạy bản cũ hơn, nâng sau
+configMapGenerator:
+  - name: web-config
+    behavior: merge
+    literals:
+      - PODINFO_UI_MESSAGE=prod
+      - PODINFO_UI_COLOR=#b71c1c
+patches:
+  - path: resources.yaml
+EOF
+cat > overlays/prod/resources.yaml <<'EOF'
+# Strategic merge patch: cùng cấu trúc với Deployment, chỉ ghi phần thêm vào
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: podinfo      # khớp container theo tên
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+EOF
+kubectl kustomize overlays/prod | yq 'select(.kind != "Service")'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+apiVersion: v1
+data:
+  PODINFO_UI_COLOR: '#b71c1c'
+  PODINFO_UI_MESSAGE: prod
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/part-of: k3-shop
+  name: web-config-h6cdgtc5md
+  namespace: k3-prod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/part-of: k3-shop
+  name: web
+  namespace: k3-prod
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - envFrom:
+            - configMapRef:
+                name: web-config-h6cdgtc5md
+          image: ghcr.io/stefanprodan/podinfo:6.14.1
+          name: podinfo
+          ports:
+            - containerPort: 9898
+              name: http
+          resources:
+            limits:
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+```
+
+</Expected>
+
+Mọi khác biệt của prod so với base đều thấy trong output: namespace, 3 replica, tag `6.14.1`, phần `resources` từ patch, và ConfigMap mang hash với tên đã được thay ở `configMapRef`. Label `part-of` nằm ở `metadata` nhưng **không** vào `selector`, đúng mặc định an toàn: selector của Deployment là bất biến, thêm label vào đó trên một Deployment đang chạy sẽ bị API server từ chối.
+
+<Terminal where="mac">
+
+```bash
+kubectl create namespace k3-dev
+kubectl create namespace k3-prod
+kubectl apply -k overlays/dev
+kubectl apply -k overlays/prod
+kubectl -n k3-prod rollout status deployment/web
+kubectl get deployment,configmap -n k3-dev  -l app.kubernetes.io/part-of=k3-shop
+kubectl get deployment,configmap -n k3-prod -l app.kubernetes.io/part-of=k3-shop
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   1/1     1            1           10s
+
+NAME                              DATA   AGE
+configmap/web-config-9md48thgcm   2      10s
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   3/3     3            3           10s
+
+NAME                              DATA   AGE
+configmap/web-config-h6cdgtc5md   2      10s
+```
+
+</Expected>
+
+Cùng một base, hai môi trường, và hai ConfigMap có hash khác nhau vì nội dung khác nhau.
+
+<Check id="k3.1.lab-kustomize-overlay">Viết được base và hai overlay có đổi namespace, replica, tag image, patch tài nguyên, và render ra để kiểm trước khi apply.</Check>
+
+### 7. Đổi cấu hình: hash mới, rollout mới
+
+<Predict question="Sửa `PODINFO_UI_MESSAGE=prod` thành `prod-v2` trong overlay prod rồi `kubectl apply -k`. Pod có khởi động lại không? ConfigMap cũ ra sao?">
+
+Có. Nội dung ConfigMap đổi nên hash đổi, Kustomize sinh một ConfigMap **tên mới** và sửa `configMapRef` trong Deployment. Pod template thay đổi nên Deployment rolling update như khi đổi image. ConfigMap cũ không bị xoá: `kubectl apply -k` không dọn những object không còn trong output.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+sed -i.bak 's/PODINFO_UI_MESSAGE=prod/PODINFO_UI_MESSAGE=prod-v2/' overlays/prod/kustomization.yaml
+kubectl diff -k overlays/prod | grep -E '^[+-] .*(web-config|PODINFO)'
+kubectl apply -k overlays/prod
+kubectl -n k3-prod rollout status deployment/web | tail -1
+kubectl -n k3-prod get configmap -l app.kubernetes.io/part-of=k3-shop
+kubectl -n k3-prod exec deployment/web -- env | grep PODINFO_UI_MESSAGE
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+-            name: web-config-h6cdgtc5md
++            name: web-config-66bm65d6g4
++  PODINFO_UI_COLOR: '#b71c1c'
++  PODINFO_UI_MESSAGE: prod-v2
++  name: web-config-66bm65d6g4
+configmap/web-config-66bm65d6g4 created
+service/web unchanged
+deployment.apps/web configured
+deployment "web" successfully rolled out
+NAME                    DATA   AGE
+web-config-66bm65d6g4   2      3s
+web-config-h6cdgtc5md   2      13s
+PODINFO_UI_MESSAGE=prod-v2
+```
+
+</Expected>
+
+`kubectl diff -k` cho thấy trước những gì sẽ đổi trên cụm; chạy nó trước mỗi lần apply lên production. Hai ConfigMap cùng tồn tại: `kubectl rollout undo deployment/web` sẽ đưa pod về template cũ, vốn trỏ vào ConfigMap cũ còn nguyên đó. Cái giá là ConfigMap cũ tích lại dần; công cụ GitOps ở D13 có cơ chế dọn (prune).
+
+<Check id="k3.1.lab-config-hash">Chứng minh được đổi một giá trị trong `configMapGenerator` tạo ConfigMap tên mới và làm Deployment rollout, và dùng được `kubectl diff -k` để xem trước.</Check>
+
+### 8. Kết hợp: chart của người khác, patch của mình
+
+Giả sử chính sách công ty đòi mọi Deployment có annotation `team`, mà chart podinfo không có tuỳ chọn cho việc đó. Thay vì fork chart, để Kustomize render chart rồi vá:
+
+<Terminal where="mac" title="~/masteva-k3/kustomize/helm-ket-hop/kustomization.yaml">
+
+```bash
+mkdir -p helm-ket-hop && cat > helm-ket-hop/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k3-helm
+helmCharts:
+  - name: podinfo
+    repo: https://stefanprodan.github.io/podinfo
+    version: 6.15.0
+    releaseName: demo
+    skipTests: true          # không render các pod "helm test" của chart
+    valuesInline:
+      replicaCount: 2
+patches:
+  - target: {kind: Deployment, name: demo-podinfo}
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value: {team: shop}
+EOF
+kubectl kustomize --enable-helm helm-ket-hop | grep -E '^kind:|team:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind: Service
+kind: Deployment
+    team: shop
+```
+
+</Expected>
+
+Kustomize gọi `helm template` (cần cờ `--enable-helm`), rồi áp patch lên kết quả. Đánh đổi: cách này chỉ dùng Helm làm bộ render. Không có release, không có `helm history` hay `helm rollback`; việc theo dõi phiên bản chuyển sang Git và công cụ GitOps. Bỏ `skipTests: true` thì ba pod kiểm thử của chart sẽ bị apply như pod thường, vì hook của Helm không có nghĩa gì với `kubectl apply`. Lệnh render còn tải chart về thư mục `helm-ket-hop/charts/` cạnh file kustomization; đưa `charts/` vào `.gitignore` để không commit nhầm. Bài chỉ render, không apply, để không đè lên release `demo` đang do Helm quản lý.
+
+<Check id="k3.1.lab-ket-hop">Render được một chart qua Kustomize kèm patch, và nêu được thứ mất đi khi không cài bằng `helm`.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `UPGRADE FAILED: conflict … with "<tên>"` | Công cụ khác đã ghi vào trường Helm quản lý | Đọc tên manager và đường dẫn trường trong lỗi; `kubectl get … --show-managed-fields` |
+| `helm upgrade` treo rồi `context deadline exceeded` | `--wait` chờ pod không bao giờ sẵn sàng | `kubectl get pods`, `kubectl describe pod`; xem image, probe |
+| Giá trị trong values không có tác dụng | Sai tên key hoặc sai mức thụt lề; Helm bỏ qua key lạ | So với `helm show values`; `helm template` rồi tìm giá trị |
+| `kubectl apply -k` báo `namespaces "…" not found` | Overlay đặt `namespace` nhưng không tạo nó | Tạo namespace trước, hoặc thêm manifest Namespace vào `resources` |
+| Patch của Kustomize không có tác dụng | `metadata.name` hoặc tên container trong patch không khớp | `kubectl kustomize` rồi đọc output |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới gỡ release `demo`, xoá ba namespace của bài cùng mọi thứ trong đó, và xoá thư mục `kustomize`. Giữ lại `~/masteva-k3` nếu học tiếp K3.2.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-k3
+helm uninstall demo -n k3-helm
+kubectl delete namespace k3-helm k3-dev k3-prod
+helm repo remove podinfo
+rm -rf kustomize rendered.yaml values-dev.yaml
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="`-f a.yaml -f b.yaml --set x=1`: giá trị nào thắng?">
+
+Thứ tự ưu tiên tăng dần: `values.yaml` của chart, rồi các file `-f` theo thứ tự viết (file sau đè file trước), rồi `--set`. Map được gộp theo từng key, nhưng **list bị thay nguyên cả list**: ghi đè một phần tử của `env` hay `tolerations` là mất các phần tử còn lại. Thói quen tốt: một file chung, một file cho từng môi trường (`-f values.yaml -f values-prod.yaml`), và chỉ dùng `--set` cho thứ thay đổi theo từng lần chạy như tag image. `helm get values <release>` cho biết lần deploy gần nhất đã dùng gì.
+
+</Reveal>
+
+<Reveal title="Release cài bằng Helm 3, nay nâng cấp bằng Helm 4 thì dùng cách apply nào?">
+
+Vẫn cách cũ của Helm 3. Cờ `--server-side` mặc định là `auto`: theo phương pháp của revision trước. Release cài mới bằng Helm 4 dùng server-side apply; release có từ thời Helm 3 tiếp tục dùng client-side cho tới khi bạn chủ động chạy một lần `helm upgrade --server-side=true`. Lần chuyển đó có thể gặp conflict với những trường đã bị công cụ khác sửa trong quá khứ, nên làm từng release, ở môi trường thử trước, và đọc từng conflict thay vì thêm sẵn `--force-conflicts`.
+
+</Reveal>
+
+<Reveal title="Strategic merge patch và JSON Patch khác nhau thế nào, chọn cái nào?">
+
+Strategic merge patch là một mảnh YAML cùng hình dạng với object; Kubernetes biết cách gộp list theo khoá (container theo `name`), nên bạn thêm `resources` cho container `podinfo` mà không phải chép cả list. Nó dễ đọc và hợp với phần lớn nhu cầu. JSON Patch (RFC 6902) là danh sách phép toán `add`, `remove`, `replace` trên đường dẫn cụ thể: chính xác tuyệt đối, xoá được một trường, sửa được phần tử thứ n của list, và dùng được cho custom resource mà Kubernetes không biết khoá gộp. Bước 6 dùng loại thứ nhất, bước 8 dùng loại thứ hai.
+
+</Reveal>
+
+<Reveal title="Vì sao không nên truyền mật khẩu bằng --set?">
+
+Ba lý do. Giá trị nằm trong lịch sử shell và log của pipeline. Helm lưu toàn bộ values vào Secret của release, nên ai đọc được Secret trong namespace (hoặc chạy `helm get values`) là đọc được mật khẩu, ở mọi revision còn giữ. Và chart thường đưa giá trị đó vào một object Secret chỉ được mã hoá base64. Cách làm đúng tách bí mật khỏi Helm: chart chỉ nhận **tên** của một Secret đã có sẵn (`existingSecret`), còn nội dung do một công cụ quản lý bí mật đưa vào cụm. D15 làm phần này.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI rất hữu ích để giải thích một chart lạ ("values nào bật TLS?") và viết patch Kustomize. Chỗ hay sai: (1) dùng cờ và hành vi của Helm 3 (`--atomic`, `helm install --name`), hoặc khẳng định Helm ghi đè thay đổi tay, điều không còn đúng với SSA; (2) bịa tên key trong values, mà Helm lại im lặng bỏ qua key lạ; (3) đề xuất chart Bitnami theo thói quen; (4) viết `commonLabels` của Kustomize, trường cũ làm đổi cả selector. Cách kiểm không phụ thuộc AI: `helm show values` để đối chiếu từng key, `helm template` hoặc `kubectl kustomize` để đọc output thật, và `kubectl diff` trước khi apply.
+
+</Callout>
+
+<Callout kind="link">
+
+K3.2 tự viết một chart, có kiểm tra values và test, rồi phát hành lên OCI registry. K2.2 đã cài Envoy Gateway bằng đúng lệnh `helm install` từ OCI. K5 dạy HPA, lý do thật sự của conflict trên `.spec.replicas`. D13 đặt cả Helm lẫn Kustomize dưới GitOps: Git là nguồn sự thật, công cụ tự apply và tự phát hiện thay đổi tay. D15 xử lý bí mật trong values.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k3.1.mastery-helm-vong-doi">Cài được một chart bên thứ ba với file values riêng và version ghim cứng, nâng cấp, đọc lịch sử, và rollback khi hỏng.</Check>
+
+<Check id="k3.1.mastery-conflict">Gặp lỗi `conflict` của Helm 4, tìm được ai đang sở hữu trường đó và quyết định được nên sửa values, sửa chart hay `--force-conflicts`.</Check>
+
+<Check id="k3.1.mastery-kustomize">Tự dựng được base và overlay cho một ứng dụng có hai môi trường, dùng `configMapGenerator` để cấu hình đổi thì pod rollout.</Check>
+
+<Check id="k3.1.mastery-chon">Giải thích được cho đồng đội vì sao một tình huống hợp với Helm, Kustomize hay cả hai, và vì sao tránh chart Bitnami.</Check>
+
+</Mastery>

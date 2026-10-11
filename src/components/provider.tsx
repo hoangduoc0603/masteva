@@ -5,6 +5,7 @@ import dynamic from 'next/dynamic';
 import { MessagesProvider } from '@/components/messages-provider';
 import { LANGUAGE_STORAGE_KEY } from '@/lib/i18n';
 import type { Messages } from '@/lib/messages';
+import { SearchScopeProvider, type SearchScope } from '@/lib/search/scope';
 
 // Hộp tìm kiếm (kèm chỉ mục và bộ dựng kết quả) chỉ được tải khi người học mở nó.
 const SearchDialog = dynamic(() => import('@/components/search'), { ssr: false });
@@ -15,11 +16,13 @@ export function Provider({
   lang,
   i18n,
   messages,
+  searchScope,
   children,
 }: {
   lang: string;
   i18n: I18nProps;
   messages: Messages;
+  searchScope: SearchScope;
   children: ReactNode;
 }) {
   // Ghi nhớ ngôn ngữ đang xem để trang `/` chuyển hướng đúng lần sau.
@@ -32,8 +35,10 @@ export function Provider({
   }, [lang]);
 
   return (
-    <RootProvider i18n={i18n} search={{ SearchDialog }} theme={{ defaultTheme: 'dark' }}>
-      <MessagesProvider messages={messages}>{children}</MessagesProvider>
-    </RootProvider>
+    <SearchScopeProvider value={searchScope}>
+      <RootProvider i18n={i18n} search={{ SearchDialog }} theme={{ defaultTheme: 'dark' }}>
+        <MessagesProvider messages={messages}>{children}</MessagesProvider>
+      </RootProvider>
+    </SearchScopeProvider>
   );
 }

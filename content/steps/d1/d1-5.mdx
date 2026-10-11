@@ -1,0 +1,598 @@
+---
+title: Kernel, sysctl, namespace, cgroup và AppArmor
+description: Xuống tầng kernel để thấy những mảnh ghép mà container được dựng từ đó. Đặt tham số sysctl cho bền, tự tạo namespace bằng unshare, bóp CPU của một dịch vụ bằng cgroup v2 và đọc bằng chứng throttle, rồi viết một profile AppArmor chặn cả root.
+id: d1.5
+step: d1
+prerequisites: [d1.4]
+topics: [d1.kernel-sysctl-cgroups, d1.apparmor-selinux]
+status: verified
+verified:
+  date: 2026-10-10
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    kernel: 7.0.0-38-generic
+    systemd: '259'
+    util-linux: 2.41.3
+    stress-ng: 0.20.01
+    apparmor: 5.0.0~beta1
+    dracut: '110'
+---
+
+<Goal>
+
+Hiểu những cơ chế kernel đứng sau các con số của D1.4, và thấy container thật ra được ghép từ gì. Học xong bài này, bạn giải thích và làm được:
+
+- Đặt một tham số kernel sao cho còn sau khi khởi động lại, và biết vì sao trên Ubuntu 26.04 xoá file cấu hình rồi mà giá trị vẫn còn.
+- Vì sao một tiến trình chỉ dùng 20% CPU mà vẫn chậm: nó bị cgroup bóp, và bằng chứng nằm ở đâu.
+- Vì sao root vẫn nhận `Permission denied`, và vì sao `unshare --user` bị từ chối trên Ubuntu 26.04.
+- Container là tiến trình bình thường cộng với ba lớp nào của kernel.
+
+</Goal>
+
+<Knowledge>
+
+### Kernel, module và sysctl
+
+**Kernel** là chương trình duy nhất nói chuyện trực tiếp với phần cứng; mọi thứ khác gọi nó qua system call. `uname -r` in phiên bản (Ubuntu 26.04 dùng dòng 7.0). Driver và tính năng ít dùng nằm trong **module** nạp khi cần: `lsmod` liệt kê, `modprobe <tên>` nạp, `modinfo` xem mô tả.
+
+Kernel có hơn một nghìn tham số chỉnh được lúc đang chạy, xuất hiện dưới dạng file trong `/proc/sys`. `sysctl` chỉ là cách đọc ghi các file đó: `net.ipv4.ip_forward` là `/proc/sys/net/ipv4/ip_forward`.
+
+| Cách đặt | Lệnh | Sống tới khi |
+|---|---|---|
+| Tạm thời | `sysctl -w tên=giá_trị` | Khởi động lại |
+| Lâu dài | File `/etc/sysctl.d/NN-tên.conf`, nạp bằng `sysctl --system` | Xoá file (và xem lưu ý về initramfs ngay dưới). Các file nạp theo thứ tự tên; file sau ghi đè file trước |
+
+File của distro nằm ở `/usr/lib/sysctl.d/`, file của quản trị viên ở `/etc/sysctl.d/`; cùng tên thì bản trong `/etc` thắng.
+
+<Callout kind="pitfall">
+
+Ubuntu 26.04 dựng initramfs bằng **dracut**, và dracut chép `/etc/sysctl.d/*.conf` vào initramfs để áp dụng ngay từ đầu quá trình khởi động. Hệ quả: nếu initramfs được dựng lại trong lúc file của bạn còn đó (mỗi lần cài kernel mới, kể cả do unattended-upgrades), một bản sao của file nằm lại trong initramfs. Sau đó bạn xoá file trong `/etc`, khởi động lại, và giá trị **vẫn còn**. Chuyện này đã xảy ra thật trên VM kiểm chứng của bài. Kiểm bằng `sudo lsinitrd /boot/initrd.img-$(uname -r) | grep sysctl.d`; gỡ bằng `sudo dracut --force --regenerate-all` rồi khởi động lại. Phần Dọn dẹp làm đúng hai việc này.
+
+</Callout>
+
+Những tham số người làm DevOps gặp thật:
+
+| Tham số | Làm gì | Gặp khi |
+|---|---|---|
+| `net.ipv4.ip_forward` | Cho máy chuyển gói giữa các card mạng | Router, NAT, node Kubernetes (D2) |
+| `fs.inotify.max_user_watches`, `max_user_instances` | Số file, số phiên theo dõi thay đổi file mỗi user | Cụm kind nhiều node trên Linux, IDE, công cụ hot reload |
+| `vm.max_map_count` | Số vùng nhớ mmap của một tiến trình | Elasticsearch, OpenSearch không khởi động với mặc định của kernel (65530). Ubuntu 26.04 đã đặt sẵn 1048576 trong `/usr/lib/sysctl.d/55-map-count.conf`; distro khác và image cũ thì phải tự đặt |
+| `vm.swappiness` | Kernel ưu tiên swap tới mức nào | Máy database |
+| `vm.overcommit_memory` | Cho cấp phát vượt RAM thật hay không | Redis khuyên đặt `1` |
+| `net.core.somaxconn` | Độ dài hàng chờ kết nối của socket | Server chịu nhiều kết nối mới mỗi giây |
+| `fs.protected_regular` | Hàng rào `/tmp` đã gặp ở D1.2 | Khi một chương trình cũ ghi vào file của user khác trong `/tmp` |
+
+<Check id="d1.5.sysctl">Giải thích được sysctl là gì, đặt được một tham số tạm thời và lâu dài, và kể được vài tham số hay phải chỉnh cùng lý do.</Check>
+
+### Namespace và cgroup: container được ghép từ gì
+
+Container không phải là một đối tượng của kernel. Kernel chỉ có **tiến trình**, và hai cơ chế độc lập áp lên tiến trình:
+
+```text
+                        ┌────────────────────────────────────────────┐
+  namespace             │  tiến trình thấy gì                          │
+  (cô lập tầm nhìn)     │  pid: cây tiến trình riêng, nó là PID 1      │
+                        │  mnt: cây thư mục riêng (image)              │
+                        │  net: card mạng, IP, bảng route riêng        │
+                        │  uts: hostname riêng    ipc, user, cgroup, time
+                        ├────────────────────────────────────────────┤
+  cgroup                │  tiến trình được dùng bao nhiêu              │
+  (giới hạn tài nguyên) │  cpu.max, memory.max, pids.max, io.max      │
+                        ├────────────────────────────────────────────┤
+  LSM, seccomp          │  tiến trình được phép làm gì                 │
+  (hạn chế hành vi)     │  AppArmor hoặc SELinux, bộ lọc system call   │
+                        └────────────────────────────────────────────┘
+        "container" = một tiến trình bình thường + ba lớp trên + một image làm cây thư mục
+```
+
+**Namespace** có tám loại; mỗi tiến trình thuộc đúng một namespace mỗi loại, mặc định là namespace chung của máy:
+
+| Namespace | Cô lập | Trong container |
+|---|---|---|
+| `pid` | Số PID và cây tiến trình | Ứng dụng là PID 1 (vì thế có chuyện `exec` ở D1.1) |
+| `mnt` | Danh sách mount | Thấy filesystem của image, không thấy của máy chủ |
+| `net` | Card mạng, IP, route, iptables, cổng | Mỗi container, mỗi pod một IP riêng |
+| `uts` | Hostname | Hostname là ID container, tên pod |
+| `ipc` | Bộ nhớ chia sẻ, hàng đợi System V | |
+| `user` | Bảng ánh xạ UID, GID | Root trong container là user thường bên ngoài (Docker rootless ở D0.1) |
+| `cgroup` | Gốc cây cgroup nhìn thấy | Container thấy mình ở `/` |
+| `time` | Đồng hồ monotonic, boottime | Ít dùng |
+
+**cgroup v2** là một cây thư mục ở `/sys/fs/cgroup`. Mỗi thư mục là một nhóm tiến trình; giới hạn và số đo là các file trong đó:
+
+| File | Nghĩa |
+|---|---|
+| `cgroup.procs` | PID thuộc nhóm |
+| `cpu.max` | `quota period` tính bằng micro giây: `20000 100000` là 20% của một CPU |
+| `cpu.stat` | Thời gian CPU đã dùng, số lần bị bóp (`nr_throttled`) |
+| `memory.max` | Trần cứng: chạm là OOM kill trong nhóm |
+| `memory.high` | Trần mềm: vượt thì bị làm chậm và thu hồi, chưa kill |
+| `memory.events` | Bộ đếm `oom`, `oom_kill`, `max` |
+| `pids.max` | Số tiến trình tối đa (chặn fork bomb) |
+| `*.pressure` | PSI của riêng nhóm |
+
+Trên máy dùng systemd, **systemd là người quản lý cây cgroup**: mỗi service là một cgroup (`system.slice/nginx.service`), và các thuộc tính `CPUQuota=`, `MemoryMax=`, `TasksMax=` trong unit được ghi thẳng xuống `cpu.max`, `memory.max`, `pids.max`. Docker và kubelet nhờ systemd tạo cgroup theo đúng cách đó. Ubuntu 26.04 đã bỏ hẳn cgroup v1; tài liệu nhắc tới `/sys/fs/cgroup/memory/…` hay `memory.limit_in_bytes` là tài liệu cũ.
+
+SB11.3 đã cho thấy JVM đọc `memory.max` và `cpu.max` để tự chọn kích thước heap và số luồng; sự cố 2 của D1.4 đã cho thấy chuyện gì xảy ra khi chạm `memory.max`. Bài này đứng ở phía kernel: ai ghi các file đó, và phía CPU thì chạm trần trông thế nào. D5 ghép namespace, cgroup và image thành một container hoàn chỉnh.
+
+<Callout kind="production">
+
+Năm 2019, đội kỹ sư của Indeed công bố một lỗi trong bộ lập lịch CFS của kernel Linux: container bị đặt giới hạn CPU (`cpu.max`, tức `limits.cpu` của Kubernetes) bị **throttle rất nặng dù mức dùng CPU thấp hơn nhiều so với giới hạn**. Triệu chứng trên production là độ trễ của service tăng vọt và health check timeout, trong khi mọi dashboard về `%CPU` đều "xanh". Thứ chỉ ra vấn đề là tỷ lệ `nr_throttled` trên `nr_periods` trong file `cpu.stat` của cgroup, mà họ gọi là "throttled percentage" (thời đó là cgroup v1, bộ đếm thời gian tên `throttled_time`; ở cgroup v2 nó là `throttled_usec`). Bản sửa vào kernel 5.4. Bước 3 của lab dùng **cùng cách chẩn đoán**, nhưng với nguyên nhân khác: ở lab, tiến trình bị bóp vì nó thật sự muốn dùng nhiều hơn quota, tức cơ chế chạy đúng; ở Indeed, tiến trình bị bóp khi **chưa dùng hết** quota, tức lỗi của kernel. Bài học chung còn nguyên giá trị với kernel hôm nay: `%CPU` thấp không chứng minh tiến trình không thiếu CPU; khi một dịch vụ có giới hạn CPU mà chậm, hãy nhìn `cpu.stat` và PSI của cgroup đó.
+
+</Callout>
+
+<Check id="d1.5.namespace-cgroup">Giải thích được container là tiến trình cộng namespace, cgroup và lớp hạn chế hành vi; kể được namespace `pid`, `mnt`, `net`, `user` cô lập gì; đọc được `cpu.max` và `memory.max`.</Check>
+
+### AppArmor và SELinux
+
+Quyền file ở D1.2 là **DAC** (Discretionary Access Control): chủ file tự quyết, và root vượt qua hết. **MAC** (Mandatory Access Control) là lớp thứ hai do quản trị viên đặt cho từng **chương trình**, áp cả lên root: dù nginx chạy bằng root và bị chiếm quyền, nó vẫn chỉ đọc được những đường dẫn mà chính sách cho phép. Linux hiện thực MAC qua khung LSM, với hai lựa chọn chính:
+
+| | AppArmor | SELinux |
+|---|---|---|
+| Mặc định ở | Ubuntu, Debian, SUSE | RHEL, Rocky, Alma, Fedora, Amazon Linux |
+| Chính sách gắn theo | **Đường dẫn** của chương trình và của file | **Nhãn** (label) trên mọi file, tiến trình, cổng |
+| Viết chính sách | Profile text trong `/etc/apparmor.d/`, đọc được bằng mắt | Module chính sách biên dịch; thường chỉ chỉnh boolean và nhãn |
+| Chế độ | `enforce` (chặn và ghi log), `complain` (chỉ ghi log) theo từng profile | `Enforcing`, `Permissive`, `Disabled` cho cả máy |
+| Chương trình không có chính sách | Không bị hạn chế (`unconfined`) | Vẫn chạy trong một domain có luật |
+| Xem trạng thái | `aa-status` | `getenforce`, `sestatus` |
+| Xem nhãn | `ps -eo label,comm` | `ps -eZ`, `ls -Z` |
+| Log từ chối | `journalctl -k`, dòng `apparmor="DENIED"` | `/var/log/audit/audit.log`, dòng `avc: denied`; giải thích bằng `audit2why` |
+| Sửa hay gặp | Thêm đường dẫn vào profile rồi `apparmor_parser -r` | `restorecon -Rv <thư mục>` (sửa nhãn), `setsebool -P <tên> on` |
+
+Bài này thực hành AppArmor vì VM là Ubuntu; cột SELinux để bạn không lạc khi gặp máy họ RHEL, lab của roadmap không chạy nó. Quy tắc chung cho cả hai: khi nghi MAC chặn, **đọc dòng log từ chối** rồi sửa chính sách hoặc nhãn. Tắt hẳn (`setenforce 0`, `aa-teardown`) để "cho chạy được" là gỡ luôn lớp bảo vệ của mọi dịch vụ trên máy.
+
+Ubuntu còn dùng AppArmor để chặn **user namespace không đặc quyền**: từ 24.04, chương trình không có profile cho phép sẽ tạo được user namespace nhưng không có quyền gì trong đó. Đây là lý do `unshare --user` thất bại ở bước 2. Docker rootless (D0.1) chạy được vì gói `apparmor` của Ubuntu có sẵn một profile cho `/usr/bin/rootlesskit` cho phép tạo user namespace; binary đặt ở đường dẫn khác thì phải tự viết profile.
+
+<Check id="d1.5.mac">Phân biệt được DAC với MAC, AppArmor với SELinux, chế độ enforce với complain, và biết tìm dòng log từ chối của AppArmor ở đâu.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Control Group v2 (Linux kernel)](https://docs.kernel.org/admin-guide/cgroup-v2.html): tra từng file `cpu.*`, `memory.*`, `pids.*`; đọc mục "Memory Interface Files" trước.
+- [`namespaces(7)`](https://man7.org/linux/man-pages/man7/namespaces.7.html): tám loại namespace và các file trong `/proc/<PID>/ns`.
+- [Documentation for /proc/sys (Linux kernel)](https://docs.kernel.org/admin-guide/sysctl/index.html): tra ý nghĩa một tham số sysctl theo nhóm `fs`, `kernel`, `net`, `vm` trước khi chỉnh nó.
+- [AppArmor (Ubuntu Server)](https://documentation.ubuntu.com/server/how-to/security/apparmor/): cú pháp profile, chế độ enforce và complain, cách nạp lại.
+- [Unthrottled: Fixing CPU Limits in the Cloud](https://engineering.indeedblog.com/blog/2019/12/unthrottled-fixing-cpu-limits-in-the-cloud/) của Indeed: nguồn của callout production, có mô hình giải thích quota và period rất dễ hiểu.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:**
+
+- VM `ubuntu` của D0.1 đang chạy, vào bằng `cd ~ && limactl shell ubuntu`. Mọi lệnh chạy trong VM.
+- **Profile máy:** VM 2 CPU, 2 GiB. Bước 3 dùng 20% của một CPU trong một phút. Máy 8 GB: tắt Docker khi làm.
+- `stress-ng` đã cài ở D1.4. Nếu chưa, lệnh dưới cài nó:
+
+<Terminal where="vm">
+
+```bash
+command -v stress-ng >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng >/dev/null
+stress-ng --version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+stress-ng, version 0.20.01 (gcc 15.2.0, aarch64 Linux 7.0.0-38-generic)
+```
+
+</Expected>
+
+Bài được kiểm chứng sau khi VM đã tự cài bản vá và khởi động lại, nên kernel là `7.0.0-38`; VM mới tạo từ image ngày 20/07/2026 là `7.0.0-28`. Các số đo, PID và mã namespace trên máy bạn sẽ khác.
+
+### 1. sysctl: đọc, đặt tạm, đặt lâu dài
+
+<Terminal where="vm">
+
+```bash
+uname -r
+sudo sysctl -a 2>/dev/null | wc -l
+sysctl fs.inotify.max_user_watches fs.inotify.max_user_instances
+cat /proc/sys/fs/inotify/max_user_watches
+sudo sysctl -w vm.swapiness=10; echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+7.0.0-38-generic
+1112
+fs.inotify.max_user_watches = 15154
+fs.inotify.max_user_instances = 128
+15154
+sysctl: cannot stat /proc/sys/vm/swapiness: No such file or directory
+exit=1
+```
+
+</Expected>
+
+Hơn một nghìn tham số. `sysctl` và `cat /proc/sys/…` đọc cùng một giá trị. Gõ sai tên (`swapiness` thiếu chữ `p`) thì lỗi nói thẳng là không có file tương ứng trong `/proc/sys`. Giá trị mặc định của `max_user_watches` được kernel tính theo RAM, nên máy 2 GiB chỉ có khoảng 15 nghìn (15154 với kernel 7.0.0-38, 14968 với 7.0.0-28; VM `docker` 3 GiB ở D0.1 có 22575). Nếu bạn thấy `524288` ngay từ đầu, xem mục gỡ lỗi.
+
+Tài liệu của kind yêu cầu tăng hai tham số inotify khi chạy cụm nhiều node trên máy Linux. Đặt lâu dài bằng một file trong `/etc/sysctl.d`:
+
+<Terminal where="vm" title="/etc/sysctl.d/90-lab.conf">
+
+```bash
+sudo tee /etc/sysctl.d/90-lab.conf >/dev/null <<'EOF'
+# kind nhiều node trên Linux cần nhiều inotify watch hơn mặc định
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 512
+EOF
+sudo sysctl --system 2>&1 | grep -E '^\* Applying /etc|max_user'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+* Applying /etc/sysctl.d/90-lab.conf ...
+* Applying /etc/sysctl.d/99-cloudimg-ipv6.conf ...
+* Applying /etc/sysctl.d/99-lima.conf ...
+fs.inotify.max_user_watches = 524288
+fs.inotify.max_user_instances = 512
+```
+
+</Expected>
+
+`sysctl --system` nạp mọi file theo thứ tự tên: `90-lab.conf` trước hai file `99-…` của image và của Lima. Nếu hai file cùng đặt một tham số, file có số lớn hơn thắng; đó là lý do một giá trị bạn đặt "không ăn" dù file của bạn đúng cú pháp.
+
+Còn một nơi nữa giữ bản sao của các file này: initramfs. Xem nó đang chứa gì:
+
+<Terminal where="vm">
+
+```bash
+sudo lsinitrd /boot/initrd.img-$(uname -r) | grep 'etc/sysctl.d/'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+-rw-r--r--   1 root     root          185 Jul 20 23:37 etc/sysctl.d/99-cloudimg-ipv6.conf
+-rw-r--r--   1 root     root          114 Oct  9 17:33 etc/sysctl.d/99-lima.conf
+```
+
+</Expected>
+
+Lúc này initramfs chỉ có hai file có sẵn từ trước; `90-lab.conf` chưa vào đó vì initramfs chưa được dựng lại kể từ khi bạn tạo file. Lần dựng lại kế tiếp (khi unattended-upgrades cài kernel mới, hoặc khi ai đó chạy `dracut`), file của bạn sẽ được chép vào. Trên VM kiểm chứng, đúng chuyện đó đã xảy ra: file được tạo chiều hôm trước, kernel `7.0.0-38` được cài tự động sáng hôm sau, và sau khi file trong `/etc` bị xoá rồi VM khởi động lại, `max_user_watches` vẫn là `524288`. Chạy `sudo dracut --force --regenerate-all` (khoảng 20 giây) rồi khởi động lại mới đưa nó về `15154`. Với một tham số bạn **muốn** giữ thì đây là hành vi tốt; nó chỉ gây bất ngờ khi bạn tưởng đã gỡ. Phần Dọn dẹp xử lý cả hai nơi.
+
+<Check id="d1.5.lab-sysctl">Đọc được một tham số kernel bằng hai cách, đặt được nó lâu dài bằng file trong `/etc/sysctl.d`, giải thích được thứ tự nạp, và kiểm được initramfs có giữ bản sao của file đó không.</Check>
+
+### 2. Namespace bằng tay
+
+`unshare` chạy một chương trình trong namespace mới. Tạo namespace `pid`, `mnt` và `uts` riêng, đổi hostname bên trong, rồi so với bên ngoài:
+
+<Terminal where="vm">
+
+```bash
+sudo unshare --fork --pid --mount-proc --uts bash -c 'hostname hop-cat; echo "hostname: $(hostname)"; ps -o pid,ppid,cmd -e; readlink /proc/self/ns/pid; true'
+hostname
+readlink /proc/self/ns/pid
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+hostname: hop-cat
+    PID    PPID CMD
+      1       0 bash -c hostname hop-cat; echo "hostname: $(hostname)"; ps -o pid,ppid,cmd -e; readlink /proc/self/ns/pid; true
+      4       1 ps -o pid,ppid,cmd -e
+pid:[4026532360]
+lima-ubuntu
+pid:[4026531836]
+```
+
+</Expected>
+
+Bên trong, `bash` là **PID 1** và `ps` chỉ thấy hai tiến trình: cả trăm tiến trình khác của VM đã biến mất khỏi tầm nhìn. Hostname đổi bên trong không ảnh hưởng bên ngoài. Hai số trong ngoặc vuông khác nhau: đó là mã của hai namespace `pid` khác nhau (mã bên trong của bạn sẽ khác). Bạn vừa tự dựng một phần ba của một container.
+
+Namespace `net` mới chỉ có card loopback, chưa bật:
+
+<Terminal where="vm">
+
+```bash
+sudo unshare --net ip -br link
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lo               DOWN           00:00:00:00:00:00 <LOOPBACK>
+```
+
+</Expected>
+
+Không có card mạng nào khác, nên tiến trình trong đó không ra được mạng. D2 nối các namespace này lại bằng cặp card ảo `veth`, đúng cách Docker và Kubernetes làm.
+
+Giờ thử namespace `user`, **không** dùng sudo:
+
+<Terminal where="vm">
+
+```bash
+unshare --user --map-root-user id; echo "exit=$?"
+sysctl kernel.apparmor_restrict_unprivileged_userns
+sudo journalctl -k --since "-1min" --no-pager -o cat | grep -o 'apparmor="DENIED".*capname="sys_admin"' | tail -1
+```
+
+</Terminal>
+
+<Predict question="Trên nhiều distro, lệnh này in uid=0(root). Trên Ubuntu 26.04 thì sao?">
+
+Thất bại: `unshare: write failed /proc/self/uid_map: Operation not permitted`. Ubuntu đặt `kernel.apparmor_restrict_unprivileged_userns=1`: chương trình không có profile AppArmor cho phép vẫn tạo được user namespace, nhưng bị chuyển sang profile `unprivileged_userns`, vốn từ chối mọi capability bên trong, nên bước ghi bảng ánh xạ UID bị chặn. Log kernel ghi lại lần từ chối. User namespace không đặc quyền từng là đường khai thác của nhiều lỗ hổng kernel, nên Ubuntu chỉ mở cho chương trình có profile riêng.
+
+</Predict>
+
+<Expected>
+
+```text
+unshare: write failed /proc/self/uid_map: Operation not permitted
+exit=1
+kernel.apparmor_restrict_unprivileged_userns = 1
+apparmor="DENIED" operation="capable" class="cap" profile="unprivileged_userns" pid=11290 comm="unshare" capability=21  capname="sys_admin"
+```
+
+</Expected>
+
+<Check id="d1.5.lab-namespace">Tạo được namespace `pid`, `uts`, `net` bằng `unshare`, chỉ ra được tiến trình bên trong thấy gì khác bên ngoài, và giải thích được vì sao `unshare --user` bị AppArmor chặn trên Ubuntu.</Check>
+
+### 3. cgroup v2: bóp CPU của một dịch vụ
+
+Chạy đúng loại tải của sự cố 1 ở D1.4 (`stress-ng --cpu`), nhưng lần này trong một unit có `CPUQuota=20%`:
+
+<Terminal where="vm">
+
+```bash
+stat -fc %T /sys/fs/cgroup; cat /sys/fs/cgroup/cgroup.controllers
+sudo systemd-run --quiet --unit=lab-cpu -p CPUQuota=20% stress-ng --cpu 1 --timeout 60s --quiet
+sleep 5
+CG=/sys/fs/cgroup$(systemctl show lab-cpu -p ControlGroup --value); echo $CG
+cat $CG/cpu.max
+grep -E 'nr_periods|nr_throttled|throttled_usec' $CG/cpu.stat
+top -b -n 2 -d 2 | grep -E '^ *[0-9]+ .* R .*stress' | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cgroup2fs
+cpuset cpu io memory hugetlb pids rdma misc dmem
+/sys/fs/cgroup/system.slice/lab-cpu.service
+20000 100000
+nr_periods 50
+nr_throttled 50
+throttled_usec 3906853
+  11304 root      20   0   26808   7788   5120 R  19.9   0.4   0:01.45 stress-+
+```
+
+</Expected>
+
+`cgroup2fs` xác nhận máy dùng cgroup v2. systemd đã dịch `CPUQuota=20%` thành `cpu.max` = `20000 100000`: mỗi chu kỳ 100 mili giây, nhóm được chạy 20 mili giây. `stress-ng` muốn 100% nên bị bóp ở **mọi** chu kỳ (`nr_throttled` bằng `nr_periods`), và đã phải đứng chờ tổng cộng 3,9 giây trong 5 giây đầu. `top` chỉ thấy tiến trình dùng khoảng 20% CPU: nếu không biết có giới hạn, bạn sẽ kết luận máy còn rảnh. Cách nhìn này chính là cách đội Indeed dùng trong callout ở trên: so `nr_throttled` với `nr_periods`.
+
+<Terminal where="vm">
+
+```bash
+sleep 10; head -1 $CG/cpu.pressure
+grep -E 'nr_periods|nr_throttled' $CG/cpu.stat
+sudo systemctl stop lab-cpu
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+some avg10=60.29 avg60=17.86 avg300=4.09 total=13275908
+nr_periods 173
+nr_throttled 173
+```
+
+</Expected>
+
+PSI của riêng cgroup nói điều `top` không nói: khoảng 60% thời gian trong 10 giây gần nhất (con số còn đang leo về phía 80%), tiến trình trong nhóm này muốn chạy mà không được. Sau 17 giây, cả 173 chu kỳ đều bị bóp. Sự cố 2 của D1.4 đã cho thấy mặt bộ nhớ của cgroup: `MemoryMax` ghi xuống `memory.max`, chạm trần là bị kill.
+
+<Check id="d1.5.lab-cgroup">Đặt được giới hạn CPU cho một unit, tìm được thư mục cgroup của nó, và chứng minh được nó bị throttle bằng `cpu.max`, `cpu.stat` và `cpu.pressure`.</Check>
+
+### 4. AppArmor: chặn cả root
+
+Tạo một chương trình nhỏ để giam: một bản sao của `cat` (bản GNU) tên `labcat`. Chưa có profile, root dùng nó đọc được `/etc/shadow`:
+
+<Terminal where="vm">
+
+```bash
+sudo cp /usr/bin/gnucat /usr/local/bin/labcat
+sudo mkdir -p /srv/public && echo "tài liệu công khai" | sudo tee /srv/public/readme.txt >/dev/null
+sudo labcat /etc/shadow | head -1 | cut -d: -f1
+sudo aa-status | head -3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+root
+apparmor module is loaded.
+178 profiles are loaded.
+102 profiles are in enforce mode.
+```
+
+</Expected>
+
+Viết profile: `labcat` chỉ được đọc trong `/srv/public`. Nạp bằng `apparmor_parser -r`:
+
+<Terminal where="vm" title="/etc/apparmor.d/usr.local.bin.labcat">
+
+```bash
+sudo tee /etc/apparmor.d/usr.local.bin.labcat >/dev/null <<'EOF'
+abi <abi/5.0>,
+include <tunables/global>
+
+profile labcat /usr/local/bin/labcat {
+  include <abstractions/base>
+
+  /usr/local/bin/labcat mr,
+  /srv/public/** r,
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.labcat
+sudo aa-status | grep labcat
+labcat /srv/public/readme.txt
+sudo labcat /etc/shadow; echo "exit=$?"
+sudo journalctl -k --since "-1min" --no-pager -o cat | grep -o 'apparmor="DENIED".*profile="labcat".*' | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   labcat
+tài liệu công khai
+labcat: /etc/shadow: Permission denied
+exit=1
+apparmor="DENIED" operation="open" class="file" profile="labcat" name="/etc/shadow" pid=11351 comm="labcat" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+```
+
+</Expected>
+
+Root (`fsuid=0`) bị từ chối đọc `/etc/shadow`. Thông báo lỗi giống hệt lỗi quyền file ở D1.2; chỉ có dòng log kernel cho biết lớp từ chối là AppArmor: profile nào (`labcat`), thao tác gì (`open`), trên file nào, cần quyền gì (`r`). Trong profile, dòng `abi <abi/5.0>` khai profile viết theo bộ tính năng AppArmor 5.0, giống đa số profile có sẵn trong `/etc/apparmor.d` của Ubuntu 26.04; `mr` cho phép ánh xạ vào bộ nhớ và đọc chính file chương trình; `abstractions/base` cho các thư viện chung; mọi thứ không liệt kê đều bị cấm.
+
+Chuyển profile sang chế độ **complain** để xem một chương trình cần những gì mà chưa chặn nó:
+
+<Terminal where="vm">
+
+```bash
+sudo sed -i 's|^profile labcat /usr/local/bin/labcat {|profile labcat /usr/local/bin/labcat flags=(complain) {|' /etc/apparmor.d/usr.local.bin.labcat
+sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.labcat
+sudo labcat /etc/shadow | head -1 | cut -d: -f1
+sudo journalctl -k --since "-1min" --no-pager -o cat | grep -o 'apparmor="ALLOWED".*profile="labcat".*' | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+root
+apparmor="ALLOWED" operation="file_perm" class="file" profile="labcat" name="/etc/shadow" pid=11368 comm="labcat" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+```
+
+</Expected>
+
+Ở chế độ complain, thao tác được cho qua nhưng vẫn ghi log với `apparmor="ALLOWED"`. Quy trình viết profile cho một dịch vụ thật: chạy ở complain, dùng dịch vụ đủ các chức năng, đọc log để bổ sung luật, rồi chuyển về enforce.
+
+<Check id="d1.5.lab-apparmor">Viết và nạp được một profile AppArmor đơn giản, đọc được dòng `apparmor="DENIED"` để biết ai bị chặn làm gì, và chuyển được profile giữa enforce và complain.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- Giá trị inotify ở bước 1 đã là `524288` trước khi bạn đặt: bạn đã làm bài này trước đó và file `90-lab.conf` còn trong `/etc/sysctl.d` hoặc trong initramfs. Làm phần Dọn dẹp, khởi động lại VM (`limactl stop ubuntu && limactl start ubuntu` trên Mac) rồi bắt đầu lại.
+- `Failed to start transient service unit: Unit lab-cpu.service was already loaded`: lần chạy trước chưa dừng. `sudo systemctl stop lab-cpu; sudo systemctl reset-failed lab-cpu`.
+- `cat: /sys/fs/cgroup/cpu.max: No such file or directory`: biến `$CG` rỗng vì unit đã kết thúc (tải chỉ chạy 60 giây). Chạy lại cả khối lệnh của bước 3.
+- `unshare: unshare failed: Operation not permitted` ở lệnh có `sudo`: thiếu `sudo`. Riêng lệnh `unshare --user` cố ý không có sudo và phải thất bại.
+- `apparmor_parser` báo `Could not open 'abi/5.0'` hoặc lỗi cú pháp: xem `ls /etc/apparmor.d/abi/` và dùng một phiên bản có trong đó; kiểm dấu phẩy cuối mỗi dòng luật.
+- `labcat` vẫn đọc được `/etc/shadow` sau khi nạp profile: bạn đang chạy nó qua một đường dẫn khác (profile gắn theo `/usr/local/bin/labcat`), hoặc profile đang ở complain.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới đây gỡ profile AppArmor `labcat`, xoá file chương trình, thư mục `/srv/public` và file sysctl của lab, rồi dựng lại initramfs nếu nó đã chép file sysctl đó (mất khoảng 20 giây). Giá trị inotify trở về mặc định sau lần khởi động lại kế tiếp. Chỉ chạy trong VM lab.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+sudo systemctl stop lab-cpu 2>/dev/null
+sudo apparmor_parser -R /etc/apparmor.d/usr.local.bin.labcat
+sudo rm -f /etc/apparmor.d/usr.local.bin.labcat /usr/local/bin/labcat /etc/sysctl.d/90-lab.conf
+sudo rm -rf /srv/public
+sudo aa-status | grep -c labcat
+if sudo lsinitrd /boot/initrd.img-$(uname -r) | grep -q 'sysctl.d/90-lab.conf'; then sudo dracut --force --regenerate-all; fi
+sudo lsinitrd /boot/initrd.img-$(uname -r) | grep -c 'sysctl.d/90-lab.conf'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+0
+```
+
+</Expected>
+
+Số `0` đầu: không còn profile `labcat`. Số `0` cuối: initramfs không chứa file sysctl của lab. Nếu initramfs chưa từng được dựng lại trong lúc bạn làm bài thì lệnh `if` không làm gì; nếu đã dựng lại (VM vừa tự cài kernel mới), nó chạy `dracut` để gỡ bản sao.
+
+Chặng D1 kết thúc ở đây. Giữ VM `ubuntu` cho D2 và D3; tắt nó bằng `limactl stop ubuntu` trên Mac khi không học.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="memory.max và memory.high khác nhau thế nào, và Kubernetes dùng cái nào?">
+
+`memory.max` là trần cứng: nhóm vượt qua mà kernel không thu hồi kịp thì OOM kill ngay trong nhóm. `memory.high` là trần mềm: vượt qua thì tiến trình trong nhóm bị làm chậm lại và kernel ráo riết thu hồi bộ nhớ của nhóm, nhưng chưa ai bị giết; triệu chứng là dịch vụ chậm dần và PSI `memory` của nhóm tăng, thay vì chết đột ngột. Kubernetes ghi `limits.memory` xuống `memory.max`. Tính năng Memory QoS của Kubernetes dùng thêm `memory.high` và `memory.min` dựa trên request, nhưng vẫn là tính năng phải bật riêng và còn thay đổi giữa các phiên bản; hãy kiểm tài liệu của đúng phiên bản bạn dùng trước khi dựa vào nó. Với systemd, bạn tự đặt được cả hai: `MemoryHigh=` để dịch vụ bị phanh trước, `MemoryMax=` làm chốt chặn cuối.
+
+</Reveal>
+
+<Reveal title="Đặt net.core.somaxconn trên máy chủ rồi mà container vẫn thấy giá trị cũ. Vì sao?">
+
+Không phải mọi sysctl đều thuộc về cả máy. Phần lớn tham số `net.*` thuộc về **network namespace**: mỗi namespace có bản riêng, và namespace mới được tạo với giá trị mặc định của kernel chứ không thừa hưởng giá trị bạn đã chỉnh ở máy chủ. Container và pod có network namespace riêng (bước 2 đã tạo một cái), nên `net.core.somaxconn` hay `net.ipv4.ip_local_port_range` đặt trong `/etc/sysctl.d` của node không tới được bên trong. Muốn đổi cho container phải đặt lúc tạo nó: `docker run --sysctl net.core.somaxconn=4096`, hoặc `securityContext.sysctls` của pod (Kubernetes chỉ cho sẵn một nhóm nhỏ gọi là "safe sysctls", phần còn lại quản trị viên cụm phải bật). Ngược lại, tham số `vm.*`, `fs.*` và phần lớn `kernel.*` là của cả kernel: `vm.max_map_count` cho Elasticsearch phải đặt trên **node**, đặt trong container là vô nghĩa hoặc bị từ chối. Khi một sysctl "không ăn", câu hỏi đầu tiên là nó thuộc về namespace nào.
+
+</Reveal>
+
+<Reveal title="Trên VM kiểm chứng, log kernel có sẵn dòng apparmor=DENIED của profile who. Nên phản ứng thế nào?">
+
+Dòng đó là `apparmor="DENIED" operation="open" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" … requested_mask="r"`: profile có sẵn của lệnh `who` được viết cho bản GNU, còn `who` của uutils (D1.2) cần đọc thêm file bản dịch thông báo mà profile chưa cho phép. Lệnh vẫn chạy, chỉ thiếu phần bản dịch. Cách phản ứng đúng theo thứ tự: đọc xem ai bị chặn làm gì; đánh giá ảnh hưởng (ở đây gần như không); nếu cần sửa thì thêm một dòng cho phép đọc vào file trong `/etc/apparmor.d/local/` rồi nạp lại profile, và báo lỗi cho distro. Cách phản ứng sai là tắt AppArmor cho cả máy vì "nó chặn linh tinh". Ví dụ này cũng cho thấy cái giá của chính sách theo đường dẫn: chương trình đổi cách hiện thực thì profile phải đổi theo.
+
+</Reveal>
+
+<Reveal title="Docker dùng những gì trong bài này khi chạy docker run --memory=512m --cpus=1 nginx?">
+
+Tất cả. Docker (qua containerd và runc) tạo cho tiến trình `nginx` một bộ namespace mới: `pid`, `mnt` (gốc là filesystem của image), `net` (nối ra ngoài bằng cặp `veth`), `uts`, `ipc`, và `cgroup`. Nó nhờ systemd tạo một cgroup rồi ghi `memory.max` = 536870912 và `cpu.max` = `100000 100000`. Nó nạp profile AppArmor `docker-default` cho tiến trình (trên máy họ RHEL là nhãn SELinux `container_t`), cộng một bộ lọc seccomp chặn các system call nguy hiểm, và bỏ bớt capability của root. Không có máy ảo nào: `ps` trên máy chủ thấy `nginx` như mọi tiến trình khác, và mọi công cụ của bài này (`ps -o unit`, `cpu.stat`, `memory.events`, `journalctl -k`) dùng được nguyên với container. D5 mở từng lớp này ra trên một container thật.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một dòng `apparmor="DENIED"`, một file trong thư mục cgroup, hay viết nháp một profile AppArmor từ danh sách đường dẫn dịch vụ cần đọc ghi. AI hay sai ở: đưa đường dẫn cgroup v1 (`/sys/fs/cgroup/memory/memory.limit_in_bytes`, `cpu.cfs_quota_us`), khuyên `setenforce 0`, `aa-teardown` hay `--privileged` để "hết lỗi quyền", đề xuất chỉnh sysctl theo các bài "tối ưu kernel" không kèm số đo, quên rằng trên Ubuntu `unshare --user` bị AppArmor chặn, và viết profile AppArmor cho phép quá rộng (`/** rw,`). Kiểm lại bằng cách đọc file thật trong `/sys/fs/cgroup`, chạy profile ở chế độ complain rồi đọc log, và đo trước sau mỗi thay đổi sysctl.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.4 đo và chẩn đoán từ bên ngoài; bài này giải thích cơ chế bên dưới. D1.2 dạy lớp quyền DAC mà AppArmor đứng sau. D0.1 dùng Docker rootless, vốn dựa vào user namespace và profile `rootlesskit`; D0.2 cần hai tham số inotify của bước 1. D2 nối các network namespace bằng `veth`. D5 ghép namespace, cgroup, AppArmor thành container; SB11.3 đã nhìn cgroup từ phía JVM. K1 đặt request và limit, tức `cpu.max` và `memory.max` của pod; K8 dạy seccomp và AppArmor cho pod.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d1.5.mastery-container-pieces">Giải thích được container cho một người chưa biết bằng ba ý namespace, cgroup, lớp hạn chế hành vi, và minh hoạ từng ý bằng một lệnh đã chạy trong bài.</Check>
+
+<Check id="d1.5.mastery-limits">Đặt được giới hạn CPU cho một dịch vụ systemd, và nhận ra được dịch vụ đang bị throttle từ `cpu.stat` và `cpu.pressure` của cgroup dù `top` báo CPU thấp.</Check>
+
+<Check id="d1.5.mastery-sysctl-mac">Đặt và gỡ được một tham số sysctl cho sạch (kể cả bản sao trong initramfs), và khi gặp `Permission denied` mà quyền file đúng, biết tìm dòng từ chối của AppArmor rồi sửa profile thay vì tắt nó.</Check>
+
+</Mastery>

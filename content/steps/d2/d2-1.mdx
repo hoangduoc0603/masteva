@@ -1,0 +1,1014 @@
+---
+title: TCP/IP, subnet, route và bắt tay TCP
+description: Dựng ba "máy" bằng network namespace trong một VM, cho gói tin đi qua một router, rồi nhìn tận mắt bắt tay TCP, gói RST và ICMP để phân biệt "Connection refused", "timed out" và "No route to host".
+id: d2.1
+step: d2
+prerequisites: [d1.1]
+topics: [d2.mo-hinh-tcp-ip, d2.ip-subnet-route, d2.tcp-udp-bat-tay, d2.curl-dig-ss-tcpdump]
+status: verified
+verified:
+  date: 2026-10-10
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    iproute2: 6.19.0
+    tcpdump: 4.99.6
+    curl: 8.18.0
+    netcat-openbsd: 1.234-1
+    python: 3.14.4
+---
+
+<Goal>
+
+Hiểu một gói tin đi từ máy này sang máy khác như thế nào: qua những tầng nào, chọn đường ra sao, và kết nối TCP được mở rồi đóng bằng những gói nào. Học xong bài này, bạn giải thích được những chuyện hay gặp khi vận hành:
+
+- Vì sao cùng là "không kết nối được", có lúc báo `Connection refused` ngay lập tức, có lúc chờ hết thời gian rồi báo `timed out`, có lúc báo `No route to host`.
+- Vì sao một máy cấu hình sai netmask vẫn nói chuyện được với máy cùng dải nhưng không trả lời được máy ở dải khác.
+- Vì sao `ping` thành công không chứng minh máy đích tồn tại, và vì sao server có hàng nghìn kết nối `TIME-WAIT`.
+
+</Goal>
+
+<Knowledge>
+
+### Mô hình TCP/IP: bốn tầng, mỗi tầng một loại địa chỉ
+
+Mạng được chia thành tầng để mỗi tầng chỉ lo một việc và dùng dịch vụ của tầng dưới. Internet chạy theo **mô hình TCP/IP** bốn tầng. Mô hình **OSI** bảy tầng hay được nhắc trong tài liệu và phỏng vấn ("load balancer L4", "L7"), nên bảng dưới đặt hai mô hình cạnh nhau:
+
+| Tầng TCP/IP | Tương ứng OSI | Đơn vị dữ liệu | Địa chỉ | Ví dụ giao thức | Nằm ở đâu trên Linux |
+|---|---|---|---|---|---|
+| Application | L5–L7 | message | tên miền, URL | HTTP, DNS, SSH, TLS | Chương trình user space: `curl`, Nginx, JVM |
+| Transport | L4 | segment (TCP), datagram (UDP) | **port** | TCP, UDP | Kernel |
+| Internet | L3 | packet | **địa chỉ IP** | IPv4, IPv6, ICMP | Kernel: bảng route, netfilter |
+| Link | L1–L2 | frame | **địa chỉ MAC** | Ethernet, Wi-Fi, ARP | Driver card mạng, bridge, veth |
+
+Khi `curl` gửi một request HTTP, mỗi tầng bọc thêm phần đầu (header) của mình lên dữ liệu của tầng trên. Máy nhận bóc từng lớp theo thứ tự ngược lại. Quá trình này gọi là **encapsulation (đóng gói)**:
+
+```text
+ curl: "GET / HTTP/1.1 ..."                                    tầng Application
+ [TCP: port nguồn 44370 -> port đích 8080, seq, cờ] + dữ liệu  tầng Transport
+ [IP: 10.0.1.10 -> 10.0.2.20, TTL 64] + segment TCP            tầng Internet
+ [Ethernet: MAC nguồn -> MAC của router] + packet IP           tầng Link
+```
+
+Một điều quan trọng nằm ở dòng cuối: **MAC đích là MAC của chặng kế tiếp**, không phải của máy đích cuối cùng. Địa chỉ IP đi suốt hành trình; địa chỉ MAC đổi ở mỗi router. Lệnh `tcpdump -e` trong lab cho bạn thấy cả hai lớp địa chỉ trên cùng một gói.
+
+<Check id="d2.1.tcp-ip-layers">Kể được bốn tầng TCP/IP, địa chỉ của từng tầng (MAC, IP, port) và giải thích được vì sao MAC đích đổi ở mỗi router còn IP đích thì không.</Check>
+
+### Địa chỉ IP, subnet và CIDR
+
+Địa chỉ IPv4 là 32 bit, viết thành bốn số thập phân như `10.0.2.20`. Cách viết **CIDR** `10.0.2.20/24` nói thêm: 24 bit đầu là phần **mạng (network)**, 8 bit còn lại là phần **máy (host)**. Mọi địa chỉ có cùng 24 bit đầu thuộc cùng một **subnet** `10.0.2.0/24`. Netmask `255.255.255.0` là cách viết cũ của cùng con số `/24`.
+
+| Tiền tố | Netmask | Số địa chỉ | Thường dùng cho |
+|---|---|---|---|
+| `/32` | 255.255.255.255 | 1 | Một máy duy nhất trong rule firewall, route tới một IP |
+| `/24` | 255.255.255.0 | 256 (254 dùng được) | Một mạng LAN, một subnet trên cloud |
+| `/16` | 255.255.0.0 | 65.536 | Một VPC, dải pod của cụm Kubernetes |
+| `/8` | 255.0.0.0 | 16.777.216 | Cả khối `10.0.0.0/8` |
+| `/0` | 0.0.0.0 | toàn bộ | Default route: "mọi đích khác" |
+
+Trong một subnet IPv4, địa chỉ đầu (`10.0.2.0`) là địa chỉ mạng và địa chỉ cuối (`10.0.2.255`) là broadcast, nên `/24` còn 254 địa chỉ cho máy. Một số dải có ý nghĩa riêng, bạn sẽ gặp chúng hằng ngày:
+
+| Dải | Ý nghĩa |
+|---|---|
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | Địa chỉ riêng (RFC 1918): dùng trong mạng nội bộ, không đi thẳng ra Internet được, phải qua NAT (bài D2.4) |
+| `127.0.0.0/8` | Loopback: chính máy này |
+| `169.254.0.0/16` | Link-local: máy tự gán khi không có DHCP; cloud dùng `169.254.169.254` cho metadata service |
+| `100.64.0.0/10` | Shared address space, nhà mạng dùng cho CGNAT |
+| `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` | Dành cho tài liệu (RFC 5737), không thuộc máy nào |
+
+**Netmask quyết định máy gửi thẳng hay gửi qua router.** Trước khi gửi, máy so địa chỉ đích với subnet của chính nó. Cùng subnet: máy hỏi MAC của đích bằng **ARP** ("ai có 10.0.2.21?") rồi gửi thẳng. Khác subnet: máy gửi cho **gateway** (router). Netmask sai làm máy đoán sai: tưởng một máy ở xa là hàng xóm và cứ hỏi ARP mãi không ai trả lời. Bước 6 của lab tái hiện đúng lỗi này.
+
+<Check id="d2.1.cidr">Từ một địa chỉ CIDR như `10.0.2.20/24`, tính được địa chỉ mạng, broadcast, số máy, và nói được hai địa chỉ có cùng subnet hay không.</Check>
+
+### Bảng route, default gateway và longest prefix match
+
+Mỗi máy Linux có một **bảng route (routing table)**: danh sách "đích nào thì đi đường nào". Một dòng route gồm dải đích, chặng kế tiếp (`via`, nếu có) và card mạng (`dev`):
+
+```text
+default via 192.168.5.2 dev eth0           mọi đích khác: gửi cho 192.168.5.2
+10.0.0.0/16 via 10.0.1.1 dev lan0          dải 10.0.x.x: gửi cho router 10.0.1.1
+10.0.1.0/24 dev lan0 scope link            dải 10.0.1.x: gửi thẳng, không qua router
+```
+
+Khi một địa chỉ khớp nhiều dòng, kernel chọn dòng có **tiền tố dài nhất (longest prefix match)**. `10.0.1.1` khớp cả ba dòng trên, nhưng `/24` dài nhất nên gửi thẳng. `10.0.2.20` khớp `/16` và `default` (tức `/0`), nên đi qua router. `8.8.8.8` chỉ khớp `default`. **Default gateway** chính là dòng `default`: chặng kế tiếp cho mọi đích không có dòng cụ thể hơn.
+
+Một **router** là máy chấp nhận chuyển tiếp gói không gửi cho mình. Trên Linux, việc đó bật bằng `net.ipv4.ip_forward=1`; mặc định nó tắt, nên một máy có hai card mạng không tự thành router. Mỗi lần chuyển tiếp, router giảm **TTL** của gói đi 1; TTL về 0 thì gói bị huỷ, để gói lạc đường không chạy vòng mãi. Vì vậy `ping` qua một router thấy `ttl=63` thay vì `ttl=64`.
+
+Đường đi của một gói từ VM tới server trong lab, qua router:
+
+```text
+ VM (10.0.1.10)                 router                         server (10.0.2.20)
+ lan0 ───────────────────── r-lan     r-wan ─────────────────── eth0
+  1. route: 10.0.2.20 khớp 10.0.0.0/16 via 10.0.1.1
+  2. ARP: "ai có 10.0.1.1?" -> MAC của r-lan
+  3. gửi frame tới MAC r-lan, IP đích vẫn 10.0.2.20 ─>
+                                 4. ip_forward=1: không phải gói cho mình, chuyển tiếp
+                                 5. route: 10.0.2.0/24 nối thẳng qua r-wan, TTL 64 -> 63
+                                 6. ARP: "ai có 10.0.2.20?" -> MAC của eth0
+                                 7. gửi frame tới MAC eth0 ──────────────────────>
+                                                                   8. trả lời: route về 10.0.1.10?
+                                                                      default via 10.0.2.1
+ Thiếu bất kỳ mắt xích nào (route đi, ip_forward, route về) là gói rơi mất, không ai báo lỗi.
+```
+
+Route phải đúng **cả hai chiều**. Thiếu route ở chiều về là lỗi rất hay gặp: gói tới được đích, đích không biết đường trả lời, và từ phía người gửi trông y như đích không tồn tại.
+
+<Check id="d2.1.route">Đọc được bảng route, giải thích được longest prefix match và default gateway, và kể được ba điều kiện để một gói đi qua router và quay về.</Check>
+
+### Network namespace: một máy riêng trong vài dòng lệnh
+
+D1.5 đã giới thiệu namespace, cơ chế kernel cô lập "tầm nhìn" của tiến trình, và dừng ở một network namespace chỉ có `lo`. Lab của bài này dựng nhiều "máy" bên trong một VM bằng chính **network namespace (netns)** đó: mỗi netns có card mạng, địa chỉ IP, bảng route, bảng ARP, firewall và danh sách socket riêng. Một cặp **veth** là sợi dây ảo có hai đầu: gói vào đầu này thì ra đầu kia, và hai đầu có thể nằm ở hai netns khác nhau.
+
+Đây không phải mẹo riêng cho lab. Mỗi container Docker và mỗi pod Kubernetes có netns riêng, nối với máy chủ bằng veth. Những gì bạn làm tay ở đây chính là việc Docker (D5.3) và plugin CNI của Kubernetes (K6) làm tự động; K2 học mạng pod, Service và NetworkPolicy dựng trên nền đó.
+
+### TCP và UDP
+
+Tầng transport có hai giao thức chính. Cả hai dùng **port** (0–65535) để biết gói thuộc chương trình nào trên máy.
+
+| | TCP | UDP |
+|---|---|---|
+| Kết nối | Bắt tay trước khi gửi dữ liệu | Không: gửi ngay từng datagram |
+| Đảm bảo | Đúng thứ tự, không mất, không trùng (tự gửi lại) | Không đảm bảo gì, mất là mất |
+| Kiểm soát tốc độ | Flow control và congestion control | Không có, chương trình tự lo |
+| Gửi tới port đóng | Đích trả gói `RST`: `Connection refused` | Đích trả ICMP "port unreachable" |
+| Dùng cho | HTTP/1.1, HTTP/2, SSH, PostgreSQL, Kafka | DNS, NTP, syslog, VoIP, QUIC (HTTP/3) |
+
+**Bắt tay ba bước (three-way handshake).** TCP phải thống nhất số thứ tự (sequence number) ban đầu của hai bên trước khi gửi dữ liệu. Mỗi byte gửi đi được đánh số; bên nhận báo đã nhận tới đâu bằng `ack`.
+
+```text
+ client                                            server (LISTEN)
+   │ ── SYN, seq=x ─────────────────────────────────> │   "tôi muốn mở kết nối, số của tôi bắt đầu từ x"
+   │ <──────────────────────── SYN-ACK, seq=y, ack=x+1 │   "đồng ý, số của tôi từ y, đã nhận tới x"
+   │ ── ACK, ack=y+1 ──────────────────────────────> │   ESTABLISHED ở cả hai bên
+   │ ── dữ liệu (GET / ...) ─────────────────────────> │
+   │ <────────────────────────────── dữ liệu (200 OK)  │
+   │ <──────────────────────────────────────── FIN    │   server đóng trước: "tôi gửi xong"
+   │ ── ACK, FIN ───────────────────────────────────> │   client cũng đóng
+   │ <──────────────────────────────────────── ACK    │
+   │ CLOSED                                   TIME-WAIT │   bên đóng trước chờ 60 giây
+```
+
+Một lần bắt tay tốn một vòng đi về (RTT) trước khi gửi được byte dữ liệu đầu tiên; thêm TLS (bài D2.3) là thêm ít nhất một vòng nữa. Đó là lý do HTTP keep-alive và connection pool tồn tại: mở kết nối một lần, dùng nhiều lần.
+
+**Đóng kết nối và TIME-WAIT.** Mỗi chiều đóng riêng bằng một `FIN`. Bên **gửi `FIN` trước** (active close) phải ở trạng thái `TIME-WAIT` một thời gian (trên Linux cố định 60 giây) để gói trễ của kết nối cũ không lẫn vào kết nối mới dùng lại đúng bộ bốn (IP nguồn, port nguồn, IP đích, port đích). `TIME-WAIT` là bình thường, không phải lỗi. Nó chỉ thành vấn đề khi một máy mở rất nhiều kết nối ngắn tới **cùng một đích**: mỗi kết nối chiếm một port nguồn trong 60 giây, và dải port nguồn của Linux mặc định chỉ có 28.232 port (`32768–60999`).
+
+<Callout kind="production">
+
+Cạn port nguồn là sự cố có thật ở quy mô lớn. Bài của Cloudflare, [How to stop running out of ephemeral ports and start to love long-lived connections](https://blog.cloudflare.com/how-to-stop-running-out-of-ephemeral-ports-and-start-to-love-long-lived-connections/) (2022), mô tả cơ chế: mỗi kết nối ra ngoài chiếm một port trong dải port nguồn, khi không còn port phù hợp thì `connect()` trả lỗi `EADDRNOTAVAIL`, và họ viết một hàm `connectx()` để chọn port nguồn khéo hơn cho hàng loạt kết nối sống lâu.
+
+Phần sau đây là suy ra của bài này, không nằm trong bài của Cloudflare. Kịch bản quen thuộc hơn với service Java: mỗi lời gọi HTTP sang service khác tạo client mới, không dùng lại kết nối. Ở 500 request mỗi giây tới cùng một đích, 60 giây `TIME-WAIT` giữ khoảng 30.000 port, vượt dải mặc định; lời gọi mới lỗi `Cannot assign requested address` (chính là `EADDRNOTAVAIL`) dù CPU và RAM còn thừa. Cách sửa đúng là dùng lại kết nối (keep-alive, connection pool), không phải chỉnh `tcp_tw_reuse` hay tăng dải port cho qua chuyện. `ss -s` cho bạn đếm nhanh số `timewait`.
+
+</Callout>
+
+<Check id="d2.1.tcp-handshake">Vẽ lại được bắt tay ba bước và chuỗi đóng kết nối, nói được bên nào giữ `TIME-WAIT` và vì sao nhiều `TIME-WAIT` có thể làm cạn port nguồn.</Check>
+
+### Ba kiểu "không kết nối được"
+
+Khi một kết nối TCP thất bại, thông báo lỗi cho biết gói đã đi tới đâu. Phân biệt được ba kiểu này rút ngắn rất nhiều thời gian chẩn đoán:
+
+| Thông báo | Chuyện gì xảy ra | Thời gian | Thường do |
+|---|---|---|---|
+| `Connection refused` | Gói tới được máy đích, nhưng không có chương trình nào nghe ở port đó; kernel đích trả `RST` | Ngay lập tức | Service chưa chạy, nghe sai port, chỉ nghe ở `127.0.0.1`, hoặc firewall `reject` kiểu mặc định |
+| `No route to host` | Một router (hoặc chính máy gửi) trả ICMP "unreachable" | Ngay, hoặc khoảng 3 giây khi router hỏi ARP mà máy đích không trả lời | Route bị chặn có chủ đích, máy đích tắt hoặc sai IP trong cùng subnet, firewall `reject` kiểu `host-unreachable` hoặc `admin-prohibited` |
+| `timed out` | Gói rơi mất, không ai trả lời gì | Hết thời gian chờ của chương trình, hoặc khoảng 2 phút khi kernel thôi gửi lại SYN | Firewall chọn `drop`, thiếu route chiều về, security group trên cloud |
+
+Bài D2.4 dựng firewall và cho bạn thấy từng kiểu `drop`, `reject` rơi vào dòng nào của bảng. `ping` dùng ICMP, không dùng TCP. Ping được chỉ chứng minh tầng IP thông; port có mở hay không phải kiểm bằng công cụ TCP như `nc -zv` hay `curl`.
+
+<Check id="d2.1.failure-modes">Nhìn thông báo `Connection refused`, `No route to host` hay `timed out` là nói được gói đã đi tới đâu và nên kiểm tra gì tiếp theo.</Check>
+
+### Bộ công cụ: ip, ss, tcpdump, curl, dig
+
+| Công cụ | Trả lời câu hỏi | Lệnh hay dùng |
+|---|---|---|
+| `ip` (iproute2) | Máy có địa chỉ gì, route thế nào, hàng xóm là ai | `ip -br addr`, `ip route`, `ip route get <IP>`, `ip neigh` |
+| `ss` | Chương trình nào đang nghe port nào, kết nối nào đang mở | `ss -tlnp`, `ss -tan state time-wait`, `ss -s` |
+| `tcpdump` | Gói nào thật sự đi qua card mạng | `tcpdump -ni <card> 'tcp port 8080'`, thêm `-e` để xem MAC |
+| `nc` (netcat) | Port có mở không, gửi thử TCP/UDP | `nc -zv -w5 <IP> <port>`, `nc -u` |
+| `curl` | Request HTTP từ đầu tới cuối trả gì | `curl -v`, `curl -w '%{time_connect}'` |
+| `dig` | Tên miền phân giải ra gì | Học kỹ ở bài D2.2 |
+
+`ip` và `ss` thay cho `ifconfig`, `route`, `netstat` của gói net-tools cũ; Ubuntu 26.04 không cài sẵn net-tools. Thứ tự chẩn đoán hay dùng: `ip route get` (máy định gửi đi đâu), `ss` (phía server có nghe không), `tcpdump` (gói có thật sự đi và về không).
+
+<Check id="d2.1.tools">Chọn đúng công cụ cho từng câu hỏi: route (`ip route get`), port đang nghe (`ss -tlnp`), gói thật trên dây (`tcpdump`), port có mở từ xa (`nc -zv`).</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [ip-route(8)](https://man7.org/linux/man-pages/man8/ip-route.8.html): đọc phần mô tả các loại route (`unicast`, `unreachable`, `blackhole`, `prohibit`) và lệnh `ip route get`.
+- [ip-netns(8)](https://man7.org/linux/man-pages/man8/ip-netns.8.html): network namespace là gì và `ip netns exec` hoạt động thế nào.
+- [RFC 9293: Transmission Control Protocol (TCP)](https://www.rfc-editor.org/rfc/rfc9293): mục 3.3.2 "State Machine Overview" và 3.5 "Establishing a Connection" là bản chuẩn của sơ đồ bắt tay và các trạng thái.
+- [ss(8)](https://man7.org/linux/man-pages/man8/ss.8.html): cú pháp lọc theo trạng thái (`state time-wait`) và theo địa chỉ (`dst`, `sport`).
+- [tcpdump(1)](https://www.tcpdump.org/manpages/tcpdump.1.html): phần "Output format" giải thích các cờ `[S]`, `[S.]`, `[P.]`, `[F.]`, `[R.]`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM Lima Ubuntu 26.04 từ D0.1. Mọi lệnh của lab chạy trong VM; bài mẫu dùng một VM riêng tên `d2-lab` để không đụng VM đang dùng cho bài khác, bạn dùng VM `ubuntu` của D0.1 cũng được. Lab chỉ tạo vài card mạng ảo và một server Python, tốn dưới 100 MB RAM, nên máy 8 GB chạy thoải mái với VM 2 CPU, 2 GiB. Nếu muốn VM riêng như bài mẫu:
+
+<Terminal where="mac" title="Tạo VM riêng cho chặng D2 (tuỳ chọn)">
+
+```bash
+limactl start --name d2-lab --cpus 2 --memory 2 --tty=false template:ubuntu
+limactl shell d2-lab
+```
+
+</Terminal>
+
+Bạn sẽ dựng mạng này, trong đó chính VM đóng vai laptop của bạn:
+
+```text
+ VM (main namespace, "laptop")      netns router                   netns server
+ lan0  10.0.1.10/24 ─── veth ─── r-lan 10.0.1.1/24
+                                  r-wan 10.0.2.1/24 ─── veth ─── eth0 10.0.2.20/24
+ eth0  192.168.5.15 -> Internet qua Lima
+```
+
+Các công cụ của bài có sẵn trong image Ubuntu của Lima; chạy lệnh dưới để chắc chắn (gói đã có thì `apt` bỏ qua):
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y iproute2 tcpdump netcat-openbsd curl time python3
+```
+
+</Terminal>
+
+Lệnh `ip` với namespace khác (`ip -n router ...`) và `tcpdump` cần quyền root, nên có `sudo`; D1.2 đã nói về sudo-rs trên Ubuntu 26.04, mọi lệnh `sudo` trong bài chạy như với bản cũ.
+
+### 1. Mạng hiện có của VM
+
+<Terminal where="vm">
+
+```bash
+ip -br addr
+ip route
+ip route get 1.1.1.1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+eth0             UP             192.168.5.15/24 metric 200 fe80::5055:55ff:fede:2808/64
+default via 192.168.5.2 dev eth0 proto dhcp src 192.168.5.15 metric 200
+192.168.5.0/24 dev eth0 proto kernel scope link src 192.168.5.15 metric 200
+192.168.5.2 dev eth0 proto dhcp scope link src 192.168.5.15 metric 200
+1.1.1.1 via 192.168.5.2 dev eth0 src 192.168.5.15 uid 501
+    cache
+```
+
+</Expected>
+
+VM có một card `eth0` trong subnet `192.168.5.0/24` và default gateway `192.168.5.2`, do Lima cấp qua DHCP. `ip route get` không gửi gói nào, chỉ hỏi kernel "nếu gửi tới đây thì đi đường nào". Đây là lệnh đầu tiên nên chạy khi nghi ngờ vấn đề mạng. `uid 501` là user của bạn, máy khác có thể khác.
+
+### 2. Tạo hai "máy": router và server
+
+<Terminal where="vm">
+
+```bash
+mkdir -p ~/masteva-d2 && cd ~/masteva-d2
+sudo ip netns add router
+sudo ip netns add server
+ip netns list
+sudo ip -n server -br addr
+sudo ip netns exec server ping -c1 -W1 127.0.0.1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+server
+router
+lo               DOWN
+ping: connect: Network is unreachable
+```
+
+</Expected>
+
+Namespace mới chỉ có `lo` và nó còn tắt: một máy chưa cắm dây, chưa bật cả loopback. `ip -n server <lệnh>` là cách viết tắt của `ip netns exec server ip <lệnh>`.
+
+### 3. Nối dây và gán địa chỉ
+
+<Terminal where="vm">
+
+```bash
+# Dây 1: VM <-> router. Tạo cặp veth, đẩy một đầu vào netns router
+sudo ip link add lan0 type veth peer name r-lan netns router
+# Dây 2: router <-> server
+sudo ip -n router link add r-wan type veth peer name eth0 netns server
+
+sudo ip addr add 10.0.1.10/24 dev lan0 && sudo ip link set lan0 up
+sudo ip -n router addr add 10.0.1.1/24 dev r-lan
+sudo ip -n router addr add 10.0.2.1/24 dev r-wan
+for i in lo r-lan r-wan; do sudo ip -n router link set "$i" up; done
+sudo ip -n server addr add 10.0.2.20/24 dev eth0
+for i in lo eth0; do sudo ip -n server link set "$i" up; done
+
+sudo ip -n router -br addr
+sudo ip -n server route
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+r-lan@if4        UP             10.0.1.1/24 fe80::90c7:27ff:fed2:ff64/64
+r-wan@if2        UP             10.0.2.1/24 fe80::4432:f4ff:fe32:a441/64
+10.0.2.0/24 dev eth0 proto kernel scope link src 10.0.2.20
+```
+
+</Expected>
+
+Gán địa chỉ `10.0.2.20/24` cho `eth0` tự sinh ra một route "nối thẳng" (`proto kernel scope link`) cho cả subnet `10.0.2.0/24`. `@if4` là số thứ tự (ifindex) của đầu veth bên kia, có thể khác trên máy bạn. Địa chỉ IPv6 `fe80::` và địa chỉ MAC sẽ khác trên máy bạn vì được sinh ngẫu nhiên.
+
+### 4. Ping qua router: từng mắt xích một
+
+Ping router trước, chắc chắn thành công vì cùng subnet `10.0.1.0/24`:
+
+<Terminal where="vm">
+
+```bash
+ping -c2 10.0.1.1
+```
+
+</Terminal>
+
+Giờ ping server, khi VM **chưa có route** nào tới `10.0.2.0/24`:
+
+<Terminal where="vm">
+
+```bash
+ping -c2 -W1 10.0.2.20
+ip route get 10.0.2.20
+```
+
+</Terminal>
+
+<Predict question="VM chưa biết đường tới 10.0.2.0/24. Ping có thành công không?">
+
+Có, và đó chính là cái bẫy:
+
+```text
+64 bytes from 10.0.2.20: icmp_seq=1 ttl=64 time=7.12 ms
+64 bytes from 10.0.2.20: icmp_seq=2 ttl=64 time=4.32 ms
+10.0.2.20 via 192.168.5.2 dev eth0 src 192.168.5.15 uid 501
+```
+
+`ip route get` cho thấy gói đi theo default route ra `eth0`, tới mạng ảo của Lima, hoàn toàn không qua router của bạn. Mạng user-mode mà Lima giả lập tự trả lời ping cho mọi địa chỉ đích: bài mẫu đã thử với `203.0.113.5`, một địa chỉ dành cho tài liệu không thuộc máy nào, và vẫn nhận được trả lời. Thử `curl -m3 http://10.0.2.20/` sẽ thấy timeout. Bài học: ping thành công chưa chứng minh gì, hãy xem `ip route get` trước.
+
+</Predict>
+
+Thêm route cho VM: dải `10.0.2.0/24` đi qua router.
+
+<Terminal where="vm">
+
+```bash
+sudo ip route add 10.0.2.0/24 via 10.0.1.1
+ip route get 10.0.2.20
+ping -c2 -W1 10.0.2.20
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10.0.2.20 via 10.0.1.1 dev lan0 src 10.0.1.10 uid 501
+    cache
+2 packets transmitted, 0 received, 100% packet loss, time 1053ms
+```
+
+</Expected>
+
+Gói đã đi đúng đường nhưng không có trả lời. Mở **terminal thứ hai** (chạy `limactl shell <tên VM>` lần nữa) và xem gói ở router, trên mọi card (`-i any`), chỉ lấy ICMP:
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec router tcpdump -ni any icmp
+```
+
+</Terminal>
+
+Ở terminal 1, ping lại:
+
+<Terminal where="vm">
+
+```bash
+ping -c2 -W1 10.0.2.20 | tail -2 | head -1
+```
+
+</Terminal>
+
+Terminal 2 hiện:
+
+<Expected>
+
+```text
+17:39:49.596728 r-lan In  IP 10.0.1.10 > 10.0.2.20: ICMP echo request, id 21216, seq 1, length 64
+17:39:50.639392 r-lan In  IP 10.0.1.10 > 10.0.2.20: ICMP echo request, id 21216, seq 2, length 64
+```
+
+</Expected>
+
+Gói vào `r-lan` nhưng không ra `r-wan`: router không chuyển tiếp vì `ip_forward` đang tắt. Mỗi namespace có `sysctl` mạng riêng, và trong namespace mới nó mặc định là `0`.
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec router sysctl net.ipv4.ip_forward
+sudo ip netns exec router sysctl -w net.ipv4.ip_forward=1
+ping -c2 -W1 10.0.2.20
+```
+
+</Terminal>
+
+Ping vẫn mất 100%. Terminal 2 giờ có thêm dòng `r-wan Out`:
+
+<Expected>
+
+```text
+17:39:57.305649 r-lan In  IP 10.0.1.10 > 10.0.2.20: ICMP echo request, id 21217, seq 1, length 64
+17:39:57.308392 r-wan Out IP 10.0.1.10 > 10.0.2.20: ICMP echo request, id 21217, seq 1, length 64
+```
+
+</Expected>
+
+Gói đã tới server. Server có trả lời không? Hỏi bảng route của server:
+
+<Terminal where="vm">
+
+```bash
+sudo ip -n server route get 10.0.1.10
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+RTNETLINK answers: Network is unreachable
+```
+
+</Expected>
+
+Server chỉ biết subnet của chính nó, không biết đường về `10.0.1.10`. Thêm default gateway cho server:
+
+<Terminal where="vm">
+
+```bash
+sudo ip -n server route add default via 10.0.2.1
+ping -c2 10.0.2.20
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+64 bytes from 10.0.2.20: icmp_seq=1 ttl=63 time=0.642 ms
+64 bytes from 10.0.2.20: icmp_seq=2 ttl=63 time=0.362 ms
+```
+
+</Expected>
+
+`ttl=63`: server gửi với TTL 64, router giảm đi 1. So với `ttl=64` của bước trước, đây là bằng chứng gói thật sự đi qua router của bạn. Dừng tcpdump ở terminal 2 bằng Ctrl+C.
+
+<Check id="d2.1.lab-route">Tự đưa được ping qua router bằng cách sửa lần lượt route chiều đi, `ip_forward` và route chiều về, dùng `tcpdump` để biết gói dừng ở đâu.</Check>
+
+### 5. Bảng ARP
+
+<Terminal where="vm">
+
+```bash
+ip neigh show dev lan0
+sudo ip -n router neigh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10.0.1.1 lladdr 92:c7:27:d2:ff:64 REACHABLE
+10.0.2.20 dev r-wan lladdr 3a:e8:7b:a9:21:b2 REACHABLE
+10.0.1.10 dev r-lan lladdr ee:a1:38:27:ee:1b REACHABLE
+```
+
+</Expected>
+
+Địa chỉ MAC trên máy bạn sẽ khác, vì veth nhận MAC ngẫu nhiên mỗi lần tạo; cột trạng thái có thể là `REACHABLE`, `STALE` hay `DELAY` tuỳ lúc xem. VM chỉ biết MAC của router, không biết MAC của server: mọi gói tới server đều gửi tới MAC của router. Router biết MAC của cả hai bên vì nó nối thẳng với cả hai.
+
+### 6. Netmask sai
+
+Đổi netmask của server thành `/16`, như khi ai đó gõ nhầm trong file cấu hình mạng:
+
+<Terminal where="vm">
+
+```bash
+sudo ip -n server addr flush dev eth0
+sudo ip -n server addr add 10.0.2.20/16 dev eth0
+sudo ip -n server route add default via 10.0.2.1
+sudo ip -n server route get 10.0.1.10
+```
+
+</Terminal>
+
+<Predict question="Server giờ tin dải 10.0.0.0/16 nằm ngay trên dây eth0. Ping từ VM tới server sẽ ra sao, và tcpdump trên eth0 của server thấy gì?">
+
+Ping mất 100%. Server nhận được echo request, nhưng vì `10.0.1.10` nằm trong `10.0.0.0/16`, nó tin VM là hàng xóm và hỏi ARP thẳng trên dây thay vì gửi cho gateway. Không ai trả lời, nên reply không bao giờ được gửi.
+
+```text
+10.0.1.10 dev eth0 src 10.0.2.20 uid 0
+IP 10.0.1.10 > 10.0.2.20: ICMP echo request, id 21219, seq 1, length 64
+ARP, Request who-has 10.0.1.10 tell 10.0.2.20, length 28
+ARP, Request who-has 10.0.1.10 tell 10.0.2.20, length 28
+```
+
+`ip -n server neigh` sau đó có dòng `10.0.1.10 dev eth0 INCOMPLETE` (đang hỏi), vài giây sau thành `FAILED` (bỏ cuộc).
+
+</Predict>
+
+Kiểm chứng bằng tcpdump trên server (terminal 2) rồi ping (terminal 1):
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec server tcpdump -ni eth0
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+ping -c2 -W1 10.0.2.20
+sudo ip -n server neigh
+```
+
+</Terminal>
+
+Trả netmask về đúng rồi dừng tcpdump:
+
+<Terminal where="vm">
+
+```bash
+sudo ip -n server addr flush dev eth0
+sudo ip -n server addr add 10.0.2.20/24 dev eth0
+sudo ip -n server route add default via 10.0.2.1
+ping -c1 10.0.2.20
+```
+
+</Terminal>
+
+Python có sẵn module `ipaddress` để tính subnet thay vì nhẩm:
+
+<Terminal where="vm">
+
+```bash
+python3 -c 'import ipaddress as i; n=i.ip_network("10.0.2.0/24"); print(n.netmask, n.num_addresses, n[1], n[-2], n.broadcast_address); print(i.ip_address("10.0.1.10") in i.ip_network("10.0.0.0/16"))'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+255.255.255.0 256 10.0.2.1 10.0.2.254 10.0.2.255
+True
+```
+
+</Expected>
+
+<Check id="d2.1.lab-netmask">Tái hiện được lỗi netmask sai và giải thích từ output tcpdump vì sao server không trả lời.</Check>
+
+### 7. Longest prefix match
+
+Thay route `/24` của VM bằng một route rộng hơn cho cả `10.0.0.0/16`, rồi hỏi kernel về vài địa chỉ:
+
+<Terminal where="vm">
+
+```bash
+sudo ip route add 10.0.0.0/16 via 10.0.1.1
+sudo ip route del 10.0.2.0/24 via 10.0.1.1
+ip route | grep -E '^(default|10\.)'
+for ip in 10.0.1.1 10.0.2.20 10.0.3.5 10.1.0.5; do ip route get "$ip" | head -1; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+default via 192.168.5.2 dev eth0 proto dhcp src 192.168.5.15 metric 200
+10.0.0.0/16 via 10.0.1.1 dev lan0
+10.0.1.0/24 dev lan0 proto kernel scope link src 10.0.1.10
+10.0.1.1 dev lan0 src 10.0.1.10 uid 501
+10.0.2.20 via 10.0.1.1 dev lan0 src 10.0.1.10 uid 501
+10.0.3.5 via 10.0.1.1 dev lan0 src 10.0.1.10 uid 501
+10.1.0.5 via 192.168.5.2 dev eth0 src 192.168.5.15 uid 501
+```
+
+</Expected>
+
+`10.0.1.1` khớp cả `/16` lẫn `/24`, và `/24` thắng nên gửi thẳng. `10.1.0.5` nằm ngoài `10.0.0.0/16`, chỉ khớp `default`.
+
+<Check id="d2.1.lab-lpm">Đoán đúng đường đi của một địa chỉ trước khi chạy `ip route get`, dựa trên longest prefix match.</Check>
+
+### 8. Bắt tay TCP dưới tcpdump
+
+Chạy một web server trong netns server. Server của Python dùng HTTP/1.0, đóng kết nối ngay sau khi trả lời, vừa đủ để thấy cả vòng đời một kết nối:
+
+<Terminal where="vm">
+
+```bash
+mkdir -p ~/masteva-d2/www && echo "xin chao tu server" > ~/masteva-d2/www/index.html
+sudo ip netns exec server python3 -m http.server 8080 --bind 10.0.2.20 \
+  --directory ~/masteva-d2/www > ~/masteva-d2/http.log 2>&1 &
+sleep 1; sudo ip netns exec server ss -tlnp
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      5          10.0.2.20:8080      0.0.0.0:*    users:(("python3",pid=17659,fd=3))
+```
+
+</Expected>
+
+`ss -tlnp`: `t` TCP, `l` chỉ socket đang nghe, `n` không đổi số port thành tên, `p` hiện tiến trình (cần `sudo` để thấy tiến trình của user khác). PID trên máy bạn sẽ khác.
+
+Terminal 2 bắt gói trên dây giữa router và server:
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec router tcpdump -ni r-wan 'tcp port 8080'
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+curl -s http://10.0.2.20:8080/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+IP 10.0.1.10.58166 > 10.0.2.20.8080: Flags [S], seq 346988387, win 64240, options [mss 1460,sackOK,TS val 1759070767 ecr 0,nop,wscale 8], length 0
+IP 10.0.2.20.8080 > 10.0.1.10.58166: Flags [S.], seq 3930245623, ack 346988388, win 65160, options [mss 1460,...], length 0
+IP 10.0.1.10.58166 > 10.0.2.20.8080: Flags [.], ack 1, win 251, length 0
+IP 10.0.1.10.58166 > 10.0.2.20.8080: Flags [P.], seq 1:79, ack 1, win 251, length 78: HTTP: GET / HTTP/1.1
+IP 10.0.2.20.8080 > 10.0.1.10.58166: Flags [.], ack 79, win 255, length 0
+IP 10.0.2.20.8080 > 10.0.1.10.58166: Flags [P.], seq 1:186, ack 79, win 255, length 185: HTTP: HTTP/1.0 200 OK
+IP 10.0.1.10.58166 > 10.0.2.20.8080: Flags [.], ack 186, win 251, length 0
+IP 10.0.2.20.8080 > 10.0.1.10.58166: Flags [P.], seq 186:205, ack 79, win 255, length 19: HTTP
+IP 10.0.1.10.58166 > 10.0.2.20.8080: Flags [.], ack 205, win 251, length 0
+IP 10.0.2.20.8080 > 10.0.1.10.58166: Flags [F.], seq 205, ack 79, win 255, length 0
+IP 10.0.1.10.58166 > 10.0.2.20.8080: Flags [F.], seq 79, ack 206, win 251, length 0
+IP 10.0.2.20.8080 > 10.0.1.10.58166: Flags [.], ack 80, win 255, length 0
+```
+
+</Expected>
+
+Đọc từng dòng, đã bỏ phần giờ và rút gọn options:
+
+- `[S]`, `[S.]`, `[.]`: bắt tay ba bước. Dấu `.` là cờ ACK. Sau gói SYN, tcpdump in số thứ tự tương đối (`ack 1`, `seq 1:79`) cho dễ đọc. Port nguồn `58166` do kernel chọn ngẫu nhiên trong dải port nguồn.
+- `[P.] seq 1:79 ... GET / HTTP/1.1`: 78 byte request. Server báo `ack 79`: đã nhận tới byte 78, chờ byte 79.
+- Header (185 byte) và thân (19 byte, chính là `xin chao tu server` cùng ký tự xuống dòng) đi thành hai gói.
+- `[F.]` từ server trước: server đóng trước, nên **server** giữ `TIME-WAIT`.
+- `mss 1460` là kích thước dữ liệu tối đa mỗi segment: MTU 1500 của Ethernet trừ 20 byte header IP và 20 byte header TCP.
+
+Thêm `-e` để thấy cả lớp Ethernet của gói đầu tiên trên dây giữa VM và router:
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec router tcpdump -eni r-lan -c1 'tcp port 8080'
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+curl -s -o /dev/null http://10.0.2.20:8080/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ee:a1:38:27:ee:1b > 92:c7:27:d2:ff:64, ethertype IPv4 (0x0800), length 74: 10.0.1.10.54236 > 10.0.2.20.8080: Flags [S], seq 4073863422, ...
+```
+
+</Expected>
+
+`-c1` làm tcpdump tự thoát sau gói đầu tiên. Đủ ba tầng trên một dòng: MAC (link), IP (internet), port và cờ TCP (transport). MAC đích `92:c7:27:d2:ff:64` là MAC của `r-lan` (đúng dòng `10.0.1.1` trong bảng ARP ở bước 5), không phải của server.
+
+Giờ xem `TIME-WAIT` ở hai phía:
+
+<Terminal where="vm">
+
+```bash
+for i in 1 2 3 4 5 6; do curl -s -o /dev/null http://10.0.2.20:8080/; done
+echo server=$(sudo ip netns exec server ss -Htan state time-wait | wc -l) vm=$(ss -Htan state time-wait dst 10.0.2.20 | wc -l)
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+server=5 vm=1
+```
+
+</Expected>
+
+Phần lớn `TIME-WAIT` nằm ở server, bên đóng trước. Con số phụ thuộc thời điểm: khi `curl` cũng gửi `FIN` gần như cùng lúc với server (simultaneous close), cả hai bên cùng vào `TIME-WAIT`, nên bạn có thể thấy `server=6 vm=0` hoặc `server=5 vm=1`. Các `curl` ở trên chưa quá 60 giây cũng được đếm thêm; muốn số sạch thì chờ hơn một phút rồi chạy lại. Dừng tcpdump ở terminal 2.
+
+<Check id="d2.1.lab-handshake">Bắt được bắt tay ba bước và chuỗi `FIN` bằng tcpdump, chỉ ra được gói nào là SYN, SYN-ACK, dữ liệu, và bên nào đóng trước.</Check>
+
+### 9. Refused, unreachable, timeout
+
+Tạo hai dải "có vấn đề" trên router: `10.0.3.0/24` bị vứt bỏ im lặng (`blackhole`), `10.0.4.0/24` bị từ chối có thông báo (`unreachable`). Route `10.0.0.0/16` ở bước 7 đã đưa cả hai dải này tới router.
+
+<Terminal where="vm">
+
+```bash
+sudo ip -n router route add blackhole 10.0.3.0/24
+sudo ip -n router route add unreachable 10.0.4.0/24
+```
+
+</Terminal>
+
+Thử bốn đích: port đóng trên server, dải `unreachable`, một địa chỉ cùng subnet với server nhưng không có máy nào (`10.0.2.99`), và dải `blackhole`. `/usr/bin/time` in thêm thời gian mỗi lần thử.
+
+<Terminal where="vm">
+
+```bash
+for t in 10.0.2.20:9999 10.0.4.5:8080 10.0.2.99:8080 10.0.3.5:8080; do
+  /usr/bin/time -f "  %es" nc -zv -w5 "${t%:*}" "${t#*:}"
+done
+```
+
+</Terminal>
+
+<Predict question="Mỗi đích trong bốn đích trên báo lỗi gì, và sau bao lâu?">
+
+```text
+nc: connect to 10.0.2.20 port 9999 (tcp) failed: Connection refused
+Command exited with non-zero status 1
+  0.00s
+nc: connect to 10.0.4.5 port 8080 (tcp) failed: No route to host
+Command exited with non-zero status 1
+  0.00s
+nc: connect to 10.0.2.99 port 8080 (tcp) failed: No route to host
+Command exited with non-zero status 1
+  3.07s
+nc: connect to 10.0.3.5 port 8080 (tcp) timed out: Operation now in progress
+Command exited with non-zero status 1
+  5.01s
+```
+
+- Port đóng: kernel của server trả `RST` ngay.
+- Route `unreachable`: router trả ICMP ngay.
+- Máy không tồn tại trong subnet: router hỏi ARP 3 lần, mỗi lần một giây, không ai trả lời, rồi mới trả ICMP "host unreachable". Đó là 3 giây đặc trưng.
+- Blackhole: không ai trả lời gì, `nc` chờ hết 5 giây của `-w5`. Không có `-w`, kernel gửi lại SYN 6 lần (`net.ipv4.tcp_syn_retries = 6`) và bỏ cuộc sau khoảng 2 phút.
+
+Dòng `Command exited with non-zero status 1` do `/usr/bin/time` in ra: `nc` thoát mã 1 ở cả bốn trường hợp, nên script chỉ dựa vào exit code thì không phân biệt được ba kiểu lỗi.
+
+</Predict>
+
+Lệnh `${t%:*}` lấy phần trước dấu `:`, `${t#*:}` lấy phần sau; bài D3.1 giải thích cú pháp này. Nhìn gói `RST` và ICMP trên dây (terminal 2), rồi thử port đóng và một gói UDP tới port đóng ở terminal 1:
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec router tcpdump -ni r-wan 'port 9999 or port 9001 or icmp'
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+nc -z -w2 10.0.2.20 9999
+echo "hello udp" | nc -u -w1 10.0.2.20 9001
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+IP 10.0.1.10.52398 > 10.0.2.20.9999: Flags [S], seq 3092211003, win 64240, ...
+IP 10.0.2.20.9999 > 10.0.1.10.52398: Flags [R.], seq 0, ack 3092211004, win 0, length 0
+IP 10.0.1.10.47821 > 10.0.2.20.9001: UDP, length 10
+IP 10.0.2.20 > 10.0.1.10: ICMP 10.0.2.20 udp port 9001 unreachable, length 46
+```
+
+</Expected>
+
+Port TCP đóng trả `[R.]` (RST). Port UDP đóng trả ICMP "port unreachable", vì UDP không có cờ nào để từ chối. Lệnh `nc -u` vẫn thoát mã 0: UDP gửi đi là xong, chương trình gửi không biết gói có tới hay không, trừ khi nó đọc lại lỗi ICMP từ socket.
+
+<Check id="d2.1.lab-failures">Tái hiện được `Connection refused`, `No route to host` và `timed out`, và chỉ ra trên tcpdump gói RST và ICMP tương ứng.</Check>
+
+### 10. UDP không bắt tay
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec server nc -u -l 10.0.2.20 9001
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+echo "xin chao udp" | nc -u -w1 10.0.2.20 9001
+```
+
+</Terminal>
+
+Terminal 2 in `xin chao udp`. Nếu chạy tcpdump trên `r-wan` cùng lúc, bạn chỉ thấy đúng một dòng `UDP, length 13`: không SYN, không ACK, không FIN. Đó là lý do DNS dùng UDP: một câu hỏi, một câu trả lời, không tốn vòng bắt tay. Dừng `nc` ở terminal 2 bằng Ctrl+C.
+
+### 11. Gom thành script để dùng lại
+
+Namespace và veth mất khi VM khởi động lại. Các bài sau của chặng dùng lại đúng mạng này, nên gom các bước thành một script:
+
+<Terminal where="vm" title="~/masteva-d2/topo.sh">
+
+```bash
+cat > ~/masteva-d2/topo.sh <<'EOF'
+#!/usr/bin/env bash
+# Dựng lại mạng lab D2: VM (laptop) -- router -- server
+set -euo pipefail
+
+down() {
+  ip link del lan0 2>/dev/null || true      # xoá một đầu veth thì đầu kia mất theo
+  ip netns del server 2>/dev/null || true
+  ip netns del router 2>/dev/null || true
+}
+
+up() {
+  down
+  ip netns add router
+  ip netns add server
+  ip link add lan0 type veth peer name r-lan netns router
+  ip -n router link add r-wan type veth peer name eth0 netns server
+
+  ip addr add 10.0.1.10/24 dev lan0
+  ip link set lan0 up
+  ip route add 10.0.0.0/16 via 10.0.1.1
+
+  ip -n router addr add 10.0.1.1/24 dev r-lan
+  ip -n router addr add 10.0.2.1/24 dev r-wan
+  for i in lo r-lan r-wan; do ip -n router link set "$i" up; done
+  ip netns exec router sysctl -qw net.ipv4.ip_forward=1
+
+  ip -n server addr add 10.0.2.20/24 dev eth0
+  for i in lo eth0; do ip -n server link set "$i" up; done
+  ip -n server route add default via 10.0.2.1
+}
+
+case "${1:-}" in
+  up) up ;;
+  down) down ;;
+  *) echo "Cách dùng: sudo $0 up|down" >&2; exit 2 ;;
+esac
+EOF
+chmod +x ~/masteva-d2/topo.sh
+```
+
+</Terminal>
+
+Dòng `ip link del lan0` trong `down` không thừa: xoá namespace là việc kernel làm **bất đồng bộ**, card veth bên trong có thể còn sống thêm một lúc. Bài mẫu đã gặp đúng chuyện này: chạy `down` rồi `up` ngay, `lan0` cũ vẫn còn và `ip link add lan0` báo `File exists`. Xoá thẳng đầu veth là việc đồng bộ. `set -euo pipefail` và `${1:-}` là chủ đề của bài D3.1.
+
+Thử lại từ đầu bằng script (dừng server Python trước, xem phần dọn dẹp):
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns pids server | xargs -r sudo kill
+sudo ~/masteva-d2/topo.sh up && ping -c1 10.0.2.20 | sed -n 2p
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+64 bytes from 10.0.2.20: icmp_seq=1 ttl=63 time=0.312 ms
+```
+
+</Expected>
+
+<Check id="d2.1.lab-script">Dựng lại được toàn bộ mạng lab bằng `topo.sh` sau khi xoá.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `setting the network namespace "router" failed: Operation not permitted`: thiếu `sudo` trước `ip -n ...`.
+- `RTNETLINK answers: File exists` khi thêm địa chỉ hay route: bạn đã chạy lệnh đó rồi. Xem bằng `ip addr`, `ip route`, hoặc dựng lại bằng `sudo ~/masteva-d2/topo.sh up`.
+- `Cannot find device "lan0"`: VM đã khởi động lại, hoặc namespace router đã bị xoá (veth mất theo). Chạy lại `topo.sh up`.
+- Ping "thành công" với `ttl=64` tới `10.0.x.x`: gói đang đi ra Lima chứ không qua router của bạn (bước 4). Kiểm bằng `ip route get`.
+- `curl` treo khi server chưa chạy: kiểm `sudo ip netns exec server ss -tlnp`. Server Python chạy nền đã chết thì xem `~/masteva-d2/http.log`.
+- `pkill -f "http.server"` từ một script có chứa đúng chuỗi đó sẽ giết luôn chính script. Dùng `ip netns pids` như phần dọn dẹp để chỉ dừng tiến trình trong namespace.
+
+</Callout>
+
+### Dọn dẹp
+
+Dừng mọi tiến trình đang chạy trong netns server rồi gỡ mạng lab. Giữ `~/masteva-d2/topo.sh` cho bài D2.2.
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+sudo ip netns pids server | xargs -r sudo kill
+sudo ~/masteva-d2/topo.sh down
+ip netns list; ip -br link | grep -c lan0
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+```
+
+</Expected>
+
+Muốn tắt VM: `limactl stop <tên VM>` trên máy Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao server nghe ở 127.0.0.1 thì từ máy khác báo Connection refused, không phải timeout?">
+
+Gói SYN vẫn tới được card mạng của máy đích. Kernel tìm socket nào nghe ở đúng IP đích và port đó; socket chỉ gắn `127.0.0.1:8080` không khớp với gói tới `10.0.2.20:8080`, nên kernel trả `RST` như thể port đóng. `ss -tlnp` cho thấy ngay: cột `Local Address` là `127.0.0.1:8080` thay vì `0.0.0.0:8080` hay IP của card. Đây là lỗi hay gặp với ứng dụng chạy trong container: ứng dụng nghe `localhost` bên trong container, nên publish port ra ngoài vẫn bị từ chối.
+
+</Reveal>
+
+<Reveal title="Vì sao MSS là 1460, và chuyện gì xảy ra khi đường đi có MTU nhỏ hơn?">
+
+MTU là kích thước lớn nhất của một gói IP trên một đoạn dây; Ethernet là 1500 byte. Trừ 20 byte header IPv4 và 20 byte header TCP còn 1460 byte dữ liệu, hai bên báo cho nhau con số này lúc bắt tay. Khi đường đi có một đoạn MTU nhỏ hơn (VPN, tunnel VXLAN của overlay network), gói lớn phải bị chia nhỏ hoặc bị huỷ kèm ICMP "fragmentation needed". Nếu firewall nào đó chặn mất ICMP này, bắt tay và request nhỏ chạy bình thường nhưng response lớn treo mãi: triệu chứng kinh điển "curl trang nhỏ được, tải file lớn thì treo". Cách xử lý thường là giảm MTU của card tunnel hoặc cho router "kẹp" MSS (MSS clamping).
+
+</Reveal>
+
+<Reveal title="Có nên bật net.ipv4.tcp_tw_reuse hay tcp_tw_recycle để bớt TIME-WAIT?">
+
+`tcp_tw_recycle` đã bị xoá khỏi kernel từ Linux 4.12 vì làm hỏng kết nối từ các máy sau NAT. `tcp_tw_reuse` cho phép dùng lại một kết nối `TIME-WAIT` cho kết nối **ra ngoài** mới khi timestamp cho thấy an toàn; giá trị mặc định `2` trên kernel hiện tại chỉ bật nó cho loopback. Nó giảm triệu chứng phía client, nhưng nguyên nhân gốc vẫn là mở quá nhiều kết nối ngắn. Sửa ở ứng dụng: keep-alive, connection pool, hoặc để bên kia đóng trước.
+
+</Reveal>
+
+<Reveal title="Container trong Docker ra Internet bằng cách nào, khi nó có IP 172.17.0.x?">
+
+Đúng như lab: container có netns riêng, một đầu veth nằm trong container, đầu kia gắn vào bridge `docker0` trên máy chủ. Máy chủ có `ip_forward=1` và một rule NAT đổi IP nguồn `172.17.0.x` thành IP của máy chủ khi gói đi ra (masquerade). Bài D2.4 làm NAT bằng nftables trên chính router của lab này. Dải `172.17.0.0/16` của Docker cũng là nguồn của một lỗi quen thuộc: VPN công ty dùng trùng dải đó, và longest prefix match đưa gói tới mạng của Docker thay vì VPN.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một đoạn output `tcpdump` hay `ss`, hoặc tính subnet cho một thiết kế mạng. AI hay quy mọi `Connection refused` cho firewall, trong khi firewall cấu hình `drop` cho ra timeout và chỉ `reject` kiểu mặc định mới cho `Connection refused`, hay đưa lệnh `ifconfig`, `netstat` không có sẵn trên Ubuntu mới, và hay đề nghị bật `tcp_tw_recycle` vốn đã bị xoá. Với phép tính subnet, kiểm lại bằng `python3 -c 'import ipaddress ...'` như bước 6; với lời khuyên về route, kiểm bằng `ip route get` trước khi áp dụng.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.5 dạy namespace và sysctl mà lab này dựa vào. Bài D2.2 dùng lại mạng này để chạy DNS server, D2.3 thêm HTTPS, D2.4 biến router thành firewall có NAT, D2.5 thêm reverse proxy. D1.1 đã dạy exit code; `nc` và `curl` trả exit code khác nhau cho từng kiểu lỗi, bài D3.1 dùng chúng trong script. Network namespace và veth là nền của mạng container ở D5.3; trong Kubernetes, plugin CNI (K6) nối veth cho từng pod, còn K2 học mạng pod, Service, DNS và NetworkPolicy.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d2.1.mastery-path">Kể được đường đi của một gói từ máy mình tới một server ở subnet khác: route, ARP, router chuyển tiếp, TTL, route chiều về.</Check>
+
+<Check id="d2.1.mastery-diagnose">Khi một service "không kết nối được", tự chọn được thứ tự kiểm tra `ip route get`, `ss -tlnp`, `nc -zv`, `tcpdump` và nói được gói dừng ở đâu.</Check>
+
+<Check id="d2.1.mastery-tcp">Đọc được một đoạn tcpdump của kết nối TCP: bắt tay, dữ liệu, đóng, RST, và giải thích được `TIME-WAIT` thuộc về bên nào.</Check>
+
+</Mastery>

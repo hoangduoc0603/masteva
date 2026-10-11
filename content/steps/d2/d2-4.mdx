@@ -1,0 +1,746 @@
+---
+title: Firewall, NAT, SSH và tunnel
+description: Biến router của lab thành firewall nftables có policy drop, thấy drop và từng kiểu reject cho client lỗi gì, cấu hình masquerade và port forward rồi đọc phép đổi địa chỉ trong conntrack, đi qua bastion bằng ProxyJump và mở ba kiểu tunnel SSH.
+id: d2.4
+step: d2
+prerequisites: [d2.3]
+topics: [d2.firewall-nat, d2.ssh-tunnel]
+status: verified
+verified:
+  date: 2026-10-10
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    nftables: 1.1.6
+    conntrack-tools: 1.4.9
+    openssh: 10.2p1
+    netcat-openbsd: 1.234-1
+    curl: 8.18.0
+    python: 3.14.4
+---
+
+<Goal>
+
+Kiểm soát ai tới được đâu trên mạng của bạn, và mở một đường quản trị an toàn vào bên trong. Học xong bài này, bạn giải thích được:
+
+- Vì sao firewall `drop` làm client treo tới timeout, `reject` cho lỗi ngay, và vì sao quên một dòng `established,related` là mọi kết nối đều chết.
+- Vì sao server chỉ thấy IP của router chứ không thấy IP thật của client khi đi qua NAT, và `docker run -p` thực chất làm gì.
+- Vì sao một port "đã chặn bằng ufw" vẫn mở ra Internet trên máy chạy Docker.
+- Làm sao vào được một máy không mở SSH ra ngoài, và ba kiểu tunnel `-L`, `-R`, `-D` khác nhau ở đâu.
+
+</Goal>
+
+<Knowledge>
+
+### Netfilter và nftables
+
+**Netfilter** là khung trong kernel cho phép chèn luật vào đường đi của gói. **nftables** (lệnh `nft`) là công cụ viết luật hiện hành, thay cho iptables. Trên Ubuntu 26.04, lệnh `iptables` còn đó nhưng là bản dịch sang nftables (iptables-nft); `ufw` và `firewalld` là lớp giao diện phía trên.
+
+Gói đi qua năm **hook**. Bạn gắn **chain** vào hook, mỗi chain chứa các **rule** chạy từ trên xuống:
+
+```text
+             ┌───────────┐  gói cho máy này   ┌───────┐         ┌────────┐
+ card vào ──>│ prerouting│──> định tuyến ────>│ input │──> tiến trình ──>│ output │──┐
+             │ (DNAT)    │        │           └───────┘                  └────────┘  │
+             └───────────┘        │ gói cho máy khác                                 v
+                                  │           ┌─────────┐              ┌─────────────┐
+                                  └──────────>│ forward │─────────────>│ postrouting │──> card ra
+                                              └─────────┘              │ (SNAT)      │
+                                                                       └─────────────┘
+```
+
+- Máy là router: gói đi `prerouting → forward → postrouting`. Luật lọc đặt ở `forward`.
+- Máy là server: gói tới đi `prerouting → input`, gói đi ra từ `output → postrouting`.
+- Mỗi chain có **policy** cho gói không khớp rule nào. Firewall tử tế đặt `policy drop` rồi chỉ mở những gì cần.
+
+**Stateful firewall và conntrack.** Kernel theo dõi mọi kết nối trong bảng **conntrack**: gói đầu tiên có trạng thái `new`, các gói sau của cùng kết nối (cả chiều về) là `established`. Nhờ đó bạn chỉ viết luật cho chiều mở kết nối, cộng một dòng `ct state established,related accept` cho mọi gói trả lời. Thiếu dòng đó, gói SYN đi lọt nhưng SYN-ACK quay về bị chặn.
+
+| Hành động | Client thấy gì | Dùng khi |
+|---|---|---|
+| `accept` | Kết nối bình thường | |
+| `drop` | Treo tới timeout (D2.1: không ai trả lời) | Mặt ngoài Internet: không tiết lộ gì cho kẻ quét port |
+| `reject` (mặc định trả ICMP port-unreachable), `reject with tcp reset` | Lỗi ngay: `Connection refused`, y như port đóng | Mạng nội bộ: người dùng và ứng dụng biết ngay, không phải chờ |
+| `reject with icmpx admin-prohibited` hoặc `host-unreachable` | Lỗi ngay: `No route to host` | Khi muốn phân biệt "bị chặn" với "port đóng" |
+
+Bước 1 của lab chạy cả ba kiểu để bạn thấy đúng ba thông báo của D2.1.
+
+<Check id="d2.4.netfilter">Kể được các hook của netfilter và đường đi của gói qua router, giải thích được vai trò của conntrack và dòng `established,related`.</Check>
+
+### NAT: đổi địa chỉ trên đường đi
+
+**NAT (network address translation)** sửa địa chỉ của gói khi nó đi qua router. Conntrack nhớ phép đổi để tự đổi ngược cho gói trả lời.
+
+| Kiểu | Đổi gì, ở hook nào | Dùng cho |
+|---|---|---|
+| **SNAT / masquerade** | IP nguồn, ở `postrouting` | Mạng riêng ra Internet: router ở nhà, NAT gateway trên cloud, container ra ngoài. `masquerade` là SNAT tự lấy IP của card ra |
+| **DNAT** | IP đích (và port), ở `prerouting` | Port forward vào máy bên trong: `docker run -p`, Service của Kubernetes, load balancer L4 |
+
+Một request từ VM `10.0.1.10` tới server `10.0.2.20` đi qua router đang masquerade (bước 2 của lab):
+
+```text
+ VM 10.0.1.10                    router (r-lan 10.0.1.1, r-wan 10.0.2.1)              server 10.0.2.20
+   │ src 10.0.1.10:55142                                                                   │
+   │ dst 10.0.2.20:8080 ────────> postrouting: đổi nguồn thành 10.0.2.1:55142              │
+   │                              conntrack ghi: 10.0.1.10:55142 <-> 10.0.2.1:55142        │
+   │                              src 10.0.2.1:55142, dst 10.0.2.20:8080 ────────────────> │ thấy client là 10.0.2.1
+   │                                                                                       │
+   │                              <──────────────── src 10.0.2.20:8080, dst 10.0.2.1:55142 │ trả lời cho router
+   │                              conntrack tra bảng, đổi đích về 10.0.1.10:55142          │
+   │ <──────── src 10.0.2.20:8080, dst 10.0.1.10:55142                                     │
+```
+
+Hệ quả vận hành quan trọng nhất của SNAT: **server không còn thấy IP thật của client**, chỉ thấy IP của thiết bị NAT. Log, rate limit theo IP và danh sách cho phép theo IP đều bị ảnh hưởng.
+
+<Callout kind="production">
+
+Tài liệu của Docker có hẳn một mục cảnh báo "Docker and ufw" trong trang [Packet filtering and firewalls](https://docs.docker.com/engine/network/packet-filtering-firewalls/): khi bạn publish port (`docker run -p 8080:80`), Docker tự thêm luật NAT và forward, và gói tới container được chuyển hướng trước khi đi qua các chain mà `ufw` quản lý. Kết quả là port container **mở ra Internet dù `ufw status` báo đang chặn**. NewsBlur mất database MongoDB theo đúng cách này vào tháng 6/2021; người sáng lập kể lại trong bài [How a Docker footgun led to a vandal deleting NewsBlur's MongoDB database](https://blog.newsblur.com/2021/06/28/story-of-a-hacking/), và D5.3 phân tích kỹ vụ đó. Trên máy chủ có IP công khai: publish vào `127.0.0.1` (`-p 127.0.0.1:8080:80`) khi chỉ cần reverse proxy cùng máy gọi tới, và kiểm port từ **bên ngoài** bằng `nc -zv`, đừng chỉ tin `ufw status`.
+
+</Callout>
+
+<Check id="d2.4.nat">Phân biệt được SNAT/masquerade với DNAT, nói được mỗi loại nằm ở hook nào và vì sao NAT làm server mất IP thật của client.</Check>
+
+### SSH: khoá, host key và bastion
+
+SSH xác thực **hai chiều**. Server chứng minh danh tính bằng **host key**: lần đầu kết nối, client ghi nó vào `known_hosts`; lần sau khác đi thì cảnh báo, vì có thể ai đó đang đứng giữa. Người dùng chứng minh danh tính bằng **cặp khoá**: khoá công khai nằm trong `authorized_keys` trên server, khoá riêng không rời máy bạn.
+
+Cấu hình sshd tối thiểu cho máy chủ thật:
+
+| Dòng trong `sshd_config` | Vì sao |
+|---|---|
+| `PasswordAuthentication no`, `KbdInteractiveAuthentication no` | Mật khẩu bị dò liên tục trên mọi IP công khai; khoá thì không dò được |
+| `PermitRootLogin no` | Đăng nhập bằng user thường rồi `sudo`, để log ghi được ai làm gì |
+| `AllowUsers` hoặc `AllowGroups` | Chỉ người cần mới vào được |
+| Không mở port 22 ra Internet | Đi qua VPN hoặc **bastion** (jump host): một máy duy nhất nhận SSH từ ngoài |
+
+Qua bastion, dùng `ProxyJump` (`ssh -J`): client mở kết nối tới bastion, rồi đi **xuyên qua** nó để bắt tay SSH thẳng với máy đích. Khoá riêng vẫn ở máy bạn. Đừng dùng agent forwarding (`ssh -A`) cho việc này: nó để agent của bạn lộ ra trên bastion, ai có root ở đó dùng được khoá của bạn.
+
+**Tunnel** là dùng kết nối SSH để chở kết nối TCP khác:
+
+```text
+ -L 9000:127.0.0.1:9000   Local: mở port trên MÁY BẠN, đầu ra ở phía server
+   máy bạn :9000 ══ssh══> server ──> 127.0.0.1:9000 (nhìn từ server)
+   Dùng khi: vào trang quản trị hay database chỉ nghe ở localhost của server
+
+ -R 9001:10.0.1.10:8000   Remote: mở port trên SERVER, đầu ra ở phía máy bạn
+   server :9001 ══ssh══> máy bạn ──> 10.0.1.10:8000 (nhìn từ máy bạn)
+   Dùng khi: cho máy ở xa gọi về một service chạy trên máy bạn
+
+ -D 1080                  Dynamic: SOCKS proxy trên máy bạn, đích do từng request chọn
+   máy bạn :1080 ══ssh══> bastion ──> bất kỳ host:port nào bastion tới được
+   Dùng khi: cần tới nhiều địa chỉ nội bộ qua một bastion
+```
+
+<Check id="d2.4.ssh">Giải thích được host key và khoá người dùng xác thực cái gì, vì sao dùng `ProxyJump` thay cho agent forwarding, và chọn đúng `-L`, `-R`, `-D` cho một tình huống.</Check>
+</Knowledge>
+
+<Resources>
+
+- [nftables wiki: Quick reference, nftables in 10 minutes](https://wiki.nftables.org/wiki-nftables/index.php/Quick_reference-nftables_in_10_minutes): cú pháp table, chain, rule, set và các hook; trang tra cứu chính thức của dự án.
+- [nftables wiki: Performing Network Address Translation (NAT)](https://wiki.nftables.org/wiki-nftables/index.php/Performing_Network_Address_Translation_%28NAT%29): ví dụ SNAT, masquerade, DNAT và redirect.
+- [Docker: Packet filtering and firewalls](https://docs.docker.com/engine/network/packet-filtering-firewalls/): Docker thêm luật gì vào firewall và mục "Docker and ufw".
+- [ssh_config(5)](https://man7.org/linux/man-pages/man5/ssh_config.5.html): `ProxyJump`, `LocalForward`, `RemoteForward`, `DynamicForward`, `IdentitiesOnly`.
+- [sshd_config(5)](https://man7.org/linux/man-pages/man5/sshd_config.5.html): `PasswordAuthentication`, `AllowUsers`, `AllowTcpForwarding`, `PermitOpen`, `GatewayPorts`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** có `~/masteva-d2/topo.sh` của D2.1; bài này không cần DNS hay chứng chỉ của hai bài trước. VM 2 CPU, 2 GiB; lab chạy hai sshd và vài tiến trình Python, tốn dưới 100 MB, máy 8 GB không cần thu gọn. Cài gói và dựng mạng:
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y nftables conntrack openssh-server netcat-openbsd
+sudo ~/masteva-d2/topo.sh up
+mkdir -p ~/masteva-d2/{fw,ssh,www} && cd ~/masteva-d2
+echo "xin chao tu server" > www/index.html
+echo "trang quan tri noi bo" > www/admin.html
+nft --version; conntrack --version; ssh -V
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+nftables v1.1.6 (Commodore Bullmoose #7)
+conntrack v1.4.9 (conntrack-tools)
+OpenSSH_10.2p1 Ubuntu-2ubuntu3.7, OpenSSL 3.5.5 27 Jan 2026
+```
+
+</Expected>
+
+`nftables`, `openssh-server` và `netcat-openbsd` có sẵn trong image Ubuntu của Lima; chỉ `conntrack` được cài mới (và `apt` có thể nhân tiện nâng `openssh-server` lên bản vá mới hơn, nên hậu tố `ubuntu3.7` trên máy bạn có thể khác). Vai của từng máy trong bài:
+
+```text
+ VM 10.0.1.10 ────────── router ────────────────── server 10.0.2.20
+   lan0 (mạng LAN)    r-lan 10.0.1.1                 eth0 ("Internet" ở bước 2)
+                      r-wan 10.0.2.1                 service :8080, :9100, 127.0.0.1:9000
+                      firewall, NAT, bastion SSH     sshd
+```
+
+Ba service Python trên server để thử firewall: `8080` (công khai), `9100` (nội bộ, firewall sẽ chặn) và `9000` chỉ nghe ở `127.0.0.1`. Vòng lặp tách `host:port` bằng parameter expansion (D3.1).
+
+<Terminal where="vm">
+
+```bash
+for spec in 10.0.2.20:8080 10.0.2.20:9100 127.0.0.1:9000; do
+  sudo ip netns exec server python3 -m http.server "${spec#*:}" --bind "${spec%:*}" --directory www >/dev/null 2>&1 &
+done
+sleep 1; sudo ip netns exec server ss -tln | grep -c LISTEN
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+3
+```
+
+</Expected>
+
+Bài dùng hai terminal ở bước 4; terminal 2 cần `cd ~/masteva-d2`.
+
+### 1. Firewall trên router
+
+Namespace router chưa có luật nào (`sudo ip netns exec router nft list ruleset` in ra rỗng), nên mọi gói được chuyển tiếp. Viết luật vào file rồi nạp một lần.
+
+<Callout kind="danger">
+
+File luật bắt đầu bằng `flush ruleset`: xoá **toàn bộ** luật firewall của nơi nó được nạp. Trong lab, luôn nạp qua `sudo ip netns exec router nft -f ...`. Gõ thiếu `ip netns exec router` là xoá ruleset của chính VM: trong VM của Lima đó là table `nat` do Lima tạo, trên một máy khác có thể là toàn bộ luật của Docker. Trên máy thật, `flush ruleset` chỉ dành cho máy mà file này là nguồn duy nhất của mọi luật.
+
+</Callout>
+
+<Terminal where="vm" title="~/masteva-d2/fw/filter.nft">
+
+```bash
+cat > fw/filter.nft <<'EOF'
+#!/usr/sbin/nft -f
+# Firewall của router: LAN (r-lan) chỉ được tới vài port ở phía r-wan
+flush ruleset
+
+table inet filter {
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+
+    ct state established,related accept      # gói của kết nối đã được cho phép
+    ct state invalid drop
+
+    iifname "r-lan" oifname "r-wan" tcp dport { 80, 443, 8080 } accept
+    iifname "r-lan" oifname "r-wan" icmp type echo-request accept
+
+    counter comment "bi chan"
+  }
+}
+EOF
+sudo ip netns exec router nft -f fw/filter.nft
+curl -sS -m3 http://10.0.2.20:8080/
+curl -sS -m3 http://10.0.2.20:9100/admin.html
+ping -c1 -W1 10.0.2.20 | sed -n 2p
+sudo ip netns exec router nft list chain inet filter forward | grep counter
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+xin chao tu server
+curl: (28) Connection timed out after 3003 milliseconds
+64 bytes from 10.0.2.20: icmp_seq=1 ttl=63 time=0.508 ms
+		counter packets 3 bytes 180 comment "bi chan"
+```
+
+</Expected>
+
+- `nft -f` nạp cả file như **một giao dịch**: hoặc toàn bộ luật mới có hiệu lực, hoặc không gì thay đổi. `flush ruleset` ở đầu file nằm trong cùng giao dịch, nên không có khoảnh khắc nào firewall trống.
+- Table họ `inet` áp dụng cho cả IPv4 lẫn IPv6.
+- Port 9100 bị `policy drop`: curl treo tới hết 3 giây. Dòng `counter` cuối chain đếm gói rơi xuống tới đó: 3 gói là SYN và hai lần gửi lại.
+
+Xem bảng conntrack của router:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec router conntrack -L 2>/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+icmp     1 29 src=10.0.1.10 dst=10.0.2.20 type=8 code=0 id=21231 src=10.0.2.20 dst=10.0.1.10 type=0 code=0 id=21231 mark=0 use=1
+tcp      6 116 TIME_WAIT src=10.0.1.10 dst=10.0.2.20 sport=38940 dport=8080 src=10.0.2.20 dst=10.0.1.10 sport=8080 dport=38940 [ASSURED] mark=0 use=1
+```
+
+</Expected>
+
+Mỗi dòng là một kết nối với hai nửa: chiều gốc và chiều trả lời mà kernel chờ. Gói khớp nửa sau chính là `established`. Kết nối tới 9100 không có trong bảng vì gói SYN đã bị drop. Port nguồn và id trên máy bạn sẽ khác.
+
+`reject` có nhiều kiểu trả lời. Thêm lần lượt hai kiểu vào cuối chain và thử port 9100:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec router nft add rule inet filter forward counter reject
+nc -zv -w3 10.0.2.20 9100
+sudo ip netns exec router nft -f fw/filter.nft
+sudo ip netns exec router nft add rule inet filter forward counter reject with icmpx admin-prohibited
+nc -zv -w3 10.0.2.20 9100
+```
+
+</Terminal>
+
+<Predict question="Hai lần nc báo gì, nhanh hay chậm? Lần nào giống hệt một port đóng?">
+
+```text
+nc: connect to 10.0.2.20 port 9100 (tcp) failed: Connection refused
+nc: connect to 10.0.2.20 port 9100 (tcp) failed: No route to host
+```
+
+Cả hai trả lời ngay thay vì để client chờ 3 giây. `reject` không tham số gửi ICMP "port unreachable", và client thấy `Connection refused`, không phân biệt được với port không có ai nghe. `admin-prohibited` cho `No route to host`, cùng thông báo với route `unreachable` ở D2.1. Nhìn thông báo lỗi ở client, bạn đoán được firewall trên đường đi đang cấu hình kiểu nào.
+
+</Predict>
+
+Giờ xem dòng `established,related` gánh việc gì. Nạp lại luật gốc, tìm **handle** (mã của rule) rồi xoá đúng rule đó:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec router nft -f fw/filter.nft
+sudo ip netns exec router nft -a list chain inet filter forward | grep established
+h=$(sudo ip netns exec router nft -a list chain inet filter forward | awk '/established/ {print $NF}')
+sudo ip netns exec router nft delete rule inet filter forward handle "$h"
+curl -sS -m3 http://10.0.2.20:8080/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+		ct state established,related accept # handle 2
+curl: (28) Connection timed out after 3002 milliseconds
+```
+
+</Expected>
+
+Port 8080 vẫn nằm trong danh sách cho phép, nhưng curl timeout: SYN đi qua nhờ rule port 8080, còn SYN-ACK quay về đi theo chiều `r-wan → r-lan`, không khớp rule nào và rơi vào `policy drop`. `nft -a` in handle sau mỗi rule; số handle trên máy bạn có thể khác.
+
+Nạp lại file để về trạng thái chuẩn. `nft -c -f` chỉ kiểm cú pháp mà không nạp, nên chạy nó trước khi nạp luật trên máy thật:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec router nft -c -f fw/filter.nft && sudo ip netns exec router nft -f fw/filter.nft
+curl -sS -m3 http://10.0.2.20:8080/
+```
+
+</Terminal>
+
+<Check id="d2.4.lab-firewall">Viết được ruleset nftables có `policy drop`, cho phép theo port, phân biệt được `drop` với hai kiểu `reject` qua lỗi phía client, và dùng counter cùng `conntrack -L` để biết gói bị chặn ở đâu.</Check>
+
+### 2. NAT: masquerade và port forward
+
+Biến phía server thành "Internet": máy trên Internet không biết đường về dải riêng `10.0.1.0/24`, nên xoá default route của server.
+
+<Terminal where="vm">
+
+```bash
+curl -s -o /dev/null http://10.0.2.20:8080/
+sudo ip -n server route del default
+curl -sS -m3 http://10.0.2.20:8080/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+curl: (28) Connection timed out after 3002 milliseconds
+```
+
+</Expected>
+
+Đúng lỗi "thiếu route chiều về" của D2.1. Giờ thêm NAT: `masquerade` cho gói đi ra `r-wan`, và một port forward đưa `10.0.2.1:8000` vào service chạy trên VM.
+
+<Terminal where="vm" title="~/masteva-d2/fw/nat.nft">
+
+```bash
+python3 -m http.server 8000 --bind 10.0.1.10 --directory www > lan.log 2>&1 &
+cat > fw/nat.nft <<'EOF'
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet filter {
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iifname "r-lan" oifname "r-wan" tcp dport { 80, 443, 8080 } accept
+    iifname "r-lan" oifname "r-wan" icmp type echo-request accept
+    iifname "r-wan" oifname "r-lan" ct status dnat accept     # chỉ gói đã được DNAT bên dưới
+  }
+}
+
+table ip nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "r-wan" tcp dport 8000 dnat to 10.0.1.10:8000    # port forward vào LAN
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "r-wan" ip saddr 10.0.1.0/24 masquerade          # LAN ra ngoài mang IP của r-wan
+  }
+}
+EOF
+sudo ip netns exec router nft -f fw/nat.nft
+curl -sS -m3 http://10.0.2.20:8080/
+sudo ip netns exec router conntrack -L --src-nat 2>/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+xin chao tu server
+tcp      6 119 TIME_WAIT src=10.0.1.10 dst=10.0.2.20 sport=55142 dport=8080 src=10.0.2.20 dst=10.0.2.1 sport=8080 dport=55142 [ASSURED] mark=0 use=1
+```
+
+</Expected>
+
+Server vẫn không có route về `10.0.1.0/24`, nhưng không cần nữa: gói tới nó mang IP nguồn `10.0.2.1`, cùng subnet. Dòng conntrack cho thấy phép đổi: chiều gốc `src=10.0.1.10`, chiều trả lời gửi về `dst=10.0.2.1`; router đổi ngược lại trước khi chuyển cho VM.
+
+Thử port forward từ phía "Internet":
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec server curl -sS -m3 http://10.0.2.1:8000/
+tail -1 lan.log
+sudo ip netns exec router conntrack -L --dst-nat 2>/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+xin chao tu server
+10.0.2.20 - - [10/Oct/2026 08:06:16] "GET / HTTP/1.1" 200 -
+tcp      6 115 TIME_WAIT src=10.0.2.20 dst=10.0.2.1 sport=41036 dport=8000 src=10.0.1.10 dst=10.0.2.20 sport=8000 dport=41036 [ASSURED] mark=0 use=1
+```
+
+</Expected>
+
+Server gọi `10.0.2.1:8000`, router đổi đích thành `10.0.1.10:8000`. Đây là cơ chế của `docker run -p` và của Service trong Kubernetes. Trả lab về trạng thái không NAT cho các bước sau. Server Python ở port 8000 cứ để chạy, bước 4 dùng lại.
+
+<Terminal where="vm">
+
+```bash
+sudo ip -n server route add default via 10.0.2.1
+sudo ip netns exec router nft -f fw/filter.nft
+curl -s http://10.0.2.20:8080/
+```
+
+</Terminal>
+
+<Check id="d2.4.lab-nat">Cấu hình được masquerade và DNAT bằng nftables, và đọc được phép đổi địa chỉ trong `conntrack -L --src-nat` và `--dst-nat`.</Check>
+
+### 3. SSH qua bastion
+
+Tạo khoá người dùng, host key, và cấu hình hai sshd: bastion trên router, sshd của server. Firewall ở bước 1 không cho VM tới thẳng port 22 của server.
+
+<Terminal where="vm" title="~/masteva-d2/ssh">
+
+```bash
+cd ~/masteva-d2/ssh && chmod 700 .
+ssh-keygen -q -t ed25519 -N '' -C masteva-lab -f id_ed25519
+ssh-keygen -q -t ed25519 -N '' -f host_ed25519
+cp id_ed25519.pub authorized_keys && chmod 600 authorized_keys
+for h in bastion:10.0.1.1 server:10.0.2.20; do
+cat > sshd_${h%:*}.conf <<EOF
+ListenAddress ${h#*:}
+Port 22
+HostKey $HOME/masteva-d2/ssh/host_ed25519
+PidFile $HOME/masteva-d2/ssh/sshd_${h%:*}.pid
+AuthorizedKeysFile $HOME/masteva-d2/ssh/authorized_keys
+UsePAM yes
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AllowUsers $USER
+X11Forwarding no
+EOF
+done
+sudo mkdir -p /run/sshd
+sudo ip netns exec router /usr/sbin/sshd -f $HOME/masteva-d2/ssh/sshd_bastion.conf
+sudo ip netns exec server /usr/sbin/sshd -f $HOME/masteva-d2/ssh/sshd_server.conf
+sudo ip netns exec server /usr/sbin/sshd -T -f $HOME/masteva-d2/ssh/sshd_server.conf \
+  | grep -E '^(passwordauthentication|permitrootlogin|allowusers|pubkeyauthentication)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+permitrootlogin no
+pubkeyauthentication yes
+passwordauthentication no
+allowusers hoangduoc
+```
+
+</Expected>
+
+`sshd -T` in cấu hình **có hiệu lực** sau khi gộp mọi file và giá trị mặc định; dùng nó để kiểm thay vì đọc file. `allowusers` là user của bạn. Khoá ed25519 ngắn và nhanh, là lựa chọn mặc định hiện nay. Hai sshd dùng chung một host key cho gọn; máy thật mỗi máy một host key. `/run/sshd` là thư mục sshd cần để tách quyền; trên Ubuntu 26.04 sshd hệ thống chạy theo kiểu socket activation và thư mục này chỉ tồn tại khi `ssh.service` đang chạy, nên lab tự tạo.
+
+Cấu hình phía client, đặt riêng trong thư mục lab để không đụng `~/.ssh/config` của bạn:
+
+<Terminal where="vm" title="~/masteva-d2/ssh/config">
+
+```bash
+cat > config <<EOF
+Host bastion
+  HostName 10.0.1.1
+Host server
+  HostName 10.0.2.20
+  ProxyJump bastion
+Host *
+  User $USER
+  IdentityFile $HOME/masteva-d2/ssh/id_ed25519
+  IdentitiesOnly yes
+  UserKnownHostsFile $HOME/masteva-d2/ssh/known_hosts
+  StrictHostKeyChecking accept-new
+  ConnectTimeout 3
+  ExitOnForwardFailure yes
+EOF
+cd ~/masteva-d2
+ssh -F ssh/config -o ProxyJump=none server true
+ssh -F ssh/config bastion hostname -I
+ssh -F ssh/config server 'hostname -I; echo $SSH_CONNECTION'
+ssh -F ssh/config -o PubkeyAuthentication=no bastion true
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ssh: connect to host 10.0.2.20 port 22: Connection timed out
+Warning: Permanently added '10.0.1.1' (ED25519) to the list of known hosts.
+10.0.1.1 10.0.2.1
+Warning: Permanently added '10.0.2.20' (ED25519) to the list of known hosts.
+10.0.2.20
+10.0.2.1 47900 10.0.2.20 22
+hoangduoc@10.0.1.1: Permission denied (publickey).
+```
+
+</Expected>
+
+- Đi thẳng tới server: firewall drop, timeout.
+- Qua `ProxyJump`: vào được. `SSH_CONNECTION` trên server ghi kết nối đến từ `10.0.2.1`, tức từ bastion, không phải từ VM. Kết nối từ bastion là gói do chính router phát ra (hook `output`), không qua chain `forward`, nên firewall không chặn.
+- Tắt xác thực bằng khoá: server không còn cách nào khác để thử, `Permission denied (publickey)`. Không có lời nhắc mật khẩu.
+- `StrictHostKeyChecking accept-new` ghi host key ở lần đầu và từ chối nếu sau này nó đổi.
+
+<Check id="d2.4.lab-ssh">Dựng được sshd chỉ nhận khoá, kiểm cấu hình bằng `sshd -T`, và vào được máy phía trong qua bastion bằng `ProxyJump`.</Check>
+
+### 4. Ba kiểu tunnel
+
+Mỗi tunnel chạy ở **terminal 2** với `-N` (không mở shell), dừng bằng Ctrl+C trước khi sang tunnel kế tiếp. Terminal 2 cần `cd ~/masteva-d2` trước.
+
+**Local forward:** tới service chỉ nghe ở `127.0.0.1:9000` của server.
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+ssh -F ssh/config -N -L 9000:127.0.0.1:9000 server
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+curl -sS -m3 http://127.0.0.1:9000/admin.html
+ss -tlnp | grep 9000
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trang quan tri noi bo
+LISTEN 0      128        127.0.0.1:9000       0.0.0.0:*    users:(("ssh",pid=32495,fd=6))
+LISTEN 0      128            [::1]:9000          [::]:*    users:(("ssh",pid=32495,fd=3))
+```
+
+</Expected>
+
+Tiến trình `ssh` trên VM nghe port 9000 và chở kết nối qua bastion tới server; `127.0.0.1:9000` ở vế sau được phân giải **từ phía server**.
+
+**Remote forward:** cho server gọi về service `10.0.1.10:8000` trên VM (server Python đã chạy từ bước 2).
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+ssh -F ssh/config -N -R 9001:10.0.1.10:8000 server
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec server curl -sS -m3 http://127.0.0.1:9001/
+sudo ip netns exec server ss -tlnp | grep 9001 | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+xin chao tu server
+LISTEN 0      128        127.0.0.1:9001      0.0.0.0:*    users:(("sshd-session",pid=32830,fd=11))
+```
+
+</Expected>
+
+Lần này `sshd-session` trên **server** nghe port. Mặc định nó chỉ nghe ở `127.0.0.1` của server; muốn máy khác gọi vào được phải bật `GatewayPorts` trong sshd, một quyết định cần cân nhắc.
+
+**Dynamic forward:** SOCKS proxy qua bastion để tới port 9100 mà firewall chặn.
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+ssh -F ssh/config -N -D 1080 bastion
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+curl -sS -m3 http://10.0.2.20:9100/admin.html
+curl -sS -m3 --socks5-hostname 127.0.0.1:1080 http://10.0.2.20:9100/admin.html
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+curl: (28) Connection timed out after 3007 milliseconds
+trang quan tri noi bo
+```
+
+</Expected>
+
+Đi thẳng thì bị firewall drop; qua SOCKS, kết nối tới `10.0.2.20:9100` xuất phát từ bastion. `--socks5-hostname` cho proxy phân giải cả tên miền, nên tên nội bộ cũng dùng được. Dừng tunnel ở terminal 2.
+
+Tunnel tiện, và vì thế cũng là đường vòng qua firewall: ai SSH được vào bastion là tới được mọi thứ bastion tới được. Trên bastion thật, cân nhắc `AllowTcpForwarding no` hoặc `PermitOpen` cho từng nhóm người dùng.
+
+<Check id="d2.4.lab-tunnel">Mở được tunnel `-L`, `-R` và `-D`, và chỉ ra bằng `ss -tlnp` tiến trình nào nghe port ở phía nào.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `Permission denied (publickey)` dù khoá đúng, và `sudo journalctl -n 5` có dòng `User ... not allowed because account is locked`: thiếu `UsePAM yes`. Tài khoản do Lima tạo bị khoá mật khẩu, và sshd không dùng PAM từ chối tài khoản như vậy. Bài mẫu đã gặp đúng lỗi này.
+- `Missing privilege separation directory: /run/sshd` khi khởi động sshd của lab: thiếu `sudo mkdir -p /run/sshd`. Thư mục này biến mất mỗi khi `ssh.service` của hệ thống dừng, ví dụ sau một đợt tự cập nhật gói.
+- `Authentication refused: bad ownership or modes`: thư mục hoặc file `authorized_keys` cho người khác ghi. `chmod 700 ~/masteva-d2/ssh; chmod 600 authorized_keys`.
+- Tunnel `-R` vừa mở mà `curl` phía server báo từ chối: forward chưa kịp lập. `ExitOnForwardFailure yes` trong config làm `ssh` thoát với lỗi rõ ràng nếu không mở được port.
+- `bind [127.0.0.1]:9000: Address already in use` khi mở tunnel: tunnel trước còn chạy ở terminal 2, hoặc một service khác đang nghe port đó trên VM.
+- `curl: (28)` tới port 8080 sau khi làm bước 2: quên trả default route cho server hoặc quên nạp lại `fw/filter.nft`.
+- `Error: Could not process rule: No such file or directory` khi `nft add rule`: table hoặc chain chưa tồn tại trong namespace đó; nhớ `ip netns exec router`.
+- Mất luật firewall của chính VM sau khi nạp file: bạn đã chạy `nft -f` thiếu `ip netns exec router`. Trong VM của Lima, ruleset gốc chỉ có một table `nat` nhỏ do Lima tạo lúc khởi động (chain `LIMADNS`); khởi động lại VM (`limactl stop` rồi `limactl start`) để có lại. Trên máy có Docker thì khởi động lại Docker để nó viết lại luật của mình.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới dừng mọi tiến trình trong hai namespace của lab (kể cả hai sshd của lab) và xoá namespace cùng luật firewall bên trong. Nó không đụng sshd hệ thống mà Lima dùng để bạn vào VM, vì sshd đó chạy ngoài các namespace này.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+kill $(jobs -p) 2>/dev/null
+for ns in server router; do sudo ip netns pids "$ns" 2>/dev/null | xargs -r sudo kill; done
+sudo ~/masteva-d2/topo.sh down
+ip netns list | wc -l; sudo nft list ruleset | grep -c 'chain forward'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+0
+```
+
+</Expected>
+
+Các file trong `~/masteva-d2/fw` và `~/masteva-d2/ssh` được giữ lại. Bài D2.5 tự dựng lại mạng và không cần firewall.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Bảng conntrack đầy thì chuyện gì xảy ra?">
+
+Kernel giới hạn số kết nối theo dõi (`net.netfilter.nf_conntrack_max`). Khi đầy, gói của kết nối **mới** bị drop và `dmesg` in `nf_conntrack: table full, dropping packet`; kết nối đang có vẫn chạy. Triệu chứng là lỗi kết nối ngẫu nhiên khi tải cao trên máy làm NAT, load balancer hay node Kubernetes. Xem mức dùng bằng `conntrack -C` so với `sysctl net.netfilter.nf_conntrack_max`. Tăng giới hạn là cách chữa nhanh; nguyên nhân thường là quá nhiều kết nối ngắn (D2.1) hoặc timeout của conntrack quá dài cho loại traffic đó.
+
+</Reveal>
+
+<Reveal title="Vì sao Kubernetes và Docker vẫn gắn với iptables trong khi nftables là hiện hành?">
+
+Vì lịch sử: mọi công cụ viết luật bằng lệnh `iptables`. Lớp tương thích iptables-nft cho chúng chạy tiếp trên nền nftables. Docker 29 mới có backend nftables ở mức thử nghiệm; kube-proxy có mode `nftables` bên cạnh `iptables` và `ipvs` (K6). Khi chẩn đoán trên một máy có Docker, hãy xem cả `nft list ruleset` lẫn `iptables-save`: luật có thể được viết bằng công cụ này và hiện ra ở công cụ kia dưới tên table khác.
+
+</Reveal>
+
+<Reveal title="Mặt ngoài Internet nên drop hay reject?">
+
+Phần lớn firewall mặt ngoài chọn `drop`: kẻ quét port không nhận được gì, phải chờ timeout cho từng port, và không biết máy có tồn tại hay không. Cái giá là người dùng hợp lệ gõ nhầm port cũng phải chờ, và việc chẩn đoán khó hơn vì `drop` trông giống mất gói. Bên trong mạng nội bộ, `reject` thường tốt hơn: ứng dụng thất bại ngay và rõ ràng, thay vì giữ thread chờ timeout hàng chục giây và kéo theo cả chuỗi gọi phía trên. Một ngoại lệ đáng nhớ: đừng chặn mọi ICMP ở mặt ngoài, vì thông báo "fragmentation needed" cần đi qua để các kết nối tự dò được MTU (D2.1).
+
+</Reveal>
+
+<Reveal title="Một trăm máy và hai mươi kỹ sư: quản lý authorized_keys thế nào?">
+
+Chép khoá công khai của từng người vào từng máy không mở rộng được: người nghỉ việc vẫn còn khoá ở đâu đó, và không ai biết khoá nào đang dùng. Ba hướng thường gặp. Một, quản lý `authorized_keys` bằng công cụ cấu hình (Ansible ở D8), để danh sách khoá nằm trong Git. Hai, **chứng chỉ SSH**: một CA ký khoá của người dùng với thời hạn ngắn (vài giờ), sshd chỉ cần tin CA đó (`TrustedUserCAKeys`), không còn file `authorized_keys` trên từng máy. Ba, bỏ SSH trực tiếp và đi qua một cổng truy cập có đăng nhập SSO và ghi lại phiên (AWS SSM Session Manager, Teleport và các công cụ tương tự). D15 bàn về truy cập của con người: SSO, cấp quyền tạm thời và break-glass.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết ruleset nftables từ mô tả bằng lời, chuyển luật iptables cũ sang nftables, hoặc viết `~/.ssh/config` cho một chuỗi bastion. AI hay quên dòng `established,related`, hay đặt luật ở chain `input` trong khi máy là router (cần `forward`), hay trộn cú pháp iptables vào nftables, và hay đề nghị `ssh -A` để qua bastion. Kiểm lại: `nft -c -f file` (chỉ kiểm, không nạp), `sshd -T` cho cấu hình có hiệu lực, rồi thử từ phía client bằng `nc -zv` cho cả port phải mở lẫn port phải đóng.
+
+</Callout>
+
+<Callout kind="link">
+
+D2.1 đã dạy ba kiểu "không kết nối được"; bài này cho thấy firewall tạo ra từng kiểu. D1.5 dạy sysctl và namespace mà lab dựa vào. D5.3 cho thấy Docker tự viết các luật NAT này khi publish port, và kể vụ NewsBlur. D8 dùng SSH để Ansible cấu hình máy. D10 có security group và NAT gateway, bản cloud của firewall và masquerade. D15 dạy truy cập của con người qua bastion, SSO và phân vùng mạng. K2.1 dùng Service, cùng ý tưởng DNAT ở quy mô cụm; K2.2 có NetworkPolicy.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d2.4.mastery-firewall">Tự viết được ruleset nftables cho một router: `policy drop`, cho phép theo port, masquerade cho mạng trong và một port forward; kiểm bằng counter và conntrack.</Check>
+
+<Check id="d2.4.mastery-diagnose">Từ thông báo lỗi phía client (`timed out`, `Connection refused`, `No route to host`) và `conntrack -L`, nói được firewall trên đường đi đang làm gì với gói.</Check>
+
+<Check id="d2.4.mastery-access">Thiết kế được đường quản trị vào một nhóm máy không mở SSH ra ngoài: bastion, `ProxyJump`, sshd chỉ nhận khoá; và chọn đúng kiểu tunnel khi cần tới một service nội bộ.</Check>
+
+</Mastery>

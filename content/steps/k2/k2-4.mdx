@@ -1,0 +1,717 @@
+---
+title: SecurityContext và NetworkPolicy
+description: Siết hai lớp còn lại của pod - tiến trình bên trong container chạy không root, không capability, filesystem chỉ đọc; và mạng giữa các pod bị chặn mặc định rồi mở từng đường - mỗi lớp đều được chứng minh bằng một lần thử trước và sau.
+id: k2.4
+step: k2
+prerequisites: [k2.3]
+topics: [k2.security-context, k2.networkpolicy]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    kindnet: v20260820-69b56db7
+    nginx-unprivileged: 1.30.5
+---
+
+<Goal>
+
+K2.3 giới hạn pod trước API server. Bài này giới hạn hai thứ còn lại: **tiến trình trong container làm được gì trên node**, và **pod nói chuyện được với ai qua mạng**. Mặc định cả hai đều rộng: container chạy root, và mọi pod gọi được mọi pod. Học xong, bạn giải thích được:
+
+- Vì sao pod báo `CreateContainerConfigError` sau khi thêm `runAsNonRoot: true`.
+- Vì sao bật `readOnlyRootFilesystem` làm ứng dụng `CrashLoopBackOff`, và sửa thế nào mà không tắt nó đi.
+- Vì sao một NetworkPolicy "cho phép frontend" lại mở cửa cho mọi pod trong cụm.
+- Vì sao vừa bật chặn egress thì mọi lời gọi theo tên đều hỏng, kể cả lời gọi đã được cho phép.
+
+</Goal>
+
+<Knowledge>
+
+### SecurityContext: giới hạn chính tiến trình trong container
+
+Container dùng chung kernel với node. Hàng rào giữa chúng là namespace, cgroup và capability mà D5 đã mô tả. `securityContext` trong pod spec là nơi bạn siết các hàng rào đó:
+
+| Trường | Cấp | Tác dụng | Mặc định khi không ghi |
+|---|---|---|---|
+| `runAsNonRoot: true` | pod, container | kubelet **từ chối khởi động** container nếu nó sẽ chạy bằng UID 0 | Chạy theo `USER` của image, thường là root |
+| `runAsUser`, `runAsGroup` | pod, container | Ép UID và GID | Theo image |
+| `readOnlyRootFilesystem: true` | container | Filesystem gốc chỉ đọc; chỉ ghi được vào volume | Ghi được |
+| `allowPrivilegeEscalation: false` | container | Đặt cờ `no_new_privs`: tiến trình không tăng quyền được qua file setuid | Cho phép |
+| `capabilities.drop: ["ALL"]` | container | Bỏ hết capability (các mảnh quyền của root, ví dụ `CAP_CHOWN`, `CAP_NET_RAW`) | Giữ khoảng 14 capability mặc định của runtime |
+| `seccompProfile.type: RuntimeDefault` | pod, container | Chặn các syscall hiếm dùng và nguy hiểm | `Unconfined` (không lọc), trừ khi kubelet bật `seccompDefault` |
+| `privileged: true` | container | **Tắt** gần hết hàng rào, container gần như là root của node | `false` |
+
+Trường ở cấp pod áp cho mọi container; trường ở cấp container ghi đè. Bốn trường `runAsNonRoot`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]` và `seccompProfile` là yêu cầu của mức `restricted` trong Pod Security Standards; `readOnlyRootFilesystem` là lớp nên thêm. K8 dạy cách bắt buộc mức này cho cả namespace bằng Pod Security Admission; bài này dạy tự đặt cho pod của mình.
+
+<Callout kind="production">
+
+Lỗ hổng [CVE-2019-5736 của runc](https://kubernetes.io/blog/2019/02/11/runc-and-cve-2019-5736/) cho phép tiến trình trong container ghi đè file thực thi `runc` trên node, tức thoát khỏi container và chiếm node. Điều kiện khai thác: tiến trình trong container chạy bằng **UID 0**. Cụm nào đã ép container chạy non-root thì không dính, trước cả khi có bản vá. Đó là lý do "không chạy root" là lớp phòng thủ đáng làm dù image của bạn không có lỗi: nó vô hiệu hoá trước cả những lỗ hổng runtime chưa ai tìm ra mà cần quyền root để khai thác. Nó không thay cho việc vá runtime và kernel.
+
+</Callout>
+
+<Check id="k2.4.securitycontext-truong">Nói được tác dụng của `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation`, `capabilities.drop` và `seccompProfile`, và trường nào đặt ở cấp pod, trường nào ở cấp container.</Check>
+
+### NetworkPolicy: tường lửa giữa các pod
+
+Mặc định mọi pod trong cụm gọi được mọi pod khác, ở mọi namespace. **NetworkPolicy** là danh sách cho phép, hoạt động theo bốn quy tắc:
+
+1. Pod **không** được policy nào chọn: mọi traffic được phép (như mặc định).
+2. Pod được ít nhất một policy chọn theo một chiều (`Ingress` hoặc `Egress`): chiều đó chuyển sang **chặn hết**, chỉ mở những gì các policy liệt kê.
+3. Nhiều policy cùng chọn một pod thì **cộng dồn** (hợp). Không có rule cấm, không có thứ tự ưu tiên.
+4. Policy có trạng thái: kết nối đã được phép thì gói trả lời tự được phép, không cần rule chiều ngược lại.
+
+```text
+ namespace k2-np
+ +---------------------------------------------------------------+
+ |  default-deny-ingress: podSelector {}  ->  chọn MỌI pod, không mở gì
+ |
+ |  [frontend] --8080--> [web]       allow-frontend: chọn pod app=web,
+ |  role=frontend        app=web     mở cho pod role=frontend, cổng 8080
+ |
+ |  [khac]     --8080--X [web]       không policy nào mở cho role=other
+ +---------------------------------------------------------------+
+        ^
+        |  kube-system/CoreDNS :53   <- quên mở chiều egress này thì
+        +---------------------------    mọi lời gọi theo tên đều hỏng
+```
+
+Ba điều hay gây lỗi:
+
+- **API server nhận policy không có nghĩa là có ai thực thi.** NetworkPolicy do CNI thực thi. Calico, Cilium làm, kindnet của cụm lab cũng làm; một số CNI đơn giản như Flannel thì không, và policy nằm đó vô tác dụng mà không có cảnh báo nào. Luôn thử bằng một kết nối thật.
+- **Hai selector trong một phần tử `from` là VÀ; hai phần tử là HOẶC.** Chỉ khác nhau một dấu gạch đầu dòng trong YAML. Bước 4 của lab tái hiện lỗi này.
+- **Cổng trong policy là cổng của pod**, không phải cổng của Service. Policy được xét sau khi kube-proxy đã đổi địa chỉ đích (K2.1), lúc đó gói mang cổng `targetPort`.
+
+<Check id="k2.4.networkpolicy-quy-tac">Kể được bốn quy tắc của NetworkPolicy và giải thích được vì sao policy "default deny" chỉ cần `podSelector: {}` mà không cần rule nào.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Configure a Security Context for a Pod or Container | Kubernetes](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/): ví dụ chạy được cho từng trường của `securityContext`.
+- [Pod Security Standards | Kubernetes](https://kubernetes.io/docs/concepts/security/pod-security-standards/): ba mức privileged, baseline, restricted và trường nào thuộc mức nào.
+- [Network Policies | Kubernetes](https://kubernetes.io/docs/concepts/services-networking/network-policies/): mục "Behavior of to and from selectors" giải thích VÀ với HOẶC, và các policy mặc định mẫu.
+- [Runc and CVE-2019-5736 | Kubernetes](https://kubernetes.io/blog/2019/02/11/runc-and-cve-2019-5736/): một lỗ hổng thoát container có thật và vì sao container non-root không dính.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Cụm `k2-lab` của K2.1 đang chạy (kind 0.33, Kubernetes 1.37, CNI mặc định kindnet). Bài này **chỉ dùng lại cụm và thư mục `~/masteva-k2`**, không dùng namespace nào của các bài trước. Nếu đã xoá cụm, làm lại bước 1 của K2.1.
+- **Profile máy:** các pod của bài rất nhẹ; `docker stats` báo hai node dùng tổng cộng khoảng 1,6 GiB RAM. Máy 8 GB: Docker Desktop 4 GB là đủ.
+- Tên pod trong output của bạn sẽ khác.
+
+### 1. SecurityContext: pod mặc định và pod chặt chẽ
+
+Hai pod cùng image: `mac-dinh` tạo bằng `kubectl run` không cấu hình gì, `chat-che` đặt đủ các trường trong bảng ở phần Kiến thức:
+
+<Terminal where="mac" title="~/masteva-k2/sc.yaml">
+
+```bash
+cd ~/masteva-k2
+kubectl create namespace k2-sec
+kubectl -n k2-sec run mac-dinh --image=busybox:1.38.0 -- sleep infinity
+cat > sc.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: chat-che
+  namespace: k2-sec
+spec:
+  securityContext:                  # cấp pod: áp cho mọi container
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sleep", "infinity"]
+      securityContext:              # cấp container
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp           # chỗ duy nhất được ghi
+  volumes:
+    - name: tmp
+      emptyDir: {}
+EOF
+kubectl apply -f sc.yaml
+kubectl -n k2-sec wait --for=condition=Ready pod --all --timeout=120s
+cat > kiem-sc.sh <<'EOF'
+#!/bin/sh
+# In ra danh tính, capability và thử ba thao tác trong pod $1
+kubectl -n k2-sec exec "$1" -- sh -c '
+  id
+  grep -E "^(CapEff|NoNewPrivs|Seccomp):" /proc/1/status
+  touch /etc/thu 2>&1 && echo "ghi /etc: được"
+  echo x > /tmp/f && echo "ghi /tmp: được"
+  chown 65534 /tmp/f 2>&1 && echo "chown: được"
+  true'
+EOF
+chmod +x kiem-sc.sh
+./kiem-sc.sh mac-dinh; echo; ./kiem-sc.sh chat-che
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+uid=0(root) gid=0(root) groups=0(root),10(wheel)
+CapEff:	00000000a80425fb
+NoNewPrivs:	0
+Seccomp:	0
+ghi /etc: được
+ghi /tmp: được
+chown: được
+
+uid=10001 gid=10001 groups=10001
+CapEff:	0000000000000000
+NoNewPrivs:	1
+Seccomp:	2
+touch: /etc/thu: Read-only file system
+ghi /tmp: được
+chown: /tmp/f: Operation not permitted
+```
+
+</Expected>
+
+Đọc từng dòng của hai pod:
+
+| Dòng | `mac-dinh` | `chat-che` | Do trường nào |
+|---|---|---|---|
+| `id` | root | UID 10001 | `runAsUser`, `runAsGroup` |
+| `CapEff` | `a80425fb`: 14 capability mặc định | `0`: không còn capability nào | `capabilities.drop: ["ALL"]` |
+| `NoNewPrivs` | 0 | 1 | `allowPrivilegeEscalation: false` |
+| `Seccomp` | 0: không lọc syscall | 2: đang lọc | `seccompProfile: RuntimeDefault` |
+| Ghi `/etc` | Được | `Read-only file system` | `readOnlyRootFilesystem: true` |
+| Ghi `/tmp` | Được | Được, nhờ `emptyDir` | Volume luôn ghi được |
+| `chown` | Được | `Operation not permitted` | Không còn `CAP_CHOWN` |
+
+<Check id="k2.4.lab-securitycontext">So sánh được pod mặc định với pod đặt đủ SecurityContext qua `id`, `/proc/1/status` và ba thao tác ghi, và nói được dòng nào do trường nào.</Check>
+
+### 2. `runAsNonRoot` với image chạy root
+
+<Predict question="Một pod có `runAsNonRoot: true` nhưng không ghi `runAsUser`, dùng image `busybox` (không có lệnh `USER`). Chuyện gì xảy ra?">
+
+Pod được tạo nhưng container không bao giờ khởi động, trạng thái `CreateContainerConfigError`. `runAsNonRoot` không đổi UID; nó chỉ là một phép kiểm của kubelet. Image không khai `USER` nghĩa là chạy root, và kubelet từ chối. Sửa bằng cách thêm `runAsUser`, hoặc tốt hơn là đặt `USER` bằng số trong Dockerfile (D5).
+
+</Predict>
+
+<Terminal where="mac" title="~/masteva-k2/sc-nonroot-loi.yaml">
+
+```bash
+cat > sc-nonroot-loi.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nonroot-loi
+  namespace: k2-sec
+spec:
+  securityContext:
+    runAsNonRoot: true        # đòi non-root nhưng không nói chạy bằng UID nào
+  containers:
+    - name: app
+      image: busybox:1.38.0   # image không có USER, mặc định là root
+      command: ["sleep", "infinity"]
+EOF
+kubectl apply -f sc-nonroot-loi.yaml && sleep 8
+kubectl -n k2-sec get pod nonroot-loi
+kubectl -n k2-sec get events --field-selector involvedObject.name=nonroot-loi,reason=Failed \
+  -o custom-columns=MESSAGE:.message | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME          READY   STATUS                       RESTARTS   AGE
+nonroot-loi   0/1     CreateContainerConfigError   0          8s
+Error: container has runAsNonRoot and image will run as root (pod: "nonroot-loi_k2-sec(2276b5b1-7851-4c9d-b72e-75bf8f36d907)", container: app)
+```
+
+</Expected>
+
+`runAsNonRoot` vì thế là lưới an toàn, không phải cách đổi user: nó bảo đảm một image lỡ chạy root sẽ **không khởi động được** thay vì âm thầm chạy root. Xoá pod lỗi:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-sec delete pod nonroot-loi --now
+```
+
+</Terminal>
+
+<Check id="k2.4.lab-nonroot">Tái hiện được `CreateContainerConfigError` của `runAsNonRoot` và nêu được hai cách sửa.</Check>
+
+### 3. Ứng dụng gãy vì `readOnlyRootFilesystem`, và cách sửa đúng
+
+`readOnlyRootFilesystem` là trường hay làm ứng dụng gãy nhất: JVM ghi vào `/tmp`, nginx ghi PID và file tạm. Thử với một nginx thật. Image `nginxinc/nginx-unprivileged` đã chạy bằng UID 101 nên qua được `runAsNonRoot`:
+
+<Terminal where="mac" title="~/masteva-k2/web-ro.yaml">
+
+```bash
+cat > web-ro.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web-ro, namespace: k2-sec}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: web-ro}
+  template:
+    metadata:
+      labels: {app: web-ro}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.30.5-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+EOF
+kubectl apply -f web-ro.yaml
+kubectl -n k2-sec wait --for=jsonpath='{.status.containerStatuses[0].restartCount}'=2 pod -l app=web-ro --timeout=120s
+kubectl -n k2-sec get pod -l app=web-ro -o jsonpath='{range .items[*].status.containerStatuses[*]}{.restartCount}{" lần khởi động lại; lần gần nhất kết thúc: "}{.lastState.terminated.reason}{", exit code "}{.lastState.terminated.exitCode}{"\n"}{end}'
+kubectl -n k2-sec logs deployment/web-ro --previous | grep emerg | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web-ro created
+pod/web-ro-856d84db4f-d9n4p condition met
+2 lần khởi động lại; lần gần nhất kết thúc: Error, exit code 1
+nginx: [emerg] mkdir() "/tmp/proxy_temp" failed (30: Read-only file system)
+```
+
+</Expected>
+
+Container khởi động, chết với exit code 1, được khởi động lại, và sẽ lặp mãi với khoảng nghỉ tăng dần; `kubectl get pods` lúc này cho thấy `STATUS` đổi qua lại giữa `Running`, `Error` và `CrashLoopBackOff`. Lệnh `wait` chờ tới lần khởi động lại thứ hai để kết quả không phụ thuộc thời điểm bạn nhìn. Log nói đúng một việc: nginx cần tạo thư mục trong `/tmp` và filesystem gốc chỉ đọc. Có hai cách "sửa". Cách sai là bỏ `readOnlyRootFilesystem`. Cách đúng là cho ứng dụng **đúng chỗ nó cần ghi**: một `emptyDir` mount vào `/tmp`, phần còn lại vẫn chỉ đọc.
+
+<Terminal where="mac">
+
+```bash
+cat >> web-ro.yaml <<'EOF'
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+EOF
+kubectl apply -f web-ro.yaml
+kubectl -n k2-sec rollout status deployment/web-ro --timeout=120s | tail -1
+kubectl -n k2-sec exec deployment/web-ro -- sh -c 'id -u; ls /tmp; touch /etc/thu'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web-ro configured
+deployment "web-ro" successfully rolled out
+101
+client_temp
+fastcgi_temp
+nginx.pid
+proxy_temp
+scgi_temp
+uwsgi_temp
+touch: /etc/thu: Read-only file system
+command terminated with exit code 1
+```
+
+</Expected>
+
+nginx chạy bằng UID 101, tạo được các thư mục tạm và file PID trong `/tmp`, và mọi chỗ khác vẫn không ghi được. Quy trình chung cho một ứng dụng bất kỳ: bật `readOnlyRootFilesystem`, đọc log xem nó gãy ở đường dẫn nào, mount `emptyDir` vào đúng đường dẫn đó, lặp lại tới khi chạy. K3.2 đưa đúng cấu hình này vào một Helm chart.
+
+<Check id="k2.4.lab-readonly">Tái hiện được ứng dụng gãy vì `readOnlyRootFilesystem`, tìm được đường dẫn cần ghi từ log, và sửa bằng `emptyDir` mà không nới lỏng SecurityContext.</Check>
+
+### 4. NetworkPolicy: chặn mặc định rồi mở từng đường
+
+Một Deployment `web` và ba pod gọi tới nó: `frontend` (`role=frontend`) và `khac` (`role=other`) cùng namespace, và một `frontend` ở namespace `k2-np-ngoai`. Phần này tạo bằng lệnh cho gọn; thứ cần đọc kỹ là các policy.
+
+<Terminal where="mac" title="Ứng dụng thử và ~/masteva-k2/thu.sh">
+
+```bash
+kubectl create namespace k2-np
+kubectl create namespace k2-np-ngoai
+kubectl -n k2-np create deployment web --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 \
+  --port=8080 -- /agnhost netexec --http-port=8080
+kubectl -n k2-np expose deployment web --port=80 --target-port=8080
+IMG=curlimages/curl:8.22.0
+kubectl -n k2-np       run frontend --image=$IMG --labels=role=frontend -- sleep infinity
+kubectl -n k2-np       run khac     --image=$IMG --labels=role=other    -- sleep infinity
+kubectl -n k2-np-ngoai run frontend --image=$IMG --labels=role=frontend -- sleep infinity
+cat > thu.sh <<'EOF'
+#!/bin/sh
+# Gọi web.k2-np từ ba pod; in mã HTTP và exit code của curl
+for src in k2-np/frontend k2-np/khac k2-np-ngoai/frontend; do
+  ns=${src%/*}; pod=${src#*/}
+  code=$(kubectl -n "$ns" exec "$pod" -- curl -s -m 2 -o /dev/null -w '%{http_code}' http://web.k2-np/hostname 2>/dev/null)
+  printf '%-22s http=%s exit=%s\n' "$src" "$code" "$?"
+done
+EOF
+chmod +x thu.sh
+kubectl -n k2-np rollout status deployment/web
+kubectl -n k2-np wait --for=condition=Ready pod --all --timeout=120s
+kubectl -n k2-np-ngoai wait --for=condition=Ready pod --all --timeout=120s
+sleep 5   # chờ kube-proxy ghi luật cho Service mới (như bước 2 của K2.1)
+./thu.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k2-np/frontend         http=200 exit=0
+k2-np/khac             http=200 exit=0
+k2-np-ngoai/frontend   http=200 exit=0
+```
+
+</Expected>
+
+Chưa có policy nào: cả ba đều gọi được, kể cả pod ở namespace khác. `thu.sh` là phép thử dùng suốt phần còn lại; `exit=28` của `curl` nghĩa là hết thời gian chờ. Bật chặn mặc định cho mọi ingress vào `k2-np`:
+
+<Terminal where="mac" title="~/masteva-k2/np-deny.yaml">
+
+```bash
+cat > np-deny.yaml <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: k2-np
+spec:
+  podSelector: {}          # rỗng = mọi pod trong namespace
+  policyTypes: ["Ingress"] # không liệt kê rule ingress nào = chặn hết
+EOF
+kubectl apply -f np-deny.yaml
+sleep 2   # CNI cần khoảng một giây để áp policy
+./thu.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k2-np/frontend         http=000 exit=28
+k2-np/khac             http=000 exit=28
+k2-np-ngoai/frontend   http=000 exit=28
+```
+
+</Expected>
+
+Cả ba bị chặn: CNI của cụm đang thực thi policy. Lệnh `sleep 2` sau mỗi lần `apply` là có lý do: policy là một object trong API server, CNI trên từng node phải nhận được nó rồi mới cài luật, nên có độ trễ khoảng một giây giữa `apply` và lúc policy có hiệu lực. Thử ngay lập tức có thể cho kết quả của trạng thái cũ. Gói bị **bỏ im lặng** nên client chờ hết giờ, không nhận được "connection refused"; trên production, lỗi do NetworkPolicy luôn có dạng timeout. Giờ mở đường với yêu cầu: **chỉ pod `role=frontend`, ở namespace nào cũng được, mới gọi được `web` cổng 8080.** Bản đầu tiên viết sai một cách rất phổ biến:
+
+<Terminal where="mac" title="~/masteva-k2/np-allow-sai.yaml">
+
+```bash
+cat > np-allow-sai.yaml <<'EOF'
+# Bản SAI: hai phần tử (hai dấu "-") trong "from" là HOẶC
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend
+  namespace: k2-np
+spec:
+  podSelector:
+    matchLabels: {app: web}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector: {}        # mọi namespace
+        - podSelector:
+            matchLabels: {role: frontend}
+      ports:
+        - {protocol: TCP, port: 8080}
+EOF
+kubectl apply -f np-allow-sai.yaml
+sleep 2   # CNI cần khoảng một giây để áp policy
+./thu.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k2-np/frontend         http=200 exit=0
+k2-np/khac             http=200 exit=0
+k2-np-ngoai/frontend   http=200 exit=0
+```
+
+</Expected>
+
+`khac` không phải frontend mà vẫn vào được. Phần tử thứ nhất (`namespaceSelector: {}`) tự nó đã mở cho **mọi pod của mọi namespace**; phần tử thứ hai trở nên thừa. Policy này vô hiệu hoá luôn default deny vừa đặt. Bản đúng gộp hai selector vào **một** phần tử, tức bỏ đúng một dấu `-` trước `podSelector`, để chúng thành VÀ:
+
+<Terminal where="mac" title="~/masteva-k2/np-allow.yaml">
+
+```bash
+sed -e 's/        - podSelector:/          podSelector:/' \
+    -e '1s/.*/# Bản ĐÚNG: một phần tử chứa cả hai selector là VÀ/' np-allow-sai.yaml > np-allow.yaml
+diff np-allow-sai.yaml np-allow.yaml
+kubectl apply -f np-allow.yaml
+sleep 2   # CNI cần khoảng một giây để áp policy
+./thu.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1c1
+< # Bản SAI: hai phần tử (hai dấu "-") trong "from" là HOẶC
+---
+> # Bản ĐÚNG: một phần tử chứa cả hai selector là VÀ
+14c14
+<         - podSelector:
+---
+>           podSelector:
+networkpolicy.networking.k8s.io/allow-frontend configured
+k2-np/frontend         http=200 exit=0
+k2-np/khac             http=000 exit=28
+k2-np-ngoai/frontend   http=200 exit=0
+```
+
+</Expected>
+
+Hai file khác nhau đúng một ký tự có nghĩa, và `kubectl apply` nhận cả hai không cảnh báo gì. Chỉ phép thử `khac` phải bị chặn mới phân biệt được. Thêm một quy tắc cần nhớ: `podSelector` đứng **một mình** trong `from` (không kèm `namespaceSelector`) chỉ xét pod cùng namespace với policy; muốn chọn pod ở namespace khác thì luôn phải có `namespaceSelector` đi kèm.
+
+<Check id="k2.4.lab-networkpolicy-ingress">Áp được default deny, chứng minh nó có hiệu lực bằng `curl` trước và sau, và sửa được policy viết nhầm HOẶC thành VÀ.</Check>
+
+### 5. Egress và DNS
+
+<Predict question="Thêm default deny cho egress của mọi pod trong `k2-np`. `frontend` gọi `http://web.k2-np` sẽ lỗi ở bước nào: kết nối tới web, hay sớm hơn?">
+
+Sớm hơn: ở bước phân giải tên. Truy vấn DNS tới CoreDNS trong `kube-system` cũng là egress và bị chặn, nên `curl` báo `Resolving timed out` trước khi kịp mở kết nối nào. Mở egress tới `web` mà quên DNS thì lời gọi theo tên vẫn hỏng.
+
+</Predict>
+
+<Terminal where="mac" title="~/masteva-k2/np-deny-egress.yaml">
+
+```bash
+sed -e 's/ingress/egress/g' -e 's/Ingress/Egress/' np-deny.yaml > np-deny-egress.yaml
+kubectl apply -f np-deny-egress.yaml
+sleep 2
+./thu.sh
+kubectl -n k2-np exec frontend -- curl -sS -m 2 -o /dev/null http://web.k2-np/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k2-np/frontend         http=000 exit=28
+k2-np/khac             http=000 exit=28
+k2-np-ngoai/frontend   http=200 exit=0
+curl: (28) Resolving timed out after 2002 milliseconds
+command terminated with exit code 28
+```
+
+</Expected>
+
+`frontend` ở `k2-np-ngoai` không bị ảnh hưởng: policy egress chỉ áp cho pod trong `k2-np`. Mở hai đường: DNS cho mọi pod, và `frontend` tới `web`.
+
+<Terminal where="mac" title="~/masteva-k2/np-allow-egress.yaml">
+
+```bash
+cat > np-allow-egress.yaml <<'EOF'
+# Cho mọi pod trong k2-np hỏi DNS ở CoreDNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: k2-np
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# Cho frontend gọi web. Cổng là cổng của POD (8080), không phải của Service (80)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-to-web
+  namespace: k2-np
+spec:
+  podSelector:
+    matchLabels: {role: frontend}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {app: web}
+      ports:
+        - {protocol: TCP, port: 8080}
+EOF
+kubectl apply -f np-allow-egress.yaml
+sleep 2
+./thu.sh
+kubectl -n k2-np exec frontend -- curl -sS -m 3 -o /dev/null https://example.com
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k2-np/frontend         http=200 exit=0
+k2-np/khac             http=000 exit=28
+k2-np-ngoai/frontend   http=200 exit=0
+curl: (28) Connection timed out after 3003 milliseconds
+command terminated with exit code 28
+```
+
+</Expected>
+
+`frontend` gọi được `web`, nhưng không mở được kết nối trực tiếp ra Internet: lần này `curl` phân giải được tên rồi mới hết giờ ở bước kết nối. Một pod bị chiếm trong namespace này không tải được công cụ từ ngoài về qua HTTP. Đừng kết luận quá: truy vấn DNS qua CoreDNS vẫn đi được, và CoreDNS chuyển tiếp ra ngoài, nên dữ liệu vẫn có thể rò qua DNS; chặn đường đó cần policy theo tên miền ở K6. `frontend` gọi `web` qua Service cổng 80, nhưng policy ghi `8080`: trong lab, đổi số đó thành `80` thì dòng đầu của `thu.sh` trở lại `http=000 exit=28`.
+
+<Check id="k2.4.lab-networkpolicy-egress">Áp được default deny egress, giải thích được vì sao lỗi đầu tiên là DNS, và mở lại đúng DNS cùng một đường egress tới cổng của pod.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `CreateContainerConfigError` | `runAsNonRoot` với image chạy root | `kubectl describe pod`, đọc event |
+| `CrashLoopBackOff` sau khi bật `readOnlyRootFilesystem` | Ứng dụng cần ghi vào một thư mục chưa có volume | `kubectl logs`, tìm `Read-only file system` kèm đường dẫn; mount `emptyDir` vào đó |
+| `Operation not permitted` khi ứng dụng mở cổng dưới 1024 hoặc `chown` | Đã bỏ capability mà ứng dụng cần | Đổi ứng dụng sang cổng cao; chỉ thêm lại đúng capability cần (`add: ["NET_BIND_SERVICE"]`) khi không còn cách khác |
+| Policy đã apply nhưng không chặn gì | CNI không thực thi NetworkPolicy; hoặc `podSelector` không khớp pod nào; hoặc thử quá sớm sau `apply` | `kubectl -n <ns> get networkpolicy`, cột `POD-SELECTOR`; thử lại `curl` sau vài giây |
+| Mọi lời gọi theo tên timeout sau khi bật egress | Chưa mở DNS (UDP và TCP 53 tới CoreDNS) | `curl -sS` báo `Resolving timed out` |
+| Đã mở egress tới Service mà vẫn timeout | Policy ghi cổng của Service thay vì cổng của pod | So cổng trong policy với `targetPort` |
+
+### Dọn dẹp
+
+Đây là bài cuối của chặng K2.
+
+<Callout kind="danger">
+
+Khối lệnh đầu xoá ba namespace của bài cùng mọi thứ trong đó. Khối thứ hai xoá cả cụm `k2-lab` và thư mục lab; **giữ cụm nếu học tiếp K3.1**, bài đó chạy được ngay trên cụm này.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K3">
+
+```bash
+kubectl delete namespace k2-sec k2-np k2-np-ngoai
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi không học tiếp K3">
+
+```bash
+kind delete cluster --name k2-lab
+rm -rf ~/masteva-k2
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Root mà không có capability thì còn làm được gì?">
+
+Ít hơn nhiều người nghĩ. Thử ngay trên cụm lab với một pod chạy UID 0 nhưng bỏ hết capability:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-sec run root-khong-cap --image=busybox:1.38.0 --restart=Never \
+  --overrides='{"spec":{"containers":[{"name":"root-khong-cap","image":"busybox:1.38.0","command":["sleep","infinity"],"securityContext":{"capabilities":{"drop":["ALL"]}}}]}}'
+kubectl -n k2-sec wait --for=condition=Ready pod/root-khong-cap --timeout=60s
+kubectl -n k2-sec exec root-khong-cap -- sh -c 'id -u; grep CapEff /proc/1/status; echo x > /tmp/f; chown 65534 /tmp/f'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/root-khong-cap created
+pod/root-khong-cap condition met
+0
+CapEff:	0000000000000000
+chown: /tmp/f: Operation not permitted
+command terminated with exit code 1
+```
+
+</Expected>
+
+Từ lâu Linux đã tách quyền của root thành các capability; UID 0 không có capability chỉ còn là chủ của các file thuộc root, và `chown` bị từ chối dù đang là root. Nhưng nó vẫn nguy hiểm hơn một UID thường: nhiều file nhạy cảm thuộc root, và các lỗ hổng thoát container như CVE-2019-5736 kiểm UID chứ không kiểm capability. Vì vậy hai lớp đi cùng nhau: bỏ capability **và** không chạy root.
+
+</Reveal>
+
+<Reveal title="Tự đặt SecurityContext cho từng pod và Pod Security Admission khác nhau thế nào?">
+
+`securityContext` là thứ **bạn viết** trong pod spec; quên viết thì pod chạy với mặc định rộng. Pod Security Admission là thứ **cụm kiểm**: gắn label `pod-security.kubernetes.io/enforce: restricted` lên một namespace thì API server từ chối mọi pod không đạt mức đó ngay lúc tạo, kèm thông báo thiếu trường nào. Hai thứ bổ sung cho nhau: đội ứng dụng viết SecurityContext đúng như bài này, đội nền tảng bật admission để không pod nào lọt lưới. Chế độ `warn` và `audit` của admission cho phép xem trước cái gì sẽ bị chặn mà chưa chặn thật. K8 làm phần đó, cùng các policy tuỳ biến hơn.
+
+</Reveal>
+
+<Reveal title="NetworkPolicy có chặn được traffic từ chính node không?">
+
+Không, với node đang chạy pod đó. Tài liệu Kubernetes ghi rõ: khi một pod bị cô lập chiều ingress, kết nối từ **node của chính nó** vẫn luôn được phép, vì kubelet cần gọi probe (K1.3). Hệ quả: tiến trình trên node có thể đi vòng qua policy của bạn; với pod dùng `hostNetwork: true`, cách xử lý tuỳ từng CNI. NetworkPolicy cũng chỉ làm việc ở tầng 3 và 4 (IP, cổng): không lọc được theo đường dẫn HTTP hay tên miền đích. Những nhu cầu đó cần policy mở rộng của CNI (Cilium, Calico) ở K6 hoặc service mesh ở K11.
+
+</Reveal>
+
+<Reveal title="Làm sao biết CNI của một cụm có thực thi NetworkPolicy không?">
+
+Không có trường nào trong API nói điều đó: `kubectl apply` một NetworkPolicy luôn thành công, kể cả trên cụm mà CNI bỏ qua nó hoàn toàn. Cách duy nhất đáng tin là phép thử của bài này: một pod phải bị chặn, áp default deny, rồi `curl` và thấy timeout. Nên biến phép thử đó thành một kiểm tra chạy định kỳ hoặc sau mỗi lần nâng cấp CNI, vì một bản cập nhật cấu hình CNI sai có thể tắt việc thực thi mà không pod nào báo lỗi. Trên cụm lab, kindnet của kind 0.33 thực thi được; trên production, Calico và Cilium là hai lựa chọn phổ biến và có thêm policy riêng mạnh hơn chuẩn (K6).
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI sinh SecurityContext và NetworkPolicy rất nhanh, và sai theo những cách khó thấy bằng mắt. Hay gặp: thêm `runAsNonRoot` mà không kiểm image chạy UID nào; gặp `Read-only file system` thì khuyên bỏ `readOnlyRootFilesystem` thay vì mount `emptyDir`; thêm `privileged: true` hoặc `capabilities.add: ["SYS_ADMIN"]` để "sửa" lỗi quyền; NetworkPolicy đặt nhầm dấu `-` biến VÀ thành HOẶC như bước 4; quên rule DNS cho egress; ghi cổng của Service thay cho cổng của pod. Đừng duyệt bằng cách đọc YAML. Yêu cầu AI viết kèm phép thử, rồi tự chạy: `id` và `/proc/1/status` trong pod, một lệnh `curl` từ pod được phép và một từ pod phải bị chặn.
+
+</Callout>
+
+<Callout kind="link">
+
+K3.2 đưa đúng bộ SecurityContext của bài này vào template của một Helm chart. K2.1 giải thích vì sao policy phải ghi cổng của pod, K2.3 là lớp quyền trên API server đi cùng hai lớp ở đây. K6 dạy policy theo tên miền, kiểm soát egress ra Internet và CNI Cilium. K8 ép SecurityContext cho cả cụm bằng Pod Security Admission, thêm seccomp, AppArmor và phát hiện tấn công lúc chạy. D5 là nền về namespace, cgroup, capability và lệnh `USER` trong Dockerfile.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k2.4.mastery-securitycontext">Tự viết được pod spec chạy non-root, filesystem gốc chỉ đọc, bỏ hết capability, và sửa được ứng dụng gãy vì cần ghi file tạm.</Check>
+
+<Check id="k2.4.mastery-networkpolicy">Tự viết được bộ NetworkPolicy "chặn mặc định, mở từng đường" cho một namespace, gồm cả DNS, và kiểm bằng `curl` từ pod được phép lẫn pod bị chặn.</Check>
+
+<Check id="k2.4.mastery-gioi-han">Nói được SecurityContext và NetworkPolicy **không** chặn được gì (lỗ hổng không cần root, traffic từ node, rò dữ liệu qua DNS), và lớp nào ở chặng sau lo phần đó.</Check>
+
+</Mastery>

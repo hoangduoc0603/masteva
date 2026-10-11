@@ -34,7 +34,7 @@ Báo cáo chi tiết (nguồn, bảng phiên bản, số đo) nằm ở [researc
 | **Vận hành dữ liệu stateful** (Postgres HA, PITR có kiểm tra tự động, Kafka 4 KRaft) | GitLab 2017 có 5 cơ chế backup nhưng không cái nào khôi phục được; Atlassian 2022 mất 14 ngày | SRE Workbook, SAP-C02 |
 | **Observability ở quy mô** (lưu dài hạn, cardinality, tail sampling, chi phí log, meta-monitoring) | Roblox 2021 mất 73 giờ một phần vì hệ thống giám sát phụ thuộc chính hệ thống bị sập | PCA, OTCA, Google Pro |
 | **Cloud ở quy mô tổ chức** (landing zone, nhiều account, SCP, IAM Identity Center, hybrid) | SAP-C02 Domain 1 chiếm 26%; ngân hàng Việt Nam chạy hybrid | SAP-C02, Google Section 1 |
-| **Identity thay cho secret tĩnh** (OIDC từ CI, workload identity, ghim action theo SHA) | CircleCI 2023, tj-actions 2025, Trivy action 03/2026 (75/76 tag bị chiếm) | CKS, DOP-C02 |
+| **Identity thay cho secret tĩnh** (OIDC từ CI, workload identity, ghim action theo SHA) | CircleCI 2023, tj-actions 2025, Trivy action 03/2026 (76/77 tag bị chiếm, theo GHSA-69fq-xp46-6x23) | CKS, DOP-C02 |
 | **Mạng ở quy mô** (LB L4/L7, DNS, CDN, anycast mức khái niệm, CNI/eBPF, egress) | CNCF vừa ra chứng chỉ CKNE riêng cho mảng này (01/10/2026) | CKNE, CCA |
 | **Giới hạn blast radius** (failure domain, cell, shuffle sharding, static stability) | Cách AWS, Slack, DoorDash giới hạn phạm vi sự cố | AWS Builders' Library |
 | **Quản lý sự cố đầy đủ** (vai trò IC, giao tiếp, runbook, game day) | DOP-C02 Domain 5 chiếm 14% | DOP-C02, Google 3.3 |

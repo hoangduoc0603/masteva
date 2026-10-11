@@ -1,0 +1,983 @@
+---
+title: Kiến trúc cụm, Pod, ReplicaSet và Deployment
+description: Cụm Kubernetes gồm những thành phần nào và chúng nói chuyện với nhau ra sao; vì sao xoá một pod thì pod khác mọc lên; rollout thay pod theo thứ tự nào, hỏng thì dừng ở đâu, và quay lại bản cũ bằng cách nào.
+id: d11.1
+step: d11
+prerequisites: [d6.1]
+topics: [d11.kien-truc-cum, d11.pod-deployment-replicaset]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trên Docker Desktop)
+  tools:
+    kubernetes: 1.37.0
+    kind: 0.33.0
+    kubectl: 1.37.1
+    docker: 29.8.0
+    containerd: 2.3.4
+    agnhost: '2.61'
+    yq: 4.54.1
+---
+
+<Goal>
+
+Hiểu Kubernetes làm việc theo mô hình nào trước khi viết manifest: bạn khai báo trạng thái mong muốn, các controller tự kéo thực tế về đúng trạng thái đó. Học xong bài này, bạn giải thích được:
+
+- Vì sao `kubectl delete pod` một pod của Deployment thì vài giây sau có pod khác thay, còn pod tạo bằng `kubectl run` thì mất hẳn.
+- Vì sao một lần deploy image sai tag không làm sập service, nhưng cũng không tự quay về bản cũ.
+- Vì sao sáng hôm sau `kubectl get events` không còn dấu vết gì của sự cố đêm qua.
+
+</Goal>
+
+<Knowledge>
+
+### Khai báo trạng thái, không ra lệnh từng bước
+
+Với Docker ở D5, bạn ra lệnh: `docker run` thì có container, container chết thì bạn (hoặc `--restart`) chạy lại. Kubernetes đổi cách làm việc: bạn gửi lên một **object** mô tả điều mình muốn, ví dụ "luôn có 3 bản của image này", và hệ thống chịu trách nhiệm giữ điều đó đúng.
+
+Mỗi object có hai nửa:
+
+| Phần | Ai ghi | Ý nghĩa |
+|---|---|---|
+| `spec` | Bạn | Trạng thái **mong muốn** (desired state) |
+| `status` | Kubernetes | Trạng thái **thực tế** nó quan sát được |
+
+Một **controller** là một vòng lặp chạy mãi: đọc `spec`, đọc thực tế, thấy lệch thì làm một việc để giảm độ lệch, rồi lặp lại. Vòng lặp đó gọi là **reconcile** (đối chiếu và sửa).
+
+```text
+        ┌──────────────── quan sát ────────────────┐
+        v                                          |
+  spec: 3 pod  ──so sánh──>  thực tế: 2 pod  ──> hành động: tạo 1 pod
+        ^                                          |
+        └──────────── thực tế đổi, lặp lại ────────┘
+```
+
+Controller không nhớ "đã có chuyện gì xảy ra", nó chỉ nhìn "bây giờ đang thế nào". Vì vậy nó chịu được việc chính nó bị khởi động lại, mất một sự kiện, hay ai đó sửa tay: lần lặp sau vẫn thấy độ lệch và sửa. Đổi lại, mọi thay đổi bạn làm tay lên thứ một controller đang quản lý sẽ bị ghi đè (lab bước 5).
+
+<Check id="d11.1.reconcile">Giải thích được `spec`, `status` và vòng reconcile, và vì sao sửa tay một object do controller quản lý thì bị ghi đè.</Check>
+
+### Các thành phần của cụm
+
+Một cụm (cluster) gồm **control plane** ra quyết định và các **node** chạy container.
+
+```text
+                        CONTROL PLANE
+  kubectl ──HTTPS──> kube-apiserver <──────> etcd
+                       ^    ^    ^           (chỉ API server đọc ghi etcd)
+            watch, ghi |    |    | watch, ghi
+     kube-controller-manager    kube-scheduler
+     (deployment, replicaset,   (chọn node cho pod
+      job, node... controller)   chưa có nodeName)
+                            ^
+  ──────────────────────────┼──────────────────────────────────
+  NODE                      | watch pod của node mình, báo status
+                         kubelet ──CRI──> containerd ──> container
+                         kube-proxy (luật mạng cho Service)
+```
+
+| Thành phần | Chạy ở | Việc của nó |
+|---|---|---|
+| `kube-apiserver` | Control plane | Cửa duy nhất vào cụm: xác thực, kiểm quyền, kiểm hợp lệ, rồi đọc ghi object. Mọi thành phần khác đều là client của nó |
+| `etcd` | Control plane | Kho key-value lưu toàn bộ object. Mất etcd là mất cụm (K4 dạy sao lưu) |
+| `kube-scheduler` | Control plane | Thấy pod chưa có node thì lọc node đủ điều kiện, chấm điểm, ghi tên node vào pod |
+| `kube-controller-manager` | Control plane | Một tiến trình chứa vài chục controller: Deployment, ReplicaSet, Job, Node... |
+| `kubelet` | Mọi node | Thấy pod được gán cho node mình thì tạo container, chạy probe, báo `status` |
+| Container runtime | Mọi node | Kéo image, tạo container theo lệnh của kubelet qua giao diện **CRI**. Phổ biến nhất là containerd |
+| `kube-proxy` | Mọi node | Viết luật mạng trên node để địa chỉ của Service dẫn tới đúng pod (K2 đi sâu) |
+
+Ba điều rút ra từ sơ đồ:
+
+- **Không thành phần nào gọi thẳng thành phần khác.** Scheduler không "bảo" kubelet chạy pod; nó ghi `nodeName` vào pod qua API server, kubelet đang **watch** (giữ kết nối để nhận thay đổi) thấy và tự làm. Nhờ vậy một thành phần chết không kéo theo thành phần khác.
+- **Control plane chết thì ứng dụng vẫn chạy.** Container đang chạy do kubelet và containerd giữ. Thứ mất đi là khả năng thay đổi: không deploy được, pod chết trên node khác không được thay.
+- **Khi control plane có nhiều bản, `kube-controller-manager` và `kube-scheduler` vẫn chỉ có một bản làm việc**, chọn bằng leader election qua object `Lease` (xem bằng `kubectl -n kube-system get lease`). Bản đang giữ quyền mà không gia hạn kịp sẽ tự thoát để bản khác thay.
+
+Trên cloud, control plane còn có `cloud-controller-manager` để tạo load balancer, ổ đĩa của nhà cung cấp. Ngoài ra cụm nào cũng có add-on: DNS nội bộ (CoreDNS) và plugin mạng **CNI** cấp IP cho pod (kind dùng kindnet).
+
+<Check id="d11.1.components">Kể được việc của API server, etcd, scheduler, controller manager, kubelet, container runtime, kube-proxy, và nói được chuyện gì còn chạy khi control plane chết.</Check>
+
+### Từ `kubectl apply` tới container đang chạy
+
+Khi bạn `kubectl apply` một Deployment 3 bản, chuỗi sau diễn ra, mỗi bước là một controller phản ứng với thứ bước trước vừa ghi:
+
+```text
+ 1. kubectl apply          API server xác thực, kiểm quyền, kiểm hợp lệ, ghi Deployment vào etcd
+ 2. deployment controller  thấy Deployment mới            -> tạo ReplicaSet web-5b76b7f6f
+ 3. replicaset controller  thấy ReplicaSet cần 3, có 0    -> tạo 3 Pod (chưa có nodeName)
+ 4. scheduler              thấy Pod chưa có node          -> ghi nodeName cho từng Pod
+ 5. kubelet trên node đó   thấy Pod của mình              -> gọi containerd kéo image, tạo container
+ 6. kubelet                báo status Running, Ready      -> API server ghi vào etcd
+```
+
+Chuỗi này giải thích cách gỡ lỗi: pod kẹt ở đâu thì hỏi thành phần của bước đó. Pod `Pending` không có node là việc của scheduler (bước 4); pod có node mà `ImagePullBackOff` là việc của kubelet và registry (bước 5).
+
+<Check id="d11.1.apply-flow">Kể được 6 bước từ `kubectl apply` tới lúc container chạy, và thành phần nào làm bước nào.</Check>
+
+### Pod
+
+**Pod** là đơn vị nhỏ nhất Kubernetes lên lịch: một hoặc vài container luôn chạy cùng node, chung một network namespace (chung IP, gọi nhau qua `localhost`) và có thể chung volume. D5.1 đã nói về namespace của Linux; ở đây kubelet tạo một container giữ chỗ tên `pause` để giữ network namespace, rồi các container của bạn tham gia vào đó. Đa số pod chỉ có một container; K1.3 nói khi nào nên có hơn.
+
+Pod là thứ **dùng một lần**:
+
+- Pod không bao giờ "chuyển" sang node khác. Node chết thì pod mất; thứ xuất hiện trên node khác là pod **mới**, tên mới, IP mới.
+- Container trong pod chết thì **kubelet** khởi động lại nó tại chỗ theo `restartPolicy` (mặc định `Always`), với thời gian chờ tăng dần 10 giây, 20 giây, 40 giây... tối đa 5 phút. Trạng thái `CrashLoopBackOff` nghĩa là đang trong khoảng chờ đó.
+- Pod bị xoá, hoặc node của nó chết, thì kubelet không làm gì được. Phải có một controller tạo pod thay thế.
+
+`status.phase` của pod có 5 giá trị: `Pending` (chưa chạy: chờ node, chờ image), `Running`, `Succeeded`, `Failed`, `Unknown`. Cột `STATUS` của `kubectl get pod` chi tiết hơn phase: nó lấy lý do từ container, ví dụ `ImagePullBackOff`, `CrashLoopBackOff`, `OOMKilled`.
+
+Vì vậy gần như không ai chạy pod "trần" (không có controller sở hữu) trên production.
+
+<Check id="d11.1.pod">Giải thích được pod gồm gì, kubelet tự sửa được chuyện nào và chuyện nào cần controller, và đọc được `Pending`, `ImagePullBackOff`, `CrashLoopBackOff`.</Check>
+
+### ReplicaSet
+
+**ReplicaSet** giữ đúng N pod khớp một **label selector**. Nó có ba thứ: `replicas`, `selector`, và `template` để đúc pod mới. Vòng reconcile của nó chỉ đếm: thiếu thì tạo từ template, thừa thì xoá.
+
+Hai chi tiết quyết định hành vi:
+
+- ReplicaSet nhận pod là của mình bằng **label**, không bằng tên. Gỡ label khỏi một pod là tách pod đó ra: ReplicaSet tạo pod khác thay, pod cũ vẫn chạy để bạn gỡ lỗi.
+- Pod do nó tạo có `metadata.ownerReferences` trỏ về nó. Xoá ReplicaSet thì **garbage collector** xoá luôn các pod con.
+
+ReplicaSet không biết đổi phiên bản: sửa `template` không đụng tới pod đang chạy. Bạn hầu như không tạo ReplicaSet trực tiếp; đó là việc của Deployment.
+
+### Deployment và rollout
+
+**Deployment** quản lý các ReplicaSet để đổi phiên bản có kiểm soát. Mỗi lần `spec.template` đổi (image, biến môi trường, tài nguyên...), nó tạo một ReplicaSet **mới** có tên kèm mã băm của template (`web-55f4f88ff8`), tăng dần ReplicaSet mới và giảm dần cái cũ. Quá trình đó là **rollout**. Đổi `replicas` không tạo rollout, chỉ đổi số pod của ReplicaSet hiện tại.
+
+```text
+ Deployment web (replicas: 3)
+   ├── ReplicaSet web-5b76b7f6f   (revision 1, template v1)   3 -> 2 -> 1 -> 0
+   └── ReplicaSet web-55f4f88ff8  (revision 2, template v2)   0 -> 1 -> 2 -> 3
+```
+
+Tốc độ đổi do hai tham số của chiến lược `RollingUpdate` quyết định. Cả hai nhận số tuyệt đối hoặc phần trăm của `replicas`:
+
+| Tham số | Ý nghĩa | Mặc định | Làm tròn |
+|---|---|---|---|
+| `maxSurge` | Được có thêm bao nhiêu pod **vượt** `replicas` trong lúc rollout | 25% | Lên |
+| `maxUnavailable` | Được thiếu bao nhiêu pod **sẵn sàng** so với `replicas` | 25% | Xuống |
+
+Với 3 bản, mặc định 25% thành `maxSurge` 1 (0,75 làm tròn lên) và `maxUnavailable` 0 (0,75 làm tròn xuống). Với 10 bản là 3 và 2. Ba cách đặt hay gặp:
+
+| Cấu hình | Trong lúc rollout | Hợp khi |
+|---|---|---|
+| `maxSurge: 1`, `maxUnavailable: 0` | Luôn đủ `replicas` pod sẵn sàng, tạm có thêm 1 pod | Mặc định an toàn cho service nhận traffic; cụm phải còn chỗ cho pod dư |
+| `maxSurge: 0`, `maxUnavailable: 1` | Không bao giờ vượt `replicas`, tạm thiếu 1 pod | Cụm hết tài nguyên, hoặc pod giữ thứ không chia sẻ được (GPU, cổng trên node) |
+| `strategy.type: Recreate` | Xoá hết pod cũ rồi mới tạo pod mới: có downtime | Hai phiên bản không được chạy song song, ví dụ migration làm bản cũ lỗi |
+
+Deployment chỉ giảm ReplicaSet cũ khi pod mới **Ready** (và đã Ready đủ `minReadySeconds`, mặc định 0). Vì vậy khi pod mới không bao giờ Ready (image sai tag, ứng dụng crash), rollout **đứng yên** ở giữa chừng, pod cũ còn lại tiếp tục phục vụ. Sau `progressDeadlineSeconds` (mặc định 600 giây) không tiến thêm, Deployment ghi condition `Progressing=False` với lý do `ProgressDeadlineExceeded` và `kubectl rollout status` thoát với mã lỗi.
+
+<Callout kind="production">
+
+Deployment **không tự quay lui**. `ProgressDeadlineExceeded` chỉ là một condition: ReplicaSet mới vẫn nằm đó, pod hỏng vẫn được thử lại mãi. Nếu pipeline chỉ chạy `kubectl apply` rồi kết thúc, bản hỏng có thể treo nhiều giờ mà không ai biết. Với `maxUnavailable` lớn hơn 0, suốt thời gian đó service chạy thiếu pod: lab bước 8 cho thấy 3 bản chỉ còn 2.
+
+Pipeline deploy nên chạy `kubectl rollout status --timeout=...` ngay sau `apply` và coi mã thoát khác 0 là thất bại, rồi quyết định `rollout undo` hay báo người trực. Tự động quay lui theo metric là việc của công cụ chuyên dụng như Argo Rollouts (D13).
+
+</Callout>
+
+Mỗi ReplicaSet cũ được giữ lại với 0 pod để làm lịch sử, mỗi cái ứng với một **revision**. `kubectl rollout undo` không có phép gì riêng: nó chép `template` của revision cũ vào Deployment, và rollout diễn ra như mọi lần đổi khác. `revisionHistoryLimit` (mặc định 10) quyết định giữ bao nhiêu ReplicaSet cũ.
+
+| Lệnh | Tác dụng |
+|---|---|
+| `kubectl rollout status deploy/web` | Chờ rollout xong; thoát khác 0 khi quá hạn |
+| `kubectl rollout history deploy/web` | Liệt kê revision |
+| `kubectl rollout undo deploy/web` | Về revision liền trước; `--to-revision=N` để chọn |
+| `kubectl rollout restart deploy/web` | Thay toàn bộ pod bằng pod mới cùng template (dùng nhiều ở K1.2) |
+| `kubectl rollout pause` / `resume` | Dừng giữa chừng để sửa nhiều thứ trong một lần rollout |
+
+<Check id="d11.1.rollout">Tính được số pod tối đa và tối thiểu trong lúc rollout từ `replicas`, `maxSurge`, `maxUnavailable`, và nói được Deployment làm gì khi pod mới không bao giờ Ready.</Check>
+
+### Sự kiện: nhật ký của các controller
+
+Mỗi lần một thành phần làm việc gì đáng chú ý, nó ghi một object **Event**: scheduler ghi `Scheduled`, kubelet ghi `Pulling`, `Started`, `Unhealthy`, deployment controller ghi `ScalingReplicaSet`. Event có loại `Normal` hoặc `Warning`, lý do, thông điệp, và object liên quan. Đây là nơi đầu tiên cần nhìn khi một pod không chạy.
+
+| Lệnh | Cho bạn |
+|---|---|
+| `kubectl describe pod X` | Trạng thái chi tiết của pod, cuối là các event của riêng nó |
+| `kubectl events --for deploy/web` | Event của một object, theo thứ tự thời gian |
+| `kubectl get events --sort-by=.lastTimestamp` | Mọi event trong namespace; mặc định không sắp theo thời gian nên cần `--sort-by` |
+| `kubectl get events --field-selector type=Warning` | Chỉ cảnh báo |
+
+Event lặp lại được gộp: `x3 over 61s` nghĩa là 3 lần trong 61 giây.
+
+<Callout kind="production">
+
+Event **không phải log lâu dài**. API server xoá event sau thời gian đặt bởi cờ `--event-ttl`, mặc định 1 giờ, để etcd không phình. Pod bị OOMKilled lúc 2 giờ sáng thì 8 giờ sáng `kubectl get events` không còn gì. Hệ thống thật cần một thành phần đẩy event ra nơi lưu lâu hơn cùng với log (D12). Thông tin sống lâu hơn event một chút là `lastState` của container trong `status` pod, nhưng nó cũng mất khi pod bị thay.
+
+</Callout>
+
+<Check id="d11.1.events">Dùng được `describe` và `kubectl events` để biết pod kẹt ở bước nào, và nói được vì sao event của hôm qua không còn.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Cluster Architecture](https://kubernetes.io/docs/concepts/architecture/): sơ đồ và mô tả từng thành phần của control plane và node; đọc khi cần đối chiếu với sơ đồ trong bài.
+- [Controllers](https://kubernetes.io/docs/concepts/architecture/controller/): mô hình vòng điều khiển và desired state, ngắn và đáng đọc trọn.
+- [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/): phần "Rolling Update Deployment", "Failed Deployment" và "Rolling Back a Deployment".
+- [Pod Lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/): phần "Pod phase" và "Container states" để đọc đúng cột STATUS.
+- [kube-apiserver](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/): tìm `--event-ttl` để thấy mặc định 1 giờ.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cần Docker đang chạy, cùng `kind`, `kubectl` và `yq` đã cài ở D0.2 (K1.4 dùng thêm `jq`). Lab dùng một cụm kind riêng tên `k1-lab` gồm 1 control plane và 2 worker; cả bốn bài của K1 dùng chung cụm này.
+
+**Profile máy.** Cụm 3 node dùng khoảng 1,3 GiB RAM của Docker khi đang chạy lab (control plane khoảng 850 MiB, mỗi worker 210 tới 280 MiB). Máy 16 GB chạy thoải mái. Máy 8 GB: đặt Docker khoảng 4 GB, dừng VM Lima và các cụm kind khác trước khi làm; nếu vẫn chật, bỏ một dòng `role: worker` trong file cấu hình, các bước của bài này vẫn chạy được với 1 worker.
+
+### 1. Tạo cụm 3 node
+
+D0.2 đã giải thích file cấu hình của kind, vì sao ghim image node theo digest, và vì sao lab dùng kubeconfig riêng. Ở đây chỉ đổi tên cụm và đường dẫn:
+
+<Terminal where="mac" title="~/masteva-d11/kind.yaml">
+
+```bash
+mkdir -p ~/masteva-d11/k1-1 && cd ~/masteva-d11
+cat > kind.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k1-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+EOF
+export KUBECONFIG=~/masteva-d11/kubeconfig
+kind create cluster --config kind.yaml
+```
+
+</Terminal>
+
+Lệnh mất khoảng 30 giây. Vì có biến `KUBECONFIG`, kind ghi context `kind-k1-lab` vào file riêng của lab chứ không đụng tới `~/.kube/config`. Từ đây **mọi terminal dùng cho K1 phải có dòng `export` đó**; mở terminal mới thì export lại. Kiểm tra mình đang nói chuyện với đúng cụm, và chờ cả ba node sẵn sàng (node vừa tạo `NotReady` vài giây đầu, cho tới khi plugin mạng chạy xong):
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl wait --for=condition=Ready node --all --timeout=120s
+kubectl get nodes
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k1-lab
+node/k1-lab-control-plane condition met
+node/k1-lab-worker condition met
+node/k1-lab-worker2 condition met
+NAME                   STATUS   ROLES           AGE   VERSION
+k1-lab-control-plane   Ready    control-plane   24s   v1.37.0
+k1-lab-worker          Ready    <none>          14s   v1.37.0
+k1-lab-worker2         Ready    <none>          14s   v1.37.0
+```
+
+</Expected>
+
+### 2. Tìm từng thành phần trong sơ đồ
+
+D0.2 đã liệt kê 13 pod hệ thống của một cụm kind theo node. Đối chiếu danh sách đó với sơ đồ ở phần Kiến thức: bốn thành phần control plane chạy **dưới dạng pod** trên node control plane; `kube-proxy` và `kindnet` mỗi node một pod (đó là DaemonSet, K1.4 dạy). Không có pod nào tên `kubelet` hay `containerd`: chúng là tiến trình của node, và phải có trước thì mới chạy được pod.
+
+Vậy ai chạy pod `kube-apiserver` khi chưa có API server để nhận lệnh? Câu trả lời nằm trong node:
+
+<Terminal where="mac">
+
+```bash
+docker exec k1-lab-control-plane ls /etc/kubernetes/manifests
+docker exec k1-lab-control-plane ps -eo pid,comm | grep -E "etcd|kube|containerd$"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+etcd.yaml
+kube-apiserver.yaml
+kube-controller-manager.yaml
+kube-scheduler.yaml
+    130 containerd
+    580 kube-scheduler
+    589 etcd
+    597 kube-controller
+    668 kube-apiserver
+    731 kubelet
+    924 kube-proxy
+```
+
+</Expected>
+
+Đó là **static pod**: kubelet đọc manifest trong thư mục này và tự chạy, không cần API server. Cụm dựng bằng kubeadm (K4) cũng làm đúng như vậy. PID trên máy bạn sẽ khác.
+
+<Check id="d11.1.lab-cluster">Tạo được cụm 3 node, chỉ ra từng thành phần của sơ đồ trong cụm, và giải thích được static pod.</Check>
+
+### 3. Một pod trần: ai làm gì
+
+Tạo namespace riêng cho K1 và đặt nó làm mặc định của context, để không phải gõ `-n k1` ở mọi lệnh:
+
+<Terminal where="mac">
+
+```bash
+kubectl create namespace k1
+kubectl config set-context --current --namespace k1
+kubectl run hello --image=registry.k8s.io/e2e-test-images/agnhost:2.61 -- netexec --http-port=8080
+kubectl wait --for=condition=Ready pod/hello --timeout=120s
+```
+
+</Terminal>
+
+`agnhost` là image thử nghiệm của chính dự án Kubernetes; lệnh con `netexec` mở một HTTP server nhỏ. Lần đầu node phải kéo image nên mất 15 tới 20 giây. Giờ xem thành phần nào đã làm gì:
+
+<Terminal where="mac">
+
+```bash
+kubectl get events --field-selector involvedObject.name=hello \
+  -o custom-columns=REASON:.reason,FROM:.source.component,MESSAGE:.message
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+REASON      FROM                MESSAGE
+Scheduled   default-scheduler   Successfully assigned k1/hello to k1-lab-worker
+Pulling     kubelet             Pulling image "registry.k8s.io/e2e-test-images/agnhost:2.61"
+Pulled      kubelet             Successfully pulled image "registry.k8s.io/e2e-test-images/agnhost:2.61" in 16.937s (16.937s including waiting). Image size: 55208481 bytes.
+Created     kubelet             Container created
+Started     kubelet             Container started
+```
+
+</Expected>
+
+Đây là bước 4 tới 6 của chuỗi ở phần Kiến thức. Pod có thể rơi vào `k1-lab-worker2` trên máy bạn.
+
+Giờ giả lập ứng dụng chết bằng cách dừng container ngay trên node của nó, dùng `crictl` như ở D0.2. `crictl stop` mặc định chờ 0 giây, tức gửi `SIGKILL` ngay:
+
+<Terminal where="mac">
+
+```bash
+NODE=$(kubectl get pod hello -o jsonpath='{.spec.nodeName}')
+docker exec $NODE sh -c 'crictl stop $(crictl ps -q --name hello)'
+sleep 3
+kubectl get pod hello
+kubectl get pod hello -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1202681ec23b6f592d85ef9d013232e5c300b4aaf613f88da9687d5eb896f8a5
+NAME    READY   STATUS    RESTARTS     AGE
+hello   1/1     Running   1 (4s ago)   26s
+137
+```
+
+</Expected>
+
+`RESTARTS` là 1: kubelet thấy container chết và chạy lại ngay trong pod cũ, cùng tên, cùng IP. Exit code 137 là 128 + 9 như D1.1 đã giải thích. Giờ xoá hẳn pod:
+
+<Predict question="Sau `kubectl delete pod hello`, `kubectl get pods` in ra gì?">
+
+```text
+pod "hello" deleted from k1 namespace
+No resources found in k1 namespace.
+```
+
+Không có gì mọc lại. kubelet chỉ khởi động lại **container** trong một pod còn tồn tại. Pod đã bị xoá khỏi API server thì không controller nào có `spec` nói "phải có pod hello", nên không có độ lệch nào để sửa.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl delete pod hello
+kubectl get pods
+```
+
+</Terminal>
+
+<Check id="d11.1.lab-pod">Chỉ ra được qua event thành phần nào lên lịch và thành phần nào chạy container, và phân biệt được "kubelet khởi động lại container" với "controller tạo pod mới".</Check>
+
+### 4. Deployment, ReplicaSet và quan hệ sở hữu
+
+<Terminal where="mac" title="~/masteva-d11/k1-1/web.yaml">
+
+```bash
+cd ~/masteva-d11/k1-1
+cat > web.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  annotations:
+    kubernetes.io/change-cause: "v1"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 60
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/e2e-test-images/agnhost:2.61
+          args: ["netexec", "--http-port=8080"]
+          env:
+            - name: APP_VERSION
+              value: v1
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 2
+EOF
+kubectl apply -f web.yaml && kubectl rollout status deploy/web
+```
+
+</Terminal>
+
+Ba chỗ đáng chú ý trong manifest: `selector.matchLabels` phải khớp `template.metadata.labels`; `progressDeadlineSeconds: 60` thay cho mặc định 600 để bước 8 không phải chờ 10 phút; `readinessProbe` cho Kubernetes biết khi nào pod nhận được request (K1.3 dạy kỹ). Annotation `kubernetes.io/change-cause` là ghi chú sẽ hiện trong lịch sử rollout.
+
+<Terminal where="mac">
+
+```bash
+kubectl get deploy web
+kubectl get rs,pod -l app=web --show-labels
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME   READY   UP-TO-DATE   AVAILABLE   AGE
+web    3/3     3            3           1s
+NAME                            DESIRED   CURRENT   READY   AGE   LABELS
+replicaset.apps/web-5b76b7f6f   3         3         3       1s    app=web,pod-template-hash=5b76b7f6f
+
+NAME                      READY   STATUS    RESTARTS   AGE   LABELS
+pod/web-5b76b7f6f-gzxs5   1/1     Running   0          1s    app=web,pod-template-hash=5b76b7f6f
+pod/web-5b76b7f6f-vgflm   1/1     Running   0          1s    app=web,pod-template-hash=5b76b7f6f
+pod/web-5b76b7f6f-zkjwk   1/1     Running   0          1s    app=web,pod-template-hash=5b76b7f6f
+```
+
+</Expected>
+
+Tên pod ghép từ ba phần: Deployment `web`, mã băm template `5b76b7f6f`, hậu tố ngẫu nhiên. Mã băm phụ thuộc nội dung template nên trên máy bạn cũng là `5b76b7f6f` nếu chép đúng manifest; hậu tố thì khác. Deployment tự thêm label `pod-template-hash` vào selector của ReplicaSet để ReplicaSet của hai phiên bản không nhận nhầm pod của nhau.
+
+Lần theo `ownerReferences` từ pod lên:
+
+<Terminal where="mac">
+
+```bash
+P=$(kubectl get pod -l app=web -o name | head -1)
+kubectl get $P -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+kubectl get rs -l app=web -o jsonpath='{.items[0].metadata.ownerReferences[0].kind}/{.items[0].metadata.ownerReferences[0].name}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ReplicaSet/web-5b76b7f6f
+Deployment/web
+```
+
+</Expected>
+
+### 5. Vòng reconcile sửa mọi độ lệch
+
+Xoá một pod của Deployment:
+
+<Terminal where="mac">
+
+```bash
+kubectl delete $(kubectl get pod -l app=web -o name | head -1)
+kubectl get pod -l app=web
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "web-5b76b7f6f-gzxs5" deleted from k1 namespace
+NAME                  READY   STATUS    RESTARTS   AGE
+web-5b76b7f6f-k67wl   1/1     Running   0          0s
+web-5b76b7f6f-vgflm   1/1     Running   0          4s
+web-5b76b7f6f-zkjwk   1/1     Running   0          4s
+```
+
+</Expected>
+
+Pod `k67wl` vừa sinh do replicaset controller tạo ngay khi đếm thấy còn 2. Khác với bước 3, đây là pod **mới**: tên mới, IP mới.
+
+Giờ thử "lách" Deployment bằng cách tăng thẳng ReplicaSet lên 5:
+
+<Predict question="Sau `kubectl scale rs ... --replicas=5` vài giây, ReplicaSet có mấy pod?">
+
+Vẫn 3. ReplicaSet do Deployment sở hữu, và `spec.replicas` của Deployment vẫn là 3. Deployment controller thấy ReplicaSet lệch khỏi điều nó muốn và kéo về 3. Replicaset controller kịp tạo 2 pod rồi lại xoá chính 2 pod đó.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+RS=$(kubectl get rs -l app=web -o name)
+kubectl scale $RS --replicas=5
+sleep 3
+kubectl get $RS
+kubectl events --for $RS | tail -4
+kubectl events --for deploy/web | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+replicaset.apps/web-5b76b7f6f scaled
+NAME            DESIRED   CURRENT   READY   AGE
+web-5b76b7f6f   3         3         3       7s
+4s          Normal   SuccessfulCreate   ReplicaSet/web-5b76b7f6f   Created pod: web-5b76b7f6f-qztmb
+4s          Normal   SuccessfulCreate   ReplicaSet/web-5b76b7f6f   Created pod: web-5b76b7f6f-5dqdv
+4s          Normal   SuccessfulDelete   ReplicaSet/web-5b76b7f6f   Deleted pod: web-5b76b7f6f-5dqdv
+4s          Normal   SuccessfulDelete   ReplicaSet/web-5b76b7f6f   Deleted pod: web-5b76b7f6f-qztmb
+4s          Normal   ScalingReplicaSet   Deployment/web   Scaled down replica set web-5b76b7f6f from 5 to 3
+```
+
+</Expected>
+
+Hai controller, mỗi cái sửa độ lệch ở tầng của mình. Nếu deployment controller nhanh hơn, bạn có thể không thấy hai dòng `Created`; dòng `Scaled down ... from 5 to 3` thì luôn có. Muốn đổi số pod, sửa ở tầng trên cùng: `spec.replicas` của Deployment.
+
+<Check id="d11.1.lab-reconcile">Thấy được pod bị xoá được thay và ReplicaSet bị sửa tay bị kéo về, và chỉ ra được controller nào làm việc đó qua event.</Check>
+
+### 6. Rollout với `maxSurge: 1`, `maxUnavailable: 0`
+
+Mở **terminal thứ hai** để theo dõi bốn con số của Deployment trong lúc rollout. Terminal mới chưa có biến `KUBECONFIG` nên phải export lại:
+
+<Terminal where="mac" title="Terminal 2">
+
+```bash
+export KUBECONFIG=~/masteva-d11/kubeconfig
+kubectl get deploy web -w -o custom-columns=UPDATED:.status.updatedReplicas,READY:.status.readyReplicas,AVAILABLE:.status.availableReplicas,TOTAL:.status.replicas
+```
+
+</Terminal>
+
+Ở terminal đầu, sửa file thành phiên bản v2 bằng `yq`, xem trước thay đổi bằng `kubectl diff`, rồi apply:
+
+<Terminal where="mac">
+
+```bash
+yq -i '.spec.template.spec.containers[0].env[0].value = "v2" | .metadata.annotations."kubernetes.io/change-cause" = "v2"' web.yaml
+kubectl diff -f web.yaml | grep '^[-+] '
+kubectl apply -f web.yaml && kubectl rollout status deploy/web
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+-    kubernetes.io/change-cause: v1
++    kubernetes.io/change-cause: v2
+-  generation: 1
++  generation: 2
+-          value: v1
++          value: v2
+deployment.apps/web configured
+Waiting for deployment "web" rollout to finish: 1 out of 3 new replicas have been updated...
+Waiting for deployment "web" rollout to finish: 2 out of 3 new replicas have been updated...
+Waiting for deployment "web" rollout to finish: 1 old replicas are pending termination...
+deployment "web" successfully rolled out
+```
+
+</Expected>
+
+`kubectl diff` hỏi API server "nếu apply file này thì object đổi gì" mà không đổi thật; tập thói quen chạy nó trước mọi `apply`. Các dòng `Waiting` lặp lại đã được lược bớt ở đây và ở các bước sau. Terminal 2 in ra (đã bỏ các dòng lặp liền nhau):
+
+<Expected>
+
+```text
+UPDATED   READY   AVAILABLE   TOTAL
+3         3       3           3
+<none>    3       3           3
+1         3       3           4
+1         4       4           4
+1         3       3           3
+2         3       3           4
+2         4       4           4
+2         3       3           3
+3         3       3           4
+3         4       4           4
+3         3       3           3
+```
+
+</Expected>
+
+`TOTAL` lên 4 rồi về 3 ba lần: mỗi lượt thêm 1 pod mới (`maxSurge: 1`), chờ nó Ready, rồi mới bớt 1 pod cũ. `AVAILABLE` không lúc nào dưới 3 (`maxUnavailable: 0`). Số dòng trung gian có thể khác đôi chút tuỳ lúc `status` được cập nhật; hai giới hạn đó thì không đổi.
+
+### 7. Rollout với `maxSurge: 0`, `maxUnavailable: 1`
+
+Để nguyên terminal 2. Lần này đổi chiến lược sang `maxSurge: 0`, `maxUnavailable: 1` và ra phiên bản v3. Đoán trước rồi mới chạy:
+
+<Predict question="Lần này cột TOTAL và AVAILABLE ở terminal 2 dao động trong khoảng nào?">
+
+`TOTAL` không bao giờ vượt 3, `AVAILABLE` xuống 2 rồi về 3 ba lần:
+
+```text
+UPDATED   READY   AVAILABLE   TOTAL
+<none>    3       3           3
+<none>    2       2           2
+1         2       2           3
+1         3       3           3
+1         2       2           2
+2         2       2           3
+2         3       3           3
+2         2       2           2
+3         2       2           3
+3         3       3           3
+```
+
+Thứ tự đảo lại: bớt 1 pod cũ **trước**, rồi mới thêm 1 pod mới. Cụm không cần chỗ cho pod dư, đổi lại service chạy với 2 phần 3 năng lực suốt rollout.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+yq -i '.spec.strategy.rollingUpdate.maxSurge = 0 | .spec.strategy.rollingUpdate.maxUnavailable = 1 | .spec.template.spec.containers[0].env[0].value = "v3" | .metadata.annotations."kubernetes.io/change-cause" = "v3, maxSurge=0"' web.yaml
+kubectl apply -f web.yaml && kubectl rollout status deploy/web
+```
+
+</Terminal>
+
+Nhấn Ctrl+C ở terminal 2 khi rollout xong.
+
+<Check id="d11.1.lab-rollout">Chạy được hai rollout với hai chiến lược và giải thích được từng cột của terminal theo dõi bằng `maxSurge`, `maxUnavailable`.</Check>
+
+### 8. Rollout hỏng: image sai tag
+
+Tag `2.99` không tồn tại. Chiến lược đang là `maxSurge: 0`, `maxUnavailable: 1` từ bước 7:
+
+<Terminal where="mac">
+
+```bash
+yq -i '.spec.template.spec.containers[0].image = "registry.k8s.io/e2e-test-images/agnhost:2.99" | .metadata.annotations."kubernetes.io/change-cause" = "v4, agnhost 2.99"' web.yaml
+kubectl apply -f web.yaml
+kubectl rollout status deploy/web --timeout=120s; echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web configured
+Waiting for deployment "web" rollout to finish: 0 out of 3 new replicas have been updated...
+Waiting for deployment "web" rollout to finish: 1 out of 3 new replicas have been updated...
+error: deployment "web" exceeded its progress deadline
+exit=1
+```
+
+</Expected>
+
+Lệnh đứng khoảng 60 giây, đúng bằng `progressDeadlineSeconds`, rồi thoát với mã 1. Xem cụm đang ở trạng thái nào:
+
+<Terminal where="mac">
+
+```bash
+kubectl get deploy web
+kubectl get rs,pod -l app=web
+kubectl get deploy web -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME   READY   UP-TO-DATE   AVAILABLE   AGE
+web    2/3     1            2           92s
+NAME                             DESIRED   CURRENT   READY   AGE
+replicaset.apps/web-55f4f88ff8   0         0         0       75s
+replicaset.apps/web-5b76b7f6f    0         0         0       92s
+replicaset.apps/web-6cd75cc4d8   1         1         0       61s
+replicaset.apps/web-6df674f755   2         2         2       72s
+
+NAME                       READY   STATUS         RESTARTS   AGE
+pod/web-6cd75cc4d8-srs5c   0/1     ErrImagePull   0          61s
+pod/web-6df674f755-b5dlp   1/1     Running        0          72s
+pod/web-6df674f755-n676s   1/1     Running        0          71s
+Available=True MinimumReplicasAvailable: Deployment has minimum availability.
+Progressing=False ProgressDeadlineExceeded: ReplicaSet "web-6cd75cc4d8" has timed out progressing.
+```
+
+</Expected>
+
+Cột `AGE` trên máy bạn sẽ dài hơn vì lần chạy kiểm chứng làm các bước liền nhau. Đọc kết quả:
+
+- Rollout **dừng ở lượt đầu**: bớt 1 pod v3, thêm 1 pod v4, pod v4 không bao giờ Ready nên không bớt thêm pod v3 nào. Hai pod cũ vẫn phục vụ.
+- Service chạy **2 trên 3** cho tới khi có người can thiệp, vì chiến lược cho phép thiếu 1. Với `maxSurge: 1`, `maxUnavailable: 0` của bước 6, cả 3 pod cũ sẽ còn nguyên và pod hỏng chỉ là pod dư.
+- `Available=True` vì 2 pod vẫn đạt mức tối thiểu `replicas - maxUnavailable`. `Progressing=False` là dấu hiệu duy nhất của sự cố.
+
+Hỏi pod hỏng xem nó kẹt ở đâu:
+
+<Terminal where="mac">
+
+```bash
+kubectl describe pod -l pod-template-hash=6cd75cc4d8 | sed -n '/^Events:/,$p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Events:
+  Type     Reason     Age                From               Message
+  ----     ------     ----               ----               -------
+  Normal   Scheduled  61s                default-scheduler  Successfully assigned k1/web-6cd75cc4d8-srs5c to k1-lab-worker
+  Normal   Pulling    24s (x3 over 60s)  kubelet            spec.containers{web}: Pulling image "registry.k8s.io/e2e-test-images/agnhost:2.99"
+  Warning  Failed     24s (x3 over 59s)  kubelet            spec.containers{web}: Failed to pull image "registry.k8s.io/e2e-test-images/agnhost:2.99": rpc error: code = NotFound desc = failed to pull and unpack image "registry.k8s.io/e2e-test-images/agnhost:2.99": failed to resolve reference "registry.k8s.io/e2e-test-images/agnhost:2.99": registry.k8s.io/e2e-test-images/agnhost:2.99: not found
+  Warning  Failed     24s (x3 over 59s)  kubelet            spec.containers{web}: Error: ErrImagePull
+  Normal   BackOff    10s (x3 over 59s)  kubelet            spec.containers{web}: Back-off pulling image "registry.k8s.io/e2e-test-images/agnhost:2.99"
+  Warning  Failed     10s (x3 over 59s)  kubelet            spec.containers{web}: Error: ImagePullBackOff
+```
+
+</Expected>
+
+Pod đã có node (bước 4 của chuỗi xong), kẹt ở bước 5: kubelet kéo image và registry trả `not found`. `ErrImagePull` là lần kéo vừa thất bại; `ImagePullBackOff` là đang chờ tới lần thử sau, khoảng chờ tăng dần.
+
+### 9. Quay lại bản cũ, và cái giá của `rollout undo`
+
+<Terminal where="mac">
+
+```bash
+kubectl rollout history deploy/web
+kubectl rollout undo deploy/web --to-revision=3
+kubectl rollout status deploy/web
+kubectl rollout history deploy/web
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web 
+REVISION  CHANGE-CAUSE
+1         v1
+2         v2
+3         v3, maxSurge=0
+4         v4, agnhost 2.99
+
+Warning: resource deployments/web was previously managed with 'kubectl apply'. Rolling back will not update the kubectl.kubernetes.io/last-applied-configuration annotation, which may cause unexpected behavior on future 'kubectl apply' operations. Consider using 'kubectl apply' with your previous configuration file instead.
+deployment.apps/web rolled back
+deployment "web" successfully rolled out
+deployment.apps/web 
+REVISION  CHANGE-CAUSE
+1         v1
+2         v2
+4         v4, agnhost 2.99
+5         v3, maxSurge=0
+```
+
+</Expected>
+
+Revision 3 biến mất và thành revision 5: `undo` chép template của revision 3 vào Deployment, template đó khớp ReplicaSet `web-6df674f755` có sẵn nên Deployment dùng lại nó và đánh số mới. Không có pod nào phải kéo image lại, nên undo nhanh.
+
+Cảnh báo của `kubectl` nói đúng vấn đề: cụm đã về image `2.61`, nhưng **file `web.yaml` vẫn ghi `2.99`**.
+
+<Terminal where="mac">
+
+```bash
+kubectl diff -f web.yaml | grep '^[-+] '
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+-    kubernetes.io/change-cause: v3, maxSurge=0
++    kubernetes.io/change-cause: v4, agnhost 2.99
+-  generation: 5
++  generation: 6
+-        image: registry.k8s.io/e2e-test-images/agnhost:2.61
++        image: registry.k8s.io/e2e-test-images/agnhost:2.99
+```
+
+</Expected>
+
+Ai đó chạy lại `kubectl apply -f web.yaml` (hoặc pipeline chạy lại) là bản hỏng quay về. `rollout undo` là thao tác **cầm máu**; sửa thật là sửa nguồn khai báo rồi apply lại:
+
+<Terminal where="mac">
+
+```bash
+yq -i '.spec.template.spec.containers[0].image = "registry.k8s.io/e2e-test-images/agnhost:2.61" | .metadata.annotations."kubernetes.io/change-cause" = "v3, maxSurge=0"' web.yaml
+kubectl diff -f web.yaml; echo "diff exit=$?"
+kubectl apply -f web.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+diff exit=0
+deployment.apps/web configured
+```
+
+</Expected>
+
+`kubectl diff` thoát 0 và không in gì nghĩa là file và cụm đã khớp. Lệnh `apply` cuối chỉ để cập nhật annotation `last-applied-configuration` mà cảnh báo nhắc tới.
+
+<Check id="d11.1.lab-undo">Tái hiện được rollout kẹt vì image sai, đọc được condition và event để tìm nguyên nhân, quay lại bằng `rollout undo`, rồi đưa file khai báo về khớp với cụm.</Check>
+
+### 10. Lọc event và hạn sống của chúng
+
+<Terminal where="mac">
+
+```bash
+kubectl get events --field-selector type=Warning --sort-by=.lastTimestamp \
+  -o custom-columns=REASON:.reason,OBJECT:.involvedObject.name,COUNT:.count,MESSAGE:.message | cut -c1-110 | tail -4
+docker exec k1-lab-control-plane grep -c event-ttl /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Failed      web-6cd75cc4d8-srs5c   3       Failed to pull image "registry.k8s.io/e2e-test-images/agnhost:2.99"
+Failed      web-6cd75cc4d8-srs5c   3       Error: ErrImagePull
+Failed      web-6cd75cc4d8-srs5c   3       Error: ImagePullBackOff
+Unhealthy   web-6df674f755-rrflg   1       Readiness probe failed: Get "http://10.244.1.47:8080/readyz": dial 
+0
+```
+
+</Expected>
+
+Pod `srs5c` đã bị xoá khi undo, nhưng event của nó vẫn còn: event là object riêng, sống theo TTL chứ không theo pod. Dòng `Unhealthy` cuối là probe gọi vào pod mới trước khi ứng dụng kịp mở cổng, chuyện bình thường lúc khởi động. Số `0` nghĩa là manifest của API server không đặt `--event-ttl`, tức dùng mặc định 1 giờ: quay lại sau một giờ, các dòng trên sẽ không còn.
+
+### Khi gặp lỗi
+
+- `kind create cluster` báo `node(s) already exist for a cluster with the name "k1-lab"`: cụm đã có từ lần trước. Dùng tiếp, hoặc `kind delete cluster --name k1-lab` rồi tạo lại.
+- `kubectl` báo `The connection to the server localhost:8080 was refused`: terminal này chưa có `export KUBECONFIG=~/masteva-d11/kubeconfig`.
+- `ImagePullBackOff` với image `2.61` đúng: node không ra được Internet (VPN, proxy). Kéo image về máy rồi nạp thẳng vào node: `docker pull registry.k8s.io/e2e-test-images/agnhost:2.61 && kind load docker-image registry.k8s.io/e2e-test-images/agnhost:2.61 --name k1-lab`.
+- `yq: command not found`: cài lại theo D0.2, hoặc sửa file bằng trình soạn thảo rồi `kubectl apply` như cũ.
+
+### Dọn dẹp
+
+Nếu học tiếp K1.2 ngay, chỉ xoá Deployment và giữ cụm:
+
+<Terminal where="mac">
+
+```bash
+kubectl delete deploy web
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Hai lệnh dưới xoá toàn bộ cụm `k1-lab` cùng mọi thứ trong đó, và xoá thư mục lab `~/masteva-d11` gồm cả kubeconfig của lab. Chỉ chạy khi bạn dừng học K1; kiểm tra lại tên cụm và đường dẫn trước khi nhấn Enter.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn hẳn">
+
+```bash
+kind delete cluster --name k1-lab
+rm -rf ~/masteva-d11
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao chỉ API server được nói chuyện với etcd?">
+
+Vì mọi luật của cụm nằm ở API server: xác thực, phân quyền RBAC (K2), kiểm hợp lệ, admission (K8), ghi audit log. Một thành phần ghi thẳng vào etcd sẽ đi vòng qua tất cả những thứ đó. Ngoài ra API server là nơi cung cấp cơ chế **watch** và số phiên bản `resourceVersion` cho mỗi object, thứ giúp hai controller cùng sửa một object phát hiện xung đột thay vì ghi đè nhau.
+
+Hệ quả vận hành: ai đọc được etcd là đọc được mọi Secret của cụm (K1.2 cho xem tận mắt), nên etcd phải được bảo vệ ngang với quyền admin.
+
+</Reveal>
+
+<Reveal title="Control plane chết 10 phút thì người dùng cuối thấy gì?">
+
+Nếu không có gì khác hỏng trong 10 phút đó thì không thấy gì: container vẫn chạy, luật mạng của kube-proxy đã nằm sẵn trên node, DNS nội bộ vẫn trả lời từ cache của nó.
+
+Thứ ngừng hoạt động là mọi vòng reconcile: pod chết trên node khác không được thay, node chết không được phát hiện, HPA không scale, CronJob không tạo Job, và pod vừa Ready hay vừa chết không được thêm bớt khỏi Service. Vì vậy control plane production chạy 3 bản trên 3 máy (K4).
+
+</Reveal>
+
+<Reveal title="Vì sao controller so sánh trạng thái thay vì xử lý từng sự kiện?">
+
+Xử lý theo sự kiện ("pod X vừa chết, tạo một pod") sai ngay khi mất một sự kiện: controller khởi động lại đúng lúc, mạng rớt, hàng đợi đầy. Hệ thống sẽ lệch vĩnh viễn mà không ai biết.
+
+So sánh trạng thái ("cần 3, đang có 2") thì lần lặp nào cũng tự sửa được, bất kể đã bỏ lỡ gì. Sự kiện watch chỉ dùng làm tín hiệu "nên kiểm tra lại object này sớm", và controller vẫn định kỳ đối chiếu lại toàn bộ. K9 dùng đúng mô hình này để bạn tự viết controller.
+
+</Reveal>
+
+<Reveal title="Cột TOTAL về 3 rồi, pod cũ đã thật sự biến mất chưa?">
+
+Chưa chắc. `status.replicas` chỉ đếm pod chưa bị đánh dấu xoá. Pod cũ đang trong thời gian tắt êm (mặc định tới 30 giây, K1.3 dạy) vẫn chạy và vẫn chiếm CPU, RAM của node, nhưng không còn được đếm. Kubernetes 1.37 có trường `status.terminatingReplicas` để thấy số pod này.
+
+Điều này quan trọng với `maxSurge: 0`: bạn chọn nó vì cụm hết chỗ, nhưng trong lúc pod cũ chưa tắt xong và pod mới đã được tạo, tổng tài nguyên dùng thật vẫn có thể vượt `replicas`.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết khung manifest Deployment, giải thích một thông báo trong `kubectl describe`, viết lệnh `jsonpath` hay `custom-columns` để lọc đúng trường.
+
+**AI hay sai ở đâu:** dùng `image: ...:latest` (không biết phiên bản nào đang chạy, undo không có nghĩa); bỏ `readinessProbe` nên rollout coi pod mới là sẵn sàng ngay khi container vừa chạy; để selector và label template lệch nhau; khuyên `kubectl edit` hoặc `kubectl set image` trên production mà không sửa file nguồn; dùng cờ `--record` đã bị deprecated thay cho annotation `kubernetes.io/change-cause`.
+
+**Cách kiểm tra:** chạy `kubectl apply --dry-run=server -f file.yaml` để API server kiểm hợp lệ thật, rồi `kubectl diff -f file.yaml` để đọc đúng thứ sẽ đổi. Sau khi apply, luôn chạy `kubectl rollout status` và đọc condition, đừng tin câu "deployment configured".
+
+</Callout>
+
+<Callout kind="link">
+
+D1.1 giải thích exit code 137 và signal; D5 giải thích image, tag và namespace của container. K1.2 thêm cấu hình và tài nguyên vào pod template của bài này; K1.3 thêm probe, cách tắt êm và sidecar; K1.4 dạy các controller khác ngoài Deployment. K2 đưa Deployment ra sau Service và Gateway. K4 dựng control plane thật bằng kubeadm, sao lưu etcd. K9 tự viết controller theo đúng vòng reconcile. D13 thay `kubectl apply` bằng GitOps, nơi Git là nguồn khai báo duy nhất và `rollout undo` bằng tay bị ghi đè.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d11.1.mastery-flow">Kể được chuỗi từ `kubectl apply` một Deployment tới lúc container chạy, nêu thành phần chịu trách nhiệm ở mỗi bước, và dùng chuỗi đó để khoanh vùng một pod `Pending` hay `ImagePullBackOff`.</Check>
+
+<Check id="d11.1.mastery-rollout">Với một Deployment bất kỳ, tính được số pod tối đa và số pod sẵn sàng tối thiểu trong lúc rollout, và chọn được `maxSurge`, `maxUnavailable` cho một service nhận traffic và cho một cụm đã hết chỗ.</Check>
+
+<Check id="d11.1.mastery-undo">Xử lý được một rollout kẹt: đọc condition và event để tìm nguyên nhân, `rollout undo` về đúng revision, rồi sửa nguồn khai báo để lần apply sau không đưa bản hỏng trở lại.</Check>
+
+</Mastery>

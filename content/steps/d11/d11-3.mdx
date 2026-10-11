@@ -1,0 +1,741 @@
+---
+title: Probe, vòng đời pod và sidecar
+description: Ba loại probe quyết định khi nào kubelet giết container và khi nào ngừng gửi traffic, trình tự preStop rồi SIGTERM rồi SIGKILL khi một pod bị xoá, và cách chạy container phụ bên cạnh ứng dụng mà không làm hỏng thứ tự khởi động, tắt hay làm Job treo mãi.
+id: d11.3
+step: d11
+prerequisites: [d11.2]
+topics: [d11.probe-vong-doi-pod, d11.multi-container]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trên Docker Desktop)
+  tools:
+    kubernetes: 1.37.0
+    kind: 0.33.0
+    kubectl: 1.37.1
+    docker: 29.8.0
+    containerd: 2.3.4
+    busybox: 1.38.0
+    yq: 4.54.1
+---
+
+<Goal>
+
+K1.2 cho pod cấu hình và tài nguyên. Bài này dạy phần còn lại của pod template: cách kubelet biết ứng dụng còn khoẻ, cách một pod tắt, và cách đặt thêm container phụ bên cạnh ứng dụng. Học xong, bạn giải thích được:
+
+- Vì sao một ứng dụng khởi động chậm bị khởi động lại mãi, và mỗi lần deploy lại rớt vài request.
+- Vì sao một pod mất đúng 30 giây mới tắt và chết với exit code 137.
+- Vì sao một Job có sidecar không bao giờ `Complete`.
+
+</Goal>
+
+<Knowledge>
+
+### Ba loại probe
+
+SB8.3 đã dạy liveness và readiness từ phía ứng dụng: mỗi loại trả lời câu hỏi gì, và vì sao không đưa database vào liveness. Phần này là phía kubelet: nó gọi probe khi nào và làm gì với kết quả.
+
+| Probe | Chạy khi nào | Thất bại quá ngưỡng thì |
+|---|---|---|
+| `startupProbe` | Từ lúc container chạy tới lần thành công đầu tiên, rồi **thôi hẳn** | Giết container, khởi động lại |
+| `livenessProbe` | Suốt đời container, **sau khi** startup thành công | Giết container, khởi động lại |
+| `readinessProbe` | Suốt đời container, sau khi startup thành công | Đánh dấu pod chưa Ready: gỡ khỏi endpoint của Service, rollout không đi tiếp. **Không giết** |
+
+```text
+ container chạy
+   |--- startupProbe: mỗi 2 s, tối đa 30 lần ---|  (liveness và readiness chưa chạy)
+                                    thành công  |--- livenessProbe  mỗi 10 s, suốt đời ---->
+                                                |--- readinessProbe mỗi 5 s,  suốt đời ---->
+```
+
+Probe có bốn cách kiểm: `httpGet` (mã 200 tới 399 là đạt), `tcpSocket` (mở được kết nối), `grpc`, và `exec` (chạy lệnh trong container, exit 0 là đạt). Năm tham số, cùng tên cho cả ba loại:
+
+| Tham số | Mặc định | Lưu ý |
+|---|---|---|
+| `periodSeconds` | 10 | Chu kỳ gọi |
+| `timeoutSeconds` | **1** | Quá giờ tính là thất bại. 1 giây là ngắn với ứng dụng đang bị throttle CPU hoặc đang GC |
+| `failureThreshold` | 3 | Số lần thất bại liên tiếp trước khi hành động |
+| `successThreshold` | 1 | Chỉ readiness được đặt lớn hơn 1 |
+| `initialDelaySeconds` | 0 | Chờ trước lần gọi đầu |
+
+Những sai lầm hay gặp, ngoài các lỗi SB8.3 đã nêu:
+
+| Sai lầm | Hậu quả | Sửa |
+|---|---|---|
+| Dùng `initialDelaySeconds` lớn để chờ ứng dụng khởi động chậm | Đặt thấp thì bị giết khi đang khởi động; đặt cao thì pod treo thật lúc đầu không ai phát hiện | `startupProbe` với `failureThreshold × periodSeconds` bằng thời gian khởi động xấu nhất |
+| Không có `readinessProbe` | Pod được coi là Ready ngay khi container chạy, nhận traffic lúc chưa mở cổng; rollout đi tiếp dù bản mới hỏng | Luôn có readiness cho pod nhận traffic |
+| Liveness và readiness cùng endpoint, cùng ngưỡng | Pod quá tải tạm thời bị giết thay vì chỉ bị ngừng nhận traffic | Liveness lỏng hơn nhiều: endpoint riêng, ngưỡng cao hơn |
+| Giữ `timeoutSeconds: 1` cho ứng dụng có CPU limit thấp | Probe quá giờ lúc tải cao, pod bị giết đúng lúc cần nó nhất | Tăng timeout; xem lại CPU limit |
+| Probe `exec` chạy lệnh nặng mỗi vài giây | Mỗi lần gọi tạo tiến trình mới trong container, tính vào CPU của nó | Dùng `httpGet` hoặc `grpc` khi được |
+| Liveness kiểm database hay service khác | Phụ thuộc chậm là mọi pod bị giết cùng lúc, đúng lúc hệ thống yếu nhất | Liveness chỉ kiểm trạng thái nội bộ của tiến trình (SB8.3 có ví dụ) |
+
+<Check id="d11.3.probes">Nói được ba loại probe chạy khi nào, thất bại thì kubelet làm gì, và vì sao ứng dụng khởi động chậm cần `startupProbe` thay vì `initialDelaySeconds` lớn.</Check>
+
+### Trình tự tắt một pod
+
+D1.1 đã dạy `SIGTERM`, `SIGKILL` và vai trò của PID 1; SB8.3 đã dạy Spring Boot làm gì khi nhận `SIGTERM`. Còn lại là phần của Kubernetes, và điểm mấu chốt là **hai nhánh chạy song song, không chờ nhau**:
+
+```text
+ kubectl delete pod, rollout, hoặc drain node
+   t = 0   API server ghi deletionTimestamp; pod thành Terminating
+           |
+           |-- nhánh kubelet:   chạy preStop hook (nếu có) --> gửi SIGTERM tới PID 1 --> chờ tiến trình thoát
+           |
+           '-- nhánh endpoint:  gỡ IP của pod khỏi EndpointSlice --> kube-proxy, gateway, load balancer
+                                lần lượt cập nhật (vài trăm ms tới vài giây, tuỳ thành phần)
+
+   t = terminationGracePeriodSeconds (mặc định 30)
+           container nào còn chạy thì nhận SIGKILL --> exit 137
+```
+
+SB8.3 đã nêu hệ quả: ứng dụng đóng cổng ngay khi nhận `SIGTERM` sẽ thắng nhánh endpoint, và vài request cuối rơi vào một pod đã đóng cửa. `preStop` là chỗ chèn một khoảng chờ **trước** `SIGTERM` để nhánh endpoint kịp xong:
+
+```yaml
+lifecycle:
+  preStop:
+    sleep:
+      seconds: 5
+```
+
+Hành động `sleep` do kubelet tự thực hiện (bật mặc định từ Kubernetes 1.30, ổn định từ 1.34), nên image không cần có lệnh `sleep` hay shell. Dạng `exec` chạy một lệnh trong container, dùng khi cần làm việc gì đó thật, ví dụ báo cho ứng dụng ngừng nhận việc.
+
+Ngân sách thời gian phải khép kín:
+
+```text
+ preStop  +  thời gian ứng dụng tắt êm  <  terminationGracePeriodSeconds
+   5 s    +          20 s               <            30 s
+```
+
+`preStop` **tính vào** grace period. Nếu hook chạy lố hạn, kubelet chỉ cho thêm đúng 2 giây rồi giết. Và mọi thứ ở trên vô nghĩa nếu PID 1 của container không nhận hay không xử lý `SIGTERM`: pod sẽ luôn mất trọn grace period để tắt rồi chết với 137 (lab bước 3).
+
+<Check id="d11.3.termination">Vẽ được hai nhánh song song khi pod bị xoá, và tính được ngân sách giữa `preStop`, thời gian tắt của ứng dụng và `terminationGracePeriodSeconds`.</Check>
+
+### Pod nhiều container và sidecar
+
+Đặt hai container vào một pod khi chúng **sống chết cùng nhau** và cần chung mạng hoặc volume: ứng dụng và tiến trình gom log của nó, ứng dụng và proxy mTLS của service mesh (K11). Nếu hai thứ scale độc lập được thì chúng là hai Deployment, không phải một pod.
+
+Pod có ba chỗ đặt container, khác nhau ở thứ tự và vòng đời:
+
+| | Init container | Sidecar gốc (native) | Container thường |
+|---|---|---|---|
+| Khai ở | `initContainers` | `initContainers`, thêm `restartPolicy: Always` | `containers` |
+| Chạy | Lần lượt, từng cái phải **chạy xong** | Khởi động theo thứ tự khai báo, rồi **chạy tiếp** | Cùng lúc, sau khi mọi init container xong và mọi sidecar đã chạy |
+| Chết giữa chừng | Chạy lại (theo `restartPolicy` của pod) | Luôn được khởi động lại riêng nó | Theo `restartPolicy` của pod |
+| Khi pod tắt | Đã xong từ lâu | Tắt **sau** container thường, theo thứ tự ngược | Tắt trước |
+| Có probe | Không | Có; `startupProbe` của nó chặn container sau cho tới khi đạt | Có |
+| Dùng cho | Chờ phụ thuộc, tải cấu hình, chạy migration | Proxy, gom log, nạp lại chứng chỉ | Ứng dụng chính |
+
+Trước khi có sidecar gốc (ổn định từ Kubernetes 1.33), sidecar phải khai như một container thường, và kéo theo ba lỗi kinh điển: không có thứ tự khởi động (ứng dụng gọi ra ngoài trước khi proxy sẵn sàng); khi tắt, proxy chết trước ứng dụng nên request đang xử lý mất đường ra; và **Job không bao giờ xong**, vì Job chỉ hoàn thành khi mọi container thường thoát mà sidecar thì chạy mãi (lab bước 4).
+
+Về tài nguyên: request của sidecar gốc được **cộng** vào request của pod như một container thường, còn init container chỉ tính theo cái lớn nhất, vì chúng không chạy cùng lúc với ứng dụng.
+
+<Check id="d11.3.sidecar">Phân biệt được init container, sidecar gốc và container thường theo thứ tự khởi động và tắt, và nêu được ba lỗi của sidecar khai theo kiểu cũ.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Pod Lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/): phần "Container probes" và "Termination of Pods" là nguồn gốc của hai sơ đồ trong bài.
+- [Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/): ví dụ từng kiểu probe và bảng tham số.
+- [Container Lifecycle Hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/): `preStop`, các kiểu handler và điều gì xảy ra khi hook lỗi.
+- [Sidecar Containers](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/): khác biệt với init container và với container thường, thứ tự tắt.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k1-lab` và namespace `k1`. Lab của bài này không cần thứ gì từ lab K1.2. Nếu đã xoá cụm, làm lại bước 1 của K1.1 (tạo cụm) và hai lệnh tạo namespace ở bước 3 của bài đó.
+
+**Profile máy.** Như K1.1: khoảng 1,3 GiB RAM của Docker; các pod của bài chỉ là `busybox`. Máy 8 GB chạy được với cụm 1 control plane và 1 worker.
+
+Bước 3 cần **hai terminal**. Terminal nào cũng phải có biến `KUBECONFIG` của lab; mở terminal mới thì phải export lại:
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-d11/kubeconfig
+kubectl config current-context
+kubectl config set-context --current --namespace k1
+mkdir -p ~/masteva-d11/k1-3 && cd ~/masteva-d11/k1-3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k1-lab
+Context "kind-k1-lab" modified.
+```
+
+</Expected>
+
+### 1. Ứng dụng khởi động chậm: liveness giết nhầm, startup cứu
+
+Container dưới đây giả lập một ứng dụng cần 20 giây mới mở cổng. Liveness kiểm mỗi 2 giây, sai 3 lần thì giết:
+
+<Terminal where="mac" title="~/masteva-d11/k1-3/slow-start.yaml">
+
+```bash
+cat > slow-start.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: slow-start
+spec:
+  terminationGracePeriodSeconds: 3
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command:
+        - sh
+        - -c
+        - |
+          echo "khởi động, cần 20 giây..."
+          sleep 20
+          mkdir -p /www && echo ok > /www/healthz
+          echo "sẵn sàng"
+          exec httpd -f -p 8080 -h /www
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        periodSeconds: 2
+        failureThreshold: 3
+EOF
+kubectl apply -f slow-start.yaml && sleep 45
+kubectl get pod slow-start
+kubectl events --for pod/slow-start | grep -E "Unhealthy|Killing|BackOff"
+kubectl logs slow-start --previous
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/slow-start created
+NAME         READY   STATUS    RESTARTS      AGE
+slow-start   1/1     Running   3 (20s ago)   45s
+20s (x2 over 20s)   Warning   BackOff     Pod/slow-start   Back-off restarting failed container app in pod slow-start_k1(c44ec275-cce0-4e9f-a6e9-2720e9708731)
+1s (x12 over 43s)   Warning   Unhealthy   Pod/slow-start   Liveness probe failed: Get "http://10.244.2.16:8080/healthz": dial tcp 10.244.2.16:8080: connect: connection refused
+1s (x4 over 39s)    Normal    Killing     Pod/slow-start   Container app failed liveness probe, will be restarted
+khởi động, cần 20 giây...
+```
+
+</Expected>
+
+kubelet quyết định giết container ở khoảng giây thứ 6 của mỗi lần chạy (3 lần sai × 2 giây); cộng 3 giây grace period, mỗi container sống 8 tới 9 giây và không lần nào in được "sẵn sàng". Ứng dụng không hỏng; probe sai. Tuỳ thời điểm bạn xem, pod đang `Running` với `1/1` như trên, hoặc `CrashLoopBackOff` với `0/1` nếu rơi vào khoảng chờ giữa hai lần chạy. Trường hợp `1/1` đáng để ý: không có `readinessProbe` thì pod được coi là sẵn sàng ngay cả khi chưa mở cổng. Số `RESTARTS` có thể lệch một đơn vị.
+
+Thêm `startupProbe` cho phép tối đa 30 lần × 2 giây = 60 giây khởi động, rồi tạo lại pod:
+
+<Terminal where="mac">
+
+```bash
+cat >> slow-start.yaml <<'EOF'
+      startupProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        periodSeconds: 2
+        failureThreshold: 30
+EOF
+kubectl delete pod slow-start && kubectl apply -f slow-start.yaml
+for i in 1 2 3 4 5 6; do sleep 5; kubectl get pod slow-start --no-headers; done
+kubectl logs slow-start
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "slow-start" deleted from k1 namespace
+pod/slow-start created
+slow-start   0/1   Running   0     5s
+slow-start   0/1   Running   0     11s
+slow-start   0/1   Running   0     16s
+slow-start   0/1   Running   0     21s
+slow-start   1/1   Running   0     26s
+slow-start   1/1   Running   0     31s
+khởi động, cần 20 giây...
+sẵn sàng
+```
+
+</Expected>
+
+Không lần khởi động lại nào. Trong 20 giây đầu startup probe thất bại khoảng 10 lần nhưng còn xa ngưỡng 30; liveness chưa được chạy. Pod cũng chỉ `1/1` sau khi startup đạt. Từ đó liveness mới tiếp quản với ngưỡng chặt của nó (6 giây), nên một ứng dụng treo thật vẫn bị phát hiện nhanh.
+
+`terminationGracePeriodSeconds: 3` chỉ để lab chạy nhanh: `sh` làm PID 1 không phản ứng với `SIGTERM` trong lúc `sleep` (D1.1), nên với mặc định 30 giây mỗi lần liveness "giết" sẽ mất nửa phút.
+
+### 2. Readiness: ngừng nhận traffic mà không bị giết
+
+Deployment hai bản và một Service tối thiểu đứng trước (K2 dạy kỹ Service). Readiness ở đây là probe `exec` kiểm nội dung một file, để bạn bật tắt được bằng tay:
+
+<Terminal where="mac" title="~/masteva-d11/k1-3/shop.yaml">
+
+```bash
+cat > shop.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: shop }
+  template:
+    metadata:
+      labels: { app: shop }
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.38.0
+          command: ["sh", "-c", "mkdir -p /www && echo ok > /www/healthz && echo ok > /www/ready && exec httpd -f -p 8080 -h /www"]
+          readinessProbe:
+            exec:
+              command: ["grep", "-q", "ok", "/www/ready"]
+            periodSeconds: 2
+            failureThreshold: 1
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+spec:
+  selector: { app: shop }
+  ports:
+    - port: 80
+      targetPort: 8080
+EOF
+kubectl apply -f shop.yaml && kubectl rollout status deploy/shop
+P=$(kubectl get pod -l app=shop -o jsonpath='{.items[0].metadata.name}')
+echo maintenance | kubectl exec -i $P -- tee /www/ready
+sleep 5
+kubectl get pod -l app=shop
+kubectl get endpointslice -l kubernetes.io/service-name=shop \
+  -o jsonpath='{range .items[0].endpoints[*]}{.targetRef.name} ready={.conditions.ready}{"\n"}{end}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/shop created
+service/shop created
+Waiting for deployment "shop" rollout to finish: 0 of 2 updated replicas are available...
+Waiting for deployment "shop" rollout to finish: 1 of 2 updated replicas are available...
+deployment "shop" successfully rolled out
+maintenance
+NAME                    READY   STATUS    RESTARTS   AGE
+shop-6b6c74d99d-8hvzk   0/1     Running   0          6s
+shop-6b6c74d99d-v6vs9   1/1     Running   0          6s
+shop-6b6c74d99d-v6vs9 ready=true
+shop-6b6c74d99d-8hvzk ready=false
+```
+
+</Expected>
+
+Pod đầu thành `0/1` nhưng `RESTARTS` vẫn 0 và `STATUS` vẫn `Running`. Trong **EndpointSlice**, danh sách địa chỉ đứng sau Service, nó được đánh dấu `ready=false`: kube-proxy ngừng gửi traffic tới nó. Liveness vẫn đạt nên không ai giết. Đây là hành vi bạn muốn khi pod quá tải tạm thời hoặc đang nạp dữ liệu. Ghi lại `ok` thì pod quay về:
+
+<Terminal where="mac">
+
+```bash
+echo ok | kubectl exec -i $P -- tee /www/ready
+sleep 4
+kubectl get endpointslice -l kubernetes.io/service-name=shop \
+  -o jsonpath='{range .items[0].endpoints[*]}{.targetRef.name} ready={.conditions.ready}{"\n"}{end}'
+kubectl delete -f shop.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ok
+shop-6b6c74d99d-v6vs9 ready=true
+shop-6b6c74d99d-8hvzk ready=true
+deployment.apps "shop" deleted from k1 namespace
+service "shop" deleted from k1 namespace
+```
+
+</Expected>
+
+<Check id="d11.3.lab-probes">Tái hiện được vòng khởi động lại do liveness trên ứng dụng khởi động chậm và sửa bằng `startupProbe`; làm một pod rời khỏi EndpointSlice bằng readiness mà không bị khởi động lại.</Check>
+
+### 3. `preStop`, `SIGTERM` và grace period
+
+Container này bắt `SIGTERM` và mất 3 giây dọn dẹp. `preStop` ghi một dòng vào stdout của PID 1 rồi chờ 5 giây:
+
+<Terminal where="mac" title="~/masteva-d11/k1-3/graceful.yaml">
+
+```bash
+cat > graceful.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: graceful
+spec:
+  terminationGracePeriodSeconds: 15
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command:
+        - sh
+        - -c
+        - |
+          trap 'echo "$(date +%T) nhận SIGTERM, dọn dẹp 3 giây"; sleep 3; echo "$(date +%T) thoát"; exit 0' TERM
+          echo "$(date +%T) chạy"
+          while true; do sleep 1; done
+      lifecycle:
+        preStop:
+          exec:
+            command: ["sh", "-c", "echo \"$(date +%T) preStop: chờ 5 giây\" > /proc/1/fd/1; sleep 5"]
+EOF
+kubectl apply -f graceful.yaml && kubectl wait --for=condition=Ready pod/graceful --timeout=60s
+```
+
+</Terminal>
+
+Mở **terminal thứ hai** theo dõi log. Terminal mới chưa có biến `KUBECONFIG` nên phải export lại:
+
+<Terminal where="mac" title="Terminal 2">
+
+```bash
+export KUBECONFIG=~/masteva-d11/kubeconfig
+kubectl logs -f graceful
+```
+
+</Terminal>
+
+<Predict question="Sau `kubectl delete pod graceful`, các dòng log xuất hiện theo thứ tự nào, và lệnh xoá mất khoảng bao lâu?">
+
+`preStop` trước, `SIGTERM` sau khi hook xong, và lệnh xoá mất khoảng 9 tới 10 giây:
+
+```text
+02:44:21 chạy
+02:44:24 preStop: chờ 5 giây
+02:44:29 nhận SIGTERM, dọn dẹp 3 giây
+02:44:32 thoát
+```
+
+5 giây `preStop`, rồi mới tới `SIGTERM`, rồi 3 giây dọn dẹp; phần còn lại là các bước của kubelet. Dòng `SIGTERM` có thể trễ thêm tới 1 giây vì shell chỉ chạy `trap` sau khi lệnh `sleep 1` đang dở kết thúc. Tổng nằm trong hạn 15 giây nên không có `SIGKILL`. Giờ trong container là UTC.
+
+</Predict>
+
+Ở terminal đầu:
+
+<Terminal where="mac">
+
+```bash
+time kubectl delete pod graceful
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "graceful" deleted from k1 namespace
+kubectl delete pod graceful  0.04s user 0.04s system 0% cpu 9.424 total
+```
+
+</Expected>
+
+Dòng cuối là định dạng `time` của zsh, con số cần đọc là `total`; bash in ba dòng `real`, `user`, `sys`.
+
+Giờ tới một container không xử lý `SIGTERM`: `sleep` làm PID 1 và không cài handler. `preStop` dùng hành động `sleep` của kubelet:
+
+<Terminal where="mac" title="~/masteva-d11/k1-3/stubborn.yaml">
+
+```bash
+cat > stubborn.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stubborn
+spec:
+  terminationGracePeriodSeconds: 15
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sleep", "3600"]
+      lifecycle:
+        preStop:
+          sleep:
+            seconds: 5
+EOF
+kubectl apply -f stubborn.yaml && kubectl wait --for=condition=Ready pod/stubborn --timeout=60s
+```
+
+</Terminal>
+
+Ở terminal 2 (lệnh `logs -f` cũ đã tự thoát khi pod mất), theo dõi trạng thái container:
+
+<Terminal where="mac" title="Terminal 2">
+
+```bash
+export KUBECONFIG=~/masteva-d11/kubeconfig
+kubectl get pod stubborn -w -o jsonpath='{.status.containerStatuses[0].state}{"\n"}'
+```
+
+</Terminal>
+
+Ở terminal đầu:
+
+<Terminal where="mac">
+
+```bash
+time kubectl delete pod stubborn
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "stubborn" deleted from k1 namespace
+kubectl delete pod stubborn  0.04s user 0.02s system 0% cpu 15.450 total
+```
+
+</Expected>
+
+Terminal 2 in ra (đã bỏ dòng lặp và rút gọn `containerID`):
+
+<Expected>
+
+```text
+{"running":{"startedAt":"2026-10-10T02:44:34Z"}}
+{"terminated":{"containerID":"containerd://2b86…","exitCode":137,"finishedAt":"2026-10-10T02:44:50Z","reason":"Error","startedAt":"2026-10-10T02:44:34Z"}}
+```
+
+</Expected>
+
+Hơn 15 giây và exit 137 (các lần đo khi kiểm chứng: 15,5 tới 17,1 giây). `SIGTERM` tới ở giây 5, sau `preStop`, và bị phớt lờ; `SIGKILL` tới ở giây 15 chứ không phải 20, vì `preStop` tính vào grace period; phần còn lại, tới 2 giây, là kubelet dọn sandbox của pod. Mỗi pod như vậy làm rollout chậm thêm 15 giây (30 giây với mặc định), và ứng dụng thật thì không kịp đóng kết nối hay ghi dữ liệu dở. Cách sửa nằm ở image, như D1.1: tiến trình chính phải là PID 1 và phải xử lý `SIGTERM`.
+
+<Check id="d11.3.lab-termination">Quan sát được thứ tự `preStop` rồi `SIGTERM`, đo được thời gian xoá pod trong hai trường hợp, và giải thích được con số 137.</Check>
+
+### 4. Sidecar kiểu cũ làm Job treo, sidecar gốc thì không
+
+Một Job gồm ba container: `prepare` tạo file log rồi thoát; `log-shipper` đọc file đó ra stdout; `report` ghi 3 dòng vào file rồi thoát. Bản này khai `log-shipper` là sidecar gốc: nằm trong `initContainers`, có `restartPolicy: Always`, và xử lý `SIGTERM`:
+
+<Terminal where="mac" title="~/masteva-d11/k1-3/job-sidecar-native.yaml">
+
+```bash
+cat > job-sidecar-native.yaml <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: report-native
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: logs
+          emptyDir: {}
+      initContainers:
+        - name: prepare
+          image: busybox:1.38.0
+          command: ["sh", "-c", "echo \"$(date +%T) prepare: tạo file log\"; touch /logs/app.log"]
+          volumeMounts:
+            - { name: logs, mountPath: /logs }
+        - name: log-shipper
+          image: busybox:1.38.0
+          restartPolicy: Always
+          command:
+            - sh
+            - -c
+            - |
+              trap 'echo "$(date +%T) log-shipper: nhận SIGTERM"; exit 0' TERM
+              echo "$(date +%T) log-shipper: bắt đầu"
+              tail -F /logs/app.log &
+              wait
+          volumeMounts:
+            - { name: logs, mountPath: /logs }
+      containers:
+        - name: report
+          image: busybox:1.38.0
+          command:
+            - sh
+            - -c
+            - |
+              echo "$(date +%T) report: bắt đầu"
+              for i in 1 2 3; do echo "dòng $i" >> /logs/app.log; sleep 2; done
+              echo "$(date +%T) report: xong"
+          volumeMounts:
+            - { name: logs, mountPath: /logs }
+EOF
+```
+
+</Terminal>
+
+Bản kiểu cũ chỉ khác một chỗ: `log-shipper` chuyển từ `initContainers` sang `containers` và bỏ `restartPolicy`. Sinh nó từ file trên bằng `yq`, rồi chạy cả hai:
+
+<Terminal where="mac">
+
+```bash
+yq '.metadata.name = "report-old" | .spec.template.spec.containers += [.spec.template.spec.initContainers[1] | del(.restartPolicy)] | del(.spec.template.spec.initContainers[1])' job-sidecar-native.yaml > job-sidecar-old.yaml
+kubectl apply -f job-sidecar-native.yaml -f job-sidecar-old.yaml
+kubectl wait --for=condition=Complete job/report-native --timeout=120s && sleep 5
+kubectl get jobs
+kubectl get pods -l batch.kubernetes.io/job-name
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+job.batch/report-native created
+job.batch/report-old created
+job.batch/report-native condition met
+NAME            STATUS     COMPLETIONS   DURATION   AGE
+report-native   Complete   1/1           10s        15s
+report-old      Running    0/1           15s        15s
+NAME                  READY   STATUS      RESTARTS   AGE
+report-native-7tpjv   0/2     Completed   0          15s
+report-old-ztjlz      1/2     NotReady    0          15s
+```
+
+</Expected>
+
+`report-old` sẽ `Running` mãi: container `report` đã xong, nhưng `log-shipper` còn chạy nên pod không kết thúc, và Job không có cách nào biết "việc chính đã xong". `report-native` hoàn thành sau 10 giây. Xem log theo container để thấy thứ tự, rồi xoá cả hai:
+
+<Terminal where="mac">
+
+```bash
+kubectl logs job/report-native --all-containers --prefix
+kubectl delete job report-old report-native
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[pod/report-native-7tpjv/prepare] 02:44:52 prepare: tạo file log
+[pod/report-native-7tpjv/log-shipper] 02:44:53 log-shipper: bắt đầu
+[pod/report-native-7tpjv/log-shipper] dòng 1
+[pod/report-native-7tpjv/log-shipper] dòng 2
+[pod/report-native-7tpjv/log-shipper] dòng 3
+[pod/report-native-7tpjv/log-shipper] 02:45:00 log-shipper: nhận SIGTERM
+[pod/report-native-7tpjv/report] 02:44:53 report: bắt đầu
+[pod/report-native-7tpjv/report] 02:44:59 report: xong
+job.batch "report-old" deleted from k1 namespace
+job.batch "report-native" deleted from k1 namespace
+```
+
+</Expected>
+
+Đọc theo giờ: `prepare` chạy xong, `log-shipper` khởi động, rồi `report` mới bắt đầu. `report` xong lúc `:59`, kubelet gửi `SIGTERM` cho sidecar một giây sau, sidecar thoát với mã 0, pod kết thúc, Job `Complete`.
+
+`trap` trong sidecar không phải để cho đẹp. Ở lần chạy thử đầu tiên khi soạn bài, `log-shipper` chỉ là `tail -F` làm PID 1, không xử lý `SIGTERM`: Job vẫn hoàn thành nhưng mất **46 giây** thay vì 10, vì kubelet phải chờ hết grace period 30 giây rồi mới `SIGKILL` sidecar. Sidecar cũng phải tắt êm như ứng dụng chính.
+
+<Check id="d11.3.lab-sidecar">Chỉ ra được vì sao Job có sidecar kiểu cũ không bao giờ xong, chuyển được nó thành sidecar gốc, và đọc được thứ tự khởi động, tắt qua log.</Check>
+
+### Khi gặp lỗi
+
+- `The connection to the server localhost:8080 was refused` ở terminal 2: terminal đó chưa có `export KUBECONFIG=~/masteva-d11/kubeconfig`.
+- `slow-start` báo `CrashLoopBackOff` cả sau khi thêm `startupProbe`: đoạn `cat >>` đã nối sai thụt lề. `startupProbe` phải ngang hàng với `livenessProbe`; xem lại bằng `kubectl apply --dry-run=server -f slow-start.yaml`.
+- Manifest có `preStop` dạng `sleep:` bị API server từ chối: cụm cũ hơn Kubernetes 1.30 chưa bật hành động này. Dùng dạng `exec` với `["sleep", "5"]` nếu image có lệnh đó.
+- `time` in ra ba dòng `real`, `user`, `sys` thay vì một dòng như trong bài: bạn đang dùng bash; bài chạy trên zsh. Con số cần đọc là `real`.
+- `report-native` cũng đứng ở `Running`: `log-shipper` đang nằm trong `containers` thay vì `initContainers`, hoặc thiếu `restartPolicy: Always`. Không có dòng đó, nó là init container thường và `report` không bao giờ được chạy.
+
+### Dọn dẹp
+
+Deployment, Service và Job của bài đã được xoá trong từng bước. Nếu học tiếp K1.4 ngay, xoá pod còn lại và giữ cụm:
+
+<Terminal where="mac">
+
+```bash
+kubectl delete pod slow-start --ignore-not-found
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Hai lệnh dưới xoá toàn bộ cụm `k1-lab` và thư mục lab `~/masteva-d11`, gồm cả file của các bài K1 khác và kubeconfig của lab. Chỉ chạy khi bạn dừng học K1; kiểm tra lại tên cụm và đường dẫn trước khi nhấn Enter.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn hẳn">
+
+```bash
+kind delete cluster --name k1-lab
+rm -rf ~/masteva-d11
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="`preStop` nên chờ bao lâu?">
+
+Đủ để thành phần chậm nhất trên đường đi của traffic biết pod đã rời đi. Trong cụm, kube-proxy và các gateway thường cập nhật trong một hai giây, nên 5 giây là con số hay gặp. Nếu trước cụm có load balancer của cloud trỏ thẳng vào IP pod, thời gian huỷ đăng ký của nó có thể tới hàng chục giây và phải cấu hình khớp nhau.
+
+Đừng đoán: đo bằng cách deploy liên tục trong lúc bắn tải đều (SB12 có k6) và đếm lỗi. Hết lỗi kết nối khi tăng `preStop` nghĩa là bạn đã tìm đúng nhánh. Nhớ cộng thời gian đó vào `terminationGracePeriodSeconds`.
+
+</Reveal>
+
+<Reveal title="Có nên bỏ hẳn liveness probe?">
+
+Với nhiều service thì có thể. Nếu ứng dụng gặp lỗi không cứu được mà tự thoát, kubelet đã khởi động lại nó, không cần probe. Liveness chỉ có ích cho trường hợp tiến trình **còn sống nhưng không làm việc**: deadlock, hết thread, vòng lặp vô hạn.
+
+Một liveness sai gây hại nhiều hơn không có liveness: nó giết pod đang chậm vì quá tải, tải dồn sang pod còn lại, các pod đó cũng chậm và bị giết theo. Nếu đặt liveness, hãy để nó kiểm thứ rẻ và nội bộ, ngưỡng rộng (ví dụ 3 lần × 10 giây, timeout vài giây), và luôn có `startupProbe` che giai đoạn khởi động.
+
+</Reveal>
+
+<Reveal title="Một pod đứng mãi ở Terminating thì do đâu?">
+
+Ba nguyên nhân hay gặp. Một: container không chịu thoát và `terminationGracePeriodSeconds` được đặt rất lớn; pod đang chờ đúng như được bảo. Hai: node của pod mất liên lạc, kubelet không còn ở đó để xác nhận container đã dừng, nên API server giữ object lại. Ba: pod có **finalizer**, một cái tên trong `metadata.finalizers` mà controller nào đó phải gỡ sau khi dọn xong việc của nó; controller đó chết thì pod treo.
+
+`kubectl delete pod --grace-period=0 --force` chỉ xoá object khỏi API server, **không** bảo đảm container đã dừng. Với pod thường thì ít hại; với pod của StatefulSet (K1.4), controller sẽ tạo ngay một pod cùng tên trong khi bản cũ có thể còn chạy và còn ghi vào ổ đĩa. Tìm nguyên nhân bằng `kubectl get pod -o yaml` (xem `deletionTimestamp`, `finalizers`) và trạng thái node trước khi dùng `--force`.
+
+</Reveal>
+
+<Reveal title="Sidecar gốc chết giữa chừng thì ứng dụng chính ra sao?">
+
+kubelet khởi động lại riêng sidecar, kể cả khi pod có `restartPolicy: Never`; container chính không bị đụng tới. Nhưng trong lúc sidecar chết, thứ nó cung cấp cũng mất: proxy chết thì ứng dụng không gọi ra ngoài được, dù tiến trình ứng dụng vẫn khoẻ.
+
+Vì vậy sidecar quan trọng cần `readinessProbe` của riêng nó: pod chỉ Ready khi mọi container, kể cả sidecar, đều Ready, nên Service ngừng gửi traffic tới pod có proxy đang hỏng. Còn `startupProbe` của sidecar giữ cho container chính chưa khởi động khi sidecar chưa sẵn sàng. Đây là hai thứ sidecar khai kiểu cũ không làm được một cách có thứ tự.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết khung probe cho một framework cụ thể, tính ngân sách thời gian tắt từ các tham số bạn đưa, chuyển một sidecar khai kiểu cũ sang `initContainers`.
+
+**AI hay sai ở đâu:** chép cùng một endpoint cho liveness và readiness; dùng `initialDelaySeconds: 60` thay cho `startupProbe`; đưa database vào liveness; quên rằng `preStop` tính vào grace period; khai sidecar trong `containers` theo tài liệu cũ, hoặc quên `restartPolicy: Always` khiến nó thành init container thường và chặn ứng dụng mãi; viết `preStop` gọi `sleep` cho image distroless không có lệnh đó.
+
+**Cách kiểm tra:** `kubectl apply --dry-run=server` để bắt trường sai; `kubectl events --for pod/TÊN` để xem probe nào đang thất bại; xoá thử một pod với `time kubectl delete pod` và so với ngân sách bạn tính; với Job có sidecar, chờ xem nó có tới `Complete` không.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.1 là nền của `SIGTERM`, `SIGKILL`, PID 1 và exit code; SB8.3 là nửa ứng dụng của probe và graceful shutdown. K1.1 là rollout, thứ dựa vào readiness để đi tiếp; K1.2 là CPU limit, thứ làm probe quá giờ. K1.4 dùng lại Job, init container và cách tắt êm cho bốn controller khác. K2 dạy Service và EndpointSlice đứng sau readiness. K5 dạy PodDisruptionBudget, thứ giới hạn số pod bị tắt cùng lúc khi rút node. K11 là nơi sidecar được dùng nhiều nhất.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d11.3.mastery-probes">Viết được ba probe và `preStop` cho một service khởi động mất 40 giây, tính được ngân sách tắt, và chứng minh bằng `time kubectl delete pod` rằng pod tắt trong hạn mà không bị `SIGKILL`.</Check>
+
+<Check id="d11.3.mastery-sidecar">Quyết định được một tiến trình phụ nên là init container, sidecar gốc hay một Deployment riêng, và viết được manifest sidecar gốc cho một Job mà Job vẫn hoàn thành.</Check>
+
+</Mastery>

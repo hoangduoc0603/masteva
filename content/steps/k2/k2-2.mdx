@@ -1,0 +1,753 @@
+---
+title: Gateway API và Ingress cũ
+description: Đưa traffic HTTP từ ngoài vào cụm bằng Gateway API với Envoy Gateway, đọc status để biết vì sao một route không chạy, chia traffic theo trọng số và header, sửa request bằng filter, và chuyển một manifest Ingress cũ khi ingress-nginx đã ngừng bảo trì.
+id: k2.2
+step: k2
+prerequisites: [k2.1]
+topics: [k2.gateway-api]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    envoy-gateway: 1.9.2
+    gateway-api: 1.6.1 (experimental)
+    ingress2gateway: 1.2.0
+    yq: 4.54.1
+---
+
+<Goal>
+
+K2.1 dừng ở Service: một cổng cho một nhóm pod, chia tải theo kết nối. Ứng dụng web cần nhiều hơn: nhiều tên miền chung một địa chỉ, định tuyến theo đường dẫn và header, chia traffic theo tỉ lệ. Bài này dạy Gateway API, chuẩn hiện hành cho việc đó. Học xong, bạn giải thích được:
+
+- Vì sao cụm còn chạy ingress-nginx phải có kế hoạch chuyển đi, và chuyển một manifest Ingress cũ như thế nào.
+- Vì sao `kubectl apply` một route báo thành công mà mọi request nhận `500`.
+- Vì sao chia 80/20 bằng HTTPRoute cho kết quả khác chia bằng số pod sau một Service.
+- Ai trong đội nên sở hữu GatewayClass, Gateway và HTTPRoute.
+
+</Goal>
+
+<Knowledge>
+
+### Ingress: API cũ và giới hạn của nó
+
+K2.1 đã mở Service ra ngoài bằng `NodePort` và `LoadBalancer`. Hai kiểu đó làm việc ở tầng 4: một cổng cho một Service. Ứng dụng web cần tầng 7: nhiều tên miền và đường dẫn chung một IP, kết thúc TLS, chia traffic theo tỉ lệ. Kubernetes có hai API cho việc này.
+
+**Ingress** là API cũ. Một object `Ingress` chứa luật theo host và path; một **ingress controller** (nginx, Traefik, HAProxy…) đọc object đó và cấu hình proxy. Ingress có ba hạn chế đã lộ rõ sau nhiều năm:
+
+- API chỉ mô tả được host, path và TLS. Mọi thứ khác (rewrite, canary, timeout, giới hạn tốc độ) phải viết bằng **annotation riêng của từng controller**, nên manifest không mang sang controller khác được.
+- Một object gộp cả việc của người vận hành hạ tầng (cổng, chứng chỉ) lẫn của đội ứng dụng (đường dẫn), không phân quyền riêng được.
+- Chỉ có HTTP và HTTPS.
+
+API Ingress vẫn tồn tại trong Kubernetes 1.37 nhưng đã **đóng băng**: không nhận tính năng mới, mọi phát triển chuyển sang Gateway API.
+
+<Callout kind="production">
+
+**ingress-nginx đã ngừng bảo trì.** Đây từng là ingress controller phổ biến nhất. Tháng 3/2025, nhóm lỗ hổng "IngressNightmare" (nặng nhất là [CVE-2025-1974](https://kubernetes.io/blog/2025/03/24/ingress-nginx-cve-2025-1974/), điểm CVSS 9,8) cho phép bất kỳ ai tới được mạng pod chiếm quyền controller và từ đó đọc mọi Secret trong cụm, không cần đăng nhập. Tháng 11/2025, dự án Kubernetes [thông báo dừng ingress-nginx](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/): chỉ bảo trì tối thiểu tới tháng 3/2026, sau đó repo được lưu trữ (ngày 24/03/2026) và **không còn bản vá bảo mật**. Cụm đang chạy vẫn chạy, nhưng lỗ hổng tìm ra từ nay sẽ không ai sửa. Đừng cài mới ingress-nginx. Với cụm đang dùng, lập kế hoạch chuyển sang một implementation của Gateway API; bước 6 của lab chuyển thử một manifest.
+
+Lưu ý tên gọi: sản phẩm bị dừng là `kubernetes/ingress-nginx` của cộng đồng Kubernetes. `NGINX Ingress Controller` và `NGINX Gateway Fabric` của F5 là sản phẩm khác, vẫn được phát triển.
+
+</Callout>
+
+<Check id="k2.2.ingress-nginx-retire">Giải thích được "API Ingress đóng băng" khác "ingress-nginx ngừng bảo trì" ở đâu, và hệ quả của từng việc với một cụm đang chạy.</Check>
+
+### Gateway API: ba vai trò, ba loại object
+
+**Gateway API** là API thay thế, ổn định (GA) từ bản 1.0 cuối năm 2023, hiện ở dòng 1.6. Nó tách việc thành ba loại object, khớp với ba vai trò trong một tổ chức:
+
+```text
+   Nhà cung cấp hạ tầng          Người vận hành cụm            Đội ứng dụng
+   ---------------------         -------------------            ---------------------
+   GatewayClass "eg"      <----  Gateway "web"           <----  HTTPRoute "echo"
+   (loại gateway nào,            (mở cổng 80, giao thức         (host echo.k2.test,
+    controller nào xử lý)         HTTP, chứng chỉ TLS,           path, header, trọng số
+                                  namespace nào được gắn          -> Service nào)
+                                  route)
+                                        |
+                                        v
+                          Controller (Envoy Gateway) đọc cả ba,
+                          dựng một Deployment Envoy + một Service cho Gateway,
+                          rồi nạp cấu hình định tuyến vào Envoy
+                                        |
+   client --> Service của Envoy --> pod Envoy --(theo HTTPRoute)--> pod ứng dụng
+```
+
+| | Ingress | Gateway API |
+|---|---|---|
+| Số loại object | Một (`Ingress`) | Ba vai trò: `GatewayClass`, `Gateway`, các loại `Route` |
+| Tính năng ngoài host/path | Annotation riêng từng controller | Trường chuẩn trong API: header, method, trọng số, redirect, rewrite, mirror |
+| Giao thức | HTTP, HTTPS | HTTP, gRPC, TLS, TCP, UDP (mỗi loại một kiểu Route) |
+| Chia quyền | Không | RBAC theo từng loại object; `allowedRoutes` quyết định namespace nào được gắn route |
+| Trạng thái | Gần như không có | `status.conditions` trên từng object: `Accepted`, `Programmed`, `ResolvedRefs` |
+| Tình trạng | Đóng băng | Đang phát triển |
+
+Gateway API chỉ là bộ định nghĩa (CRD). Cần một **implementation** làm việc thật. Bài dùng **Envoy Gateway** vì nó thuần Gateway API và nhẹ; NGINX Gateway Fabric, Traefik, Cilium và Istio là các lựa chọn khác, cùng đọc những object giống hệt. Đó là khác biệt lớn nhất so với Ingress: đổi implementation không phải viết lại luật định tuyến.
+
+<Check id="k2.2.gateway-vai-tro">Kể được ba loại object của Gateway API, ai sở hữu từng loại, và ba hạn chế của Ingress mà chúng giải quyết.</Check>
+
+### Bên trong một HTTPRoute
+
+Một `HTTPRoute` gắn vào Gateway qua `parentRefs`, nhận các tên miền trong `hostnames`, và chứa danh sách `rules`. Mỗi rule có ba phần:
+
+| Phần | Làm gì | Ví dụ |
+|---|---|---|
+| `matches` | Điều kiện để rule áp dụng: path (`Exact`, `PathPrefix`), header, query, method. Không ghi thì khớp mọi request | `path: {type: PathPrefix, value: /api}` |
+| `filters` | Sửa request hoặc response trước khi chuyển tiếp | `RequestHeaderModifier`, `ResponseHeaderModifier`, `URLRewrite`, `RequestRedirect`, `RequestMirror` |
+| `backendRefs` | Đích: một hoặc nhiều Service kèm cổng và `weight` | `{name: echo, port: 80, weight: 80}` |
+
+Khi nhiều rule cùng khớp một request, **thứ tự viết trong file không quyết định**. Đặc tả quy định thứ tự ưu tiên, xét lần lượt cho tới khi phân định được: path `Exact` thắng prefix; prefix dài hơn thắng prefix ngắn; rule có điều kiện method; rule có nhiều điều kiện header hơn; rule có nhiều điều kiện query hơn. Nếu vẫn hoà giữa hai route thì route được tạo trước thắng; trong cùng một route thì rule viết trước thắng.
+
+Gateway API báo kết quả qua `status.conditions` trên từng object. Đây là chỗ nhìn đầu tiên khi một route không chạy, vì `kubectl apply` thành công **không** có nghĩa là route hoạt động:
+
+| Điều kiện | Trên object | `False` nghĩa là | Client thấy gì |
+|---|---|---|---|
+| `Accepted` | GatewayClass, Gateway, Route | Không controller nào nhận, hoặc Gateway không cho route này gắn vào | `404`: gateway không biết route |
+| `Programmed` | Gateway | Proxy chưa sẵn sàng hoặc chưa có địa chỉ | Không kết nối được |
+| `ResolvedRefs` | Gateway, Route | Thứ được tham chiếu (Service, cổng, Secret TLS) không tồn tại hoặc không được phép | `500` cho phần traffic đi tới backend hỏng |
+
+Gateway API phát hành CRD theo hai **kênh**: `standard` gồm những thứ đã ổn định (mọi object trong bài này), và `experimental` thêm các trường và loại còn có thể đổi. Chart của Envoy Gateway 1.9 cài sẵn bộ CRD kênh experimental; lab chấp nhận điều đó cho gọn. Trên production, cài bộ CRD kênh standard như một bước riêng rồi cài chart với `--skip-crds`, để việc nâng CRD (dùng chung cho mọi implementation trong cụm) không bị buộc vào vòng đời của một chart (K6).
+
+<Check id="k2.2.httproute-cau-truc">Kể được ba phần của một rule trong HTTPRoute, thứ tự ưu tiên khi nhiều rule cùng khớp, và ý nghĩa của `Accepted`, `Programmed`, `ResolvedRefs`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Gateway API | Kubernetes](https://kubernetes.io/docs/concepts/services-networking/gateway/): mô hình tài nguyên và đường đi của một request qua Gateway, đọc trước tiên.
+- [HTTPRoute | Gateway API](https://gateway-api.sigs.k8s.io/reference/api-types/httproute/): mọi trường của HTTPRoute, danh sách filter và quy tắc ưu tiên khi nhiều rule cùng khớp.
+- [Quickstart | Envoy Gateway](https://gateway.envoyproxy.io/docs/tasks/quickstart/): cách cài và ví dụ tối thiểu của implementation dùng trong bài.
+- [Ingress NGINX Retirement: What You Need to Know](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/): thông báo chính thức, lý do và lời khuyên chuyển đổi.
+- [A Welcome Guide for Ingress-NGINX Users | Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/migrating-from-ingress-nginx/): những hành vi ngầm của ingress-nginx mà Gateway API không có, cần kiểm khi chuyển.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Cụm `k2-lab` của K2.1 đang chạy, và **dùng lại từ K2.1**: namespace `k2-demo` với Deployment `echo-v1` (3 pod), Service `echo`, pod `client`; cổng `9571` trên máy đã nối vào NodePort 30081 của cụm; thư mục `~/masteva-k2`. Nếu đã xoá cụm, làm lại bước 1 và bước 2 của K2.1.
+- Helm 4.3 (cài ở D0), `yq`, `curl`.
+- **Profile máy:** Envoy Gateway thêm một controller và một proxy; `docker stats` báo hai node dùng tổng cộng khoảng 1,6 GiB RAM sau bài này. Máy 8 GB: Docker Desktop 4 GB là đủ.
+
+Kiểm nhanh những thứ dùng lại:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k2
+kubectl -n k2-demo get deployment/echo-v1 service/echo pod/client -o name
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/echo-v1
+service/echo
+pod/client
+```
+
+</Expected>
+
+### 1. Cài Envoy Gateway và tạo Gateway
+
+Envoy Gateway phát hành dưới dạng Helm chart trên OCI registry. K3.1 dạy Helm kỹ; ở đây chỉ cần một lệnh. Chart cài luôn bộ CRD của Gateway API.
+
+<Terminal where="mac">
+
+```bash
+helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.9.2 \
+  -n envoy-gateway-system --create-namespace --wait | grep -E '^(NAME|NAMESPACE|STATUS):'
+kubectl api-resources --api-group=gateway.networking.k8s.io | awk '{print $1, $NF}' | column -t
+kubectl get crd httproutes.gateway.networking.k8s.io -o jsonpath='{.metadata.annotations}' \
+  | jq -r 'to_entries[] | select(.key | test("bundle-version|channel")) | "\(.key)=\(.value)"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME: eg
+NAMESPACE: envoy-gateway-system
+STATUS: deployed
+NAME                KIND
+backendtlspolicies  BackendTLSPolicy
+gatewayclasses      GatewayClass
+gateways            Gateway
+grpcroutes          GRPCRoute
+httproutes          HTTPRoute
+listenersets        ListenerSet
+referencegrants     ReferenceGrant
+tcproutes           TCPRoute
+tlsroutes           TLSRoute
+udproutes           UDPRoute
+gateway.networking.k8s.io/bundle-version=v1.6.1
+gateway.networking.k8s.io/channel=experimental
+```
+
+</Expected>
+
+Annotation trên CRD cho biết chart đã cài bộ Gateway API **1.6.1, kênh experimental**. Mọi loại object bài này dùng (`GatewayClass`, `Gateway`, `HTTPRoute`) đều thuộc kênh standard, nên manifest của bạn chạy nguyên trên cụm chỉ cài kênh standard.
+
+Lúc này mới chỉ có controller (`envoy-gateway`) chạy trong namespace `envoy-gateway-system`; chưa có proxy nào. Proxy chỉ được dựng khi bạn tạo một `Gateway`.
+
+Mặc định Envoy Gateway mở proxy bằng một Service kiểu `LoadBalancer`, và K2.1 đã cho thấy kind không cấp được địa chỉ cho kiểu đó. Object `EnvoyProxy` dưới đây (cấu hình riêng của Envoy Gateway, không thuộc Gateway API) đổi sang `NodePort` 30081 để khớp cổng `9571` đã nối từ K2.1. Trên cloud bạn bỏ object này và phần `infrastructure` trong Gateway.
+
+<Terminal where="mac" title="~/masteva-k2/gateway.yaml">
+
+```bash
+cat > gateway.yaml <<'EOF'
+# 1. GatewayClass: "loại" gateway, do người quản hạ tầng khai báo
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {name: eg}
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+# Cấu hình riêng của Envoy Gateway: mở Envoy bằng NodePort 30081 thay cho LoadBalancer
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata: {name: nodeport, namespace: k2-demo}
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
+        externalTrafficPolicy: Cluster
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              ports:
+                - port: 80
+                  nodePort: 30081
+---
+# 2. Gateway: một điểm vào cụ thể (cổng, giao thức), do người vận hành cụm khai báo
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: web, namespace: k2-demo}
+spec:
+  gatewayClassName: eg
+  infrastructure:
+    parametersRef: {group: gateway.envoyproxy.io, kind: EnvoyProxy, name: nodeport}
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+EOF
+kubectl apply -f gateway.yaml
+kubectl -n k2-demo wait --for=condition=Programmed gateway/web --timeout=120s
+kubectl get gatewayclass
+kubectl -n k2-demo get gateway
+kubectl -n envoy-gateway-system get pods,services | grep -v certgen
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+gatewayclass.gateway.networking.k8s.io/eg created
+envoyproxy.gateway.envoyproxy.io/nodeport created
+gateway.gateway.networking.k8s.io/web created
+gateway.gateway.networking.k8s.io/web condition met
+NAME   CONTROLLER                                      ACCEPTED   AGE
+eg     gateway.envoyproxy.io/gatewayclass-controller   True       11s
+NAME   CLASS   ADDRESS      PROGRAMMED   AGE
+web    eg      172.20.0.6   True         11s
+NAME                                             READY   STATUS      RESTARTS   AGE
+pod/envoy-gateway-75b559cc4c-rxjwc               1/1     Running     0          14s
+pod/envoy-k2-demo-web-4ef50194-848858944-z9hg5   2/2     Running     0          11s
+
+NAME                                 TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)                                            AGE
+service/envoy-gateway                ClusterIP   10.96.107.231   <none>        18000/TCP,18001/TCP,18002/TCP,19001/TCP,9443/TCP   14s
+service/envoy-k2-demo-web-4ef50194   NodePort    10.96.112.7     <none>        80:30081/TCP                                       11s
+```
+
+</Expected>
+
+Một pod `envoy-k2-demo-web-…` và một Service cùng tên vừa xuất hiện: controller dựng chúng cho Gateway `web`, đúng như sơ đồ ở phần Kiến thức. `ACCEPTED=True` trên GatewayClass nghĩa là có controller nhận loại này. `PROGRAMMED=True` trên Gateway nghĩa là proxy đã chạy và có địa chỉ; ở đây địa chỉ là IP của một node, vì đang dùng NodePort.
+
+<Check id="k2.2.lab-gateway">Cài được Envoy Gateway, tạo GatewayClass và Gateway, và chỉ ra được pod proxy cùng Service mà controller dựng cho Gateway đó.</Check>
+
+### 2. HTTPRoute đầu tiên
+
+Gateway mới chỉ mở cổng. Chưa có route nào nên mọi request nhận `404`. Thêm route đưa `echo.k2.test` về Service `echo` của K2.1:
+
+<Terminal where="mac" title="~/masteva-k2/route.yaml">
+
+```bash
+curl -s -o /dev/null -w 'chưa có route: %{http_code}\n' -H 'Host: echo.k2.test' localhost:9571/hostname
+cat > route.yaml <<'EOF'
+# 3. HTTPRoute: luật định tuyến, do đội ứng dụng khai báo
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: echo, namespace: k2-demo}
+spec:
+  parentRefs:
+    - name: web
+  hostnames: ["echo.k2.test"]
+  rules:
+    - backendRefs:
+        - {name: echo, port: 80}
+EOF
+kubectl apply -f route.yaml
+sleep 3   # Envoy cần một hai giây để nhận cấu hình mới
+cat > xem-route.sh <<'EOF'
+#!/bin/sh
+# In các điều kiện trong status của HTTPRoute echo
+kubectl -n k2-demo get httproute echo -o yaml \
+  | yq '.status.parents[0].conditions[] | [.type, .status, .reason, .message] | join(" | ")'
+EOF
+chmod +x xem-route.sh && ./xem-route.sh
+curl -s -i -H 'Host: echo.k2.test' localhost:9571/hostname; echo
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: khac.k2.test' localhost:9571/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+chưa có route: 404
+httproute.gateway.networking.k8s.io/echo created
+Accepted | True | Accepted | Route is accepted
+ResolvedRefs | True | ResolvedRefs | Resolved all the Object references for the Route
+HTTP/1.1 200 OK
+date: Sat, 10 Oct 2026 02:48:14 GMT
+content-length: 24
+content-type: text/plain; charset=utf-8
+
+echo-v1-7cfdc4df58-r62sl
+404
+```
+
+</Expected>
+
+`ResolvedRefs=True` nghĩa là Service `echo` cổng 80 mà route trỏ tới có tồn tại. Request có `Host: echo.k2.test` tới được pod; host khác nhận `404` từ Envoy vì không route nào khớp. Lab dùng header `Host` thay cho DNS thật; trên production, tên miền trỏ về địa chỉ của Gateway.
+
+<Check id="k2.2.lab-route">Viết được một HTTPRoute gắn vào Gateway, gọi được ứng dụng từ máy mình qua Gateway, và đọc được `status` của route.</Check>
+
+### 3. Route hỏng: `apply` thành công không có nghĩa là chạy
+
+<Predict question="Sửa `backendRefs` trỏ sang Service `echo-khong-co` (không tồn tại) rồi `kubectl apply`. Lệnh apply báo gì? Request qua Gateway nhận mã gì?">
+
+`kubectl apply` báo `configured`, không lỗi: API server chỉ kiểm cú pháp, không kiểm Service có tồn tại không. Controller đặt `ResolvedRefs=False` với lý do `BackendNotFound` trong status của route, và Envoy trả `500` cho mọi request khớp rule đó. Không có sự kiện hay cảnh báo nào hiện ra ở terminal của người vừa apply.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+sed 's/{name: echo, port: 80}/{name: echo-khong-co, port: 80}/' route.yaml | kubectl apply -f -
+sleep 3; ./xem-route.sh
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: echo.k2.test' localhost:9571/hostname
+sed 's/{name: echo, port: 80}/{name: echo, port: 8080}/' route.yaml | kubectl apply -f -
+sleep 3; ./xem-route.sh
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: echo.k2.test' localhost:9571/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/echo configured
+Accepted | True | Accepted | Route is accepted
+ResolvedRefs | False | BackendNotFound | Failed to process route rule 0 backendRef 0: service k2-demo/echo-khong-co not found.
+500
+httproute.gateway.networking.k8s.io/echo configured
+Accepted | True | Accepted | Route is accepted
+ResolvedRefs | False | PortNotFound | Failed to process route rule 0 backendRef 0: TCP Port 8080 not found on Service k2-demo/echo.
+500
+```
+
+</Expected>
+
+Hai lỗi phổ biến nhất khi viết route, cùng một triệu chứng `500`, và `message` nói thẳng nguyên nhân: Service không tồn tại, rồi cổng không có trên Service. Lỗi thứ hai là nhầm lẫn quen thuộc của K2.1: `backendRefs.port` là **cổng của Service** (80), không phải cổng của pod (8080).
+
+Thói quen cần có: sau mỗi lần `apply` một route, đọc `status` trước khi báo "xong". Trong pipeline, `kubectl wait --for=condition=ResolvedRefs` không dùng được trực tiếp vì điều kiện nằm sâu trong `status.parents`; lệnh `yq` trong `xem-route.sh` là cách kiểm đơn giản. Đưa route về trạng thái đúng:
+
+<Terminal where="mac">
+
+```bash
+kubectl apply -f route.yaml
+sleep 3; ./xem-route.sh | cut -d'|' -f1-3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/echo configured
+Accepted | True | Accepted
+ResolvedRefs | True | ResolvedRefs
+```
+
+</Expected>
+
+<Check id="k2.2.lab-route-hong">Tái hiện được route trỏ sai Service và sai cổng, tìm được nguyên nhân từ `status` của HTTPRoute, và sửa lại.</Check>
+
+### 4. Chia traffic theo trọng số và theo header
+
+Triển khai bản v2 của ứng dụng, có Service riêng. Lần này dùng lệnh cho gọn; `kubectl create deployment` tự gắn label `app=echo-v2`, khác `app=echo`, nên Service `echo` không chọn nhầm pod v2:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-demo create deployment echo-v2 --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 \
+  --port=8080 -- /agnhost netexec --http-port=8080
+kubectl -n k2-demo expose deployment echo-v2 --port=80 --target-port=8080
+kubectl -n k2-demo rollout status deployment/echo-v2
+```
+
+</Terminal>
+
+Sửa HTTPRoute thành hai rule: ai gửi header `x-version: v2` thì luôn vào v2 (để đội phát triển tự thử); còn lại chia 80/20.
+
+<Terminal where="mac" title="~/masteva-k2/route-canary.yaml">
+
+```bash
+cat > route-canary.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: echo
+  namespace: k2-demo
+spec:
+  parentRefs:
+    - name: web
+  hostnames: ["echo.k2.test"]
+  rules:
+    # Quy tắc 1: ai gửi header x-version: v2 thì luôn vào v2
+    - matches:
+        - headers:
+            - name: x-version
+              value: v2
+      backendRefs:
+        - name: echo-v2
+          port: 80
+    # Quy tắc 2: còn lại chia 80/20 giữa v1 và v2
+    - backendRefs:
+        - name: echo
+          port: 80
+          weight: 80
+        - name: echo-v2
+          port: 80
+          weight: 20
+EOF
+kubectl apply -f route-canary.yaml
+sleep 3   # Envoy cần một hai giây để nhận cấu hình mới
+for i in $(seq 100); do curl -s -H 'Host: echo.k2.test' localhost:9571/hostname; echo; done \
+  | cut -d- -f1,2 | sort | uniq -c
+for i in $(seq 5); do curl -s -H 'Host: echo.k2.test' -H 'x-version: v2' localhost:9571/hostname; echo; done \
+  | cut -d- -f1,2 | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  79 echo-v1
+  21 echo-v2
+   5 echo-v2
+```
+
+</Expected>
+
+100 request thường chia xấp xỉ 80/20; các lần chạy khác trong lab cho 81/19, 78/22 và 83/17. `weight` là tỉ lệ tương đối, không phải phần trăm: `8` và `2` cho cùng kết quả. Năm request có header vào v2 cả năm, vì rule có điều kiện header cụ thể hơn rule không có điều kiện. Đây là canary release ở dạng đơn giản nhất: tăng dần `weight` của v2, theo dõi tỉ lệ lỗi, rồi bỏ v1. D13 tự động hoá việc tăng dần này bằng Argo Rollouts.
+
+So với Service ở K2.1: Service chia theo **kết nối** và theo số pod (3 pod v1, 1 pod v2 sẽ là 75/25, không chỉnh được). HTTPRoute chia theo **request** và theo con số bạn đặt, không phụ thuộc số pod.
+
+<Check id="k2.2.lab-canary">Viết được HTTPRoute chia traffic theo trọng số và theo header, và đo được tỉ lệ bằng `curl`.</Check>
+
+### 5. Filter: sửa request và response ngay tại gateway
+
+Ba nhu cầu hay gặp: đường dẫn công khai khác đường dẫn nội bộ của ứng dụng; ứng dụng cần biết request đã đi qua gateway nào; và client cần thêm một header trong response. Cả ba làm bằng `filters`, không đụng vào code ứng dụng. `agnhost` có sẵn đường dẫn `/header?key=…` trả về giá trị một header nó nhận được, tiện để kiểm.
+
+<Terminal where="mac" title="~/masteva-k2/route-filter.yaml">
+
+```bash
+cat > route-filter.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: echo, namespace: k2-demo}
+spec:
+  parentRefs:
+    - name: web
+  hostnames: ["echo.k2.test"]
+  rules:
+    # /ten ở bên ngoài được viết lại thành /hostname trước khi tới ứng dụng
+    - matches:
+        - path: {type: PathPrefix, value: /ten}
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path: {type: ReplacePrefixMatch, replacePrefixMatch: /hostname}
+        - type: ResponseHeaderModifier
+          responseHeaderModifier:
+            add:
+              - {name: x-route, value: viet-lai}
+      backendRefs:
+        - {name: echo, port: 80}
+    # mọi request khác: ghi đè header x-gateway để ứng dụng biết nó đi qua gateway nào
+    - filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - {name: x-gateway, value: web}
+      backendRefs:
+        - {name: echo, port: 80}
+EOF
+kubectl apply -f route-filter.yaml
+sleep 3; ./xem-route.sh | cut -d'|' -f1-3
+curl -s -i -H 'Host: echo.k2.test' localhost:9571/ten | grep -v '^date'; echo
+curl -s -H 'Host: echo.k2.test' 'localhost:9571/header?key=x-gateway'; echo
+curl -s -H 'Host: echo.k2.test' -H 'x-gateway: gia-mao' 'localhost:9571/header?key=x-gateway'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/echo configured
+Accepted | True | Accepted
+ResolvedRefs | True | ResolvedRefs
+HTTP/1.1 200 OK
+content-length: 24
+content-type: text/plain; charset=utf-8
+x-route: viet-lai
+
+echo-v1-7cfdc4df58-r62sl
+
+web
+web
+```
+
+</Expected>
+
+- `/ten` khớp rule thứ nhất vì path cụ thể hơn rule không có `matches`. Ứng dụng nhận `/hostname` và trả tên pod; response có thêm `x-route: viet-lai`.
+- Request khác rơi vào rule thứ hai. Ứng dụng thấy `x-gateway: web` dù client không gửi.
+- Dòng cuối: client cố gửi `x-gateway: gia-mao`, ứng dụng vẫn thấy `web`. `set` **ghi đè** giá trị client gửi; `add` thì nối thêm. Với header mà backend tin tưởng (danh tính, nguồn gốc request), luôn dùng `set` ở gateway, nếu không client tự khai được.
+
+Filter chuẩn còn có `RequestRedirect` (chuyển HTTP sang HTTPS, đổi tên miền) và `RequestMirror` (sao chép traffic sang một backend khác để thử). Thứ gì nằm ngoài danh sách chuẩn, như giới hạn tốc độ hay xác thực, mỗi implementation có policy riêng gắn vào route (K6).
+
+<Check id="k2.2.lab-filter">Dùng được filter để viết lại đường dẫn, thêm header vào response và ghi đè header của request, và giải thích được `set` khác `add` ở đâu.</Check>
+
+### 6. Chuyển một Ingress cũ sang Gateway API
+
+Giả sử cụm cũ chạy ingress-nginx với hai Ingress: một cái chính, một cái canary viết bằng annotation. Bạn không cài ingress-nginx; chỉ cần file manifest.
+
+<Terminal where="mac" title="~/masteva-k2/ingress-cu.yaml">
+
+```bash
+cat > ingress-cu.yaml <<'EOF'
+# Manifest kiểu cũ: Ingress cho ingress-nginx (controller đã ngừng bảo trì)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: echo, namespace: k2-demo}
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: echo.k2.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: echo, port: {number: 80}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-canary
+  namespace: k2-demo
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "20"
+    nginx.ingress.kubernetes.io/canary-by-header: x-version
+    nginx.ingress.kubernetes.io/canary-by-header-value: v2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: echo.k2.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: echo-v2, port: {number: 80}}
+EOF
+```
+
+</Terminal>
+
+Bốn annotation `canary*` chỉ ingress-nginx hiểu. `ingress2gateway` là công cụ của SIG Network đọc Ingress cùng annotation của từng controller và in ra object Gateway API tương đương. Tải bản 1.2.0 vào thư mục lab (không cài vào hệ thống) và kiểm checksum. Máy Mac chip Intel thay `arm64` bằng `x86_64`; Linux thay `Darwin` bằng `Linux`.
+
+<Terminal where="mac">
+
+```bash
+mkdir -p bin && cd bin
+V=v1.2.0; F=ingress2gateway_Darwin_arm64.tar.gz
+curl -sLO https://github.com/kubernetes-sigs/ingress2gateway/releases/download/$V/$F
+curl -sLO https://github.com/kubernetes-sigs/ingress2gateway/releases/download/$V/checksums.txt
+grep "$F" checksums.txt | shasum -a 256 -c -
+tar xzf "$F" ingress2gateway && cd ..
+./bin/ingress2gateway print --providers ingress-nginx --input-file ingress-cu.yaml --no-color > gateway-moi.yaml
+grep -E '^kind|gatewayClassName' gateway-moi.yaml
+yq 'select(.kind == "HTTPRoute") | .spec.rules' gateway-moi.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ingress2gateway_Darwin_arm64.tar.gz: OK
+┌─ WARN  ────────────────────────────────────────
+│  Ingress NGINX serves TLS traffic for host "echo.k2.test" with a self-signed certificate. This behavior will not be translated and the host will not be accessible via HTTPS.
+│  source: INGRESS-NGINX
+└─
+┌─ WARN  ────────────────────────────────────────
+│  Gateway API does not support configuring URL normalization (RFC 3986, Section 6). Please check if this matters for your use case and consult implementation-specific details.
+│  source: STANDARD_EMITTER
+└─
+kind: Gateway
+  gatewayClassName: nginx
+kind: HTTPRoute
+- backendRefs:
+    - name: echo
+      port: 80
+      weight: 80
+    - name: echo-v2
+      port: 80
+      weight: 20
+  matches:
+    - path:
+        type: PathPrefix
+        value: /
+- backendRefs:
+    - name: echo-v2
+      port: 80
+  matches:
+    - headers:
+        - name: x-version
+          value: v2
+      path:
+        type: PathPrefix
+        value: /
+```
+
+</Expected>
+
+Object Gateway API được ghi vào `gateway-moi.yaml`; cảnh báo in ra màn hình. Công cụ đã gộp hai Ingress thành một HTTPRoute, đổi annotation canary thành `weight: 80/20` và một rule theo header: cùng nội dung với `route-canary.yaml` bạn tự viết ở bước 4. Nhưng output chưa dùng ngay được. Ba việc phải làm tay:
+
+- `gatewayClassName: nginx` lấy từ `ingressClassName` cũ. Đổi thành class của implementation bạn chọn (`eg`), hoặc bỏ hẳn object Gateway và trỏ `parentRefs` vào Gateway đã có.
+- Hai cảnh báo là hai **khác biệt hành vi** công cụ không dịch được: ingress-nginx tự phục vụ HTTPS bằng chứng chỉ tự ký, và tự chuẩn hoá URL. Nếu hệ thống cũ dựa vào chúng, bạn phải cấu hình tương đương ở Gateway mới.
+- Annotation nào công cụ chưa hỗ trợ sẽ bị bỏ qua kèm cảnh báo. Đọc hết cảnh báo, và thử từng route trên môi trường staging trước khi chuyển DNS.
+
+<Check id="k2.2.lab-ingress2gateway">Chạy được `ingress2gateway` trên một manifest Ingress cũ và chỉ ra được những gì phải sửa tay trước khi dùng output.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Gọi qua Gateway nhận `404` | Thiếu hoặc sai header `Host`; `hostnames` của route không khớp; route chưa `Accepted` | `./xem-route.sh`; so `hostnames` với header gửi đi |
+| Gọi qua Gateway nhận `500` | `backendRefs` trỏ tới Service không tồn tại hoặc sai cổng | `./xem-route.sh`: `ResolvedRefs=False` kèm `message` |
+| Gateway `PROGRAMMED=False`, lý do `AddressNotAssigned` | Service của Envoy là `LoadBalancer` và không ai cấp địa chỉ | Kiểm `infrastructure.parametersRef` trỏ đúng `EnvoyProxy` |
+| `curl localhost:9571` không kết nối được | Cụm tạo thiếu `extraPortMappings` 30081, hoặc Service của Envoy không dùng NodePort 30081 | `docker port k2-lab-control-plane`; `kubectl -n envoy-gateway-system get services` |
+| Vừa `apply` route mà kết quả vẫn như cũ | Envoy chưa nhận cấu hình mới | Chờ hai ba giây rồi thử lại |
+| `no matches for kind "HTTPRoute"` | Chưa cài CRD của Gateway API | `kubectl api-resources --api-group=gateway.networking.k8s.io` |
+
+### Dọn dẹp
+
+K2.3 và K2.4 chỉ cần cụm `k2-lab`, không dùng lại ứng dụng `echo` hay Gateway. Gỡ chúng để cụm nhẹ đi, nhưng **giữ cụm**. Sau khi gỡ, các CRD của Gateway API và Envoy Gateway vẫn còn trong cụm: Helm không xoá CRD khi `uninstall`, và chúng vô hại với các bài sau.
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá namespace `k2-demo` cùng mọi thứ trong đó và gỡ Envoy Gateway khỏi cụm. Khối lệnh thứ hai xoá cả cụm và thư mục lab; chỉ chạy nó khi không học tiếp K2.3.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K2.3">
+
+```bash
+kubectl delete namespace k2-demo
+kubectl delete gatewayclass eg
+helm uninstall eg -n envoy-gateway-system
+kubectl delete namespace envoy-gateway-system
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k2-lab
+rm -rf ~/masteva-k2
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="HTTPRoute ở namespace này gắn vào Gateway ở namespace khác được không?">
+
+Được, nếu Gateway cho phép. Mặc định mỗi listener chỉ nhận route cùng namespace (`allowedRoutes.namespaces.from: Same`). Người vận hành đổi thành `All` hoặc `Selector` kèm label để mở cho các namespace cụ thể; route khi đó ghi `parentRefs` kèm `namespace` của Gateway. Chiều ngược lại, route trỏ `backendRefs` sang Service ở namespace khác, cần chủ của namespace đích tạo một `ReferenceGrant` cho phép. Cả hai cơ chế đều là "bên bị tham chiếu phải đồng ý", để một đội không tự ý lấy traffic hay gọi Service của đội khác. K6 dựng mô hình một Gateway dùng chung cho nhiều đội.
+
+</Reveal>
+
+<Reveal title="Lab mở Envoy bằng NodePort với externalTrafficPolicy: Cluster. Production khác thế nào?">
+
+Trên cloud, Service của proxy là `LoadBalancer` và nhà cung cấp cấp một địa chỉ công khai; Gateway hiện địa chỉ đó ở cột `ADDRESS`, và DNS của bạn trỏ vào nó. Envoy Gateway đặt `externalTrafficPolicy: Local` làm mặc định cho Service này để ứng dụng thấy IP thật của client (K2.1 đã giải thích cái giá của `Local`). Lab phải đổi sang `Cluster` vì kind chỉ nối cổng 9571 vào node control plane, còn pod Envoy nằm trên worker: với `Local`, control plane không có pod Envoy nào và sẽ từ chối kết nối. Trên máy chủ riêng, K4 dùng MetalLB để có Service `LoadBalancer` thật.
+
+</Reveal>
+
+<Reveal title="HTTPS đặt ở đâu trong mô hình này?">
+
+Ở listener của Gateway. Người vận hành thêm một listener `protocol: HTTPS`, `port: 443`, với `tls.certificateRefs` trỏ tới một Secret kiểu `kubernetes.io/tls` chứa chứng chỉ và khoá. Envoy kết thúc TLS, rồi chuyển HTTP thường tới Service bên trong; HTTPRoute của đội ứng dụng không phải biết gì về chứng chỉ. Đó chính là lợi ích của việc tách vai: chứng chỉ và khoá riêng nằm trong namespace của người vận hành, đội ứng dụng không cần quyền đọc. Phần còn lại là ai cấp và gia hạn chứng chỉ; K6 dùng cert-manager để tự động hoá việc đó, D2.3 là nền về TLS.
+
+</Reveal>
+
+<Reveal title="Vì sao chart của một implementation không nên là nơi quản lý CRD của Gateway API?">
+
+Vì CRD là tài nguyên cấp cụm, dùng chung cho mọi implementation và mọi route của mọi đội. Nếu hai implementation cùng cài CRD ở hai phiên bản, bên cài sau ghi đè bên trước. Nếu chart mang CRD kênh experimental, cả cụm nhận những trường còn có thể đổi hoặc bị gỡ ở bản sau. Và Helm chỉ cài CRD trong thư mục `crds/` ở lần install đầu, không nâng cấp chúng về sau (K3.2). Cách làm bền hơn: coi bộ CRD Gateway API kênh standard là một phần của nền tảng cụm, cài và nâng bằng manifest chính thức của dự án, rồi cài từng implementation với `--skip-crds`.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết HTTPRoute nhanh và đúng cú pháp trong phần lớn trường hợp. Chỗ hay sai: (1) vẫn đề xuất cài `ingress-nginx` và viết `Ingress` kèm annotation `nginx.ingress.kubernetes.io/*`, vì dữ liệu huấn luyện phần lớn có trước khi dự án dừng; (2) dùng `apiVersion: gateway.networking.k8s.io/v1beta1` đã cũ; (3) ghi cổng của pod vào `backendRefs.port`; (4) dựa vào thứ tự viết rule thay vì quy tắc ưu tiên; (5) dùng `add` cho header mà backend tin tưởng. Kiểm bằng cụm thật: `kubectl apply --dry-run=server` bắt lỗi schema, nhưng chỉ `status.conditions` của route và một lệnh `curl` mới cho biết route có chạy không.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.1 là lớp Service bên dưới mọi `backendRefs` của bài này. K3.1 giải thích lệnh `helm install` ở bước 1; K3.2 nói vì sao Helm không nâng CRD. K4 cấp địa chỉ `LoadBalancer` trên máy chủ riêng bằng MetalLB. K6 đi sâu Gateway dùng chung nhiều đội, TLS với cert-manager, external-dns và các policy riêng của implementation. D13 dùng trọng số của HTTPRoute để canary tự động với Argo Rollouts. K11 đưa cùng mô hình route vào traffic giữa các service trong cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k2.2.mastery-gateway">Tự viết được Gateway và HTTPRoute cho một ứng dụng, có chia traffic theo trọng số và một filter.</Check>
+
+<Check id="k2.2.mastery-status">Gặp một route trả `404` hoặc `500`, đọc `status` của Gateway và HTTPRoute để chỉ ra nguyên nhân.</Check>
+
+<Check id="k2.2.mastery-ingress">Giải thích được cho đồng đội vì sao không cài mới ingress-nginx và các bước chuyển một Ingress cũ sang Gateway API.</Check>
+
+</Mastery>

@@ -199,8 +199,8 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 
 ## 8. Tìm kiếm
 
-- **Công cụ:** zbsearch. Lúc build, route tĩnh `src/app/[lang]/search.json/route.ts` xuất nội dung các bài (tiêu đề, đề mục, đoạn văn, đường dẫn) thành `/<lang>/search.json`; trình duyệt dựng chỉ mục từ file này (`src/lib/search/lesson-index.ts`, `lesson-client.ts`), xem ADR-009.
-- **Tải chậm:** file chỉ được tải khi người học mở hộp tìm kiếm và gõ lần đầu, mỗi ngôn ngữ một lần trong phiên, nên trang bài học không bị nặng thêm.
+- **Công cụ:** zbsearch. Lúc build, route tĩnh `src/app/[lang]/search/[file]/route.ts` xuất nội dung các bài (tiêu đề, đề mục, đoạn văn, đường dẫn), **mỗi roadmap có bài một file** `/<lang>/search/<roadmap>.json`; trình duyệt dựng một chỉ mục chung từ các file này (`src/lib/search/lesson-index.ts`, `lesson-client.ts`), xem ADR-009.
+- **Tải chậm:** các file chỉ được tải khi người học mở hộp tìm kiếm và gõ lần đầu, mỗi file một lần trong phiên, nên trang bài học không bị nặng thêm. Mọi file tải song song; file của roadmap đang xem (suy từ đường dẫn, `src/lib/search/scope.tsx`) vào chỉ mục trước và cho kết quả ngay, các roadmap khác vào sau và hộp tìm tự tìm lại để bổ sung. Trang không thuộc roadmap nào (trang chủ) thì chờ đủ mọi file. File tải lỗi bị bỏ qua lần đó, lần tìm sau tải lại.
 - **Tokenizer tiếng Việt** (FR-SEARCH-001):
   1. Chuyển về chữ thường.
   2. Chuẩn hoá Unicode NFD rồi bỏ dấu thanh và dấu phụ.
@@ -210,7 +210,7 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
   Nội dung và từ khoá tìm kiếm đi qua cùng tokenizer, nên "tien trinh" và "tiến trình" cho cùng kết quả.
 - **Đã kiểm chứng ở G0:** bộ tách từ mặc định (zbsearch, bản kế thừa Orama mà Fumadocs 16 dùng) chỉ bỏ được một phần dấu: "Tiến trình đồng bộ" thành `tiến`, `trinh`, `dồng`, `bộ`, nên gõ không dấu không ra kết quả. Tokenizer riêng giải quyết được và có unit test.
 - **Phía trình duyệt:** `createLessonSearchClient` tạo cơ sở dữ liệu zbsearch với cùng tokenizer, nạp tài liệu rồi gom kết quả theo trang như Fumadocs. Hộp tìm kiếm được tải chậm (`next/dynamic`), nên zbsearch và bộ dựng kết quả không nằm trong JavaScript ban đầu của trang.
-- **Ngân sách kích thước:** `/vi/search.json` dưới 2 MB (E2E kiểm). Ngày 05/10/2026, với 64 bài: 1,34 MB, 387 KB gzip (bản xuất Orama cũ: 16 MB cho `vi,en`). Khi gần chạm ngân sách thì chia file theo roadmap.
+- **Ngân sách kích thước:** mỗi file `/vi/search/<roadmap>.json` dưới 2 MB (E2E kiểm). Ngày 11/10/2026, với 118 bài: Java 0,81 MB, Spring Boot 1,23 MB, DevOps 0,58 MB (22 bài), Kubernetes 0,29 MB; tổng 2,9 MB, khoảng 0,84 MB gzip (bản xuất Orama cũ: 16 MB cho 64 bài). File gộp `/<lang>/search.json` đã bỏ từ 11/10/2026 vì vượt 2 MB. DevOps đủ bài (khoảng 75) sẽ gần chạm 2 MB: khi đó chia tiếp theo cấp.
 
 ## 9. Trang bài học
 

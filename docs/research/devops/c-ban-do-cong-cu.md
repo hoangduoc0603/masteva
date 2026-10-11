@@ -53,7 +53,7 @@ Ký hiệu: **G** = CNCF Graduated, **I** = CNCF Incubating, **S** = CNCF Sandbo
 | Attestation | in-toto | attestation v1.2.0 | Apache-2.0 | **G** | Thấp | Nền tảng của SLSA provenance | https://github.com/in-toto/attestation/releases |
 | SBOM **chính** | Syft | v1.54.1 (06/10/2026) | Apache-2.0 | Hoạt động | TB | Xuất CycloneDX và SPDX | https://github.com/anchore/syft/releases |
 | Định dạng SBOM | CycloneDX / SPDX | CycloneDX **1.7** (spec 1.7.2), SPDX **3.0.1** | Mở | — | — | Dạy cả hai, mặc định dùng CycloneDX JSON | https://github.com/CycloneDX/specification/releases · https://github.com/spdx/spdx-spec/releases |
-| Quét **chính** | Trivy | v0.75.0 (01/10/2026) | Apache-2.0 | Hoạt động | Cao | **Bẫy bảo mật**: 03/2026 bị TeamPCP tấn công chuỗi cung ứng (CVE-2026-33634). Binary v0.69.4 và image 0.69.4–0.69.6 bị cài mã độc, **75/76 tag của `trivy-action` bị force-push**. Đây là ví dụ thực tế để dạy pin action theo **commit SHA** | https://github.com/aquasecurity/trivy/releases · https://www.aquasec.com/blog/trivy-supply-chain-attack-what-you-need-to-know · https://thehackernews.com/2026/03/trivy-security-scanner-github-actions.html |
+| Quét **chính** | Trivy | v0.75.0 (01/10/2026) | Apache-2.0 | Hoạt động | Cao | **Bẫy bảo mật**: 03/2026 bị TeamPCP tấn công chuỗi cung ứng (CVE-2026-33634). Binary v0.69.4 và image 0.69.4–0.69.6 bị cài mã độc, **76/77 tag của `trivy-action` bị force-push** (theo advisory GHSA-69fq-xp46-6x23; ghim SHA tới commit trước 09/04/2025 vẫn dính vì kéo `setup-trivy` theo tag). Đây là ví dụ thực tế để dạy pin action theo **commit SHA** | https://github.com/aquasecurity/trivy/releases · https://www.aquasec.com/blog/trivy-supply-chain-attack-what-you-need-to-know · https://thehackernews.com/2026/03/trivy-security-scanner-github-actions.html |
 | Quét thay thế | Grype | v0.120.1 | Apache-2.0 | Hoạt động | TB | Đi cặp với Syft (quét từ SBOM) | https://github.com/anchore/grype/releases |
 | Cập nhật dependency | Renovate / Dependabot | Renovate 44.148.4, Dependabot-core v0.399.0 | Renovate **AGPL-3.0**, Dependabot MIT | Hoạt động | TB | Dependabot dễ nhất trên GitHub, Renovate đa nền tảng (GitLab) | https://github.com/renovatebot/renovate/releases |
 | Registry lab **chính** | Zot | v2.1.22 | Apache-2.0 | **S** | Thấp | Một binary nhẹ, OCI-native, hỗ trợ referrers cho chữ ký cosign. Hợp chạy trong Lima hoặc kind | https://github.com/project-zot/zot/releases |
@@ -272,7 +272,7 @@ Nguyên tắc chọn:
 ## 4. Chưa kiểm được hoặc cần xác minh thêm
 
 - Phiên bản Nginx, Caddy, Sloth/Pyrra, kubectl plugin (krew), yq: chưa kiểm.
-- Kindnet (CNI mặc định của kind) có thực thi NetworkPolicy hay không: chưa xác minh với kind 0.33.
+- Kindnet (CNI mặc định của kind): **đã xác minh ngày 10/10/2026** khi duyệt K2 với kind 0.33 (kindnetd v20260820): NetworkPolicy có hiệu lực (default deny, ingress/egress, cổng), trễ khoảng 1 giây sau `apply`. Lab K2 vì vậy không cài Calico.
 - Istio 1.31 với Kubernetes 1.37: thông báo 1.31.0 chỉ ghi tới 1.36. Cần xem trang "supported releases" của Istio cho 1.31.1.
 - Cơ chế backup hiện hành của CNPG 1.30 (plugin Barman Cloud): cần đọc tài liệu CNPG trước khi viết D17.
 - Tình trạng giấy phép, gói Hobby của LocalStack và giá thương mại: lấy từ blog LocalStack và nguồn thứ cấp.

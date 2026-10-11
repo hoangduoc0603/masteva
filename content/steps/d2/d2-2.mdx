@@ -1,0 +1,639 @@
+---
+title: "DNS: phân giải, TTL, cache và split-horizon"
+description: Lần theo một câu hỏi DNS từ root tới máy chủ có thẩm quyền, dựng DNS nội bộ bằng dnsmasq, cấu hình split DNS trong systemd-resolved, thấy cache giữ bản ghi cũ tới hết TTL và dựng split-horizon bằng hai DNS server.
+id: d2.2
+step: d2
+prerequisites: [d2.1]
+topics: [d2.dns, d2.dns-van-hanh, d2.curl-dig-ss-tcpdump]
+status: verified
+verified:
+  date: 2026-10-10
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    systemd: '259'
+    dig: 9.20.24
+    dnsmasq: '2.92'
+    iproute2: 6.19.0
+---
+
+<Goal>
+
+Hiểu việc đầu tiên xảy ra trước mọi kết nối tới một tên miền: phân giải tên ra địa chỉ IP, qua những máy nào và được cache ở đâu. Học xong bài này, bạn giải thích được:
+
+- Vì sao đổi bản ghi DNS xong mà một số máy vẫn gọi vào IP cũ, và vì sao phải hạ TTL **trước** ngày chuyển hệ thống.
+- Vì sao cùng một tên miền, máy trong văn phòng ra IP nội bộ còn máy ở nhà ra IP công khai.
+- Vì sao `dig` trả lời đúng mà ứng dụng vẫn kết nối sai chỗ, và nên kiểm tra theo thứ tự nào.
+
+</Goal>
+
+<Knowledge>
+
+### DNS: một cơ sở dữ liệu phân tán theo cây
+
+**DNS (Domain Name System)** đổi tên như `api.example.com` thành dữ liệu, thường là địa chỉ IP. Không máy nào giữ toàn bộ dữ liệu: tên miền là một cây, và mỗi nhánh được **uỷ quyền (delegate)** cho máy chủ của người sở hữu nhánh đó.
+
+```text
+                    . (root, 13 tên a–m.root-servers.net)
+          ┌─────────┼──────────┐
+         com        io        vn ...           TLD: do nhà đăng ký quản lý
+          │
+       example                                 uỷ quyền bằng bản ghi NS
+          │                                    tới hera.ns.cloudflare.com
+     api, www ...                              máy chủ có thẩm quyền (authoritative)
+```
+
+Có ba vai trò, hay bị gọi chung là "DNS server" và gây nhầm lẫn:
+
+| Vai trò | Làm gì | Ví dụ |
+|---|---|---|
+| **Stub resolver** | Thư viện trên máy bạn: gửi câu hỏi tới một recursive resolver và chờ | `glibc`, `systemd-resolved` (`127.0.0.53`) |
+| **Recursive resolver** | Đi hỏi từ root xuống thay cho client, rồi cache kết quả | DNS của nhà mạng, `1.1.1.1`, `8.8.8.8`, DNS nội bộ công ty, CoreDNS trong Kubernetes |
+| **Authoritative server** | Giữ dữ liệu gốc của một zone, chỉ trả lời cho zone của mình | Route 53, Cloudflare DNS, BIND, PowerDNS |
+
+Phân giải đệ quy của `api.example.com` khi cache trống:
+
+```text
+ app ─1─> stub (127.0.0.53) ─2─> recursive resolver
+                                    │ 3. hỏi root: "api.example.com?"     -> "hỏi máy chủ của com" (NS + IP)
+                                    │ 4. hỏi máy chủ com                  -> "hỏi hera.ns.cloudflare.com" (NS)
+                                    │ 5. hỏi hera.ns.cloudflare.com        -> "A 104.20.23.154, TTL 300"  (aa)
+                                    │ 6. lưu cache 300 giây
+ app <─8── stub <──────7── trả lời ─┘
+```
+
+Root và TLD chỉ trả lời "hỏi chỗ khác" (referral). Chỉ máy chủ có thẩm quyền trả lời kèm cờ `aa` (authoritative answer). Lệnh `dig +trace` tự làm bước 3–5 để bạn xem từng chặng.
+
+<Check id="d2.2.dns-resolution">Phân biệt được stub resolver, recursive resolver và authoritative server, và kể lại được các chặng của một lần phân giải đệ quy.</Check>
+
+### Các loại bản ghi hay gặp
+
+| Bản ghi | Chứa gì | Ghi chú khi vận hành |
+|---|---|---|
+| `A`, `AAAA` | Địa chỉ IPv4, IPv6 | Nhiều bản ghi `A` cho một tên: client tự chọn, là cách cân bằng tải thô sơ nhất |
+| `CNAME` | "Tên này là bí danh của tên kia" | Không đặt được ở gốc zone (`example.com`); không được đứng chung với bản ghi khác cùng tên |
+| `NS` | Máy chủ có thẩm quyền của zone | Đổi nhà cung cấp DNS là đổi `NS` ở nhà đăng ký |
+| `SOA` | Thông tin zone, trong đó số cuối là TTL cho câu trả lời phủ định | Quyết định NXDOMAIN được cache bao lâu |
+| `MX` | Máy chủ nhận email, kèm độ ưu tiên | `MX 0 .` (null MX) nghĩa là "tên miền này không nhận email" |
+| `TXT` | Chuỗi tuỳ ý | SPF, DKIM, xác minh sở hữu tên miền cho ACME và Google |
+| `PTR` | Tra ngược IP ra tên, trong zone `in-addr.arpa` | Máy chủ email và log hay dùng |
+| `SRV` | Host và port của một dịch vụ | Kubernetes, LDAP, SIP dùng |
+
+### TTL, cache và độ trễ khi đổi bản ghi
+
+Mỗi bản ghi có **TTL (time to live)**: số giây mà người khác được phép cache nó. Câu trả lời có thể bị cache ở nhiều tầng cùng lúc:
+
+```text
+ ứng dụng (JVM, thư viện HTTP) -> stub trên máy (systemd-resolved) -> recursive resolver -> authoritative
+     cache riêng                        cache theo TTL                    cache theo TTL
+```
+
+Hệ quả khi bạn đổi IP của `api.example.com` từ máy cũ sang máy mới: máy chủ có thẩm quyền đổi ngay, nhưng mọi resolver đã cache bản ghi cũ vẫn trả IP cũ cho tới hết TTL. Với TTL 86400 (một ngày), máy cũ phải sống thêm ít nhất một ngày. Cách làm chuẩn:
+
+1. Vài ngày trước khi chuyển, hạ TTL xuống 60–300 giây, rồi chờ hết **TTL cũ** để mọi cache nhận TTL mới.
+2. Đổi bản ghi. Giữ máy cũ chạy thêm ít nhất bằng TTL mới.
+3. Chuyển xong, nâng TTL lên lại để giảm tải cho DNS.
+
+**Cache phủ định (negative caching):** câu trả lời "tên này không tồn tại" (NXDOMAIN) cũng được cache, theo số cuối của bản ghi `SOA` (RFC 2308). Tạo bản ghi mới sau khi ai đó đã hỏi tên đó có thể phải chờ hết thời gian này.
+
+**Cache trong ứng dụng:** JVM có cache DNS riêng. Khi không có security manager, mặc định JVM giữ câu trả lời thành công 30 giây (`networkaddress.cache.ttl` trong `java.security`), không theo TTL của bản ghi. Connection pool còn giữ kết nối TCP tới IP cũ lâu hơn nữa: đổi DNS không làm kết nối đang mở chuyển đi.
+
+<Check id="d2.2.ttl">Giải thích được vì sao đổi bản ghi DNS không có hiệu lực ngay, và lập được kế hoạch hạ TTL trước khi chuyển hệ thống.</Check>
+
+### Resolver trên Ubuntu: systemd-resolved
+
+Trên Ubuntu 26.04, `/etc/resolv.conf` là symlink tới file do **systemd-resolved** sinh ra, chỉ có một dòng `nameserver 127.0.0.53`. Mọi chương trình hỏi stub ở `127.0.0.53`, và resolved quyết định chuyển câu hỏi tới DNS server nào, theo từng card mạng:
+
+- Mỗi card (link) có danh sách DNS server và **routing domain** riêng. Domain dạng `~lab.internal` nghĩa là "câu hỏi cho `*.lab.internal` gửi qua card này".
+- Card có `Default Route: yes` nhận mọi câu hỏi không khớp routing domain nào.
+- Đây chính là **split DNS** của VPN: tên nội bộ hỏi DNS công ty qua đường VPN, tên khác hỏi DNS thường.
+
+Hai dòng khác trong `resolv.conf` đổi cách một tên được hỏi. `search a.example b.example` là danh sách đuôi được thử ghép vào tên ngắn: hỏi `db` thì resolver thử `db.a.example`, rồi `db.b.example`. `options ndots:N` quyết định tên nào bị coi là "ngắn": tên có ít hơn N dấu chấm được ghép với search domain **trước** khi hỏi nguyên văn (mặc định N là 1). Muốn chắc chắn hỏi nguyên văn, viết tên có dấu chấm cuối: `api.example.com.`
+
+`resolvectl` là công cụ đi kèm: `resolvectl status`, `resolvectl query <tên>`, `resolvectl flush-caches`, `resolvectl statistics`. Lưu ý `dig` bỏ qua `/etc/hosts` và gửi thẳng câu hỏi DNS, còn ứng dụng thật đi qua NSS (`/etc/nsswitch.conf`, dòng `hosts:`), đọc `/etc/hosts` trước. Muốn biết ứng dụng thật nhận được gì, dùng `getent hosts <tên>`.
+
+### Split-horizon DNS
+
+**Split-horizon** (còn gọi split-brain DNS) là cùng một tên nhưng trả lời khác nhau tuỳ người hỏi: client trong mạng nội bộ nhận IP riêng `10.x`, client trên Internet nhận IP công khai. Hai cách làm phổ biến: hai DNS server riêng (nội bộ và công khai), hoặc một server có "view" theo dải IP nguồn (BIND `view`, Route 53 private hosted zone gắn với VPC).
+
+Lợi ích là traffic nội bộ không phải vòng ra Internet rồi quay lại. Cái giá là có hai nguồn sự thật: quên cập nhật một bên, hoặc một laptop rời VPN nhưng còn cache câu trả lời nội bộ, là sự cố "chỉ hỏng với vài người" rất khó tái hiện.
+
+<Callout kind="production">
+
+Ngày 4/10/2021, Facebook, Instagram và WhatsApp biến mất khỏi Internet. Theo bài phân tích của chính Facebook, [More details about the October 4 outage](https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/), một lệnh bảo trì làm đứt toàn bộ mạng backbone; các máy chủ DNS có thẩm quyền của họ được thiết kế để tự rút quảng bá BGP khi không nói chuyện được với datacenter, nên phần còn lại của Internet không còn đường tới chúng. Bài viết cũng kể việc mất DNS làm hỏng nhiều công cụ nội bộ mà kỹ sư thường dùng để điều tra và sửa, khiến việc khắc phục chậm hơn. Bài học vận hành: DNS là phụ thuộc của mọi thứ, kể cả công cụ dùng để sửa DNS.
+
+</Callout>
+
+<Check id="d2.2.split-dns">Giải thích được split DNS (theo routing domain) và split-horizon (cùng tên, trả lời khác theo người hỏi), và nêu được một sự cố mỗi cách có thể gây ra.</Check>
+</Knowledge>
+
+<Resources>
+
+- [RFC 1034: Domain names - concepts and facilities](https://www.rfc-editor.org/rfc/rfc1034): mục 2 và 4 mô tả cây tên miền, zone, uỷ quyền và resolver; vẫn là nền của DNS ngày nay.
+- [RFC 2308: Negative Caching of DNS Queries](https://www.rfc-editor.org/rfc/rfc2308): câu trả lời "không tồn tại" được cache bao lâu và vì sao phụ thuộc bản ghi SOA.
+- [systemd-resolved.service(8)](https://man7.org/linux/man-pages/man8/systemd-resolved.service.8.html): mục "Protocols and Routing" giải thích resolved chọn DNS server theo routing domain thế nào.
+- [resolvectl(1)](https://man7.org/linux/man-pages/man1/resolvectl.1.html): các lệnh `status`, `query`, `dns`, `domain`, `flush-caches`, `statistics` dùng trong lab.
+- [BIND 9 Manual Pages](https://bind9.readthedocs.io/en/stable/manpages.html): trang man của `dig`, tra các cờ `+trace`, `+short`, `+noall +answer`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm bài D2.1 và có `~/masteva-d2/topo.sh`. VM 2 CPU, 2 GiB là đủ: lab chạy hai tiến trình dnsmasq, tốn dưới 50 MB. Máy 8 GB không cần thu gọn gì. Bước 2–3 cần VM ra được Internet (UDP cổng 53). Cài công cụ và dựng lại mạng lab:
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y dnsmasq-base bind9-dnsutils
+sudo ~/masteva-d2/topo.sh up
+mkdir -p ~/masteva-d2/dns && cd ~/masteva-d2
+dnsmasq --version | head -1; dig -v
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Dnsmasq version 2.92  Copyright (c) 2000-2025 Simon Kelley
+DiG 9.20.24-1ubuntu0.3-Ubuntu
+```
+
+</Expected>
+
+Bài cài `dnsmasq-base` (chỉ có chương trình) chứ không cài gói `dnsmasq` đầy đủ. Gói đầy đủ kèm một service systemd (`dnsmasq.service`) nghe cổng 53 trên mọi địa chỉ, mà cổng đó trong VM đã có stub của systemd-resolved: bài mẫu chạy thử `dnsmasq` với cấu hình mặc định ở namespace chính và nhận `failed to create listening socket for port 53: Address already in use`. Lab chạy dnsmasq bằng tay bên trong namespace, nơi cổng 53 còn trống.
+
+### 1. Resolver của VM
+
+<Terminal where="vm">
+
+```bash
+ls -l /etc/resolv.conf
+grep -v '^#' /etc/resolv.conf
+resolvectl status eth0 | head -6
+grep ^hosts /etc/nsswitch.conf
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lrwxrwxrwx 1 root root 39 Jul 20 23:34 /etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf
+nameserver 127.0.0.53
+options edns0 trust-ad
+search .
+Link 2 (eth0)
+    Current Scopes: DNS mDNS/IPv4 mDNS/IPv6
+         Protocols: +DefaultRoute -LLMNR +mDNS -DNSOverTLS DNSSEC=no/unsupported
+Current DNS Server: 192.168.5.2
+       DNS Servers: 192.168.5.2
+     Default Route: yes
+hosts:          files dns
+```
+
+</Expected>
+
+Chương trình hỏi `127.0.0.53` (stub của resolved), resolved chuyển tiếp tới `192.168.5.2`, DNS do Lima cung cấp, và Lima lại hỏi resolver của macOS. `hosts: files dns`: ứng dụng đọc `/etc/hosts` trước, rồi mới hỏi DNS.
+
+### 2. Đọc output của dig
+
+<Terminal where="vm">
+
+```bash
+dig example.com
+dig @1.1.1.1 example.com +noall +answer
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 37572
+;; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
+;; QUESTION SECTION:
+;example.com.			IN	A
+
+;; ANSWER SECTION:
+example.com.		0	IN	A	104.20.23.154
+example.com.		0	IN	A	172.66.147.243
+
+;; Query time: 54 msec
+;; SERVER: 127.0.0.53#53(127.0.0.53) (UDP)
+
+example.com.		43	IN	A	172.66.147.243
+example.com.		43	IN	A	104.20.23.154
+```
+
+</Expected>
+
+- `status: NOERROR`: tên tồn tại. `NXDOMAIN` là không tồn tại; `SERVFAIL` là resolver không hỏi được tới nơi; `REFUSED` là server không chịu trả lời bạn.
+- Cờ `rd` (recursion desired): client nhờ đệ quy; `ra` (recursion available): server chịu đệ quy. Không có `aa`: câu trả lời lấy từ cache của resolver, không phải từ máy chủ có thẩm quyền.
+- Cột thứ hai là TTL còn lại. DNS của Lima luôn trả TTL `0` (đã thử nhiều tên), nên resolved trong VM không cache được tên công khai. `1.1.1.1` trả TTL thật, đang đếm ngược trong cache của nó. Địa chỉ IP và TTL của tên công khai trên máy bạn sẽ khác.
+
+DNS của Lima cũng không trả bản ghi `SOA` (bài mẫu thử `dig kubernetes.io SOA` nhận `ANSWER: 0`). Vì vậy các bước hỏi tên công khai dưới đây hỏi thẳng `@1.1.1.1`.
+
+### 3. Đi từ root xuống với dig +trace
+
+<Terminal where="vm">
+
+```bash
+dig +trace +nodnssec example.com
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+.			0	IN	NS	a.root-servers.net.
+...
+;; Received 239 bytes from 127.0.0.53#53(127.0.0.53) in 23 ms
+
+com.			172800	IN	NS	l.gtld-servers.net.
+com.			172800	IN	NS	j.gtld-servers.net.
+...
+;; Received 836 bytes from 198.41.0.4#53(a.root-servers.net) in 174 ms
+
+example.com.		172800	IN	NS	hera.ns.cloudflare.com.
+example.com.		172800	IN	NS	elliott.ns.cloudflare.com.
+;; Received 359 bytes from 192.43.172.30#53(i.gtld-servers.net) in 225 ms
+
+example.com.		300	IN	A	172.66.147.243
+example.com.		300	IN	A	104.20.23.154
+;; Received 72 bytes from 162.159.44.228#53(elliott.ns.cloudflare.com) in 69 ms
+```
+
+</Expected>
+
+Đúng bốn chặng của sơ đồ: danh sách root (lấy qua resolver của bạn), root trả referral tới máy chủ `com`, máy chủ `com` trả referral tới Cloudflare (với TTL 172800 giây, tức hai ngày: đổi nhà cung cấp DNS là chờ lâu), và Cloudflare trả bản ghi `A` với TTL gốc 300. `dig +trace` tự hỏi từng máy, không dùng cache của resolver, nên đây là cách xem "sự thật" ở máy chủ có thẩm quyền.
+
+<Terminal where="vm">
+
+```bash
+dig @1.1.1.1 www.github.com +noall +answer
+dig @1.1.1.1 kubernetes.io SOA +noall +answer
+dig @1.1.1.1 example.com MX +noall +answer
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+www.github.com.		3133	IN	CNAME	github.com.
+github.com.		4	IN	A	20.205.243.166
+kubernetes.io.		21600	IN	SOA	ns-cloud-a1.googledomains.com. cloud-dns-hostmaster.google.com. 1 21600 3600 259200 300
+example.com.		193	IN	MX	0 .
+```
+
+</Expected>
+
+`www.github.com` là bí danh của `github.com`; resolver tự đi tiếp và trả cả hai. Số cuối của `SOA` (`300`) là thời gian cache câu trả lời phủ định của zone `kubernetes.io`. `MX 0 .` là null MX: `example.com` tuyên bố không nhận email.
+
+<Check id="d2.2.lab-dig">Đọc được status, cờ và TTL trong output `dig`, và dùng `dig +trace` để xem câu trả lời từ máy chủ có thẩm quyền.</Check>
+
+### 4. Dựng DNS nội bộ cho lab.internal
+
+ICANN đã dành `.internal` cho mạng riêng (2024), nên tên này không bao giờ trùng với tên công khai. Thêm địa chỉ `10.0.2.53` cho máy server (một card mạng có nhiều IP là chuyện bình thường) rồi chạy dnsmasq trên đó:
+
+<Terminal where="vm" title="~/masteva-d2/dns/internal.conf">
+
+```bash
+sudo ip -n server addr add 10.0.2.53/24 dev eth0
+cat > ~/masteva-d2/dns/internal.conf <<EOF
+# DNS nội bộ của lab: chỉ trả lời cho lab.internal, không hỏi tiếp ra ngoài
+listen-address=10.0.2.53
+bind-interfaces
+no-resolv
+no-hosts
+local=/lab.internal/
+host-record=api.lab.internal,10.0.2.20
+host-record=db.lab.internal,10.0.2.30
+cname=www.lab.internal,api.lab.internal
+mx-host=lab.internal,mail.lab.internal,10
+txt-record=lab.internal,"v=spf1 -all"
+local-ttl=30
+log-queries
+log-facility=$HOME/masteva-d2/dns/internal.log
+pid-file=$HOME/masteva-d2/dns/internal.pid
+EOF
+sudo ip netns exec server dnsmasq --conf-file=$HOME/masteva-d2/dns/internal.conf
+sudo ip netns exec server ss -ulnp | grep :53
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+UNCONN 0      0          10.0.2.53:53        0.0.0.0:*    users:(("dnsmasq",pid=18714,fd=4))
+```
+
+</Expected>
+
+`host-record` tạo cả bản ghi `A` lẫn `PTR`. `local=/lab.internal/` nghĩa là dnsmasq tự trả lời mọi tên trong zone này, tên không khai báo thì trả NXDOMAIN thay vì hỏi tiếp. `local-ttl=30` đặt TTL 30 giây cho các bản ghi. Heredoc không có dấu nháy (`<<EOF`) nên `$HOME` được thay bằng đường dẫn thật khi ghi file.
+
+<Terminal where="vm">
+
+```bash
+dig @10.0.2.53 api.lab.internal | grep -E 'flags|IN'
+dig @10.0.2.53 www.lab.internal +noall +answer
+dig @10.0.2.53 lab.internal MX +noall +answer
+dig @10.0.2.53 lab.internal TXT +noall +answer
+dig @10.0.2.53 -x 10.0.2.20 +noall +answer
+dig @10.0.2.53 nope.lab.internal | grep status
+dig @10.0.2.53 example.com | grep status
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
+; EDNS: version: 0, flags:; udp: 1232
+;api.lab.internal.		IN	A
+api.lab.internal.	30	IN	A	10.0.2.20
+www.lab.internal.	30	IN	CNAME	api.lab.internal.
+api.lab.internal.	30	IN	A	10.0.2.20
+lab.internal.		30	IN	MX	10 mail.lab.internal.
+lab.internal.		30	IN	TXT	"v=spf1 -all"
+20.2.0.10.in-addr.arpa.	30	IN	PTR	api.lab.internal.
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 24719
+;; ->>HEADER<<- opcode: QUERY, status: REFUSED, id: 43979
+```
+
+</Expected>
+
+Lần này có cờ `aa`: dnsmasq trả lời từ dữ liệu của chính nó. `example.com` bị `REFUSED` vì server này không có upstream (`no-resolv`): nó là DNS cho một zone, không phải resolver cho mọi tên. Tra ngược `-x 10.0.2.20` hỏi tên `20.2.0.10.in-addr.arpa`, IP viết ngược.
+
+<Check id="d2.2.lab-dns-server">Dựng được một DNS server nhỏ với bản ghi A, CNAME, MX, TXT, PTR và giải thích được vì sao nó trả `REFUSED` cho tên ngoài zone.</Check>
+
+### 5. Split DNS với systemd-resolved
+
+VM vẫn hỏi Lima cho mọi tên, nên `api.lab.internal` chưa phân giải được qua đường thường. Cấu hình để riêng `*.lab.internal` đi qua card `lan0` tới DNS nội bộ, đúng như VPN làm:
+
+<Terminal where="vm">
+
+```bash
+sudo resolvectl dns lan0 10.0.2.53
+sudo resolvectl domain lan0 '~lab.internal'
+resolvectl status lan0
+resolvectl query api.lab.internal
+getent hosts www.lab.internal
+resolvectl query example.com | head -2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Link 9 (lan0)
+    Current Scopes: DNS mDNS/IPv4 mDNS/IPv6
+         Protocols: -DefaultRoute -LLMNR +mDNS -DNSOverTLS DNSSEC=no/unsupported
+       DNS Servers: 10.0.2.53
+        DNS Domain: ~lab.internal
+     Default Route: no
+api.lab.internal: 10.0.2.20                                 -- link: lan0
+
+-- Information acquired via protocol DNS in 13.5ms.
+-- Data is authenticated: no; Data was acquired via local or encrypted transport: no
+-- Data from: network
+10.0.2.20       api.lab.internal www.lab.internal
+example.com: 172.66.147.243                                 -- link: eth0
+             104.20.23.154                                  -- link: eth0
+```
+
+</Expected>
+
+`api.lab.internal` đi qua `lan0`, `example.com` vẫn đi qua `eth0`. Cấu hình bằng `resolvectl` chỉ sống tới khi card mất hoặc VM khởi động lại; cấu hình lâu dài nằm trong netplan hoặc systemd-networkd. Số `Link 9` trên máy bạn sẽ khác.
+
+### 6. TTL và cache: bản ghi cũ còn sống
+
+<Terminal where="vm">
+
+```bash
+sudo resolvectl flush-caches; sudo resolvectl reset-statistics
+for i in 1 2 3; do dig api.lab.internal +noall +answer; sleep 5; done
+sudo resolvectl statistics | grep -E 'Cache (Hits|Misses)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+api.lab.internal.	30	IN	A	10.0.2.20
+api.lab.internal.	24	IN	A	10.0.2.20
+api.lab.internal.	19	IN	A	10.0.2.20
+                                 Cache Hits: 2
+                               Cache Misses: 1
+```
+
+</Expected>
+
+Lần đầu resolved hỏi dnsmasq (cache miss) và nhận TTL 30. Hai lần sau trả từ cache, TTL đếm ngược. `sudo tail ~/masteva-d2/dns/internal.log` chỉ có một dòng `query[A] api.lab.internal` cho cả ba lần.
+
+Giờ "chuyển" `api` sang máy mới `10.0.2.21`:
+
+<Terminal where="vm">
+
+```bash
+cd ~/masteva-d2/dns
+sed -i 's/^host-record=api.lab.internal,10.0.2.20/host-record=api.lab.internal,10.0.2.21/' internal.conf
+sudo kill $(cat internal.pid); sleep 0.5
+sudo ip netns exec server dnsmasq --conf-file=$HOME/masteva-d2/dns/internal.conf
+dig @10.0.2.53 api.lab.internal +noall +answer
+dig api.lab.internal +noall +answer
+```
+
+</Terminal>
+
+<Predict question="DNS server đã trả IP mới. Một ứng dụng trên VM hỏi qua resolver lúc này nhận IP nào, và tới khi nào?">
+
+```text
+api.lab.internal.	30	IN	A	10.0.2.21
+api.lab.internal.	13	IN	A	10.0.2.20
+```
+
+Hỏi thẳng server: IP mới. Hỏi qua resolved: vẫn IP **cũ**, với TTL còn 13 giây (con số của bạn tuỳ lúc chạy). Chỉ khi TTL về 0, resolved mới hỏi lại và nhận `10.0.2.21`. Trên production, cache này nằm ở hàng nghìn resolver bạn không kiểm soát, nên bạn chỉ có thể chờ, hoặc đã hạ TTL từ trước.
+
+</Predict>
+
+<Terminal where="vm">
+
+```bash
+sleep 16; dig api.lab.internal +noall +answer
+```
+
+</Terminal>
+
+Sau khi TTL hết, resolved trả `10.0.2.21` với TTL 30 mới. Trên máy của chính bạn, `sudo resolvectl flush-caches` xoá cache ngay. Trả bản ghi về như cũ, vì bài D2.3 cần `api` trỏ tới `10.0.2.20`:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/^host-record=api.lab.internal,10.0.2.21/host-record=api.lab.internal,10.0.2.20/' internal.conf
+sudo kill $(cat internal.pid); sleep 0.5
+sudo ip netns exec server dnsmasq --conf-file=$HOME/masteva-d2/dns/internal.conf
+sudo resolvectl flush-caches; dig api.lab.internal +short
+```
+
+</Terminal>
+
+dnsmasq trả NXDOMAIN không kèm `SOA` (nó không phải authoritative đầy đủ cho zone), nên resolved không cache câu trả lời phủ định của lab này. Với DNS thật có `SOA`, NXDOMAIN được cache theo số cuối của `SOA` như phần Kiến thức.
+
+<Check id="d2.2.lab-ttl">Tái hiện được việc resolver trả bản ghi cũ tới hết TTL sau khi đổi bản ghi, và giải thích bằng `resolvectl statistics` và log của DNS server.</Check>
+
+### 7. Split-horizon: cùng tên, hai câu trả lời
+
+Dựng thêm một "DNS công khai" trên router, trả IP công khai cho `shop.masteva.test`, trong khi DNS nội bộ trả IP riêng cho cùng tên. `.test` là TLD dành cho thử nghiệm (RFC 6761).
+
+<Terminal where="vm" title="~/masteva-d2/dns/public.conf">
+
+```bash
+echo "host-record=shop.masteva.test,10.0.2.20" >> ~/masteva-d2/dns/internal.conf
+sudo kill $(cat ~/masteva-d2/dns/internal.pid); sleep 0.5
+sudo ip netns exec server dnsmasq --conf-file=$HOME/masteva-d2/dns/internal.conf
+cat > ~/masteva-d2/dns/public.conf <<EOF
+# "DNS công khai": cùng tên shop.masteva.test nhưng trả IP công khai
+listen-address=10.0.1.1
+bind-interfaces
+no-resolv
+no-hosts
+local=/masteva.test/
+host-record=shop.masteva.test,203.0.113.10
+local-ttl=300
+pid-file=$HOME/masteva-d2/dns/public.pid
+EOF
+sudo ip netns exec router dnsmasq --conf-file=$HOME/masteva-d2/dns/public.conf
+dig @10.0.1.1 shop.masteva.test +short
+dig @10.0.2.53 shop.masteva.test +short
+dig shop.masteva.test | grep status
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+203.0.113.10
+10.0.2.20
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 9544
+```
+
+</Expected>
+
+Câu thứ ba đi theo đường mặc định ra Internet thật qua Lima, nơi `masteva.test` không tồn tại. Thêm `~masteva.test` vào routing domain của `lan0`, như máy vừa nối VPN công ty:
+
+<Terminal where="vm">
+
+```bash
+sudo resolvectl domain lan0 '~lab.internal' '~masteva.test'
+dig shop.masteva.test +short
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10.0.2.20
+```
+
+</Expected>
+
+Cùng một câu hỏi, câu trả lời phụ thuộc vào resolver mà máy đang dùng. Khi người dùng báo "trang chỉ lỗi với tôi", hai câu hỏi đầu tiên là: máy họ hỏi resolver nào (`resolvectl status`), và resolver đó trả gì (`dig @<resolver>`).
+
+<Check id="d2.2.lab-split-horizon">Dựng được split-horizon bằng hai DNS server và giải thích được vì sao kết quả `dig` thay đổi khi thêm routing domain.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `dnsmasq: command not found`: chưa cài `dnsmasq-base` ở phần Chuẩn bị.
+- `dnsmasq: failed to create listening socket for 10.0.2.53: Cannot assign requested address`: chưa thêm `10.0.2.53` vào `eth0` của server, hoặc đã dựng lại mạng bằng `topo.sh up` (địa chỉ phụ mất theo). Chạy lại lệnh `ip -n server addr add` ở bước 4.
+- `dnsmasq: failed to create listening socket ... Address already in use`: một dnsmasq cũ còn chạy trong namespace đó, hoặc bạn quên `ip netns exec` nên nó đang tranh cổng 53 với systemd-resolved. `sudo ip netns pids server` để xem, `sudo kill $(cat ~/masteva-d2/dns/internal.pid)` để dừng.
+- `dig api.lab.internal` trả NXDOMAIN dù `dig @10.0.2.53` đúng: thiếu `resolvectl dns`/`domain` cho `lan0`, hoặc `lan0` vừa được tạo lại nên mất cấu hình. Chạy lại bước 5.
+- `dig +trace` dừng ở chặng đầu với `connection timed out`: mạng của bạn chặn UDP 53 đi thẳng ra root server. Bỏ qua bước 3, các bước sau không cần Internet.
+- `dig api.lab.internal +short` ra `10.0.2.21`: bạn dừng giữa bước 6. Chạy khối lệnh cuối của bước 6 để trả bản ghi về `10.0.2.20`.
+
+</Callout>
+
+### Dọn dẹp
+
+Nếu học tiếp bài D2.3 ngay, **giữ nguyên lab**: bài đó cần DNS nội bộ đang chạy và cấu hình split DNS trên `lan0`. Nếu dừng ở đây, gỡ cấu hình resolver, dừng hai dnsmasq và gỡ mạng; các file trong `~/masteva-d2/dns` được giữ lại để dựng lại nhanh.
+
+<Terminal where="vm" title="Dọn dẹp (khi không học tiếp ngay)">
+
+```bash
+sudo resolvectl revert lan0
+for ns in server router; do sudo ip netns pids "$ns" | xargs -r sudo kill; done
+sudo ~/masteva-d2/topo.sh down
+dig api.lab.internal | grep status
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 28731
+```
+
+</Expected>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="dig trả lời đúng mà ứng dụng vẫn kết nối sai chỗ. Kiểm gì?">
+
+`dig` hỏi thẳng DNS, còn ứng dụng đi một đường dài hơn. Kiểm lần lượt: `getent hosts <tên>` cho biết thư viện hệ thống trả gì (đã tính `/etc/hosts` và thứ tự trong `nsswitch.conf`); một dòng cũ trong `/etc/hosts` thắng mọi DNS server. Tiếp theo là cache trong chính ứng dụng (JVM, thư viện HTTP) và kết nối đang mở trong connection pool, vốn không biết gì về việc DNS đã đổi. Trong container, `/etc/resolv.conf` là của container chứ không phải của máy chủ, nên phải chạy `dig` hay `getent` **bên trong** container. Cuối cùng mới là resolver: `resolvectl status` cho biết câu hỏi đi qua card nào tới server nào.
+
+</Reveal>
+
+<Reveal title="Nhiều bản ghi A cho một tên có phải là cân bằng tải không?">
+
+Chỉ ở mức thô. Resolver trả cả danh sách (thường xoay vòng thứ tự), và client tự chọn một địa chỉ, thường là cái đầu tiên. Không ai đo tải của từng máy, và khi một máy chết, bản ghi của nó vẫn nằm trong cache tới hết TTL; client có thử địa chỉ kế tiếp hay không tuỳ thư viện. Vì vậy DNS round robin chỉ hợp để chia traffic giữa các **load balancer** hoặc giữa các vùng, kèm health check ở phía DNS (Route 53, các dịch vụ GSLB) và TTL ngắn. Chia tải giữa các bản của ứng dụng là việc của load balancer ở bài D2.5.
+
+</Reveal>
+
+<Reveal title="Vì sao Kubernetes khuyên chỉnh ndots, và search domain liên quan gì?">
+
+Khi tên không có đủ số dấu chấm theo `ndots`, resolver thử ghép lần lượt với các search domain trong `/etc/resolv.conf` trước khi hỏi tên gốc. Pod trong Kubernetes có `ndots:5` và ba search domain, nên một lời gọi tới `api.example.com` (2 dấu chấm) có thể sinh ra vài câu hỏi thất bại (`api.example.com.default.svc.cluster.local`...) trước câu hỏi đúng, mỗi câu nhân đôi vì có cả `A` và `AAAA`. Với service gọi API bên ngoài liên tục, đây là tải thừa đáng kể lên CoreDNS. Cách xử lý: viết tên đầy đủ có dấu chấm cuối (`api.example.com.`) hoặc hạ `ndots` trong `dnsConfig` của pod. K2 đi sâu phần DNS trong cụm.
+
+</Reveal>
+
+<Reveal title="Đổi IP sau load balancer trên cloud, vì sao ứng dụng Java vẫn gọi vào IP cũ hàng giờ?">
+
+Load balancer trên cloud (AWS ALB, NLB) đổi IP theo thời gian, với TTL DNS ngắn, khoảng 60 giây. Nếu ứng dụng chỉ phân giải một lần lúc khởi động, hoặc connection pool giữ kết nối tới IP cũ mãi, thì khi IP đó bị thu hồi, request lỗi hàng loạt. Cần kiểm ba tầng: cache DNS của JVM (`networkaddress.cache.ttl`), thời gian sống tối đa của kết nối trong pool (ví dụ `maxLifetime` của HikariCP, thời gian sống của kết nối trong HTTP client), và cache của resolver trên máy.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một output `dig`, đọc một file zone, hoặc viết cấu hình split DNS cho systemd-resolved hay dnsmasq. AI hay khẳng định "DNS lan truyền mất 24–48 giờ" như một hằng số thay vì giải thích TTL của từng bản ghi, hay đề nghị sửa `/etc/resolv.conf` bằng tay trên máy dùng systemd-resolved (file sẽ bị ghi đè), và hay đặt `CNAME` ở gốc zone. Kiểm lại bằng `dig +trace` (sự thật ở máy chủ có thẩm quyền), `resolvectl status` (máy đang hỏi ai) và `getent hosts` (ứng dụng nhận gì).
+
+</Callout>
+
+<Callout kind="link">
+
+D2.1 đã dạy UDP và công cụ; bài này dùng chúng cho DNS. Bài D2.3 dùng tên `api.lab.internal` vừa tạo để học HTTP và TLS. K2.1 học CoreDNS và DNS của Service trong cụm, nơi `search` và `ndots` có hệ quả lớn; K6 dùng external-dns và vận hành CoreDNS ở quy mô lớn. D21 xem DNS như một phụ thuộc toàn cục khi bàn về giới hạn blast radius.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d2.2.mastery-dns-debug">Khi "tên miền trỏ sai", tự kiểm được theo thứ tự: ứng dụng nhận gì (`getent hosts`), máy đang hỏi resolver nào, resolver trả gì và TTL còn bao lâu, máy chủ có thẩm quyền trả gì (`dig +trace`).</Check>
+
+<Check id="d2.2.mastery-migration">Lập được kế hoạch đổi IP của một dịch vụ qua DNS mà không gián đoạn: hạ TTL trước, giữ máy cũ, kiểm cache ở các tầng.</Check>
+
+<Check id="d2.2.mastery-split">Tự dựng được một DNS nội bộ cho một zone riêng và cấu hình máy chỉ hỏi nó cho zone đó, rồi giải thích được cho người khác vì sao cùng một tên ra hai câu trả lời.</Check>
+
+</Mastery>

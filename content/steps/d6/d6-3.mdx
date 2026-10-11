@@ -1,0 +1,906 @@
+---
+title: Volume, network, Docker Compose và Podman
+description: Giữ dữ liệu sống lâu hơn container và sửa lỗi permission denied của volume lẫn bind mount, nối container bằng DNS trên mạng riêng và chỉ mở cổng cần mở, mô tả cả cụm bằng Compose với healthcheck, depends_on có điều kiện và profiles, rồi chạy thử Podman rootless.
+id: d6.3
+step: d6
+prerequisites: [d6.2]
+topics: [d6.volume-network, d6.docker-compose, d6.podman]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    nginx-image: 1.30.5-alpine
+    alpine: 3.24.2
+    podman: 5.8.7 (image quay.io/podman/stable, chạy trong Docker)
+    curl: 8.4.0
+---
+
+<Goal>
+
+Chạy được một ứng dụng nhiều container trên một máy: dữ liệu không mất khi container bị thay, các service tìm thấy nhau bằng tên, chỉ đúng một cổng lộ ra ngoài, và cả cụm khởi động theo đúng thứ tự bằng một lệnh. Học xong bài này, bạn giải thích được:
+
+- Vì sao container chạy bằng user thường báo `permission denied` khi ghi vào volume, và vì sao lỗi đó không xuất hiện trên Mac nhưng xuất hiện trên server Linux.
+- Vì sao `ping db` chạy được trong mạng do bạn tạo nhưng không chạy được trên mạng mặc định của Docker.
+- Vì sao một cổng "đã chặn bằng ufw" vẫn mở ra Internet khi publish bằng Docker.
+- Vì sao `depends_on` không ngăn được lỗi 502 khi service phía sau khởi động lại.
+
+</Goal>
+
+<Knowledge>
+
+### Dữ liệu sống ở đâu
+
+D5.1 cho thấy mọi thứ container ghi ra rơi vào lớp ghi của nó và mất khi `docker rm`. Dữ liệu cần sống lâu hơn container phải nằm ngoài lớp đó, qua một **mount**:
+
+| Loại | Cú pháp | Dữ liệu nằm ở | Dùng cho | Lưu ý |
+|---|---|---|---|---|
+| **Named volume** | `-v d5-data:/data` | Thư mục do Docker quản lý (`/var/lib/docker/volumes/<tên>/_data`) | Dữ liệu của database, file upload, mọi thứ cần bền | Sống tới khi bạn `docker volume rm`. Tên không có dấu `/` |
+| **Bind mount** | `-v /duong/dan:/data` | Chính đường dẫn đó trên máy chủ | Đưa file cấu hình vào (`:ro`), mã nguồn khi phát triển | Container thấy đúng quyền sở hữu của thư mục trên máy chủ |
+| **tmpfs** | `--tmpfs /tmp` | RAM | File tạm, secret không được chạm đĩa | Mất khi container dừng; tính vào giới hạn bộ nhớ |
+
+Hai cơ chế quyết định ai ghi được vào đâu:
+
+- **Kernel so quyền bằng số uid, không bằng tên.** Tiến trình uid 65532 ghi được vào thư mục khi thư mục thuộc uid 65532 (hoặc cho phép "other" ghi). Tên `nonroot` trong container và tên user trên máy chủ không liên quan.
+- **Volume rỗng được khởi tạo từ image.** Khi gắn một named volume còn rỗng vào đường dẫn đã có trong image, Docker chép nội dung và **quyền sở hữu** của thư mục đó sang volume. Nếu đường dẫn không có trong image, Docker tạo thư mục thuộc root. Bind mount không có bước chép này: thư mục máy chủ thế nào thì container thấy thế ấy.
+
+Từ đó có ba cách sửa `permission denied` khi chạy user thường:
+
+| Tình huống | Cách sửa |
+|---|---|
+| Named volume | Tạo sẵn thư mục trong image với đúng chủ sở hữu (`COPY --chown` hoặc `RUN mkdir && chown`), để volume rỗng nhận quyền đó |
+| Bind mount, bạn quản lý thư mục máy chủ | `chown <uid>:<gid>` thư mục trên máy chủ theo uid của container |
+| Bind mount, cần file thuộc user của bạn (phát triển) | Chạy container bằng uid của bạn: `--user $(id -u):$(id -g)` |
+
+Docker Desktop trên Mac và Windows chia sẻ thư mục của máy thật vào VM qua một lớp file riêng (virtiofs), lớp này cho mọi uid trong container ghi và quy file về user của bạn. Lỗi quyền vì thế **bị che trên máy phát triển** và chỉ lộ ra trên server Linux. Lab tái hiện cả hai.
+
+<Check id="d6.3.storage">Chọn được giữa named volume, bind mount và tmpfs, giải thích được vì sao user thường không ghi được vào volume hay bind mount, và nêu được cách sửa cho từng trường hợp.</Check>
+
+### Mạng giữa các container
+
+Mỗi container có network namespace riêng (D5.1). Docker nối chúng lại bằng **bridge**: một switch ảo trên máy chủ, mỗi container cắm vào qua một cặp card ảo (veth).
+
+```text
+                         máy chủ (hoặc VM của Docker Desktop)
+ Internet ──▶ cổng 127.0.0.1:9530 ─DNAT─┐
+                                         ▼
+   mạng "front" (bridge)            ┌─────────┐
+   172.x.0.0/16 ────────────────────│  proxy  │
+                                    └────┬────┘
+   mạng "back" (bridge, internal)        │  http://api:8080   (DNS 127.0.0.11 trả IP của api)
+   172.y.0.0/16 ────────────────────┬────┴────┬──────────┐
+                                    │   api   │ toolbox  │      không có đường ra Internet,
+                                    └─────────┘──────────┘      không publish cổng nào
+```
+
+| | Bridge mặc định (`docker0`) | Bridge do bạn tạo (`docker network create`, Compose) |
+|---|---|---|
+| Container nào tham gia | Mọi container không khai báo `--network` | Chỉ container bạn gắn vào |
+| DNS theo tên container | **Không có** | Có: DNS nội bộ của Docker ở `127.0.0.11` phân giải tên container, alias và tên service của Compose |
+| Cô lập | Mọi container thấy nhau qua IP | Container ở hai mạng khác nhau không nói chuyện được với nhau |
+| Dùng khi | Thử nhanh một container | Mọi trường hợp có từ hai container trở lên |
+
+Các điểm cần nhớ:
+
+- **Trong cùng mạng, gọi nhau bằng tên và cổng của container** (`http://api:8080`), không qua cổng publish. IP của container đổi sau mỗi lần tạo lại, nên đừng ghi IP vào cấu hình.
+- **Publish cổng** (`-p <ip máy chủ>:<cổng máy chủ>:<cổng container>`) là quy tắc DNAT trên máy chủ, chỉ cần cho lưu lượng **từ ngoài vào**. Thiếu phần IP, Docker nghe trên `0.0.0.0`, tức mọi card mạng của máy. Viết `127.0.0.1:9530:80` nếu chỉ cần gọi từ chính máy đó.
+- `internal: true` tạo mạng không có đường ra ngoài: hợp cho database và service nội bộ.
+- `--network host` bỏ cô lập mạng, container dùng thẳng mạng của máy chủ. Trên Docker Desktop, "máy chủ" đó là VM; muốn cổng hiện ra trên máy thật phải bật tuỳ chọn host networking trong Settings.
+
+<Callout kind="production">
+
+Tối 23/06/2021, NewsBlur chuyển MongoDB chính sang một máy chủ mới chạy bằng Docker. Máy đó có bật `ufw` với danh sách chỉ cho phép các server nội bộ. Nhưng khi publish cổng, Docker tự chèn quy tắc vào iptables, **đứng trước** các quy tắc của ufw, và cổng 27017 mở thẳng ra Internet; database lại dựa vào tường lửa chứ không bật xác thực. Khoảng 3 giờ 25 phút sau, một công cụ quét tự động kết nối vào, xoá database `newsblur` trong chừng 90 giây và để lại thư đòi 0,03 BTC. NewsBlur không mất dữ liệu nhờ máy chính cũ còn nguyên bản sao, nhưng dịch vụ ngừng nhiều giờ. Tài liệu của Docker ghi rõ hành vi này: cổng publish đi vòng qua quy tắc của ufw. Phòng thủ gồm ba lớp: không publish cổng của database (đặt nó trên mạng `internal`), nếu phải publish thì ghi rõ IP nội bộ hoặc `127.0.0.1`, và luôn bật xác thực của chính database.
+
+</Callout>
+
+<Check id="d6.3.network">Giải thích được khác biệt giữa bridge mặc định và bridge tự tạo, cách container tìm nhau bằng DNS, publish cổng làm gì ở máy chủ, và vì sao cổng publish vượt qua ufw.</Check>
+
+### Docker Compose
+
+Compose mô tả **cả ứng dụng** (các service, mạng, volume) trong một file `compose.yaml`, rồi tạo, cập nhật, gỡ chúng bằng một lệnh. Compose hiện là plugin của Docker CLI (`docker compose`), đã ở dòng phiên bản 5; bản v1 viết bằng Python với lệnh `docker-compose` đã ngừng phát triển; trường `version:` ở đầu file đã bị bỏ, không cần ghi.
+
+Mọi thứ Compose tạo ra được đặt tên theo **project** (mặc định là tên thư mục, hoặc trường `name:`): container `d5-shop-api-1`, mạng `d5-shop_back`, volume `d5-shop_data`. Mỗi service tự có tên DNS bằng tên service trong các mạng nó tham gia.
+
+**Thứ tự khởi động.** `depends_on` dạng ngắn chỉ bảo đảm container kia **đã được start**, không chờ nó sẵn sàng. Muốn chờ, cần hai thứ đi cùng nhau:
+
+```text
+ api:    healthcheck: lệnh chạy định kỳ TRONG container api; exit 0 = healthy
+ proxy:  depends_on: { api: { condition: service_healthy } }
+
+ docker compose up
+   1. tạo mạng, volume
+   2. start api                      trạng thái: starting
+   3. chạy healthcheck mỗi interval  ... thất bại trong start_period thì không tính
+   4. healthcheck qua                trạng thái: healthy
+   5. lúc này mới start proxy
+```
+
+| `condition` | Chờ tới khi | Dùng cho |
+|---|---|---|
+| `service_started` (mặc định) | Container kia đã start | Phụ thuộc lỏng |
+| `service_healthy` | Healthcheck của nó qua | Database, API phải sẵn sàng trước |
+| `service_completed_successfully` | Nó chạy xong với exit 0 | Job chạy một lần: migration, tạo dữ liệu mẫu |
+
+`depends_on` **chỉ có tác dụng lúc khởi động**. Khi `api` chết hoặc khởi động lại lúc đang chạy, Compose không dừng hay hoãn `proxy`. Ứng dụng vẫn phải tự chịu được việc service phía sau biến mất tạm thời: timeout, retry, trả lỗi rõ ràng (SB8.3 và chặng K1 gặp lại chuyện này với probe).
+
+**Profiles** gắn nhãn cho service phụ (công cụ gỡ lỗi, giao diện quản trị, job nạp dữ liệu). Service có `profiles` không chạy với `docker compose up` thường; chỉ chạy khi gọi `--profile <tên>` hoặc gọi đích danh bằng `docker compose run`.
+
+**Biến môi trường** trong Compose là ba thứ khác nhau, hay bị nhầm:
+
+| Thứ | Ở đâu | Tác dụng |
+|---|---|---|
+| File `.env` cạnh `compose.yaml` | Máy chạy lệnh `docker compose` | Cấp giá trị cho `${BIEN}` **trong file compose** (thay thế lúc đọc file). Không tự vào container |
+| Biến của shell | Máy chạy lệnh | Như trên, và **thắng** file `.env` |
+| `environment:` và `env_file:` của service | Trong file compose | Đặt biến môi trường **bên trong container** |
+
+`docker compose config` in file sau khi đã thay thế mọi biến: chạy nó trước khi `up` để biết chính xác thứ sẽ được tạo.
+
+Compose hợp cho môi trường phát triển, test tích hợp trong CI và triển khai nhỏ trên một máy. Nó không dời container sang máy khác khi máy chết, không tự co giãn, không cập nhật cuốn chiếu; đó là việc của Kubernetes (chặng K1).
+
+<Check id="d6.3.compose">Viết được file Compose có healthcheck, `depends_on` với `condition`, profile và biến từ `.env`, và giải thích được vì sao `depends_on` không thay được việc ứng dụng tự retry.</Check>
+
+### Podman (tuỳ chọn)
+
+**Podman** là container engine mã nguồn mở do Red Hat khởi xướng, nay là dự án CNCF Sandbox (mã nguồn ở tổ chức `podman-container-tools` trên GitHub), mặc định trên RHEL và Fedora. Nó chạy cùng image OCI, cùng Dockerfile, và lệnh gần như trùng với Docker (`podman run`, `podman build`, `podman ps`). Khác biệt nằm ở kiến trúc:
+
+| | Docker | Podman |
+|---|---|---|
+| Tiến trình nền | `dockerd` chạy bằng root, mọi lệnh đi qua nó | **Không có daemon**: lệnh `podman` tự tạo container; mỗi container có một tiến trình giám sát nhỏ (`conmon`) |
+| Chạy không cần root | Có chế độ rootless, phải tự bật | **Rootless là mặc định**: dùng user namespace, uid 0 trong container ánh xạ thành uid của bạn trên máy chủ |
+| Runtime mặc định | runc | crun |
+| Nhóm container | Compose | Pod (như Kubernetes), `podman kube play` chạy manifest Kubernetes; có `podman compose` gọi tới một công cụ Compose bên ngoài |
+| Chạy như service | Restart policy của daemon | Unit systemd sinh từ file Quadlet |
+| Trên Mac, Windows | Docker Desktop (VM) | `podman machine` (VM) |
+
+Rootless đóng đúng lỗ hổng mà D5.1 chỉ ra: với Docker mặc định, root trong container là uid 0 của máy chủ; với Podman rootless, tiến trình thoát được ra ngoài cũng chỉ có quyền của một user thường. Cái giá: không bind được cổng dưới 1024 nếu không cấu hình thêm, mạng đi qua một lớp ở user space (chậm hơn một chút), và một số image đòi quyền root thật sẽ không chạy.
+
+Podman 6 (phát hành giữa năm 2026) bỏ hỗ trợ cgroup v1, CNI, slirp4netns và Mac Intel; hướng dẫn cũ dùng các thành phần đó không còn đúng. Khi nào cần biết Podman: công ty dùng RHEL và không cho cài Docker, môi trường cấm daemon chạy root, hoặc bạn cần chạy container bằng systemd trên một máy lẻ.
+
+<Check id="d6.3.podman">Nêu được ba khác biệt kiến trúc giữa Podman và Docker, và giải thích được rootless bảo vệ máy chủ thế nào.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Volumes (Docker Docs)](https://docs.docker.com/engine/storage/volumes/): vòng đời volume, cách volume rỗng được khởi tạo từ image, sao lưu và khôi phục.
+- [Packet filtering and firewalls (Docker Docs)](https://docs.docker.com/engine/network/packet-filtering-firewalls/): Docker ghi gì vào iptables hay nftables, phần "Docker and ufw" và chain `DOCKER-USER`.
+- [Control startup and shutdown order in Compose](https://docs.docker.com/compose/how-tos/startup-order/): `depends_on`, `condition` và healthcheck; ngắn, nên đọc hết.
+- [Environment variables precedence in Docker Compose](https://docs.docker.com/compose/how-tos/environment-variables/envvars-precedence/): bảng thứ tự ưu tiên đầy đủ giữa shell, `.env`, `env_file`, `environment`.
+- [How a Docker footgun led to a vandal deleting NewsBlur's MongoDB database](https://blog.newsblur.com/2021/06/28/story-of-a-hacking/): bản tường trình của chính NewsBlur về sự cố trong callout, có log và dòng thời gian.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm xong D5.2, thư mục `~/masteva-d6/price-api` còn nguyên với `go.mod` đã lên `golang.org/x/text v0.42.0`. Docker đang chạy, có `curl`, máy có mạng để tải image `nginx` (27 MB) và, ở bước 7 tuỳ chọn, image Podman (236 MB). Dùng các cổng **9530–9532**. **Profile máy:** cả cụm Compose (nginx và `price-api`) dùng khoảng 13 MiB RAM; chạy được trên máy 8 GB. Bước 7 có thể bỏ qua nếu mạng chậm.
+
+**Lab được kiểm chứng với daemon rootful** (Docker Desktop). Với Docker rootless trong Lima của D0.1, phần Compose (bước 4 tới 6) và mạng (bước 3) không phụ thuộc quyền root của daemon; riêng bước 2 thì khác và **chưa được kiểm chứng**: hàm `vm` không vào được máy chủ nên phải xem và xoá `/var/tmp/d5-bind` ngay trong shell của VM, và thư mục đó thuộc user chạy daemon chứ không phải root. Bước 7 (Podman lồng trong Docker) cần `--privileged` thật, nên chỉ chạy với daemon rootful.
+
+### 1. Volume và user thường
+
+Thêm cho `price-api` một endpoint ghi dữ liệu ra đĩa, và một cách giả lập khởi động chậm (dùng ở bước 4 và 5). Hai file mới tự đăng ký vào `mux` của `main.go` qua hàm `init()`:
+
+<Terminal where="mac" title="visits.go và slowstart.go">
+
+```bash
+cd ~/masteva-d6/price-api
+ls && grep x/text go.mod
+cat > visits.go <<'EOF'
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+// POST /visit ghi thêm một dòng vào $DATA_DIR/visits.log rồi trả về tổng số dòng.
+func init() {
+	mux.HandleFunc("POST /visit", func(w http.ResponseWriter, r *http.Request) {
+		dir := os.Getenv("DATA_DIR")
+		if dir == "" {
+			dir = "/data"
+		}
+		path := filepath.Join(dir, "visits.log")
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+		fmt.Fprintln(f, time.Now().UTC().Format(time.RFC3339))
+		data, _ := os.ReadFile(path)
+		fmt.Fprintf(w, "visits=%d\n", bytes.Count(data, []byte("\n")))
+	})
+}
+EOF
+cat > slowstart.go <<'EOF'
+package main
+
+import (
+	"log"
+	"os"
+	"slices"
+	"time"
+)
+
+// START_DELAY=8s giả lập service khởi động chậm (nạp cache, chạy migration).
+// init() chạy trước main(), nên cổng 8080 chỉ mở sau khoảng chờ này.
+// Lần chạy với -healthcheck thì không chờ.
+func init() {
+	d, err := time.ParseDuration(os.Getenv("START_DELAY"))
+	if err != nil || d <= 0 || slices.Contains(os.Args, "-healthcheck") {
+		return
+	}
+	log.Printf("starting slowly: %s", d)
+	time.Sleep(d)
+}
+EOF
+docker build -q --build-arg VERSION=1.1.0 -t d5-price-api:1.1.0 .
+docker run -d --name d5-api -p 127.0.0.1:9531:8080 -v d5-data:/data d5-price-api:1.1.0
+sleep 2
+curl -s -X POST localhost:9531/visit
+docker run --rm -v d5-data:/data alpine:3.24.2 ls -ldn /data
+docker volume inspect d5-data --format '{{.Driver}} {{.Mountpoint}}'
+```
+
+</Terminal>
+
+<Predict question="Container chạy bằng uid 65532 và gắn một named volume mới vào /data. POST /visit trả về gì?">
+
+```text
+Dockerfile
+Dockerfile.naive
+Dockerfile.secret
+go.mod
+go.sum
+main.go
+require golang.org/x/text v0.42.0
+sha256:5394c4c1f4615f8f3d34fe3ab50a9df7160a1b7959740b98f4c61d3b9d88f5ca
+e1ee53ef87b13f3269582b540b8d60529f6598bc407d921069fd97b75333da86
+open /data/visits.log: permission denied
+drwxr-xr-x    2 0        0             4096 Oct 10 02:06 /data
+local /var/lib/docker/volumes/d5-data/_data
+```
+
+`permission denied`. Image không có thư mục `/data`, nên Docker tạo volume với thư mục gốc thuộc `0:0` (root), quyền `755`. Tiến trình uid 65532 chỉ được đọc. `docker run -v d5-data:/data` tự tạo volume nếu chưa có; nó nằm trong thư mục của Docker trên máy chủ (với Docker Desktop là trong VM).
+
+</Predict>
+
+Sửa ở image: tạo sẵn `/data` thuộc uid 65532. Distroless không có shell nên không `RUN mkdir` ở stage cuối được; tạo thư mục ở stage build rồi `COPY --chown` sang:
+
+<Callout kind="danger">
+
+`docker rm -f` xoá container đang chạy cùng lớp ghi của nó. Từ đây tới hết bước 3, lệnh này chỉ dùng cho các container `d5-api` và `d5-bind` do lab tạo; volume `d5-data` được giữ lại.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's|-o /out/price-api \.$|-o /out/price-api . \&\& mkdir /out/data|; s|^(COPY --from=build /out/price-api /price-api)$|$1\nCOPY --from=build --chown=65532:65532 /out/data /data|' Dockerfile
+grep -n -E 'mkdir|COPY --from' Dockerfile
+docker build -q --build-arg VERSION=1.1.1 -t d5-price-api:1.1.1 .
+docker rm -f d5-api
+docker run -d --name d5-api -p 127.0.0.1:9531:8080 -v d5-data:/data d5-price-api:1.1.1
+sleep 2
+curl -s -X POST localhost:9531/visit
+curl -s -X POST localhost:9531/visit
+docker run --rm -v d5-data:/data alpine:3.24.2 ls -ldn /data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+11:    go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/price-api . && mkdir /out/data
+14:COPY --from=build /out/price-api /price-api
+15:COPY --from=build --chown=65532:65532 /out/data /data
+sha256:4638868ede097575ca6279c796617dd9d8328f18de78ea0fc8d10827c69dc0af
+d5-api
+f4886ce0cecbf9b9f606175b7a0215026e1ac52ba400f2643bdc5300b3cda114
+visits=1
+visits=2
+drwxr-xr-x    2 65532    65532         4096 Oct 10 02:06 /data
+```
+
+</Expected>
+
+Cùng volume `d5-data`, giờ thuộc `65532:65532`. Volume vẫn còn rỗng (lần ghi trước thất bại), nên khi gắn vào image mới có sẵn `/data`, Docker chép quyền sở hữu của thư mục đó sang. Với volume **đã có dữ liệu**, bước chép này không xảy ra: phải `chown` bằng một container chạy root, như bước 2.
+
+Giờ thay container và xem dữ liệu còn không:
+
+<Terminal where="mac">
+
+```bash
+docker rm -f d5-api
+docker run -d --name d5-api -p 127.0.0.1:9531:8080 -v d5-data:/data d5-price-api:1.1.1
+sleep 2
+curl -s -X POST localhost:9531/visit
+docker rm -f d5-api
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d5-api
+ae82819469e747ecefcd8fd84b974663465270ff1e565ba0495b8da16338a4ca
+visits=3
+d5-api
+```
+
+</Expected>
+
+Container mới, bộ đếm tiếp tục từ 3: dữ liệu nằm trong volume, không nằm trong container.
+
+<Check id="d6.3.lab-volume">Tái hiện được `permission denied` khi user thường ghi vào volume mới, sửa bằng thư mục có sẵn trong image, và chứng minh được dữ liệu sống qua việc thay container.</Check>
+
+### 2. Bind mount: Linux và Mac khác nhau
+
+Gắn một thư mục của **máy chủ Linux** vào container. `/var/tmp/d5-bind` chưa tồn tại nên Docker tự tạo. Trên Docker Desktop, đường dẫn này nằm trong VM; trên Linux, nó nằm ngay trên máy bạn.
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name d5-bind -p 127.0.0.1:9532:8080 -v /var/tmp/d5-bind:/data d5-price-api:1.1.1
+sleep 2
+curl -s -X POST localhost:9532/visit
+docker run --rm -v /var/tmp/d5-bind:/data alpine:3.24.2 ls -ldn /data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+dd6e3613f63f89d9ff4862e307e5498e14245091c33d64e977f657cfe5591ceb
+open /data/visits.log: permission denied
+drwxr-xr-x    2 0        0               40 Oct 10 02:06 /data
+```
+
+</Expected>
+
+Image đã có `/data` thuộc 65532, nhưng bind mount **che** thư mục đó bằng thư mục của máy chủ, vốn do Docker tạo với chủ là root. Không có bước chép quyền nào như với volume. Sửa bằng cách đổi chủ thư mục trên máy chủ, ở đây thông qua một container chạy root:
+
+<Callout kind="danger">
+
+`vm rm -r` ở cuối khối lệnh xoá vĩnh viễn thư mục `/var/tmp/d5-bind` trên máy chủ Docker (VM của Docker Desktop, hoặc chính máy bạn nếu chạy Linux). Hàm `vm` có toàn quyền root trên máy chủ, như đã cảnh báo ở D5.1; gõ đúng đường dẫn.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker run --rm -v /var/tmp/d5-bind:/data alpine:3.24.2 chown 65532:65532 /data
+curl -s -X POST localhost:9532/visit
+docker rm -f d5-bind
+vm() { docker run --rm -i --privileged --pid=host alpine:3.24.2 nsenter -t 1 -m -u -n -i -- "$@"; }
+vm ls -ln /var/tmp/d5-bind
+vm rm -r /var/tmp/d5-bind
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+visits=1
+d5-bind
+total 4
+-rw-r--r-- 1 65532 65532 21 Oct 10 02:06 visits.log
+```
+
+</Expected>
+
+File trên máy chủ thuộc uid 65532, một uid không có tên trên máy đó. Giờ làm đúng việc ấy với một thư mục **của Mac**:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-d6/bind
+docker run --rm --user 65532:65532 -v ~/masteva-d6/bind:/data alpine:3.24.2 sh -c 'ls -ldn /data; touch /data/x && ls -ln /data | tail -1'
+ls -l ~/masteva-d6/bind | tail -1 | awk '{print $1, $3, $9}' | sed "s/$(id -un)/<user của bạn>/"
+```
+
+</Terminal>
+
+<Predict question="Thư mục ~/masteva-d6/bind thuộc user của bạn trên Mac, không thuộc uid 65532. Lệnh touch có bị permission denied không?">
+
+```text
+drwxr-xr-x    2 0        0               64 Oct 10 02:06 /data
+-rw-r--r--    1 65532    65532            0 Oct 10 02:06 x
+-rw-r--r-- <user của bạn> x
+```
+
+Không lỗi. Trong container, thư mục hiện là của `0:0` với quyền `755`, đáng lẽ uid 65532 không ghi được, vậy mà `touch` thành công; file hiện là của 65532 khi nhìn từ container và là của bạn khi nhìn từ Mac. Lớp chia sẻ file của Docker Desktop tự quy đổi quyền. Trên Linux thật, cùng lệnh này báo `Permission denied` như đầu bước 2. Hệ quả: một file Compose bind mount thư mục dữ liệu "chạy ngon trên máy tôi" có thể hỏng ngay khi lên server; hãy thử trên Linux (VM Lima của D0 là đủ) trước khi tin.
+
+</Predict>
+
+<Check id="d6.3.lab-bind">Tái hiện và sửa được lỗi quyền của bind mount trên máy chủ Linux, và giải thích được vì sao cùng lệnh đó không lỗi với thư mục chia sẻ từ Mac.</Check>
+
+### 3. Mạng: DNS, cô lập, publish
+
+<Terminal where="mac">
+
+```bash
+docker network create d5-app
+docker run -d --name d5-api --network d5-app d5-price-api:1.1.1
+sleep 2
+docker run --rm --network d5-app alpine:3.24.2 sh -c 'grep nameserver /etc/resolv.conf; wget -qO- http://d5-api:8080/price'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+dc0f078e2a9252d51e4e9da7144acbc5dba78598aec856664f2e150e77f7154b
+d7bb71edc00a51379db64b4ed1c86fc04c863b2b8febc6eb23cab38007f3189e
+nameserver 127.0.0.11
+{"arch":"arm64","host":"d7bb71edc00a","price":"1.250.000 đ","uid":"65532","version":"1.1.1"}
+```
+
+</Expected>
+
+Container `d5-api` không publish cổng nào. Một container khác trên cùng mạng `d5-app` gọi được nó bằng **tên** và cổng của container; DNS là `127.0.0.11`, máy chủ DNS nội bộ của Docker. Giờ thử từ ba nơi không thuộc mạng đó:
+
+<Terminal where="mac">
+
+```bash
+docker run --rm alpine:3.24.2 sh -c 'grep nameserver /etc/resolv.conf; wget -qO- -T 3 http://d5-api:8080/price'; echo "exit=$?"
+IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "d5-app").IPAddress}}' d5-api)
+docker run --rm alpine:3.24.2 wget -qO- -T 3 http://$IP:8080/price; echo "exit=$?"
+curl -s -m 2 localhost:8080/price; echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+nameserver 192.168.65.7
+wget: bad address 'd5-api:8080'
+exit=1
+wget: download timed out
+exit=1
+exit=7
+```
+
+</Expected>
+
+- Container trên bridge mặc định dùng DNS của máy chủ (địa chỉ `192.168.65.7` là của Docker Desktop, trên máy bạn có thể khác) nên không biết tên `d5-api`.
+- Gọi thẳng IP cũng hết thời gian chờ: hai bridge khác nhau bị cô lập với nhau.
+- Từ máy bạn, `curl` trả mã 7 (không kết nối được): không có cổng nào được publish.
+
+Publish cổng, chỉ trên `127.0.0.1`:
+
+<Callout kind="danger">
+
+Khối lệnh dưới xoá container `d5-api` và mạng `d5-app` của lab bằng `docker rm -f` và `docker network rm`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker network inspect d5-app --format '{{.Driver}} {{(index .IPAM.Config 0).Subnet}} {{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}' | sed -E 's/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/<ip>/g'
+docker rm -f d5-api
+docker run -d --name d5-api --network d5-app -p 127.0.0.1:9531:8080 d5-price-api:1.1.1
+docker port d5-api
+sleep 1; curl -s localhost:9531/healthz
+docker rm -f d5-api
+docker network rm d5-app
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+bridge <ip>/16 d5-api=<ip>/16 
+d5-api
+c0c97f4e2215bff0348ed2bfd43f633c893f3d9a8d3906751af49e41c2509066
+8080/tcp -> 127.0.0.1:9531
+ok
+d5-api
+d5-app
+```
+
+</Expected>
+
+Lệnh `sed` che địa chỉ IP vì dải mạng Docker cấp trên mỗi máy một khác. `docker port` cho thấy chính xác cổng nào của máy chủ dẫn tới container và nghe trên địa chỉ nào. Viết `-p 9531:8080` thì dòng đó là `0.0.0.0:9531`: mọi máy với tới được máy chủ đều gọi được, bất kể ufw.
+
+<Check id="d6.3.lab-network">Cho hai container gọi nhau bằng tên trên mạng tự tạo, chứng minh được bridge mặc định không có DNS và hai mạng bị cô lập, và publish được một cổng chỉ trên `127.0.0.1`.</Check>
+
+### 4. Viết cụm bằng Compose
+
+Cụm gồm `api` (không lộ ra ngoài, khởi động chậm 8 giây), `proxy` (nginx, cổng duy nhất mở ra máy bạn), và `toolbox` (chỉ dùng khi gỡ lỗi).
+
+<Terminal where="mac" title="~/masteva-d6/stack">
+
+```bash
+mkdir -p ~/masteva-d6/stack && cd ~/masteva-d6/stack
+cat > nginx.conf <<'EOF'
+server {
+    listen 80;
+    location = /nginx-health {
+        return 200 "ok\n";
+    }
+    location / {
+        proxy_pass http://api:8080;
+        proxy_connect_timeout 2s;
+    }
+}
+EOF
+cat > .env <<'EOF'
+API_VERSION=1.2.0
+PROXY_PORT=9530
+EOF
+cat > compose.yaml <<'EOF'
+name: d5-shop
+
+services:
+  api:
+    build:
+      context: ../price-api
+      args:
+        VERSION: ${API_VERSION}
+    image: d5-price-api:${API_VERSION}
+    environment:
+      DATA_DIR: /data
+      START_DELAY: 8s
+    volumes:
+      - data:/data
+    networks: [back]
+    read_only: true
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "/price-api", "-healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  proxy:
+    image: nginx:1.30.5-alpine
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PROXY_PORT:-9530}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [front, back]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  toolbox:
+    image: alpine:3.24.2
+    profiles: [debug]
+    networks: [back]
+
+volumes:
+  data:
+
+networks:
+  front:
+  back:
+    internal: true
+EOF
+docker compose config | grep -E 'image:|published:|VERSION:|START_DELAY'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+        VERSION: 1.2.0
+      START_DELAY: 8s
+    image: d5-price-api:1.2.0
+    image: nginx:1.30.5-alpine
+        published: "9530"
+```
+
+</Expected>
+
+`docker compose config` cho thấy `${API_VERSION}` và `${PROXY_PORT}` đã được thay bằng giá trị trong `.env`. Đọc file theo từng service:
+
+- `api`: build từ thư mục `price-api` của D5.2, gắn volume `data`, chỉ nằm trên mạng `back`, không có `ports`. `read_only: true` làm hệ thống file gốc chỉ đọc (chỉ `/data` ghi được) và `cap_drop: [ALL]` bỏ hết capability: hai lớp phòng thủ D5.1 đã nhắc. Healthcheck dùng chính cờ `-healthcheck` của binary; `start_period: 15s` cho phép thất bại trong lúc khởi động chậm mà không bị tính.
+- `proxy`: chỉ start khi `api` healthy; publish một cổng trên `127.0.0.1`; bind mount file cấu hình ở chế độ chỉ đọc; nằm trên cả hai mạng để nhận request từ ngoài và gọi vào `api`. Healthcheck của nó gọi `/nginx-health`, một đường dẫn nginx tự trả lời, **không** chuyển tiếp sang `api`: sức khoẻ của proxy không nên phụ thuộc service phía sau (phần Đào sâu giải thích).
+- `toolbox`: có `profiles: [debug]` nên không chạy mặc định.
+- Mạng `back` là `internal`: container trên đó không có đường ra Internet.
+
+<Terminal where="mac">
+
+```bash
+s=$(date +%s)
+docker compose --progress plain up -d --build --wait 2>&1 | grep -E '^ Container .* (Created|Started|Waiting|Healthy)'
+echo "up mất $(( $(date +%s) - s )) giây"
+curl -s -w '  HTTP %{http_code}\n' localhost:9530/price
+docker compose ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d5-shop-api-1 Created 
+ Container d5-shop-proxy-1 Created 
+ Container d5-shop-api-1 Started 
+ Container d5-shop-api-1 Waiting 
+ Container d5-shop-api-1 Healthy 
+ Container d5-shop-proxy-1 Started 
+ Container d5-shop-api-1 Waiting 
+ Container d5-shop-proxy-1 Waiting 
+ Container d5-shop-api-1 Healthy 
+ Container d5-shop-proxy-1 Healthy 
+up mất 17 giây
+{"arch":"arm64","host":"e27a599d08a6","price":"1.250.000 đ","uid":"65532","version":"1.2.0"}
+  HTTP 200
+SERVICE   STATUS                    PORTS
+api       Up 13 seconds (healthy)   8080/tcp
+proxy     Up 2 seconds (healthy)    127.0.0.1:9530->80/tcp
+```
+
+</Expected>
+
+Sáu dòng đầu là thứ tự khởi động: `api` Started, Compose **chờ** (`Waiting`) cho tới khi nó `Healthy`, rồi mới Started `proxy`. Trong `docker compose ps`, `api` đã chạy 13 giây còn `proxy` mới 2 giây: khoảng cách đó là 8 giây khởi động chậm cộng thời gian healthcheck. Bốn dòng sau là của cờ `--wait`: lệnh `up` chỉ trả về khi mọi service healthy, nên `curl` ngay sau đó chắc chắn thành công. Không có `--wait`, `up -d` trả về ngay khi container cuối vừa start, và script gọi tiếp có thể chạm vào nginx chưa kịp lắng nghe. `8080/tcp` ở cột PORTS của `api` không có mũi tên: cổng chỉ được khai báo trong image, không publish.
+
+<Check id="d6.3.lab-compose-up">Viết được file Compose với hai mạng, volume, healthcheck và `depends_on` có điều kiện, và đọc được thứ tự khởi động từ đầu ra của `docker compose up`.</Check>
+
+### 5. depends_on không bảo vệ lúc đang chạy
+
+<Terminal where="mac">
+
+```bash
+curl -s -X POST localhost:9530/visit
+docker compose restart api >/dev/null 2>&1
+curl -s -o /dev/null -w 'ngay sau restart: HTTP %{http_code}\n' localhost:9530/price
+docker inspect -f '{{.Name}}: {{.State.Health.Status}}' d5-shop-proxy-1 d5-shop-api-1
+until [ "$(docker inspect -f '{{.State.Health.Status}}' d5-shop-api-1)" = healthy ]; do sleep 1; done
+curl -s -o /dev/null -w 'khi api healthy:  HTTP %{http_code}\n' localhost:9530/price
+curl -s -X POST localhost:9530/visit
+```
+
+</Terminal>
+
+<Predict question="proxy có depends_on api với condition service_healthy. Ngay sau khi api khởi động lại, request qua proxy trả mã gì?">
+
+```text
+visits=1
+ngay sau restart: HTTP 502
+/d5-shop-proxy-1: healthy
+/d5-shop-api-1: starting
+khi api healthy:  HTTP 200
+visits=2
+```
+
+`502 Bad Gateway`. `depends_on` chỉ quyết định thứ tự lúc `up`. Khi `api` khởi động lại, `proxy` vẫn chạy (và vẫn `healthy`, vì healthcheck của nó chỉ hỏi chính nginx) trong khi `api` đang `starting`, nên request được chuyển tới một cổng chưa mở. Lab làm kết quả này tất định bằng `START_DELAY=8s`: trong 8 giây đó `api` chắc chắn chưa lắng nghe. Vòng `until` chờ healthcheck qua rồi gọi lại: 200, và bộ đếm tiếp tục từ volume. Service thật cần tự xử lý khoảng trống này (retry có giới hạn, trang lỗi thân thiện, hoặc nhiều bản sao phía sau proxy).
+
+</Predict>
+
+<Check id="d6.3.lab-depends-on">Chứng minh được `depends_on` không ngăn lỗi 502 khi service phía sau khởi động lại, và nói được ứng dụng phải bù bằng cách nào.</Check>
+
+### 6. Profile, mạng internal, biến môi trường
+
+<Terminal where="mac">
+
+```bash
+docker compose ps --services
+docker compose exec toolbox true; echo "exit=$?"
+docker compose run --rm toolbox sh -c 'wget -qO- http://api:8080/price; wget -qO- -T 3 http://example.com 2>&1; echo "ra Internet: exit=$?"' 2>&1 | grep -v -E 'Container|Network'
+docker compose exec api /price-api -healthcheck; echo "healthcheck exit=$?"
+docker inspect d5-shop-api-1 --format 'readonly={{.HostConfig.ReadonlyRootfs}} capdrop={{.HostConfig.CapDrop}} restart={{.HostConfig.RestartPolicy.Name}}'
+PROXY_PORT=9535 docker compose config | grep published
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+api
+proxy
+service "toolbox" is not running
+exit=1
+{"arch":"arm64","host":"e27a599d08a6","price":"1.250.000 đ","uid":"65532","version":"1.2.0"}
+wget: bad address 'example.com'
+ra Internet: exit=1
+healthcheck exit=0
+readonly=true capdrop=[ALL] restart=unless-stopped
+        published: "9535"
+```
+
+</Expected>
+
+- `toolbox` không có trong danh sách service đang chạy, nên `exec` vào nó báo `is not running`. `docker compose run --rm toolbox` gọi đích danh service nên không cần `--profile`; nó chạy một lần trên mạng `back` và gọi được `api` bằng tên service: cách gỡ lỗi một container distroless không có shell. Muốn `toolbox` chạy thường trực thì dùng `docker compose --profile debug up -d`.
+- Từ mạng `internal`, `example.com` không phân giải được: không có đường ra ngoài, kể cả DNS.
+- `docker compose exec api /price-api -healthcheck` chạy đúng lệnh mà healthcheck chạy, để tự kiểm khi service báo unhealthy.
+- Biến `PROXY_PORT=9535` của shell thắng giá trị `9530` trong `.env`. Lệnh `config` chỉ in, không đổi cụm đang chạy.
+
+Cuối cùng, gỡ cụm và dựng lại để xem volume:
+
+<Terminal where="mac">
+
+```bash
+docker compose down 2>&1 | grep Removed
+docker volume ls --format '{{.Name}}' | grep d5-shop
+docker compose up -d --wait 2>&1 | grep -c Healthy
+curl -s -X POST localhost:9530/visit
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d5-shop-proxy-1 Removed 
+ Container d5-shop-api-1 Removed 
+ Network d5-shop_back Removed 
+ Network d5-shop_front Removed 
+d5-shop_data
+3
+visits=3
+```
+
+</Expected>
+
+`docker compose down` xoá container và mạng nhưng **giữ volume**; cụm dựng lại đếm tiếp từ 3. Con số `3` trước đó là số dòng `Healthy` trong đầu ra của `up`. Thêm `-v` thì volume cũng bị xoá, cùng toàn bộ dữ liệu.
+
+<Check id="d6.3.lab-compose-ops">Chạy được service theo profile, kiểm được mạng internal và thứ tự ưu tiên của biến, và phân biệt được `down` với `down -v`.</Check>
+
+### 7. Podman rootless (tuỳ chọn)
+
+Không cần cài Podman: image `quay.io/podman/stable` chứa sẵn Podman và một user thường tên `podman`. Chạy nó trong Docker (cần `--privileged` để Podman tạo được user namespace lồng bên trong), rồi dùng Podman **bằng user thường đó**:
+
+<Terminal where="mac">
+
+```bash
+docker pull -q quay.io/podman/stable:v5.8.7
+docker run --rm --privileged --user podman quay.io/podman/stable:v5.8.7 sh -c '
+  id
+  podman --version
+  podman info --format "rootless={{.Host.Security.Rootless}} cgroup={{.Host.CgroupsVersion}} network={{.Host.NetworkBackend}} runtime={{.Host.OCIRuntime.Name}}"
+  podman run --rm -q docker.io/library/alpine:3.24.2 sh -c "id -u; cat /proc/self/uid_map"
+  podman run -d -q --name web docker.io/library/alpine:3.24.2 sleep 60 >/dev/null
+  podman ps --format "{{.Names}} {{.Image}} {{.Status}}"
+  for p in /proc/[0-9]*; do cat $p/comm; done | sort | uniq -c
+' 2>&1 | grep -v -E '^(Trying|Getting|Copying|Writing|Storing)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+quay.io/podman/stable:v5.8.7
+uid=1000(podman) gid=1000(podman) groups=1000(podman)
+podman version 5.8.7
+rootless=true cgroup=v2 network=netavark runtime=crun
+0
+         0       1000          1
+         1          1        999
+      1000       1001      64535
+web docker.io/library/alpine:3.24.2 Up Less than a second
+      1 catatonit
+      1 conmon
+      2 sh
+      1 sleep
+      1 sort
+      1 uniq
+```
+
+</Expected>
+
+- Người gọi là uid 1000, không phải root, và `podman info` báo `rootless=true`.
+- Trong container Podman, `id -u` in `0`. Dòng đầu của `uid_map` đọc là: uid `0` bên trong ứng với uid `1000` bên ngoài, dải dài `1`. Tức "root" của container chính là user `podman`. So với D5.1: container Docker dùng chung user namespace với máy chủ; ở đây thì không.
+- Danh sách tiến trình không có daemon nào: chỉ có `conmon` giám sát container, `catatonit` giữ user namespace, và `sleep` của container. Tên image phải ghi đủ `docker.io/library/…` vì Podman không mặc định Docker Hub.
+
+Image chính thức trên quay.io lúc kiểm chứng mới tới Podman 5.8.7, trong khi bản phát hành mới nhất là 6.1; các lệnh trong bước này giống nhau ở cả hai dòng.
+
+<Check id="d6.3.lab-podman">Chạy được container bằng Podman rootless, đọc được `uid_map` để chỉ ra root trong container là user nào bên ngoài, và thấy được Podman không có daemon.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`dependency failed to start: container d5-shop-api-1 is unhealthy`:** healthcheck thất bại quá số lần cho phép. Xem `docker inspect -f '{{json .State.Health}}' d5-shop-api-1` để đọc đầu ra của từng lần kiểm. Nguyên nhân thường gặp: `start_period` ngắn hơn thời gian khởi động, hoặc lệnh kiểm tra không tồn tại trong image (image distroless không có `curl`, `wget`).
+- **`Bind for 127.0.0.1:9530 failed: port is already allocated`:** cổng đang bận. Đổi `PROXY_PORT` trong `.env`.
+- **nginx báo `host not found in upstream "api"`** và thoát: `proxy` không nằm trên mạng nào chung với `api`, hoặc bạn chạy riêng `proxy` khi `api` chưa tồn tại.
+- **`service "toolbox" is not running`** khi `docker compose exec toolbox …`: service có profile không được `up` thường khởi động. Dùng `docker compose run --rm toolbox …` (gọi đích danh thì không cần `--profile`), hoặc `docker compose --profile debug up -d` nếu muốn nó chạy thường trực.
+- **`mounts denied: The path … is not shared from the host`** trên Docker Desktop: đường dẫn bind mount nằm ngoài các thư mục được chia sẻ. Dùng thư mục dưới `/Users`, hoặc thêm đường dẫn trong Settings → Resources → File sharing.
+- **Bước 7 lỗi ngay khi Podman tạo user namespace** (thông báo có `Operation not permitted` hoặc nhắc tới `newuidmap`): thiếu `--privileged` khi chạy image Podman trong Docker.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá cụm Compose **kèm volume** `d5-shop_data`, volume `d5-data`, mọi image `d5-price-api`, image Podman và toàn bộ thư mục lab `~/masteva-d6` của cả chặng D5. Dữ liệu trong hai volume mất vĩnh viễn.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-d6/stack && docker compose --profile debug down -v 2>&1 | grep Removed
+docker volume rm d5-data
+docker rmi -f $(docker images -q --filter reference='d5-price-api' | sort -u)
+docker rmi quay.io/podman/stable:v5.8.7
+cd ~ && rm -rf ~/masteva-d6
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Sao lưu một named volume thế nào khi nó nằm trong thư mục của Docker?">
+
+Không chép trực tiếp `/var/lib/docker/volumes`. Cách chuẩn là chạy một container tạm gắn volume ở chế độ chỉ đọc cùng một bind mount, rồi nén sang: `docker run --rm -v d5-data:/data:ro -v "$PWD":/backup alpine tar -czf /backup/data.tgz -C /data .`. Khôi phục thì làm ngược lại vào một volume rỗng. Với database, bản chép file lúc đang chạy có thể không nhất quán: dùng công cụ của chính database (`pg_dump`, snapshot) rồi mới lưu kết quả. Chặng D20 làm sao lưu và khôi phục có kiểm tra tự động.
+
+</Reveal>
+
+<Reveal title="Nếu không được publish cổng database, lập trình viên kết nối vào nó để gỡ lỗi bằng cách nào?">
+
+Ba cách, theo mức an toàn tăng dần. Publish cổng chỉ trên `127.0.0.1` của máy chủ rồi dùng SSH tunnel (`ssh -L 5432:127.0.0.1:5432 server`) từ máy mình. Chạy client ngay trong mạng của database bằng một container tạm, như `toolbox` với profile `debug` ở bước 6. Hoặc `docker compose exec db psql …` nếu image database có sẵn client. Cả ba đều không mở cổng ra Internet, và đều để lại dấu vết ở nơi kiểm soát được (SSH, lịch sử lệnh trên server).
+
+</Reveal>
+
+<Reveal title="Healthcheck nên kiểm tra sâu tới đâu?">
+
+Đủ để trả lời "tiến trình này có nhận được request không", và không hơn. Healthcheck của `api` chỉ gọi `/healthz` của chính nó; healthcheck của `proxy` chỉ hỏi nginx qua `/nginx-health`, không đi xuyên sang `api`. Nếu nó kiểm cả database, một lần database chậm làm mọi bản sao `api` cùng unhealthy và cùng bị khởi động lại, biến sự cố nhỏ thành sự cố lớn. Kubernetes tách hai câu hỏi thành hai probe: liveness ("có cần khởi động lại không") và readiness ("có nên nhận request lúc này không"), SB8.3 đã cấu hình chúng cho Spring Boot. Compose chỉ có một healthcheck, và nó chỉ ảnh hưởng `depends_on` cùng trạng thái hiển thị; Docker không tự khởi động lại container unhealthy.
+
+</Reveal>
+
+<Reveal title="Compose có dùng cho production được không?">
+
+Được, trong phạm vi của nó: một máy, vài service, chấp nhận gián đoạn ngắn khi cập nhật và khi máy đó chết. Nhiều sản phẩm nhỏ chạy như vậy trong nhiều năm, với `restart: unless-stopped`, volume được sao lưu, và file Compose nằm trong Git. Dấu hiệu đã vượt phạm vi: cần cập nhật không gián đoạn, cần chạy trên nhiều máy, cần tự co giãn, hoặc nhiều đội cùng triển khai lên một cụm. Khi đó các khái niệm của bài này chuyển gần như một-một sang Kubernetes: service thành Deployment và Service, healthcheck thành probe, volume thành PersistentVolumeClaim, mạng `internal` thành NetworkPolicy.
+
+</Reveal>
+
+<Reveal title="Docker cũng có chế độ rootless. Vì sao không phải ai cũng bật?">
+
+D0.1 đã dựng Docker rootless trong Lima và giải thích nó an toàn hơn ở đâu: `dockerd` và mọi container chạy trong user namespace của một user thường, nên thoát khỏi container hay chiếm được daemon không còn là chiếm root của máy. Nhiều máy chủ vẫn chạy rootful vì rootless đổi vài thứ mà hệ thống cũ dựa vào: socket của Docker chuyển về thư mục của user, cổng dưới 1024 cần cấu hình thêm, một số storage driver và tính năng mạng bị giới hạn, giới hạn cgroup cần systemd uỷ quyền, và công cụ nào gắn `/var/run/docker.sock` phải sửa đường dẫn. Máy chủ mới dựng cho CI runner hoặc cho nhiều người dùng chung là nơi nên bật trước.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết file Compose rất nhanh, và đó là việc nên giao: mô tả các service, nhờ nó dựng khung rồi tự rà. Những chỗ AI hay sai: thêm `version: "3.8"` (đã bỏ), dùng `depends_on` dạng ngắn rồi khẳng định "db sẽ sẵn sàng trước app", publish cổng database ra `0.0.0.0` "cho tiện", `links:` và `container_name` không cần thiết, healthcheck gọi `curl` trong image không có `curl`, và bind mount thư mục dữ liệu mà không nhắc tới quyền. Kiểm lại bằng `docker compose config` (thứ thật sự được tạo), `docker compose ps` (trạng thái healthy), `docker port` hoặc cột PORTS (cổng nào nghe ở địa chỉ nào), và chạy thử trên Linux nếu file có bind mount.
+
+</Callout>
+
+<Callout kind="link">
+
+SB2 dùng Testcontainers, tức cùng các khái niệm này nhưng điều khiển từ test. Chặng D6 chạy Compose trong pipeline để test tích hợp. Chặng K1 chuyển healthcheck thành probe; K2 chuyển volume thành PersistentVolumeClaim, mạng và publish cổng thành Service, Gateway và NetworkPolicy. D9 đặt proxy và TLS thật ở phía trước, D2 giải thích iptables và DNAT mà publish cổng dựa vào.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d6.3.mastery-data">Thiết kế được chỗ lưu dữ liệu cho một service chạy user thường: chọn loại mount, bảo đảm quyền ghi, và chứng minh dữ liệu còn sau khi thay container.</Check>
+
+<Check id="d6.3.mastery-network">Nhìn một cụm container, chỉ ra được service nào gọi được service nào, cổng nào lộ ra ngoài và trên địa chỉ nào, rồi thu hẹp về mức tối thiểu.</Check>
+
+<Check id="d6.3.mastery-compose">Tự viết được file Compose cho một ứng dụng có proxy, API và dữ liệu bền, khởi động đúng thứ tự bằng healthcheck, và giải thích được giới hạn của `depends_on`.</Check>
+
+</Mastery>

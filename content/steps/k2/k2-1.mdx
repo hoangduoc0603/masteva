@@ -1,0 +1,740 @@
+---
+title: Service và DNS trong cụm
+description: Một request đi từ tên Service tới pod qua những lớp nào (DNS, ClusterIP, luật của kube-proxy, EndpointSlice), các kiểu Service khác nhau ở đâu, và vì sao một lời gọi ra ngoài từ pod sinh tám truy vấn DNS.
+id: k2.1
+step: k2
+prerequisites: [d11.2, d2.2]
+topics: [k2.service-dns]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    kindnet: v20260820-69b56db7
+    coredns: 1.14.6
+    yq: 4.54.1
+---
+
+<Goal>
+
+Pod sinh ra và mất đi liên tục, IP của nó đổi theo. Bài này dạy lớp đứng giữa người gọi và pod: Service, EndpointSlice, kube-proxy và DNS của cụm. Học xong, bạn giải thích được:
+
+- Vì sao gọi `echo` thì được nhưng gọi `kubernetes` từ cùng pod đó lại không phân giải được.
+- Vì sao một lời gọi tới `example.com` từ trong pod sinh ra tám truy vấn DNS, và cách giảm còn hai.
+- Vì sao tăng số pod của một service gRPC mà tải vẫn dồn vào vài pod cũ.
+- Vì sao Service kiểu `LoadBalancer` đứng mãi ở `<pending>` trên kind và trên máy chủ riêng.
+
+</Goal>
+
+<Knowledge>
+
+### Vì sao cần Service
+
+K1.1 đã cho thấy Deployment thay pod bất cứ lúc nào: rollout, node hỏng, pod bị giết vì quá RAM. Mỗi pod mới có một IP mới. Nếu service A ghi cứng IP pod của service B, lời gọi hỏng ngay ở lần rollout đầu tiên.
+
+**Service** giải quyết bằng ba thứ ổn định:
+
+- Một **tên** trong DNS của cụm, ví dụ `echo.k2-demo.svc.cluster.local`.
+- Một **IP ảo** (ClusterIP), không đổi suốt đời Service.
+- Một **selector** theo label: pod nào mang đủ các label đó và đang ready thì nhận traffic.
+
+Service không chọn pod theo tên Deployment. Nó chỉ nhìn label. Hai Deployment khác nhau có cùng label `app: echo` sẽ cùng đứng sau một Service, và một pod bị bỏ label thì rời Service dù vẫn đang chạy. Bước 3 của lab dùng đúng tính chất này.
+
+<Check id="k2.1.service-la-gi">Giải thích được Service cho người gọi ba thứ ổn định nào, và Service chọn pod bằng gì.</Check>
+
+### Từ ClusterIP tới pod: EndpointSlice và kube-proxy
+
+ClusterIP là IP ảo: không card mạng nào mang nó, không tiến trình nào lắng nghe trên nó. Thứ biến nó thành kết nối tới pod thật là chuỗi sau:
+
+```text
+ (1) Bạn apply Service echo (selector app=echo) và Deployment echo-v1
+
+ (2) EndpointSlice controller (trong kube-controller-manager)
+       theo dõi pod khớp selector  --->  ghi object EndpointSlice:
+                                          10.244.1.2:8080  ready
+                                          10.244.1.3:8080  ready
+                                          10.244.1.4:8080  ready
+
+ (3) kube-proxy trên MỖI node theo dõi Service + EndpointSlice
+       ---> viết luật iptables (hoặc nftables) trên node đó:
+            "gói tới 10.96.72.229:80  ->  chọn ngẫu nhiên 1 trong 3 pod, DNAT"
+
+ (4) Pod client gọi 10.96.72.229:80
+       gói rời pod, đi qua kernel của node  --luật DNAT-->  10.244.1.3:8080
+       (conntrack nhớ ánh xạ này cho cả kết nối, gói trả về được đổi ngược lại)
+```
+
+Ba điều rút ra từ sơ đồ:
+
+- **Không có proxy nào đứng giữa** ở chế độ mặc định. kube-proxy chỉ viết luật; kernel của node đổi địa chỉ đích của gói. Vì vậy ClusterIP chỉ có nghĩa bên trong cụm, và chỉ với đúng cổng đã khai báo.
+- **Cân bằng tải theo kết nối, không theo request.** Luật chọn pod chạy một lần khi kết nối TCP mở. Mọi request đi trên kết nối đó tới cùng một pod.
+- **Pod chưa ready không nhận traffic.** K1.3 đã cho thấy readiness probe fail thì pod bị gỡ khỏi endpoint của Service; cơ chế là bước (2) và (3) ở đây: endpoint chuyển sang `ready: false` và kube-proxy bỏ nó khỏi luật.
+
+**EndpointSlice** là danh sách địa chỉ đứng sau một Service. Nó thay cho API `Endpoints` cũ, vốn dồn mọi địa chỉ của một Service vào một object: Service có 5.000 pod thì mỗi lần một pod đổi trạng thái, cả object lớn đó phải gửi lại cho mọi node. EndpointSlice chia nhỏ, mặc định tối đa 100 địa chỉ mỗi slice. API `Endpoints` bị đánh dấu deprecated từ Kubernetes 1.33; công cụ mới nên đọc EndpointSlice.
+
+Mỗi endpoint có ba điều kiện:
+
+| Điều kiện | Ý nghĩa |
+|---|---|
+| `ready` | Nhận được traffic mới (readiness probe đạt, pod không đang bị xoá) |
+| `serving` | Vẫn phục vụ được, kể cả khi đang bị xoá |
+| `terminating` | Pod đã nhận lệnh xoá, đang trong thời gian chờ tắt (trình tự tắt pod ở K1.3) |
+
+kube-proxy trên Linux có ba chế độ ghi luật: `iptables` (mặc định, cụm lab đang dùng), `nftables` (ổn định từ Kubernetes 1.33, được khuyên dùng cho cụm mới) và `ipvs` (deprecated từ 1.35; theo tài liệu sẽ tắt mặc định ở 1.40 và gỡ hẳn ở 1.43). Một số CNI như Cilium thay hẳn kube-proxy bằng eBPF. K6 so sánh các lựa chọn này; ở đây chỉ cần nhớ rằng mọi chế độ đều thực hiện cùng một việc ở bước (3).
+
+<Callout kind="production">
+
+Bài [gRPC Load Balancing on Kubernetes without Tears](https://kubernetes.io/blog/2018/11/07/grpc-load-balancing-on-kubernetes-without-tears/) trên blog Kubernetes mô tả một lỗi nhiều đội gặp khi chuyển sang gRPC: tăng số pod của service mà tải không giảm, vài pod quá tải còn pod mới gần như không có request. Nguyên nhân: gRPC chạy trên HTTP/2 và giữ một kết nối TCP rất lâu; luật của kube-proxy chỉ chọn pod lúc kết nối mở, nên mọi request của một client đi mãi vào một pod. Cùng hiện tượng xảy ra với HTTP keep-alive và connection pool tới database. Cách xử lý nằm ở tầng hiểu request: client tự cân bằng tải qua headless Service, giới hạn tuổi thọ kết nối phía server (`MAX_CONNECTION_AGE` của gRPC), hoặc đặt một proxy tầng 7 ở giữa (Gateway API ở K2.2, service mesh ở K11).
+
+</Callout>
+
+<Check id="k2.1.endpointslice-kube-proxy">Kể được chuỗi Service → EndpointSlice → luật của kube-proxy → pod, và giải thích được vì sao cân bằng tải của Service là theo kết nối.</Check>
+
+### Các kiểu Service
+
+| Kiểu | Ai gọi được | Cách hoạt động | Dùng khi |
+|---|---|---|---|
+| `ClusterIP` (mặc định) | Pod trong cụm | IP ảo + luật DNAT | Gọi giữa các service trong cụm |
+| `NodePort` | Bất kỳ ai tới được IP của node | ClusterIP, cộng thêm một cổng 30000–32767 mở trên **mọi** node | Lab, hoặc khi có load balancer bên ngoài tự trỏ vào các node |
+| `LoadBalancer` | Bên ngoài cụm | NodePort, cộng thêm việc **nhờ nhà cung cấp hạ tầng** cấp một load balancer có IP riêng | Cloud (AWS, GCP…) hoặc cụm có MetalLB |
+| `ExternalName` | Pod trong cụm | Chỉ là bản ghi `CNAME` trong DNS của cụm, trỏ ra tên bên ngoài | Đặt tên nội bộ cho database nằm ngoài cụm |
+| Headless (`clusterIP: None`) | Pod trong cụm | Không có IP ảo; DNS trả thẳng IP của từng pod | StatefulSet (K1.4), client tự cân bằng tải |
+
+Ba kiểu đầu lồng nhau: `LoadBalancer` gồm một `NodePort`, `NodePort` gồm một `ClusterIP`.
+
+`LoadBalancer` cần một thành phần ngoài Kubernetes thực sự tạo ra load balancer. Trên cloud đó là cloud controller manager gọi API của nhà cung cấp. Trên kind và trên máy chủ riêng không có ai làm việc này, nên cột `EXTERNAL-IP` đứng mãi ở `<pending>`. Với kind có thể chạy thêm `cloud-provider-kind`; với máy chủ riêng, K4 dùng MetalLB.
+
+<Check id="k2.1.service-types">Chọn được kiểu Service cho một nhu cầu cụ thể và giải thích được vì sao `LoadBalancer` kẹt ở `<pending>` khi cụm không có ai cấp load balancer.</Check>
+
+### DNS trong cụm
+
+Mỗi cụm chạy **CoreDNS** (Deployment trong `kube-system`, đứng sau Service `kube-dns`). CoreDNS theo dõi API server và trả lời cho mọi Service:
+
+```text
+ echo . k2-demo . svc . cluster.local
+ ----   -------   ---   -------------
+ tên    namespace  cố    tên miền của cụm
+ Service           định  (mặc định cluster.local)
+```
+
+- Service thường: bản ghi `A` trả về ClusterIP.
+- Headless Service: bản ghi `A` trả về IP của từng pod ready. Pod của StatefulSet còn có tên riêng `<tên pod>.<tên Service>.<namespace>.svc.cluster.local`.
+
+Bạn không phải gõ tên đầy đủ, vì kubelet ghi sẵn `/etc/resolv.conf` cho mỗi pod:
+
+```text
+search k2-demo.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+```
+
+D2.2 đã giải thích `search` và `ndots` của resolver. Trong pod, chúng tạo ra hai hệ quả:
+
+**Tên ngắn phụ thuộc namespace của người gọi.** Gọi `echo` từ pod trong `k2-demo` được ghép thành `echo.k2-demo.svc.cluster.local` và thành công. Gọi `kubernetes` (Service của API server, nằm ở namespace `default`) từ cùng pod thì được ghép thành `kubernetes.k2-demo.svc.cluster.local`, không tồn tại. Gọi sang namespace khác phải viết ít nhất `<service>.<namespace>`.
+
+**Tên bên ngoài bị hỏi thừa.** `ndots:5` nghĩa là tên có dưới 5 dấu chấm được thử ghép với từng search domain trước. `example.com` có một dấu chấm, nên resolver hỏi lần lượt:
+
+| Thứ tự | Tên được hỏi | Kết quả |
+|---|---|---|
+| 1 | `example.com.k2-demo.svc.cluster.local.` | NXDOMAIN |
+| 2 | `example.com.svc.cluster.local.` | NXDOMAIN |
+| 3 | `example.com.cluster.local.` | NXDOMAIN |
+| 4 | `example.com.` | Có địa chỉ |
+
+Mỗi tên hỏi hai lần, một cho `A` (IPv4) và một cho `AAAA` (IPv6): tổng cộng tám truy vấn, sáu cái thừa. Bước 4 của lab đếm đúng tám dòng này trong log CoreDNS. Ba cách giảm:
+
+| Cách | Viết thế nào | Đánh đổi |
+|---|---|---|
+| Tên có dấu chấm cuối | `example.com.` | Phải sửa ở từng chỗ gọi; một số thư viện và chứng chỉ TLS xử lý dấu chấm cuối không nhất quán |
+| Hạ `ndots` | `dnsConfig.options: [{name: ndots, value: "2"}]` trong pod spec | Tên nội bộ dạng `a.b.c` (2 dấu chấm trở lên) sẽ được hỏi như tên tuyệt đối trước |
+| Cache DNS trên node | NodeLocal DNSCache | Thêm một DaemonSet phải vận hành; K6 làm phần này |
+
+<Callout kind="production">
+
+Issue [kubernetes #56903](https://github.com/kubernetes/kubernetes/issues/56903) ghi lại một lỗi nhiều đội gặp: thỉnh thoảng một lời gọi HTTP trong pod chậm thêm đúng 5 giây. Resolver gửi câu hỏi `A` và `AAAA` gần như cùng lúc từ một socket UDP; hai gói đi qua luật DNAT tới CoreDNS chạy đua trong bảng conntrack của kernel và một gói bị rơi. Resolver chờ hết timeout mặc định 5 giây rồi mới hỏi lại. Kernel mới đã vá phần lớn các trường hợp, nhưng dấu hiệu "độ trễ p99 có bậc thang 5 giây" vẫn là lý do để nghi DNS đầu tiên. NodeLocal DNSCache tránh được lỗi này vì pod hỏi cache ngay trên node, không qua DNAT.
+
+</Callout>
+
+<Check id="k2.1.dns-ten-day-du">Viết được tên DNS đầy đủ của một Service, và giải thích được vì sao tên ngắn chỉ dùng được trong cùng namespace.</Check>
+
+<Check id="k2.1.ndots">Giải thích được `ndots:5` làm một tên bên ngoài sinh ra tám truy vấn như thế nào, và nêu được hai cách giảm.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Service | Kubernetes](https://kubernetes.io/docs/concepts/services-networking/service/): định nghĩa đầy đủ các kiểu Service; đọc mục "Publishing Services (ServiceTypes)" và "Headless Services".
+- [Virtual IPs and Service Proxies | Kubernetes](https://kubernetes.io/docs/reference/networking/virtual-ips/): kube-proxy biến ClusterIP thành kết nối tới pod thế nào ở từng chế độ, và các traffic policy.
+- [EndpointSlices | Kubernetes](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/): cấu trúc EndpointSlice và ý nghĩa ba điều kiện `ready`, `serving`, `terminating`.
+- [DNS for Services and Pods | Kubernetes](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/): các bản ghi CoreDNS tạo ra, và mục "Pod's DNS Config" để hạ `ndots`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Đã làm K1: có Docker, kind 0.33, kubectl 1.37, `jq`, `yq` trên máy (cài ở D0).
+- **Profile máy:** cụm của bài gồm 1 control plane và 1 worker; `docker stats` báo hai node dùng tổng cộng khoảng 0,9 GiB RAM. Máy 16 GB chạy thoải mái. Máy 8 GB: đặt Docker Desktop ở 4 GB, tắt các cụm kind và VM Lima khác trước khi làm.
+- Cổng `9570` và `9571` trên máy còn trống.
+- Lệnh chạy trên macOS; trên Linux giống hệt. Tên pod và IP trong output của bạn sẽ khác.
+
+Cụm này dùng suốt chặng K2 (bốn bài). Giữ nó tới hết K2.4.
+
+### 1. Tạo cụm `k2-lab`
+
+<Terminal where="mac" title="~/masteva-k2/kind-k2.yaml">
+
+```bash
+mkdir -p ~/masteva-k2 && cd ~/masteva-k2
+cat > kind-k2.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k2-lab
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080   # NodePort của Service ở bước 5
+        hostPort: 9570
+        listenAddress: 127.0.0.1
+      - containerPort: 30081   # NodePort của Gateway ở K2.2
+        hostPort: 9571
+        listenAddress: 127.0.0.1
+  - role: worker
+EOF
+kind create cluster --config kind-k2.yaml
+kubectl wait --for=condition=Ready nodes --all --timeout=120s
+kubectl get nodes
+kubectl -n kube-system get pods -o wide | awk '{print $1, $2, $3, $7}' | column -t
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k2-lab-control-plane condition met
+node/k2-lab-worker condition met
+NAME                   STATUS   ROLES           AGE   VERSION
+k2-lab-control-plane   Ready    control-plane   23s   v1.37.0
+k2-lab-worker          Ready    <none>          12s   v1.37.0
+NAME                                          READY  STATUS   NODE
+coredns-559f6c778d-bvbgj                      1/1    Running  k2-lab-control-plane
+coredns-559f6c778d-pjgkp                      1/1    Running  k2-lab-control-plane
+etcd-k2-lab-control-plane                     1/1    Running  k2-lab-control-plane
+kindnet-dlndc                                 1/1    Running  k2-lab-worker
+kindnet-fj598                                 1/1    Running  k2-lab-control-plane
+kube-apiserver-k2-lab-control-plane           1/1    Running  k2-lab-control-plane
+kube-controller-manager-k2-lab-control-plane  1/1    Running  k2-lab-control-plane
+kube-proxy-9bmbd                              1/1    Running  k2-lab-control-plane
+kube-proxy-9qrvl                              1/1    Running  k2-lab-worker
+kube-scheduler-k2-lab-control-plane           1/1    Running  k2-lab-control-plane
+```
+
+</Expected>
+
+`extraPortMappings` nối cổng trên máy bạn vào container của node control plane; kind chỉ đặt được lúc tạo cụm, nên phải khai báo ngay từ bây giờ, kể cả cổng mà K2.2 mới dùng.
+
+Danh sách pod `kube-system` có sẵn ba thành phần bài này mổ xẻ: `kube-proxy` trên mỗi node, hai pod `coredns`, và `kindnet`, CNI mặc định của kind lo việc cấp IP và nối mạng cho pod. Cụm production thường dùng Calico hoặc Cilium (K6); với nội dung của chặng K2, kindnet là đủ, kể cả NetworkPolicy ở K2.4.
+
+kind tự chuyển kubectl sang context `kind-k2-lab`. Mọi lệnh `kubectl` trong bài chạy trên context này; nếu bạn có cụm khác, kiểm lại bằng `kubectl config current-context` trước khi gõ.
+
+<Check id="k2.1.lab-cum">Tạo được cụm `k2-lab` có nối sẵn hai cổng ra máy, và chỉ ra được `kube-proxy`, `coredns`, `kindnet` trong `kube-system`.</Check>
+
+### 2. Service ClusterIP và EndpointSlice
+
+Ứng dụng mẫu là `agnhost netexec`, image thử nghiệm của dự án Kubernetes: đường dẫn `/hostname` trả về tên pod, đủ để biết request rơi vào pod nào. Pod `client` dùng để gọi từ bên trong cụm.
+
+<Terminal where="mac" title="~/masteva-k2/echo.yaml">
+
+```bash
+cat > echo.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: {name: k2-demo}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: echo-v1, namespace: k2-demo}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: echo, version: v1}
+  template:
+    metadata:
+      labels: {app: echo, version: v1}
+    spec:
+      containers:
+        - name: echo
+          image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+          args: ["netexec", "--http-port=8080"]
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo, namespace: k2-demo}
+spec:
+  selector:
+    app: echo            # chọn theo label, không theo tên Deployment
+  ports:
+    - name: http
+      port: 80           # cổng của Service
+      targetPort: http   # tên cổng trong container (8080)
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: client, namespace: k2-demo}
+spec:
+  containers:
+    - {name: curl, image: "curlimages/curl:8.22.0", command: ["sleep", "infinity"]}
+EOF
+kubectl apply -f echo.yaml
+kubectl -n k2-demo rollout status deployment/echo-v1
+kubectl -n k2-demo wait --for=condition=Ready pod/client --timeout=120s
+kubectl -n k2-demo get service echo
+kubectl -n k2-demo get endpointslices -l kubernetes.io/service-name=echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME   TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+echo   ClusterIP   10.96.72.229   <none>        80/TCP    13s
+NAME         ADDRESSTYPE   PORTS   ENDPOINTS                          AGE
+echo-l979c   IPv4          8080    10.244.1.2,10.244.1.3,10.244.1.4   13s
+```
+
+</Expected>
+
+Service có cổng 80, còn EndpointSlice ghi cổng 8080 và IP của ba pod: đó là kết quả của `targetPort: http`. EndpointSlice do controller tạo, gắn với Service bằng label `kubernetes.io/service-name`. Gọi Service chín lần từ pod `client`:
+
+<Terminal where="mac">
+
+```bash
+sleep 5   # chờ kube-proxy ghi xong luật cho cả ba pod
+kubectl -n k2-demo exec client -- sh -c \
+  'for i in $(seq 9); do curl -s echo/hostname; echo; done | sort | uniq -c'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+      4 echo-v1-7cfdc4df58-8xswz
+      4 echo-v1-7cfdc4df58-f7t2p
+      1 echo-v1-7cfdc4df58-zcc67
+```
+
+</Expected>
+
+Phân phối không đều vì mỗi lần `curl` mở một kết nối mới và luật chọn pod **ngẫu nhiên**; số của bạn sẽ khác. Xem chính các luật đó trên node worker (node của kind là một container Docker, nên vào bằng `docker exec`):
+
+<Terminal where="mac">
+
+```bash
+docker exec k2-lab-worker iptables-save -t nat 2>/dev/null \
+  | grep 'k2-demo/echo:http' | grep -E 'KUBE-SERVICES|statistic|DNAT'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+-A KUBE-SEP-D55H4JH2ATFYW2IZ -p tcp -m comment --comment "k2-demo/echo:http" -m tcp -j DNAT --to-destination 10.244.1.4:8080
+-A KUBE-SEP-E2HAF3TRA2WTYKTR -p tcp -m comment --comment "k2-demo/echo:http" -m tcp -j DNAT --to-destination 10.244.1.2:8080
+-A KUBE-SEP-TRGTFGWKZ27CORWC -p tcp -m comment --comment "k2-demo/echo:http" -m tcp -j DNAT --to-destination 10.244.1.3:8080
+-A KUBE-SERVICES -d 10.96.72.229/32 -p tcp -m comment --comment "k2-demo/echo:http cluster IP" -m tcp --dport 80 -j KUBE-SVC-ULGCXA776RBOCWDY
+-A KUBE-SVC-ULGCXA776RBOCWDY -m comment --comment "k2-demo/echo:http -> 10.244.1.2:8080" -m statistic --mode random --probability 0.33333333349 -j KUBE-SEP-E2HAF3TRA2WTYKTR
+-A KUBE-SVC-ULGCXA776RBOCWDY -m comment --comment "k2-demo/echo:http -> 10.244.1.3:8080" -m statistic --mode random --probability 0.50000000000 -j KUBE-SEP-TRGTFGWKZ27CORWC
+```
+
+</Expected>
+
+Đọc từ dòng `KUBE-SERVICES`: gói TCP tới `10.96.72.229:80` nhảy vào chain `KUBE-SVC-…`. Ở đó, pod thứ nhất được chọn với xác suất 1/3; nếu không, pod thứ hai với xác suất 1/2 của phần còn lại; còn lại rơi vào pod thứ ba (dòng cuối, không có `statistic`, không khớp bộ lọc của lệnh). Mỗi chain `KUBE-SEP-…` làm đúng một việc: `DNAT` sang IP và cổng của pod. Sơ đồ ở phần Kiến thức chính là sáu dòng này.
+
+<Check id="k2.1.lab-clusterip">Tạo được Service ClusterIP, đọc được EndpointSlice của nó, và chỉ ra được luật DNAT tương ứng trên node.</Check>
+
+### 3. Đưa một pod ra khỏi Service bằng label
+
+<Predict question="Đổi label `app` của một pod đang chạy từ `echo` thành `debug`. Pod đó có bị xoá không? Deployment còn mấy pod? Service còn mấy endpoint?">
+
+Pod không bị xoá: nó vẫn chạy, chỉ không còn khớp selector. ReplicaSet của Deployment đếm thấy chỉ còn 2 pod khớp nên tạo thêm 1 pod mới. Service vẫn có 3 endpoint, trong đó 1 IP mới thay cho pod vừa đổi label. Pod `debug` trở thành pod "mồ côi": không ai quản lý, không nhận traffic.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+POD=$(kubectl -n k2-demo get pods -l app=echo -o jsonpath='{.items[0].metadata.name}')
+kubectl -n k2-demo label pod "$POD" app=debug --overwrite
+kubectl -n k2-demo rollout status deployment/echo-v1
+kubectl -n k2-demo get pods -l version=v1 -L app
+kubectl -n k2-demo get endpointslices -l kubernetes.io/service-name=echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME                       READY   STATUS    RESTARTS   AGE   APP
+echo-v1-7cfdc4df58-8xswz   1/1     Running   0          29s   debug
+echo-v1-7cfdc4df58-f7t2p   1/1     Running   0          29s   echo
+echo-v1-7cfdc4df58-r62sl   1/1     Running   0          10s   echo
+echo-v1-7cfdc4df58-zcc67   1/1     Running   0          29s   echo
+NAME         ADDRESSTYPE   PORTS   ENDPOINTS                          AGE
+echo-l979c   IPv4          8080    10.244.1.2,10.244.1.4,10.244.1.6   29s
+```
+
+</Expected>
+
+Đây là một kỹ thuật vận hành có thật: khi một pod production có biểu hiện lạ, đổi label để nó thôi nhận traffic nhưng vẫn sống, rồi vào xem heap, thread, file tạm mà không ảnh hưởng người dùng. Xong thì xoá pod mồ côi:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-demo delete pod -l app=debug --now
+```
+
+</Terminal>
+
+<Check id="k2.1.lab-label">Đưa được một pod ra khỏi Service bằng cách đổi label và giải thích được vì sao Deployment tạo pod thay thế.</Check>
+
+### 4. DNS: tên ngắn, tên đầy đủ và `ndots`
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-demo exec client -- cat /etc/resolv.conf
+kubectl -n k2-demo exec client -- sh -c \
+  'for n in echo echo.k2-demo echo.k2-demo.svc.cluster.local kubernetes kubernetes.default; do
+     ip=$(getent hosts $n | cut -d" " -f1)
+     printf "%-32s %s\n" $n "${ip:-KHÔNG phân giải được}"
+   done'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+search k2-demo.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+echo                             10.96.72.229
+echo.k2-demo                     10.96.72.229
+echo.k2-demo.svc.cluster.local   10.96.72.229
+kubernetes                       KHÔNG phân giải được
+kubernetes.default               10.96.0.1
+```
+
+</Expected>
+
+`nameserver 10.96.0.10` là ClusterIP của Service `kube-dns`. `kubernetes` thất bại vì Service đó nằm ở namespace `default`, còn search domain đầu tiên của pod là `k2-demo.svc.cluster.local`. Thêm `.default` thì search domain thứ hai (`svc.cluster.local`) ghép ra tên đúng.
+
+Giờ đếm số truy vấn thật. Bật plugin `log` của CoreDNS bằng cách thêm một dòng vào Corefile (cấu hình của CoreDNS, nằm trong ConfigMap `coredns`):
+
+<Terminal where="mac">
+
+```bash
+kubectl -n kube-system get configmap coredns -o yaml \
+  | yq '.data.Corefile |= sub("errors\n", "errors\n    log\n")' \
+  | kubectl replace -f -
+kubectl -n kube-system rollout restart deployment/coredns
+kubectl -n kube-system rollout status deployment/coredns | tail -1
+sleep 5   # chờ kube-proxy trỏ Service kube-dns sang hai pod CoreDNS mới
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/coredns replaced
+deployment.apps/coredns restarted
+deployment "coredns" successfully rolled out
+```
+
+</Expected>
+
+CoreDNS tự nạp lại Corefile khi ConfigMap đổi, nhưng kubelet cần tới hơn một phút để cập nhật file trong từng pod, và hai pod CoreDNS không nạp cùng lúc. `rollout restart` thay cả hai pod ngay để phép đo dưới đây không phụ thuộc thời điểm.
+
+<Predict question="Trong pod, phân giải `example.com` rồi `example.com.` (có dấu chấm cuối). CoreDNS nhận mấy truy vấn cho mỗi lần?">
+
+Tám và hai. `example.com` có 1 dấu chấm, ít hơn `ndots:5`, nên resolver thử ghép ba search domain trước (sáu truy vấn `NXDOMAIN`, gồm `A` và `AAAA`) rồi mới hỏi tên thật (hai truy vấn). Dấu chấm cuối báo "đây là tên tuyệt đối", resolver bỏ qua search domain.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+dem() {  # phân giải tên $1 trong pod, rồi in các truy vấn CoreDNS vừa nhận
+  kubectl -n k2-demo exec client -- getent hosts "$1" > /dev/null
+  sleep 5
+  kubectl -n kube-system logs -l k8s-app=kube-dns --since=12s | grep -o '"[A-Z]* IN example[^ ]*' | sort
+}
+dem example.com
+sleep 15; echo "--- có dấu chấm cuối"
+dem example.com.
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+"A IN example.com.
+"A IN example.com.cluster.local.
+"A IN example.com.k2-demo.svc.cluster.local.
+"A IN example.com.svc.cluster.local.
+"AAAA IN example.com.
+"AAAA IN example.com.cluster.local.
+"AAAA IN example.com.k2-demo.svc.cluster.local.
+"AAAA IN example.com.svc.cluster.local.
+--- có dấu chấm cuối
+"A IN example.com.
+"AAAA IN example.com.
+```
+
+</Expected>
+
+Tám truy vấn còn hai. `sleep 15` ở giữa để log của lần đầu trôi khỏi cửa sổ `--since=12s`. Với một service gọi API bên ngoài vài trăm lần mỗi giây mà mỗi lần mở kết nối mới và không cache DNS, đây là khác biệt giữa CoreDNS nhàn rỗi và CoreDNS quá tải; client có connection pool thì chỉ hỏi DNS khi mở kết nối. Pod `client` dùng Alpine (musl); image dựa trên glibc cũng đi qua cùng danh sách search domain. Tắt log lại để CoreDNS không ghi mọi truy vấn:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n kube-system get configmap coredns -o yaml \
+  | yq '.data.Corefile |= sub("    log\n", "")' \
+  | kubectl replace -f -
+kubectl -n kube-system rollout restart deployment/coredns
+kubectl -n kube-system rollout status deployment/coredns
+```
+
+</Terminal>
+
+<Check id="k2.1.lab-dns">Đọc được `/etc/resolv.conf` của pod, giải thích được vì sao `kubernetes` không phân giải được từ namespace `k2-demo`, và đếm được tám truy vấn của `example.com` trong log CoreDNS.</Check>
+
+### 5. Headless Service, NodePort và LoadBalancer
+
+<Terminal where="mac" title="~/masteva-k2/services-them.yaml">
+
+```bash
+cat > services-them.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata: {name: echo-headless, namespace: k2-demo}
+spec:
+  clusterIP: None          # headless: không có IP ảo
+  selector: {app: echo}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo-nodeport, namespace: k2-demo}
+spec:
+  type: NodePort
+  selector: {app: echo}
+  ports:
+    - {name: http, port: 80, targetPort: http, nodePort: 30080}  # khớp extraPortMappings
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo-lb, namespace: k2-demo}
+spec:
+  type: LoadBalancer
+  selector: {app: echo}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+EOF
+kubectl apply -f services-them.yaml
+kubectl -n k2-demo get services
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME            TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+echo            ClusterIP      10.96.72.229    <none>        80/TCP         65s
+echo-headless   ClusterIP      None            <none>        8080/TCP       0s
+echo-lb         LoadBalancer   10.96.183.95    <pending>     80:31261/TCP   0s
+echo-nodeport   NodePort       10.96.250.137   <none>        80:30080/TCP   0s
+```
+
+</Expected>
+
+Bốn Service cùng trỏ vào ba pod, khác nhau ở cách người gọi tới được.
+
+Hỏi DNS cho Service thường và Service headless, rồi gọi NodePort từ máy bạn (kind đã nối cổng 30080 của control plane ra `127.0.0.1:9570`):
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-demo exec client -- nslookup -type=a echo.k2-demo.svc.cluster.local | grep -A1 Name
+kubectl -n k2-demo exec client -- nslookup -type=a echo-headless.k2-demo.svc.cluster.local | grep -A1 Name
+sleep 3   # NodePort vừa tạo cần một hai giây mới nhận kết nối
+for i in 1 2 3 4; do curl -s localhost:9570/hostname; echo; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Name:	echo.k2-demo.svc.cluster.local
+Address: 10.96.72.229
+Name:	echo-headless.k2-demo.svc.cluster.local
+Address: 10.244.1.6
+Name:	echo-headless.k2-demo.svc.cluster.local
+Address: 10.244.1.4
+Name:	echo-headless.k2-demo.svc.cluster.local
+Address: 10.244.1.2
+echo-v1-7cfdc4df58-zcc67
+echo-v1-7cfdc4df58-zcc67
+echo-v1-7cfdc4df58-zcc67
+echo-v1-7cfdc4df58-f7t2p
+```
+
+</Expected>
+
+**Headless.** Service thường trả một IP ảo. Headless trả IP của cả ba pod: client tự chọn pod, không qua luật của kube-proxy, và phải gọi thẳng cổng của pod (8080) vì không còn ai đổi cổng.
+
+**NodePort.** Request vào node control plane, nhưng cả ba pod nằm trên worker: NodePort nhận ở node nào cũng chuyển được tới pod ở node khác.
+
+**LoadBalancer.** `echo-lb` đã có ClusterIP và một NodePort tự cấp (`31261` ở trên), nhưng `EXTERNAL-IP` là `<pending>` và sẽ đứng mãi như vậy: cụm kind không có thành phần nào cấp load balancer. Trên EKS hay GKE, cùng manifest này sẽ có địa chỉ sau một đến vài phút. Dự án kind có công cụ `cloud-provider-kind` đóng vai nhà cung cấp cho lab, nhưng phải cài thêm một binary và chạy bằng `sudo` trên macOS, nên bài này không dùng; K4 cấp địa chỉ thật bằng MetalLB. Xoá Service treo đó đi:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-demo delete service echo-lb
+```
+
+</Terminal>
+
+<Check id="k2.1.lab-service-types">Quan sát được DNS của headless Service trả IP từng pod, gọi được NodePort từ máy mình, và thấy `LoadBalancer` đứng ở `<pending>`.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `curl` tới Service treo rồi timeout | Selector không khớp label của pod, hoặc pod chưa ready | `kubectl -n k2-demo get endpointslices`: cột `ENDPOINTS` trống |
+| `curl` báo `Connection refused` | `targetPort` trỏ sai cổng container | So `targetPort` với `containerPort`; xem cổng trong EndpointSlice |
+| `curl localhost:9570` không trả gì ngay sau khi tạo Service | kube-proxy chưa kịp ghi luật | Chờ một hai giây rồi thử lại |
+| `Could not resolve host` với tên ngắn | Service ở namespace khác | Gọi `<service>.<namespace>` |
+| Log CoreDNS không có dòng truy vấn | Pod CoreDNS chưa chạy với Corefile mới | `kubectl -n kube-system get configmap coredns -o yaml` có dòng `log`; chạy lại `rollout restart` |
+
+### Dọn dẹp
+
+Nếu học tiếp K2.2, **giữ nguyên cụm và namespace `k2-demo`**: bài đó dùng lại Deployment `echo-v1`, Service `echo`, pod `client` và các file trong `~/masteva-k2`. Chỉ xoá ba Service phụ của bước 5 nếu muốn gọn:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-demo delete service echo-headless echo-nodeport
+```
+
+</Terminal>
+
+Nếu dừng hẳn ở đây thì xoá cụm.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá toàn bộ cụm `k2-lab` cùng mọi thứ trong đó, và xoá thư mục lab. Kiểm lại tên cụm trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp (chỉ khi không học tiếp K2.2)">
+
+```bash
+kind delete cluster --name k2-lab
+rm -rf ~/masteva-k2
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao curl tới ClusterIP thì được mà ping thì không?">
+
+ClusterIP không thuộc về card mạng nào. Thứ duy nhất "biết" nó là luật DNAT của kube-proxy, và luật đó chỉ khớp đúng giao thức và cổng đã khai trong Service (ở đây là TCP 80). Gói ICMP của `ping` không khớp luật nào, không được đổi địa chỉ, và không ai trả lời. Thử ngay trên cụm lab:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k2-demo exec client -- ping -c 1 -W 2 echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PING echo (10.96.72.229): 56 data bytes
+
+--- echo ping statistics ---
+1 packets transmitted, 0 packets received, 100% packet loss
+command terminated with exit code 1
+```
+
+</Expected>
+
+Tên phân giải được ra ClusterIP, nhưng mất 100% gói. Vì vậy đừng dùng `ping` để kiểm một Service; dùng `curl` hoặc `nc` tới đúng cổng.
+
+</Reveal>
+
+<Reveal title="Service không có selector dùng để làm gì?">
+
+Để đặt một cái tên trong cụm cho thứ **không phải pod**: database chạy trên máy ảo, một API của hệ thống cũ, hay service ở cụm khác. Bạn tạo Service không có `selector`, rồi tự viết một EndpointSlice (có label `kubernetes.io/service-name` trỏ về Service) chứa IP và cổng thật. Ứng dụng gọi `db.shop.svc.cluster.local` như mọi Service khác; hôm nào database chuyển vào cụm, bạn thêm selector và xoá EndpointSlice tay, ứng dụng không phải đổi gì. So với `ExternalName` (chỉ là bản ghi `CNAME`), cách này đổi được cổng và không vướng chuyện chứng chỉ TLS không khớp tên. Cái giá: không ai kiểm sức khoẻ các địa chỉ đó thay bạn.
+
+</Reveal>
+
+<Reveal title="externalTrafficPolicy: Local và Cluster khác nhau thế nào?">
+
+Áp dụng cho Service `NodePort` và `LoadBalancer`. Với `Cluster` (mặc định), node nhận request có thể chuyển tiếp sang pod ở node khác; để gói trả về đi đúng đường, node đổi cả địa chỉ nguồn, nên ứng dụng thấy IP của node chứ không thấy IP client. Bước 5 chạy đúng kiểu này: request vào control plane, pod nằm trên worker. Với `Local`, node chỉ giao cho pod nằm trên chính nó: giữ được IP client và bớt một chặng, nhưng node không có pod nào sẽ từ chối, nên load balancer bên ngoài phải biết kiểm sức khoẻ từng node. K2.2 gặp lại lựa chọn này khi mở proxy của Gateway ra ngoài.
+
+</Reveal>
+
+<Reveal title="Tên nội bộ đầy đủ như echo.k2-demo.svc.cluster.local có tránh được search domain không?">
+
+Không, nếu thiếu dấu chấm cuối. Tên đó có 4 dấu chấm, vẫn ít hơn `ndots:5`, nên resolver ghép search domain trước: `echo.k2-demo.svc.cluster.local.k2-demo.svc.cluster.local` và hai tên tương tự đều `NXDOMAIN`, rồi mới tới tên thật. Lặp lại phép đo ở bước 4 với tên này, log CoreDNS cho thấy đúng chuỗi đó. Con số 5 được chọn để mọi dạng tên nội bộ, kể cả dạng dài nhất của pod StatefulSet, đều đi qua search domain trước. Trong cùng namespace, tên ngắn `echo` lại rẻ nhất: khớp ngay search domain đầu tiên.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết manifest Service nhanh và thường đúng cú pháp. Ba chỗ hay sai: (1) nhầm `port` và `targetPort`, hoặc selector của Service không khớp label trong pod template; (2) khuyên `ping` ClusterIP để "kiểm kết nối"; (3) đề xuất `type: LoadBalancer` cho mọi service cần ra ngoài mà không hỏi cụm chạy ở đâu. Khi gỡ lỗi DNS, AI hay bỏ qua `ndots` và search domain. Kiểm lại bằng cụm thật: `kubectl apply --dry-run=server -f file.yaml` bắt lỗi schema, `kubectl get endpointslices` cho biết selector có chọn được pod không, và `getent hosts <tên>` chạy trong pod cho biết tên phân giải ra gì.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.2 đặt Gateway API trước các Service của bài này để nhận traffic HTTP từ ngoài và chia theo request. K2.4 chặn traffic giữa các pod bằng NetworkPolicy, cũng dựa trên label. K4 cấp địa chỉ cho Service `LoadBalancer` trên máy chủ riêng bằng MetalLB. K6 đi sâu các chế độ của kube-proxy, NodeLocal DNSCache và CoreDNS ở quy mô lớn. D2.2 là nền về resolver, `search` và `ndots`.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k2.1.mastery-duong-di">Kể được đường đi của một request từ tên Service tới pod: DNS, ClusterIP, luật của kube-proxy, EndpointSlice.</Check>
+
+<Check id="k2.1.mastery-dns">Nhìn `/etc/resolv.conf` của một pod, nói được một tên bất kỳ sẽ sinh những truy vấn nào và tên nào dùng được từ namespace khác.</Check>
+
+<Check id="k2.1.mastery-chon-service">Với một nhu cầu cụ thể (gọi nội bộ, StatefulSet, mở ra ngoài trên cloud, mở ra ngoài trong lab), chọn được kiểu Service và nói được điều gì phải có sẵn để nó hoạt động.</Check>
+
+</Mastery>

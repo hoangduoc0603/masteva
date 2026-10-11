@@ -1,0 +1,859 @@
+---
+title: Tự viết Helm chart và phát hành qua OCI registry
+description: Viết một chart từ file trắng, gồm helper, kiểm tra values bằng JSON Schema và test, rồi đóng gói, đẩy lên một OCI registry cục bộ và thấy vì sao phải ghim chart theo phiên bản và digest.
+id: k3.2
+step: k3
+prerequisites: [k3.1, k2.4]
+topics: [k3.helm-viet-chart, k3.chart-oci]
+status: verified
+verified:
+  date: 2026-10-10
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    helm: 4.3.0
+    kubectl: 1.37.1
+    kubernetes: 1.37.0
+    kind: 0.33.0
+    docker: 29.8.0
+    registry: 3.1.2
+    nginx-unprivileged: 1.30.5
+---
+
+<Goal>
+
+K3.1 dùng chart của người khác. Bài này đổi vai: bạn là người viết chart cho đội mình và cho người khác cài. Học xong, bạn giải thích được:
+
+- Vì sao gõ nhầm tên một key trong values mà Helm không báo gì, và cách bắt lỗi đó trước khi nó lên cụm.
+- Vì sao `helm upgrade` đổi ConfigMap mà ứng dụng vẫn phục vụ nội dung cũ, và một dòng annotation sửa việc đó.
+- Vì sao hai máy cùng cài "chart phiên bản 0.1.0" lại ra hai kết quả khác nhau.
+- Chart nằm trong OCI registry dưới dạng gì, khác image container ở đâu.
+
+</Goal>
+
+<Knowledge>
+
+### Một chart gồm những gì
+
+Chart là một thư mục có cấu trúc cố định:
+
+```text
+ hello-web/
+ ├── Chart.yaml            tên, version của chart, appVersion của ứng dụng
+ ├── values.yaml           giá trị mặc định: "giao diện" của chart với người dùng
+ ├── values.schema.json    (tuỳ chọn) JSON Schema kiểm values khi lint, template, install
+ ├── .helmignore           file không đóng gói
+ └── templates/
+     ├── _helpers.tpl      đoạn template dùng chung (file bắt đầu bằng _ không sinh manifest)
+     ├── configmap.yaml    ┐
+     ├── deployment.yaml   ├ mỗi file là một manifest có chỗ trống {{ ... }}
+     ├── service.yaml      ┘
+     ├── NOTES.txt         lời nhắn in ra sau khi cài
+     └── tests/
+         └── test-connection.yaml   pod chạy khi gọi "helm test"
+```
+
+Hai con số phiên bản trong `Chart.yaml` hay bị nhầm:
+
+| Trường | Là phiên bản của | Tăng khi | Ví dụ |
+|---|---|---|---|
+| `version` | **Chart** (bắt buộc, theo SemVer) | Đổi bất cứ thứ gì trong chart: template, values mặc định, kể cả chỉ nâng `appVersion` | `0.1.0` → `0.1.1` |
+| `appVersion` | **Ứng dụng** bên trong (chỉ để hiển thị, thường dùng làm tag image mặc định) | Ứng dụng ra bản mới | `"1.30.5"` |
+
+`apiVersion: v2` là định dạng chart của cả Helm 3 lẫn Helm 4. Helm 4 có định dạng v3 đang thử nghiệm, chưa dùng cho production. Lệnh `helm create <tên>` sinh sẵn một chart mẫu khá đầy đủ (bản 4.3 có cả `httproute.yaml`); bài này viết tay từ file trắng để hiểu từng dòng, sau đó bạn sẽ đọc được chart mẫu.
+
+<Check id="k3.2.cau-truc-chart">Kể được các file của một chart và phân biệt `version` với `appVersion`.</Check>
+
+### Ngôn ngữ template
+
+Template của Helm là Go template cộng thư viện hàm Sprig. Mọi thứ nằm trong `{{ }}`; phần còn lại là văn bản được giữ nguyên. Helm render **văn bản** trước, rồi mới đọc kết quả như YAML: nó không hiểu cấu trúc YAML khi render, nên thụt lề là việc của bạn.
+
+Dữ liệu vào đến từ vài object có sẵn:
+
+| Object | Chứa gì | Ví dụ |
+|---|---|---|
+| `.Values` | values mặc định đã gộp với phần người dùng ghi đè | `.Values.replicaCount` |
+| `.Release` | Thông tin lần cài | `.Release.Name`, `.Release.Namespace` |
+| `.Chart` | Nội dung `Chart.yaml` | `.Chart.Name`, `.Chart.AppVersion` |
+| `.Capabilities` | Cụm đích có gì | `.Capabilities.KubeVersion`, `.Capabilities.APIVersions.Has "…"` |
+| `.Template` | File đang render | `.Template.BasePath` |
+
+Những cú pháp gặp trong mọi chart:
+
+```yaml
+replicas: {{ .Values.replicaCount }}                 # chèn giá trị
+image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+                                                     # | là pipeline; default: dùng vế sau nếu rỗng
+message: {{ .Values.message | quote }}               # quote: bọc trong "", an toàn với ký tự lạ
+resources:
+  {{- toYaml .Values.resources | nindent 2 }}        # toYaml: đổ cả một nhánh values ra YAML
+                                                     # nindent 2: xuống dòng rồi thụt 2 dấu cách
+{{- if .Values.ingress.enabled }} ... {{- end }}     # điều kiện
+{{- range .Values.hosts }} - {{ . | quote }} {{- end }}   # lặp; trong range, "." là phần tử
+labels:
+  {{- include "hello-web.labels" . | nindent 2 }}    # gọi named template, truyền ngữ cảnh "."
+```
+
+Dấu `-` trong `{{-` xoá khoảng trắng và dòng trống **phía trước** thẻ; `-}}` xoá phía sau. Thiếu nó, output đầy dòng trống; thừa nó, hai dòng YAML dính vào nhau. Cặp `{{- … | nindent N }}` là thành ngữ chuẩn để chèn một khối nhiều dòng vào đúng mức thụt.
+
+**Named template** (định nghĩa bằng `define` trong `_helpers.tpl`, gọi bằng `include`) là cách tránh lặp: tên đầy đủ của object và bộ label xuất hiện ở mọi manifest, viết một chỗ. Dùng `include` chứ không dùng `template`: `include` trả về chuỗi nên nối tiếp được `| nindent`.
+
+<Callout kind="pitfall">
+
+**Selector không được chứa thứ sẽ đổi.** Selector của Deployment (`spec.selector.matchLabels`) là bất biến sau khi tạo. Nếu bộ label dùng cho selector có chứa phiên bản chart (`helm.sh/chart: hello-web-0.1.0`), lần `helm upgrade` đầu tiên sang chart 0.1.1 sẽ bị API server từ chối với `field is immutable`, và cách sửa duy nhất là xoá Deployment rồi tạo lại, tức là downtime. Vì vậy chart tách hai bộ: `selectorLabels` chỉ gồm thứ không bao giờ đổi (tên ứng dụng, tên release), và `labels` gồm `selectorLabels` cộng các label thông tin như version. Chart do `helm create` sinh ra làm đúng như vậy.
+
+</Callout>
+
+<Check id="k3.2.template-co-ban">Đọc được một template có `.Values`, pipeline, `toYaml`, `nindent`, `include`, và giải thích được vì sao tách `selectorLabels` khỏi `labels`.</Check>
+
+### Thiết kế values và kiểm chart
+
+`values.yaml` là giao diện công khai của chart. Một khi người khác đã viết file values dựa trên nó, đổi tên một key là thay đổi phá vỡ tương thích. Vài nguyên tắc:
+
+- Chỉ đưa ra thứ người dùng **thật sự cần chỉnh**. Mỗi key là một lời hứa phải giữ; template hoá mọi trường của Deployment biến chart thành một bản YAML khó đọc hơn.
+- Mặc định phải chạy được và an toàn: `helm install` không kèm values nào vẫn ra một ứng dụng hoạt động, không chạy root.
+- Đặt tên kiểu `camelCase`, gom theo nhóm (`image.repository`, `image.tag`), ghi chú thích ngay trong file.
+
+Helm **không báo lỗi khi gặp key lạ** trong values. Gõ `mesage` thay cho `message` thì chart render bình thường với giá trị mặc định, và bạn tưởng cấu hình đã có hiệu lực. Bốn lớp kiểm, từ rẻ tới đắt:
+
+| Lớp | Bắt được | Không bắt được |
+|---|---|---|
+| `helm lint` | Chart sai cấu trúc, template lỗi cú pháp, YAML hỏng | Manifest hợp lệ YAML nhưng sai nghĩa |
+| `values.schema.json` | Sai kiểu, thiếu key bắt buộc, giá trị ngoài khoảng, **key lạ** (với `additionalProperties: false`) | Lỗi trong template |
+| `helm template` rồi `kubectl apply --dry-run=server` | Trường không tồn tại trong API, giá trị API server từ chối | Ứng dụng có chạy được không |
+| `helm test` | Ứng dụng sau khi cài có trả lời đúng không | Mọi thứ test không hỏi tới |
+
+Schema được Helm áp tự động ở `lint`, `template`, `install` và `upgrade`: người dùng chart không cần làm gì thêm, và lỗi hiện ra trước khi bất cứ thứ gì chạm tới cụm.
+
+**Cấu hình đổi thì pod phải biết.** Chart để nội dung cấu hình trong ConfigMap. `helm upgrade` với cấu hình mới cập nhật ConfigMap, nhưng Deployment không đổi dòng nào nên không rollout. Pod có thấy cấu hình mới hay không tuỳ cách nó dùng ConfigMap (K1.2): volume ConfigMap được kubelet cập nhật sau vài giây tới hơn một phút, và chỉ có tác dụng nếu ứng dụng đọc lại file; còn biến môi trường, file mount bằng `subPath`, và cấu hình ứng dụng chỉ đọc lúc khởi động thì **không bao giờ** đổi cho tới khi pod được tạo lại. Kustomize giải bằng hash trong tên (K3.1). Chart giải bằng một annotation trên pod template chứa hash của ConfigMap đã render, biến mọi trường hợp thành một rollout có kiểm soát: đi qua readiness probe, và rollback được.
+
+```yaml
+annotations:
+  checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+```
+
+ConfigMap đổi thì chuỗi hash đổi, pod template đổi, Deployment rollout.
+
+<Check id="k3.2.values-schema">Giải thích được vì sao Helm im lặng với key lạ, `values.schema.json` bắt được những lỗi nào, và annotation `checksum/config` giải quyết việc gì.</Check>
+
+### Phát hành chart qua OCI registry
+
+Chart đóng gói thành một file `tên-version.tgz`. Từ Helm 3.8, cách phát hành chuẩn là đẩy file đó lên **OCI registry**, cùng loại kho đang chứa image container của bạn (D5): một hạ tầng, một cơ chế phân quyền, một chỗ sao lưu.
+
+```text
+ helm package hello-web        ->  hello-web-0.1.0.tgz
+ helm push ….tgz oci://registry/charts
+        |
+        v   trong registry, repository "charts/hello-web":
+   tag 0.1.0  ──>  manifest (digest sha256:66d7…)
+                     ├── config  application/vnd.cncf.helm.config.v1+json        (Chart.yaml)
+                     └── layer   application/vnd.cncf.helm.chart.content.v1.tar+gzip  (file .tgz)
+
+ helm install shop oci://registry/charts/hello-web --version 0.1.0     theo tag
+ helm install shop oci://registry/charts/hello-web@sha256:66d7…        theo digest
+```
+
+Registry không phân biệt chart với image; nó chỉ lưu manifest và blob. Khác nhau nằm ở **media type**: `docker pull` một chart vẫn tải về được, nhưng `docker run` thì lỗi vì bên trong không phải filesystem của container; còn `helm pull` một image bị từ chối ngay với `manifest does not contain minimum number of descriptors (2)`. Tên repository là đường dẫn bạn chọn cộng tên chart; tag là `version` trong `Chart.yaml`.
+
+Ba điều phải biết khi phát hành:
+
+- **Tag ghi đè được.** Đẩy lại `0.1.0` với nội dung khác thì tag trỏ sang manifest mới, không cảnh báo nào (trừ khi registry bật chế độ tag bất biến). Quy tắc: mỗi thay đổi tăng `version`; không bao giờ đẩy lại một version đã phát hành.
+- **Digest thì không đổi được.** Nó là hash của manifest, và manifest ghi cả hash của file `.tgz` lẫn thời điểm sửa cuối của file đó (tức lúc đóng gói). Đẩy lại đúng file đó cho cùng digest; đóng gói lại, dù nội dung chart không đổi, cho digest mới. Digest vì thế định danh **một lần đóng gói**. Người cài nên ghim digest cho production, như K3.1 đã làm.
+- **Chữ ký chứng minh ai phát hành.** Digest chỉ đảm bảo "đúng nội dung này", không nói nội dung đó đến từ ai. Helm có cơ chế provenance (`helm package --sign`, file `.prov`), và chart trong OCI registry ký được bằng cosign y như image. D14 dạy ký và xác minh; bài này dừng ở phiên bản và digest.
+
+<Callout kind="production">
+
+Tháng 3/2026, kẻ tấn công dùng thông tin đăng nhập bị lộ để **force-push 76 trên 77 tag phiên bản** của GitHub Action `aquasecurity/trivy-action` sang commit chứa mã đánh cắp bí mật ([advisory GHSA-69fq-xp46-6x23](https://github.com/advisories/GHSA-69fq-xp46-6x23), CVE-2026-33634). Mọi pipeline tham chiếu action theo tag, kể cả tag phiên bản cụ thể như `0.34.2`, đã chạy mã độc trong khoảng 12 giờ mà không ai đổi một dòng cấu hình nào. Tag duy nhất không bị đổi là bản được bật tính năng release bất biến. Ghim theo SHA của commit thì an toàn hơn nhưng chưa đủ: ai ghim tới commit trước 09/04/2025 vẫn dính, vì bản đó còn kéo một action phụ thuộc theo tag. Tag của chart trong OCI registry có đúng tính chất đó: nó là một cái tên ghi đè được. Ba lớp chặn cho chart: registry bật tag bất biến (Harbor, ECR và nhiều registry khác có), pipeline từ chối đẩy khi version đã tồn tại, và nơi cài ghim digest. Bước 6 của lab ghi đè một tag ngay trên máy bạn. D14 phân tích vụ này và các lớp phòng thủ chuỗi cung ứng.
+
+</Callout>
+
+<Check id="k3.2.oci-tag-digest">Mô tả được chart nằm trong OCI registry dưới dạng gì, và vì sao tag không đủ để đảm bảo hai lần cài giống nhau.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Charts | Helm](https://helm.sh/docs/topics/charts/): mọi trường của `Chart.yaml`, cấu trúc thư mục, mục "Schema Files" cho `values.schema.json`.
+- [Getting Started | Helm](https://helm.sh/docs/chart_template_guide/getting_started/): trang đầu của Chart Template Guide; đọc tiếp các mục "Built-in Objects", "Flow Control" và "Named Templates".
+- [Best Practices | Helm](https://helm.sh/docs/chart_best_practices/): quy ước đặt tên values, label chuẩn, cách viết template dễ bảo trì.
+- [Chart Tests | Helm](https://helm.sh/docs/topics/chart_tests/): hook `test` hoạt động thế nào và nên kiểm gì.
+- [Use OCI-based registries | Helm](https://helm.sh/docs/topics/registries/): `helm push`, `helm pull`, đăng nhập registry và cài theo digest.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Đã làm K3.1. Một cụm Kubernetes 1.37 (bài được kiểm trên cụm `k2-lab`), Helm 4.3, kubectl, Docker, `jq`.
+- Cổng `9580` (registry) và `9591` (xem ứng dụng) trên máy còn trống.
+- **Profile máy:** chart chạy 2 đến 3 pod nginx nhỏ (mỗi pod xin 16 Mi), registry cục bộ dùng khoảng 10 MiB theo `docker stats`. Máy 8 GB làm được với Docker Desktop 4 GB.
+- Ứng dụng mẫu: một trang tĩnh phục vụ bằng `nginxinc/nginx-unprivileged`, bản nginx chạy bằng UID 101 và lắng nghe cổng 8080, nên dùng được bộ SecurityContext của K2.4 (kể cả `emptyDir` cho `/tmp` mà K2.4 đã tìm ra).
+
+### 1. Khung chart: Chart.yaml, values và helper
+
+<Terminal where="mac" title="~/masteva-k3/hello-web">
+
+```bash
+mkdir -p ~/masteva-k3/hello-web/templates/tests && cd ~/masteva-k3
+cat > hello-web/Chart.yaml <<'EOF'
+apiVersion: v2                # định dạng chart của Helm 3 và Helm 4
+name: hello-web
+description: Trang tĩnh nhỏ chạy bằng nginx không cần root
+type: application
+version: 0.1.0                # phiên bản của CHART, tăng mỗi lần đổi chart
+appVersion: "1.30.5"          # phiên bản của ỨNG DỤNG bên trong (nginx)
+kubeVersion: ">=1.33.0-0"
+EOF
+printf '*.bak\n.DS_Store\n' > hello-web/.helmignore   # file không đưa vào gói
+cat > hello-web/values.yaml <<'EOF'
+replicaCount: 2
+
+image:
+  repository: nginxinc/nginx-unprivileged
+  tag: ""                     # để trống thì dùng appVersion của chart
+  pullPolicy: IfNotPresent
+
+message: "Xin chào từ hello-web"
+
+service:
+  port: 80
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    memory: 64Mi
+EOF
+cat > hello-web/templates/_helpers.tpl <<'EOF'
+{{/* Tên đầy đủ: <release>-<chart>, cắt ở 63 ký tự vì giới hạn tên DNS */}}
+{{- define "hello-web.fullname" -}}
+{{- if contains .Chart.Name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{/* Nhãn chọn pod: KHÔNG được đổi sau khi đã cài, vì selector của Deployment là bất biến */}}
+{{- define "hello-web.selectorLabels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/* Nhãn chung cho mọi object */}}
+{{- define "hello-web.labels" -}}
+{{ include "hello-web.selectorLabels" . }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+EOF
+```
+
+</Terminal>
+
+Ba named template: `fullname` đặt tên cho mọi object (hai release của cùng chart trong một namespace không đụng tên nhau), `selectorLabels` và `labels` đúng như callout ở phần Kiến thức. Các label `app.kubernetes.io/*` là quy ước chung của Kubernetes; công cụ như k9s hay dashboard dựa vào chúng để gom object theo ứng dụng.
+
+### 2. Template cho ConfigMap, Deployment và Service
+
+<Terminal where="mac" title="~/masteva-k3/hello-web/templates">
+
+```bash
+cat > hello-web/templates/configmap.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hello-web.fullname" . }}
+  labels:
+    {{- include "hello-web.labels" . | nindent 4 }}
+data:
+  index.html: |
+    <h1>{{ .Values.message }}</h1>
+    <p>release {{ .Release.Name }}, chart {{ .Chart.Version }}</p>
+EOF
+cat > hello-web/templates/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hello-web.fullname" . }}
+  labels:
+    {{- include "hello-web.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hello-web.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hello-web.selectorLabels" . | nindent 8 }}
+      annotations:
+        # ConfigMap đổi thì checksum đổi, pod template đổi, Deployment rollout lại
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: html                # chỉ thay đúng một file, giữ các file khác của image
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: html
+          configMap:
+            name: {{ include "hello-web.fullname" . }}
+        - name: tmp
+          emptyDir: {}
+EOF
+cat > hello-web/templates/service.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hello-web.fullname" . }}
+  labels:
+    {{- include "hello-web.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "hello-web.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+EOF
+cat > hello-web/templates/NOTES.txt <<'EOF'
+Đã cài {{ .Release.Name }} (chart {{ .Chart.Name }}-{{ .Chart.Version }}).
+Xem thử:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hello-web.fullname" . }} 9591:{{ .Values.service.port }}
+  curl localhost:9591
+EOF
+helm lint hello-web
+helm template shop hello-web | yq 'select(.kind == "Service")'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+==> Linting hello-web
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed
+# Source: hello-web/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop-hello-web
+  labels:
+    app.kubernetes.io/name: hello-web
+    app.kubernetes.io/instance: shop
+    helm.sh/chart: hello-web-0.1.0
+    app.kubernetes.io/version: "1.30.5"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  selector:
+    app.kubernetes.io/name: hello-web
+    app.kubernetes.io/instance: shop
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+</Expected>
+
+Vài điểm trong các template:
+
+- Phần cố định của ứng dụng (cổng 8080, SecurityContext, probe) **viết cứng**, không đưa vào values. Người dùng chart không nên phải biết nginx này lắng nghe cổng nào.
+- `image.tag | default .Chart.AppVersion`: mặc định chart cài đúng bản ứng dụng nó được kiểm cùng; người dùng vẫn ghi đè được.
+- `toYaml .Values.resources | nindent 12`: đổ nguyên nhánh `resources` vào, nên người dùng thêm `limits.cpu` hay bỏ cả khối mà không cần sửa template. Số `12` là mức thụt của vị trí chèn; đếm sai một dấu cách là YAML hỏng, và `helm lint` bắt được.
+- Trong output, `metadata.labels` có năm label còn `selector` chỉ có hai: đúng ý đồ tách hai bộ.
+
+<Check id="k3.2.lab-template">Viết được Chart.yaml, values, `_helpers.tpl` và ba template, và kiểm bằng `helm lint` cùng `helm template`.</Check>
+
+### 3. Cài, rồi đổi cấu hình
+
+<Terminal where="mac">
+
+```bash
+helm upgrade --install shop ./hello-web -n k3-chart --create-namespace --wait | tail -5
+kubectl -n k3-chart port-forward service/shop-hello-web 9591:80 > /dev/null &
+sleep 2; curl -s localhost:9591; kill %1
+kubectl -n k3-chart get pods
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NOTES:
+Đã cài shop (chart hello-web-0.1.0).
+Xem thử:
+  kubectl -n k3-chart port-forward svc/shop-hello-web 9591:80
+  curl localhost:9591
+<h1>Xin chào từ hello-web</h1>
+<p>release shop, chart 0.1.0</p>
+NAME                              READY   STATUS    RESTARTS   AGE
+shop-hello-web-5c7ddbc564-26r47   1/1     Running   0          13s
+shop-hello-web-5c7ddbc564-n8w72   1/1     Running   0          13s
+```
+
+</Expected>
+
+Chart cài được từ một thư mục (`./hello-web`), không cần đóng gói: tiện khi đang phát triển. Giờ đổi lời chào. Thứ duy nhất thay đổi là nội dung ConfigMap:
+
+<Terminal where="mac">
+
+```bash
+helm upgrade shop ./hello-web -n k3-chart --set message="Phiên bản mới" --wait | grep REVISION
+kubectl -n k3-chart rollout status deployment/shop-hello-web | tail -1
+kubectl -n k3-chart get pods --field-selector=status.phase=Running
+kubectl -n k3-chart port-forward service/shop-hello-web 9591:80 > /dev/null &
+sleep 2; curl -s localhost:9591 | head -1; kill %1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+REVISION: 2
+deployment "shop-hello-web" successfully rolled out
+NAME                              READY   STATUS    RESTARTS   AGE
+shop-hello-web-6cc67b8989-8mc8c   1/1     Running   0          14s
+shop-hello-web-6cc67b8989-8sdxv   1/1     Running   0          14s
+<h1>Phiên bản mới</h1>
+```
+
+</Expected>
+
+Hash trong tên pod đổi và pod mới chỉ vài giây tuổi: Deployment đã rollout dù không ai đổi image. Đó là công của annotation `checksum/config`.
+
+<Predict question="Xoá dòng `checksum/config` khỏi template rồi `helm upgrade` với một lời chào khác. ConfigMap có đổi không? Pod có đổi không? `curl` trả lời chào nào?">
+
+ConfigMap đổi, pod giữ nguyên, và `curl` vẫn trả lời chào **cũ**, kể cả sau một phút rưỡi. Chart mount `index.html` bằng `subPath`, và file mount bằng `subPath` không bao giờ được kubelet cập nhật. Không có annotation, không có gì báo cho Deployment rằng nó cần pod mới.
+
+</Predict>
+
+Làm thí nghiệm ngược đó. Lần upgrade đầu sau khi xoá annotation vẫn rollout một lần, vì bản thân việc mất annotation là một thay đổi của pod template; lần thứ hai mới là phép thử:
+
+<Terminal where="mac">
+
+```bash
+sed -i.bak '/checksum\/config/d' hello-web/templates/deployment.yaml
+helm upgrade shop ./hello-web -n k3-chart --set message="Phiên bản mới" --wait | grep REVISION
+kubectl -n k3-chart rollout status deployment/shop-hello-web | tail -1
+kubectl -n k3-chart get pods --field-selector=status.phase=Running -o name
+helm upgrade shop ./hello-web -n k3-chart --set message="Không ai thấy" --wait | grep REVISION
+sleep 90   # dư thời gian để kubelet đồng bộ volume ConfigMap, nếu nó có đồng bộ
+kubectl -n k3-chart get pods --field-selector=status.phase=Running -o name
+kubectl -n k3-chart get configmap shop-hello-web -o jsonpath='{.data.index\.html}' | head -1
+kubectl -n k3-chart port-forward service/shop-hello-web 9591:80 > /dev/null &
+sleep 2; curl -s localhost:9591 | head -1; kill %1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+REVISION: 3
+deployment "shop-hello-web" successfully rolled out
+pod/shop-hello-web-74685cc8cb-gcjwl
+pod/shop-hello-web-74685cc8cb-qkn2s
+REVISION: 4
+pod/shop-hello-web-74685cc8cb-gcjwl
+pod/shop-hello-web-74685cc8cb-qkn2s
+<h1>Không ai thấy</h1>
+<h1>Phiên bản mới</h1>
+```
+
+</Expected>
+
+Sau revision 4, tên hai pod không đổi. ConfigMap trên cụm đã mang lời chào mới, nhưng nginx vẫn phục vụ lời chào cũ: release báo `deployed`, mọi thứ trông đúng, và cấu hình mới không hề được dùng. Đây là loại lỗi chỉ lộ ra khi pod tình cờ bị tạo lại vài ngày sau. Trả annotation về chỗ cũ:
+
+<Terminal where="mac">
+
+```bash
+mv hello-web/templates/deployment.yaml.bak hello-web/templates/deployment.yaml
+helm upgrade shop ./hello-web -n k3-chart --set message="Có checksum" --wait | grep REVISION
+kubectl -n k3-chart rollout status deployment/shop-hello-web | tail -1
+kubectl -n k3-chart port-forward service/shop-hello-web 9591:80 > /dev/null &
+sleep 2; curl -s localhost:9591 | head -1; kill %1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+REVISION: 5
+deployment "shop-hello-web" successfully rolled out
+<h1>Có checksum</h1>
+```
+
+</Expected>
+
+<Check id="k3.2.lab-checksum">Cài được chart từ thư mục, và chứng minh bằng thí nghiệm hai chiều rằng annotation `checksum/config` là thứ làm pod rollout khi chỉ có ConfigMap đổi.</Check>
+
+### 4. Bắt lỗi values bằng JSON Schema
+
+<Predict question="Chạy `helm template shop hello-web --set mesage=abc` (thiếu một chữ s). Helm báo lỗi, cảnh báo, hay không nói gì?">
+
+Không nói gì. Helm gộp `mesage: abc` vào values như một key mới mà không template nào đọc, rồi render với `message` mặc định. Không có khái niệm "key không được dùng". Người dùng tin rằng cấu hình đã áp dụng. Chỉ một schema có `additionalProperties: false` mới bắt được.
+
+</Predict>
+
+<Terminal where="mac" title="~/masteva-k3/hello-web/values.schema.json">
+
+```bash
+helm template shop hello-web --set mesage=abc | grep '<h1>'
+cat > hello-web/values.schema.json <<'EOF'
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["replicaCount", "image", "message", "service"],
+  "properties": {
+    "replicaCount": { "type": "integer", "minimum": 1, "maximum": 10 },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "message": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "service": {
+      "type": "object",
+      "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    },
+    "resources": { "type": "object" }
+  }
+}
+EOF
+helm lint hello-web | tail -1
+helm template shop hello-web --set mesage=abc 2>&1 | grep -E '^(Error|hello-web|- at)'
+helm template shop hello-web --set-string replicaCount=hai 2>&1 | grep '^- at'
+helm template shop hello-web --set replicaCount=0 2>&1 | grep '^- at'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    <h1>Xin chào từ hello-web</h1>
+1 chart(s) linted, 0 chart(s) failed
+Error: values don't meet the specifications of the schema(s) in the following chart(s):
+hello-web:
+- at '': additional properties 'mesage' not allowed
+- at '/replicaCount': got string, want integer
+- at '/replicaCount': minimum: got 0, want 1
+```
+
+</Expected>
+
+Dòng đầu là trước khi có schema: gõ nhầm, không ai báo, trang vẫn hiện lời chào mặc định. Sau khi thêm schema, cùng lệnh đó dừng với thông báo chỉ đúng chỗ sai, và hai lỗi kiểu dữ liệu cũng bị chặn. Schema còn là tài liệu máy đọc được: trình soạn thảo dùng nó để gợi ý và gạch đỏ ngay trong file values.
+
+`additionalProperties: false` là con dao hai lưỡi: mỗi lần thêm một key vào `values.yaml` bạn phải thêm vào schema, nếu không chart tự từ chối giá trị mặc định của chính nó (`helm lint` bắt được). Đó là cái giá hợp lý cho một chart nhiều người dùng.
+
+<Check id="k3.2.lab-schema">Chứng minh được Helm im lặng với key gõ nhầm, rồi viết `values.schema.json` để chặn key lạ, sai kiểu và giá trị ngoài khoảng.</Check>
+
+### 5. `helm test`: kiểm ứng dụng sau khi cài
+
+Test của chart là một pod thường có annotation `helm.sh/hook: test`. Helm không tạo nó khi install; chỉ tạo khi bạn gọi `helm test`, và coi test đạt nếu pod kết thúc với exit code 0 (D1.1).
+
+<Terminal where="mac" title="~/masteva-k3/hello-web/templates/tests/test-connection.yaml">
+
+```bash
+cat > hello-web/templates/tests/test-connection.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "hello-web.fullname" . }}-test
+  labels:
+    {{- include "hello-web.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: curl
+      image: curlimages/curl:8.22.0
+      command: ["sh", "-c"]
+      args:
+        - curl -fsS http://{{ include "hello-web.fullname" . }}:{{ .Values.service.port }}/ | grep -F {{ .Values.message | quote }}
+EOF
+helm upgrade shop ./hello-web -n k3-chart --wait | grep REVISION
+helm get values shop -n k3-chart
+helm test shop -n k3-chart | grep -E 'TEST SUITE|Phase'
+kubectl -n k3-chart get pods
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+REVISION: 6
+USER-SUPPLIED VALUES:
+message: Có checksum
+TEST SUITE:     shop-hello-web-test
+Phase:          Succeeded
+NAME                              READY   STATUS    RESTARTS   AGE
+shop-hello-web-6bdfcf64d5-7f4r6   1/1     Running   0          27s
+shop-hello-web-6bdfcf64d5-9q9ll   1/1     Running   0          25s
+```
+
+</Expected>
+
+Pod test gọi Service của release và kiểm trang trả về có đúng lời chào trong values. Nó kiểm được cả chuỗi: Service chọn đúng pod, pod đọc đúng ConfigMap, nginx phục vụ đúng file. `hook-succeeded` xoá pod test khi đạt, nên danh sách pod sạch; khi test fail, pod được giữ lại để bạn đọc log.
+
+Để ý `helm get values`: lần upgrade này không kèm `-f` hay `--set` nào, và Helm **dùng lại values của revision trước** (`message: Có checksum`) thay vì quay về mặc định của chart. Vì thế ConfigMap không đổi, checksum không đổi, hai pod giữ nguyên, và test tìm đúng lời chào mới. Hành vi này tiện khi thử tay nhưng dễ gây nhầm trong pipeline: luôn truyền đủ file values ở mỗi lần `upgrade` để kết quả chỉ phụ thuộc vào Git, không phụ thuộc lần chạy trước.
+
+Trong pipeline, chạy `helm test` ngay sau `helm upgrade --wait` ở môi trường thử: một cách rẻ để biết "cài xong" có nghĩa là "chạy được".
+
+<Check id="k3.2.lab-test">Viết được một test cho chart và chạy bằng `helm test`.</Check>
+
+### 6. Đóng gói và đẩy lên OCI registry cục bộ
+
+Chạy registry chính thức của dự án Distribution (CNCF) trong Docker, chỉ mở trên `127.0.0.1`:
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name k3-registry -p 127.0.0.1:9580:5000 registry:3.1.2
+sleep 2
+helm package hello-web -d dist
+helm push dist/hello-web-0.1.0.tgz oci://localhost:9580/charts --plain-http
+curl -s localhost:9580/v2/charts/hello-web/tags/list
+curl -s -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+  localhost:9580/v2/charts/hello-web/manifests/0.1.0 \
+  | jq -c '{config: .config.mediaType, layers: [.layers[].mediaType]}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+843f269833f0df04ef18869a050084b333681928fe1e22da9e9745012c80cc2f
+Successfully packaged chart and saved it to: dist/hello-web-0.1.0.tgz
+Pushed: localhost:9580/charts/hello-web:0.1.0
+Digest: sha256:66d75f8c2fca99f4271630e9b2b36e459c0dc15bad566fa5880074b16962eb16
+{"name":"charts/hello-web","tags":["0.1.0"]}
+{"config":"application/vnd.cncf.helm.config.v1+json","layers":["application/vnd.cncf.helm.chart.content.v1.tar+gzip"]}
+```
+
+</Expected>
+
+Bạn đẩy tới `oci://localhost:9580/charts`; Helm tự nối tên chart thành repository `charts/hello-web` và lấy `version` làm tag. `--plain-http` vì registry lab không có TLS; registry thật luôn dùng HTTPS và cần `helm registry login <tên miền>` trước khi đẩy. Hai lệnh `curl` gọi thẳng API của registry: một manifest với hai media type của Helm, đúng như sơ đồ ở phần Kiến thức. Dòng đầu của output là ID container registry. Digest của bạn sẽ khác, vì manifest ghi cả thời điểm file `.tgz` được đóng gói.
+
+Cài từ registry, ghim version:
+
+<Terminal where="mac">
+
+```bash
+helm upgrade --install shop oci://localhost:9580/charts/hello-web --version 0.1.0 --plain-http \
+  -n k3-chart --wait 2>&1 | grep -E 'Pulled|Digest|REVISION'
+helm list -n k3-chart
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Pulled: localhost:9580/charts/hello-web:0.1.0
+Digest: sha256:66d75f8c2fca99f4271630e9b2b36e459c0dc15bad566fa5880074b16962eb16
+REVISION: 7
+NAME	NAMESPACE	REVISION	UPDATED                            	STATUS  	CHART          	APP VERSION
+shop	k3-chart 	7       	2026-10-10 10:06:10.27049 +0700 +07	deployed	hello-web-0.1.0	1.30.5
+```
+
+</Expected>
+
+<Predict question="Đẩy lại đúng file `.tgz` cũ thì digest có đổi không? Rồi sửa `replicaCount` mặc định thành 3, quên tăng `version`, đóng gói và đẩy lại: registry có từ chối không, tag `0.1.0` trỏ vào đâu, bản cũ còn lấy được không?">
+
+Đẩy lại đúng file cũ cho **cùng digest**: manifest giống hệt nên registry không có gì mới để lưu. Còn lần đẩy sau khi sửa thì registry nhận mà không cảnh báo: tag `0.1.0` trỏ sang manifest mới có digest khác. Bản cũ vẫn lấy được **nếu bạn biết digest của nó**, cho tới khi registry dọn rác. Ai cài theo tag từ giờ nhận nội dung mới, dù số phiên bản y nguyên.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+helm push dist/hello-web-0.1.0.tgz oci://localhost:9580/charts --plain-http 2>&1 | grep Digest
+CU=$(helm show chart oci://localhost:9580/charts/hello-web --version 0.1.0 --plain-http 2>&1 | awk '/^Digest:/{print $2}')
+sed -i.bak 's/^replicaCount: 2/replicaCount: 3/' hello-web/values.yaml
+helm package hello-web -d dist > /dev/null
+helm push dist/hello-web-0.1.0.tgz oci://localhost:9580/charts --plain-http 2>&1 | grep Digest
+echo "digest cũ: $CU"
+helm show values oci://localhost:9580/charts/hello-web --version 0.1.0 --plain-http 2>/dev/null | head -1
+helm show values oci://localhost:9580/charts/hello-web@$CU --plain-http 2>/dev/null | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Digest: sha256:66d75f8c2fca99f4271630e9b2b36e459c0dc15bad566fa5880074b16962eb16
+Digest: sha256:48ced932f4f18b518139dd014f0370838af6644940e7db9f9ef72674e98b87b7
+digest cũ: sha256:66d75f8c2fca99f4271630e9b2b36e459c0dc15bad566fa5880074b16962eb16
+replicaCount: 3
+replicaCount: 2
+```
+
+</Expected>
+
+Dòng `Digest` đầu tiên trùng với digest ở lần đẩy trước: cùng một file thì cùng digest. Dòng thứ hai là sau khi đóng gói lại với nội dung khác. Cùng "phiên bản 0.1.0", hai nội dung. Đây chính là sự cố trong callout ở phần Kiến thức, thu nhỏ. Làm lại cho đúng: thay đổi nào cũng đi kèm một version mới.
+
+<Terminal where="mac">
+
+```bash
+sed -i.bak 's/^version: 0.1.0 /version: 0.1.1 /' hello-web/Chart.yaml
+helm package hello-web -d dist
+helm push dist/hello-web-0.1.1.tgz oci://localhost:9580/charts --plain-http 2>&1 | grep Pushed
+curl -s localhost:9580/v2/charts/hello-web/tags/list
+helm upgrade shop oci://localhost:9580/charts/hello-web --version 0.1.1 --plain-http -n k3-chart --wait \
+  2>&1 | grep REVISION
+helm list -n k3-chart -o json | jq -r '.[] | "\(.name) \(.chart) rev=\(.revision)"'
+kubectl -n k3-chart get deployment shop-hello-web -o jsonpath='{.status.readyReplicas}{" pod sẵn sàng\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Successfully packaged chart and saved it to: dist/hello-web-0.1.1.tgz
+Pushed: localhost:9580/charts/hello-web:0.1.1
+{"name":"charts/hello-web","tags":["0.1.0","0.1.1"]}
+REVISION: 8
+shop hello-web-0.1.1 rev=8
+3 pod sẵn sàng
+```
+
+</Expected>
+
+Registry giờ có hai tag, `helm list` ghi rõ release đang chạy chart `0.1.1`, và ba pod khớp với mặc định mới. Từ phía người dùng chart, nâng cấp là đổi một con số trong lệnh; quay lại là `helm rollback`.
+
+<Check id="k3.2.lab-oci">Đóng gói và đẩy được chart lên OCI registry, cài từ đó với version ghim cứng, và tái hiện được việc tag bị ghi đè khi không tăng version.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `error converting YAML to JSON` khi lint hoặc template | Thụt lề sai sau `nindent`, hoặc thiếu `-` làm dính dòng | `helm template --debug` in cả output hỏng; tìm dòng được báo |
+| `nil pointer evaluating interface` | Template đọc `.Values.a.b` khi `a` không tồn tại | Thêm mặc định cho `a` trong `values.yaml`, hoặc bọc bằng `with` |
+| `values don't meet the specifications of the schema` ngay với values mặc định | Thêm key vào `values.yaml` mà quên thêm vào schema | Đọc đường dẫn trong lỗi; sửa `values.schema.json` |
+| Upgrade báo `field is immutable` | Label trong selector thay đổi giữa hai bản chart | So `selectorLabels` hai bản; selector chỉ chứa thứ không đổi |
+| `helm push` báo `server gave HTTP response to HTTPS client` | Registry không có TLS mà thiếu `--plain-http` | Thêm cờ (chỉ cho registry lab) |
+| `helm test` treo rồi fail | Pod test không gọi được Service, hoặc `grep` không khớp | `kubectl -n k3-chart logs <tên pod test>`; pod fail được giữ lại |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Khối lệnh đầu gỡ release `shop`, xoá namespace `k3-chart`, xoá container registry cùng mọi chart đã đẩy vào đó. Khối thứ hai xoá cả cụm `k2-lab` và hai thư mục lab; chỉ chạy nó khi không còn bài nào cần cụm.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+helm uninstall shop -n k3-chart
+kubectl delete namespace k3-chart
+docker rm -f k3-registry
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi không dùng cụm nữa">
+
+```bash
+kind delete cluster --name k2-lab
+rm -rf ~/masteva-k3 ~/masteva-k2
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao dùng include mà không dùng template?">
+
+`template "tên" .` là một hành động: nó ghi thẳng kết quả vào output và không trả về gì, nên không nối tiếp được bằng pipeline. `include "tên" .` là một hàm trả về chuỗi, nên viết được `include "hello-web.labels" . | nindent 4`. Named template thường sinh nhiều dòng và được chèn ở các mức thụt khác nhau (4 ở `metadata.labels`, 8 trong pod template), nên gần như lúc nào cũng cần `nindent`, tức là cần `include`.
+
+</Reveal>
+
+<Reveal title="Chart có nên tạo Namespace và CRD của chính nó không?">
+
+Thường là không. Namespace do `--create-namespace` hoặc người vận hành tạo; một chart tự tạo namespace sẽ xoá namespace đó, cùng mọi thứ người khác đặt vào, khi bị gỡ. CRD khó hơn: Helm cài CRD trong thư mục `crds/` ở lần install đầu nhưng **không nâng cấp và không xoá** chúng về sau, vì xoá CRD là xoá mọi object thuộc loại đó trong cả cụm. Các dự án lớn vì thế hay tách CRD ra chart riêng hoặc để operator tự quản. K9 quay lại chuyện vòng đời CRD.
+
+</Reveal>
+
+<Reveal title="Helm có hàm lookup đọc object đang có trên cụm. Vì sao nên hạn chế dùng?">
+
+`lookup` hỏi API server lúc render, ví dụ để giữ lại mật khẩu đã sinh ở lần cài trước. Cái giá: output của chart không còn chỉ phụ thuộc chart và values. `helm template` không nối cụm nên `lookup` trả về rỗng, và chart render ra kết quả khác với lúc cài thật; công cụ GitOps render chart ngoài cụm (D13) gặp đúng vấn đề đó. Chart dùng `lookup` cũng cần quyền đọc những object nó hỏi. Giữ chart là hàm thuần của values thì kiểm, so sánh và tái lập đều dễ hơn.
+
+</Reveal>
+
+<Reveal title="Đóng gói lại cùng một chart, không sửa gì, có cho cùng digest không?">
+
+Không. Manifest OCI mà Helm tạo có annotation `org.opencontainers.image.created` lấy từ thời điểm sửa cuối của file `.tgz`, tức lúc `helm package` chạy. Đẩy lại đúng file đó bao nhiêu lần cũng ra một digest, như bước 6 đã thấy. Nhưng chạy `helm package` lần nữa, hoặc chép file theo cách làm đổi thời điểm sửa, thì manifest khác đi và digest mới xuất hiện, dù nội dung chart không đổi một byte. Hệ quả thực tế: digest định danh **một lần đóng gói**, không phải một nội dung. Đừng thiết kế pipeline dựa vào việc "build lại sẽ ra cùng digest"; hãy đóng gói một lần rồi chuyển đúng file đó, hoặc đúng digest đó, qua các môi trường.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết khung chart và template nhanh, đặc biệt khi bạn đưa manifest có sẵn và nhờ "chuyển thành chart". Chỗ hay sai: (1) đếm sai số trong `indent`/`nindent`, hoặc dùng `indent` ở chỗ cần `nindent`; (2) template hoá quá tay, mỗi trường một value, sinh ra chart không ai bảo trì nổi; (3) đưa label chứa version vào selector; (4) quên `quote` cho giá trị chuỗi trông như số hoặc boolean (`"true"`, `"0123"`); (5) không viết schema. Yêu cầu AI nộp kèm ba thứ và tự chạy: output `helm lint`, output `helm template` với hai bộ values khác nhau (đọc diff giữa chúng), và một `values.schema.json` có `additionalProperties: false`.
+
+</Callout>
+
+<Callout kind="link">
+
+D14 ký chart và image bằng cosign, và xác minh chữ ký trước khi cài. D13 đưa chart vào GitOps: Argo CD hoặc Flux theo dõi registry và tự nâng version. D6 đặt các bước `lint`, `template`, `package`, `push` của bài này vào pipeline CI. K5 thêm HPA và PodDisruptionBudget vào chart, kèm điều kiện bỏ `replicas` khi bật autoscaling. K9 xử lý chart có CRD và operator.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k3.2.mastery-viet-chart">Tự viết được chart cho một ứng dụng nhỏ: helper cho tên và label, values gọn, template có `checksum/config` và SecurityContext.</Check>
+
+<Check id="k3.2.mastery-kiem-chart">Bảo vệ được chart bằng `helm lint`, `values.schema.json` và `helm test`, và nói được mỗi lớp bắt loại lỗi nào.</Check>
+
+<Check id="k3.2.mastery-phat-hanh">Đóng gói, đẩy chart lên OCI registry và cài lại từ đó theo version; giải thích được vì sao production nên ghim digest và không bao giờ đẩy lại một version cũ.</Check>
+
+</Mastery>

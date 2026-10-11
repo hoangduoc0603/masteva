@@ -1,0 +1,683 @@
+---
+title: HTTP và TLS
+description: Đọc một request HTTPS từ bắt tay TLS tới response bằng curl -v, tự làm một CA có intermediate để hiểu chuỗi tin cậy, SAN và SNI, tái hiện lỗi "unable to get local issuer certificate" khi server quên gửi intermediate, và cài CA nội bộ vào trust store.
+id: d2.3
+step: d2
+prerequisites: [d2.2]
+topics: [d2.http-tls]
+status: verified
+verified:
+  date: 2026-10-10
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    openssl: 3.5.5
+    curl: 8.18.0
+    python: 3.14.4
+    tcpdump: 4.99.6
+    dnsmasq: '2.92'
+---
+
+<Goal>
+
+Hiểu chuyện xảy ra giữa lúc kết nối TCP mở xong và lúc ứng dụng nhận được request: bắt tay TLS để client biết mình đang nói chuyện với đúng server, rồi HTTP chạy bên trong. Học xong bài này, bạn giải thích được:
+
+- Vì sao trình duyệt mở trang bình thường mà `curl`, Java hay Python lại báo `unable to get local issuer certificate`.
+- Vì sao một địa chỉ IP phục vụ được nhiều trang HTTPS với chứng chỉ khác nhau, và vì sao người đứng giữa vẫn biết bạn vào trang nào.
+- Vì sao gọi một service bằng IP thì lỗi chứng chỉ dù gọi bằng tên thì không, và vì sao `curl -k` không phải cách sửa.
+
+</Goal>
+
+<Knowledge>
+
+### HTTP: request, response, header
+
+J10.1 đã dạy request, response và status code từ phía người viết API. Phần này chỉ nhắc những gì người vận hành cần. HTTP/1.1 là giao thức văn bản chạy trên một kết nối TCP; `curl -v` in ra đúng những dòng đi trên dây:
+
+```text
+> GET /orders/42 HTTP/1.1          method, đường dẫn, phiên bản
+> Host: api.lab.internal:8443      bắt buộc ở HTTP/1.1: một IP phục vụ nhiều tên miền
+> User-Agent: curl/8.18.0
+> Accept: */*
+>                                  dòng trống: hết header
+< HTTP/1.1 200 OK                  phiên bản, status code, lý do
+< Content-Type: text/plain; charset=utf-8
+< Content-Length: 39               biết khi nào hết body, để dùng lại kết nối (keep-alive)
+<
+< xin chao ...                     body
+```
+
+Bảng status code đầy đủ nằm ở J10.1. Với người vận hành, nhóm đáng nhớ nhất là 5xx do proxy sinh ra (`502`, `503`, `504`); bài D2.5 phân biệt từng mã bằng lab.
+
+| Phiên bản | Tầng dưới | Điểm chính |
+|---|---|---|
+| HTTP/1.1 | TCP | Một request mỗi lúc trên một kết nối; trình duyệt mở nhiều kết nối song song |
+| HTTP/2 | TCP + TLS | Nhiều request song song trên một kết nối (multiplexing), header nén; chọn bằng ALPN lúc bắt tay TLS |
+| HTTP/3 | QUIC trên UDP | Mất một gói không chặn các luồng khác; bắt tay gộp với TLS 1.3 |
+
+### TLS: mã hoá và xác thực server
+
+**TLS** đặt một lớp giữa TCP và HTTP để đạt ba mục tiêu: không ai đọc được (mã hoá), không ai sửa được (toàn vẹn), và client biết chắc đang nói chuyện với đúng server (xác thực). Hai mục tiêu đầu dễ; mục tiêu thứ ba cần **chứng chỉ (certificate)**.
+
+Bắt tay TLS 1.3, ngay sau bắt tay TCP:
+
+```text
+ client                                                server
+   │ ── ClientHello: phiên bản, cipher, khoá DH tạm,       │
+   │    SNI = "api.lab.internal" (chưa mã hoá),            │
+   │    ALPN = h2, http/1.1 ─────────────────────────────> │ chọn chứng chỉ theo SNI
+   │ <── ServerHello: khoá DH tạm của server ───────────── │
+   │ <── (mã hoá) Certificate: lá + intermediate ───────── │
+   │ <── (mã hoá) CertificateVerify: ký bằng khoá riêng ── │ chứng minh giữ khoá riêng
+   │ <── (mã hoá) Finished ────────────────────────────── │
+   │ kiểm tra: chuỗi tới root tin cậy? tên khớp SAN?       │
+   │          còn hạn? chữ ký đúng?                        │
+   │ ── Finished ─────────────────────────────────────────> │
+   │ ══ GET / HTTP/1.1 (mã hoá) ═══════════════════════════> │   tổng cộng thêm 1 RTT so với TCP
+```
+
+Một chứng chỉ X.509 gắn một **khoá công khai** với một **tên**, và được một **CA (certificate authority)** ký. Những trường cần đọc được:
+
+| Trường | Ý nghĩa |
+|---|---|
+| Subject, **Subject Alternative Name (SAN)** | Tên mà chứng chỉ có hiệu lực. Client hiện đại chỉ kiểm SAN, bỏ qua CN của Subject |
+| Issuer | CA đã ký chứng chỉ này |
+| Not Before, Not After | Thời hạn. Chứng chỉ công khai ngày càng ngắn hạn (Let's Encrypt cấp 90 ngày) |
+| Basic Constraints `CA:TRUE` | Chứng chỉ này được ký chứng chỉ khác |
+| Key Usage, Extended Key Usage `serverAuth` | Được dùng vào việc gì |
+
+**Chuỗi tin cậy (chain of trust).** CA gốc (root) giữ khoá riêng cất kỹ, chỉ dùng để ký vài CA trung gian (intermediate); intermediate mới ký chứng chỉ cho từng website. Client chỉ có sẵn các root trong **trust store** (trên Ubuntu là `/etc/ssl/certs`, Java có `cacerts` riêng). Vì vậy **server phải gửi kèm intermediate**: client có root, server cung cấp mắt xích ở giữa.
+
+```text
+ trust store của client          server gửi trong bắt tay
+ ┌──────────────────────┐       ┌────────────────────────────┐   ┌────────────────────┐
+ │ Masteva Lab Root CA  │ ký ─> │ Masteva Lab Intermediate CA │ ký ─> │ CN=api.lab.internal │
+ │ (tự ký, có sẵn)      │       │ (server phải gửi)           │   │ SAN: api, www       │
+ └──────────────────────┘       └────────────────────────────┘   └────────────────────┘
+```
+
+**SNI (Server Name Indication).** Server cần biết client muốn tên nào để chọn chứng chỉ, nhưng header `Host` nằm trong phần đã mã hoá. Vì vậy client gửi tên trong ClientHello, dưới dạng **chưa mã hoá**: bất kỳ ai trên đường đi (firewall công ty, nhà mạng) đều đọc được tên miền bạn truy cập, dù không đọc được nội dung. Bước 6 của lab thấy điều này bằng tcpdump. Encrypted Client Hello (ECH) giải quyết chuyện này nhưng chưa phổ biến.
+
+<Callout kind="production">
+
+Ngày 30/9/2021, chứng chỉ root "DST Root CA X3" mà Let's Encrypt dùng để tương thích với thiết bị cũ hết hạn. Let's Encrypt đã công bố trước trong trang [DST Root CA X3 Expiration (September 2021)](https://letsencrypt.org/docs/dst-root-ca-x3-expiration-september-2021/) và chuyển sang root của chính họ, ISRG Root X1. Trình duyệt và hệ điều hành mới không bị gì. Theo trang đó, hai nhóm client gặp lỗi: client dùng OpenSSL 1.0.x (cần cách khắc phục riêng), và thiết bị hay phần mềm có trust store chưa có ISRG Root X1, trong đó có các bản JDK cũ. Hệ quả ngoài thực tế là nhiều tích hợp server-to-server ngừng chạy cùng một ngày dù phía server không đổi gì. Chẩn đoán đúng cần biết chuỗi mà server gửi (`openssl s_client -showcerts`) và trust store mà **client** đang dùng, không phải của máy bạn.
+
+</Callout>
+
+<Check id="d2.3.tls-chain">Đọc được các trường chính của một chứng chỉ, vẽ được chuỗi root, intermediate, lá, và giải thích được vì sao server phải gửi kèm intermediate.</Check>
+
+<Check id="d2.3.sni">Giải thích được SNI dùng để làm gì và vì sao tên miền trong SNI không được mã hoá.</Check>
+</Knowledge>
+
+<Resources>
+
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110): mục 9 (method) và 15 (status code), bản chuẩn hiện hành của HTTP.
+- [RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3](https://www.rfc-editor.org/rfc/rfc8446): mục 2 "Protocol Overview" có sơ đồ bắt tay đầy đủ.
+- [curl: SSL CA Certificates](https://curl.se/docs/sslcerts.html): curl kiểm chứng chỉ thế nào, các cách chỉ CA (`--cacert`, trust store).
+- [openssl-s_client](https://docs.openssl.org/3.5/man1/openssl-s_client/): các cờ `-servername`, `-showcerts`, `-CAfile` và ý nghĩa `Verify return code`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** lab của bài D2.2 đang chạy: mạng `topo.sh`, DNS nội bộ ở `10.0.2.53` và split DNS trên `lan0`, để tên `api.lab.internal` phân giải được. VM 2 CPU, 2 GiB; lab thêm một server Python, tốn dưới 100 MB, máy 8 GB không cần thu gọn. Các công cụ của bài có sẵn trong image Ubuntu của Lima; chạy lệnh dưới để chắc chắn (gói đã có thì `apt` bỏ qua, `dnsmasq-base` đã cài ở D2.2):
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y openssl curl python3 tcpdump
+```
+
+</Terminal>
+
+Nếu bạn đã dọn lab D2.2, dựng lại bằng các file còn giữ trong `~/masteva-d2/dns`:
+
+<Terminal where="vm" title="Dựng lại lab D2.2 (bỏ qua nếu lab còn chạy)">
+
+```bash
+sudo ~/masteva-d2/topo.sh up
+sudo ip -n server addr add 10.0.2.53/24 dev eth0
+sudo ip netns exec server dnsmasq --conf-file=$HOME/masteva-d2/dns/internal.conf
+sudo resolvectl dns lan0 10.0.2.53
+sudo resolvectl domain lan0 '~lab.internal'
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+mkdir -p ~/masteva-d2/pki && cd ~/masteva-d2
+dig api.lab.internal +short
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10.0.2.20
+```
+
+</Expected>
+
+Bài này dùng hai terminal, cả hai `cd ~/masteva-d2`. Terminal 2 chạy server ở chế độ foreground để bạn thấy log trực tiếp.
+
+### 1. Tự làm một CA có intermediate
+
+Lab không có tên miền công khai nên không xin được chứng chỉ từ Let's Encrypt. Bạn tự làm một CA ba tầng giống cấu trúc CA thật. Khoá dùng đường cong elliptic P-256, nhỏ và nhanh.
+
+<Terminal where="vm" title="~/masteva-d2/pki">
+
+```bash
+cd ~/masteva-d2/pki
+# 1. Root CA: tự ký, 10 năm
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+  -keyout root.key -out root.crt -subj "/CN=Masteva Lab Root CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+# 2. Intermediate CA: root ký, 5 năm, không được ký thêm CA nào bên dưới (pathlen:0)
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout int.key -out int.csr -subj "/CN=Masteva Lab Intermediate CA"
+openssl x509 -req -in int.csr -CA root.crt -CAkey root.key -days 1825 -out int.crt \
+  -extfile <(printf "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n")
+# 3. Chứng chỉ lá cho api và www: intermediate ký, 90 ngày
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout api.key -out api.csr -subj "/CN=api.lab.internal"
+openssl x509 -req -in api.csr -CA int.crt -CAkey int.key -days 90 -out api.crt \
+  -extfile <(printf "subjectAltName=DNS:api.lab.internal,DNS:www.lab.internal\nextendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature\n")
+# 4. Chứng chỉ lá thứ hai cho admin, để thử SNI
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout admin.key -out admin.csr -subj "/CN=admin.lab.internal"
+openssl x509 -req -in admin.csr -CA int.crt -CAkey int.key -days 90 -out admin.crt \
+  -extfile <(printf "subjectAltName=DNS:admin.lab.internal\nextendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature\n")
+# Server gửi lá kèm intermediate: ghép thành file chain
+cat api.crt int.crt > api-chain.crt
+cat admin.crt int.crt > admin-chain.crt
+```
+
+</Terminal>
+
+`.csr` (certificate signing request) là "đơn xin cấp chứng chỉ": chứa khoá công khai và tên, ký bằng khoá riêng của người xin. Khoá riêng (`.key`) không bao giờ rời máy của người xin. Kiểm tra kết quả:
+
+<Terminal where="vm">
+
+```bash
+openssl x509 -in api.crt -noout -subject -issuer -dates -ext subjectAltName
+openssl verify -CAfile root.crt -untrusted int.crt api.crt
+openssl verify -CAfile root.crt api.crt
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+subject=CN=api.lab.internal
+issuer=CN=Masteva Lab Intermediate CA
+notBefore=Oct  9 10:53:29 2026 GMT
+notAfter=Jan  7 10:53:29 2027 GMT
+X509v3 Subject Alternative Name:
+    DNS:api.lab.internal, DNS:www.lab.internal
+api.crt: OK
+CN=api.lab.internal
+error 20 at 0 depth lookup: unable to get local issuer certificate
+error api.crt: verification failed
+```
+
+</Expected>
+
+Có intermediate (`-untrusted int.crt`): chuỗi đầy đủ, `OK`. Chỉ có root: OpenSSL không nối được lá với root, lỗi 20. Hãy nhớ lỗi này, bước 5 gặp lại nó qua mạng. Ngày giờ trên máy bạn sẽ khác.
+
+<Check id="d2.3.lab-ca">Tự tạo được root CA, intermediate và chứng chỉ lá có SAN bằng `openssl`, và kiểm được chuỗi bằng `openssl verify`.</Check>
+
+### 2. Server HTTPS chọn chứng chỉ theo SNI
+
+Một server Python nhỏ, nghe `10.0.2.20:8443`, có hai chứng chỉ và chọn theo SNI. Tham số thứ hai chọn gửi kèm intermediate (`chain`) hay không (`leaf`):
+
+<Terminal where="vm" title="~/masteva-d2/tls_server.py">
+
+```bash
+cat > ~/masteva-d2/tls_server.py <<'EOF'
+#!/usr/bin/env python3
+"""HTTPS server nhỏ cho lab D2.3: chọn chứng chỉ theo SNI.
+
+Cách chạy: tls_server.py <thư mục pki> [chain|leaf]
+  chain: gửi chứng chỉ lá kèm intermediate (đúng)
+  leaf:  chỉ gửi chứng chỉ lá (lỗi cấu hình hay gặp)
+"""
+import http.server
+import ssl
+import sys
+
+PKI = sys.argv[1]
+MODE = sys.argv[2] if len(sys.argv) > 2 else "chain"
+
+def context_for(name):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    cert = f"{PKI}/{name}-chain.crt" if MODE == "chain" else f"{PKI}/{name}.crt"
+    ctx.load_cert_chain(cert, f"{PKI}/{name}.key")
+    return ctx
+
+contexts = {
+    "api.lab.internal": context_for("api"),
+    "admin.lab.internal": context_for("admin"),
+}
+default = contexts["api.lab.internal"]
+
+def pick_certificate(sock, server_name, _ctx):
+    print(f"SNI={server_name}", flush=True)
+    if server_name in contexts:
+        sock.context = contexts[server_name]
+
+default.sni_callback = pick_certificate
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        body = f"xin chao {self.headers['Host']} qua TLS\n".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+class Server(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # Client bỏ kết nối giữa chừng (ví dụ vì từ chối chứng chỉ): in một dòng thay cho traceback
+        print(f"kết nối từ {client_address[0]} bị đóng: {sys.exc_info()[1]}", flush=True)
+
+server = Server(("10.0.2.20", 8443), Handler)
+server.socket = default.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+EOF
+```
+
+</Terminal>
+
+Chạy ở terminal 2 và để nó ở đó:
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec server python3 ~/masteva-d2/tls_server.py ~/masteva-d2/pki chain
+```
+
+</Terminal>
+
+### 3. curl và HTTPS
+
+<Terminal where="vm">
+
+```bash
+cd ~/masteva-d2
+curl -sS https://api.lab.internal:8443/
+curl -sS --cacert pki/root.crt https://api.lab.internal:8443/
+curl -sS --cacert pki/root.crt https://www.lab.internal:8443/
+curl -sS --cacert pki/root.crt https://10.0.2.20:8443/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+curl: (60) SSL certificate OpenSSL verify result: unable to get local issuer certificate (20)
+More details here: https://curl.se/docs/sslcerts.html
+...
+xin chao api.lab.internal:8443 qua TLS
+xin chao www.lab.internal:8443 qua TLS
+curl: (60) SSL: no alternative certificate subject name matches target ipv4 address '10.0.2.20'
+```
+
+</Expected>
+
+- Không có `--cacert`: trust store của hệ thống không có root của lab, exit code 60.
+- `www.lab.internal` dùng được cùng chứng chỉ vì có trong SAN.
+- Gọi bằng IP: chuỗi tin cậy đúng nhưng **tên** không khớp, vì SAN không có IP. curl cũng không gửi SNI khi đích là IP: terminal 2 in `SNI=None`.
+
+Mỗi lần curl từ chối chứng chỉ (lệnh thứ nhất và thứ tư), nó bỏ kết nối giữa chừng và terminal 2 in thêm một dòng `kết nối từ 10.0.1.10 bị đóng: ...`. Đó là phía server ghi nhận client bỏ đi, không phải lỗi của server. Kiểm tên là một nửa của xác thực; bỏ nó (`curl -k`, `verify=False`) là mở cửa cho kẻ đứng giữa.
+
+Đừng sửa lỗi 60 bằng `-k`. Xem chi tiết bắt tay:
+
+<Terminal where="vm">
+
+```bash
+curl -v --cacert pki/root.crt https://api.lab.internal:8443/ 2>&1 | grep -E '^\*|^>|^<'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+…
+* IPv4: 10.0.2.20
+*   Trying 10.0.2.20:8443...
+* ALPN: curl offers h2,http/1.1
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* SSL Trust Anchors:
+*   CAfile: pki/root.crt
+*   CApath: /etc/ssl/certs
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+…
+* TLSv1.3 (IN), TLS handshake, Encrypted Extensions (8):
+* TLSv1.3 (IN), TLS handshake, Certificate (11):
+* TLSv1.3 (IN), TLS handshake, CERT verify (15):
+* TLSv1.3 (IN), TLS handshake, Finished (20):
+…
+* TLSv1.3 (OUT), TLS handshake, Finished (20):
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519MLKEM768 / id-ecPublicKey
+* ALPN: server did not agree on a protocol. Uses default.
+* Server certificate:
+*   subject: CN=api.lab.internal
+*   start date: Oct  9 10:53:29 2026 GMT
+*   expire date: Jan  7 10:53:29 2027 GMT
+*   issuer: CN=Masteva Lab Intermediate CA
+…
+*   subjectAltName: "api.lab.internal" matches cert's "api.lab.internal"
+* SSL certificate verified via OpenSSL.
+…
+* using HTTP/1.x
+> GET / HTTP/1.1
+> Host: api.lab.internal:8443
+> User-Agent: curl/8.18.0
+> Accept: */*
+>
+…
+< HTTP/1.1 200 OK
+< Server: BaseHTTP/0.6 Python/3.14.4
+…
+< Content-Type: text/plain; charset=utf-8
+< Content-Length: 39
+```
+
+</Expected>
+
+Dấu `…` là những dòng đã lược. Đối chiếu với sơ đồ bắt tay ở phần Kiến thức: Client hello, Server hello, Certificate, CERT verify, Finished. Thêm vài điều đáng để ý:
+
+- `X25519MLKEM768`: OpenSSL 3.5 mặc định trao đổi khoá kiểu lai, ghép X25519 với ML-KEM, một thuật toán chống máy tính lượng tử.
+- `ALPN: server did not agree`: server Python không nói HTTP/2, nên hai bên dùng HTTP/1.1. Với Nginx bật `http2`, dòng này thành `ALPN: server accepted h2`.
+- Dòng `>` là request, `<` là response. Cả hai đi trong đường hầm đã mã hoá.
+
+Đo thời gian từng giai đoạn của một request:
+
+<Terminal where="vm">
+
+```bash
+curl -s -o /dev/null --cacert pki/root.crt \
+  -w 'dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' \
+  https://api.lab.internal:8443/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+dns=0.001084 tcp=0.001229 tls=0.009102 ttfb=0.051169 total=0.051236
+```
+
+</Expected>
+
+Các mốc là thời gian **cộng dồn** tính từ lúc bắt đầu, đơn vị giây. Trong lab, TLS tốn khoảng 8 ms còn server Python mất khoảng 40 ms để trả byte đầu tiên. Khi một API "chậm", lệnh này cho biết chậm ở DNS, kết nối, TLS hay chính ứng dụng. Số trên máy bạn sẽ khác.
+
+<Check id="d2.3.lab-curl-tls">Đọc được output `curl -v` của một request HTTPS: bắt tay TLS, chứng chỉ, request và response; và dùng `curl -w` để tách thời gian DNS, TCP, TLS, ứng dụng.</Check>
+
+### 4. openssl s_client và SNI
+
+<Terminal where="vm">
+
+```bash
+openssl s_client -connect 10.0.2.20:8443 -servername api.lab.internal -CAfile pki/root.crt </dev/null 2>/dev/null \
+  | grep -E '^Certificate chain| s:| i:|^Verify return code'
+openssl s_client -connect 10.0.2.20:8443 -servername admin.lab.internal -CAfile pki/root.crt </dev/null 2>/dev/null \
+  | grep -E ' s:|^Verify return code'
+openssl s_client -connect 10.0.2.20:8443 -noservername -CAfile pki/root.crt </dev/null 2>/dev/null \
+  | grep -E ' s:|^Verify return code'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Certificate chain
+ 0 s:CN=api.lab.internal
+   i:CN=Masteva Lab Intermediate CA
+ 1 s:CN=Masteva Lab Intermediate CA
+   i:CN=Masteva Lab Root CA
+Verify return code: 0 (ok)
+ 0 s:CN=admin.lab.internal
+ 1 s:CN=Masteva Lab Intermediate CA
+Verify return code: 0 (ok)
+ 0 s:CN=api.lab.internal
+ 1 s:CN=Masteva Lab Intermediate CA
+Verify return code: 0 (ok)
+```
+
+</Expected>
+
+Cùng IP, cùng port, nhưng SNI khác cho chứng chỉ khác. Không gửi SNI thì nhận chứng chỉ mặc định. Terminal 2 in `SNI=api.lab.internal`, `SNI=admin.lab.internal`, `SNI=None` theo đúng thứ tự. `s_client` chỉ kiểm chuỗi, không kiểm tên: lệnh thứ ba trả `0 (ok)` dù bạn không nói tên nào. Đó là lý do bước 3 dùng `curl` để kiểm cả tên.
+
+`s:` là subject, `i:` là issuer: đọc theo cặp sẽ thấy lá do intermediate ký, intermediate do root ký. Server **không** gửi root; client phải tự có nó.
+
+### 5. Quên gửi intermediate
+
+Ở terminal 2, dừng server bằng Ctrl+C và chạy lại ở chế độ `leaf`:
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec server python3 ~/masteva-d2/tls_server.py ~/masteva-d2/pki leaf
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+curl -sS --cacert pki/root.crt https://api.lab.internal:8443/
+openssl s_client -connect 10.0.2.20:8443 -servername api.lab.internal -CAfile pki/root.crt </dev/null 2>/dev/null \
+  | grep -E ' s:| i:|^Verify return code'
+python3 -c 'import ssl, urllib.request; c = ssl.create_default_context(cafile="pki/root.crt"); print(urllib.request.urlopen("https://api.lab.internal:8443/", context=c).read())' 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+curl: (60) SSL certificate OpenSSL verify result: unable to get local issuer certificate (20)
+ 0 s:CN=api.lab.internal
+   i:CN=Masteva Lab Intermediate CA
+Verify return code: 21 (unable to verify the first certificate)
+urllib.error.URLError: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1081)>
+```
+
+</Expected>
+
+Client có root, nhưng thiếu mắt xích ở giữa. Trên production, lỗi này hay **lọt qua kiểm thử bằng trình duyệt**: trình duyệt thường đã có sẵn intermediate phổ biến hoặc tự tải nó qua URL trong chứng chỉ (AIA), nên trang vẫn mở. Client là `curl`, Java, Python, Go, ứng dụng di động thì không làm vậy và báo lỗi. Cách kiểm đúng sau mỗi lần thay chứng chỉ là `openssl s_client -showcerts` và đếm số chứng chỉ server gửi.
+
+Dừng server và chạy lại ở chế độ `chain` cho các bước sau:
+
+<Terminal where="vm" title="Terminal 2">
+
+```bash
+sudo ip netns exec server python3 ~/masteva-d2/tls_server.py ~/masteva-d2/pki chain
+```
+
+</Terminal>
+
+<Check id="d2.3.lab-missing-intermediate">Tái hiện được lỗi thiếu intermediate, nhận ra nó qua `Verify return code: 21` và số chứng chỉ trong chuỗi, và giải thích được vì sao trình duyệt có thể không báo lỗi.</Check>
+
+### 6. SNI đi trên dây dưới dạng rõ
+
+<Terminal where="vm" title="Terminal 3 (hoặc chạy nền)">
+
+```bash
+sudo ip netns exec router tcpdump -ni r-wan -A -l 'tcp port 8443' 2>/dev/null | grep -o '[a-z]*\.lab\.internal'
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+curl -s -o /dev/null --cacert pki/root.crt https://api.lab.internal:8443/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+api.lab.internal
+```
+
+</Expected>
+
+`tcpdump -A` in nội dung gói dạng ký tự. Tên miền hiện nguyên trong ClientHello. Không có dòng nào chứa `GET` hay nội dung trả về: phần đó đã mã hoá. Dừng tcpdump bằng Ctrl+C.
+
+### 7. Đưa root CA vào trust store của hệ thống
+
+Thay vì truyền `--cacert` mỗi lần, cài root của lab vào trust store của Ubuntu, như công ty cài CA nội bộ lên máy chủ:
+
+<Terminal where="vm">
+
+```bash
+sudo cp ~/masteva-d2/pki/root.crt /usr/local/share/ca-certificates/masteva-lab-root.crt
+sudo update-ca-certificates
+curl -sS https://api.lab.internal:8443/
+python3 -c 'import urllib.request; print(urllib.request.urlopen("https://api.lab.internal:8443/").read())'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Updating certificates in /etc/ssl/certs...
+rehash: warning: skipping ca-certificates.crt, it does not contain exactly one certificate or CRL
+1 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+xin chao api.lab.internal:8443 qua TLS
+b'xin chao api.lab.internal:8443 qua TLS\n'
+```
+
+</Expected>
+
+Dòng `rehash: warning` là bình thường: file gộp `ca-certificates.crt` chứa nhiều chứng chỉ nên bị bỏ qua khi tạo symlink. `curl` và Python dùng trust store của hệ thống nên chạy được ngay. Với Java thì tuỳ cách cài: JDK lấy từ ngoài gói của distro (tarball Temurin, SDKMAN, phần lớn image container) đọc file `cacerts` riêng trong thư mục JDK và **không** thấy CA vừa cài, nên phải nhập bằng `keytool` hoặc dùng image đã có CA. OpenJDK cài từ gói của Ubuntu dùng kho `cacerts` do gói `ca-certificates-java` đồng bộ từ trust store hệ thống qua chính các hook vừa chạy ở trên (bài mẫu không cài JDK trong VM để kiểm điều này). File phải có đuôi `.crt` thì `update-ca-certificates` mới nhận.
+
+Kiểm hạn chứng chỉ, việc nên có trong giám sát:
+
+<Terminal where="vm">
+
+```bash
+openssl x509 -in ~/masteva-d2/pki/api.crt -noout -checkend $((30*86400)); echo "exit=$?"
+openssl x509 -in ~/masteva-d2/pki/api.crt -noout -checkend $((100*86400)); echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Certificate will not expire
+exit=0
+Certificate will expire
+exit=1
+```
+
+</Expected>
+
+Chứng chỉ 90 ngày còn hạn sau 30 ngày nữa, nhưng hết hạn trong vòng 100 ngày. Exit code khác 0 khiến lệnh này dùng được ngay trong script cảnh báo (bài D3.1). D9 dạy giám sát hạn và gia hạn tự động; bài đó dùng lại đúng CA trong `~/masteva-d2/pki` và không dạy lại `openssl req`, `openssl x509`.
+
+<Check id="d2.3.lab-trust-store">Cài được một CA nội bộ vào trust store của Ubuntu, biết JVM dùng trust store riêng, và kiểm hạn chứng chỉ bằng `openssl x509 -checkend`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `curl: (6) Could not resolve host: api.lab.internal`: DNS của bài D2.2 không chạy, hoặc `lan0` mất cấu hình `resolvectl`. Chạy khối "Dựng lại lab D2.2" ở phần Chuẩn bị.
+- `curl: (7) Failed to connect ... after 3000 ms`: `api.lab.internal` đang trỏ tới IP không có máy (còn `10.0.2.21` từ bước 6 của D2.2). Kiểm `dig api.lab.internal +short`.
+- `curl: (7) ... Could not connect to server` ngay lập tức: server ở terminal 2 chưa chạy, hoặc vừa dừng để đổi chế độ.
+- `OSError: [Errno 98] Address already in use` khi chạy `tls_server.py`: một bản cũ còn chạy. `sudo ip netns pids server | xargs -r ps -o pid,args -p` để tìm, rồi `sudo kill <pid>`.
+- `-extfile <(printf ...)` báo lỗi: bạn đang chạy trong `sh` chứ không phải `bash`. Process substitution `<( )` chỉ có trong bash.
+- `FileNotFoundError` khi khởi động `tls_server.py`: thiếu file `api-chain.crt` hoặc `admin-chain.crt` trong `pki`; chạy lại hai lệnh `cat` cuối bước 1.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới xoá root CA của lab khỏi trust store của VM và dừng mọi tiến trình trong hai namespace. **Giữ thư mục `~/masteva-d2/pki`**: bài D2.5 dùng chứng chỉ `api` cho Nginx, và D9 dùng lại cả CA.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+sudo rm /usr/local/share/ca-certificates/masteva-lab-root.crt && sudo update-ca-certificates --fresh >/dev/null 2>&1
+sudo resolvectl revert lan0
+for ns in server router; do sudo ip netns pids "$ns" | xargs -r sudo kill; done
+sudo ~/masteva-d2/topo.sh down
+```
+
+</Terminal>
+
+Kiểm lại: `curl https://api.lab.internal:8443/` giờ báo `curl: (6) Could not resolve host`, và `ls /etc/ssl/certs | grep -c masteva` in `0`. Bài D2.4 tự dựng lại mạng bằng `topo.sh up`.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nên đặt hạn chứng chỉ dài hay ngắn?">
+
+Ngắn, và tự động gia hạn. Chứng chỉ hạn dài nghĩa là khoá bị lộ được dùng lâu, và việc gia hạn hiếm đến mức không ai nhớ quy trình, nên sự cố hết hạn thường rơi đúng vào chứng chỉ "một năm mới gia hạn một lần". CA/Browser Forum đã thông qua lộ trình rút hạn chứng chỉ công khai xuống 47 ngày vào năm 2029. Với chứng chỉ nội bộ, cert-manager trong Kubernetes (K6) và ACME trên Nginx, Caddy (D9) làm việc gia hạn tự động.
+
+</Reveal>
+
+<Reveal title="mTLS khác TLS thường ở đâu?">
+
+TLS thường chỉ xác thực server. mTLS (mutual TLS) thêm một bước: server yêu cầu client gửi chứng chỉ, và kiểm chuỗi của nó theo CA mà server tin. Service mesh dùng mTLS để mỗi service có danh tính riêng và mã hoá traffic nội bộ. Cơ chế chuỗi tin cậy y hệt bài này, chỉ là hai chiều; khó nhất là cấp và xoay chứng chỉ cho hàng nghìn workload, đó là việc của PKI nội bộ (D9) và SPIFFE (D15).
+
+</Reveal>
+
+<Reveal title="Nên kết thúc TLS ở proxy hay ở chính ứng dụng?">
+
+Kết thúc ở proxy (Nginx, load balancer) gom chứng chỉ, cipher và việc gia hạn về một chỗ, và ứng dụng phía sau chỉ nói HTTP. Cái giá là đoạn từ proxy tới ứng dụng không mã hoá: chấp nhận được khi hai bên ở cùng máy hoặc cùng mạng riêng mà bạn kiểm soát, không chấp nhận được khi traffic đi qua mạng dùng chung hoặc quy định yêu cầu mã hoá suốt đường đi. Khi đó hoặc proxy mở TLS lần nữa tới ứng dụng (re-encrypt), hoặc proxy chỉ chuyển TCP (passthrough, chọn backend theo SNI) và ứng dụng tự giữ chứng chỉ. Bài D2.5 làm kiểu thứ nhất với Nginx.
+
+</Reveal>
+
+<Reveal title="Khoá riêng của một chứng chỉ bị lộ thì làm gì?">
+
+Cấp chứng chỉ mới với **khoá mới** và thay ngay, rồi yêu cầu CA thu hồi chứng chỉ cũ. Đừng trông vào việc thu hồi: nhiều client không kiểm CRL hay OCSP, hoặc bỏ qua khi không hỏi được, nên chứng chỉ cũ vẫn được tin tới ngày hết hạn. Đó là lý do thật sự của chứng chỉ ngắn hạn: thời gian kẻ có khoá lợi dụng được bị chặn trên bởi hạn chứng chỉ. Với CA nội bộ, lộ khoá của intermediate thì thay intermediate và mọi lá bên dưới; lộ khoá root thì phải thay trust store trên mọi máy, nên root được giữ ngoại tuyến.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một output `curl -v` hay `openssl s_client`, hoặc sinh lệnh `openssl` tạo CA lab. AI hay đề nghị `curl -k` hay `verify=False` để "sửa" lỗi chứng chỉ, hay quên SAN và chỉ đặt CN (client hiện đại từ chối), hay nhầm thứ tự file chain (lá phải đứng trước intermediate), và hay đưa cú pháp OpenSSL cũ. Kiểm lại bằng `openssl verify`, `openssl x509 -noout -text`, và `openssl s_client -showcerts` rồi đếm số chứng chỉ server gửi.
+
+</Callout>
+
+<Callout kind="link">
+
+Bài D2.2 cấp tên `api.lab.internal`; bài này cấp chứng chỉ cho tên đó. Bài D2.5 đặt Nginx trước ứng dụng và kết thúc TLS bằng chứng chỉ vừa tạo. D9 đi sâu TLS trên production: ACME, OCSP, xoay chứng chỉ, PKI nội bộ. K6 dùng cert-manager để cấp chứng chỉ trong cụm. J10.1 dạy HTTP từ phía người thiết kế API: phương thức, status code, header.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d2.3.mastery-tls-debug">Chẩn đoán được ba lỗi TLS hay gặp (CA không tin cậy, tên không khớp SAN, thiếu intermediate) bằng `curl -v` và `openssl s_client`, và sửa đúng chỗ thay vì tắt kiểm tra.</Check>
+
+<Check id="d2.3.mastery-issue">Tự cấp được chứng chỉ cho một service nội bộ từ một CA có intermediate, cấu hình server gửi đúng chuỗi, và phân phối root cho client.</Check>
+
+<Check id="d2.3.mastery-explain">Kể lại được một request HTTPS từ đầu tới cuối: DNS, bắt tay TCP, bắt tay TLS (SNI, chứng chỉ, kiểm chuỗi và tên), request và response HTTP, và chỉ ra `curl -w` đo mốc nào.</Check>
+
+</Mastery>

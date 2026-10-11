@@ -10,22 +10,26 @@ import {
   SearchDialogOverlay,
   type SharedProps,
 } from 'fumadocs-ui/components/dialog/search';
-import { useDocsSearch, type SearchClient } from 'fumadocs-core/search/client';
+import { useDocsSearch } from 'fumadocs-core/search/client';
 import { useI18n } from 'fumadocs-ui/contexts/i18n';
-import { useEffect } from 'react';
-import { createLessonSearchClient } from '@/lib/search/lesson-client';
+import { usePathname } from 'next/navigation';
+import { useEffect, useSyncExternalStore } from 'react';
+import { createLessonSearchClient, type LessonSearchClient } from '@/lib/search/lesson-client';
 import type { SearchFile } from '@/lib/search/lesson-index';
 import { takeHandOff } from '@/lib/search/handoff';
+import { roadmapOfPath, useSearchScope } from '@/lib/search/scope';
 
-// Mỗi ngôn ngữ một client: file `/<lang>/search.json` chỉ tải một lần trong phiên (ADR-009).
-const clients = new Map<string, SearchClient>();
+// Mỗi ngôn ngữ một client: mỗi file `/<lang>/search/<roadmap>.json` chỉ tải một lần trong phiên (ADR-009).
+const clients = new Map<string, LessonSearchClient>();
 
-function clientFor(locale: string): SearchClient {
+function clientFor(locale: string, ids: readonly string[]): LessonSearchClient {
   let client = clients.get(locale);
   if (!client) {
-    client = createLessonSearchClient(() =>
-      fetch(`/${locale}/search.json`).then((r) => (r.ok ? (r.json() as Promise<SearchFile>) : Promise.reject(new Error(String(r.status))))),
-    );
+    client = createLessonSearchClient({
+      ids,
+      load: (id) =>
+        fetch(`/${locale}/search/${id}.json`).then((r) => (r.ok ? (r.json() as Promise<SearchFile>) : Promise.reject(new Error(String(r.status))))),
+    });
     clients.set(locale, client);
   }
   return client;
@@ -33,9 +37,13 @@ function clientFor(locale: string): SearchClient {
 
 export default function MastevaSearchDialog(props: SharedProps) {
   const { locale } = useI18n();
-  const { search, setSearch, query } = useDocsSearch({
-    client: clientFor(locale ?? 'vi'),
-  });
+  const scope = useSearchScope();
+  const pathname = usePathname();
+  const client = clientFor(locale ?? 'vi', scope.files);
+  // Roadmap đang xem được tìm trước; khi file của roadmap khác vào chỉ mục thì tìm lại để bổ sung kết quả.
+  client.setFirst(roadmapOfPath(pathname, scope));
+  const loaded = useSyncExternalStore(client.subscribe, client.loadedCount, () => 0);
+  const { search, setSearch, query } = useDocsSearch({ client }, [client, loaded]);
 
   // Mở từ dòng "Tìm … trong nội dung bài học" ở trang chủ: điền sẵn từ khoá.
   useEffect(() => {
