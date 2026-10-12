@@ -1,0 +1,713 @@
+---
+title: Cache, artifact và đánh phiên bản trong pipeline
+description: Làm pipeline nhanh hơn bằng cache dependency và cache layer qua registry, đo xem mỗi loại cache cứu được gì khi runner không giữ trạng thái; lưu báo cáo test và thông tin image thành artifact; rồi phát hành phiên bản 1.0.0 bằng cách gắn tên cho đúng image đã test, không build lại, và chặn việc ghi đè tag.
+id: d7.2
+step: d7
+prerequisites: [d7.1]
+topics: [d7.artifact-danh-phien-ban, d7.pipeline-stage]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    buildx-trong-job: 0.34.1
+    gitea: 28.1.0
+    gitea-runner: 5.0.0
+    registry: 3.1.2
+    actions-cache: v6.1.0
+    actions-upload-artifact: v7.0.2
+    jq: 1.8.2
+---
+
+<Goal>
+
+Biết pipeline tạo ra những gì, giữ chúng ở đâu, và gọi tên chúng thế nào để lần ngược được từ production về commit. Học xong bài này, bạn giải thích được:
+
+- Vì sao thêm `--cache-from` rồi mà job build image gần như không nhanh hơn: vẫn tải lại dependency và biên dịch lại từ đầu.
+- Vì sao cache hỏng không được làm pipeline đỏ, còn artifact hỏng thì phải.
+- Vì sao bản `1.0.0` nên là **cùng digest** với image đã test trên `main`, không phải một lần build mới từ tag.
+- Vì sao tag `1.0.0` trong registry và tag `v1.0.0` trong Git đều có thể bị dời, và pipeline chặn chuyện đó ở đâu.
+
+</Goal>
+
+<Knowledge>
+
+### Cache: thứ có thể mất mà không sai
+
+Mỗi job của D6.1 bắt đầu từ một container sạch. Sạch là tốt cho tính tái lập, nhưng nghĩa là mỗi lần chạy phải tải lại module và biên dịch lại thư viện chuẩn. **Cache** là bản sao của một kết quả trung gian, giữ lại để lần sau khỏi tính lại. Định nghĩa quan trọng nhất: **xoá hết cache thì pipeline vẫn phải cho đúng kết quả, chỉ chậm hơn**. Thứ gì mà mất đi làm pipeline sai thì đó là artifact, không phải cache.
+
+| Loại cache | Giữ cái gì | Nằm ở đâu | Khoá (key) |
+|---|---|---|---|
+| Cache dependency (`actions/cache`, `cache:` của GitLab) | Thư mục tải về và build dở của công cụ: `~/.m2`, `node_modules`, module và build cache của Go | Kho cache của hệ CI (trong lab: cache server của runner) | Bạn tự đặt, thường gồm hệ điều hành và hash của lockfile |
+| Layer cache của BuildKit | Kết quả từng lệnh trong Dockerfile | Trong builder; xuất ra ngoài bằng `--cache-to` | BuildKit tự tính từ lệnh và nội dung đầu vào |
+| Cache mount (`RUN --mount=type=cache`) | Thư mục cache của compiler và trình quản lý gói trong lúc build image | Chỉ trong builder đã chạy lệnh đó | Đường dẫn `target` |
+| Trạng thái còn lại trên runner sống lâu | Image đã kéo, layer đã build, action đã tải | Đĩa của máy runner | Không có; "tình cờ còn đó" |
+
+Với cache dependency, khoá quyết định tất cả:
+
+```text
+ key: go-Linux-ARM64-<hash của go.sum>
+        │
+        ├─ có đúng khoá này  ──▶ cache hit: giải nén, bỏ qua bước lưu ở cuối job
+        ├─ không có, nhưng có restore-keys khớp tiền tố "go-Linux-ARM64-"
+        │                    ──▶ lấy bản gần nhất, cuối job lưu bản mới dưới khoá mới
+        └─ không có gì       ──▶ cache miss: chạy như chưa có cache, cuối job lưu lại
+```
+
+- Khoá phải đổi khi nội dung nên đổi: đưa hash của lockfile (`go.sum`, `package-lock.json`, `pom.xml`) vào khoá. Khoá cố định kiểu `go-cache` thì cache cũ mãi; khoá chứa commit SHA thì không bao giờ trúng.
+- Một bản cache đã lưu là **bất biến**: muốn nội dung khác phải có khoá khác.
+- Cache là dữ liệu do một lượt chạy khác ghi ra. Nếu lượt chạy ít tin cậy (pull request) ghi được vào cache mà lượt chạy nhiều quyền (nhánh chính, release) đọc, đó là đường đầu độc. GitHub giới hạn theo nhánh: lượt chạy chỉ đọc được cache của nhánh mình và nhánh mặc định, cache do pull request tạo không vào được phạm vi của nhánh mặc định. Cache server của Gitea Runner trong lab không tách như vậy, bước 1 cho thấy.
+
+Layer cache của BuildKit có thêm một chiều: **builder sống bao lâu**. D5.2 đã báo trước: cache mount và layer cache chỉ sống trong builder. Runner sống lâu dùng chung một Docker daemon (D6.1) thì cache luôn nóng. Runner dùng một lần, hoặc builder tạo mới mỗi job như trên GitHub-hosted runner, thì mọi lần build đều lạnh, trừ khi gửi cache ra ngoài:
+
+| Backend của `--cache-to` | Cache nằm ở | Ghi chú |
+|---|---|---|
+| `inline` | Trong chính image đẩy lên | Đơn giản nhất; chỉ giữ layer của stage cuối |
+| `registry` | Một tag riêng trong registry, ví dụ `price-api:buildcache` | `mode=max` giữ cả layer của stage build; lab dùng cách này |
+| `local` | Một thư mục, tự bạn cất đi đâu đó | Hợp khi có đĩa chung |
+| `gha`, `s3`, `azblob` | Cache của GitHub Actions hoặc object storage | Phụ thuộc nền tảng |
+
+Điều lab sẽ đo: cache xuất ra ngoài **chỉ mang theo layer**. Nội dung trong cache mount không đi theo, và một lệnh `RUN` có đầu vào đổi ở mọi commit (như `ARG VERSION` chứa commit SHA) thì luôn chạy lại.
+
+<Check id="d7.2.cache-types">Phân biệt được cache dependency, layer cache, cache mount và trạng thái còn lại trên runner; thiết kế được khoá cache từ lockfile; và giải thích được vì sao cache phải là thứ xoá được.</Check>
+
+### Artifact: thứ pipeline tạo ra để dùng tiếp
+
+| | Artifact của lượt chạy | Artifact trong kho (registry, package repository) |
+|---|---|---|
+| Ví dụ | Báo cáo test, coverage, log, file mô tả bản build | Image, JAR, gói npm, chart |
+| Dùng để | Chuyển file giữa các job; giữ bằng chứng của lượt chạy | Triển khai, phân phối |
+| Định danh | Tên + mã lượt chạy | Tên + phiên bản, và digest |
+| Thời gian sống | Có hạn (Gitea mặc định 90 ngày, đặt được theo từng lần upload) | Tới khi có chính sách dọn |
+| Yêu cầu | Tải lại được khi cần điều tra | **Bất biến**, truy được nguồn gốc, phân quyền ai được ghi |
+
+Nguyên tắc nối hai chủ đề của bài: **build một lần**. Thứ được test là thứ được phát hành và là thứ chạy trên production, đúng từng byte. Build lại "cùng mã nguồn" ở bước sau không cho cùng kết quả: base image có thể đã đổi, dependency có thể đã ra bản vá, thời điểm build đi vào binary. Mọi bước sau bước build chỉ được **chuyển và gắn tên** cho artifact đã có.
+
+<Check id="d7.2.artifact-kinds">Phân biệt được artifact của lượt chạy với artifact trong kho, và giải thích được nguyên tắc build một lần.</Check>
+
+### Đánh phiên bản: ba cái tên cho cùng một thứ
+
+| Tên | Ví dụ | Ai đặt | Trả lời câu hỏi | Bất biến? |
+|---|---|---|---|---|
+| Commit SHA | `8ef33b667363` | Git | Bản này build từ dòng code nào | Có (hash của nội dung) |
+| Digest | `sha256:2787…15f1` | Registry, từ nội dung image | Đây có đúng là những byte đó không | Có |
+| Phiên bản | `1.0.0` | Con người | Bản này tương thích thế nào với bản trước | **Không**, trừ khi bạn ép |
+
+**Semantic Versioning** (semver) quy ước ý nghĩa cho `MAJOR.MINOR.PATCH`: tăng MAJOR khi thay đổi làm vỡ tương thích, MINOR khi thêm tính năng mà vẫn tương thích ngược, PATCH khi sửa lỗi tương thích ngược. `1.1.0-rc.1` là bản thử trước `1.1.0`. Đặc tả có một điều hay bị quên: phiên bản đã phát hành thì **không được sửa nội dung**; sửa gì cũng phải ra phiên bản mới. Semver hợp với thứ có người phụ thuộc theo phiên bản (thư viện, API, chart). Một service nội bộ triển khai nhiều lần mỗi ngày thường chỉ cần commit SHA hoặc số thứ tự bản build.
+
+Có hai cách ghép phiên bản với artifact:
+
+| | Gắn tag rồi build | Build rồi gắn tên |
+|---|---|---|
+| Trình tự | Tạo tag Git `v1.0.0`, pipeline build từ tag, đẩy `app:1.0.0` | Mỗi commit trên nhánh chính có image `app:<sha>`; phát hành là thêm tên `1.0.0` cho image đó |
+| Binary biết phiên bản của mình | Có (`VERSION=1.0.0` lúc build) | Chỉ biết commit; phiên bản nằm ở tên trong registry |
+| Thứ phát hành có phải thứ đã test | Không chắc: là một lần build khác | Có: cùng digest |
+| Hợp với | Thư viện, công cụ dòng lệnh, thứ người dùng tự tải | Service triển khai liên tục |
+
+Lab đi theo cột phải. Kèm theo là ba việc giữ cho cái tên đáng tin:
+
+- **Nhãn OCI** trên image: `org.opencontainers.image.revision` (commit), `org.opencontainers.image.source` (repo). Từ một image bất kỳ, lần được về mã nguồn mà không cần hỏi ai.
+- **Tag bất biến**: `registry:3` của lab, như D5.2 đã thấy, nhận push đè không cảnh báo. ECR và Harbor có tuỳ chọn tag bất biến; khi registry không có thì pipeline phải tự từ chối ghi đè.
+- **Nơi triển khai ghi nhận digest**, không chỉ tag (D6.3 làm).
+
+<Callout kind="production">
+
+Theo báo cáo sau sự cố của Codecov: từ 31/01/2021, kẻ tấn công nhiều lần sửa script Bash Uploader ngay trên kho lưu trữ nơi Codecov phân phối nó, sau khi lấy được một khoá truy cập còn sót trong layer trung gian của image Docker công khai của hãng (đúng kiểu lỗi D5.1 đã mổ). Script bị sửa gửi biến môi trường của job CI, tức token và khoá, ra máy chủ bên ngoài. Mọi pipeline tải và chạy script trong khoảng đó đều nhận bản bị sửa, và suốt hai tháng không ai nhận ra. Sự cố chỉ lộ ngày 01/04/2021, khi một khách hàng tự tính SHA-256 của file tải về và thấy khác giá trị công bố trên GitHub. Chính báo cáo gọi cách phân phối kiểu tải script về rồi chạy thẳng bằng shell là "tiện nhưng đầy vấn đề bảo mật". Phần rút ra của bài: cùng một cái tên, nội dung đã khác, và thứ bảo vệ duy nhất là so digest. Bài học cho pipeline của bạn: artifact phải bất biến ở nơi lưu, và nơi dùng phải kiểm digest chứ không tin tên.
+
+</Callout>
+
+<Check id="d7.2.versioning">So sánh được commit SHA, digest và phiên bản semver; nói được quy tắc tăng MAJOR, MINOR, PATCH; và chọn được giữa "gắn tag rồi build" và "build rồi gắn tên" cho một sản phẩm cụ thể.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Dependency caching reference (GitHub Docs)](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching): cách khớp `key` và `restore-keys`, giới hạn truy cập cache theo nhánh, hạn xoá.
+- [Cache storage backends (Docker Docs)](https://docs.docker.com/build/cache/backends/): các backend `inline`, `registry`, `local`, `gha`, `s3`, `azblob` và khác biệt giữa `mode=min` với `mode=max`.
+- [Caching (Gitea Runner)](https://docs.gitea.com/runner/cache/): cache server của runner, cách chia sẻ giữa nhiều runner; kèm trang [Artifacts](https://docs.gitea.com/usage/actions/artifacts) cho phần lưu và xem artifact.
+- [Semantic Versioning 2.0.0](https://semver.org/): đặc tả đầy đủ, ngắn; đọc mục 3 (phiên bản đã phát hành không được sửa) và mục 9–11 (bản thử, metadata, thứ tự).
+- [Post-Mortem / Root Cause Analysis (April 2021) - Codecov](https://about.codecov.io/apr-2021-post-mortem/): báo cáo gốc của vụ việc trong callout; trang [Bash Uploader Security Update](https://about.codecov.io/security-update/) có mốc thời gian.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** stack của D6.1 đang chạy (`docker start d6-gitea d6-registry d6-runner` nếu đã dừng), repo `~/masteva-d7/price-api` đang ở nhánh `main` và sạch. Máy có mạng: runner tải thêm hai action từ `github.com`, và builder dùng một lần kéo lại base image từ Docker Hub ở **mỗi** lượt chạy. **Profile máy:** như D6.1; mỗi job build image dùng thêm khoảng 1 GB RAM trong nửa phút. Lab mở và merge bốn pull request, mỗi cái chờ pipeline khoảng một phút.
+
+### 0. Ba hàm cho vòng lặp pull request
+
+Từ bài này, mọi thay đổi đều vào `main` qua pull request như một đội thật. Hàm `ship` gói cả vòng: đẩy nhánh, mở PR, chờ CI của PR, binh approve, squash merge, chờ pipeline của `main`.
+
+<Terminal where="mac" title="Thêm vào ~/masteva-d7/lab.sh">
+
+```bash
+cd ~/masteva-d7
+cat >> lab.sh <<'EOF'
+last_run() { cat "$HOME/masteva-d7/.last_run"; }
+steps() {     # steps <job> [run]: thời gian từng step của job
+  api_an "$R/actions/runs/${2:-$(last_run)}/jobs" | jq -r --arg n "$1" '.jobs[] | select(.name == $n) | .steps[]
+    | "\((.completed_at|fromdate) - (.started_at|fromdate)) giây  \(.name[0:42])"'
+}
+ship() {      # ship "<tiêu đề>": đẩy nhánh hiện tại, mở PR, chờ CI, binh approve, squash merge, chờ pipeline của main
+  local br n; br=$(git branch --show-current)
+  an_git push -q -u origin "$br" 2>&1 | grep -v '^remote:'
+  n=$(api_an -X POST "$R/pulls" -d "$(jq -n --arg t "$1" --arg h "$br" '{title: $t, head: $h, base: "main"}')" | jq .number)
+  echo "PR #$n: $1"; wait_run
+  api_binh -X POST -d '{"event":"APPROVED"}' "$R/pulls/$n/reviews" >/dev/null
+  api_an -o /dev/null -w "merge: HTTP %{http_code}\n" -X POST \
+    -d '{"Do":"squash","delete_branch_after_merge":true}' "$R/pulls/$n/merge"
+  git switch -q main && an_git pull -q --ff-only --prune && wait_run
+}
+EOF
+. ./lab.sh && cd price-api && git switch -q main && git status --short | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+       0
+```
+
+</Expected>
+
+### 1. Cache dependency, báo cáo test, builder dùng một lần
+
+Một pull request sửa cả hai job. Job `test` thêm `actions/cache` và xuất báo cáo test dạng JSON thành artifact. Job `image` bỏ cách dựa vào Docker daemon của máy runner: nó tạo một **builder riêng cho mỗi job** rồi xoá đi, giống cách một runner dùng một lần hay `docker/setup-buildx-action` trên GitHub làm, để thấy pipeline chạy thế nào khi không có gì "tình cờ còn đó".
+
+<Terminal where="mac" title=".gitea/workflows/ci.yaml">
+
+```bash
+git switch -q -c ci/cache-artifact
+cat > .gitea/workflows/ci.yaml <<'EOF'
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  REGISTRY: d6-registry:5000
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /go/pkg/mod
+            /root/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -json ./... > test-report.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: test-report
+          path: test-report.json
+          retention-days: 7
+
+  image:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Builder dùng một lần
+        run: |
+          printf '[registry."%s"]\n  http = true\n' "$REGISTRY" > /tmp/buildkitd.toml
+          docker buildx create --name ci --driver docker-container \
+            --driver-opt network=d6-net --buildkitd-config /tmp/buildkitd.toml --use
+      - name: Build và push image
+        run: |
+          V=${GITHUB_SHA::12}
+          docker buildx build --progress=plain \
+            --build-arg VERSION=$V \
+            --label org.opencontainers.image.revision=$GITHUB_SHA \
+            --label org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY \
+            --metadata-file /tmp/meta.json \
+            -t $REGISTRY/price-api:$V --push .
+          jq -n --arg v "$V" --arg rev "$GITHUB_SHA" --slurpfile m /tmp/meta.json \
+            '{version: $v, revision: $rev, digest: $m[0]["containerimage.digest"]}' | tee image.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: image.json
+      - name: Xoá builder
+        if: always()
+        run: docker buildx rm ci
+EOF
+git commit -q -am "ci: cache của Go, báo cáo test, builder dùng một lần"
+ship "ci: cache của Go, báo cáo test, builder dùng một lần"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PR #2: ci: cache của Go, báo cáo test, builder dùng một lần
+run 6  test: success
+run 6  image: skipped
+merge: HTTP 200
+run 7  test: success
+run 7  image: success
+```
+
+</Expected>
+
+Những điểm mới trong file:
+
+- `key` của cache ghép hệ điều hành, kiến trúc CPU và hash của `go.sum`. Hai thư mục được lưu là module đã tải và build cache của Go.
+- `go test -json` ghi mỗi sự kiện test thành một dòng JSON. `if: always()` ở bước upload để báo cáo vẫn được lưu **khi test đỏ**, lúc cần nó nhất.
+- Builder `ci` dùng driver `docker-container`: BuildKit chạy trong một container riêng trên `d6-net`. Từ trong đó, registry có tên `d6-registry:5000`; từ máy bạn nó là `localhost:9501`. Một registry, hai tên. File `buildkitd.toml` cho phép HTTP với registry lab.
+- `--metadata-file` ghi digest của image vừa đẩy; job gói phiên bản, commit và digest vào `image.json`.
+- `docker buildx rm ci` với `if: always()` xoá builder cùng volume trạng thái của nó. Runner tự dọn container mà job bỏ lại (D6.1 bước 6) nhưng không dọn volume này, nên thiếu bước này cache của builder vẫn âm thầm sống sang job sau.
+
+Lượt chạy 6 (của PR) và 7 (của `main`) chạy cùng job `test`. So thời gian từng step:
+
+<Terminal where="mac">
+
+```bash
+PR_RUN=$(( $(last_run) - 1 ))
+steps test $PR_RUN | grep -E 'cache|Vet|Test'
+job_log test $PR_RUN | grep -E '^Cache (not found|saved)' | cut -c1-60
+echo "--- main"
+steps test | grep -E 'cache|Vet|Test'
+job_log test | grep -E '^Cache (hit for|restored successfully)' | cut -c1-60
+```
+
+</Terminal>
+
+<Predict question="Lượt chạy của PR lưu cache dưới khoá chứa hash của go.sum. Lượt chạy trên main ngay sau đó có trúng cache đó không? Trên GitHub thì sao?">
+
+```text
+1 giây  Run actions/cache@55cc8345863c7cc4c66a329a
+14 giây  Vet
+3 giây  Test
+Cache not found for input keys: go-Linux-ARM64-60a6c1a22581f
+Cache saved with key: go-Linux-ARM64-60a6c1a22581f5adb92127b
+--- main
+1 giây  Run actions/cache@55cc8345863c7cc4c66a329a
+1 giây  Vet
+0 giây  Test
+Cache hit for: go-Linux-ARM64-60a6c1a22581f5adb92127b75d68c6
+Cache restored successfully
+```
+
+Trúng. `go vet` từ 14 giây xuống 1 giây: lần đầu nó phải tải module và biên dịch thư viện chuẩn, lần sau lấy từ cache. Số giây trên máy bạn sẽ khác, tỉ lệ thì tương tự.
+
+Nhưng để ý **ai ghi cache này**: lượt chạy của pull request, tức code chưa review, và `main` đọc lại nó. Trên GitHub điều đó không xảy ra: cache của pull request bị giới hạn trong phạm vi PR, `main` phải tự tạo cache của mình. Cache server của Gitea Runner chỉ tách theo repo. Với repo mà mọi người push đều tin được thì không sao; với repo nhận PR từ người ngoài, đây là một lý do nữa để không cho PR từ fork chạy trên runner chung (D6.5).
+
+</Predict>
+
+<Check id="d7.2.lab-dep-cache">Thêm được cache dependency với khoá từ lockfile, và chứng minh được cache miss, cache hit bằng log và thời gian từng step.</Check>
+
+### 2. Lấy artifact của một lượt chạy
+
+<Terminal where="mac">
+
+```bash
+api_an "$R/actions/runs/$(last_run)/artifacts" \
+  | jq -r '.artifacts[] | "\(.id)  \(.name)  \(.size_in_bytes) byte  hết hạn \(.expires_at[0:10])"'
+aid() { api_an "$R/actions/runs/$(last_run)/artifacts" | jq --arg n "$1" '.artifacts[] | select(.name == $n) | .id'; }
+api_an -L "$R/actions/artifacts/$(aid test-report)/zip" -o ../test-report.zip
+unzip -p ../test-report.zip test-report.json \
+  | jq -r 'select(.Test and (.Action == "pass" or .Action == "fail")) | "\(.Action)  \(.Test)"'
+api_an -L "$R/actions/artifacts/$(aid image)/zip" -o ../image.zip
+unzip -p ../image.zip image.json | jq -c .
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2  test-report  470 byte  hết hạn 2026-10-18
+3  image  261 byte  hết hạn 2027-01-09
+pass  TestFormat
+pass  TestRound
+{"version":"6fd3764744aa","revision":"6fd3764744aa4f80cf671ee69b440414b709cb77","digest":"sha256:b0eec9d8ee30459dff96151ef9d31a14c1e21748e1a16768aedb9c8df4a48c83"}
+```
+
+</Expected>
+
+Mã artifact, kích thước, ngày, SHA và digest trên máy bạn sẽ khác. `test-report` hết hạn sau 7 ngày theo `retention-days`; `image` không đặt nên theo mặc định 90 ngày của Gitea. Artifact tải về là một file zip. `image.json` là "giấy khai sinh" của bản build: phiên bản, commit, digest. D6.3 dùng đúng digest này để triển khai, D7.1 dùng nó để tính chỉ số.
+
+Kiểm rằng image trong registry tự nói được nguồn gốc của nó, và khớp với giấy khai sinh:
+
+<Terminal where="mac">
+
+```bash
+V=$(git rev-parse --short=12 HEAD)
+docker pull -q localhost:9501/price-api:$V
+docker image inspect localhost:9501/price-api:$V --format '{{json .Config.Labels}}' | jq -c 'with_entries(select(.key | startswith("org.opencontainers")))'
+docker image inspect localhost:9501/price-api:$V --format '{{index .RepoDigests 0}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+localhost:9501/price-api:6fd3764744aa
+{"org.opencontainers.image.revision":"6fd3764744aa4f80cf671ee69b440414b709cb77","org.opencontainers.image.source":"http://d6-gitea:3000/an/price-api"}
+localhost:9501/price-api@sha256:b0eec9d8ee30459dff96151ef9d31a14c1e21748e1a16768aedb9c8df4a48c83
+```
+
+</Expected>
+
+Ba nguồn độc lập (artifact của lượt chạy, nhãn trong image, digest do registry tính) chỉ về cùng một commit và cùng một nội dung.
+
+<Check id="d7.2.lab-artifact">Lưu được báo cáo test và thông tin bản build thành artifact, tải lại bằng API, và đối chiếu được commit, nhãn OCI và digest của một image.</Check>
+
+### 3. Builder lạnh, và cache qua registry cứu được gì
+
+Job `image` của lượt chạy vừa rồi là một lần build hoàn toàn lạnh:
+
+<Terminal where="mac">
+
+```bash
+steps image | grep -E 'Builder|Build'
+job_log image | grep -c -E '^#[0-9]+ CACHED'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0 giây  Builder dùng một lần
+29 giây  Build và push image
+0
+```
+
+</Expected>
+
+29 giây, không layer nào `CACHED`, so với vài giây ở D6.1 khi dùng Docker daemon của máy. Giờ thêm cache qua registry, và thêm luôn workflow phát hành cho bước 5:
+
+<Terminal where="mac" title="Hai dòng cache và .gitea/workflows/release.yaml">
+
+```bash
+git switch -q -c ci/registry-cache
+perl -0pi -e 's|(docker buildx build --progress=plain \\\n)|$1            --cache-from type=registry,ref=\$REGISTRY/price-api:buildcache \\\n            --cache-to type=registry,ref=\$REGISTRY/price-api:buildcache,mode=max \\\n|' .gitea/workflows/ci.yaml
+git diff --stat
+cat > .gitea/workflows/release.yaml <<'EOF'
+name: release
+on:
+  push:
+    tags: ['v*']
+
+env:
+  MANIFESTS: http://d6-registry:5000/v2/price-api/manifests
+  INDEX: application/vnd.oci.image.index.v1+json
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gắn phiên bản cho image đã build
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "LỖI: $GITHUB_REF_NAME không phải dạng vMAJOR.MINOR.PATCH"; exit 1; }
+          digest() { curl -sI -H "Accept: $INDEX" "$MANIFESTS/$1" | tr -d '\r' \
+            | awk 'tolower($1) == "docker-content-digest:" {print $2}'; }
+          SRC=$(digest ${GITHUB_SHA::12})
+          [ -n "$SRC" ] || { echo "LỖI: chưa có image cho commit ${GITHUB_SHA::12}"; exit 1; }
+          OLD=$(digest $VERSION)
+          if [ -n "$OLD" ] && [ "$OLD" != "$SRC" ]; then
+            echo "LỖI: tag $VERSION đã trỏ tới $OLD, không ghi đè"; exit 1
+          fi
+          curl -sf -H "Accept: $INDEX" "$MANIFESTS/$SRC" -o /tmp/index.json
+          curl -sf -X PUT -H "Content-Type: $INDEX" --data-binary @/tmp/index.json "$MANIFESTS/$VERSION"
+          echo "price-api:$VERSION -> $SRC (commit ${GITHUB_SHA::12})"
+EOF
+git add -A && git commit -q -m "ci: cache layer qua registry, phát hành theo tag"
+ship "ci: cache layer qua registry, phát hành theo tag"
+steps image | grep Build
+job_log image | grep -E '^#[0-9]+ (importing cache|ERROR|exporting cache to)' | cut -c1-110
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ .gitea/workflows/ci.yaml | 2 ++
+ 1 file changed, 2 insertions(+)
+PR #3: ci: cache layer qua registry, phát hành theo tag
+run 8  test: success
+run 8  image: skipped
+merge: HTTP 200
+run 9  test: success
+run 9  image: success
+22 giây  Build và push image
+#8 importing cache manifest from d6-registry:5000/price-api:buildcache
+#8 ERROR: failed to configure registry cache importer: d6-registry:5000/price-api:buildcache: not found
+#19 exporting cache to registry
+```
+
+</Expected>
+
+Vẫn lạnh: lần đầu chưa có gì để nhập (dòng `ERROR … not found` chỉ là cảnh báo, build không dừng), nhưng cuối job cache đã được xuất lên tag `buildcache`. Thử hai tình huống. Trước hết chạy lại **đúng lượt chạy đó**, cùng commit, qua API:
+
+<Terminal where="mac">
+
+```bash
+RUN=$(last_run)
+api_an -X POST -o /dev/null -w 'rerun: HTTP %{http_code}\n' "$R/actions/runs/$RUN/rerun"
+until [ "$(api_an "$R/actions/runs/$RUN" | jq -r .status)" = completed ]; do sleep 2; done
+steps image | grep Build
+job_log image | grep -c -E '^#[0-9]+ CACHED'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+rerun: HTTP 201
+10 giây  Build và push image
+6
+```
+
+</Expected>
+
+Mọi bước của Dockerfile đều `CACHED`: builder mới tinh lấy lại toàn bộ kết quả từ registry. Giờ tình huống thường gặp hơn, một commit mới có sửa code:
+
+<Terminal where="mac">
+
+```bash
+git switch -q -c feature/round-price
+perl -pi -e 's/Format\(1250000\)/Format(Round(1250499))/' main.go
+git commit -q -am "Làm tròn giá trả về"
+ship "Làm tròn giá trả về"
+steps image | grep Build
+job_log image | grep -E '^#[0-9]+ (CACHED|sha256:|\[build [2-6]/6\])' | cut -c1-60 \
+  | awk '/ CACHED$/ {s[$1]="CACHED"; next} / sha256:/ {if (!s[$1]) s[$1]="kéo layer từ cache"; next} {n[$1]=$0}
+         END {for (k in n) print n[k], "=>", (s[k] ? s[k] : "chạy lệnh")}' | sort -k3
+job_log image | grep -c 'go: downloading'
+```
+
+</Terminal>
+
+<Predict question="Chỉ main.go đổi; go.mod và go.sum giữ nguyên. Bước go mod download có được CACHED không? Bước go build có phải tải lại module không?">
+
+```text
+PR #4: Làm tròn giá trả về
+run 10  test: success
+run 10  image: skipped
+merge: HTTP 200
+run 11  test: success
+run 11  image: success
+23 giây  Build và push image
+#12 [build 2/6] WORKDIR /src => CACHED
+#13 [build 3/6] COPY go.mod go.sum ./ => CACHED
+#14 [build 4/6] RUN --mount=type=cache,target=/go/pkg/mod go => kéo layer từ cache
+#15 [build 5/6] COPY *.go ./ => chạy lệnh
+#16 [build 6/6] RUN --mount=type=cache,target=/go/pkg/mod    => chạy lệnh
+1
+```
+
+Bước `go mod download` khớp cache: BuildKit không chạy lại lệnh mà kéo layer của nó từ registry về (log ghi tiến trình tải `sha256:…` thay vì chữ `CACHED`, nên lệnh lọc in "kéo layer từ cache"). Nhưng bước `go build` vẫn in `go: downloading golang.org/x/text`: module không nằm trong layer đó, chúng nằm trong **cache mount** `/go/pkg/mod`, và cache mount của một builder mới thì rỗng. Layer "đã tải dependency" được lấy lại nguyên vẹn mà không mang theo dependency nào.
+
+</Predict>
+
+Ba con số của cùng một Dockerfile trên builder dùng một lần (máy bạn sẽ ra số khác, thứ tự thì giữ):
+
+| Tình huống | Build và push | Vì sao |
+|---|---|---|
+| Không có cache | 22–29 giây (hai lượt chạy lạnh ở trên) | Kéo base image, tải module, biên dịch tất cả; dao động theo mạng |
+| Có cache registry, commit mới | 23 giây | Ba layer đầu lấy từ registry; bước build vẫn chạy lại với cache mount rỗng, và vẫn phải kéo base image để chạy nó. Gần như không hơn lần lạnh |
+| Có cache registry, chạy lại đúng commit | 10 giây | Mọi layer khớp; chỉ còn khởi động builder, đối chiếu và đẩy manifest |
+
+Ngay cả khi không sửa dòng code nào, một commit mới vẫn rơi vào dòng giữa: `--build-arg VERSION` mang commit SHA, mà `ARG` được dùng trong lệnh `RUN go build`, nên đầu vào của lệnh đó đổi ở mọi commit. Cache qua registry có giá trị lớn khi các layer đắt tiền **chứa** kết quả của chúng (`RUN apt-get install`, `RUN npm ci`, `RUN pip install` không dùng cache mount). Với Dockerfile dựa vào cache mount như của `price-api`, thứ thật sự làm build nhanh là một builder sống lâu. Phần Đào sâu bàn cách chọn.
+
+<Check id="d7.2.lab-registry-cache">Đo được thời gian build trên builder dùng một lần trong ba tình huống, và giải thích được vì sao layer `go mod download` khớp cache mà bước build vẫn tải lại module.</Check>
+
+### 4. Phát hành 1.0.0: gắn tên, không build lại
+
+Commit đầu nhánh `main` đã qua test và có image. Phát hành nó thành `1.0.0` bằng một tag Git; workflow `release` thêm tên `1.0.0` cho đúng image đó trong registry.
+
+<Callout kind="danger">
+
+`docker rm` xoá vĩnh viễn container cùng log và lớp ghi của nó. Trong bài này, `docker rm -f` chỉ dùng cho container thử `d6-try` do chính khối lệnh tạo ra.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+REL=$(git rev-parse --short=12 HEAD)
+git tag v1.0.0 && an_git push -q origin v1.0.0 2>&1 | grep -v '^remote:'
+wait_run
+job_log release | grep '^price-api:'
+digest() { curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' localhost:9501/v2/price-api/manifests/$1 \
+  | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" {print $2}'; }
+echo "$REL  $(digest $REL)"; echo "1.0.0         $(digest 1.0.0)"
+docker run -q --pull always -d --name d6-try -p 9502:8080 localhost:9501/price-api:1.0.0 >/dev/null
+sleep 2; curl -s localhost:9502/price; docker rm -f d6-try >/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+run 12  release: success
+price-api:1.0.0 -> sha256:8a1f3c2f144e840d54d3bceaa8c6d34f2f498492ef294f2b5499af6bcea592c6 (commit 3af9093a1372)
+3af9093a1372  sha256:8a1f3c2f144e840d54d3bceaa8c6d34f2f498492ef294f2b5499af6bcea592c6
+1.0.0         sha256:8a1f3c2f144e840d54d3bceaa8c6d34f2f498492ef294f2b5499af6bcea592c6
+{"host":"2937230ba85e","price":"1.250.000 đ","version":"3af9093a1372"}
+```
+
+</Expected>
+
+Job `release` không có `checkout`, không có `docker build`. Nó làm bốn việc bằng API của registry (D5.2 bước 4): kiểm tên tag đúng dạng semver; tìm digest của image mang SHA của commit được tag; kiểm tag phiên bản chưa bị dùng cho nội dung khác; rồi `PUT` lại đúng manifest đó dưới tên mới. Hai tên, một digest. Service trả `version` là commit, không phải `1.0.0`: binary được build trước khi ai đó quyết định nó là bản 1.0.0, đúng cái giá ghi ở bảng "build rồi gắn tên".
+
+<Predict question="Hôm sau, ai đó sửa một lỗi nhỏ, merge vào main, rồi dời tag v1.0.0 sang commit mới và push đè 'cho tiện'. Tag 1.0.0 trong registry có đổi không?">
+
+Không. Git nhận tag bị dời (nó chỉ là con trỏ, D4.1), workflow `release` chạy lại, thấy `1.0.0` đang trỏ tới một digest khác với image của commit mới, và dừng với exit 1. Chạy thử ở khối dưới.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+git switch -q -c docs/readme
+printf '# price-api\n\nService mẫu của chặng D6. Phát hành bằng tag vMAJOR.MINOR.PATCH.\n' > README.md
+git add README.md && git commit -q -m "Thêm README" && ship "Thêm README"
+git tag -f v1.0.0 >/dev/null && an_git push -q -f origin v1.0.0 2>&1 | grep -v '^remote:'
+wait_run
+job_log release | grep '^LỖI' | cut -c1-70
+echo "1.0.0         $(digest 1.0.0)"
+git tag -f v1.0.0 $REL >/dev/null && an_git push -q -f origin v1.0.0 2>&1 | grep -v '^remote:'
+wait_run
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PR #5: Thêm README
+run 13  test: success
+run 13  image: skipped
+merge: HTTP 200
+run 14  test: success
+run 14  image: success
+run 15  release: failure
+LỖI: tag 1.0.0 đã trỏ tới sha256:8a1f3c2f144e840d54d3bceaa8c6d
+1.0.0         sha256:8a1f3c2f144e840d54d3bceaa8c6d34f2f498492ef294f2b5499af6bcea592c6
+run 16  release: success
+```
+
+</Expected>
+
+Pipeline đỏ, `1.0.0` trong registry giữ nguyên digest. Hai lệnh cuối đưa tag Git về lại commit cũ; lượt chạy 16 xanh vì gắn lại cùng một digest là việc **lặp lại được** (idempotent), không phải ghi đè. Lần dời tag vừa rồi lọt qua phía Git vì chưa có gì chặn; trên máy chủ thật, bật **protected tags** cho mẫu `v*` (Gitea, GitHub và GitLab đều có) để chỉ người hoặc pipeline phát hành mới tạo được tag, và không ai dời được. Bản sửa lỗi phải là `1.0.1`.
+
+<Check id="d7.2.lab-release">Phát hành được một phiên bản bằng cách gắn thêm tên cho image đã có, chứng minh được hai tên cùng digest, và tái hiện được việc pipeline từ chối ghi đè một phiên bản đã phát hành.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`ship` in `merge: HTTP 405`:** CI của PR đỏ hoặc chưa có approval. Xem `job_log test $(last_run) | tail -20`; sửa trên nhánh, `an_git push`, rồi tự approve và merge bằng hai lệnh `api_binh … /reviews`, `api_an … /merge` như D6.1 bước 5.
+- **Lượt build "lạnh" ở bước 3 nhanh bất thường, đếm `CACHED` khác 0 dù chưa bật cache registry:** một job build trước đó bị dừng mà không kịp chạy bước `Xoá builder` (máy khởi động lại, runner bị tắt giữa chừng), để lại container `buildx_buildkit_ci0` cùng volume `buildx_buildkit_ci0_state`. Job kế tiếp không báo lỗi gì: `docker buildx create --name ci` lặng lẽ dùng lại container đó, cache còn nóng, rồi bước `Xoá builder` của chính nó mới dọn đi. Kiểm bằng `docker ps -a --filter name=buildx`; nếu còn, dọn bằng khối "Dọn builder còn sót" ngay dưới rồi chạy lại lượt chạy.
+- **`http: server gave HTTP response to HTTPS client` khi push:** builder không đọc được `buildkitd.toml`, hoặc tên registry trong file khác tên trong `-t`. Cả hai phải là `d6-registry:5000`.
+- **Kéo base image lỗi `toomanyrequests`:** Docker Hub giới hạn số lần kéo ẩn danh, và builder dùng một lần kéo lại ở mỗi job. Chờ rồi chạy lại lượt chạy bằng API `rerun`; ở công ty, đặt một registry mirror cho runner.
+- **`actions/cache` báo `Failed to restore … ETIMEDOUT`:** job không gọi được cache server của runner. Runner và job phải cùng trên `d6-net` (`container.network` ở D6.1 bước 3).
+- **Job `release` báo `chưa có image cho commit …`:** tag được đặt lên commit mà pipeline của `main` chưa build xong, hoặc commit không nằm trên `main`. Chờ lượt chạy của commit đó xanh rồi đẩy tag lại.
+
+</Callout>
+
+<Callout kind="danger">
+
+Hai lệnh dưới xoá container và volume của builder `ci`. Chúng chỉ chứa cache build, xoá đi thì lượt build sau chạy lạnh. Chỉ cần chạy khi gặp tình huống builder còn sót ở mục trên; khi không có gì để xoá, lệnh thứ hai báo `no such volume`, vô hại.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn builder còn sót">
+
+```bash
+docker rm -f buildx_buildkit_ci0; docker volume rm buildx_buildkit_ci0_state
+```
+
+</Terminal>
+
+### Dọn dẹp
+
+Stack dùng tiếp ở D6.3. Hai file zip tải về ở bước 2 thì xoá được ngay.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá hai file `test-report.zip` và `image.zip` trong `~/masteva-d7`. Muốn xoá hẳn lab, dùng khối "Xoá hẳn lab" ở cuối D6.1.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn file tạm">
+
+```bash
+rm -f ~/masteva-d7/test-report.zip ~/masteva-d7/image.zip
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Runner sống lâu có cache nóng nhưng kém an toàn; runner dùng một lần thì ngược lại. Chọn thế nào?">
+
+Tách theo mức tin cậy của code được build, không chọn một kiểu cho tất cả. Build của nhánh chính và của release, code đã review: dùng builder sống lâu và riêng cho nhóm job đó (một daemon BuildKit chạy thường trực mà chỉ runner "tin cậy" gọi được), cache mount và layer cache đều nóng. Build của pull request, nhất là từ fork: runner và builder dùng một lần, chỉ `--cache-from` (đọc) chứ không `--cache-to` (ghi), để code chưa review không ghi được vào cache mà bản phát hành đọc. Nếu buộc phải dùng builder dùng một lần cho mọi thứ, viết Dockerfile để dependency nằm **trong layer** (bỏ cache mount ở bước tải dependency) và đừng để `ARG` đổi theo commit đứng trước các bước đắt.
+
+</Reveal>
+
+<Reveal title="Vì sao không đưa commit SHA vào khoá của cache dependency cho chắc là 'mới'?">
+
+Vì khi đó mỗi commit có một khoá riêng và không bao giờ trúng khoá chính; bạn chỉ còn trông vào `restore-keys`, và mỗi lượt chạy lại lưu thêm một bản cache vài chục MB. Khoá nên đổi đúng khi **nội dung cache nên đổi**. Module tải về chỉ phụ thuộc lockfile, nên hash của lockfile là khoá đúng. Build cache của compiler thì phụ thuộc cả mã nguồn; cách thường dùng là khoá theo lockfile và chấp nhận build cache hơi cũ (compiler tự biết phần nào còn dùng được), hoặc khoá `…-<hash lockfile>-<tuần>` để định kỳ làm mới. Và luôn nhớ phép thử: xoá sạch cache thì pipeline vẫn phải xanh.
+
+</Reveal>
+
+<Reveal title="Build lại từ cùng một commit có ra cùng digest không?">
+
+Thường là không. Thời điểm build đi vào metadata của image; base image `golang:1.27.2-alpine` có thể đã được build lại; `apk add` hay `apt-get install` lấy bản mới nhất lúc chạy. Với Go, binary thì tái lập được khá dễ (`-trimpath`, cùng phiên bản compiler, cùng module), nhưng image bọc ngoài cần thêm việc: ghim base theo digest, đặt `SOURCE_DATE_EPOCH`, không tải gì không ghim. Build tái lập được (reproducible build) có giá trị thật cho kiểm toán: người thứ ba build lại và so digest. Nhưng nó không thay cho build một lần. Quy trình đáng tin là: build một lần, ghi digest, mọi môi trường dùng digest đó; D14 thêm chữ ký và provenance để chứng minh digest ấy đến từ đúng pipeline.
+
+</Reveal>
+
+<Reveal title="Tag 1.0.0 bất biến, vậy 1.0, 1 và latest thì sao?">
+
+Đó là **tag trôi** có chủ đích: `1.0` nghĩa là "bản vá mới nhất của 1.0", ai dùng nó là chấp nhận nội dung đổi. Chúng tiện cho người thử nhanh và cho `FROM` trong Dockerfile khi có công cụ theo dõi, nhưng không dùng để triển khai. Quy ước an toàn: tag đầy đủ `MAJOR.MINOR.PATCH` và tag commit là bất biến (registry hoặc pipeline ép); tag trôi do đúng một job phát hành cập nhật; nơi triển khai tham chiếu digest. Lưu ý kỹ thuật: tên tag của image không chứa được dấu `+`, nên phần build metadata của semver (`1.0.0+8ef33b6`) phải đưa vào nhãn hoặc đổi thành `-`.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết bước cache cho một ngôn ngữ bạn chưa quen (đường dẫn thư mục cache của Maven, npm, pip, Cargo) hay viết script gắn tag qua API registry là cách dùng tốt. AI hay sai ở chỗ: đặt khoá cache cố định hoặc chứa commit SHA; cache nhầm thư mục (cache `node_modules` thay vì thư mục cache của npm); thêm `--cache-to type=inline` rồi khẳng định build sẽ nhanh mà không xét cache mount; đề xuất build lại từ tag khi phát hành; và dùng `docker tag` cùng `docker push` để "promote", việc này kéo image về rồi đẩy lại và với image đa kiến trúc có thể chỉ đẩy một kiến trúc. Kiểm lại bằng số đo như bước 1 và bước 3 (`steps`, đếm `CACHED`), và so digest trước, sau như bước 4.
+
+</Callout>
+
+<Callout kind="link">
+
+D5.2 đã dạy tag, digest và cache của BuildKit trên máy; bài này đưa chúng vào pipeline. D6.3 lấy digest trong `image.json` để triển khai cùng một image qua dev, staging, prod. D6.5 bàn mặt bảo mật của cache và artifact. D14 ký image, tạo SBOM và provenance cho đúng digest này. D7.1 dùng lịch sử lượt chạy và thời điểm phát hành để tính chỉ số DORA.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d7.2.mastery-cache">Thêm được cache cho pipeline của một dự án thật, đo được trước và sau, và nói rõ được loại cache nào còn tác dụng khi runner không giữ trạng thái.</Check>
+
+<Check id="d7.2.mastery-trace">Từ một image hoặc container đang chạy, lần được về commit, lượt chạy pipeline và báo cáo test đã tạo ra nó.</Check>
+
+<Check id="d7.2.mastery-release">Thiết kế được quy trình phát hành cho một service: tên nào bất biến, phát hành có build lại không, ai được tạo tag, và pipeline chặn ghi đè ở đâu.</Check>
+
+</Mastery>

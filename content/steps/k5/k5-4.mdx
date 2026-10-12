@@ -1,0 +1,911 @@
+---
+title: KEDA, cluster autoscaler và Karpenter
+description: Scale worker theo độ dài hàng đợi và theo lịch bằng KEDA, kể cả về 0 pod; hiểu cluster autoscaler biến pod Pending thành node mới như thế nào bằng một node group giả lập với KWOK; và biết Karpenter làm khác ở đâu.
+id: k5.4
+step: k5
+prerequisites: [k5.3]
+topics: [k5.keda, k5.hpa-vpa-autoscaler, k5.karpenter]
+status: verified
+verified:
+  date: 2026-10-12
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    keda: 2.21.0
+    valkey: 9.1.2
+    cluster-autoscaler: 1.36.1 (chart 9.59.0)
+    kwok: 0.8.0
+    yq: 4.54.1
+---
+
+<Goal>
+
+K5.3 dừng ở HPA theo CPU. Bài này đi tiếp hai hướng mà CPU không lo được. Hướng thứ nhất: scale theo thứ **bên ngoài pod**, như độ dài hàng đợi hay giờ trong ngày, kể cả về 0 pod, bằng KEDA. Hướng thứ hai: khi pod mới không còn node để chạy, ai thêm node. Học xong, bạn giải thích được:
+
+- Vì sao worker đọc hàng đợi không nên scale theo CPU, và KEDA chia việc với HPA thế nào.
+- Vì sao worker vừa về 0 rồi được gọi dậy lại nhảy ngay lên số pod đỉnh cũ.
+- Cluster autoscaler quyết định thêm node dựa vào đâu, và vì sao có pod `Pending` mãi mà nó không thêm.
+- Vì sao node thừa không bị gỡ ngay, và những thứ gì giữ một node lại.
+- Karpenter khác cluster autoscaler ở điểm nào, và khi nào đáng dùng.
+
+</Goal>
+
+<Knowledge>
+
+### Scale theo sự kiện với KEDA
+
+Một worker lấy việc từ hàng đợi. Hàng đợi dồn 10.000 việc, nhưng mỗi worker vẫn chỉ xử lý từng việc một nên CPU của nó không đổi: HPA theo CPU không thấy gì. Lúc hàng đợi rỗng, worker ngồi chờ và vẫn chiếm tài nguyên. Metric đúng ở đây là **độ dài hàng đợi**, và nó nằm ngoài cụm.
+
+K5.3 đã nói HPA đọc được metric ngoài qua API `external.metrics.k8s.io`, miễn có ai phục vụ API đó. **KEDA** (Kubernetes Event-driven Autoscaling, dự án đã graduated của CNCF) là thành phần làm việc này, kèm hàng chục **scaler** biết cách hỏi từng loại nguồn: Kafka, RabbitMQ, Redis, SQS, Prometheus, PostgreSQL, cron…
+
+```text
+  ScaledObject (bạn viết)                     nguồn sự kiện: hàng đợi, Kafka, Prometheus, cron...
+        |                                                 ^
+        v                                                 |  hỏi mỗi pollingInterval
+  KEDA operator ------------------- scaler --------------+
+    |
+    |  (a) 0 <-> 1: operator tự ghi replicas của Deployment
+    |        nguồn có việc ("active")            -> 1
+    |        mọi nguồn im lặng đủ cooldownPeriod -> 0
+    |
+    |  (b) tạo và quản một HPA tên keda-hpa-<tên>
+    v
+  HPA: 1 <-> N --- hỏi external.metrics.k8s.io ---> KEDA metrics server ---> scaler
+```
+
+KEDA không thay HPA. Nó **viết HPA hộ bạn** và cấp metric cho HPA đó; phần 1 tới N vẫn là công thức và `behavior` của K5.3. KEDA tự làm đúng một việc mà HPA truyền thống không làm: bật và tắt giữa 0 và 1.
+
+Các trường chính của `ScaledObject`:
+
+| Trường | Ý nghĩa | Mặc định |
+|---|---|---|
+| `scaleTargetRef` | Workload cần scale, cùng namespace | Kiểu `Deployment` |
+| `minReplicaCount`, `maxReplicaCount` | Sàn và trần. Sàn 0 là cho phép tắt hẳn | 0 và 100 |
+| `pollingInterval` | Bao lâu hỏi nguồn một lần | 30 giây |
+| `cooldownPeriod` | Nguồn im lặng bao lâu thì về 0. Chỉ áp cho bước về 0 | 300 giây |
+| `triggers` | Danh sách nguồn. Nhiều nguồn thì nguồn đòi nhiều pod nhất thắng | Bắt buộc |
+| `advanced.horizontalPodAutoscalerConfig.behavior` | Khối `behavior` chép sang HPA mà KEDA tạo | Không có |
+
+Mỗi trigger khai một **mục tiêu trên mỗi pod**. `listLength: "10"` cho trigger hàng đợi nghĩa là "mỗi pod gánh 10 việc đang chờ": hàng đợi 300 việc thì cần 30 pod, bị kẹp ở `maxReplicaCount`.
+
+Từ Kubernetes 1.37, chính HPA cũng về 0 được: tính năng scale-to-zero lên beta và bật mặc định, cho HPA dùng metric `Object` hoặc `External` đặt `minReplicas: 0`. Điều đó không làm KEDA thừa: HPA vẫn cần ai đó phục vụ metric ngoài, và phần đó chính là các scaler của KEDA.
+
+Hai cái giá của việc về 0:
+
+- **Khởi động nguội.** Việc đầu tiên sau lúc nghỉ phải chờ KEDA hỏi nguồn (tới `pollingInterval`), pod được xếp, image được kéo, ứng dụng khởi động. Hợp với việc nền; không hợp với thứ người dùng đang chờ.
+- **Pod bị tắt giữa chừng.** Bớt pod là xoá pod, kể cả pod đang xử lý dở một việc. Worker phải tắt êm (K1.3) và việc phải làm lại được (K1.4). Với việc chạy lâu, KEDA có `ScaledJob`: mỗi việc một Job, chạy tới khi xong, không ai cắt ngang.
+
+<Check id="k5.4.keda-model">Giải thích được vì sao worker đọc hàng đợi cần metric ngoài pod, KEDA và HPA chia việc ở đâu, và ý nghĩa của `pollingInterval`, `cooldownPeriod`, mục tiêu của một trigger.</Check>
+
+### Cluster autoscaler: từ pod Pending tới node mới
+
+HPA hay KEDA thêm pod. Pod cần node. Trên cloud, **cluster autoscaler** (CA) nối hai việc đó, và tín hiệu duy nhất nó nhìn là pod không xếp được:
+
+```text
+  HPA / KEDA tăng replicas
+        |
+        v
+  Scheduler: không node nào qua vòng lọc -> pod Pending, PodScheduled=False (Unschedulable)
+        |
+        v
+  Cluster autoscaler (quét mỗi 10 giây):
+     với mỗi NODE GROUP, lấy một node mẫu và chạy lại vòng lọc của scheduler:
+     "nếu group này có thêm một node, pod Pending kia có vừa không?"
+        vừa ở một group   -> tăng kích thước group qua API của cloud; event TriggeredScaleUp
+        không group nào   -> event NotTriggerScaleUp; pod Pending cho tới khi có người can thiệp
+        |
+        v
+  Cloud tạo máy ảo -> máy khởi động, kubelet đăng ký node -> scheduler xếp pod
+  (thường 1 tới vài phút, cộng vào chuỗi độ trễ của K5.3)
+
+  Chiều giảm: một node có tổng request dưới 50% allocatable, mọi pod của nó chuyển được
+  sang node khác, và tình trạng đó kéo dài 10 phút -> CA drain node rồi xoá máy
+```
+
+Mấy điều suy ra từ sơ đồ:
+
+- **CA không nhìn CPU thật.** Node đang chạy 95% CPU mà mọi pod đều xếp được thì CA không thêm gì. Ngược lại, pod xin request thừa làm CA thêm node dù máy đang rảnh. Request sai thì cả scheduler, HPA lẫn CA cùng sai.
+- **CA làm việc theo node group**: một nhóm máy giống hệt nhau do cloud quản (Auto Scaling Group trên AWS). Nó chỉ tăng giảm số máy trong các group đã khai, mỗi group có sàn và trần.
+- **CA chạy lại vòng lọc của K5.1** trên node mẫu. Pod `Pending` vì `nodeSelector`, taint hay topology spread mà không group nào thoả thì CA bất lực, và nói vậy trong event.
+- **Chiều giảm đi qua drain**, nên mọi thứ làm drain khó ở K5.2 cũng giữ node lại: PDB hết ngân sách, pod không thuộc controller nào, pod dùng ổ đĩa cục bộ, pod không có node khác để chuyển tới.
+
+<Callout kind="production">
+
+Một lần deploy ở loveholidays treo cả tiếng: một nửa pod mới chạy, nửa còn lại `Pending`. Theo [bài tường thuật họ đăng tháng 2/2020](https://deploy.live/blog/when-gke-ran-out-of-ip-addresses/), event của pod ghi `0/256 nodes are available`, và cluster autoscaler không thêm được node nào. Event của autoscaler nói lý do: tạo máy thất bại vì dải IP của subnet đã cạn. Cụm dùng một dải /16 cho pod, tức 65.536 địa chỉ, nhưng GKE cấp sẵn cho mỗi node một khối 256 địa chỉ (gấp đôi giới hạn 110 pod mỗi node), nên trần thật là 65.536 / 256 = **256 node**, đúng con số trong event. Họ gỡ bằng cách hạ số pod tối đa mỗi node ở những node pool không cần nhiều pod.
+
+Điều rút ra (của bài này): "autoscaling" có trần mà cấu hình autoscaler không nhìn thấy: dải IP, quota máy của tài khoản cloud, hàng tồn của loại máy trong zone. Pod `Pending` kèm event `NotTriggerScaleUp` hoặc `ScaleUpFailed` là lúc đi tìm cái trần đó. D18 quay lại bài toán này ở phần kế hoạch dung lượng.
+
+</Callout>
+
+<Check id="k5.4.cluster-autoscaler">Kể được chuỗi từ pod `Pending` tới node mới, giải thích được vì sao CA nhìn request chứ không nhìn mức dùng, và nêu được những thứ ngăn CA thêm node hoặc gỡ node.</Check>
+
+### Karpenter (tuỳ chọn)
+
+**Karpenter** là autoscaler node thứ hai được SIG Autoscaling bảo trợ, bên cạnh cluster autoscaler. Nó cần quyền tạo máy trực tiếp trên hạ tầng, nên chỉ chạy được ở nơi có provider. AWS (nơi nó ra đời) và Azure là hai provider trưởng thành nhất; cộng đồng đã viết thêm provider cho GCP, Alibaba Cloud, Oracle Cloud, Hetzner, Proxmox, Cluster API, Bizfly Cloud và vài nơi khác, ở mức chín khác nhau (danh sách nằm trong README của `kubernetes-sigs/karpenter`). Bài không lab Karpenter trên kind; phần này để bạn đọc được cấu hình của nó khi gặp trên EKS.
+
+Khác biệt gốc: CA chọn trong các **node group có sẵn**; Karpenter **không có node group**. Nó đọc yêu cầu của các pod đang `Pending`, rồi tự chọn loại máy vừa nhất trong số loại bạn cho phép và tạo thẳng máy đó.
+
+| | Cluster autoscaler | Karpenter |
+|---|---|---|
+| Đơn vị cấu hình | Node group: một loại máy, sàn và trần | `NodePool`: tập ràng buộc (kiến trúc, họ máy, zone, spot hay on-demand) |
+| Chọn máy | Group nào có node mẫu vừa pod thì tăng group đó | Tính từ pod đang chờ ra loại máy và kích cỡ; nhiều pod nhỏ có thể thành một máy lớn |
+| Giảm | Gỡ node dùng dưới ngưỡng, sau 10 phút | Consolidation: chủ động gom pod và đổi sang máy rẻ hơn hoặc ít máy hơn |
+| Vòng đời node | Do node group của cloud | `expireAfter` (mặc định 720 giờ) thay node cũ; drift thay node lệch cấu hình |
+| Nơi chạy | Khoảng 30 provider, phần lớn do chính nhà cung cấp cloud bảo trì | AWS và Azure trưởng thành nhất; provider cộng đồng cho hơn chục nơi khác, mức chín không đều |
+
+Một `NodePool` tối thiểu trên AWS trông như sau (chỉ để đọc, không chạy trong lab):
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      nodeClassRef:                      # cấu hình riêng của AWS: AMI, subnet, security group
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+      requirements:                      # cùng cú pháp với node affinity của K5.1
+        - { key: kubernetes.io/arch, operator: In, values: [arm64, amd64] }
+        - { key: karpenter.sh/capacity-type, operator: In, values: [spot, on-demand] }
+      expireAfter: 720h                  # node sống tối đa 30 ngày rồi được thay
+  limits:
+    cpu: "200"                           # trần tổng CPU mà NodePool này được tạo
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+    budgets:
+      - nodes: "10%"                     # mỗi lúc chỉ được thay tối đa 10% số node
+```
+
+Consolidation là điểm mạnh và cũng là điểm phải cẩn thận: Karpenter **chủ động** evict pod để gom node, thường xuyên hơn CA nhiều. Nó đi qua Eviction API nên tôn trọng PDB. Workload chạy trên Karpenter mà không có PDB, không tắt êm, hoặc có một bản sao, sẽ bị gián đoạn hằng ngày. Mọi thứ K5.2 dạy về PDB là điều kiện cần để dùng Karpenter.
+
+<Check id="k5.4.karpenter">So sánh được Karpenter với cluster autoscaler về cách chọn máy và cách giảm, đọc được một `NodePool`, và nêu được vì sao consolidation đòi workload phải có PDB.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [KEDA Concepts](https://keda.sh/docs/2.21/concepts/): kiến trúc operator, metrics server và scaler; trang ScaledObject specification trong mục Reference cùng site có từng trường và giá trị mặc định.
+- [Node Autoscaling | Kubernetes](https://kubernetes.io/docs/concepts/cluster-administration/node-autoscaling/): mô hình chung của việc thêm và gom node, và chỗ cluster autoscaler với Karpenter giống, khác nhau.
+- [Cluster Autoscaler FAQ](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md): "How does scale-up work?", "What types of pods can prevent CA from removing a node?" và bảng tham số.
+- [Karpenter Concepts](https://karpenter.sh/docs/concepts/): NodePool, NodeClass và các kiểu disruption.
+- [When GKE ran out of IP addresses (loveholidays)](https://deploy.live/blog/when-gke-ran-out-of-ip-addresses/): sự cố autoscaler chạm trần IP, nguồn của callout production.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k5-lab` của K5.1 (nếu đã xoá, làm lại bước 1 của bài đó) và `helm`. Bài này không cần metrics-server: KEDA lấy metric thẳng từ nguồn.
+
+**Profile máy.** KEDA thêm ba pod (khoảng 85 MiB), hàng đợi Valkey và tối đa 6 worker nhỏ; cluster autoscaler và KWOK thêm hai pod. Docker dùng khoảng 1,9 GiB RAM ở lúc cao nhất. Máy 8 GB chạy được với Docker 4 GB. Node giả của KWOK không tốn tài nguyên: không có máy nào được tạo.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k5/kubeconfig
+export HELM_REPOSITORY_CONFIG=~/masteva-k5/helm/repositories.yaml HELM_REPOSITORY_CACHE=~/masteva-k5/helm/cache
+mkdir -p ~/masteva-k5/k5-4 && cd ~/masteva-k5/k5-4
+```
+
+</Terminal>
+
+### 1. Cài KEDA
+
+<Terminal where="mac">
+
+```bash
+helm install keda keda --repo https://kedacore.github.io/charts --version 2.21.0 \
+  -n keda --create-namespace --wait --timeout 10m | grep -E '^(NAME|STATUS):'
+kubectl -n keda get pods -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
+kubectl api-resources --api-group=keda.sh | awk '{print $1, $NF}' | column -t
+kubectl get apiservice | grep external.metrics
+```
+
+</Terminal>
+
+Lần đầu mất hai ba phút để kéo image.
+
+<Expected>
+
+```text
+NAME: keda
+STATUS: deployed
+NAME                                               STATUS
+keda-admission-webhooks-6c974699d8-gvh8w           Running
+keda-operator-577d8b5b4b-lxmjm                     Running
+keda-operator-metrics-apiserver-6d56b644bb-l484t   Running
+NAME                           KIND
+clustertriggerauthentications  ClusterTriggerAuthentication
+scaledjobs                     ScaledJob
+scaledobjects                  ScaledObject
+triggerauthentications         TriggerAuthentication
+v1beta1.external.metrics.k8s.io   keda/keda-operator-metrics-apiserver   True        3m37s
+```
+
+</Expected>
+
+Ba pod khớp với sơ đồ: operator, metrics server, và một webhook kiểm lỗi cấu hình (ví dụ hai ScaledObject cùng trỏ một Deployment). Dòng cuối là mắt xích quan trọng nhất: KEDA đã đăng ký làm nơi phục vụ `external.metrics.k8s.io` cho cả cụm. Mỗi cụm chỉ có một nơi phục vụ API này, nên KEDA không chạy chung được với một adapter metric ngoài khác.
+
+### 2. Hàng đợi và worker
+
+Hàng đợi là một danh sách tên `jobs` trong Valkey (tương thích giao thức Redis). Worker lấy từng việc bằng `BRPOP` và "xử lý" mỗi việc một giây. Worker dùng luôn image Valkey vì trong đó có sẵn `valkey-cli`. Lệnh `yq` áp riêng Valkey trước và chờ nó chạy, rồi mới áp cả file: worker lên trước hàng đợi thì log của nó mở đầu bằng vài dòng `Connection refused`.
+
+<Terminal where="mac" title="~/masteva-k5/k5-4/queue.yaml">
+
+```bash
+cat > queue.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: valkey }
+spec:
+  selector:
+    matchLabels: { app: valkey }
+  template:
+    metadata:
+      labels: { app: valkey }
+    spec:
+      containers:
+        - name: valkey
+          image: valkey/valkey:9.1.2-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: valkey }
+spec:
+  selector: { app: valkey }
+  ports:
+    - { port: 6379 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: worker }
+spec:
+  selector:
+    matchLabels: { app: worker }
+  template:
+    metadata:
+      labels: { app: worker }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: worker
+          image: valkey/valkey:9.1.2-alpine
+          command: ["sh", "-c"]
+          args:
+            - |
+              trap 'exit 0' TERM
+              while true; do
+                job=$(valkey-cli -h valkey BRPOP jobs 2 | tail -1)
+                [ -n "$job" ] && sleep 1 && echo "xong $job"
+              done
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+            limits: { memory: 32Mi }
+EOF
+yq 'select(.metadata.name == "valkey")' queue.yaml | kubectl apply -f -
+kubectl rollout status deploy/valkey --timeout=180s | tail -1
+kubectl apply -f queue.yaml | grep worker
+kubectl rollout status deploy/worker --timeout=180s | tail -1
+kubectl exec deploy/valkey -- sh -c 'for i in 1 2 3; do valkey-cli LPUSH jobs "thu-$i" >/dev/null; done'
+sleep 6; kubectl logs deploy/worker
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/valkey created
+service/valkey created
+deployment "valkey" successfully rolled out
+deployment.apps/worker created
+deployment "worker" successfully rolled out
+xong thu-1
+xong thu-2
+xong thu-3
+```
+
+</Expected>
+
+Một worker, một việc mỗi giây. Giờ giao việc đếm worker cho KEDA:
+
+<Terminal where="mac" title="~/masteva-k5/k5-4/scaledobject.yaml">
+
+```bash
+cat > scaledobject.yaml <<'EOF'
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+spec:
+  scaleTargetRef:
+    name: worker            # Deployment cùng namespace
+  minReplicaCount: 0        # hàng đợi rỗng thì không chạy pod nào
+  maxReplicaCount: 6
+  pollingInterval: 5        # hỏi hàng đợi mỗi 5 giây (mặc định 30)
+  cooldownPeriod: 30        # rỗng 30 giây thì về 0 (mặc định 300)
+  triggers:
+    - type: redis
+      metadata:
+        address: valkey.k5.svc:6379
+        listName: jobs
+        listLength: "10"    # mục tiêu: mỗi pod gánh 10 việc đang chờ
+EOF
+kubectl apply -f scaledobject.yaml
+kubectl wait --for=condition=Ready scaledobject/worker --timeout=60s
+until [ "$(kubectl get deploy worker -o jsonpath='{.spec.replicas}')" = "0" ]; do sleep 5; done
+kubectl get deploy worker
+kubectl get hpa
+kubectl get hpa keda-hpa-worker -o yaml | yq '.spec.metrics'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+scaledobject.keda.sh/worker created
+scaledobject.keda.sh/worker condition met
+NAME     READY   UP-TO-DATE   AVAILABLE   AGE
+worker   0/0     0            0           20s
+NAME              REFERENCE           TARGETS      MINPODS   MAXPODS   REPLICAS   AGE
+keda-hpa-worker   Deployment/worker   0/10 (avg)   1         6         1          0s
+- external:
+    metric:
+      name: s0-redis-jobs
+      selector:
+        matchLabels:
+          scaledobject.keda.sh/name: worker
+    target:
+      averageValue: "10"
+      type: AverageValue
+  type: External
+```
+
+</Expected>
+
+Hàng đợi rỗng nên worker về **0 pod**, gần như ngay: lúc ScaledObject vừa được tạo, KEDA đưa workload về `minReplicaCount` mà không chờ `cooldownPeriod` (khoảng chờ đó chỉ tính từ lần cuối nguồn còn việc). KEDA đã tạo HPA `keda-hpa-worker` với `MINPODS` là 1, không phải 0: HPA này chỉ lo khoảng 1 tới 6, đúng như sơ đồ. Metric của nó là kiểu `External` tên `s0-redis-jobs`, mục tiêu trung bình 10 mỗi pod, chính là `listLength`; cột `TARGETS` ghi `0/10` vì hàng đợi đang rỗng. Cột `REPLICAS` của HPA còn ghi 1 vì nó vừa được tạo; Deployment mới là nơi xem số pod thật.
+
+<Check id="k5.4.lab-keda-zero">Cài được KEDA, viết được một ScaledObject cho worker đọc hàng đợi, và chỉ ra được HPA mà KEDA tạo cùng metric `External` của nó.</Check>
+
+### 3. Từ 0 lên 6 rồi về 0
+
+Script `theo-doi-keda.sh` in một dòng mỗi khi số worker đổi, kèm giờ và độ dài hàng đợi lúc đó. Đẩy 300 việc vào rồi theo dõi.
+
+<Terminal where="mac" title="~/masteva-k5/theo-doi-keda.sh">
+
+```bash
+cat > ../theo-doi-keda.sh <<'EOF'
+#!/bin/sh
+# In một dòng mỗi khi số pod worker thay đổi (kèm giờ và độ dài hàng đợi "jobs"); chạy trong $1 giây
+T0=$(date +%s); PREV=""
+while [ $(( $(date +%s) - T0 )) -lt "${1:-180}" ]; do
+  NOW="replicas=$(kubectl get deploy worker -o jsonpath='{.spec.replicas}') ready=$(kubectl get deploy worker -o jsonpath='{.status.readyReplicas}')"
+  if [ "$NOW" != "$PREV" ]; then
+    LEN=$(kubectl exec deploy/valkey -- valkey-cli LLEN jobs 2>/dev/null)
+    echo "$(date +%H:%M:%S)  t=$(( $(date +%s) - T0 ))s  hang-doi=$LEN $NOW"
+  fi
+  PREV="$NOW"; sleep 1
+done
+EOF
+chmod +x ../theo-doi-keda.sh
+kubectl exec deploy/valkey -- sh -c 'for i in $(seq 300); do valkey-cli LPUSH jobs "viec-$i" >/dev/null; done; valkey-cli LLEN jobs'
+../theo-doi-keda.sh 130
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+299
+14:11:39  t=0s  hang-doi=299 replicas=0 ready=
+14:11:44  t=5s  hang-doi=298 replicas=1 ready=
+14:11:45  t=6s  hang-doi=297 replicas=1 ready=1
+14:11:54  t=15s  hang-doi=286 replicas=4 ready=1
+14:11:55  t=16s  hang-doi=283 replicas=4 ready=3
+14:12:03  t=24s  hang-doi=260 replicas=4 ready=4
+14:12:09  t=30s  hang-doi=237 replicas=6 ready=4
+14:12:10  t=31s  hang-doi=228 replicas=6 ready=6
+14:13:18  t=99s  hang-doi=0 replicas=0 ready=
+```
+
+</Expected>
+
+Đọc theo sơ đồ hai tầng:
+
+- **0 lên 1 sau 5 giây**: đây là KEDA operator. Lần hỏi hàng đợi kế tiếp (tối đa 5 giây) thấy có việc, và nó ghi `replicas: 1`.
+- **1 lên 4 lên 6**: đây là HPA. Hàng đợi gần 300 việc chia mục tiêu 10 là khoảng 30 pod, kẹp ở trần 6. Lên 4 trước rồi mới 6 là giới hạn tốc độ tăng của K5.3: HPA không khai `behavior` thì sau mỗi bước, tổng số pod không vượt mức lớn hơn giữa gấp đôi hiện tại và 4, tức từ 1 chỉ lên được 4.
+- **6 về thẳng 0**: lại là KEDA. Hàng đợi rỗng, trigger im lặng đủ 30 giây, operator ghi `replicas: 0`, bỏ qua HPA. Sáu worker xử lý khoảng 6 việc mỗi giây nên 300 việc xong trong khoảng một phút.
+
+Giờ phút cụ thể và các mốc giây sẽ khác trên máy bạn; thứ tự các bước thì không.
+
+<Check id="k5.4.lab-keda-queue">Quan sát được worker đi từ 0 lên trần rồi về 0 theo độ dài hàng đợi, và chỉ ra bước nào do KEDA operator làm, bước nào do HPA làm.</Check>
+
+### 4. Thêm lịch, và cái bẫy khi vừa về 0
+
+Thêm trigger thứ hai: giữ sẵn 2 worker trong "giờ làm việc". Để khỏi chờ tới sáng mai, lab định nghĩa giờ làm việc là 2 phút bật, 2 phút tắt: bật ở phút 0, 4, 8…, tắt ở phút 2, 6, 10… Chạy khối dưới **ngay sau bước 3**, đừng để quá hai phút: cái bẫy sắp thấy chỉ xuất hiện khi HPA còn nhớ đợt hàng đợi vừa rồi.
+
+<Predict question="Hàng đợi đang rỗng, worker đang 0 pod. Trigger cron đòi 2 pod trong giờ làm việc. Khi cửa sổ cron mở, worker lên mấy pod?">
+
+Sáu, không phải hai. KEDA gọi worker dậy (0 lên 1) rồi trao lại cho HPA. HPA không khai `behavior` nhớ mọi kết quả tính trong 300 giây gần nhất và, ở chiều giảm, áp kết quả cao nhất. Bước 3 vừa kết thúc với kết quả 6, và KEDA đã đưa Deployment về 0 bằng đường riêng, không qua HPA, nên trí nhớ đó còn nguyên.
+
+</Predict>
+
+<Terminal where="mac" title="~/masteva-k5/k5-4/scaledobject-cron.yaml">
+
+```bash
+yq '.spec.triggers += [{"type": "cron", "metadata": {
+      "timezone": "Asia/Ho_Chi_Minh",
+      "start": "0-59/4 * * * *",
+      "end": "2-59/4 * * * *",
+      "desiredReplicas": "2"}}]' scaledobject.yaml > scaledobject-cron.yaml
+sed -n '/type: cron/,$p' scaledobject-cron.yaml
+kubectl apply -f scaledobject-cron.yaml
+../theo-doi-keda.sh 180
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    - type: cron
+      metadata:
+        timezone: Asia/Ho_Chi_Minh
+        start: 0-59/4 * * * *
+        end: 2-59/4 * * * *
+        desiredReplicas: "2"
+scaledobject.keda.sh/worker configured
+14:13:51  t=1s  hang-doi=0 replicas=0 ready=
+14:13:52  t=2s  hang-doi=0 replicas=1 ready=1
+14:13:54  t=4s  hang-doi=0 replicas=4 ready=1
+14:13:55  t=5s  hang-doi=0 replicas=4 ready=4
+14:14:09  t=19s  hang-doi=0 replicas=6 ready=4
+14:14:10  t=20s  hang-doi=0 replicas=6 ready=6
+14:14:26  t=36s  hang-doi=0 replicas=0 ready=
+14:16:01  t=131s  hang-doi=0 replicas=1 ready=
+14:16:02  t=132s  hang-doi=0 replicas=1 ready=1
+14:16:10  t=140s  hang-doi=0 replicas=4 ready=4
+14:16:24  t=154s  hang-doi=0 replicas=6 ready=4
+14:16:25  t=155s  hang-doi=0 replicas=6 ready=6
+```
+
+</Expected>
+
+Cột `hang-doi` bằng 0 suốt, cron chỉ đòi 2 pod, vậy mà worker đi 1, 4, rồi **6**. Nhìn cột giờ: lần chạy này bắt đầu lúc 14:13:51, cuối một cửa sổ bật (14:12 tới 14:14), nên worker được gọi dậy ngay và lên 6 trong 20 giây. Khoảng 26 giây sau 14:14, hết `cooldownPeriod`, KEDA đưa về 0. Đúng 14:16 (phút chia hết cho 4) cửa sổ mở lại và worker lại đi 1, 4, 6, vì vẫn chưa quá 5 phút kể từ đợt hàng đợi. Bạn bắt đầu ở phút nào thì các mốc rơi vào phút tương ứng; nếu 180 giây chưa thấy worker được gọi dậy, chạy lại `../theo-doi-keda.sh 180`.
+
+Với việc nền thì chỉ tốn tiền; với worker đắt, ví dụ dùng GPU, thì đáng kể. Và nó không lộ ra khi thử từng trigger riêng: phải có một đợt tải lớn, một lần về 0, rồi một lần gọi dậy trong vòng 5 phút.
+
+Cách sửa là rút cửa sổ ổn định của HPA mà KEDA tạo, qua khối `advanced` của ScaledObject. Thêm khối đó rồi theo dõi trọn một chu kỳ:
+
+<Terminal where="mac">
+
+```bash
+yq -i '.spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown.stabilizationWindowSeconds = 30' scaledobject-cron.yaml
+sed -n '/advanced/,$p' scaledobject-cron.yaml
+kubectl apply -f scaledobject-cron.yaml
+../theo-doi-keda.sh 300
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 30
+scaledobject.keda.sh/worker configured
+14:16:50  t=0s  hang-doi=0 replicas=6 ready=6
+14:16:51  t=2s  hang-doi=0 replicas=2 ready=2
+14:18:25  t=95s  hang-doi=0 replicas=1 ready=1
+14:18:26  t=96s  hang-doi=0 replicas=0 ready=
+14:20:01  t=191s  hang-doi=0 replicas=1 ready=
+14:20:03  t=193s  hang-doi=0 replicas=1 ready=1
+14:20:10  t=200s  hang-doi=0 replicas=2 ready=2
+```
+
+</Expected>
+
+Hai giây sau khi áp, số pod tụt từ 6 về 2, đúng con số cron đòi. Khoảng 25 giây sau 14:18, cửa sổ đóng: HPA bớt còn 1, rồi KEDA đưa về 0. 14:20 cửa sổ mở: lên 1 rồi 2, không còn 6. Hai trigger giờ sống cùng nhau đúng như ý: trong giờ làm việc luôn có 2 pod chờ sẵn, hàng đợi dồn thì HPA lấy nguồn đòi nhiều hơn.
+
+Khối `advanced` sửa được vì hai lý do, cả hai nằm ở K5.3. Cửa sổ ổn định chỉ còn 30 giây, nên HPA quên đợt hàng đợi nhanh hơn. Quan trọng hơn, HPA giờ **có** khối `behavior` nên đi theo đường code thứ hai: ở đường đó, kết quả ổn định hoá xuất phát từ số pod hiện tại và chỉ bị kẹp bởi các kết quả gần đây, chứ không lấy thẳng kết quả cao nhất trong cửa sổ làm số pod mới. Mọi ScaledObject cho phép về 0 nên khai khối này.
+
+<Check id="k5.4.lab-keda-cron">Thêm được trigger cron bên cạnh trigger hàng đợi, tái hiện được worker vừa về 0 nhảy lại số pod đỉnh cũ khi được gọi dậy, giải thích được bằng cửa sổ ổn định của HPA, và sửa được bằng khối `advanced`.</Check>
+
+### 5. Cluster autoscaler với node giả
+
+Cụm kind không có cloud để xin máy. **KWOK** (Kubernetes WithOut Kubelet) lấp chỗ đó: nó tạo object Node không có máy thật phía sau và giả vai kubelet cho chúng, báo node `Ready` và pod trên đó `Running`. Cluster autoscaler có sẵn một provider tên `kwok` dùng cơ chế này làm "cloud". Mọi logic quyết định của CA chạy thật; chỉ có máy là giả.
+
+Gỡ phần KEDA để output gọn, rồi cài KWOK và CA. Bản CA mới nhất lúc viết bài là 1.36.1; CA thường đi cùng minor với cụm, nhưng chưa có bản 1.37 và bản này chạy được với cụm 1.37 trong lab.
+
+<Terminal where="mac" title="~/masteva-k5/k5-4/ca-values.yaml">
+
+```bash
+kubectl delete -f scaledobject-cron.yaml -f queue.yaml
+KWOK=https://github.com/kubernetes-sigs/kwok/releases/download/v0.8.0
+kubectl apply -f $KWOK/kwok.yaml | tail -1
+kubectl apply -f $KWOK/stage-fast.yaml | tail -1
+kubectl -n kube-system rollout status deploy/kwok-controller --timeout=180s | tail -1
+cat > ca-values.yaml <<'EOF'
+cloudProvider: kwok
+image:
+  tag: v1.36.1
+autoDiscovery:
+  clusterName: k5-lab                # provider kwok không dùng, nhưng chart bắt phải có
+extraArgs:
+  v: 2
+  scale-down-unneeded-time: 1m       # mặc định 10m: node thừa bao lâu thì bị gỡ
+  scale-down-delay-after-add: 1m     # mặc định 10m: sau khi thêm node, chờ bao lâu mới xét gỡ
+EOF
+helm install ca cluster-autoscaler --repo https://kubernetes.github.io/autoscaler --version 9.59.0 \
+  -n kube-system -f ca-values.yaml | grep -E '^(NAME|STATUS):'
+```
+
+</Terminal>
+
+Chart cài kèm một cấu hình mẫu cho provider `kwok`. Thay nó bằng cấu hình của lab: một node group duy nhất tên `gia`, mẫu node có số CPU bằng worker thật. `ALLOC` đọc con số đó từ cụm như ở K5.2. Vòng `until` gần cuối chờ CA mới nạp cấu hình và ghi trạng thái có node group `gia`.
+
+<Terminal where="mac" title="~/masteva-k5/k5-4/kwok-provider-config.yaml và kwok-node-template.yaml">
+
+```bash
+ALLOC=$(kubectl get node k5-lab-worker -o jsonpath='{.status.allocatable.cpu}')
+cat > kwok-provider-config.yaml <<'EOF'
+apiVersion: v1alpha1
+readNodesFrom: configmap                # mẫu node lấy từ ConfigMap kwok-provider-templates
+nodegroups:
+  fromNodeLabelKey: "kwok-nodegroup"    # node mẫu cùng giá trị label này thuộc một node group
+configmap:
+  name: kwok-provider-templates
+kwok:
+  install: false                        # KWOK đã cài ở trên, không để CA tự tải
+EOF
+cat > kwok-node-template.yaml <<EOF
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: Node
+    metadata:
+      name: gia
+      annotations:
+        node.alpha.kubernetes.io/ttl: "0"   # provider cần node mẫu có sẵn annotations
+      labels:
+        kubernetes.io/arch: arm64
+        kubernetes.io/os: linux
+        kwok-nodegroup: gia
+        topology.kubernetes.io/zone: zone-c
+    spec: {}
+    status:
+      allocatable: { cpu: "$ALLOC", memory: 8Gi, pods: "110" }
+      capacity: { cpu: "$ALLOC", memory: 8Gi, pods: "110" }
+EOF
+kubectl -n kube-system create configmap kwok-provider-config --from-file=config=kwok-provider-config.yaml \
+  --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+kubectl -n kube-system create configmap kwok-provider-templates --from-file=templates=kwok-node-template.yaml \
+  --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+kubectl -n kube-system rollout restart deploy/ca-kwok-cluster-autoscaler
+kubectl -n kube-system rollout status deploy/ca-kwok-cluster-autoscaler --timeout=180s | tail -1
+until kubectl -n kube-system get cm cluster-autoscaler-status -o jsonpath='{.data.status}' 2>/dev/null | grep -q 'name: gia'; do sleep 5; done
+kubectl -n kube-system get cm cluster-autoscaler-status -o jsonpath='{.data.status}' \
+  | yq '.nodeGroups[] | {"name": .name, "minSize": .health.minSize, "maxSize": .health.maxSize, "target": .health.cloudProviderTarget}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/kwok-provider-config serverside-applied
+configmap/kwok-provider-templates serverside-applied
+deployment.apps/ca-kwok-cluster-autoscaler restarted
+deployment "ca-kwok-cluster-autoscaler" successfully rolled out
+name: gia
+minSize: 0
+maxSize: 200
+target: 0
+```
+
+</Expected>
+
+`--force-conflicts` ở đây có lý do: hai ConfigMap do Helm tạo, và ta cố ý giành quyền sở hữu nội dung của chúng (K3.1 đã giải thích server-side apply). CA ghi trạng thái của nó vào ConfigMap `cluster-autoscaler-status`: một node group `gia`, đang có 0 node, được phép từ 0 tới 200.
+
+Giờ tạo tình huống thiếu chỗ. Như ở K5.2, mỗi pod `nang` xin số CPU của node trừ 1, nên mỗi worker vừa đúng một pod. Pod có toleration cho taint `kwok-provider`, thứ provider gắn lên node giả để workload thật không lạc vào đó.
+
+<Terminal where="mac" title="~/masteva-k5/k5-4/nang.yaml">
+
+```bash
+cat > nang.yaml <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: nang }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: nang }
+  template:
+    metadata:
+      labels: { app: nang }
+    spec:
+      terminationGracePeriodSeconds: 0
+      tolerations:
+        - { key: kwok-provider, operator: Exists, effect: NoSchedule }
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10.1
+          resources:
+            requests: { cpu: "$((ALLOC - 1))", memory: 64Mi }
+EOF
+kubectl apply -f nang.yaml && kubectl rollout status deploy/nang --timeout=90s | tail -1
+kubectl scale deploy/nang --replicas=5 && sleep 3
+kubectl wait --for=condition=Ready pod -l app=nang --timeout=120s | tail -2
+kubectl get nodes
+kubectl get pods -l app=nang -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName
+kubectl events | grep TriggeredScaleUp | cut -c1-200
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/nang created
+deployment "nang" successfully rolled out
+deployment.apps/nang scaled
+pod/nang-58d467496-rzjlh condition met
+pod/nang-58d467496-t4chh condition met
+NAME                   STATUS   ROLES           AGE   VERSION
+gia-ngk4m              Ready    <none>          1s    fake
+gia-zkllm              Ready    <none>          1s    fake
+k5-lab-control-plane   Ready    control-plane   64m   v1.37.0
+k5-lab-worker          Ready    <none>          64m   v1.37.0
+k5-lab-worker2         Ready    <none>          64m   v1.37.0
+k5-lab-worker3         Ready    <none>          64m   v1.37.0
+NAME                   STATUS    NODE
+nang-58d467496-72xx7   Running   k5-lab-worker2
+nang-58d467496-dvlsb   Running   k5-lab-worker
+nang-58d467496-qhdtz   Running   k5-lab-worker3
+nang-58d467496-rzjlh   Running   gia-ngk4m
+nang-58d467496-t4chh   Running   gia-zkllm
+1s                    Normal    TriggeredScaleUp               Pod/nang-58d467496-t4chh                  pod triggered scale-up: [{gia 0->2 (max: 200)}]
+1s                    Normal    TriggeredScaleUp               Pod/nang-58d467496-rzjlh                  pod triggered scale-up: [{gia 0->2 (max: 200)}]
+```
+
+</Expected>
+
+Ba pod đầu vừa ba worker thật. Hai pod thêm thì `Pending`; CA thử trên node mẫu của group `gia`, thấy mỗi node vừa một pod, và tăng group từ 0 lên 2. Trong lab, từ lúc `scale` tới lúc có node chỉ mất khoảng mười giây vì "cloud" ở đây trả máy tức thì; trên cloud thật, đoạn này là một tới vài phút. Cột `VERSION` ghi `fake`, và pod trên đó `Running` chỉ trên giấy: không container nào chạy.
+
+<Predict question="Tạo thêm một pod xin 64 CPU. Node mẫu của group `gia` có số CPU bằng worker thật. CA có thêm node không?">
+
+Không. CA chạy vòng lọc của scheduler trên node mẫu, và 64 CPU không vừa. Thêm bao nhiêu node kiểu đó cũng vô ích, nên CA không thêm node nào và ghi event `NotTriggerScaleUp` kèm lý do. Pod `Pending` cho tới khi có người sửa request hoặc thêm một node group có máy lớn hơn.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl run qua-to --image=registry.k8s.io/pause:3.10.1 --overrides='{"spec":{
+  "tolerations":[{"key":"kwok-provider","operator":"Exists","effect":"NoSchedule"}],
+  "containers":[{"name":"qua-to","image":"registry.k8s.io/pause:3.10.1","resources":{"requests":{"cpu":"64"}}}]}}'
+sleep 25
+kubectl events --for pod/qua-to | cut -c1-180
+kubectl delete pod qua-to
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/qua-to created
+LAST SEEN   TYPE      REASON              OBJECT       MESSAGE
+25s         Warning   FailedScheduling    Pod/qua-to   0/6 nodes are available: 1 node(s) had untolerated taint(s), 5 Insufficient cpu. preemption: 0/6 nodes are available: 6 Preem
+15s         Normal    NotTriggerScaleUp   Pod/qua-to   pod didn't trigger scale-up: 1 Insufficient cpu
+pod "qua-to" deleted from k5 namespace
+```
+
+</Expected>
+
+Hai event, hai tác giả: scheduler nói không node nào đang có vừa; cluster autoscaler nói thêm node cũng không giúp. Cặp event này là thứ cần tìm khi có pod `Pending` trên cụm có autoscaler.
+
+<Check id="k5.4.lab-ca-scale-up">Dựng được cluster autoscaler với một node group giả, tạo được pod `Pending` làm nó thêm node, và phân biệt được `TriggeredScaleUp` với `NotTriggerScaleUp`.</Check>
+
+### 6. Gỡ node thừa
+
+Giảm `nang` về 3 và xem chuyện gì xảy ra với hai node giả. ReplicaSet chọn pod để xoá gần như ngẫu nhiên giữa các pod cùng tuổi; để kết quả lặp lại được, hai lệnh `annotate` đánh dấu pod trên `worker` và `worker3` là "rẻ" nhất, nên chúng bị xoá trước.
+
+<Terminal where="mac">
+
+```bash
+for n in k5-lab-worker k5-lab-worker3; do
+  kubectl annotate pod -l app=nang --field-selector spec.nodeName=$n controller.kubernetes.io/pod-deletion-cost=-1
+done
+kubectl scale deploy/nang --replicas=3 && sleep 100
+kubectl get nodes --no-headers | awk '{print $1}'
+kubectl get pods -l app=nang --no-headers -o custom-columns=NODE:.spec.nodeName | sort
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/nang-58d467496-dvlsb annotated
+pod/nang-58d467496-qhdtz annotated
+deployment.apps/nang scaled
+gia-ngk4m
+gia-zkllm
+k5-lab-control-plane
+k5-lab-worker
+k5-lab-worker2
+k5-lab-worker3
+gia-ngk4m
+gia-zkllm
+k5-lab-worker2
+```
+
+</Expected>
+
+Sau 100 giây, dài hơn hẳn ngưỡng 1 phút đã đặt, cả hai node giả vẫn còn, trong khi hai worker thật đang trống. Mỗi node giả còn một pod giữ hơn 80% CPU của nó. CA chỉ xét gỡ node dùng dưới 50%; nó không dời pod đi để làm trống một node đang bận. Đây là lý do cụm dùng CA hay "phình": tải xuống, pod rải rác mỗi node một ít trên mức ngưỡng, và không node nào đủ trống để gỡ. Consolidation của Karpenter sinh ra để xử lý đúng chuyện này.
+
+Cho node giả trống hẳn:
+
+<Terminal where="mac">
+
+```bash
+kubectl scale deploy/nang --replicas=0
+T0=$(date +%s)
+until [ "$(kubectl get nodes --no-headers | wc -l | tr -d ' ')" = "4" ]; do sleep 5; done
+echo "node giả biến mất sau $(( $(date +%s) - T0 )) giây"
+kubectl -n kube-system get events --field-selector reason=ScaleDownEmpty -o custom-columns=MESSAGE:.message
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/nang scaled
+node giả biến mất sau 71 giây
+MESSAGE
+Scale-down: removing empty node "gia-zkllm"
+Scale-down: removing empty node "gia-ngk4m"
+Scale-down: empty node gia-zkllm removed
+Scale-down: empty node gia-ngk4m removed
+```
+
+</Expected>
+
+Node trống được 1 phút (`scale-down-unneeded-time` của lab) thì bị gỡ. Hai khoảng chờ không cộng dồn mà chạy song song: một node bị gỡ khi nó đã thừa đủ `scale-down-unneeded-time` **và** đã qua `scale-down-delay-after-add` kể từ lần thêm node gần nhất. Với mặc định 10 phút cho cả hai, một đợt tải ngắn để lại node thừa khoảng 10 tới 12 phút. Đó là chủ ý: thêm node thì chậm và gỡ nhầm thì đắt, nên CA nghiêng về giữ.
+
+<Check id="k5.4.lab-ca-scale-down">Chỉ ra được vì sao node còn pod không bị gỡ dù cụm thừa chỗ, quan sát được node trống bị gỡ sau thời gian chờ, và nêu được hai tham số quyết định thời gian đó.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| ScaledObject `READY` là `False` | Sai địa chỉ nguồn, thiếu thông tin đăng nhập, sai tên Deployment | `kubectl describe scaledobject worker`; `kubectl -n keda logs deploy/keda-operator` |
+| Worker không về 0 | Còn trigger đang "active" (đang trong cửa sổ cron, hàng đợi chưa rỗng); chưa hết `cooldownPeriod` | `kubectl get scaledobject worker` xem cột `ACTIVE` |
+| Worker lên quá số mong đợi sau khi vừa về 0 | HPA còn nhớ kết quả cũ trong cửa sổ ổn định | Thêm `advanced.horizontalPodAutoscalerConfig.behavior` như bước 4 |
+| Pod CA `CrashLoopBackOff`, log có `assignment to entry in nil map` | Node mẫu trong `kwok-provider-templates` thiếu `annotations` | Thêm một annotation vào node mẫu như file của bài |
+| Pod `Pending`, không có event `TriggeredScaleUp` | CA chưa chạy; pod thiếu toleration `kwok-provider`; không group nào vừa | `kubectl events --for pod/<tên>` tìm `NotTriggerScaleUp`; log của CA |
+| Node giả ở lại sau lab | CA đã bị gỡ trước khi nó kịp xoá node | `kubectl delete node -l kwok-nodegroup=gia` |
+
+### Dọn dẹp
+
+K5.5 dùng tiếp cụm nhưng không cần gì của bài này. Gỡ hết.
+
+<Callout kind="danger">
+
+Khối dưới gỡ cluster autoscaler, KWOK và KEDA, và xoá namespace `keda` cùng mọi thứ trong đó. Trên một cụm thật, gỡ KEDA làm mọi ScaledObject ngừng hoạt động. Chỉ chạy trên cụm lab: kiểm `kubectl config current-context` in ra `kind-k5-lab`.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K5.5">
+
+```bash
+kubectl delete deploy nang
+helm uninstall ca -n kube-system
+kubectl -n kube-system delete configmap kwok-provider-config kwok-provider-templates cluster-autoscaler-status --ignore-not-found
+KWOK=https://github.com/kubernetes-sigs/kwok/releases/download/v0.8.0
+kubectl delete -f $KWOK/stage-fast.yaml -f $KWOK/kwok.yaml | tail -1
+helm uninstall keda -n keda
+kubectl delete namespace keda
+kubectl get nodes --no-headers | awk '{print $1, $2}'
+```
+
+</Terminal>
+
+Cuối output phải còn đúng bốn node thật, đều `Ready`:
+
+<Expected>
+
+```text
+deployment.apps "nang" deleted from k5 namespace
+release "ca" uninstalled
+configmap "cluster-autoscaler-status" deleted from kube-system namespace
+flowschema.flowcontrol.apiserver.k8s.io "kwok-controller" deleted
+release "keda" uninstalled
+namespace "keda" deleted
+k5-lab-control-plane Ready
+k5-lab-worker Ready
+k5-lab-worker2 Ready
+k5-lab-worker3 Ready
+```
+
+</Expected>
+
+CRD của KEDA và KWOK ở lại trong cụm; chúng vô hại với bài sau. Nếu dừng hẳn ở đây, xoá cụm bằng khối lệnh cuối bài K5.1.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="HPA của Kubernetes 1.37 tự về 0 được rồi. Còn cần KEDA không?">
+
+Còn, vì hai thứ khác nhau. Scale-to-zero của HPA (beta, bật mặc định ở 1.37) cho phép đặt `minReplicas: 0` khi HPA có ít nhất một metric kiểu `Object` hoặc `External`; với metric CPU thì không, vì không có pod thì không có CPU để đo. Khi soạn bài, thử thêm một HPA tự viết với `minReplicas: 0`, đọc đúng metric `s0-redis-jobs`, nó đưa một Deployment về 0 khi hàng đợi rỗng (điều kiện `ScaledToZero: True`) và lên 3 khi có việc.
+
+Nhưng metric đó do KEDA phục vụ. HPA chỉ là bên tiêu thụ API `external.metrics.k8s.io`; phải có ai biết hỏi Valkey, Kafka hay SQS. Thứ thay đổi là phần việc: bước 0 lên 1 không còn nhất thiết do operator của KEDA làm. Giá trị còn lại của KEDA là thư viện scaler, `TriggerAuthentication` để giữ thông tin đăng nhập nguồn, `ScaledJob`, và trigger cron.
+
+</Reveal>
+
+<Reveal title="Làm sao để pod mới không phải chờ vài phút cho node mới?">
+
+Giữ sẵn chỗ trống, bằng chính preemption của K5.2. Tạo một Deployment gồm vài pod `pause` xin request lớn, với một PriorityClass có giá trị âm. Chúng chiếm chỗ nhưng thấp hơn mọi pod thật. Khi pod thật cần chỗ, scheduler đẩy pod giữ chỗ ra ngay (vài giây) và pod thật chạy. Pod giữ chỗ thành `Pending`, và chính nó kích cluster autoscaler thêm node để lấy lại vùng đệm. Tài liệu của CA gọi đây là overprovisioning. Cái giá là luôn trả tiền cho phần đệm; kích thước đệm nên bằng lượng pod bạn dự kiến phải thêm trong thời gian một node mới lên.
+
+</Reveal>
+
+<Reveal title="Cluster autoscaler có tôn trọng topology spread và PDB không?">
+
+Có, vì nó chạy lại vòng lọc của scheduler. Khi tăng: pod `Pending` vì ràng buộc zone thì CA tìm node group **ở zone thoả ràng buộc**; đây là chỗ `minDomains` của K5.2 có tác dụng, buộc CA mở node ở zone mới thay vì dồn vào zone cũ. Nhiều node group giống nhau ở nhiều zone thì nên bật `--balance-similar-node-groups` để CA giữ chúng cân. Khi giảm: CA gọi Eviction API nên PDB có hiệu lực; node có pod bị PDB chặn sẽ không bị gỡ, và ở lại mãi nếu PDB có ngân sách 0. Một PDB sai vừa làm drain treo (K5.2) vừa làm hoá đơn cloud tăng.
+
+</Reveal>
+
+<Reveal title="Khi nào chọn Karpenter thay cluster autoscaler?">
+
+Khi cụm chạy ở nơi Karpenter có provider tốt (trước hết là AWS và Azure), workload đa dạng về kích cỡ, và chi phí máy đáng để tối ưu. Karpenter chọn máy theo pod nên gói pod chặt hơn, phản ứng nhanh hơn vì gọi thẳng API tạo máy, và consolidation tự gom node khi tải xuống, đúng chỗ bước 6 cho thấy CA đứng yên. Đổi lại: nó thay node thường xuyên hơn, nên đòi PDB và tắt êm nghiêm túc; và ngoài AWS, Azure thì phải tự đánh giá provider của nơi mình chạy đã đủ chín chưa. CA vẫn hợp khi hạ tầng của bạn chỉ có provider Karpenter còn non hoặc chưa có, khi tổ chức đã quản node group bằng IaC và muốn giữ, hoặc khi workload đồng đều tới mức một hai loại máy là đủ.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI hữu ích khi viết ScaledObject cho một scaler bạn chưa dùng: tên các trường `metadata` khác nhau ở từng scaler và khó nhớ. Chỗ hay sai: (1) dùng tên trường của bản KEDA cũ, hoặc bịa trường không có; (2) tạo thêm một HPA cho cùng Deployment đã có ScaledObject, hai bên giành nhau `replicas`; (3) đặt `minReplicaCount: 0` cho service đang nhận request của người dùng; (4) nói cluster autoscaler thêm node "khi CPU cao"; (5) viết `Provisioner` (API cũ của Karpenter, đã bỏ) thay vì `NodePool`. Kiểm bằng `kubectl describe scaledobject` xem điều kiện `Ready`, và bằng cách đẩy việc thật vào hàng đợi rồi đếm pod như bước 3.
+
+</Callout>
+
+<Callout kind="link">
+
+K5.3 là nền: công thức, `behavior` và cửa sổ ổn định của HPA mà KEDA dùng lại nguyên. K5.1 dạy vòng lọc mà cluster autoscaler chạy lại trên node mẫu; K5.2 dạy PDB và drain, thứ quyết định node có gỡ được không, và preemption cho kỹ thuật giữ chỗ. K1.3 và K1.4 dạy tắt êm và việc idempotent, điều kiện để worker chịu được scale-down. D10 dạy AWS, nơi mỗi node group là một Auto Scaling Group. K10 dùng Cluster API làm provider cho autoscaler. D18 bàn kế hoạch dung lượng và giới hạn của autoscaling.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k5.4.mastery-keda">Viết được ScaledObject cho một worker đọc hàng đợi: chọn mục tiêu mỗi pod, `cooldownPeriod`, trần, có cho về 0 hay không, và nêu được worker phải làm gì để chịu được việc bị bớt pod.</Check>
+
+<Check id="k5.4.mastery-pending">Gặp pod `Pending` trên cụm có autoscaler, đọc event của scheduler và của autoscaler để nói thiếu node, thiếu node group phù hợp, hay chạm một trần bên ngoài.</Check>
+
+<Check id="k5.4.mastery-chain">Kể được chuỗi độ trễ từ lúc tải tăng tới lúc pod mới chạy trên node mới, và nêu được hai cách rút ngắn nó.</Check>
+
+<Check id="k5.4.mastery-karpenter">Giải thích được cho đồng đội Karpenter khác cluster autoscaler thế nào, và workload cần gì trước khi chạy trên cụm có consolidation.</Check>
+
+</Mastery>

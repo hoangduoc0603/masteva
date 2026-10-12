@@ -1,0 +1,824 @@
+---
+title: Remote state, khoá state và khôi phục khi state hỏng
+description: Đưa state của dev và prod lên một kho S3 chạy trong Docker, tái hiện hai người apply cùng lúc để thấy khoá hoạt động, gỡ một khoá bị kẹt bằng force-unlock, khôi phục state bị ghi đè nhờ versioning, rồi xem ai đọc được secret trong state và mã hoá nó bằng OpenTofu.
+id: d10.3
+step: d10
+prerequisites: [d10.2]
+topics: [d10.remote-state-locking]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    opentofu: 1.13.1 (image ghcr.io/opentofu/opentofu)
+    terraform: 1.16.5 (image hashicorp/terraform)
+    seaweedfs: "4.48"
+    provider-docker: kreuzwerker/docker 4.6.0
+    curl: 8.4.0
+    jq: 1.8.2
+---
+
+<Goal>
+
+Đặt được state ở nơi cả đội và CI cùng dùng mà không ghi đè lên nhau, và xử lý được khi state bị khoá kẹt, bị ghi đè hoặc bị lộ. Học xong bài này, bạn giải thích được:
+
+- Vì sao đổi máy tính có thể làm công cụ "quên" toàn bộ hạ tầng, và remote state chặn điều đó thế nào.
+- Vì sao người thứ hai chạy `apply` nhận lỗi `Error acquiring the state lock`, và khi nào được phép `force-unlock`.
+- Vì sao công cụ từ chối ghi một state cũ đè lên state mới, và làm gì khi ai đó đã ép ghi đè.
+- Vì sao quyền **đọc** kho state tương đương quyền đọc mọi secret của hạ tầng.
+
+</Goal>
+
+<Knowledge>
+
+### State cục bộ gãy ở đâu
+
+D11.1 và D11.2 để state trong file `terraform.tfstate` cạnh mã. Với một người trên một máy, thế là đủ. Với một đội, nó gãy ở bốn chỗ:
+
+| Vấn đề | Hậu quả |
+|---|---|
+| State nằm trên **một** máy | Người khác, CI, hay chính bạn trên máy mới chạy `plan` sẽ thấy "chưa có gì" và đòi tạo lại tất cả |
+| Không có khoá | Hai lần `apply` song song cùng đọc bản cũ, mỗi bên ghi bản của mình, bản ghi sau xoá mất kết quả của bản ghi trước |
+| Không có lịch sử | Một lần ghi sai là mất; chỉ còn một file `.backup` của lần ngay trước |
+| Secret nằm trên đĩa của mọi người | Mỗi laptop có bản sao là một nơi lộ |
+
+Commit state vào Git không giải quyết được gì: Git không khoá được, hai nhánh sinh hai bản state mâu thuẫn, và mọi secret nằm lại trong lịch sử repo mãi mãi.
+
+<Callout kind="production">
+
+Tối 26/02/2026, Alexey Grigorev dùng Terraform, do một AI coding agent chạy lệnh, để đưa một website mới vào cùng bộ Terraform đang quản hạ tầng production của nền tảng khoá học DataTalks.Club. Theo postmortem anh viết: file state nằm trên máy tính cũ. Trên máy mới, `terraform plan` coi như chưa có hạ tầng nào ("Terraform believed nothing existed") và bắt đầu tạo trùng tài nguyên; anh huỷ `apply` giữa chừng rồi nhờ agent dọn các bản trùng. Trong lúc đó anh chép thư mục Terraform cũ, có cả file state, sang máy mới. Agent đề xuất dọn bằng `terraform destroy` cho gọn; theo lời tác giả, anh không để ý rằng agent đã giải nén thư mục đó và thay file state hiện tại bằng file cũ, tức file mô tả hạ tầng production. Lệnh destroy xoá VPC, database RDS, cụm ECS, các load balancer và bastion host; các snapshot tự động của database bị xoá theo. AWS Support tìm được một snapshot và khôi phục đúng 24 giờ sau; bảng chính còn đủ 1.943.200 dòng. Trong các thay đổi sau sự cố, tác giả viết "Most importantly, I moved Terraform state to S3"; ngoài ra anh bật deletion protection ở cả Terraform lẫn AWS, đặt sao lưu ngoài vòng đời của Terraform kèm thử khôi phục hằng ngày, và không để agent tự chạy lệnh nữa.
+
+Bước 8 của D11.1 đã tái hiện nửa đầu câu chuyện: cùng bộ mã, không có state, plan đòi tạo lại mọi thứ. Bài này lo phần còn lại: một bản state duy nhất, ở nơi mọi máy cùng trỏ tới, có lịch sử.
+
+</Callout>
+
+<Check id="d10.3.why-remote">Nêu được bốn chỗ state cục bộ gãy khi làm việc theo đội, và vì sao commit state vào Git không phải lời giải.</Check>
+
+### Backend: nơi state sống
+
+**Backend** là nơi công cụ đọc và ghi state, khai báo trong khối `terraform`. Mặc định là `local`. Các backend hay gặp:
+
+| Backend | State nằm ở | Khoá bằng | Ghi chú |
+|---|---|---|---|
+| `local` | File cạnh mã | Khoá file của hệ điều hành, chỉ trong một máy | Chỉ cho học và thử nghiệm |
+| `s3` | Object trong bucket S3 hoặc dịch vụ tương thích | `use_lockfile = true`: một object `<key>.tflock` tạo bằng ghi có điều kiện | Có ở Terraform từ 1.10 (ổn định từ 1.11) và OpenTofu từ 1.10. Cách khoá cũ bằng bảng DynamoDB: Terraform đã đánh dấu lỗi thời từ 1.11; OpenTofu vẫn hỗ trợ đầy đủ, chỉ gọi khoá bằng S3 là cách nên dùng |
+| `gcs`, `azurerm` | Bucket GCS, Blob của Azure | Cơ chế khoá sẵn có của dịch vụ | Dùng khi hạ tầng ở cloud tương ứng |
+| `pg` | Bảng trong PostgreSQL | Advisory lock của PostgreSQL | Hợp khi không có object storage |
+| `http` | Một dịch vụ HTTP | Tuỳ dịch vụ | GitLab cung cấp sẵn backend kiểu này cho từng project |
+| `kubernetes` | Secret trong cụm | Lease | State nhỏ, gắn với một cụm |
+
+```text
+ laptop của An ──┐                         ┌─ shop/dev/terraform.tfstate
+ laptop của Bình ─┼── backend "s3" ──────▶ │  shop/dev/terraform.tfstate.tflock   (chỉ có khi đang chạy)
+ runner CI ──────┘   (cùng bucket, key)    │  shop/prod/terraform.tfstate
+                                           └─ … mỗi root module một key
+```
+
+Ba điều về khối `backend`:
+
+- Mỗi root module có **key riêng**. Hai root trỏ chung một key là hai bộ mã giành nhau một state.
+- Đổi backend thì chạy `tofu init -migrate-state` để chép state từ chỗ cũ sang chỗ mới.
+- Với Terraform, khối `backend` không dùng được biến; giá trị thay đổi theo môi trường được đưa vào bằng `-backend-config=<file>` lúc `init`. OpenTofu từ 1.8 cho dùng biến ở đây.
+
+Sau khi chuyển, thư mục làm việc không còn file state; mỗi lệnh đọc state qua mạng. `.terraform/terraform.tfstate` chỉ ghi lại backend đang dùng, không chứa tài nguyên.
+
+<Check id="d10.3.backend">Giải thích được backend là gì, kể được ba backend cùng cách khoá của chúng, và vì sao mỗi root module cần một key riêng.</Check>
+
+### Khoá state hoạt động thế nào
+
+```text
+ An: tofu apply                         kho state                    Bình: tofu plan
+ ───────────────                        ─────────                    ───────────────
+ PUT …tfstate.tflock  ───────────────▶  chưa có: tạo        
+   (If-None-Match: *)                   200 OK
+ GET …tfstate         ───────────────▶  serial 7
+ lập plan, chờ "yes", gọi API…                               ◀────── PUT …tfstate.tflock
+                                        đã có: 412                     (If-None-Match: *)
+                                        Precondition Failed ───────▶ Error acquiring the state lock
+ PUT …tfstate (serial 8) ────────────▶  ghi                           Lock Info: ID, Who, Created
+ DELETE …tfstate.tflock ─────────────▶  xoá khoá
+```
+
+`If-None-Match: *` là **ghi có điều kiện** của S3: chỉ tạo object nếu chưa có object nào cùng tên. Kho lưu trữ bảo đảm chỉ một trong hai yêu cầu đồng thời thành công, nên không cần dịch vụ khoá riêng. Lệnh nào **đọc để rồi ghi** state đều lấy khoá: `plan`, `apply`, `destroy`, `import`, `state mv`… Khoá được giữ suốt thời gian lệnh chạy, kể cả lúc chờ bạn gõ `yes`.
+
+Khi không lấy được khoá:
+
+| Cách xử lý | Khi nào |
+|---|---|
+| Chờ rồi chạy lại, hoặc `-lock-timeout=5m` | Mặc định. Có người hoặc pipeline đang chạy thật |
+| `tofu force-unlock <ID>` | Chỉ khi **chắc chắn** tiến trình giữ khoá đã chết: máy tắt, runner bị huỷ, container bị kill. Đọc `Who` và `Created` trong thông báo lỗi, hỏi người đó |
+| `-lock=false` | Gần như không bao giờ. Nó bỏ đúng lớp bảo vệ bạn đang cần |
+
+Khoá ngăn hai lần ghi **cùng lúc**. Nó không ngăn hai người lần lượt apply hai nhánh mã khác nhau và giẫm lên nhau; việc đó do quy trình giải quyết: chỉ pipeline của nhánh chính được apply (chặng D6), hoặc công cụ như Atlantis (chặng D22).
+
+<Check id="d10.3.locking">Kể được trình tự lấy khoá, đọc, ghi, nhả khoá của một lần `apply`, và quyết định được giữa chờ, `-lock-timeout` và `force-unlock` trong một tình huống cụ thể.</Check>
+
+### Khi state mất, cũ hoặc bị ghi đè
+
+Hai trường trong state bảo vệ nó khỏi bị ghi nhầm: `lineage` (danh tính; khác lineage nghĩa là state của hạ tầng khác) và `serial` (tăng một sau mỗi lần ghi). `tofu state push` từ chối một bản có `serial` nhỏ hơn bản đang lưu, cùng `serial` mà khác nội dung, hoặc khác `lineage`; cờ `-force` bỏ qua các kiểm tra đó.
+
+| Tình huống | Dấu hiệu | Cách xử lý |
+|---|---|---|
+| Khoá kẹt sau khi tiến trình chết | `Error acquiring the state lock` với `Created` từ lâu | `force-unlock` sau khi xác nhận |
+| State bị ghi đè bằng bản cũ | `plan` đòi tạo lại thứ đang chạy | Lấy lại phiên bản đúng từ **versioning của bucket**, `state push` |
+| `apply` bị giết giữa chừng | Tài nguyên đã tạo nhưng chưa vào state; lần sau báo trùng tên | Đưa vào state bằng `import` (D11.4) hoặc xoá tay rồi apply lại |
+| Mất hẳn state, không có bản sao | `plan` đòi tạo tất cả | `import` từng tài nguyên; với hạ tầng lớn là nhiều ngày công |
+
+Vì vậy kho state cần ba thứ ngoài khoá: **versioning** (mỗi lần ghi giữ lại bản trước), quyền xoá bị hạn chế, và sao lưu sang nơi khác nếu hạ tầng đủ quan trọng. `tofu state pull > file` tải state hiện tại về để xem hoặc lưu trước một thao tác rủi ro.
+
+<Check id="d10.3.recovery">Giải thích được `serial` và `lineage` bảo vệ điều gì, và chọn được cách xử lý cho khoá kẹt, state bị ghi đè, state mất.</Check>
+
+### Ai đọc được state
+
+D11.1 đã cho thấy state chứa secret dạng chữ thường. Lên remote, câu hỏi thành: ai có quyền gì trên kho?
+
+- **Quyền đọc là quyền đọc secret.** Người chỉ cần chạy `plan` vẫn phải đọc được toàn bộ state. Không có quyền "đọc state trừ mật khẩu".
+- **Tách kho theo môi trường.** State của production ở bucket (tốt hơn: tài khoản) mà chỉ pipeline production và vài người có quyền. Đây là lý do nữa để tách môi trường bằng thư mục và backend riêng (D11.2).
+- **Mã hoá phía máy chủ** (SSE của S3, mã hoá đĩa) chặn người lấy được ổ đĩa, không chặn người có quyền đọc object: kho giải mã giúp họ.
+- **Mã hoá phía client** là điểm khác biệt lớn giữa hai công cụ. OpenTofu từ 1.7 mã hoá state (và file plan) trước khi gửi đi, bằng khoá từ passphrase, AWS KMS, GCP KMS hoặc OpenBao; kho chỉ thấy bản mã. Terraform không có tính năng này: với nó, bạn dựa vào mã hoá và phân quyền của backend, hoặc dùng HCP Terraform.
+
+Giảm lượng secret đi qua state vẫn là cách tốt nhất: để nền tảng tự sinh và giữ mật khẩu, mã IaC chỉ tham chiếu tới nơi giữ.
+
+<Check id="d10.3.access">Giải thích được vì sao quyền đọc kho state là quyền nhạy cảm, và mã hoá phía máy chủ khác mã hoá phía client ở điểm nào.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Backend Type: s3 (OpenTofu Docs)](https://opentofu.org/docs/language/settings/backends/s3/): mọi tham số của backend dùng trong lab, phần "State Locking" và cấu hình cho dịch vụ tương thích S3.
+- [State Locking (OpenTofu Docs)](https://opentofu.org/docs/language/state/locking/): lệnh nào lấy khoá, và cảnh báo của chính dự án về `force-unlock`.
+- [State and Plan Encryption (OpenTofu Docs)](https://opentofu.org/docs/language/state/encryption/): các key provider, cách bật mã hoá cho state đang có và cách xoay khoá.
+- [Backend Type: s3 (HashiCorp Developer)](https://developer.hashicorp.com/terraform/language/backend/s3): bản của Terraform, để đối chiếu `use_lockfile` và quyền IAM tối thiểu trên AWS.
+- [How I Dropped Our Production Database and Now Pay 10% More for AWS](https://aishippingblog.com/p/how-i-dropped-our-production-database): postmortem trong callout, do chính người gây ra viết; đọc phần "What Actually Happened" và danh sách thay đổi sau sự cố.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D11.2 và còn nguyên `~/masteva-d10/modules`, `~/masteva-d10/envs/dev`, `~/masteva-d10/envs/prod`. Cần `curl` từ 7.75 (có `--aws-sigv4`; macOS 14 có sẵn 8.4), `jq`, `openssl`. Kho S3 của lab là SeaweedFS chạy một container; image nén khoảng 180 MB. Dùng thêm cổng **9543** (S3) và **9534**. Bước 2 và 3 cần **hai cửa sổ terminal**. **Profile máy:** SeaweedFS dùng khoảng 200 MB RAM; cộng bốn container Nginx vẫn dưới 400 MB, máy 8 GB chạy được.
+
+### 0. Dựng lại hai môi trường và kho S3
+
+<Terminal where="mac" title="Dựng lại dev và prod bằng state cục bộ">
+
+```bash
+source ~/masteva-d10/env.sh
+cd ~/masteva-d10/envs/dev && tofu apply -no-color -auto-approve | grep -E '^Apply'
+cd ~/masteva-d10/envs/prod && tofu apply -no-color -auto-approve | grep -E '^Apply'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Apply complete! Resources: 4 added, 0 changed, 0 destroyed.
+Apply complete! Resources: 5 added, 0 changed, 0 destroyed.
+```
+
+</Expected>
+
+Kho S3 có hai danh tính: `tofu` được đọc và ghi bucket state, `auditor` chỉ được đọc. Secret của chúng sinh ngẫu nhiên và nằm trong các file chỉ bạn đọc được, không nằm trong mã:
+
+<Terminal where="mac" title="~/masteva-d10/state">
+
+```bash
+mkdir -p ~/masteva-d10/state && cd ~/masteva-d10/state
+TOFU_SECRET=$(openssl rand -hex 16); AUDITOR_SECRET=$(openssl rand -hex 16)
+cat > s3.json <<EOF
+{
+  "identities": [
+    {
+      "name": "tofu",
+      "credentials": [{ "accessKey": "d11tofu", "secretKey": "$TOFU_SECRET" }],
+      "actions": ["Read:d11-state", "Write:d11-state", "List:d11-state"]
+    },
+    {
+      "name": "auditor",
+      "credentials": [{ "accessKey": "d11auditor", "secretKey": "$AUDITOR_SECRET" }],
+      "actions": ["Read:d11-state", "List:d11-state"]
+    }
+  ]
+}
+EOF
+UNSET='unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN'
+printf '%s\nexport AWS_ACCESS_KEY_ID=d11tofu\nexport AWS_SECRET_ACCESS_KEY=%s\n' "$UNSET" "$TOFU_SECRET" > tofu.env
+printf '%s\nexport AWS_ACCESS_KEY_ID=d11auditor\nexport AWS_SECRET_ACCESS_KEY=%s\n' "$UNSET" "$AUDITOR_SECRET" > auditor.env
+chmod 600 s3.json tofu.env auditor.env
+docker run -d --name d11-s3 --network d11-tools -p 127.0.0.1:9543:8333 \
+  -v d11-s3-data:/data -v "$PWD/s3.json":/etc/seaweedfs/s3.json:ro \
+  chrislusf/seaweedfs:4.48 server -dir=/data -s3 -s3.config=/etc/seaweedfs/s3.json > /dev/null
+weed() { echo "$*" | docker exec -i d11-s3 weed shell 2>/dev/null; }
+until weed s3.bucket.list | grep -q d11-state; do weed s3.bucket.create -name d11-state > /dev/null; sleep 2; done
+weed s3.bucket.versioning -name d11-state -status Enabled
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Bucket d11-state versioning set to Enabled
+```
+
+</Expected>
+
+Hai file `.env` mở đầu bằng dòng `unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN`: hàm `tofu` chuyển mọi biến `AWS_*` của terminal vào container, nên một profile hay session token của tài khoản AWS thật còn sót trong shell (ví dụ sau chặng D10) sẽ đè lên cặp khoá của lab và làm backend lỗi. `weed shell` là công cụ quản trị của SeaweedFS; vòng `until` chờ kho sẵn sàng rồi tạo bucket `d11-state`, sau đó bật versioning. Trên AWS, ba việc này là một bucket S3 bật versioning và hai IAM policy.
+
+<Terminal where="mac" title="Hàm s3get và kiểm tra quyền">
+
+```bash
+source ~/masteva-d10/state/tofu.env
+s3get() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -u "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" "http://localhost:9543/$1"; }
+keys() { s3get 'd11-state?list-type=2' | grep -oE '<Key>[^<]+' | cut -c6-; }
+curl -s -o /dev/null -w 'không xác thực: HTTP %{http_code}\n' 'http://localhost:9543/d11-state?list-type=2'
+s3get 'd11-state?list-type=2' | grep -oE '<KeyCount>[0-9]+'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+không xác thực: HTTP 403
+<KeyCount>0
+```
+
+</Expected>
+
+`s3get` gọi thẳng API S3 bằng `curl`, ký yêu cầu theo chuẩn SigV4 bằng thông tin trong hai biến `AWS_*`. Yêu cầu không ký bị từ chối với 403; bucket đang rỗng. Hàm `tofu` của D11.1 tự chuyển các biến `AWS_*` vào container.
+
+### 1. Chuyển state lên backend `s3`
+
+<Terminal where="mac" title="~/masteva-d10/envs/dev/backend.tf">
+
+```bash
+cd ~/masteva-d10/envs/dev
+cat > backend.tf <<'EOF'
+terraform {
+  backend "s3" {
+    bucket       = "d11-state"
+    key          = "shop/dev/terraform.tfstate"
+    region       = "us-east-1"
+    use_lockfile = true
+
+    # Sáu dòng dưới chỉ cần khi kho không phải S3 của AWS
+    endpoints                   = { s3 = "http://d11-s3:8333" }
+    use_path_style              = true
+    skip_credentials_validation = true
+    skip_requesting_account_id  = true
+    skip_metadata_api_check     = true
+    skip_region_validation      = true
+  }
+}
+EOF
+tofu plan -no-color 2>&1 | grep -E '^Error:'
+tofu init -no-color -migrate-state -force-copy | grep -E 'Successfully configured|successfully initialized'
+tofu state list
+keys
+wc -c terraform.tfstate terraform.tfstate.backup
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Error: Backend initialization required, please run "tofu init"
+Successfully configured the backend "s3"! OpenTofu will automatically
+OpenTofu has been successfully initialized!
+random_password.admin
+module.shop.docker_container.web[0]
+module.shop.docker_image.web
+module.shop.docker_network.this
+shop/dev/terraform.tfstate
+       0 terraform.tfstate
+    9420 terraform.tfstate.backup
+    9420 total
+```
+
+</Expected>
+
+Sửa khối `backend` xong, mọi lệnh đều dừng với lỗi cho tới khi bạn `init` lại. `-migrate-state` chép state cũ sang backend mới; `-force-copy` trả lời sẵn câu hỏi xác nhận. Sau đó `state list` đọc từ kho, và bucket có đúng một object. Endpoint là `http://d11-s3:8333`, tên container trong mạng `d11-tools`, vì lệnh `tofu` chạy trong container; `s3get` trên máy thì đi qua cổng 9543.
+
+Dòng cuối cho thấy thứ còn sót: file `terraform.tfstate` cục bộ đã rỗng, nhưng `terraform.tfstate.backup` vẫn chứa bản state cũ, kể cả `ADMIN_TOKEN`.
+
+<Callout kind="danger">
+
+Hai lệnh `rm` dưới xoá các file state cục bộ của `envs/dev` và `envs/prod`. Chỉ chạy sau khi `tofu state list` đã in đủ tài nguyên từ backend mới, như ở trên; nếu xoá khi state chưa lên kho, bạn rơi vào đúng tình huống mất state.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá bản cục bộ, chuyển nốt prod">
+
+```bash
+rm terraform.tfstate terraform.tfstate.backup
+sed 's|shop/dev|shop/prod|' backend.tf > ../prod/backend.tf
+cd ../prod
+tofu init -no-color -migrate-state -force-copy | grep -E 'successfully'
+tofu plan -no-color | grep -E '^No changes|^Plan:'
+rm terraform.tfstate terraform.tfstate.backup
+keys
+cd ../dev
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+OpenTofu has been successfully initialized!
+No changes. Your infrastructure matches the configuration.
+shop/dev/terraform.tfstate
+shop/prod/terraform.tfstate
+```
+
+</Expected>
+
+Hai môi trường, hai key trong cùng bucket. Trong lab chúng chung bucket cho gọn; ngoài đời, production nên có bucket riêng để phân quyền riêng.
+
+<Check id="d10.3.lab-migrate">Khai báo được backend `s3`, chuyển state cục bộ lên đó bằng `init -migrate-state`, kiểm được state nằm trong bucket và dọn bản cục bộ còn chứa secret.</Check>
+
+### 2. Hai người apply cùng lúc
+
+Mở cửa sổ thứ hai. **Terminal 1** là An: muốn thay container web của dev, chạy `apply` và dừng ở câu hỏi xác nhận, chưa trả lời.
+
+<Terminal where="mac" title="Terminal 1 (An): dừng ở câu hỏi, chưa gõ gì">
+
+```bash
+tofu apply -replace='module.shop.docker_container.web[0]'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Plan: 1 to add, 0 to change, 1 to destroy.
+
+Do you want to perform these actions?
+  OpenTofu will perform the actions described above.
+  Only 'yes' will be accepted to approve.
+
+  Enter a value:
+```
+
+</Expected>
+
+**Terminal 2** là Bình, làm việc trên cùng môi trường:
+
+<Terminal where="mac" title="Terminal 2 (Bình)">
+
+```bash
+source ~/masteva-d10/env.sh && source ~/masteva-d10/state/tofu.env
+s3get() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -u "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" "http://localhost:9543/$1"; }
+keys() { s3get 'd11-state?list-type=2' | grep -oE '<Key>[^<]+' | cut -c6-; }
+cd ~/masteva-d10/envs/dev
+tofu plan -no-color 2>&1 | sed -n '/^Error:/,/^  Info:/p'
+keys
+s3get d11-state/shop/dev/terraform.tfstate.tflock | jq .
+```
+
+</Terminal>
+
+<Predict question="An mới chỉ dừng ở câu hỏi, chưa thay đổi gì. Bình chạy plan (chỉ đọc) có được không?">
+
+```text
+Error: Error acquiring the state lock
+
+Error message: operation error S3: PutObject, https response error
+StatusCode: 412, RequestID: 18DD60FEB077C3030EDFB54C, HostID: , api error
+PreconditionFailed: At least one of the pre-conditions you specified did not
+hold
+Lock Info:
+  ID:        e483e343-dd39-e68c-a31a-8c37f677c9e0
+  Path:      d11-state/shop/dev/terraform.tfstate
+  Operation: OperationTypeApply
+  Who:       root@2db846203709
+  Version:   1.13.1
+  Created:   2026-10-11 05:00:59.757083336 +0000 UTC
+  Info:
+shop/dev/terraform.tfstate
+shop/dev/terraform.tfstate.tflock
+shop/prod/terraform.tfstate
+{
+  "ID": "e483e343-dd39-e68c-a31a-8c37f677c9e0",
+  "Operation": "OperationTypeApply",
+  "Info": "",
+  "Who": "root@2db846203709",
+  "Version": "1.13.1",
+  "Created": "2026-10-11T05:00:59.757083336Z",
+  "Path": "d11-state/shop/dev/terraform.tfstate"
+}
+```
+
+Không. An giữ khoá từ lúc lệnh `apply` bắt đầu, kể cả khi đang chờ gõ `yes`; và `plan` của Bình cũng cần khoá. Yêu cầu tạo file khoá của Bình nhận mã 412 `PreconditionFailed`: kho từ chối vì object đã tồn tại. Thông báo cho biết ai đang giữ (`Who`, ở đây là `root@<id container>` vì công cụ chạy trong container; trên máy thật là `tên-user@tên-máy`), từ khi nào và đang làm gì (`OperationTypeApply`). Trong bucket, file `.tflock` nằm cạnh file state và chứa đúng những thông tin đó. ID và giờ trên máy bạn sẽ khác.
+
+</Predict>
+
+Bình không huỷ, chỉ chờ. Chạy lệnh dưới ở Terminal 2, rồi **quay sang Terminal 1 gõ `no`** và Enter:
+
+<Terminal where="mac" title="Terminal 2 (Bình): chờ khoá">
+
+```bash
+tofu plan -no-color -lock-timeout=120s | grep -E '^No changes|^Plan:'
+keys
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+No changes. Your infrastructure matches the configuration.
+shop/dev/terraform.tfstate
+shop/prod/terraform.tfstate
+```
+
+</Expected>
+
+Lệnh của Bình đứng yên cho tới khi An trả lời; An thoát, khoá được nhả, plan của Bình chạy tiếp. File `.tflock` biến mất khỏi bucket.
+
+<Check id="d10.3.lab-lock">Tái hiện được lỗi `Error acquiring the state lock` giữa hai terminal, đọc được thông tin trong file khoá, và dùng được `-lock-timeout` để chờ thay vì thất bại.</Check>
+
+### 3. Khoá kẹt và `force-unlock`
+
+Lần này tiến trình giữ khoá chết mà không kịp nhả. Ở **Terminal 1**, chạy lại `apply` và dừng ở câu hỏi:
+
+<Terminal where="mac" title="Terminal 1 (An): dừng ở câu hỏi lần nữa">
+
+```bash
+tofu apply -replace='module.shop.docker_container.web[0]'
+```
+
+</Terminal>
+
+Ở **Terminal 2**, giết container đang chạy lệnh đó, như khi runner CI bị huỷ hay laptop sập nguồn:
+
+<Callout kind="danger">
+
+`docker kill` ở dòng đầu giết **mọi** container mang nhãn `d11=iac`, tức mọi lệnh `tofu` hay `terraform` của lab đang chạy ở bất kỳ terminal nào; lúc này chỉ có lệnh `apply` đang chờ ở Terminal 1. `tofu force-unlock -force` gỡ khoá mà không hỏi lại. Trên state thật, chỉ chạy nó sau khi đã xác nhận ba điều nêu ngay dưới khối lệnh.
+
+</Callout>
+
+<Terminal where="mac" title="Terminal 2">
+
+```bash
+docker kill $(docker ps -q --filter label=d11=iac) > /dev/null
+sleep 2; docker ps -q --filter label=d11=iac | wc -l
+tofu plan -no-color 2>&1 | grep -E '^Error:|^  (ID|Who|Created):'
+LOCK_ID=$(tofu plan -no-color 2>&1 | awk '$1 == "ID:" {print $2}')
+tofu force-unlock -force "$LOCK_ID" | grep -v '^$'
+tofu plan -no-color | grep -E '^No changes|^Plan:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+       0
+Error: Error acquiring the state lock
+  ID:        9dec74d7-f6d5-a907-7df1-17d133fe1376
+  Who:       root@b140de42197e
+  Created:   2026-10-11 05:01:47.828663678 +0000 UTC
+OpenTofu state has been successfully unlocked!
+The state has been unlocked, and OpenTofu commands should now be able to
+obtain a new lock on the remote state.
+No changes. Your infrastructure matches the configuration.
+```
+
+</Expected>
+
+Ở Terminal 1, lệnh `apply` kết thúc ngay, không in thêm gì và trả về dấu nhắc; `echo $?` ở đó cho `137` (128 + 9: bị `SIGKILL`, như D1.1 đã giải thích). Không còn tiến trình nào của công cụ (`0`), nhưng khoá vẫn nằm trong bucket: nhả khoá là việc tiến trình làm lúc thoát, và nó đã không kịp. Không có cơ chế hết hạn; khoá sẽ nằm đó tới khi có người gỡ. `force-unlock` cần đúng ID của khoá, để bạn không gỡ nhầm một khoá khác vừa được lấy. Trước khi gõ lệnh này ngoài đời, hãy xác nhận ba điều từ `Lock Info`: người đó (`Who`) không còn chạy gì, thời điểm `Created` khớp với lần chạy đã chết, và không pipeline nào đang chạy trên state này. Gỡ khoá của một `apply` đang sống là mời hai tiến trình cùng ghi state.
+
+<Check id="d10.3.lab-force-unlock">Tái hiện được một khoá kẹt do tiến trình bị giết, gỡ nó bằng `force-unlock` với đúng ID, và nêu được ba điều phải xác nhận trước khi gỡ.</Check>
+
+### 4. State bị ghi đè và đường quay lại
+
+Từ đây một terminal là đủ; làm tiếp ở Terminal 2. Lưu một bản state, thay đổi hạ tầng, rồi thử ghi bản cũ đè lên:
+
+<Terminal where="mac">
+
+```bash
+tofu state pull > "$LAB/state/old.tfstate"
+jq '{serial, lineage}' "$LAB/state/old.tfstate"
+perl -pi -e 's/replicas    = 1/replicas    = 2/' main.tf
+tofu apply -no-color -auto-approve | grep -E '^Apply'
+tofu state pull | jq .serial
+tofu state push "$LAB/state/old.tfstate" 2>&1 | grep -E 'Error|serial'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{
+  "serial": 1,
+  "lineage": "08f4e74a-564c-f3d4-97c6-de610475531d"
+}
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
+2
+│ Error: Failed to write the imported state
+│ cannot import state with serial 1 over newer state with serial 2
+```
+
+</Expected>
+
+Dev giờ có hai container, `serial` đã tăng, và công cụ từ chối bản cũ: nó thấy `serial` nhỏ hơn bản đang lưu. Giờ đóng vai người làm sai, thêm `-force`:
+
+<Callout kind="danger">
+
+`state push -force` ghi đè state trong kho bằng file bạn đưa, bỏ qua mọi kiểm tra. Ở đây nó chỉ đụng tới state của `shop/dev` trong lab và bước ngay sau khôi phục lại. Trên state thật, đừng chạy lệnh này khi chưa có bản sao của state hiện tại. Khối khôi phục phía sau dùng `state push -force` lần thứ hai, lần này có chủ đích với một file đã xem nội dung, rồi `rm` hai file state tạm trong `~/masteva-d10/state`; hai file đó chỉ là bản sao tải về, state thật nằm trong kho.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+tofu state push -force "$LAB/state/old.tfstate"
+tofu state pull | jq .serial
+tofu plan -no-color | grep -E '^  # |^Plan:'
+docker ps --filter name=d11-shop-dev --format '{{.Names}}' | sort
+```
+
+</Terminal>
+
+<Predict question="Container web-1 của dev vẫn đang chạy. Sau khi state bị ghi đè bằng bản cũ, plan nói gì?">
+
+```text
+2
+  # module.shop.docker_container.web[1] will be created
+Plan: 1 to add, 0 to change, 0 to destroy.
+d11-shop-dev-web-0
+d11-shop-dev-web-1
+```
+
+Plan đòi **tạo** `web[1]`, cái container đang chạy ngay trước mắt. State cũ không biết nó, nên với công cụ, nó chưa tồn tại. Đây là "Terraform believed nothing existed" của callout, ở quy mô một container. Apply lúc này sẽ lỗi vì trùng tên; trên cloud, nơi tên thường không phải duy nhất, bạn có thêm một tài nguyên trùng và tài nguyên cũ thành mồ côi, không còn ai quản. Để ý con số `2`: khi ép ghi, công cụ lưu nội dung cũ nhưng với `serial` của bản nó vừa đè lên, nên từ đây nhìn `serial` không còn phân biệt được bản đúng với bản sai.
+
+</Predict>
+
+Đường quay lại là versioning của bucket: mỗi lần ghi state là một phiên bản mới của object, các bản trước vẫn còn.
+
+<Terminal where="mac">
+
+```bash
+versions() {
+  for v in $(s3get "d11-state?versions=&prefix=$1" | grep -oE "<Key>$1</Key><VersionId>[^<]+" | sed 's/.*<VersionId>//'); do
+    s3get "d11-state/$1?versionId=$v" | jq -r --arg v "$v" \
+      '"serial=\(.serial) web=\([.resources[]? | select(.type == "docker_container") | .instances[]] | length) \($v)"'
+  done
+}
+versions shop/dev/terraform.tfstate
+GOOD=$(versions shop/dev/terraform.tfstate | sed -n 2p | cut -d' ' -f3)
+s3get "d11-state/shop/dev/terraform.tfstate?versionId=$GOOD" > "$LAB/state/good.tfstate"
+tofu state push "$LAB/state/good.tfstate" 2>&1 | grep -E 'Error|serial'
+tofu state push -force "$LAB/state/good.tfstate"
+tofu plan -no-color | grep -E '^No changes|^Plan:'
+rm "$LAB/state/old.tfstate" "$LAB/state/good.tfstate"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+serial=2 web=1 67229ef2e84c1bd1b67c61cbee898959
+serial=2 web=2 67229ef3430da4535eb1b03e2da9385c
+serial=1 web=1 67229f057a2dce93178101e95679913f
+│ Error: Failed to write the imported state
+│ cannot overwrite existing state with serial 2 with a different state that
+│ has the same serial
+No changes. Your infrastructure matches the configuration.
+```
+
+</Expected>
+
+Hàm `versions` liệt kê mọi phiên bản của object state, mới nhất ở trên, kèm `serial` và số container web đọc từ nội dung. Dòng đầu là bản vừa bị ép ghi (một container); dòng thứ hai là bản đúng ngay trước đó (hai container); cả hai cùng `serial`. Tải bản thứ hai về. `state push` thường từ chối nó, vì cùng `serial` mà khác nội dung; lần này `-force` là có chủ đích, sau khi bạn đã xem nội dung và biết chắc đây là bản khớp với thực tế. Plan trở lại "No changes". ID phiên bản trên máy bạn sẽ khác. Hai file vừa tải về chứa `ADMIN_TOKEN` nên được xoá ngay; chúng nằm trong thư mục lab vì hàm `tofu` chỉ thấy các file dưới `$LAB`.
+
+<Check id="d10.3.lab-recover">Tái hiện được việc `state push` từ chối bản cũ, hậu quả khi ép ghi đè, và khôi phục được state đúng từ versioning của bucket.</Check>
+
+### 5. Ai đọc được secret, và mã hoá state
+
+Danh tính `auditor` chỉ có quyền đọc. Xem nó làm được gì:
+
+<Terminal where="mac">
+
+```bash
+(
+  source ~/masteva-d10/state/auditor.env
+  tofu plan -no-color 2>&1 | grep -oE 'AccessDenied' | head -n 1
+  tofu state pull | jq -r '.resources[] | select(.type == "random_password") | .instances[0].attributes.result'
+)
+docker exec d11-shop-dev-web-0 printenv ADMIN_TOKEN
+```
+
+</Terminal>
+
+<Predict question="Tài khoản chỉ đọc không chạy được plan vì không tạo được file khoá. Nó có lấy được ADMIN_TOKEN không?">
+
+```text
+AccessDenied
+5rnjRxRUWVkY2pIIquDArd0m
+5rnjRxRUWVkY2pIIquDArd0m
+```
+
+Có. `plan` thất bại với `AccessDenied` vì không ghi được file khoá, nhưng `state pull` chỉ cần đọc, và state có token dạng chữ thường, trùng với giá trị container đang dùng. "Chỉ đọc" trên kho state không phải quyền vô hại. Cặp ngoặc đơn chạy các lệnh trong một shell con, để thông tin của `auditor` không đè lên biến của terminal.
+
+</Predict>
+
+Giờ bật mã hoá phía client của OpenTofu. Cấu hình nằm trong file đuôi `.tofu`, loại file chỉ OpenTofu đọc:
+
+<Terminal where="mac" title="~/masteva-d10/envs/dev/encryption.tofu">
+
+```bash
+cat > encryption.tofu <<'EOF'
+variable "state_passphrase" {
+  type      = string
+  sensitive = true
+}
+
+terraform {
+  encryption {
+    key_provider "pbkdf2" "lab" {
+      passphrase = var.state_passphrase
+    }
+
+    method "aes_gcm" "lab" {
+      keys = key_provider.pbkdf2.lab
+    }
+
+    # Cho phép đọc state chưa mã hoá trong lần chuyển đổi đầu tiên
+    method "unencrypted" "migrate" {}
+
+    state {
+      method = method.aes_gcm.lab
+
+      fallback {
+        method = method.unencrypted.migrate
+      }
+    }
+  }
+}
+EOF
+echo "export TF_VAR_state_passphrase=$(openssl rand -hex 16)" >> ~/masteva-d10/state/tofu.env
+source ~/masteva-d10/state/tofu.env
+tofu apply -no-color -auto-approve | grep -E '^Apply'
+s3get d11-state/shop/dev/terraform.tfstate | jq -c 'keys'
+(
+  source ~/masteva-d10/state/auditor.env; unset TF_VAR_state_passphrase
+  s3get d11-state/shop/dev/terraform.tfstate | grep -c "$(docker exec d11-shop-dev-web-0 printenv ADMIN_TOKEN)"
+)
+tofu plan -no-color | grep -E '^No changes|^Plan:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Apply complete! Resources: 0 added, 0 changed, 0 destroyed.
+["encrypted_data","encryption_version","lineage","meta","serial"]
+0
+No changes. Your infrastructure matches the configuration.
+```
+
+</Expected>
+
+`apply` không đổi tài nguyên nào nhưng ghi lại state ở dạng mã hoá: object giờ chỉ còn `serial`, `lineage`, phiên bản định dạng mã hoá, tham số dẫn xuất khoá (`meta`) và một khối `encrypted_data`. `auditor` tải được object nhưng tìm token trong đó ra `0` lần. Người có passphrase vẫn làm việc bình thường. Trong lab, khoá sinh từ passphrase bằng PBKDF2; ở nơi làm việc, dùng key provider `aws_kms`, `gcp_kms` hoặc `openbao` để không ai phải cầm passphrase, và sau lần chuyển đổi thì bỏ khối `fallback` để state chưa mã hoá không còn được chấp nhận. Mất khoá là mất state: không có đường giải mã nào khác.
+
+Còn một chỗ dễ quên:
+
+<Terminal where="mac">
+
+```bash
+OLDEST=$(versions shop/dev/terraform.tfstate | tail -n 1 | cut -d' ' -f3)
+(
+  source ~/masteva-d10/state/auditor.env
+  s3get "d11-state/shop/dev/terraform.tfstate?versionId=$OLDEST" | grep -c "$(docker exec d11-shop-dev-web-0 printenv ADMIN_TOKEN)"
+)
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1
+```
+
+</Expected>
+
+Phiên bản cũ nhất trong bucket vẫn là chữ thường và vẫn chứa token (`1`). Bật mã hoá không viết lại lịch sử: versioning vừa cứu bạn ở bước 4 cũng giữ lại mọi bản chưa mã hoá. Sau khi bật, xoay vòng các secret đã từng nằm trong state, và đặt chính sách hết hạn cho phiên bản cũ.
+
+Khối `backend "s3"` của bài chạy nguyên với Terraform 1.16.5 (đã kiểm khi viết bài, gồm cả khoá bằng `use_lockfile`). Phần mã hoá thì không: Terraform bỏ qua file `.tofu`, và khi gặp state OpenTofu đã mã hoá thì dừng với lỗi `Unsupported state file format`, nên bật tính năng này là quyết định ở lại với OpenTofu.
+
+<Check id="d10.3.lab-encrypt">Chứng minh được tài khoản chỉ đọc lấy được secret từ state, bật được mã hoá state của OpenTofu, và chỉ ra được vì sao các phiên bản cũ trong bucket vẫn là rủi ro.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`Error: Backend initialization required`** hoặc `Backend configuration changed`: bạn sửa khối `backend` mà chưa chạy `tofu init`. Thêm `-migrate-state` nếu muốn mang state theo, `-reconfigure` nếu muốn bỏ lại.
+- **`dial tcp: lookup d11-s3 … no such host`:** container `d11-s3` chưa chạy, hoặc không nằm trong mạng `d11-tools`. Kiểm bằng `docker ps --filter name=d11-s3`.
+- **`failed to get shared config profile`** hoặc 403 `InvalidAccessKeyId` dù khoá đúng: shell còn `AWS_PROFILE` hay `AWS_SESSION_TOKEN` của một tài khoản AWS thật và bạn chưa `source` file `.env` của lab trong terminal đó. Chạy `source ~/masteva-d10/state/tofu.env`; file này tự `unset` các biến đó.
+- **`SignatureDoesNotMatch`** hay `InvalidAccessKeyId`: terminal chưa `source ~/masteva-d10/state/tofu.env`, hoặc bạn tạo lại `s3.json` mà chưa khởi động lại container (`docker restart d11-s3`).
+- **`NoSuchBucket`:** bucket chưa được tạo; chạy lại vòng `until` ở bước 0.
+- **`Error acquiring the state lock` mãi không hết:** còn một lệnh `tofu` đang chờ ở terminal khác, hoặc khoá kẹt. Xem `docker ps --filter label=d11=iac`, rồi làm theo bước 3.
+- **`encryption.key_provider.pbkdf2.lab depends on var.state_passphrase which is not available`:** terminal chưa có biến `TF_VAR_state_passphrase`; `source` lại `tofu.env`.
+- **`s3get` in ra XML có `AccessDenied`:** bạn đang dùng thông tin của `auditor` cho một thao tác ghi, hoặc gọi ngoài bucket `d11-state`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá mọi container và mạng của `envs/dev`, `envs/prod`, rồi xoá container `d11-s3` cùng volume `d11-s3-data`, **tức toàn bộ state và lịch sử phiên bản của nó**. Thứ tự quan trọng: `destroy` trước, xoá kho sau; làm ngược lại là tự tạo tình huống mất state. Thư mục `state/` chứa secret của kho và passphrase cũng bị xoá. Giữ lại `modules/` cho D11.5.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+source ~/masteva-d10/env.sh && source ~/masteva-d10/state/tofu.env
+cd ~/masteva-d10/envs/dev && tofu destroy -no-color -auto-approve | grep -E '^Destroy'
+cd ~/masteva-d10/envs/prod && tofu destroy -no-color -auto-approve | grep -E '^Destroy'
+docker rm -f d11-s3 && docker volume rm d11-s3-data
+docker ps -a --filter name=d11- --format '{{.Names}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Destroy complete! Resources: 5 destroyed.
+Destroy complete! Resources: 5 destroyed.
+d11-s3
+d11-s3-data
+```
+
+</Expected>
+
+<Terminal where="mac" title="Xoá thư mục của bài">
+
+```bash
+cd ~/masteva-d10 && rm -rf state envs
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao khoá bằng một object trong S3 lại đủ, không cần DynamoDB nữa?">
+
+Khoá phân tán cần một phép toán nguyên tử kiểu "tạo nếu chưa có". Trước đây S3 không có phép đó: hai yêu cầu ghi cùng tên đều thành công và bản sau thắng, nên backend `s3` phải mượn DynamoDB, nơi có ghi có điều kiện. Từ tháng 08/2024, S3 hỗ trợ ghi có điều kiện với header `If-None-Match`. Terraform 1.10 (27/11/2024) thêm khoá bằng S3, bản 1.11 (27/02/2025) coi nó là ổn định và đánh dấu các tham số DynamoDB là lỗi thời. OpenTofu có `use_lockfile` từ 1.10 (24/06/2025); tài liệu của nó gọi khoá bằng S3 là cách nên dùng ("preferred"), đồng thời ghi rõ cả hai cơ chế đều được hỗ trợ đầy đủ và chưa có kế hoạch bỏ cái nào. Hệ quả cho bạn: kho tương thích S3 phải hỗ trợ đúng phép đó thì khoá mới có nghĩa. SeaweedFS 4.48 trong lab trả 412 đúng như S3; nếu dùng một kho khác, hãy chạy lại bước 2 để kiểm, vì một kho bỏ qua header này sẽ để cả hai bên "lấy được khoá".
+
+</Reveal>
+
+<Reveal title="Có nên dùng force-unlock trong pipeline để tự gỡ khoá kẹt?">
+
+Không. Pipeline không phân biệt được khoá kẹt với khoá của một lần chạy đang sống ở runner khác, và tự gỡ khoá chính là tắt khoá. Cách làm đúng là giảm khả năng kẹt và làm cho việc gỡ là quyết định của người: cho mỗi state một hàng đợi (GitLab có `resource_group`, GitHub Actions có `concurrency`) để không có hai job cùng chạy; đặt `-lock-timeout` vài phút để job đến sau chờ thay vì thất bại; không cho huỷ job giữa lúc apply; và khi khoá kẹt thật, người trực đọc `Lock Info`, đối chiếu với lịch sử pipeline rồi mới gỡ.
+
+</Reveal>
+
+<Reveal title="Sự cố DataTalks.Club: remote state chặn được bước nào, không chặn được bước nào?">
+
+Phần phân tích này là của bài. Remote state chặn **bước đầu**: trên máy mới, `init` nối tới cùng backend, plan thấy hạ tầng đang có và không tạo trùng; cũng không còn "file state cũ trong một thư mục nén" để ai đó vô tình chép đè. Nó không chặn một lệnh `destroy` chạy với đúng state: công cụ sẽ làm đúng điều được yêu cầu. Lớp chặn cho bước đó là thứ tác giả thêm sau sự cố: deletion protection ở cả hai tầng, `prevent_destroy` (D11.1), quyền của người và của agent không bao gồm xoá tài nguyên dữ liệu, plan do người đọc trước khi chạy. Và khi mọi lớp đều thủng thì chỉ còn sao lưu nằm **ngoài** tầm với của công cụ vừa gây ra sự cố, đã từng được thử khôi phục.
+
+</Reveal>
+
+<Reveal title="Nhiều root module cần dùng giá trị của nhau thì lấy qua đâu?">
+
+Khi tách state theo môi trường và thành phần, root "ứng dụng" cần id mạng do root "mạng" tạo. Có ba cách. Data source `terraform_remote_state` đọc output từ state của root kia; tiện, nhưng root đọc phải có quyền đọc **cả** state đó, tức mọi secret trong đó. Cách thứ hai là data source của chính provider: tra tài nguyên theo tên hoặc nhãn (`data "aws_vpc"` với bộ lọc), không cần đụng state của ai. Cách thứ ba là root tạo ghi giá trị ra một kho tham số (SSM Parameter Store, Consul) và root dùng đọc từ đó. Hai cách sau giữ được ranh giới quyền; chặng D22 dùng chúng khi tách state ở quy mô tổ chức.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nên nhờ AI viết khối `backend` cho một nền tảng cụ thể, IAM policy tối thiểu cho kho state, hoặc giải thích một thông báo lỗi khoá. AI hay sai ở: vẫn sinh `dynamodb_table` cho backend `s3` (cách cũ), đặt biến trong khối `backend` của Terraform, gợi ý `-lock=false` hoặc `force-unlock` như bước sửa lỗi thông thường, và đề xuất commit state vào Git "cho dễ chia sẻ". Điều quan trọng hơn: không để agent tự chạy `apply`, `destroy`, `state push` hay `force-unlock` trên hạ tầng thật; sự cố trong callout bắt đầu từ một agent được phép làm vậy và một file state bị thay mà người vận hành không thấy. Cho agent lập plan ra file, tự bạn đọc và tự bạn apply.
+
+</Callout>
+
+<Callout kind="link">
+
+D11.4 xử lý nửa còn lại của "state lệch thực tế": drift do sửa tay, và `import` để đưa tài nguyên mồ côi vào state. D11.5 đưa plan vào review. Chặng D6 đặt apply vào pipeline với một hàng đợi cho mỗi state; chặng D10 dựng kho state thật trên S3 với IAM; chặng D15 quản secret bằng OpenBao và External Secrets để chúng không phải đi qua state; chặng D22 tách state theo thành phần và dùng Atlantis.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d10.3.mastery-backend">Tự cấu hình được remote state cho một root module: backend có khoá, key riêng cho từng môi trường, versioning bật, state cục bộ đã dọn.</Check>
+
+<Check id="d10.3.mastery-incident">Đứng trước lỗi khoá state hoặc một plan đòi tạo lại thứ đang chạy, xác định được nguyên nhân (đang có người chạy, khoá kẹt, state cũ) và xử lý mà không làm hỏng thêm.</Check>
+
+<Check id="d10.3.mastery-access">Trình bày được ai trong đội cần quyền gì trên kho state, vì sao quyền đọc là nhạy cảm, và khi nào dùng mã hoá phía client.</Check>
+
+</Mastery>

@@ -61,6 +61,7 @@ Mọi bài đều có đủ 6 phần theo đúng thứ tự.
   4. **Gỡ lỗi:** các lỗi hay gặp và cách sửa.
   5. **Dọn dẹp:** trả lại tài nguyên, xoá thứ đã tạo.
 - Code dài đặt trong repo mẫu, bài học chỉ trích phần quan trọng.
+- Trong khối `<Terminal where="mac">` không viết chú thích `#` ngoài thân heredoc: zsh tương tác của macOS không coi `#` là chú thích, nên `sleep 5   # chờ…` thành lỗi và không chờ gì. Lời giải thích đặt ở văn bản quanh khối lệnh. `pnpm content:check` chặn lỗi này.
 
 ### 2.5 Đào sâu
 

@@ -1,0 +1,895 @@
+---
+title: HPA và VPA
+description: HorizontalPodAutoscaler tính số pod từ một công thức, cần request đúng mới tính được, và phản ứng chậm hơn bạn nghĩ; đo thời gian phản ứng bằng tải thật từ k6, dùng behavior để HPA không giật, và dùng VPA ở chế độ khuyến nghị để đặt request.
+id: k5.3
+step: k5
+prerequisites: [k5.2]
+topics: [k5.hpa-vpa-autoscaler]
+status: verified
+verified:
+  date: 2026-10-12
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    metrics-server: 0.9.0
+    vertical-pod-autoscaler: 1.8.0 (chart 0.13.0)
+    k6: 2.3.0
+    python: 3.14.8 (image python:3.14.8-alpine)
+    yq: 4.54.1
+---
+
+<Goal>
+
+Hai bài trước lo pod nằm ở đâu. Bài này lo có **bao nhiêu** pod và mỗi pod xin **bao nhiêu** tài nguyên, khi tải thay đổi. Bạn sẽ dựng HorizontalPodAutoscaler (HPA), bắn tải thật vào nó, đo từng giây, rồi dùng VerticalPodAutoscaler (VPA) để kiểm lại con số request. Học xong, bạn giải thích được:
+
+- Vì sao HPA báo `<unknown>` và không làm gì khi pod không khai request.
+- Vì sao tải tăng gấp đôi trong một giây mà gần một phút sau mới đủ pod.
+- Vì sao công thức nói 5 pod mà bước đầu HPA chỉ lên 4, và vì sao tải hết rồi mà 5 phút sau số pod mới giảm.
+- Vì sao một service có tải theo đợt bị HPA "giật" lên xuống liên tục, và hai dòng cấu hình nào chặn điều đó.
+- Vì sao không bật HPA và VPA trên cùng một metric.
+
+</Goal>
+
+<Knowledge>
+
+### Ba hướng co giãn
+
+| Hướng | Thay đổi gì | Công cụ | Dạy ở |
+|---|---|---|---|
+| Ngang, theo pod | Số bản sao của một workload | HPA; KEDA cho nguồn sự kiện | Bài này; K5.4 |
+| Dọc, theo pod | Request và limit của từng pod | VPA | Bài này |
+| Theo node | Số node của cụm | Cluster autoscaler, Karpenter | K5.4 |
+
+Ba hướng nối đuôi nhau: HPA thêm pod, pod không có chỗ thì `Pending`, autoscaler của cụm thấy pod `Pending` thì thêm node. Mỗi mắt xích có độ trễ riêng, và độ trễ cộng lại.
+
+### HPA: vòng điều khiển và công thức
+
+HPA là một controller chạy trong controller manager. Mặc định mỗi 15 giây nó làm một vòng:
+
+```text
+ container --> kubelet --(mỗi 15s)--> metrics-server --API metrics.k8s.io--> HPA controller
+                                                                                  |
+      mức dùng CPU trung bình của các pod, tính theo % của REQUEST                |
+                                                                                  v
+                  số pod mong muốn = làm tròn lên( số pod hiện tại × metric hiện tại / metric mục tiêu )
+                                                                                  |
+                              kẹp trong [minReplicas, maxReplicas], áp behavior   |
+                                                                                  v
+                                             ghi spec.replicas của Deployment (qua subresource scale)
+```
+
+Ví dụ: 2 pod đang dùng trung bình 111% request, mục tiêu 50%. Số pod mong muốn là 2 × 111 / 50 = 4,44, làm tròn lên thành 5.
+
+Bốn chi tiết của công thức quyết định hành vi thật:
+
+- **Phần trăm tính trên request, không phải trên limit hay trên node.** `averageUtilization: 50` nghĩa là "giữ mức dùng trung bình ở một nửa request". Pod không khai request CPU thì không có mẫu số, HPA không tính được và đứng yên. Request khai quá cao thì phần trăm luôn thấp, HPA không bao giờ tăng; khai quá thấp thì HPA luôn ở `maxReplicas`. Đây là lý do thứ hai phải khai request đúng, sau lý do của scheduler ở K1.2.
+- **Vùng dung sai 10%.** Tỉ lệ metric trên mục tiêu nằm trong khoảng 0,9 tới 1,1 thì HPA không làm gì. Từ Kubernetes 1.37, đặt được riêng cho từng HPA bằng `behavior.scaleUp.tolerance` và `behavior.scaleDown.tolerance`.
+- **Pod chưa có metric bị tính thận trọng.** Pod vừa tạo chưa có mẫu CPU. Khi tính để tăng, HPA coi chúng đang dùng 0%; khi tính để giảm, coi chúng đang dùng 100% mục tiêu. Cả hai đều kìm bớt biên độ.
+- **CPU lúc khởi động bị bỏ qua.** Mẫu CPU của pod trong 5 phút đầu chỉ được dùng nếu pod đã Ready khi mẫu được lấy (`--horizontal-pod-autoscaler-cpu-initialization-period`). Nhờ đó JVM đang khởi động, vốn ngốn CPU, không tự kích HPA tăng thêm pod.
+
+Độ trễ từ lúc tải tăng tới lúc có đủ pod là tổng của một chuỗi:
+
+| Mắt xích | Thời gian điển hình |
+|---|---|
+| metrics-server lấy mẫu từ kubelet | Tới 15 giây |
+| HPA chạy vòng kế tiếp | Tới 15 giây |
+| Scheduler xếp pod, kubelet kéo image và khởi động container | Vài giây tới vài phút (image lớn, node mới) |
+| Ứng dụng khởi động và qua readiness probe | Vài giây; service Spring Boot hàng chục giây (SB12.3) |
+
+HPA là cơ chế đuổi theo tải, không phải đón đầu. Tải tăng nhanh hơn chuỗi trên thì trong khoảng đó, số pod đang có phải tự gánh.
+
+<Callout kind="production">
+
+Ngày 24/07/2022, dịch vụ đăng nhập của Magic bị suy giảm. [Postmortem của họ](https://status.magic.link/incidents/d1s01fnl8tmf) viết gọn: traffic tăng vọt và các pod API **không mở rộng kịp**; API, đăng nhập và trang quản trị lỗi hoặc chậm. Họ xử lý bằng cách tăng tay quy mô hệ thống, rồi sửa chính sách scale-up để chịu được những đợt tăng sau.
+
+Postmortem không nêu chi tiết cấu hình. Phần suy ra của bài: autoscaling không thay được năng lực dự phòng. Với tải có thể tăng gấp đôi trong vài giây, thứ cứu service là `minReplicas` đủ lớn và mục tiêu utilization đủ thấp để số pod đang chạy chịu được đợt tăng trong lúc chờ pod mới. Bước 3 của lab đo khoảng chờ đó trên một ứng dụng khởi động trong vài giây.
+
+</Callout>
+
+<Check id="k5.3.hpa-formula">Tính được số pod mong muốn từ công thức của HPA, giải thích được vì sao pod thiếu request làm HPA đứng yên, và kể được các mắt xích tạo nên độ trễ.</Check>
+
+### Metric: CPU, bộ nhớ, và metric tuỳ biến
+
+HPA `autoscaling/v2` nhận nhiều metric; với nhiều metric, nó tính riêng từng cái và lấy **kết quả lớn nhất**.
+
+| Loại (`type`) | Metric | API cung cấp | Ai phục vụ API đó |
+|---|---|---|---|
+| `Resource` | CPU, bộ nhớ của cả pod | `metrics.k8s.io` | metrics-server |
+| `ContainerResource` | CPU, bộ nhớ của một container (bỏ qua sidecar) | `metrics.k8s.io` | metrics-server |
+| `Pods` | Metric riêng của từng pod, ví dụ request mỗi giây | `custom.metrics.k8s.io` | Một adapter, ví dụ prometheus-adapter |
+| `Object` | Metric của một object khác, ví dụ request mỗi giây của một route | `custom.metrics.k8s.io` | Adapter |
+| `External` | Metric ngoài cụm, ví dụ độ dài hàng đợi | `external.metrics.k8s.io` | Adapter; KEDA (K5.4) |
+
+CPU là metric mặc định vì có sẵn và tỉ lệ thuận với tải ở phần lớn service xử lý request. Nó sai trong hai trường hợp hay gặp:
+
+- **Service chờ I/O.** Một service mà mỗi request chờ database 200 ms có thể cạn thread hoặc cạn connection pool (SB12.2) trong khi CPU mới 20%. HPA theo CPU không thấy gì. Cần metric sát hơn: request mỗi giây, số request đang xử lý.
+- **Worker đọc hàng đợi.** CPU của worker không nói hàng đợi dài bao nhiêu. K5.4 dùng KEDA cho việc này.
+
+**Bộ nhớ hiếm khi là metric tốt cho HPA.** Thêm pod chỉ giảm bộ nhớ mỗi pod nếu bộ nhớ tỉ lệ với tải. JVM giữ heap đã xin (SB11.3), nên một lần tăng vọt làm mức dùng ở lại trên mục tiêu và HPA giữ số pod cao mãi.
+
+### `behavior`: chống giật
+
+Metric dao động, và HPA đuổi theo metric. Không có gì kìm thì số pod **giật** (flapping): tải lên, thêm pod; tải xuống 30 giây, bớt pod; tải lên lại, thêm lại. Mỗi lần thêm là một lần trả đủ chuỗi độ trễ ở trên. Trường `behavior` có ba công cụ, khai riêng cho chiều tăng và chiều giảm:
+
+| Công cụ | Làm gì | Mặc định khi có khai `behavior` |
+|---|---|---|
+| `stabilizationWindowSeconds` | HPA nhớ mọi kết quả tính trong cửa sổ này. Khi giảm, nó dùng kết quả **cao nhất** trong cửa sổ; khi tăng, dùng kết quả thấp nhất | Giảm: 300 giây. Tăng: 0 |
+| `policies` | Giới hạn tốc độ: mỗi `periodSeconds` đổi tối đa bao nhiêu pod (`Pods`) hoặc bao nhiêu phần trăm (`Percent`) | Giảm: 100% mỗi 15 giây. Tăng: thêm 100% hoặc thêm 4 pod mỗi 15 giây, lấy cái lớn hơn |
+| `selectPolicy` | Có nhiều policy thì lấy cái cho phép đổi nhiều nhất (`Max`), ít nhất (`Min`), hoặc cấm hẳn chiều đó (`Disabled`) | `Max` |
+
+Cột mặc định ở trên là những giá trị API server điền vào khi HPA **có** khối `behavior` mà bỏ trống một phần. HPA **không khai** `behavior` đi theo một đường code khác trong controller: cửa sổ giảm vẫn 300 giây, nhưng mỗi bước tăng bị chặn ở tổng số pod bằng mức lớn hơn giữa gấp đôi số pod hiện tại và 4 (hằng số `scaleUpLimitFactor = 2.0`, `scaleUpLimitMinimum = 4.0` trong `horizontal.go`). Từ 2 pod, HPA không có `behavior` lên được tối đa 4 trong một bước; HPA có `behavior` mặc định lên được 6. Bước 3 của lab chạm đúng trần thứ nhất.
+
+Cả hai đường đều thiên về an toàn: tăng ngay, giảm chậm 5 phút. Cửa sổ giảm nên dài hơn chu kỳ dao động của tải: tải lên xuống theo chu kỳ 2 phút thì cửa sổ 60 giây vẫn giật. Bước 5 của lab đo sự khác biệt.
+
+<Check id="k5.3.hpa-behavior">Kể được ba công cụ của `behavior`, giá trị mặc định của chiều tăng và chiều giảm, và vì sao CPU hay bộ nhớ có thể là metric sai cho một service.</Check>
+
+### VPA: đặt request bằng metric
+
+HPA giả định request đã đúng. **VerticalPodAutoscaler** trả lời câu hỏi đứng trước đó: request nên là bao nhiêu? VPA không nằm trong Kubernetes lõi; nó là một dự án của SIG Autoscaling gồm ba thành phần:
+
+| Thành phần | Việc |
+|---|---|
+| Recommender | Đọc mức dùng từ metrics-server, dựng histogram cho từng container, tính khuyến nghị và ghi vào `status` của object VPA |
+| Updater | Tìm pod có request lệch xa khuyến nghị và áp khuyến nghị: đổi tại chỗ, hoặc evict pod để nó được tạo lại |
+| Admission controller | Webhook sửa request của pod lúc pod được tạo, theo khuyến nghị hiện tại |
+
+Trường `updateMode` quyết định dùng tới thành phần nào:
+
+| `updateMode` | Hành vi |
+|---|---|
+| `Off` | Chỉ khuyến nghị. Không pod nào bị đụng. Chỉ cần recommender |
+| `Initial` | Đặt request lúc pod được tạo, sau đó không đổi |
+| `Recreate` (mặc định) | Đặt lúc tạo, và evict pod đang chạy khi request lệch nhiều (có tôn trọng PDB) |
+| `InPlaceOrRecreate` | Đổi request tại chỗ, không khởi động lại, nhờ tính năng in-place resize của Kubernetes; không được thì mới evict |
+| `InPlace` | Chỉ đổi tại chỗ, không bao giờ evict. Còn alpha từ VPA 1.7: phải bật feature gate `InPlace` trên updater và admission controller |
+
+Chế độ `Auto` cũ đã bị đánh dấu deprecated từ VPA 1.5; nó tương đương `Recreate`.
+
+Một khuyến nghị có bốn con số: `target` (nên đặt request bằng số này), `lowerBound` và `upperBound` (ngoài khoảng này updater mới ra tay), `uncappedTarget` (target trước khi áp trần sàn bạn khai). Recommender lấy percentile 90 của mức dùng, cộng 15% dự phòng. Mẫu cũ mất nửa trọng số sau 24 giờ, nên khuyến nghị cần vài ngày dữ liệu mới ổn định. Nó cũng có sàn: 25m CPU và 250 MiB bộ nhớ cho mỗi pod, kể cả khi pod dùng ít hơn nhiều.
+
+**Không dùng HPA và VPA trên cùng một metric.** HPA giữ mức dùng CPU mỗi pod quanh một tỉ lệ của request. VPA nhìn chính mức dùng đó để đổi request. VPA tăng request thì phần trăm utilization tụt, HPA bớt pod, mức dùng mỗi pod lại tăng, VPA lại tăng request. Hai vòng điều khiển kéo nhau. Tài liệu VPA nêu hai cách kết hợp được: HPA theo CPU và VPA chỉ quản bộ nhớ; hoặc HPA theo metric tuỳ biến hay external và VPA quản CPU, bộ nhớ. Bài này dùng cách thứ ba, an toàn hơn cả hai: VPA ở `Off`, con người đọc khuyến nghị rồi sửa manifest.
+
+<Check id="k5.3.vpa">Kể được ba thành phần của VPA, các `updateMode`, bốn con số trong một khuyến nghị, và giải thích được vòng lặp giữa HPA và VPA khi cả hai cùng dùng CPU.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Horizontal Pod Autoscaling](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/): phần "Algorithm details" cho công thức và cách xử lý pod thiếu metric; "Configurable scaling behavior" cho `behavior`.
+- [HorizontalPodAutoscaler Walkthrough](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/): ví dụ từng bước, gồm nhiều metric và metric tuỳ biến.
+- [Vertical Pod Autoscaling](https://kubernetes.io/docs/concepts/workloads/autoscaling/vertical-pod-autoscale/): mô hình ba thành phần và các chế độ cập nhật.
+- [Vertical Pod Autoscaler: Known limitations](https://github.com/kubernetes/autoscaler/blob/master/vertical-pod-autoscaler/docs/known-limitations.md): giới hạn khi dùng cùng HPA và các trường hợp pod `Pending` vì khuyến nghị quá lớn.
+- [Incident Report for Magic: Degraded performance](https://status.magic.link/incidents/d1s01fnl8tmf): postmortem ngắn dùng trong callout production.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k5-lab` của K5.1 (nếu đã xoá, làm lại bước 1 của bài đó). Cần `helm` (D0.2) cho bước cài VPA.
+
+**Profile máy.** Bài thêm metrics-server (khoảng 20 MiB), tối đa 8 pod ứng dụng nhỏ, một pod k6 và VPA recommender; Docker dùng khoảng 1,7 GiB RAM. Máy 8 GB chạy được với Docker 4 GB.
+
+Số đo trong bài lấy trên `Apple M1 Pro`, Docker Desktop cấp 6 CPU. Ứng dụng thử đốt một lượng CPU cố định mỗi request; máy nhanh hay chậm hơn thì số pod cuối cùng khác, còn cách tính thì giống.
+
+Bài có hai biến môi trường mới cho Helm. Chúng tách danh sách repo của lab khỏi cấu hình Helm trên máy bạn, giống ý của `KUBECONFIG` riêng. Cấu hình Helm của máy đang lành thì không cần hai biến này; có chúng thì lab không vấp một repo cũ chưa tải chỉ mục:
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k5/kubeconfig
+export HELM_REPOSITORY_CONFIG=~/masteva-k5/helm/repositories.yaml HELM_REPOSITORY_CACHE=~/masteva-k5/helm/cache
+mkdir -p ~/masteva-k5/k5-3/k6 && cd ~/masteva-k5/k5-3
+```
+
+</Terminal>
+
+### 1. metrics-server và ứng dụng thử
+
+K1.2 đã cài metrics-server và giải thích cờ `--kubelet-insecure-tls` (chỉ dùng cho lab). Cụm này là cụm mới nên cài lại:
+
+<Terminal where="mac">
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.9.0/components.yaml | tail -1
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server --timeout=180s | tail -1
+```
+
+</Terminal>
+
+Ứng dụng thử là một HTTP server viết bằng Python, đưa vào pod qua ConfigMap để không phải build image. Mỗi request tới `/` chạy một vòng lặp tính toán rồi trả tên pod; `/healthz` trả ngay, dành cho probe. Bản đầu của Deployment **cố ý không khai request**.
+
+<Terminal where="mac" title="~/masteva-k5/k5-3/app.py và web.yaml">
+
+```bash
+cat > app.py <<'EOF'
+# Mỗi request GET / đốt một lượng CPU cố định rồi trả tên pod.
+import http.server, math, os, socket
+
+VONG_LAP = int(os.environ.get("VONG_LAP", "300000"))
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/healthz":
+            x = 0.0
+            for i in range(VONG_LAP):
+                x += math.sqrt(i)
+        body = (socket.gethostname() + "\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+class Server(http.server.ThreadingHTTPServer):
+    request_queue_size = 256   # mặc định là 5: kết nối mới bị rớt khi tải dồn
+
+Server(("", 8080), Handler).serve_forever()
+EOF
+kubectl create configmap web-code --from-file=app.py
+cat > web.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: python:3.14.8-alpine
+          command: ["python", "/code/app.py"]
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+          volumeMounts:
+            - { name: code, mountPath: /code }
+      volumes:
+        - name: code
+          configMap: { name: web-code }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: NodePort
+  selector: { app: web }
+  ports:
+    - { port: 80, targetPort: 8080, nodePort: 30080 }
+EOF
+kubectl apply -f web.yaml && kubectl rollout status deploy/web --timeout=300s | tail -1
+curl -s --retry 5 --retry-all-errors --retry-delay 1 localhost:9580/
+```
+
+</Terminal>
+
+Dòng cuối là tên pod trả lời, qua cổng 9580 đã nối vào NodePort 30080 lúc tạo cụm. `curl` có `--retry` vì kube-proxy cần một hai giây để ghi luật cho Service vừa tạo (K2.1):
+
+<Expected>
+
+```text
+configmap/web-code created
+deployment.apps/web created
+service/web created
+deployment "web" successfully rolled out
+web-cf6d49bbd-v7g7h
+```
+
+</Expected>
+
+Manifest không ghi `spec.replicas`. K3.1 đã giải thích: trường đó sẽ do HPA sở hữu, và manifest ghi nó thì mỗi lần `apply` kéo số pod về con số cũ.
+
+Ứng dụng trả lời bằng HTTP/1.0 nên mỗi request là một kết nối mới. Điều đó có lợi cho lab: Service chia tải theo kết nối (K2.1), nên pod mới nhận request ngay khi Ready.
+
+### 2. HPA không có request
+
+Tạo HPA giữ CPU trung bình ở 50% request, từ 2 tới 8 pod:
+
+<Terminal where="mac" title="~/masteva-k5/k5-3/hpa.yaml">
+
+```bash
+cat > hpa.yaml <<'EOF'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+EOF
+kubectl apply -f hpa.yaml
+sleep 45
+kubectl get hpa web
+kubectl describe hpa web | grep -E 'ScalingActive|New size'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+horizontalpodautoscaler.autoscaling/web created
+NAME   REFERENCE        TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+web    Deployment/web   cpu: <unknown>/50%   2         8         2          45s
+  ScalingActive  False   FailedGetResourceMetric  the HPA was unable to compute the replica count: failed to get cpu utilization: missing request for cpu in container app of Pod web-cf6d49bbd-299ff
+  Normal   SuccessfulRescale             45s   horizontal-pod-autoscaler  New size: 2; reason: Current number of replicas below Spec.MinReplicas
+```
+
+</Expected>
+
+HPA làm được đúng một việc: đưa số pod lên `minReplicas`, vì việc đó không cần metric. Còn lại là `<unknown>` và `ScalingActive: False`, với lý do nói thẳng: `missing request for cpu`. Một HPA ở trạng thái này trông như đang hoạt động (object tồn tại, có 2 pod) và sẽ không tăng pod nào khi tải tới. Thêm request:
+
+<Terminal where="mac">
+
+```bash
+yq -i '(select(.kind == "Deployment") | .spec.template.spec.containers[0].resources) =
+  {"requests": {"cpu": "200m", "memory": "64Mi"}, "limits": {"memory": "64Mi"}}' web.yaml
+kubectl apply -f web.yaml && kubectl rollout status deploy/web --timeout=120s | tail -1
+until kubectl get hpa web --no-headers | grep -q '[0-9]%/50%'; do sleep 5; done
+kubectl get hpa web
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web configured
+service/web unchanged
+deployment "web" successfully rolled out
+NAME   REFERENCE        TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+web    Deployment/web   cpu: 1%/50%   2         8         2          95s
+```
+
+</Expected>
+
+Vòng `until` chờ tới khi HPA có metric đầu tiên của pod mới, thường mất 30 tới 60 giây. Request 200m và mục tiêu 50% nghĩa là HPA giữ mỗi pod quanh 100m CPU. Theo K1.2, bộ nhớ có request bằng limit và không đặt CPU limit.
+
+<Check id="k5.3.lab-missing-request">Tái hiện được HPA báo `<unknown>` vì pod thiếu request CPU, tìm được lý do trong `describe`, và sửa được.</Check>
+
+### 3. Bắn tải, rồi xem HPA tính từng bước
+
+Tải được tạo bằng k6 theo mô hình open của SB12.1: gửi đúng số request mỗi giây, không chờ server. k6 chạy thành **một pod trong cụm** và gọi qua Service `web`. Bài không bắn từ máy qua cổng 9580: khi thử, đường qua Docker Desktop làm rớt khoảng 3% kết nối ở tần suất này, và số liệu sẽ lẫn lỗi của phòng lab.
+
+<Terminal where="mac" title="~/masteva-k5/k5-3/k6/tai-deu.js, chay-tai.sh, theo-doi-hpa.sh">
+
+```bash
+cat > k6/tai-deu.js <<'EOF'
+import http from 'k6/http';
+
+// Mô hình open (SB12.1): gửi đúng RATE request mỗi giây trong 3 phút
+export const options = {
+  scenarios: {
+    deu: {
+      executor: 'constant-arrival-rate',
+      rate: Number(__ENV.RATE),
+      timeUnit: '1s',
+      duration: '3m',
+      preAllocatedVUs: 50,
+      maxVUs: 400,
+    },
+  },
+  summaryTrendStats: ['med', 'p(95)', 'p(99)', 'max'],
+};
+
+export default function () {
+  http.get('http://web.k5.svc/');
+}
+EOF
+kubectl create configmap k6-script --from-file=k6/
+cat > ../chay-tai.sh <<'EOF'
+#!/bin/sh
+# Chạy k6 thành pod "k6" trong cụm: ./chay-tai.sh <tên script> [request/giây]
+kubectl delete pod k6 --ignore-not-found >/dev/null
+kubectl apply -f - <<POD
+apiVersion: v1
+kind: Pod
+metadata: { name: k6 }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: k6
+      image: grafana/k6:2.3.0
+      args: ["run", "--quiet", "/scripts/$1"]
+      env:
+        - { name: RATE, value: "${2:-28}" }
+      volumeMounts:
+        - { name: scripts, mountPath: /scripts }
+  volumes:
+    - name: scripts
+      configMap: { name: k6-script }
+POD
+kubectl wait --for=condition=Ready pod/k6 --timeout=180s >/dev/null
+EOF
+cat > ../theo-doi-hpa.sh <<'EOF'
+#!/bin/sh
+# In một dòng mỗi khi HPA $1 đổi metric hoặc số pod; chạy trong $2 giây
+T0=$(date +%s); PREV=""
+while [ $(( $(date +%s) - T0 )) -lt "${2:-300}" ]; do
+  NOW=$(kubectl get hpa "$1" --no-headers | awk '{print "cpu=" $4 " replicas=" $7}')
+  READY=$(kubectl get deploy "$1" -o jsonpath='{.status.readyReplicas}')
+  LIMIT=$(kubectl get hpa "$1" -o jsonpath='{.status.conditions[?(@.type=="ScalingLimited")].reason}')
+  [ "$NOW $READY" != "$PREV" ] && echo "t=$(( $(date +%s) - T0 ))s  $NOW ready=${READY:-0} ($LIMIT)"
+  PREV="$NOW $READY"; sleep 2
+done
+EOF
+chmod +x ../chay-tai.sh ../theo-doi-hpa.sh
+```
+
+</Terminal>
+
+Trên máy viết bài, mỗi request tốn khoảng 16 tới 18 ms CPU. Bắn 28 request mỗi giây là khoảng 450 tới 500m CPU cho cả service.
+
+Nếu để HPA chạy sẵn rồi mới bắn tải, lần tính đầu của nó rơi vào một mẫu CPU chỉ phủ một phần đợt tải, và mỗi lần chạy ra một chuỗi bước khác nhau. Để từng phép tính đọc được, bước này làm ngược lại: gỡ HPA, bắn tải vào 2 pod, chờ tới khi `kubectl top` thấy đủ tải, rồi mới bật HPA. Vòng `until` chờ tổng CPU của hai pod vượt 400m; nếu máy bạn nhanh hơn và con số không lên tới đó, đổi 28 thành số request lớn hơn.
+
+<Terminal where="mac">
+
+```bash
+kubectl delete -f hpa.yaml
+../chay-tai.sh tai-deu.js 28
+T0=$(date +%s)
+until [ "$(kubectl top pod -l app=web --no-headers 2>/dev/null | awk '{s += $2} END {print int(s)}')" -ge 400 ]; do sleep 3; done
+echo "kubectl top thấy đủ tải sau $(( $(date +%s) - T0 )) giây"
+kubectl top pod -l app=web
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+horizontalpodautoscaler.autoscaling "web" deleted from k5 namespace
+pod/k6 created
+kubectl top thấy đủ tải sau 34 giây
+NAME                   CPU(cores)   MEMORY(bytes)   
+web-86cfd8c6fb-rjmgj   255m         12Mi            
+web-86cfd8c6fb-stpq7   245m         12Mi            
+```
+
+</Expected>
+
+Dòng đầu tiên đáng giá đã là một phép đo: tải đủ 28 request mỗi giây ngay từ giây 0, nhưng phải 34 giây sau `kubectl top` mới thấy. Đó là mắt xích đầu của bảng độ trễ (kubelet và metrics-server lấy mẫu theo chu kỳ, và mỗi mẫu là trung bình của một khoảng thời gian), và HPA nhìn đúng nguồn số liệu này. Hai pod đang gánh khoảng 250m mỗi pod trên request 200m.
+
+<Predict question="2 pod, mỗi pod đang dùng khoảng 250m trên request 200m, tức khoảng 125%. Mục tiêu là 50%. Bật HPA lúc này, nó đưa số pod lên bao nhiêu ở lần tính đầu, và dừng ở đâu?">
+
+Công thức cho 2 × 125 / 50 = 5. Nhưng lần tính đầu chỉ lên **4**: HPA không khai `behavior` bị chặn mỗi bước ở mức lớn hơn giữa gấp đôi số pod hiện tại và 4 pod. Lần tính kế tiếp mới lên 5, và dừng ở đó vì 5 pod chia 500m là khoảng 100m mỗi pod, đúng mục tiêu.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl apply -f hpa.yaml
+../theo-doi-hpa.sh web 100
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/k6 --timeout=180s
+kubectl logs k6 | grep -E 'http_req_duration\.|http_req_failed|http_reqs'
+kubectl describe hpa web | grep 'New size'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+horizontalpodautoscaler.autoscaling/web created
+t=0s  cpu=125%/50% replicas=2 ready=2 (ScaleUpLimit)
+t=2s  cpu=125%/50% replicas=2 ready=4 (ScaleUpLimit)
+t=17s  cpu=114%/50% replicas=4 ready=5 (DesiredWithinRange)
+t=32s  cpu=60%/50% replicas=5 ready=5 (DesiredWithinRange)
+t=47s  cpu=50%/50% replicas=5 ready=5 (DesiredWithinRange)
+t=77s  cpu=52%/50% replicas=5 ready=5 (DesiredWithinRange)
+t=92s  cpu=53%/50% replicas=5 ready=5 (DesiredWithinRange)
+pod/k6 condition met
+    http_req_duration..............: med=16.71ms p(95)=21.54ms p(99)=47.16ms max=301.56ms
+    http_req_failed................: 0.00%  0 out of 5040
+    http_reqs......................: 5040   27.99956/s
+  Normal  SuccessfulRescale  2m28s  horizontal-pod-autoscaler  New size: 4; reason: cpu resource utilization (percentage of request) above target
+  Normal  SuccessfulRescale  2m13s  horizontal-pod-autoscaler  New size: 5; reason: cpu resource utilization (percentage of request) above target
+```
+
+</Expected>
+
+Cột `replicas` là con số HPA ghi nhận ở vòng trước nên chậm một nhịp; cột `ready` là số pod đang thật sự nhận traffic; trong ngoặc là lý do của điều kiện `ScalingLimited`. Đọc theo thời gian:
+
+- **Giây 0: 125%, lên 4.** HPA tính ngay khi được tạo. Công thức cho 2 × 125 / 50 = 5 pod, nhưng nó chỉ lên **4** và ghi lý do `ScaleUpLimit`: đây là trần max(2 × 2, 4) = 4 của HPA không khai `behavior`. Hai giây sau, 4 pod đã Ready.
+- **Giây 17: lên 5.** Vòng tính kế tiếp, 15 giây sau. Lúc này có 4 pod nhưng 2 pod mới chưa có metric. HPA lấy 114% của hai pod cũ, coi hai pod mới là 0%, ra trung bình 57%, và tính 4 × 57 / 50 = 4,56, làm tròn lên thành 5.
+- **Từ giây 32: ổn định quanh 50 tới 60%.** Năm pod chia khoảng 500m, mỗi pod khoảng 100m. Con số 60% ở giây 32 vẫn còn lẫn mẫu cũ; từ giây 47, tỉ lệ metric trên mục tiêu nằm trong vùng dung sai 0,9 tới 1,1 nên HPA đứng yên.
+
+Ghép hai khối lại, thời gian phản ứng của cả chuỗi trong lần chạy này: 34 giây để metric thấy tải, cộng tối đa 15 giây chờ vòng tính của HPA (ở đây bằng 0 vì HPA vừa được tạo), cộng khoảng 2 giây để pod mới Ready, rồi thêm một vòng 15 giây cho bước thứ hai. Tức gần một phút từ lúc tải tăng tới lúc đủ pod, với một ứng dụng khởi động trong 2 giây và image đã có sẵn trên node; một service Spring Boot cộng thêm thời gian khởi động của nó vào mỗi bước.
+
+Hai bước đầu lặp lại được qua mọi lần chạy khi soạn bài. Phần sau thì không hẳn: metric dao động, và một lần khi máy đang bận, con số vọt lên 62% ở phút thứ hai làm HPA thêm tới 7 pod. Nếu máy bạn nhanh hơn nhiều và `kubectl top` báo mỗi pod dưới 200m, lần tính đầu ra 4 theo đúng công thức và lý do sẽ là `DesiredWithinRange` thay vì `ScaleUpLimit`.
+
+<Check id="k5.3.lab-scale-up">Bắn được tải thật vào một Deployment, đo được độ trễ của metric, rồi bật HPA và giải thích được từng bước tăng bằng công thức, giới hạn tốc độ và cách HPA xử lý pod chưa có metric.</Check>
+
+### 4. Giảm: cửa sổ ổn định và `behavior`
+
+Lệnh `kubectl wait` ở bước trước đã chờ k6 chạy hết 3 phút, nên tải đã dừng. Vòng `until` dưới chờ thêm tới khi metric tụt về một chữ số, rồi xem HPA đang nghĩ gì:
+
+<Terminal where="mac">
+
+```bash
+until kubectl get hpa web --no-headers | grep -q ' [0-9]%/50%'; do sleep 5; done
+kubectl get hpa web
+kubectl describe hpa web | grep 'AbleToScale' | cut -c1-160
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME   REFERENCE        TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+web    Deployment/web   cpu: 1%/50%   2         8         5          3m3s
+  AbleToScale     True    ScaleDownStabilized  recent recommendations were higher than current one, applying the highest recent recommendation
+```
+
+</Expected>
+
+CPU 1% mà vẫn 5 pod. `ScaleDownStabilized` giải thích: trong 300 giây gần nhất có lúc HPA tính ra 5, và nó dùng kết quả cao nhất. Để yên thì 5 phút sau lần tính cao cuối cùng, HPA giảm một phát từ 5 xuống 2 (mặc định cho phép giảm 100% mỗi 15 giây).
+
+Khai `behavior` để thấy cả hai nút vặn. Lab đặt cửa sổ 60 giây cho nhanh và cho giảm mỗi 30 giây tối đa 1 pod:
+
+<Terminal where="mac" title="~/masteva-k5/k5-3/hpa-behavior.yaml">
+
+```bash
+yq '.spec.behavior = {
+  "scaleUp":   {"stabilizationWindowSeconds": 0,
+                "policies": [{"type": "Percent", "value": 100, "periodSeconds": 15}]},
+  "scaleDown": {"stabilizationWindowSeconds": 60,
+                "policies": [{"type": "Pods", "value": 1, "periodSeconds": 30}]}}' hpa.yaml > hpa-behavior.yaml
+sed -n '/behavior/,$p' hpa-behavior.yaml
+kubectl apply -f hpa-behavior.yaml
+../theo-doi-hpa.sh web 150
+kubectl describe hpa web | grep 'New size' | tail -4
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 30
+horizontalpodautoscaler.autoscaling/web configured
+t=1s  cpu=1%/50% replicas=5 ready=5 (DesiredWithinRange)
+t=28s  cpu=0%/50% replicas=5 ready=4 (ScaleDownLimit)
+t=44s  cpu=0%/50% replicas=4 ready=4 (ScaleDownLimit)
+t=59s  cpu=0%/50% replicas=4 ready=3 (ScaleDownLimit)
+t=74s  cpu=0%/50% replicas=3 ready=3 (ScaleDownLimit)
+t=89s  cpu=0%/50% replicas=3 ready=2 (TooFewReplicas)
+t=104s  cpu=0%/50% replicas=2 ready=2 (TooFewReplicas)
+  Normal  SuccessfulRescale  5m19s  horizontal-pod-autoscaler  New size: 5; reason: cpu resource utilization (percentage of request) above target
+  Normal  SuccessfulRescale  2m4s   horizontal-pod-autoscaler  New size: 4; reason: All metrics below target
+  Normal  SuccessfulRescale  94s    horizontal-pod-autoscaler  New size: 3; reason: All metrics below target
+  Normal  SuccessfulRescale  64s    horizontal-pod-autoscaler  New size: 2; reason: All metrics below target
+```
+
+</Expected>
+
+Tải đã dừng được một lúc nên cửa sổ 60 giây sớm thoả, và số pod đi xuống từng bậc 5, 4, 3, 2, mỗi bậc cách nhau 30 giây, với lý do `ScaleDownLimit`. Giảm từ từ có ích khi pod cần thời gian tắt êm, hoặc khi mỗi pod giữ cache nóng mà mất cả loạt một lúc thì các pod còn lại bị dồn tải.
+
+<Check id="k5.3.lab-scale-down">Chỉ ra được điều kiện `ScaleDownStabilized` giữ số pod sau khi tải hết, và dùng `behavior` để đổi cửa sổ ổn định cùng tốc độ giảm.</Check>
+
+### 5. Tải theo đợt: HPA giật
+
+Kịch bản thứ hai của k6 bắn theo đợt: 60 giây có tải, 60 giây nghỉ, ba lần. Chạy nó hai lượt, mỗi lượt khoảng 6 phút: lượt đầu với cửa sổ giảm bằng 0, lượt sau với cửa sổ 120 giây.
+
+<Terminal where="mac" title="~/masteva-k5/k5-3/k6/tai-dot.js">
+
+```bash
+cat > k6/tai-dot.js <<'EOF'
+import http from 'k6/http';
+
+// Tải theo đợt: 60 giây có tải, 60 giây nghỉ, lặp 3 lần
+const scenarios = {};
+for (let i = 0; i < 3; i++) {
+  scenarios[`dot${i + 1}`] = {
+    executor: 'constant-arrival-rate',
+    rate: Number(__ENV.RATE),
+    timeUnit: '1s',
+    duration: '60s',
+    startTime: `${i * 120}s`,
+    preAllocatedVUs: 50,
+    maxVUs: 400,
+  };
+}
+export const options = { scenarios, summaryTrendStats: ['med', 'p(95)', 'p(99)', 'max'] };
+
+export default function () {
+  http.get('http://web.k5.svc/');
+}
+EOF
+kubectl create configmap k6-script --from-file=k6/ --dry-run=client -o yaml | kubectl replace -f -
+yq '.spec.behavior.scaleDown = {"stabilizationWindowSeconds": 0}' hpa-behavior.yaml | kubectl apply -f -
+../chay-tai.sh tai-dot.js 28
+../theo-doi-hpa.sh web 330 | awk '{print $1, $3, $4}' | paste -sd' ' - | fold -sw 110
+kubectl logs k6 | grep -E 'http_req_duration\.'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/k6-script replaced
+horizontalpodautoscaler.autoscaling/web configured
+pod/k6 created
+t=0s replicas=2 ready=2 t=11s replicas=2 ready=2 t=26s replicas=2 ready=2 t=30s replicas=2 ready=4 t=41s 
+replicas=4 ready=4 t=56s replicas=4 ready=4 t=71s replicas=4 ready=4 t=86s replicas=4 ready=2 t=100s 
+replicas=2 ready=2 t=115s replicas=2 ready=2 t=130s replicas=2 ready=2 t=148s replicas=2 ready=4 t=163s 
+replicas=4 ready=5 t=176s replicas=5 ready=5 t=191s replicas=5 ready=5 t=207s replicas=5 ready=2 t=222s 
+replicas=2 ready=2 t=237s replicas=2 ready=2 t=268s replicas=2 ready=2 t=270s replicas=2 ready=4 t=283s 
+replicas=4 ready=4 t=285s replicas=4 ready=6 t=296s replicas=6 ready=6 t=311s replicas=6 ready=6 t=327s 
+replicas=6 ready=2
+    http_req_duration..............: med=16.82ms p(95)=29.02ms p(99)=76ms   max=294.69ms
+```
+
+</Expected>
+
+Theo dõi cột `ready`: 2, 4, rồi về 2; lại 4, 5, rồi về 2; lại 4, 6, rồi về 2. Mỗi đợt tải, HPA dựng lại từ đầu, và mỗi đợt bắt đầu với chỉ 2 pod. Giờ chạy lại với cửa sổ 120 giây, dài hơn khoảng nghỉ 60 giây giữa hai đợt. Vòng `until` chờ số pod về lại 2 để hai lượt xuất phát như nhau:
+
+<Terminal where="mac">
+
+```bash
+until [ "$(kubectl get deploy web -o jsonpath='{.status.readyReplicas}')" = "2" ]; do sleep 5; done
+yq '.spec.behavior.scaleDown = {"stabilizationWindowSeconds": 120}' hpa-behavior.yaml | kubectl apply -f -
+../chay-tai.sh tai-dot.js 28
+../theo-doi-hpa.sh web 330 | awk '{print $1, $3, $4}' | paste -sd' ' - | fold -sw 110
+kubectl logs k6 | grep -E 'http_req_duration\.'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+horizontalpodautoscaler.autoscaling/web configured
+pod/k6 created
+t=0s replicas=2 ready=2 t=11s replicas=2 ready=2 t=26s replicas=2 ready=4 t=41s replicas=4 ready=5 t=54s 
+replicas=5 ready=5 t=70s replicas=5 ready=5 t=85s replicas=5 ready=5 t=99s replicas=5 ready=5 t=117s 
+replicas=5 ready=5 t=132s replicas=5 ready=5 t=147s replicas=5 ready=5 t=162s replicas=5 ready=5 t=192s 
+replicas=5 ready=5 t=205s replicas=5 ready=5 t=220s replicas=5 ready=5 t=250s replicas=5 ready=5 t=265s 
+replicas=5 ready=5 t=282s replicas=5 ready=5 t=312s replicas=5 ready=5 t=327s replicas=5 ready=5
+    http_req_duration..............: med=16.88ms p(95)=25.08ms p(99)=46.34ms max=171.73ms
+```
+
+</Expected>
+
+Số pod lên 4 rồi 5 ở đợt đầu và đứng yên ở 5 qua cả hai khoảng nghỉ. Kết quả của hai lượt trong lần chạy của bài:
+
+| | Cửa sổ giảm 0 giây | Cửa sổ giảm 120 giây |
+|---|---|---|
+| Số pod qua ba đợt tải | Lên 4, 5 rồi 6, mỗi lần lại về 2 | Lên 5 một lần, giữ nguyên |
+| Pod được tạo mới | 9 | 3 |
+| Số pod đang có khi đợt hai và đợt ba bắt đầu | 2 | 5 |
+| p95, p99 | 29 ms, 76 ms | 25 ms, 46 ms |
+
+Độ trễ hai lượt chênh nhau không nhiều, và đó là điều cần nói thẳng: ứng dụng thử nhẹ tới mức 2 pod vẫn gánh nổi 28 request mỗi giây trong lúc chờ pod mới. Giật chỉ thành độ trễ đáng kể khi số pod còn lại sau lúc giảm **không gánh nổi** đợt tải kế tiếp. Với service thật, mỗi đợt như vậy người dùng trả đủ chuỗi độ trễ ở bước 3, cộng thời gian khởi động của ứng dụng, cộng thời gian chờ node mới nếu cụm hết chỗ (K5.4). Thứ luôn thấy được là dòng thứ hai của bảng: 9 pod bị tạo rồi xoá trong 5 phút, mỗi pod một lần kéo image, khởi động, làm nóng cache.
+
+Cái giá của cửa sổ dài là chạy 5 pod trong lúc nghỉ; đó là đổi tiền lấy sự sẵn sàng, và mặc định 300 giây nghiêng về phía sẵn sàng. Chỉ hạ cửa sổ khi bạn biết tải không quay lại trong khoảng đó.
+
+<Check id="k5.3.lab-flapping">Tái hiện được HPA giật với tải theo đợt, so được số pod bị tạo lại và độ trễ giữa hai giá trị cửa sổ ổn định, và nêu được khi nào giật mới thành độ trễ cho người dùng.</Check>
+
+### 6. VPA ở chế độ khuyến nghị
+
+Request 200m của `web` là con số bài tự chọn. Hỏi VPA xem nó nghĩ gì. Cài riêng recommender, vì chế độ `Off` không cần hai thành phần kia. Lệnh `helm install` dùng cờ `--repo <url>` để lấy chart thẳng từ địa chỉ repo, không cần `helm repo add` như ở K3.1:
+
+<Terminal where="mac" title="~/masteva-k5/k5-3/vpa.yaml">
+
+```bash
+kubectl apply -f hpa-behavior.yaml
+helm install vpa vertical-pod-autoscaler --repo https://kubernetes.github.io/autoscaler --version 0.13.0 \
+  -n vpa --create-namespace --wait \
+  --set admissionController.enabled=false --set updater.enabled=false --set recommender.replicas=1 \
+  | grep -E '^(NAME|STATUS):'
+cat > vpa.yaml <<'EOF'
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: web
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  updatePolicy:
+    updateMode: "Off"      # chỉ khuyến nghị, không đụng vào pod
+EOF
+kubectl apply -f vpa.yaml
+until kubectl get vpa web -o jsonpath='{.status.recommendation}' | grep -q target; do sleep 5; done
+kubectl get vpa web
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+horizontalpodautoscaler.autoscaling/web configured
+NAME: vpa
+STATUS: deployed
+verticalpodautoscaler.autoscaling.k8s.io/web created
+NAME   MODE   CPU   MEM     PROVIDED   AGE
+web    Off    25m   250Mi   True       61s
+```
+
+</Expected>
+
+Service đang rảnh nên VPA đưa ra đúng hai con số sàn của nó: 25m CPU và 250 MiB bộ nhớ. Pod này thật ra dùng khoảng 12 MiB; áp nguyên khuyến nghị bộ nhớ sẽ lãng phí gấp hai mươi lần. Giờ bắn lại tải đều 3 phút, với HPA đang hoạt động, rồi đọc khuyến nghị:
+
+<Terminal where="mac">
+
+```bash
+../chay-tai.sh tai-deu.js 28
+sleep 175
+kubectl top pod -l app=web
+kubectl get vpa web -o yaml | yq '.status.recommendation.containerRecommendations[0]'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/k6 created
+NAME                   CPU(cores)   MEMORY(bytes)   
+web-86cfd8c6fb-6cr5r   93m          12Mi            
+web-86cfd8c6fb-bz2zs   91m          12Mi            
+web-86cfd8c6fb-gjf9l   96m          11Mi            
+web-86cfd8c6fb-jzfvk   97m          11Mi            
+web-86cfd8c6fb-rjmgj   89m          12Mi            
+containerName: app
+lowerBound:
+  cpu: 58m
+  memory: 250Mi
+target:
+  cpu: 182m
+  memory: 250Mi
+uncappedTarget:
+  cpu: 182m
+  memory: 250Mi
+upperBound:
+  cpu: 84271m
+  memory: "10915980491"
+```
+
+</Expected>
+
+Ba điều đọc được, và cả ba là lý do không bật VPA tự động ở đây:
+
+- **`target` 182m, gần gấp đôi mọi con số `kubectl top` đang báo.** VPA đã thấy những giây đầu của đợt tải, khi 2 pod mỗi pod gánh hơn 200m, và lấy percentile cao cộng dự phòng. Với vài phút dữ liệu, khuyến nghị nhảy theo từng đợt tải: trong một lần chạy khác của bài, `target` là 323m ngay sau đợt tải và 126m một phút sau. Con số của bạn sẽ khác.
+- **`upperBound` hơn 80 CPU là vô nghĩa.** Khoảng tin cậy rộng như vậy là cách VPA nói "chưa đủ dữ liệu". Khoảng này hẹp lại sau vài ngày.
+- **VPA đang đo đúng thứ HPA đang điều khiển.** Mức dùng mỗi pod không phải thuộc tính của ứng dụng; nó là kết quả của mục tiêu 50% mà HPA giữ. Nếu VPA tự áp 182m làm request, mục tiêu của HPA thành 91m mỗi pod, HPA bớt pod, mức dùng mỗi pod tăng, và VPA lại nâng khuyến nghị.
+
+Cách dùng VPA cho một service đã có HPA theo CPU: để `Off`, lấy khuyến nghị **bộ nhớ** sau một hai tuần chạy thật (và bỏ qua nó nếu nó chỉ là sàn 250 MiB), còn request CPU thì chọn theo cách bạn muốn HPA phản ứng.
+
+<Check id="k5.3.lab-vpa">Cài được VPA recommender, đọc được bốn con số của một khuyến nghị, và giải thích được từ số liệu vì sao không áp tự động khuyến nghị CPU lên một Deployment đang có HPA theo CPU.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| HPA báo `cpu: <unknown>/50%` mãi | Pod thiếu request CPU; metrics-server chưa chạy; pod vừa tạo chưa có mẫu | `kubectl describe hpa`; `kubectl top pod`; chờ một phút |
+| `kubectl top` báo `Metrics API not available` | metrics-server chưa Ready hoặc thiếu `--kubelet-insecure-tls` trên kind | `kubectl -n kube-system get deploy metrics-server`; xem log của nó |
+| HPA không tăng dù tải cao | Tải không tới đúng Deployment; metric trong vùng dung sai; đã chạm `maxReplicas` | `kubectl get hpa`; `kubectl describe hpa` xem `ScalingLimited` |
+| Số pod bị kéo về con số cũ mỗi lần deploy | Manifest còn ghi `spec.replicas` | Bỏ trường đó khỏi manifest (K3.1) |
+| Pod `k6` ở `Error` | Sai tên script, hoặc ConfigMap `k6-script` chưa có file đó | `kubectl logs k6`; `kubectl describe configmap k6-script` |
+| `helm install` báo `no cached repo found` | Cấu hình Helm của máy có repo trong `helm repo list` mà chỉ mục chưa tải về | Đặt hai biến `HELM_REPOSITORY_*` như phần Chuẩn bị; `helm repo update` cũng sửa được |
+| VPA không có khuyến nghị | Recommender chưa chạy, hoặc chưa đủ một phút metric | `kubectl -n vpa get pods`; `kubectl describe vpa web` |
+
+### Dọn dẹp
+
+K5.4 dùng tiếp cụm và metrics-server. Gỡ ứng dụng thử, HPA và VPA.
+
+<Callout kind="danger">
+
+Khối dưới xoá Deployment `web`, HPA, VPA, gỡ release Helm `vpa` và xoá cả namespace `vpa` cùng mọi thứ trong đó. Chỉ chạy trên cụm lab: kiểm `kubectl config current-context` in ra `kind-k5-lab`.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm và metrics-server cho K5.4">
+
+```bash
+kubectl delete -f vpa.yaml -f hpa-behavior.yaml -f web.yaml
+kubectl delete pod k6 --ignore-not-found
+kubectl delete configmap web-code k6-script
+helm uninstall vpa -n vpa
+kubectl delete namespace vpa
+```
+
+</Terminal>
+
+Hai CRD của VPA vẫn ở lại trong cụm sau `helm uninstall`; chúng vô hại với các bài sau. Nếu dừng hẳn ở đây, xoá cụm bằng khối lệnh cuối bài K5.1.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nên đặt mục tiêu utilization bao nhiêu?">
+
+Mục tiêu là phần năng lực bạn dùng lúc bình thường; phần còn lại là dự phòng cho khoảng thời gian HPA chưa kịp phản ứng. Mục tiêu 50% nghĩa là số pod hiện có chịu được tải gấp đôi trước khi vượt request. Mục tiêu 80% tiết kiệm hơn nhưng chỉ còn 25% dự phòng. Cách chọn: ước lượng tải có thể tăng bao nhiêu trong thời gian phản ứng bạn đo được ở bước 3 (cộng thời gian khởi động của ứng dụng thật), rồi đặt mục tiêu sao cho số pod đang chạy gánh được mức tăng đó. Service khởi động chậm, tải tăng dốc thì mục tiêu thấp và `minReplicas` cao. Và nhớ rằng phần trăm tính trên request: đổi request là đổi luôn ý nghĩa của mục tiêu.
+
+</Reveal>
+
+<Reveal title="HPA có khi lên quá số pod cần. Có đáng sửa không?">
+
+Lần chạy trong bài dừng đúng ở 5, nhưng khi HPA có sẵn từ trước lúc tải tăng, có lần nó dừng ở 6, vì ba cơ chế cộng lại: bước đầu bị giới hạn tốc độ nên chưa đủ; bước hai tính với metric của lúc còn 2 pod; và phép làm tròn lên biến 5,04 thành 6. Sau đó chiều giảm bị giữ bởi cửa sổ ổn định, nên pod thừa ở lại ít nhất 5 phút; hết cửa sổ, HPA mới lùi về 5 nếu metric lúc đó đủ thấp để công thức cho ra 5 (với 6 pod là dưới khoảng 41%). Thừa một pod trong vài phút thường rẻ hơn nhiều so với thiếu một pod, nên đây là hành vi hợp lý. Nếu service có hàng trăm pod và mỗi lần tăng đều vượt, giới hạn bước tăng bằng một `policies` kiểu `Percent` nhỏ hơn; đổi lại, nó sẽ đuổi theo tải chậm hơn.
+
+</Reveal>
+
+<Reveal title="Pod có sidecar thì HPA theo CPU tính thế nào?">
+
+Kiểu `Resource` cộng mức dùng và request của **mọi** container trong pod. Một sidecar proxy có request 100m và gần như không dùng CPU sẽ kéo phần trăm utilization của cả pod xuống: ứng dụng chạy 90% request của nó, cả pod mới báo 60%. HPA vì thế tăng muộn. Kiểu `ContainerResource` (ổn định từ Kubernetes 1.30) chỉ tính một container bạn nêu tên, nên metric phản ánh đúng ứng dụng. Dùng nó cho mọi pod có sidecar, kể cả sidecar gốc của K1.3.
+
+</Reveal>
+
+<Reveal title="Rollout và HPA gặp nhau thì sao?">
+
+Trong lúc rollout, Deployment tạo thêm pod theo `maxSurge`. HPA đếm pod theo `scaleTargetRef`, tính metric trên các pod đang Ready, và ghi `spec.replicas`; Deployment controller phân chia con số đó giữa ReplicaSet cũ và mới. Hai bên không giẫm lên nhau, miễn là manifest không ghi `spec.replicas`: nếu ghi, mỗi lần deploy đặt lại số pod về con số trong file, đúng lúc đang có tải. K3.1 đã cho thấy Helm 4 biến lỗi im lặng đó thành một lỗi conflict.
+
+Điểm cần để ý là pod mới của rollout cũng khởi động và có thể ngốn CPU. Cơ chế bỏ qua CPU của pod chưa Ready lo phần lớn chuyện này, với điều kiện readiness probe phản ánh đúng lúc ứng dụng sẵn sàng (K1.3).
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết manifest HPA nhanh, và nên nhờ nó dựng khung `behavior` vì cấu trúc lồng nhiều tầng. Chỗ hay sai: (1) dùng `autoscaling/v1` hoặc `v2beta2` đã cũ; (2) tạo HPA cho Deployment không có request, hoặc để nguyên `replicas` trong manifest; (3) đề xuất HPA theo bộ nhớ cho service JVM; (4) đặt `stabilizationWindowSeconds: 0` cho chiều giảm "để tiết kiệm"; (5) bật VPA `Recreate` cùng HPA theo CPU; (6) khẳng định HPA phản ứng "ngay lập tức". Kiểm bằng cách của bài này: bắn tải thật, ghi mốc thời gian từng bước, và so số pod với công thức.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.2 dạy request, limit và metrics-server; K3.1 nói vì sao manifest không được ghi `replicas` khi có HPA. SB12.1 dạy k6 và mô hình open; SB12.2 nói về thread pool và connection pool, những nút thắt mà CPU không cho thấy; SB12.3 rút ngắn thời gian khởi động, tức rút ngắn độ trễ của mỗi bước tăng. K5.4 tiếp tục với KEDA cho metric ngoài cụm và autoscaler của node, mắt xích kế tiếp khi pod mới không có chỗ. D12.2 dạy Prometheus, nguồn của metric tuỳ biến. D18 bàn về kế hoạch dung lượng, nơi quyết định `minReplicas` và mục tiêu.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k5.3.mastery-hpa">Viết được HPA cho một service thật: chọn metric, mục tiêu, `minReplicas`, `maxReplicas` và `behavior` có lý do, và nói được request của pod ảnh hưởng tới từng lựa chọn thế nào.</Check>
+
+<Check id="k5.3.mastery-measure">Đo được thời gian phản ứng của HPA bằng tải thật, chỉ ra mỗi khoảng thời gian thuộc mắt xích nào, và giải thích được số pod cuối cùng bằng công thức.</Check>
+
+<Check id="k5.3.mastery-vpa">Dùng được VPA ở chế độ `Off` để rà request của một workload, biết khi nào khuyến nghị chưa đáng tin, và nêu được ba cách kết hợp HPA với VPA không gây vòng lặp.</Check>
+
+</Mastery>

@@ -1,0 +1,792 @@
+---
+title: Vá hệ điều hành theo đợt, AWX và Semaphore
+description: Vá bốn máy web bằng một playbook theo đợt với canary, serial, max_fail_percentage, khởi động lại có kiểm soát và kiểm sức khoẻ; so với vá đồng loạt bằng một bộ đếm máy còn phục vụ, rồi chạy playbook từ Semaphore UI để có nơi chạy chung và nhật ký.
+id: d20.5
+step: d20
+prerequisites: [d20.4]
+topics: [d20.va-os-theo-dot, d20.awx-semaphore]
+status: verified
+verified:
+  date: 2026-10-11
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    ansible-core: 2.21.5
+    incus: 6.0.5
+    nginx: 1.28.3-2ubuntu1 lên 1.28.3-2ubuntu1.11
+    docker: 29.1.3
+    semaphore: 2.19.16
+    jq: 1.8.1
+---
+
+<Goal>
+
+Đưa một bản vá lên cả đội máy mà một bản vá hỏng chỉ lấy đi của bạn một máy. Học xong bài này, bạn giải thích được:
+
+- Vì sao tự động cập nhật an toàn cho một máy lại nguy hiểm cho một nghìn máy, qua hai sự cố năm 2023 và 2024.
+- `serial`, `max_fail_percentage` và bước kiểm sức khoẻ phối hợp thế nào để dừng một đợt vá ngay ở máy đầu tiên.
+- Vì sao "máy đã khởi động lại xong" chưa có nghĩa "dịch vụ đã sẵn sàng".
+- AWX và Semaphore thêm gì so với việc chạy playbook từ laptop, và khi nào cần chúng.
+
+</Goal>
+
+<Knowledge>
+
+### Cùng một thay đổi, cùng một lúc, trên mọi máy
+
+D1.2 đã xem `unattended-upgrades`: máy tự cài bản vá bảo mật mỗi ngày. Với một máy, đó là lựa chọn đúng. Với một đội máy, nó có một tính chất đáng sợ: **mọi máy nhận cùng một thay đổi trong cùng một khung giờ**. Nếu bản vá tương tác xấu với thứ gì đó chỉ hạ tầng của bạn có, cả đội máy hỏng cùng lúc, và mọi cơ chế dự phòng dựa trên "máy bên cạnh vẫn chạy" đều vô nghĩa.
+
+<Callout kind="production">
+
+**Datadog, 08/03/2023.** Theo [bài phân tích của Datadog](https://www.datadoghq.com/blog/2023-03-08-multiregion-infrastructure-connectivity-issue/), lúc 06:00 UTC một bản vá bảo mật của systemd được tự động cài lên nhiều VM. Khi `systemd-networkd` khởi động lại, nó xoá các route do plugin mạng của container (Cilium) quản lý, và node mất kết nối. Hàng chục nghìn node rơi khỏi mạng trong vòng một giờ, ở năm vùng trên ba nhà cung cấp cloud. Bài viết giải thích vì sao các vùng vốn không nối với nhau lại hỏng cùng lúc: khung tự cập nhật mặc định của hệ điều hành là 06:00–07:00 UTC ở mọi nơi. Bản vá đi qua một kênh cập nhật bảo mật cũ còn bật sẵn trong image nền; họ đã tắt kênh đó ở mọi vùng.
+
+**CrowdStrike, 19/07/2024.** Theo [báo cáo sơ bộ của CrowdStrike](https://www.crowdstrike.com/en-us/blog/falcon-content-update-preliminary-post-incident-report/), lúc 04:09 UTC họ phát một bản cập nhật nội dung cấu hình cho sensor trên Windows; nội dung lỗi gây đọc bộ nhớ ngoài vùng cho phép và làm Windows sập. Bản cập nhật được thu hồi lúc 05:27 UTC; tức 78 phút sau; máy Windows nào trực tuyến trong khoảng đó và đã tải nó về thì bị ảnh hưởng. Trong các biện pháp khắc phục họ nêu có: triển khai loại nội dung này theo từng giai đoạn, bắt đầu bằng canary, và cho khách hàng quyền kiểm soát thời điểm nhận.
+
+Phần sau là nhận định của bài. Hai sự cố khác nhau về kỹ thuật nhưng chung một hình dạng: thay đổi không sai theo nghĩa thông thường (bản vá systemd đúng, cơ chế cập nhật chạy đúng thiết kế), cái sai là **không có lô máy nào đi trước**. Và ở Datadog, đường lan nằm ngoài quy trình triển khai mà họ kiểm soát: một mặc định của image nền.
+
+</Callout>
+
+Không vá cũng không phải lối thoát: lỗ hổng đã công bố mà chưa vá là cửa mở. Lời giải là vá đều, và vá **theo đợt**.
+
+<Check id="d20.5.dong-loat">Giải thích được vì sao cập nhật tự động đồng loạt là rủi ro với một đội máy, và kể được điểm chung của sự cố Datadog 03/2023 và CrowdStrike 07/2024 theo đúng điều nguồn công bố.</Check>
+
+### Chia lô: canary, lô nhỏ, ngưỡng dừng
+
+Một đợt vá an toàn có bốn thành phần:
+
+```text
+ lô 1   canary     web1          vá ─> khởi động lại ─> kiểm sức khoẻ ──đỏ──> DỪNG. 3/4 máy chưa bị đụng tới.
+                                                              │ xanh
+ lô 2   50%        web2  web3    vá ─> khởi động lại ─> kiểm sức khoẻ ──đỏ──> DỪNG. web4 còn nguyên.
+                                                              │ xanh
+ lô 3   còn lại    web4          vá ─> khởi động lại ─> kiểm sức khoẻ
+```
+
+- **Canary:** một máy (hoặc vài máy) đi trước. Nó tồn tại để hỏng thay cho phần còn lại.
+- **Lô nhỏ dần lớn:** sau canary là các lô tăng dần. Kích thước lô trả lời câu hỏi "mất cùng lúc bao nhiêu máy thì dịch vụ vẫn đủ sức phục vụ" (D18 dạy cách tính năng lực dư).
+- **Kiểm sức khoẻ sau từng máy:** phép kiểm phải hỏi đúng thứ người dùng cần (request có được phục vụ không), không phải "tiến trình có chạy không".
+- **Ngưỡng dừng:** có máy hỏng thì dừng cả đợt, không vá tiếp.
+
+Ansible có sẵn các từ khoá ở mức play cho việc này:
+
+| Từ khoá | Tác dụng |
+|---|---|
+| `serial: 1` hoặc `serial: "25%"` | Chạy **cả play** trên từng lô máy, xong lô này mới sang lô sau |
+| `serial: [1, "50%", "100%"]` | Lô tăng dần: 1 máy, rồi một nửa đội máy, rồi phần còn lại |
+| `max_fail_percentage: 0` | Trong một lô, tỉ lệ máy lỗi vượt ngưỡng này thì dừng toàn bộ play. Không có nó, play chỉ dừng khi **cả lô** hỏng; lô hỏng một phần thì các lô sau vẫn chạy |
+| `any_errors_fatal: true` | Một máy lỗi là dừng ngay mọi máy, kể cả máy cùng lô |
+| `delegate_to: localhost` | Chạy task này ở nơi khác thay cho máy đang xử lý: gọi load balancer, gọi health check từ ngoài |
+| `until`, `retries`, `delay` | Lặp lại một task tới khi điều kiện đúng |
+
+Không có `serial`, Ansible chạy mỗi task trên **mọi máy cùng lúc** (D8.1): task "khởi động lại" sẽ tắt cả đội máy gần như cùng lúc, từng nhóm theo số `forks`.
+
+Hai chi tiết quyết định đợt vá có an toàn thật không. Thứ nhất, **máy lên chưa phải dịch vụ sẵn sàng**: module `reboot` trả về khi SSH kết nối lại được, lúc đó nginx có thể chưa khởi động xong; phép kiểm sức khoẻ phải chờ và thử lại. Thứ hai, trước khi đụng vào một máy đang phục vụ, phải **rút nó khỏi load balancer** và chờ kết nối đang dở kết thúc, rồi trả lại sau khi kiểm xong; D9 dựng load balancer và làm bước này, lab của bài chưa có nên sẽ đo thẳng số máy còn trả lời.
+
+<Check id="d20.5.theo-dot">Kể được bốn thành phần của một đợt vá an toàn, và giải thích được `serial`, `max_fail_percentage`, `delegate_to` và `until` đóng vai gì trong đó.</Check>
+
+### Kiểm soát cái gì được cài, và khi nào
+
+Chia lô chỉ có nghĩa khi mọi lô nhận **cùng một bản vá**. Nếu canary vá hôm thứ Hai và lô cuối vá hôm thứ Sáu từ kho gói trực tiếp, lô cuối có thể nhận một bản mới hơn mà chưa máy nào thử. Ba mức kiểm soát:
+
+| Cách | Mỗi lô nhận gì | Ghi chú |
+|---|---|---|
+| Để `unattended-upgrades` chạy trên mọi máy | Bản mới nhất, mọi máy trong cùng một khung giờ mỗi ngày | Đơn giản nhất; chính là cấu hình của sự cố Datadog |
+| Chia vòng theo ngày: canary thứ Hai, nhóm một thứ Ba… | Bản mới nhất **tại ngày của vòng đó** | Thêm thời gian quan sát, nhưng các vòng vẫn có thể nhận bản khác nhau |
+| Tắt tự động, vá bằng playbook theo đợt từ một kho đã chốt | Đúng một bộ gói đã thử | Cần kho nội bộ hoặc bản chụp kho theo ngày (ví dụ dịch vụ snapshot của Ubuntu), và cần kỷ luật chạy đều |
+
+Bản vá kernel và thư viện nền chỉ có hiệu lực sau khi khởi động lại; Ubuntu báo bằng file `/run/reboot-required` (D1.2). Playbook vá phải đọc file đó và khởi động lại **trong đợt**, có kiểm soát, thay vì để máy tự chọn giờ.
+
+### Vá tại chỗ hay thay bằng image mới
+
+| | Vá tại chỗ theo đợt (bài này) | Thay máy bằng image mới (D8.4) |
+|---|---|---|
+| Hợp với | Máy có trạng thái: database, lưu trữ, máy vật lý | Máy không trạng thái: web, worker |
+| Sau khi vá, máy | Mang thêm lịch sử; drift tích dần | Giống hệt image đã thử |
+| Quay lui | Hạ phiên bản gói, không phải lúc nào cũng được | Chạy lại image cũ |
+| Vẫn phải | Chia lô, kiểm sức khoẻ, có ngưỡng dừng | Chia lô, kiểm sức khoẻ, có ngưỡng dừng |
+
+Dòng cuối là điểm chính: đổi công cụ không miễn cho bạn việc chia lô.
+
+### AWX và Semaphore: nơi chạy playbook của cả nhóm
+
+Một đợt vá hằng tuần không thể sống trên laptop của một người (D8.1 đã nêu ba lý do). Nó cần một **máy chủ điều phối**: lấy playbook từ Git, giữ khoá SSH và mật khẩu vault trong kho riêng, cho phép đúng người bấm chạy đúng việc, chạy theo lịch, và lưu lại ai chạy gì, lúc nào, kết quả ra sao.
+
+| | AWX | Semaphore UI | Pipeline CI (D6) |
+|---|---|---|---|
+| Là gì | Bản mã nguồn mở đứng sau Red Hat Ansible Automation Platform | Một file chạy viết bằng Go kèm giao diện web và API | Hệ thống CI sẵn có, thêm job chạy `ansible-playbook` |
+| Triển khai | Trên Kubernetes, qua operator; cần PostgreSQL | Một container hoặc một binary; SQLite, PostgreSQL hoặc MySQL | Không thêm hệ thống mới |
+| Giấy phép | Apache-2.0 | MIT cho bản cộng đồng; có bản Pro và Enterprise trả phí | Tuỳ hệ thống CI |
+| Mạnh ở | Phân quyền chi tiết, workflow nhiều bước, đồng bộ inventory động | Nhẹ, dựng trong vài phút, chạy được cả Terraform, OpenTofu và script | Cùng chỗ với review mã và lịch sử thay đổi |
+| Lưu ý | README của dự án ghi các bản phát hành đang tạm dừng trong lúc tái cấu trúc lớn; bản gần nhất là 24.6.1, tháng 07/2024. Kiểm lại tình trạng trước khi chọn | Phân quyền đơn giản hơn; tính năng sẵn sàng cao nằm ở bản trả phí | Yếu ở quản lý inventory và ở việc cho người ngoài nhóm phát triển bấm chạy |
+
+Semaphore gọi các thành phần của nó là: **project** gom mọi thứ của một nhóm, **key store** (kho khoá) giữ bí mật mà người dùng không đọc lại được, **inventory**, **repository** trỏ tới Git, **task template** là một playbook đã gắn sẵn inventory và khoá, và **task** là một lần chạy template có nhật ký. AWX có các khái niệm tương ứng với tên khác: organization, credential, project (ở AWX là kho mã nguồn), inventory, job template và job. Pipeline CI không có inventory hay kho khoá theo nghĩa này: inventory là file trong repo, bí mật là biến của CI.
+
+<Check id="d20.5.dieu-phoi">So sánh được ba cách kiểm soát bản vá cho đội máy và hai cách vá (tại chỗ, bằng image mới), và nêu được máy chủ điều phối như AWX hay Semaphore giải quyết những gì.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Controlling playbook execution: strategies and more](https://docs.ansible.com/ansible/latest/playbook_guide/playbooks_strategies.html): `serial` dạng số, phần trăm và danh sách, `max_fail_percentage`, `any_errors_fatal`, `throttle`, `run_once`.
+- [ansible.builtin.reboot](https://docs.ansible.com/ansible/latest/collections/ansible/builtin/reboot_module.html): `reboot_timeout`, `test_command`, `post_reboot_delay`; đọc để hiểu module coi lúc nào là "máy đã lên".
+- [2023-03-08 Incident: Infrastructure connectivity issue affecting multiple regions (Datadog)](https://www.datadoghq.com/blog/2023-03-08-multiregion-infrastructure-connectivity-issue/): phần nguyên nhân và phần giải thích vì sao năm vùng độc lập hỏng cùng một giờ.
+- [Falcon Content Update Preliminary Post Incident Report (CrowdStrike)](https://www.crowdstrike.com/en-us/blog/falcon-content-update-preliminary-post-incident-report/): mục các biện pháp khắc phục về triển khai theo giai đoạn và canary.
+- [Semaphore UI Documentation](https://semaphoreui.com/docs/): cài bằng Docker, khái niệm project, key store, inventory, task template và lịch chạy.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM `d8-lab` và `~/masteva-d20` ở trạng thái cuối D8.4 (role `web`, Docker và `jq` đã cài, policy `FORWARD` là `ACCEPT`). **Profile máy:** VM 2 CPU, 2 GiB; bài chạy năm máy Incus (khoảng 100 MiB mỗi máy lúc rảnh, giới hạn 512 MiB) và, ở bước tuỳ chọn, một container Semaphore (khoảng 100 MiB RAM, image 1,4 GB trên đĩa). Tổng RAM dùng trong VM khoảng 1 GiB. Máy 8 GB chạy được; nếu đĩa VM còn dưới 3 GB (`df -h /`), bỏ qua bước 6.
+
+Thêm hai máy web, đưa chúng vào inventory và cấu hình bằng role:
+
+<Terminal where="vm">
+
+```bash
+cd ~/masteva-d20
+sudo ./nodes.sh up web3=10.20.0.13 web4=10.20.0.14
+sed -i 's/^        web2: .*/&\n        web3: {ansible_host: 10.20.0.13}\n        web4: {ansible_host: 10.20.0.14}/' inventory.yml
+ansible-playbook site.yml | grep -E '^web'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web3 10.20.0.13 sẵn sàng
+web4 10.20.0.14 sẵn sàng
+web1                       : ok=10   changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web2                       : ok=10   changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web3                       : ok=11   changed=7    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web4                       : ok=11   changed=7    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+</Expected>
+
+Hai máy mới đi từ trắng tới giống hệt hai máy cũ bằng đúng lệnh vẫn dùng; hai máy cũ `changed=0`. Lệnh lọc `grep '^web'` giấu mọi thông báo lỗi, nên ở đây và ở các bước sau, mọi dòng phải có `failed=0` trừ khi bài nói khác; nếu không, chạy lại lệnh không qua `grep` để đọc lỗi.
+
+### 1. Một đội máy lâu không vá
+
+Máy lab vừa tạo nên chưa có gì để vá. Playbook dưới đây đưa cả bốn máy về tình trạng thường gặp ở một đội máy bị bỏ quên, gồm ba thứ: gói ở bản cũ, một lần khởi động lại còn nợ (pending reboot: bản vá đã cài nhưng chưa có hiệu lực cho tới khi máy khởi động lại), và một thay đổi tay chưa ai kiểm.
+
+<Terminal where="vm" title="~/masteva-d20/stale.yml">
+
+```bash
+cat > stale.yml <<'EOF'
+- name: Lab - dua doi may web ve tinh trang lau khong va
+  hosts: web
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Tim ban nginx cu nhat con trong kho
+      ansible.builtin.command: apt-cache madison nginx
+      register: stale_madison
+      changed_when: false
+
+    - name: Ha nginx ve ban do
+      ansible.builtin.apt:
+        name:
+          - "nginx={{ stale_version }}"
+          - "nginx-common={{ stale_version }}"
+        allow_downgrade: true
+      vars:
+        stale_version: "{{ (stale_madison.stdout_lines | last).split('|')[1] | trim }}"
+
+    - name: May dang no mot lan khoi dong lai, nhu sau khi cai kernel moi
+      ansible.builtin.copy:
+        content: "*** System restart required ***\n"
+        dest: /run/reboot-required
+        mode: "0644"
+
+    - name: Mot file tinh chinh ai do tha vao tuan truoc, chua tung duoc nap
+      ansible.builtin.copy:
+        content: "worker_processes 8;\n"
+        dest: /etc/nginx/conf.d/tuning.conf
+        mode: "0644"
+EOF
+ansible-playbook stale.yml | grep -E '^web'
+ansible web -m ansible.builtin.command -a "dpkg-query -W nginx" | grep nginx
+for i in 11 12 13 14; do curl -s -m2 "http://10.20.0.$i:8081/healthz"; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web1                       : ok=4    changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web2                       : ok=4    changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web3                       : ok=4    changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web4                       : ok=4    changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+nginx	1.28.3-2ubuntu1
+nginx	1.28.3-2ubuntu1
+nginx	1.28.3-2ubuntu1
+nginx	1.28.3-2ubuntu1
+ok web1
+ok web2
+ok web3
+ok web4
+```
+
+</Expected>
+
+Kho Ubuntu giữ hai bản nginx: bản lúc phát hành (`1.28.3-2ubuntu1`) và bản đã vá trong `-updates`/`-security`; số phiên bản trên máy bạn có thể mới hơn. Cả bốn máy đang phục vụ bình thường. File `tuning.conf` chứa một chỉ thị đặt sai chỗ, nhưng nginx chỉ đọc cấu hình khi khởi động hoặc reload, và chưa ai làm việc đó. Đây là một **lỗi ngủ** (latent bug: lỗi đã có trên máy nhưng chưa gây hậu quả): đội máy khoẻ mạnh cho tới lần khởi động lại kế tiếp.
+
+Để thấy đợt vá ảnh hưởng tới người dùng ra sao, viết một bộ đếm: mỗi nửa giây gọi `/healthz` của cả bốn máy và ghi số máy trả lời. Nó đóng vai load balancer mà D9 mới dựng.
+
+<Terminal where="vm" title="~/masteva-d20/watch.sh">
+
+```bash
+cat > watch.sh <<'EOF'
+#!/usr/bin/env bash
+# Mỗi 0,5 giây: bao nhiêu máy web đang trả lời /healthz
+hosts=(10.20.0.11 10.20.0.12 10.20.0.13 10.20.0.14)
+while true; do
+  n=0
+  for h in "${hosts[@]}"; do
+    curl -sf -m1 -o /dev/null "http://$h:8081/healthz" && n=$((n + 1))
+  done
+  echo "$(date +%T) $n/${#hosts[@]}"
+  sleep 0.5
+done
+EOF
+chmod +x watch.sh
+tong_ket() { awk '{print $2}' "$1" | sort | uniq -c; }
+```
+
+</Terminal>
+
+<Check id="d20.5.lab-stale">Kiểm được phiên bản gói và trạng thái nợ khởi động lại trên cả đội máy bằng lệnh ad-hoc, và giải thích được vì sao một file cấu hình sai có thể nằm im trên máy đang chạy.</Check>
+
+### 2. Vá đồng loạt
+
+Playbook vá: nâng gói, khởi động lại nếu máy yêu cầu, rồi chờ dịch vụ trả lời. Số máy mỗi lô lấy từ biến `patch_serial`, mặc định là canary rồi tăng dần.
+
+<Terminal where="vm" title="~/masteva-d20/patch.yml">
+
+```bash
+cat > patch.yml <<'EOF'
+- name: Va may web theo dot
+  hosts: web
+  become: true
+  gather_facts: false
+  serial: "{{ patch_serial | default([1, '50%', '100%']) }}"
+  max_fail_percentage: 0
+  tasks:
+    - name: Nang cap goi
+      ansible.builtin.apt:
+        upgrade: safe
+        update_cache: true
+
+    - name: May co yeu cau khoi dong lai khong
+      ansible.builtin.stat:
+        path: /run/reboot-required
+      register: patch_reboot_flag
+
+    - name: Khoi dong lai co kiem soat
+      ansible.builtin.reboot:
+        reboot_timeout: 120
+      when: patch_reboot_flag.stat.exists
+
+    - name: Cho dich vu tra loi sau khi va
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ web_http_port }}/healthz"
+      delegate_to: localhost
+      become: false
+      register: patch_health
+      until: patch_health.status == 200
+      retries: 5
+      delay: 2
+EOF
+ansible-playbook patch.yml --syntax-check
+```
+
+</Terminal>
+
+- `upgrade: safe` nâng mọi gói có bản mới mà không gỡ gói nào. Lint coi `state: latest` trong role là lỗi (D8.3); trong playbook vá, nâng cấp chính là mục đích.
+- Module `reboot` khởi động lại máy rồi chờ tới khi SSH vào lại được. File `/run/reboot-required` nằm trên tmpfs nên tự mất sau khi khởi động lại: lần chạy sau task này bị bỏ qua.
+- Task cuối chạy trên control node (`delegate_to: localhost`) và gọi vào máy đang vá **từ bên ngoài**, như một client. `until` thử lại tối đa 5 lần cách nhau 2 giây.
+
+Trước tiên, chạy theo cách không ai chủ ý nhưng rất hay xảy ra: mọi máy cùng lúc. Đặt `patch_serial` là `100%` cho ra đúng hành vi của một playbook không có `serial`.
+
+<Terminal where="vm">
+
+```bash
+./watch.sh > watch-dong-loat.log & W=$!
+ansible-playbook patch.yml -e patch_serial=100% | grep -E '^(TASK|fatal|web)' | cut -c1-150
+sleep 2; kill $W
+tong_ket watch-dong-loat.log
+```
+
+</Terminal>
+
+<Predict question="Bốn máy cùng nâng gói, cùng khởi động lại, và cùng nạp file tuning.conf lần đầu. Thấp nhất còn mấy máy phục vụ, trong bao lâu?">
+
+```text
+TASK [Nang cap goi] ************************************************************
+TASK [May co yeu cau khoi dong lai khong] **************************************
+TASK [Khoi dong lai co kiem soat] **********************************************
+TASK [Cho dich vu tra loi sau khi va] ******************************************
+fatal: [web3 -> localhost]: FAILED! => {"attempts": 5, "changed": false, "elapsed": 0, "msg": "Status code was -1 and not [200]: Request failed: <urlo
+fatal: [web4 -> localhost]: FAILED! => {"attempts": 5, "changed": false, "elapsed": 0, "msg": "Status code was -1 and not [200]: Request failed: <urlo
+fatal: [web2 -> localhost]: FAILED! => {"attempts": 5, "changed": false, "elapsed": 0, "msg": "Status code was -1 and not [200]: Request failed: <urlo
+fatal: [web1 -> localhost]: FAILED! => {"attempts": 5, "changed": false, "elapsed": 0, "msg": "Status code was -1 and not [200]: Request failed: <urlo
+web1                       : ok=3    changed=2    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+web2                       : ok=3    changed=2    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+web3                       : ok=3    changed=2    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+web4                       : ok=3    changed=2    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+     37 0/4
+      1 2/4
+     19 4/4
+```
+
+Không còn máy nào, và không tự hồi phục: bộ đếm ghi `0/4` cho tới khi bạn dừng nó. Số dòng mỗi mức, và mức trung gian mà bộ đếm kịp bắt được lúc các máy đang tắt dần, trên máy bạn sẽ khác. Nâng gói thành công, khởi động lại thành công, và lúc khởi động nginx đọc `tuning.conf` lần đầu rồi từ chối chạy. Playbook có phát hiện ra, nhưng phát hiện **sau khi cả bốn máy đã hỏng**. Bản vá không có lỗi; thứ gây sự cố là một trạng thái ngủ trên máy, bị lần khởi động lại đánh thức trên mọi máy cùng lúc. Đây là hình dạng của sự cố Datadog thu nhỏ.
+
+</Predict>
+
+Khôi phục khẩn cấp: gỡ file thủ phạm trên mọi máy rồi để role đưa dịch vụ về trạng thái đích.
+
+<Terminal where="vm">
+
+```bash
+ansible web1 -b -m ansible.builtin.command -a "nginx -t" 2>&1 | grep -o '"worker_processes.*'
+ansible web -b -m ansible.builtin.file -a "path=/etc/nginx/conf.d/tuning.conf state=absent" | grep -c CHANGED
+ansible-playbook site.yml | grep -E '^web'
+for i in 11 12 13 14; do curl -s -m2 "http://10.20.0.$i:8081/healthz"; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+"worker_processes" directive is not allowed here in /etc/nginx/conf.d/tuning.conf:1
+4
+web1                       : ok=10   changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web2                       : ok=10   changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web3                       : ok=10   changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web4                       : ok=10   changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+ok web1
+ok web2
+ok web3
+ok web4
+```
+
+</Expected>
+
+`changed=1` trên mỗi máy là task `service: started` của role: playbook vá không biết sửa máy, còn role thì mô tả trạng thái đích nên bật lại được dịch vụ.
+
+<Check id="d20.5.lab-dong-loat">Tái hiện được một đợt vá đồng loạt làm hỏng cả đội máy vì một lỗi ngủ, đo được số máy còn phục vụ, và khôi phục được bằng lệnh ad-hoc cùng role.</Check>
+
+### 3. Vá theo đợt: canary dừng đợt vá
+
+Tua lại: đưa đội máy về đúng tình trạng trước sự cố, rồi chạy cùng playbook với `serial` mặc định.
+
+<Terminal where="vm">
+
+```bash
+ansible-playbook stale.yml | grep -c 'changed=3'
+./watch.sh > watch-theo-dot.log & W=$!
+ansible-playbook patch.yml | grep -E '^(PLAY|TASK|changed|fatal|NO MORE|web)' | cut -c1-150 | uniq
+sleep 2; kill $W
+tong_ket watch-theo-dot.log
+ansible web -m ansible.builtin.command -a "dpkg-query -W nginx" | grep -B1 nginx | grep -v '^--' | paste - - | sort | awk '{print $1, $NF}'
+```
+
+</Terminal>
+
+<Predict question="Lần này lô đầu chỉ có web1. Khi web1 hỏng sau khi khởi động lại, ba máy còn lại ra sao?">
+
+```text
+4
+PLAY [Va may web theo dot] *****************************************************
+TASK [Nang cap goi] ************************************************************
+changed: [web1]
+TASK [May co yeu cau khoi dong lai khong] **************************************
+TASK [Khoi dong lai co kiem soat] **********************************************
+changed: [web1]
+TASK [Cho dich vu tra loi sau khi va] ******************************************
+fatal: [web1 -> localhost]: FAILED! => {"attempts": 5, "changed": false, "elapsed": 0, "msg": "Status code was -1 and not [200]: Request failed: <urlo
+NO MORE HOSTS LEFT *************************************************************
+PLAY RECAP *********************************************************************
+web1                       : ok=3    changed=2    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+     33 3/4
+     10 4/4
+web1 1.28.3-2ubuntu1.11
+web2 1.28.3-2ubuntu1
+web3 1.28.3-2ubuntu1
+web4 1.28.3-2ubuntu1
+```
+
+Không bị đụng tới. `PLAY RECAP` chỉ có `web1`: Ansible chưa hề mở kết nối tới ba máy kia. Canary hỏng, và vì lô này chỉ có một máy nên cả lô hỏng: Ansible kết thúc play khi một lô không còn máy nào sống, có `max_fail_percentage` hay không (bước 5 cho thấy từ khoá đó thật sự chặn điều gì). Bộ đếm không bao giờ xuống dưới `3/4`. Ba máy vẫn ở bản cũ, vẫn mang lỗi ngủ, và vẫn phục vụ. Cùng playbook, cùng lỗi, khác đúng một dòng `serial`: sự cố toàn bộ thành mất một phần tư năng lực.
+
+</Predict>
+
+<Check id="d20.5.lab-canary">Chạy được playbook vá với `serial` dạng danh sách và `max_fail_percentage`, và chứng minh được bằng số đo rằng canary hỏng không lan sang các máy khác.</Check>
+
+### 4. Sửa nguyên nhân rồi chạy tiếp
+
+Canary đã chỉ ra vấn đề trong lúc ba phần tư đội máy còn chạy, nên bạn có thời gian chẩn đoán. Sửa nguyên nhân trên **cả đội máy** (kể cả ba máy chưa hỏng), đưa canary về trạng thái đích, rồi chạy lại đúng playbook vá:
+
+<Terminal where="vm">
+
+```bash
+ansible web -b -m ansible.builtin.file -a "path=/etc/nginx/conf.d/tuning.conf state=absent" | grep -c CHANGED
+ansible-playbook site.yml --limit web1 | grep -E '^web'
+./watch.sh > watch-chay-tiep.log & W=$!
+ansible-playbook patch.yml | grep -E '^(PLAY|TASK \[Khoi|changed|skipping|web)'
+sleep 2; kill $W
+tong_ket watch-chay-tiep.log
+ansible web -m ansible.builtin.command -a "dpkg-query -W nginx" | grep -c 'ubuntu1\.'
+ansible-playbook patch.yml | grep -E '^web'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+4
+web1                       : ok=10   changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+PLAY [Va may web theo dot] *****************************************************
+TASK [Khoi dong lai co kiem soat] **********************************************
+skipping: [web1]
+PLAY [Va may web theo dot] *****************************************************
+changed: [web2]
+changed: [web3]
+TASK [Khoi dong lai co kiem soat] **********************************************
+changed: [web2]
+changed: [web3]
+PLAY [Va may web theo dot] *****************************************************
+changed: [web4]
+TASK [Khoi dong lai co kiem soat] **********************************************
+changed: [web4]
+PLAY RECAP *********************************************************************
+web1                       : ok=3    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+web2                       : ok=4    changed=2    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web3                       : ok=4    changed=2    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web4                       : ok=4    changed=2    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+      2 2/4
+      4 3/4
+     51 4/4
+4
+web1                       : ok=3    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+web2                       : ok=3    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+web3                       : ok=3    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+web4                       : ok=3    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+```
+
+</Expected>
+
+- Ba dòng `PLAY` là ba lô: `web1`; rồi `web2` và `web3`; rồi `web4`. Với `serial`, Ansible chạy lại cả play cho từng lô.
+- `web1` đã được vá và khởi động lại ở bước 3 nên lần này không có gì để làm: chạy lại một đợt vá bị dừng giữa chừng là an toàn, nhờ idempotent.
+- Bộ đếm thấp nhất là `2/4`, đúng lúc lô hai máy khởi động lại, và phần lớn thời gian là `4/4`. Số dòng mỗi mức phụ thuộc thời điểm lấy mẫu; điều không đổi là nó không bao giờ xuống dưới số máy ngoài lô đang vá.
+- Cả bốn máy ở bản đã vá, và lần chạy cuối `changed=0`, không máy nào khởi động lại thêm.
+
+Lô hai máy trên bốn nghĩa là có lúc chỉ còn nửa năng lực. Con số `50%` hợp với lab; ở production, kích thước lô suy ra từ năng lực dư mà bạn có.
+
+<Check id="d20.5.lab-rolling">Hoàn tất được một đợt vá theo ba lô sau khi sửa nguyên nhân, đọc được số máy còn phục vụ trong từng giai đoạn, và xác nhận được chạy lại playbook vá là an toàn.</Check>
+
+### 5. `max_fail_percentage` thật sự chặn điều gì
+
+Ở bước 3, lô canary chỉ có một máy nên hỏng là hỏng cả lô, và play tự dừng. Từ khoá `max_fail_percentage` có tác dụng ở chỗ khác: một lô **nhiều máy** mà chỉ **một phần** hỏng. Cấy lại hai thứ, lần này lỗi ngủ chỉ nằm trên `web2`, máy thuộc lô thứ hai, rồi chạy một bản playbook đã bỏ dòng `max_fail_percentage`:
+
+<Terminal where="vm">
+
+```bash
+cay() {
+  ansible web -b -m ansible.builtin.copy -a "content='restart' dest=/run/reboot-required mode=0644" > /dev/null
+  ansible web2 -b -m ansible.builtin.copy -a "content='worker_processes 8;' dest=/etc/nginx/conf.d/tuning.conf mode=0644" > /dev/null
+}
+sua_web2() {
+  ansible web2 -b -m ansible.builtin.file -a "path=/etc/nginx/conf.d/tuning.conf state=absent" > /dev/null
+  ansible-playbook site.yml --limit web2 | grep -E '^web'
+}
+sed '/max_fail_percentage/d' patch.yml > patch-khong-nguong.yml
+cay; ansible-playbook patch-khong-nguong.yml | grep -E '^(NO MORE|web)' | uniq
+ansible web4 -m ansible.builtin.stat -a "path=/run/reboot-required" | grep '"exists"'
+```
+
+</Terminal>
+
+<Predict question="Lô hai gồm web2 và web3; web2 hỏng sau khi khởi động lại, web3 thì không. Không có max_fail_percentage, web4 ở lô ba có bị vá không?">
+
+```text
+web1                       : ok=4    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web2                       : ok=3    changed=1    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+web3                       : ok=4    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web4                       : ok=4    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+        "exists": false
+```
+
+Có. `web2` hỏng, nhưng lô hai vẫn còn `web3` sống, nên Ansible coi lô đó là xong và đi tiếp sang `web4`: file `reboot-required` của `web4` không còn (`"exists": false`), tức nó đã bị khởi động lại. Một đợt vá vừa làm hỏng một máy vẫn chạy tới máy cuối cùng. Nếu lỗi nằm trên mọi máy thay vì chỉ `web2`, cách dừng duy nhất còn lại là "cả lô cùng hỏng", và với lô lớn thì đó là rất nhiều máy.
+
+</Predict>
+
+Đưa `web2` về trạng thái đích, cấy lại đúng tình huống đó, và chạy playbook gốc có `max_fail_percentage: 0`:
+
+<Terminal where="vm">
+
+```bash
+sua_web2
+cay; ansible-playbook patch.yml | grep -E '^(NO MORE|web)' | uniq
+ansible web4 -m ansible.builtin.stat -a "path=/run/reboot-required" | grep '"exists"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web2                       : ok=10   changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+NO MORE HOSTS LEFT *************************************************************
+web1                       : ok=4    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web2                       : ok=3    changed=1    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+web3                       : ok=4    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+        "exists": true,
+```
+
+</Expected>
+
+Lần này một máy hỏng trên lô hai máy là 50%, vượt ngưỡng 0, nên play dừng ngay sau lô đó: `web4` không có trong tổng kết và file `reboot-required` của nó còn nguyên (`"exists": true`). Đó là việc của `max_fail_percentage`: biến "một phần lô hỏng" thành lý do dừng. Đặt `0` khi không chấp nhận máy hỏng nào; với lô vài chục máy, người ta đặt một tỉ lệ nhỏ để một máy trục trặc phần cứng không chặn cả đợt vá.
+
+Sửa `web2`, chạy nốt đợt vá, rồi đưa các playbook của bài vào Git:
+
+<Terminal where="vm">
+
+```bash
+sua_web2 > /dev/null; ansible-playbook patch.yml | grep -E '^web'
+rm patch-khong-nguong.yml && printf 'watch-*.log\n' >> .gitignore
+git add -A && git -c user.name=lab -c user.email=lab@example.com commit -q -m "Va theo dot: stale, patch, watch" && git status --short | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web1                       : ok=3    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+web2                       : ok=3    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+web3                       : ok=3    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+web4                       : ok=4    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+0
+```
+
+</Expected>
+
+<Check id="d20.5.lab-max-fail">Chứng minh được bằng hai lần chạy rằng thiếu `max_fail_percentage` thì một lô hỏng một phần không dừng được đợt vá, và có nó thì các lô sau không bị đụng tới.</Check>
+
+### 6. Chạy playbook từ Semaphore (tuỳ chọn)
+
+Bước này dựng Semaphore UI bằng một container và chạy một playbook qua nó. Mọi thao tác dùng API bằng `curl` để chép lại được; trên giao diện web, mỗi lệnh ứng với một biểu mẫu cùng tên. Playbook mẫu chỉ đọc, nằm trong một thư mục riêng đóng vai kho Git:
+
+<Terminal where="vm" title="~/masteva-d20/semaphore">
+
+```bash
+mkdir -p semaphore/repo && cat > semaphore/repo/check.yml <<'EOF'
+- name: Kiem tra doi may web
+  hosts: web
+  gather_facts: false
+  tasks:
+    - name: Phien ban nginx
+      ansible.builtin.command: nginx -v
+      register: nginx_v
+      changed_when: false
+
+    - name: In phien ban
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ nginx_v.stderr }}"
+EOF
+printf 'semaphore/cookie\n' >> .gitignore
+docker run -d --name d8-semaphore -p 127.0.0.1:13000:3000 -v "$PWD/semaphore/repo:/repo:ro" \
+  -e SEMAPHORE_DB_DIALECT=sqlite -e SEMAPHORE_ADMIN=admin -e SEMAPHORE_ADMIN_NAME=Admin \
+  -e SEMAPHORE_ADMIN_EMAIL=admin@localhost -e SEMAPHORE_ADMIN_PASSWORD=lab-admin-2026 \
+  -e SEMAPHORE_ACCESS_KEY_ENCRYPTION="$(head -c32 /dev/urandom | base64)" \
+  semaphoreui/semaphore:v2.19.16 > /dev/null
+S=http://127.0.0.1:13000/api
+until curl -sf -m2 "$S/ping" > /dev/null; do sleep 1; done
+curl -s -c semaphore/cookie -H 'Content-Type: application/json' -d '{"auth":"admin","password":"lab-admin-2026"}' -o /dev/null -w "%{http_code}\n" "$S/auth/login"
+sem() { curl -s -b semaphore/cookie -H 'Content-Type: application/json' "$@"; }
+sem "$S/info" | jq -r '.version, (.ansible | split("\n")[0])'
+docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' d8-semaphore
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+204
+v2.19.16-f8cefe6-1791363790
+ansible [core 2.20.10]
+d8-semaphore 108MiB / 1.904GiB
+```
+
+</Expected>
+
+Lần đầu Docker kéo image khoảng 1,4 GB; image mang sẵn Ansible của riêng nó (bản 2.20, khác bản 2.21 trên control node: thêm một lý do để chỉ có **một** nơi chạy playbook thật). Mã 204 là đăng nhập thành công; phiên được giữ trong file cookie. Mật khẩu admin và khoá mã hoá ở đây là giá trị của lab; triển khai thật lấy chúng từ kho bí mật. Giao diện web mở được bằng trình duyệt trên Mac ở `http://127.0.0.1:13000`, vì Lima chuyển tiếp các cổng mà VM mở ở `127.0.0.1` ra Mac.
+
+Tạo năm thứ một template cần: project, khoá SSH trong kho khoá, repository, inventory, môi trường.
+
+<Terminal where="vm">
+
+```bash
+P=$(sem -d '{"name":"d8-lab"}' "$S/projects" | jq .id)
+K=$(jq -n --rawfile k ssh/id_ed25519 --argjson p "$P" \
+      '{name:"ops-ssh", type:"ssh", project_id:$p, ssh:{login:"ops", private_key:$k}}' | sem -d @- "$S/project/$P/keys" | jq .id)
+N=$(sem "$S/project/$P/keys" | jq '.[] | select(.type == "none") | .id')
+R=$(sem -d "{\"name\":\"kho-lab\",\"project_id\":$P,\"git_url\":\"/repo\",\"git_branch\":\"\",\"ssh_key_id\":$N}" "$S/project/$P/repositories" | jq .id)
+I=$(jq -n --argjson p "$P" --argjson k "$K" \
+      '{name:"web", project_id:$p, type:"static", ssh_key_id:$k,
+        inventory:"[web]\nweb1 ansible_host=10.20.0.11\nweb2 ansible_host=10.20.0.12\nweb3 ansible_host=10.20.0.13\nweb4 ansible_host=10.20.0.14\n"}' \
+      | sem -d @- "$S/project/$P/inventory" | jq .id)
+E=$(sem -d "{\"name\":\"lab\",\"project_id\":$P,\"json\":\"{}\",\"env\":\"{\\\"ANSIBLE_HOST_KEY_CHECKING\\\":\\\"False\\\"}\"}" "$S/project/$P/environment" | jq .id)
+T=$(sem -d "{\"name\":\"Kiem tra web\",\"project_id\":$P,\"app\":\"ansible\",\"playbook\":\"check.yml\",\"inventory_id\":$I,\"repository_id\":$R,\"environment_id\":$E}" "$S/project/$P/templates" | jq .id)
+echo "project=$P key=$K repo=$R inventory=$I env=$E template=$T"
+sem "$S/project/$P/keys" | jq -c '.[] | select(.type == "ssh") | {name, type, ssh}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+project=1 key=2 repo=1 inventory=1 env=1 template=1
+{"name":"ops-ssh","type":"ssh","ssh":{"login":"","passphrase":"","private_key":""}}
+```
+
+</Expected>
+
+- Khoá SSH của user `ops` giờ nằm trong **kho khoá** của Semaphore, mã hoá bằng `SEMAPHORE_ACCESS_KEY_ENCRYPTION`. API trả về tên và loại của khoá, còn các trường `login` và `private_key` thì rỗng: người được quyền chạy template dùng được khoá mà không đọc lại được nó. Số `key=2` là vì project mới có sẵn một khoá rỗng loại `none` mang id 1; repository cục bộ không cần xác thực nên dùng chính khoá đó (biến `N`).
+- Repository trỏ vào thư mục `/repo` gắn từ VM; hệ thống thật trỏ vào URL Git và một nhánh cụ thể.
+- Môi trường tắt kiểm host key để container nối được tới các máy lab. Đây là lối tắt của lab: container không có file `known_hosts` mà `nodes.sh` đã chuẩn bị. Triển khai thật phải cấp `known_hosts` cho Semaphore, cùng lý do với D2.4.
+
+Chạy template và đọc nhật ký:
+
+<Terminal where="vm">
+
+```bash
+J=$(sem -d "{\"template_id\":$T}" "$S/project/$P/tasks" | jq .id)
+until sem "$S/project/$P/tasks/$J" | jq -e '.status | IN("success","error","stopped")' > /dev/null; do sleep 1; done
+sem "$S/project/$P/tasks/$J/output" | jq -r '.[].output' | sed 's/\x1b\[[0-9;]*m//g' | grep -E 'msg:|ok=' | sed 's/ *$//'
+sem "$S/project/$P/tasks/$J" | jq -c '{id, status, user_id, start, end}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    msg: 'web1: nginx version: nginx/1.28.3 (Ubuntu)'
+    msg: 'web2: nginx version: nginx/1.28.3 (Ubuntu)'
+    msg: 'web3: nginx version: nginx/1.28.3 (Ubuntu)'
+    msg: 'web4: nginx version: nginx/1.28.3 (Ubuntu)'
+web1                       : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web2                       : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web3                       : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web4                       : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+{"id":1,"status":"success","user_id":1,"start":"2026-10-11T03:58:57.768653804Z","end":"2026-10-11T03:59:00.641270115Z"}
+```
+
+</Expected>
+
+Playbook đã chạy từ máy chủ điều phối, bằng khoá trong kho khoá, và lần chạy được ghi lại: ai (`user_id`), lúc nào, kết quả gì, kèm toàn bộ output (thứ tự các dòng `msg` và giờ trên máy bạn sẽ khác). Đưa `patch.yml` vào đây là thêm một template nữa cùng một lịch chạy hằng tuần; khi đó đợt vá không còn phụ thuộc vào việc ai nhớ và laptop của ai có khoá.
+
+<Check id="d20.5.lab-semaphore">Dựng được Semaphore UI, đưa khoá SSH vào kho khoá, tạo inventory và template, chạy một playbook qua API và đọc được nhật ký lần chạy.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `stale.yml` lỗi ở task hạ phiên bản với `no available installation candidate` hoặc hai bản giống nhau: kho chỉ còn một bản nginx (Ubuntu vừa ra bản điểm mới). Bài vẫn làm được: lỗi ngủ và lần khởi động lại đủ để tái hiện mọi bước; bỏ task hạ phiên bản đi.
+- Task `Cai goi` hoặc `Nang cap goi` hỏng trên một máy không rõ lý do, hoặc dòng tổng kết của máy đó có `failed=1` mà các máy khác thì không: tiến trình apt có thể đã bị kernel giết vì vượt giới hạn RAM của container. Xem `sudo dmesg | grep -i oom`; nới bằng `sudo incus config set TÊN limits.memory=1GiB` rồi chạy lại.
+- Task `Nang cap goi` chạy rất lâu hoặc lỗi `Temporary failure resolving`: máy Incus mất đường ra Internet vì policy `FORWARD` (D8.4). Kiểm `sudo iptables -S FORWARD | head -1`.
+- `kill: (…) - No such process` sau khi chạy playbook: bộ đếm đã dừng từ trước, thường vì bạn chạy khối lệnh ở shell khác với shell đã khởi động nó. Tìm bằng `pgrep -f watch.sh`.
+- Bộ đếm ghi `0/4` ngay cả trước khi vá: role đang đặt cổng khác 8081. Xem `group_vars/web/vars.yml` và sửa cổng trong `watch.sh`.
+- Task kiểm sức khoẻ hỏng dù vài giây sau máy trả lời bình thường: dịch vụ khởi động chậm hơn `retries × delay`. Tăng hai số đó; đừng bỏ phép kiểm.
+- Semaphore: task đứng ở `waiting` rồi `error` với `Permission denied (publickey)`: khoá dán vào kho khoá thiếu dòng cuối hoặc sai user `login`. `UNREACHABLE … Host key verification failed`: môi trường chưa có `ANSIBLE_HOST_KEY_CHECKING`.
+- `port is already allocated` khi chạy container Semaphore: cổng 13000 trong VM hoặc trên Mac đang bận; đổi số bên trái của `-p`.
+
+</Callout>
+
+### Dọn dẹp
+
+Đây là bài cuối của chặng. Dừng bộ đếm nếu còn chạy, xoá container Semaphore cùng hai image Docker (Semaphore 1,42 GB và `ubuntu:26.04`), xoá hai máy thêm cho bài này và gỡ chúng khỏi inventory:
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá container `d8-semaphore` cùng database của nó (project, khoá và nhật ký vừa tạo), xoá hai image Docker đã kéo về, và xoá hai máy `web3`, `web4`. Lệnh cuối chạy trên Mac và xoá **toàn bộ VM `d8-lab`**: mọi máy Incus, image, repo Git của lab và khoá SSH. Chỉ chạy lệnh cuối khi bạn không còn cần lab của D8.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn bài này">
+
+```bash
+pkill -f watch.sh; docker rm -f d8-semaphore
+docker rmi semaphoreui/semaphore:v2.19.16 ubuntu:26.04 | grep -c Untagged
+sudo ~/masteva-d20/nodes.sh down web3 web4 && sed -i '/web[34]:/d' ~/masteva-d20/inventory.yml
+sudo ~/masteva-d20/nodes.sh status | grep -c RUNNING
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Xoá cả lab D8">
+
+```bash
+limactl delete --force d8-lab
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Canary xanh có nghĩa là an toàn để vá tiếp không?">
+
+Chỉ an toàn với những gì canary **giống** phần còn lại và những gì phép kiểm **nhìn thấy**. Ba lỗ hổng thường gặp. Canary là máy ít tải hoặc cấu hình khác (máy thử nội bộ), nên lỗi chỉ hiện dưới tải thật không lộ ra. Phép kiểm chỉ hỏi `/healthz` trong khi lỗi nằm ở đường xử lý request thật. Và lỗi cần thời gian mới hiện: rò bộ nhớ, chứng chỉ hết hạn, job chạy lúc nửa đêm. Vì vậy giữa các lô cần **thời gian quan sát** (bake time) tính bằng giờ hoặc ngày chứ không phải giây, canary phải nhận tải thật, và thứ quyết định "xanh" nên là các chỉ số dịch vụ (tỉ lệ lỗi, độ trễ) so với các máy chưa vá. D12 dựng các chỉ số đó; D13 dạy triển khai theo wave và bake time; D21 bàn về giới hạn phạm vi ảnh hưởng.
+
+</Reveal>
+
+<Reveal title="Vì sao lỗi ngủ chỉ lộ ra khi khởi động lại, và làm sao tìm nó trước?">
+
+Vì máy chạy lâu mang hai trạng thái: thứ nằm trên đĩa và thứ đang trong bộ nhớ. Sửa file cấu hình mà không reload, cài thư viện mới mà không khởi động lại tiến trình, thêm dòng vào `/etc/fstab` mà không mount thử: đĩa đã đổi, bộ nhớ thì chưa. Lần khởi động lại đồng bộ hai thứ đó, và mọi sai sót tích tụ lộ ra cùng lúc. Ba cách tìm trước: khởi động lại **đều đặn** từng máy theo lịch, để khoảng tích tụ ngắn và mỗi lần chỉ lộ ít thứ; kiểm cấu hình ngay khi ghi (module `template` có tham số `validate`, nginx có `nginx -t`); và check mode của D8.1 để thấy file lạ trong các thư mục role quản. Máy có uptime 400 ngày không đáng tự hào: nó là máy chưa ai biết có khởi động lại nổi không.
+
+</Reveal>
+
+<Reveal title="Ubuntu tự phát bản cập nhật tới từng nhóm máy thế nào?">
+
+Chính Ubuntu cũng không đưa bản cập nhật tới mọi máy cùng lúc. Gói trong `-updates` được phát theo **phased updates**: ban đầu chỉ một nhóm nhỏ máy nhận bản mới, nhóm đó lớn dần khi bản cập nhật tỏ ra ổn định. Việc một máy có thuộc nhóm hay không được tính ngay trên máy, từ Machine ID của nó cùng tên và phiên bản gói; gói chưa tới lượt được `apt upgrade` liệt kê riêng, với thông báo tuỳ phiên bản apt: bản 3.x của Ubuntu 26.04 in `Not upgrading yet due to phasing:` hoặc `The following upgrades have been deferred due to phasing:`, các bản cũ hơn gộp chúng vào `The following packages have been kept back:`. Hệ quả với một đội máy, theo suy ra của bài: hai máy "giống hệt" chạy `apt upgrade` cùng lúc có thể nhận hai bộ gói khác nhau, vì Machine ID của chúng khác nhau. Trang [About apt upgrade and phased updates](https://ubuntu.com/server/docs/explanation/software/about-apt-upgrade-and-phased-updates/) của Ubuntu Server mô tả cơ chế và cách tắt nó trên một máy, và ghi rõ bản vá bảo mật không bao giờ đi theo cơ chế này. Đây là thêm một lý do để đội máy lớn vá từ một kho đã chốt thay vì từ kho trực tiếp.
+
+</Reveal>
+
+<Reveal title="Khi nào nên dừng hẳn và quay lui, khi nào sửa rồi đi tiếp?">
+
+Quyết định theo ba câu hỏi. Dịch vụ còn đủ năng lực không: nếu canary hỏng mà phần còn lại gánh được, bạn có thời gian. Nguyên nhân đã rõ chưa: lab này rõ trong một lệnh `nginx -t`; nếu chưa rõ sau một khoảng thời gian định trước, quay lui trước rồi điều tra sau. Quay lui có an toàn không: hạ phiên bản gói không phải lúc nào cũng được (dữ liệu đã chuyển định dạng, kernel mới đã sửa bootloader), nên với máy quan trọng, bước "chụp snapshot trước khi vá" thuộc về playbook. Điều không bao giờ làm là vá tiếp các lô sau khi canary còn đỏ, với lý do "chắc chỉ máy đó thôi". D17 dạy quy trình ra quyết định trong sự cố.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết playbook vá theo đợt từ mô tả quy trình của nhóm, thêm bước rút máy khỏi load balancer cho loại load balancer bạn dùng, hoặc đọc output dài của một đợt vá lỗi để tìm máy và task hỏng đầu tiên. AI hay sai ở bốn chỗ: quên `serial`, hoặc đặt `serial` mà không có `max_fail_percentage`, nên lô sau vẫn chạy khi lô trước chỉ hỏng một phần; coi `reboot` xong là máy sẵn sàng, không có bước chờ dịch vụ; kiểm sức khoẻ bằng `systemctl is-active` trên chính máy đó thay vì gọi từ ngoài; và đề nghị bật `unattended-upgrades` kèm tự khởi động lại trên mọi máy như một "thực hành tốt". Kiểm lại bằng cách của bài: cấy một lỗi ngủ lên đội máy thử, chạy playbook, và nhìn bộ đếm xem có lúc nào xuống dưới ngưỡng bạn chấp nhận.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.2 dạy apt, `unattended-upgrades` và file `reboot-required` trên một máy. D8.1 giải thích vì sao thiếu `serial` thì mỗi task chạy trên mọi máy; D8.4 là cách vá thứ hai, bằng image mới. D6 đặt lịch và phê duyệt cho các lần chạy; D9 dựng load balancer để rút và trả máy trong từng lô. D12 cung cấp chỉ số để quyết định canary xanh hay đỏ. D13 dạy triển khai theo wave, bake time và coi cấu hình cũng là một thay đổi; D17 dạy ứng phó khi đợt vá thành sự cố; D21 dạy giới hạn phạm vi ảnh hưởng. K4 vá node của cụm Kubernetes theo cùng nguyên tắc với `drain`, và K5 có PodDisruptionBudget.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d20.5.mastery-playbook">Tự viết được playbook vá theo đợt cho một nhóm máy: canary, lô tăng dần, ngưỡng dừng, khởi động lại khi cần và kiểm sức khoẻ từ bên ngoài; chọn được kích thước lô theo năng lực dư của dịch vụ.</Check>
+
+<Check id="d20.5.mastery-incident">Khi canary hỏng, chẩn đoán được nguyên nhân, sửa trên cả đội máy rồi chạy tiếp đợt vá; và giải thích được vì sao chạy lại là an toàn.</Check>
+
+<Check id="d20.5.mastery-policy">Đề xuất được chính sách vá cho một đội máy cụ thể: tự động hay theo playbook, nguồn gói, lịch, ai được chạy và chạy từ đâu; và dùng hai sự cố Datadog, CrowdStrike để bảo vệ đề xuất đó.</Check>
+
+</Mastery>

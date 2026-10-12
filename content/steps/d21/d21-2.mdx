@@ -1,0 +1,932 @@
+---
+title: "HAProxy: L4, L7, health check chủ động và rút backend không rớt request"
+description: Đặt HAProxy trước hai backend, để nó tự phát hiện backend chết và backend còn mở port nhưng không khoẻ, xếp hàng request thay cho backend bằng maxconn, giữ phiên bằng cookie, rút một backend ra khỏi vòng qua runtime API mà request đang dở vẫn xong, rồi chuyển sang mode tcp và giữ IP client bằng PROXY protocol.
+id: d21.2
+step: d21
+prerequisites: [d21.1]
+topics: [d21.haproxy]
+status: verified
+verified:
+  date: 2026-10-11
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    haproxy: 3.2.9
+    socat: 1.8.1.1
+    hey: 0.1.4
+    python: 3.14.4
+    curl: 8.18.0
+---
+
+<Goal>
+
+Nginx của D2.5 chỉ biết một backend hỏng khi request thật va vào nó. HAProxy là load balancer chuyên dụng: nó tự hỏi thăm backend, cho bạn điều khiển từng backend lúc đang chạy, và làm được cả L4 lẫn L7. Học xong bài này, bạn giải thích được:
+
+- Vì sao HAProxy loại được một backend chết mà không client nào thấy lỗi, và loại được cả backend còn mở port nhưng ứng dụng bên trong đã hỏng.
+- Vì sao `maxconn` trên từng server biến HAProxy thành hàng đợi che cho backend, và `503` với cờ `sQ` trong log nghĩa là gì.
+- Vì sao khi deploy phải `drain` backend trước khi dừng nó, và `drain` khác `maint` ở đâu.
+- Vì sao sau một load balancer L4, backend mất IP client và `X-Forwarded-For` không cứu được, còn PROXY protocol thì có.
+
+</Goal>
+
+<Knowledge>
+
+### HAProxy và cấu trúc cấu hình
+
+HAProxy chỉ làm một việc: nhận kết nối và chuyển tới backend. Nó không phục vụ file tĩnh, không chạy ứng dụng. Đổi lại, phần cân bằng tải của nó đầy đủ hơn bản mở của Nginx:
+
+| | Nginx 1.28 (bản mở) | HAProxy 3.2 |
+|---|---|---|
+| Health check | Thụ động: đếm lỗi của request thật | Chủ động (L4, HTTP, script riêng) và thụ động |
+| Điều khiển lúc chạy | Sửa file rồi reload | Runtime API: rút, bật, đổi trọng số từng server, không reload |
+| Khi backend đầy | `max_conns` mỗi server (từ 1.11.5), nhưng không có hàng đợi: khi mọi server chạm trần, request bị từ chối ngay (`queue` chỉ có ở bản thương mại) | `maxconn` mỗi server, phần vượt xếp hàng trong HAProxy tới `timeout queue` |
+| Số liệu | `stub_status` (vài con số) | Trang stats và endpoint Prometheus có sẵn, tới từng server |
+| Web server, file tĩnh, cache | Có | Không (cache rất hạn chế) |
+
+Hai công cụ hay đứng cùng nhau: HAProxy ở ngoài chia tải và lo độ sẵn sàng, Nginx hoặc ứng dụng ở trong.
+
+File cấu hình có bốn loại khối:
+
+```text
+ global      thiết lập của tiến trình: log, socket điều khiển, maxconn tổng
+ defaults    giá trị mặc định cho các khối bên dưới: mode, timeout, retries
+
+ frontend    nơi NHẬN kết nối: bind IP:port, luật chọn backend (ACL)
+     │ default_backend / use_backend ... if ...
+     ▼
+ backend     nhóm server: thuật toán, health check, cookie, danh sách server
+
+ listen      frontend và backend gộp làm một, cho trường hợp đơn giản
+```
+
+Mỗi khối `frontend`, `backend`, `listen` chạy ở một `mode`:
+
+| | `mode tcp` (L4) | `mode http` (L7) |
+|---|---|---|
+| Đơn vị cân bằng | Kết nối TCP | Request HTTP |
+| Thấy được | IP, port, số byte, và SNI nếu bật kiểm tra | Phương thức, đường dẫn, header, cookie, mã trả về |
+| Giữ IP client cho backend | PROXY protocol | Header `X-Forwarded-For` (`option forwardfor`) |
+| Thử lại, chọn backend theo đường dẫn, cookie dính | Không | Có |
+| Dùng cho | PostgreSQL, Redis, Kafka, API server của Kubernetes, TLS chuyển nguyên | Web và API |
+
+D2.5 đã bàn khi nào chọn L4 thay L7; bài này cho bạn thấy khác biệt đó trên cùng một HAProxy.
+
+<Check id="d21.2.config-model">Kể được vai trò của bốn khối `global`, `defaults`, `frontend`, `backend` và nói được `mode tcp` với `mode http` khác nhau ở những khả năng nào.</Check>
+
+### Thuật toán cân bằng và hàng đợi
+
+| `balance` | Chọn server thế nào | Hợp với |
+|---|---|---|
+| `roundrobin` | Lần lượt, theo trọng số (`weight`) | Request ngắn, đều nhau. Mặc định |
+| `leastconn` | Server đang có ít kết nối nhất | Request dài ngắn rất khác nhau; kết nối sống lâu (database, WebSocket) |
+| `source` | Băm IP client | Cần dính theo client ở L4; lệch khi nhiều client sau một NAT |
+| `uri`, `hdr(<tên>)` | Băm đường dẫn hoặc một header | Cache (cùng URL về cùng máy), chia theo tenant |
+| `random(2)` | Lấy ngẫu nhiên hai server, chọn cái ít tải hơn | Nhiều load balancer cùng chia tải cho một nhóm server |
+
+Các kiểu băm nên kèm `hash-type consistent`: thêm hay bớt một server chỉ làm đổi chỗ một phần nhỏ khoá, thay vì xáo lại gần hết.
+
+Thứ làm HAProxy khác hẳn là **`maxconn` trên từng server**. Một backend chỉ xử lý tốt một số request đồng thời nhất định (số thread, số kết nối database). Đặt `maxconn 50` cho server, HAProxy chỉ đưa vào tối đa 50 request cùng lúc; request thứ 51 nằm trong **hàng đợi của HAProxy** tới khi có chỗ hoặc quá `timeout queue` (trả `503`). Backend không bao giờ bị dồn quá sức, và phần chờ nằm ở nơi rẻ nhất: một kết nối rảnh trong HAProxy tốn vài chục KB, một thread Tomcat đang chờ tốn hơn nhiều.
+
+<Check id="d21.2.balance-queue">Chọn được thuật toán cân bằng cho ba loại traffic (API ngắn, kết nối sống lâu, cache), và giải thích được `maxconn` của server cùng `timeout queue` bảo vệ backend thế nào.</Check>
+
+### Health check chủ động
+
+HAProxy tự mở kết nối tới từng server theo chu kỳ, không cần traffic thật:
+
+```text
+ server web2 10.9.0.22:8080 check inter 1s fall 2 rise 2
+
+ mỗi 1 giây (inter):    ✓    ✓    ✗    ✗ ──► DOWN      ✗    ✓    ✓ ──► UP
+                                   └ fall 2 ┘ ngừng gửi request       └ rise 2 ┘ gửi lại
+ thời gian phát hiện tối đa ≈ inter × fall  (ở đây khoảng 2 giây)
+```
+
+| Loại check | Kiểm tra gì | Bắt được | Bỏ sót |
+|---|---|---|---|
+| L4 (`check` trơn) | Bắt tay TCP thành công | Tiến trình chết, máy chết | Ứng dụng treo, hết kết nối database, trả `500` cho mọi request |
+| L7 (`option httpchk` + `http-check`) | Một request HTTP trả đúng mã mong đợi | Cả các trường hợp trên, nếu endpoint kiểm đúng thứ cần kiểm | Lỗi chỉ xảy ra ở vài đường dẫn |
+
+Trong khoảng `inter × fall` trước khi server bị đánh dấu `DOWN`, request vẫn được gửi tới nó. `retries` cùng `option redispatch` che phần này: kết nối bị từ chối thì HAProxy thử lại và chuyển sang server khác, client chỉ thấy chậm hơn. Request đã gửi đi mà backend chết giữa chừng thì không được thử lại mặc định, vì HAProxy không biết backend đã làm tới đâu.
+
+Endpoint health check nên trả lời câu "**bản này** có nhận được request không", giống readiness ở SB8.3. Đừng cho nó kiểm một phụ thuộc dùng chung như database: khi database chậm, mọi backend cùng báo hỏng, và HAProxy trả `503` cho toàn bộ traffic, kể cả phần không cần database. Khác với load balancer của AWS trong callout ở D2.5, HAProxy **không** fail open: hết server sống là `503`.
+
+<Check id="d21.2.health-check">Tính được thời gian phát hiện từ `inter`, `fall`, giải thích được check L4 bỏ sót gì so với L7, và nói được vì sao endpoint health check không nên kiểm phụ thuộc dùng chung.</Check>
+
+### Giữ phiên, runtime API và log
+
+**Giữ phiên (sticky session)** là gửi cùng một người dùng về cùng một server. Ba cách, từ nên dùng tới nên tránh:
+
+| Cách | Cấu hình | Điểm yếu |
+|---|---|---|
+| Cookie do HAProxy chèn | `cookie SRV insert indirect nocache` và `cookie w1` trên từng server | Chỉ có ở `mode http` |
+| Bảng dính theo IP | `stick-table type ip ...` và `stick on src` | Bảng nằm trong bộ nhớ từng HAProxy, phải đồng bộ giữa các máy (`peers`) |
+| Băm IP | `balance source` | Lệch tải sau NAT; thêm bớt server là đổi chỗ người dùng |
+
+Cả ba đều là thuốc giảm đau cho ứng dụng giữ trạng thái trong bộ nhớ. Cách bền, như D2.5 đã nêu, là để session ở ngoài (Redis) và giữ backend không trạng thái.
+
+**Runtime API** là một socket Unix nhận lệnh. Vài lệnh dùng hằng ngày:
+
+| Lệnh | Tác dụng |
+|---|---|
+| `show stat`, `show servers state` | Trạng thái và số liệu từng server |
+| `set server <backend>/<server> state drain` | Ngừng nhận request **mới**; request đang dở chạy tiếp; request mang cookie dính vẫn được nhận. Health check vẫn chạy |
+| `set server ... state maint` | Ngừng hẳn, kể cả request có cookie dính; tắt health check |
+| `set server ... state ready` | Đưa trở lại vòng |
+| `set server ... weight 10%` | Giảm tải dần, dùng khi thử bản mới (canary) |
+
+Trạng thái đặt qua runtime API **mất khi reload** trừ khi cấu hình `server-state-file`. Quy trình deploy từng backend vì thế là: `drain`, chờ số kết nối đang dở (`scur`) về 0, dừng và thay bản mới, chờ health check xanh, `ready`.
+
+**Log** của HAProxy dày đặc thông tin. Một dòng ở `mode http`:
+
+```text
+10.9.0.1:37076 [11/Oct/2026:09:38:30.075] fe_http app/web1 0/0/0/-1/527 502 209 - - SHNN 1/1/0/0/0 0/0 "GET /slow HTTP/1.1"
+ client         thời điểm nhận       frontend backend/server  │         mã  byte     │
+                                             TR/Tw/Tc/Tr/Ta ──┘                      └─ cờ kết thúc
+```
+
+Năm số thời gian (ms): `TR` nhận xong request, `Tw` **chờ trong hàng đợi**, `Tc` kết nối tới server, `Tr` server trả header, `Ta` tổng. `-1` nghĩa là giai đoạn đó không hoàn thành. Hai ký tự đầu của cờ kết thúc cho biết ai kết thúc và lúc nào (hai ký tự sau nói về cookie giữ phiên):
+
+| Cờ | Nghĩa | Thường do |
+|---|---|---|
+| `--` | Bình thường | |
+| `SC` | Server từ chối kết nối, hoặc không còn server (`<NOSRV>`) | Backend chết, mọi backend `DOWN` |
+| `sQ` | Hết `timeout queue` khi đang xếp hàng | Backend quá tải so với `maxconn` |
+| `SH` | Server đóng kết nối trước khi trả header | Backend chết hoặc bị dừng giữa request |
+| `sH` | Hết `timeout server` khi chờ header | Backend chậm (tương đương `504` của Nginx) |
+| `cD`, `CD` | Client hết thời gian chờ hoặc tự ngắt khi đang truyền dữ liệu | Client bỏ đi, mạng client kém |
+
+<Callout kind="production">
+
+GitHub mô tả hệ thống cân bằng tải của họ trong bài [GLB: GitHub's open source load balancer](https://github.blog/engineering/infrastructure/glb-director-open-source-load-balancer/). Theo bài viết, GLB Director là một load balancer **L4** dàn một địa chỉ IP ra nhiều máy vật lý; nó "không thay thế các dịch vụ như haproxy và nginx" mà là một lớp đứng **trước** chúng. Mục tiêu thiết kế họ nêu là giảm tối đa việc đứt kết nối mỗi khi tập máy thay đổi, và cho phép các máy ở tầng proxy được rút ra (drain) và đưa vào lại khi cần. Đó là đúng hai ý của bài này ở quy mô lớn: L4 ở ngoài cùng lo chia kết nối, L7 phía sau lo logic HTTP; và việc bảo trì một máy bắt đầu bằng drain chứ không phải tắt.
+
+</Callout>
+
+<Check id="d21.2.runtime-log">Kể được quy trình rút một backend để deploy bằng `drain` và `ready`, phân biệt được `drain` với `maint`, và đọc được năm số thời gian cùng cờ kết thúc trong một dòng log HAProxy.</Check>
+
+### PROXY protocol
+
+Ở `mode tcp`, HAProxy không hiểu HTTP nên không chèn được `X-Forwarded-For`, và backend chỉ thấy IP của load balancer (D2.4: cùng hệ quả với NAT). **PROXY protocol** giải quyết ở tầng dưới: ngay sau khi mở kết nối tới backend, load balancer gửi một đoạn mở đầu chứa địa chỉ thật của client, rồi mới tới dữ liệu.
+
+```text
+ client 10.9.0.1 ──TCP──► HAProxy 10.9.0.11 ──TCP──► backend
+                                               byte đầu tiên trên kết nối:
+                                               PROXY TCP4 10.9.0.1 10.9.0.11 55984 9001\r\n   (bản 1, dạng chữ)
+                                               GET /hello HTTP/1.1 ...                         (dữ liệu gốc của client)
+```
+
+Bản 1 là một dòng chữ; bản 2 (`send-proxy-v2`) là nhị phân, gọn hơn và mang thêm được thông tin như SNI. Ba điều phải nhớ:
+
+- **Hai đầu phải cùng bật.** Load balancer gửi mà backend không chờ: backend đọc dòng `PROXY ...` như dữ liệu và báo lỗi cú pháp. Backend chờ mà load balancer không gửi: backend coi dòng đầu của request là đoạn mở đầu hỏng. Không có cơ chế thương lượng.
+- **Health check cũng là một kết nối.** Check HTTP tới một port đang chờ PROXY protocol phải kèm `check-send-proxy`.
+- **Backend tin tuyệt đối đoạn mở đầu.** Ai kết nối thẳng được vào port đó đều tự khai được IP tuỳ ý. Chỉ bật trên port mà firewall chỉ cho load balancer tới.
+
+Nginx nhận bằng `listen ... proxy_protocol` kèm `real_ip_header proxy_protocol`; NLB của AWS (D10) gửi bản 2. Nhiều server ứng dụng và database không hiểu PROXY protocol: kiểm tài liệu của từng cái trước khi bật, nếu không thì phải có một proxy hiểu nó đứng trước.
+
+<Check id="d21.2.proxy-protocol">Giải thích được PROXY protocol gửi gì và ở đâu trong kết nối, vì sao hai đầu phải cùng bật, và vì sao port nhận PROXY protocol không được mở cho ai khác ngoài load balancer.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [HAProxy 3.2 Configuration Manual](https://docs.haproxy.org/3.2/configuration.html): mục 4.2 tra từng từ khoá (`balance`, `option httpchk`, `cookie`), mục 5.2 các tham số của `server` (`check`, `inter`, `maxconn`, `send-proxy`), mục 8 định dạng log và bảng cờ kết thúc.
+- [HAProxy 3.2 Management Guide](https://docs.haproxy.org/3.2/management.html): mục 9.3 liệt kê lệnh của runtime API (`show stat`, `set server`), mục 4 về dừng và reload êm.
+- [The PROXY protocol](https://www.haproxy.org/download/3.2/doc/proxy-protocol.txt): đặc tả gốc của cả hai bản, ngắn và đọc được; mục 2 có định dạng từng byte.
+- [HAProxy: Health checks](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/reliability/health-checks/): ví dụ check TCP, HTTP, check thụ động và agent check.
+- [GLB: GitHub's open source load balancer](https://github.blog/engineering/infrastructure/glb-director-open-source-load-balancer/): cách một hệ thống lớn xếp L4 trước L7 và rút máy không đứt kết nối.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM Lima (2 CPU, 2 GiB) có `~/masteva-d21/topo.sh` và `~/masteva-d21/lab.sh` của D9.1; chưa có thì làm phần Chuẩn bị của D9.1 tới hết khối `lab.sh`. Lab chạy một HAProxy và bốn tiến trình Python, tốn khoảng 100 MB; máy 8 GB không cần thu gọn.
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y haproxy socat hey curl netcat-openbsd
+sudo systemctl disable --now haproxy     # lab chạy HAProxy riêng trong namespace
+sudo ~/masteva-d21/topo.sh up
+mkdir -p ~/masteva-d21/{lb,web} && cd ~/masteva-d21
+haproxy -v | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HAProxy version 3.2.9-1ubuntu2.2 2026/06/19 - https://haproxy.org/
+```
+
+</Expected>
+
+```text
+ VM (client) 10.9.0.1 ── br-d9 ─┬─ lb1  10.9.0.11   HAProxy :80 (http), :9000 (tcp), :8404 (stats)
+                                ├─ web1 10.9.0.21   web.py :8080, :9090
+                                └─ web2 10.9.0.22   web.py :8080, :9090
+```
+
+Backend của bài là một server Python nhỏ có vài đường dẫn để làm thí nghiệm, và một chế độ nhận PROXY protocol dùng ở bước 6:
+
+<Terminal where="vm" title="~/masteva-d21/web/web.py">
+
+```bash
+cat > ~/masteva-d21/web/web.py <<'EOF'
+#!/usr/bin/env python3
+"""Backend lab D9.2. Cách chạy: web.py <tên> <ip> [port] [--proxy]
+  /          in tên backend và địa chỉ nó thấy
+  /slow      ngủ 3 giây rồi trả lời
+  /healthz   200, hoặc 503 khi có file web/<tên>.down
+  /hits      số request đã nhận theo đường dẫn
+--proxy: kết nối phải mở đầu bằng một dòng PROXY protocol bản 1"""
+import collections
+import http.server
+import os
+import sys
+import time
+
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+NAME, IP = args[0], args[1]
+PORT = int(args[2]) if len(args) > 2 else 8080
+PROXY = "--proxy" in sys.argv
+DOWN = os.path.join(os.path.dirname(os.path.abspath(__file__)), NAME + ".down")
+HITS = collections.Counter()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        self.proxy_src = None
+        if PROXY:   # "PROXY TCP4 <ip nguồn> <ip đích> <port nguồn> <port đích>\r\n"
+            self.proxy_src = self.rfile.readline().decode().split()[2]
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        HITS[path] += 1
+        code = 200
+        if path == "/slow":
+            time.sleep(3)
+        if path == "/healthz" and os.path.exists(DOWN):
+            code = 503
+        if path == "/hits":
+            text = " ".join(f"{k}={v}" for k, v in sorted(HITS.items()))
+        else:
+            text = (f"backend={NAME} peer={self.client_address[0]} "
+                    f"proxy_src={self.proxy_src} xff={self.headers.get('X-Forwarded-For')}")
+        body = (text + "\n").encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+class Server(http.server.ThreadingHTTPServer):
+    request_queue_size = 128    # hàng đợi accept; mặc định của Python chỉ có 5
+
+Server((IP, PORT), Handler).serve_forever()
+EOF
+```
+
+</Terminal>
+
+Các hàm của bài nằm trong `lb/hap.sh`. `hap` gửi một lệnh vào runtime API; `st` rút từ `show stat` (định dạng CSV) vài cột cần xem; `hap_reload` kiểm cấu hình rồi báo HAProxy nạp lại; `web` và `web_kill` chạy và dừng một backend.
+
+<Terminal where="vm" title="~/masteva-d21/lb/hap.sh">
+
+```bash
+cat > ~/masteva-d21/lb/hap.sh <<'EOF'
+# Hàm của lab D9.2. Nạp bằng: . ~/masteva-d21/lab.sh; . ~/masteva-d21/lb/hap.sh
+LAB=$HOME/masteva-d21
+hap() { echo "$*" | sudo socat stdio "unix-connect:$LAB/lb/haproxy.sock"; }
+st() {   # st [proxy]: trạng thái từng server của một backend (mặc định: app)
+  hap "show stat" | awk -F, -v px="${1:-app}" '$1 == px && $2 != "FRONTEND" && $2 != "BACKEND" {
+    printf "%s status=%s check=%s scur=%s qcur=%s\n", $2, $18, $37, $5, $3 }'
+}
+hap_reload() { haproxy -c -q -f "$LAB/lb/haproxy.cfg" && sudo kill -USR2 "$(cat "$LAB/lb/haproxy.pid")" && sleep 1; }
+web() {        # web <n> [port] [--proxy]: chạy backend web<n> trong namespace của nó
+  local n=$1; shift
+  sudo ip netns exec "web$n" python3 "$LAB/web/web.py" "web$n" "10.9.0.2$n" "$@" >/dev/null 2>&1 &
+}
+web_kill() {   # web_kill <n> [port]: dừng backend web<n> đang nghe port đó (mặc định 8080)
+  sudo ip netns exec "web$1" ss -ltnpH "sport = :${2:-8080}" | grep -o 'pid=[0-9]*' | cut -d= -f2 | xargs -r sudo kill
+}
+EOF
+. ~/masteva-d21/lab.sh; . ~/masteva-d21/lb/hap.sh
+web 1; web 2; sleep 1
+curl -s http://10.9.0.21:8080/; curl -s http://10.9.0.22:8080/hits
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+backend=web1 peer=10.9.0.1 proxy_src=None xff=None
+/hits=1
+```
+
+</Expected>
+
+Backend chạy nền dưới dạng job của shell. Vì vậy các bước sau dùng `wait $p` (chờ đúng một tiến trình) chứ không dùng `wait` trơn, vốn sẽ chờ luôn cả backend và không bao giờ trả về. Mở terminal mới thì nạp lại hai file hàm như dòng đầu của `hap.sh` ghi.
+
+### 1. HAProxy ở L7 với health check chủ động
+
+<Terminal where="vm" title="~/masteva-d21/lb/haproxy.cfg">
+
+```bash
+cat > lb/haproxy.cfg <<'EOF'
+global
+  log stdout format raw local0
+  stats socket LAB/lb/haproxy.sock mode 600 level admin
+  maxconn 4096
+
+defaults
+  mode http
+  log global
+  option httplog
+  timeout connect 1s
+  timeout client  30s
+  timeout server  10s
+  timeout queue   5s
+  retries 3
+  option redispatch
+
+frontend fe_http
+  bind 10.9.0.11:80
+  default_backend app
+
+backend app
+  balance roundrobin
+  option forwardfor
+  option httpchk
+  http-check send meth GET uri /healthz
+  http-check expect status 200
+  default-server check inter 1s fall 2 rise 2
+  server web1 10.9.0.21:8080
+  server web2 10.9.0.22:8080
+
+listen stats
+  bind 10.9.0.11:8404
+  stats enable
+  stats uri /
+  http-request use-service prometheus-exporter if { path /metrics }
+EOF
+sed -i "s#LAB#$HOME/masteva-d21#g" lb/haproxy.cfg
+haproxy -c -f lb/haproxy.cfg
+sudo ip netns exec lb1 haproxy -W -f lb/haproxy.cfg -p $HOME/masteva-d21/lb/haproxy.pid > lb/haproxy.log 2>&1 &
+sleep 2
+for i in 1 2 3 4; do curl -s http://10.9.0.11/; done
+tail -1 lb/haproxy.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+backend=web1 peer=10.9.0.11 proxy_src=None xff=10.9.0.1
+backend=web2 peer=10.9.0.11 proxy_src=None xff=10.9.0.1
+backend=web1 peer=10.9.0.11 proxy_src=None xff=10.9.0.1
+backend=web2 peer=10.9.0.11 proxy_src=None xff=10.9.0.1
+10.9.0.1:42216 [11/Oct/2026:09:47:53.837] fe_http app/web2 0/0/0/3/3 200 208 - - ---- 1/1/0/0/0 0/0 "GET / HTTP/1.1"
+```
+
+</Expected>
+
+- `haproxy -c` kiểm cấu hình, tương đương `nginx -t`; bản 3.2 không in gì khi cấu hình hợp lệ (thêm `-V` nếu muốn thấy dòng xác nhận). `-W` chạy kiểu master và worker để reload được bằng signal; trên máy thật, gói Ubuntu chạy đúng kiểu này qua `systemctl reload haproxy`.
+- `log stdout format raw` ghi log ra đầu ra chuẩn (lab hứng vào `lb/haproxy.log`). Trên máy thật HAProxy gửi log qua syslog tới journald.
+- `default-server check inter 1s fall 2 rise 2` áp cho mọi dòng `server` bên dưới. `option forwardfor` thêm `X-Forwarded-For`, nên backend thấy `xff=10.9.0.1`.
+- Lab chạy HAProxy bằng `root` cho gọn. Gói Ubuntu chạy nó bằng user `haproxy` trong `chroot`.
+
+Không gửi request nào trong 3 giây, rồi hỏi backend đã nhận gì và hỏi HAProxy đang thấy gì:
+
+<Terminal where="vm">
+
+```bash
+curl -s http://10.9.0.21:8080/hits; sleep 3; curl -s http://10.9.0.21:8080/hits
+st
+curl -s http://10.9.0.11:8404/metrics | grep '^haproxy_server_check_status{proxy="app"' | grep ' 1$' | cut -c1-90
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/=3 /healthz=3 /hits=1
+/=3 /healthz=6 /hits=2
+web1 status=UP check=L7OK scur=0 qcur=0
+web2 status=UP check=L7OK scur=0 qcur=0
+haproxy_server_check_status{proxy="app",server="web1",state="L7OK"} 1
+haproxy_server_check_status{proxy="app",server="web2",state="L7OK"} 1
+```
+
+</Expected>
+
+`/healthz` tăng thêm 3 trong 3 giây dù không có client nào: đó là HAProxy tự hỏi thăm, mỗi giây một lần. `check=L7OK` là kết quả check gần nhất; `scur` là số kết nối đang mở tới server, `qcur` là số request đang xếp hàng. Cùng những số liệu đó có sẵn ở dạng Prometheus tại `/metrics` (D12 thu thập chúng), và ở dạng trang web tại `http://10.9.0.11:8404/`.
+
+<Check id="d21.2.lab-l7">Cấu hình được HAProxy `mode http` với `frontend`, `backend`, health check HTTP, và đọc được trạng thái server từ runtime API cùng endpoint `/metrics`.</Check>
+
+### 2. Backend chết, backend sống mà không khoẻ
+
+Chạy tải 6 giây, giây thứ hai thì dừng `web2`:
+
+<Terminal where="vm">
+
+```bash
+( sleep 2; web_kill 2 ) &
+load -z 6s -c 20 http://10.9.0.11/
+grep '^Server' lb/haproxy.log | tail -1 | cut -d. -f1
+st
+```
+
+</Terminal>
+
+<Predict question="D2.5 cho thấy Nginx che được lỗi này cho client nhờ thử backend khác. HAProxy thì sao: có request nào lỗi không, và HAProxy biết web2 chết bằng cách nào?">
+
+```text
+req/s=488 p50=42.7ms max=73ms |  [200] 2941 | loi ket noi: 0
+Server app/web2 is DOWN, reason: Layer4 connection problem, info: "Connection refused", check duration: 0ms
+web1 status=UP check=L7OK scur=0 qcur=0
+web2 status=DOWN check=L4CON scur=0 qcur=0
+```
+
+Không request nào lỗi. Khác với Nginx, HAProxy biết `web2` chết nhờ **health check** (`L4CON`: không kết nối được), không cần request thật nào va vào. Trong khoảng tối đa 2 giây trước khi check kết luận, vài request vẫn được gửi tới `web2`, bị từ chối, và `retries` cùng `option redispatch` chuyển chúng sang `web1`: client chỉ thấy chậm hơn. Bài mẫu chạy bước này sáu lần, cả sáu đều không có request lỗi; `max` có lần khoảng 60 ms, có lần hơn một giây (khi HAProxy chờ một nhịp trước lượt thử lại). Đừng coi đó là bảo đảm tuyệt đối: một request thử hết ba lượt trong lúc `web2` chưa bị đánh dấu `DOWN` vẫn nhận `503`. Số request và req/s trên máy bạn sẽ khác.
+
+</Predict>
+
+Cho `web2` chạy lại, rồi tạo tình huống khó hơn: tiến trình còn sống, port còn mở, nhưng ứng dụng tự báo không khoẻ.
+
+<Terminal where="vm">
+
+```bash
+web 2; sleep 3; st | tail -1
+touch web/web2.down; sleep 3
+grep '^Server' lb/haproxy.log | tail -1 | cut -d. -f1
+st | tail -1
+curl -s -o /dev/null -w 'goi thang web2: %{http_code}\n' http://10.9.0.22:8080/
+for i in 1 2 3; do curl -s http://10.9.0.11/ | cut -d' ' -f1; done | tr '\n' ' '; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web2 status=UP check=L7OK scur=0 qcur=0
+Server app/web2 is DOWN, reason: Layer7 wrong status, code: 503, info: "Service Unavailable", check duration: 1ms
+web2 status=DOWN check=L7STS scur=0 qcur=0
+goi thang web2: 200
+backend=web1 backend=web1 backend=web1 
+```
+
+</Expected>
+
+`web2` vẫn trả `200` cho `/` khi gọi thẳng, nhưng `/healthz` của nó trả `503`, nên HAProxy loại nó (`L7STS`: sai mã trả về). Một check L4 sẽ không bao giờ thấy chuyện này. Đây cũng là cách ứng dụng **chủ động xin ra khỏi vòng**, ví dụ khi đang tắt dần (SB8.3). Giờ cho cả hai cùng báo hỏng:
+
+<Terminal where="vm">
+
+```bash
+touch web/web1.down; sleep 3
+curl -s -o /dev/null -w '%{http_code}\n' http://10.9.0.11/
+tail -1 lb/haproxy.log | cut -d' ' -f3-
+rm web/web1.down web/web2.down; sleep 3; st
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+503
+fe_http app/<NOSRV> 0/-1/-1/-1/0 503 217 - - SC-- 1/1/0/0/0 0/0 "GET / HTTP/1.1"
+web1 status=UP check=L7OK scur=0 qcur=0
+web2 status=UP check=L7OK scur=0 qcur=0
+```
+
+</Expected>
+
+`<NOSRV>` và cờ `SC`: không còn server nào để gửi. Hai tiến trình vẫn chạy và vẫn phục vụ được, nhưng health check đã hạ cả dịch vụ. Đó là lý do endpoint health check phải được thiết kế cẩn thận như phần Kiến thức nói.
+
+<Check id="d21.2.lab-health">Tái hiện được ba tình huống: backend chết dưới tải mà không request nào lỗi, backend bị loại vì `/healthz` trả `503` dù port còn mở, và `503` với `<NOSRV>` khi mọi backend trượt check.</Check>
+
+### 3. leastconn và hàng đợi maxconn
+
+Giữ một request chậm (3 giây) đang chạy, rồi gửi bốn request nhanh. Làm hai lần, với `roundrobin` rồi `leastconn`:
+
+<Terminal where="vm">
+
+```bash
+try4() {   # một request chậm chạy nền, rồi bốn request nhanh
+  curl -s http://10.9.0.11/slow | sed 's/ .*//; s/^/request cham: /' & local p=$!
+  sleep 0.5; for i in 1 2 3 4; do curl -s http://10.9.0.11/ | cut -d' ' -f1; done | tr '\n' ' '; echo; wait $p
+}
+try4
+sed -i 's/balance roundrobin/balance leastconn/' lb/haproxy.cfg; hap_reload
+try4
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+backend=web1 backend=web2 backend=web1 backend=web2 
+request cham: backend=web2
+backend=web1 backend=web1 backend=web1 backend=web1 
+request cham: backend=web2
+```
+
+</Expected>
+
+`roundrobin` chia đều bất kể server nào đang bận. `leastconn` thấy một server đang giữ một kết nối (request chậm) nên dồn cả bốn request nhanh sang server còn lại. Server nào nhận request chậm tuỳ lượt của vòng xoay lúc đó; trên máy bạn hai tên có thể đổi chỗ. Với request dài ngắn lẫn lộn, `leastconn` tránh được cảnh một server ôm hết việc nặng.
+
+Giờ cho mỗi server tối đa hai request cùng lúc, rồi gửi 8 request chậm đồng thời:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/rise 2$/rise 2 maxconn 2/' lb/haproxy.cfg; hap_reload
+for i in $(seq 8); do curl -s -o /dev/null -w '%{http_code} %{time_total}\n' http://10.9.0.11/slow & done | awk '{printf "%s sau %.0fs\n", $1, $2}' | sort | uniq -c
+grep '/slow' lb/haproxy.log | tail -8 | awk '{print $4, $5}' | sort -t/ -k3n
+```
+
+</Terminal>
+
+<Predict question="Hai server, mỗi server nhận tối đa 2 request, mỗi request 3 giây. 8 request cùng tới: có cái nào lỗi không, và chúng mất bao lâu?">
+
+```text
+      4 200 sau 3s
+      4 200 sau 6s
+app/web1 0/0/0/3012/3012
+app/web1 0/0/0/3015/3015
+app/web2 0/0/0/3009/3009
+app/web2 0/0/0/3014/3014
+app/web2 0/3007/3/3004/6014
+app/web1 0/3008/3/3004/6015
+app/web2 0/3009/0/3003/6012
+app/web1 0/3010/0/3004/6014
+```
+
+Không cái nào lỗi. Bốn request được đưa vào ngay (mỗi server hai cái) và xong sau 3 giây; bốn cái còn lại **nằm trong hàng đợi của HAProxy** đúng 3 giây (số thứ hai, `Tw`, khoảng 3008 ms) rồi mới tới backend, tổng 6 giây. Backend không lúc nào phải xử lý quá hai request. Các số mili giây sẽ lệch chút ít trên máy bạn.
+
+</Predict>
+
+Hàng đợi có giới hạn thời gian. Gửi 12 request: bốn cái cuối phải chờ 6 giây, lâu hơn `timeout queue 5s`.
+
+<Terminal where="vm">
+
+```bash
+for i in $(seq 12); do curl -s -o /dev/null -w '%{http_code} %{time_total}\n' http://10.9.0.11/slow & done | awk '{printf "%s sau %.0fs\n", $1, $2}' | sort | uniq -c
+grep ' 503 ' lb/haproxy.log | tail -1 | cut -d' ' -f3-
+sed -i 's/ maxconn 2$//; s/balance leastconn/balance roundrobin/' lb/haproxy.cfg; hap_reload
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+      4 200 sau 3s
+      4 200 sau 6s
+      4 503 sau 5s
+fe_http app/<NOSRV> 0/5009/-1/-1/5009 503 217 - - sQ-- 6/6/4/0/0 0/5 "GET /slow HTTP/1.1"
+```
+
+</Expected>
+
+Bốn request bị trả `503` sau đúng 5 giây xếp hàng, cờ `sQ`, `Tw` bằng 5009. Đây là cách từ chối có kiểm soát: client biết ngay sau một khoảng định trước, thay vì mọi request cùng chậm dần rồi cùng quá hạn. Dòng `sed` cuối trả cấu hình về `roundrobin` không có `maxconn` cho các bước sau.
+
+<Check id="d21.2.lab-queue">Chứng minh được `leastconn` tránh server đang bận, và dùng log (`Tw`, cờ `sQ`) giải thích được request nào xếp hàng, request nào bị từ chối khi đặt `maxconn` trên server.</Check>
+
+### 4. Giữ phiên bằng cookie
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/balance roundrobin/balance roundrobin\n  cookie SRV insert indirect nocache httponly/' lb/haproxy.cfg
+sed -i 's/server web1 10.9.0.21:8080/& cookie w1/; s/server web2 10.9.0.22:8080/& cookie w2/' lb/haproxy.cfg
+hap_reload
+curl -s -i -c /tmp/d21-jar http://10.9.0.11/ | grep -i -E '^set-cookie|^backend' | cut -d' ' -f1-2
+for i in 1 2 3; do curl -s -b /tmp/d21-jar http://10.9.0.11/ | cut -d' ' -f1; done | tr '\n' ' '; echo
+for i in 1 2 3; do curl -s http://10.9.0.11/ | cut -d' ' -f1; done | tr '\n' ' '; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+set-cookie: SRV=w1;
+backend=web1 peer=10.9.0.11
+backend=web1 backend=web1 backend=web1 
+backend=web2 backend=web1 backend=web2 
+```
+
+</Expected>
+
+Request đầu chưa có cookie: HAProxy chọn server theo `roundrobin` và chèn `Set-Cookie: SRV=w1` vào response. Ba request sau mang cookie đó luôn về `web1`; client không có cookie vẫn được chia đều. `indirect` gỡ cookie này khỏi request trước khi chuyển cho backend, nên ứng dụng không biết nó tồn tại. Khi server được dính tới chết thì sao:
+
+<Terminal where="vm">
+
+```bash
+web_kill 1; sleep 3
+curl -s -i -b /tmp/d21-jar http://10.9.0.11/ | grep -i -E '^set-cookie|^backend' | cut -d' ' -f1-2
+web 1; sleep 3; st
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+set-cookie: SRV=w2;
+backend=web2 peer=10.9.0.11
+web1 status=UP check=L7OK scur=0 qcur=0
+web2 status=UP check=L7OK scur=0 qcur=0
+```
+
+</Expected>
+
+`web1` đã `DOWN`, nên HAProxy bỏ qua cookie cũ, gửi sang `web2` và phát cookie mới. Người dùng không thấy lỗi, nhưng mọi thứ ứng dụng giữ trong bộ nhớ của `web1` (giỏ hàng, phiên đăng nhập) đã mất. Giữ phiên không thay được việc đưa trạng thái ra ngoài.
+
+<Check id="d21.2.lab-sticky">Cấu hình được cookie giữ phiên do HAProxy chèn, chứng minh được request có cookie luôn về một server, và mô tả được điều xảy ra với người dùng khi server đó chết.</Check>
+
+### 5. Rút một backend để deploy
+
+Kịch bản: cần dừng `web1` để thay bản mới, trong lúc nó đang xử lý một request dài. Request chậm dưới đây mang cookie `SRV=w1` để chắc chắn vào `web1`.
+
+<Terminal where="vm">
+
+```bash
+curl -s -b SRV=w1 -o /dev/null -w 'request dang do: %{http_code} sau %{time_total}s\n' http://10.9.0.11/slow & p=$!
+sleep 0.5
+hap "set server app/web1 state drain"; st
+for i in 1 2 3 4; do curl -s http://10.9.0.11/ | cut -d' ' -f1; done | tr '\n' ' '; echo
+curl -s -b SRV=w1 http://10.9.0.11/ | cut -d' ' -f1
+wait $p; st | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+
+web1 status=DRAIN check=L7OK scur=1 qcur=0
+web2 status=UP check=L7OK scur=0 qcur=0
+backend=web2 backend=web2 backend=web2 backend=web2 
+backend=web1
+request dang do: 200 sau 2.997032s
+web1 status=DRAIN check=L7OK scur=0 qcur=0
+```
+
+</Expected>
+
+Sau lệnh `drain` (HAProxy trả một dòng trống khi lệnh thành công), mọi request mới đi `web2`. Request đang dở trên `web1` (`scur=1`) chạy tới hết và trả `200`. Request mang cookie dính `SRV=w1` **vẫn** vào `web1`: `drain` tôn trọng phiên đang có, để người dùng đang giữa một thao tác làm xong. Khi `scur=0` thì dừng `web1` được. Nếu phải ngắt cả người dùng đang dính, dùng `maint`.
+
+Hoàn tất lượt deploy rồi thử cách làm sai: dừng thẳng backend đang có request.
+
+<Terminal where="vm">
+
+```bash
+web_kill 1; web 1; sleep 3
+hap "set server app/web1 state ready"; st | head -1
+curl -s -b SRV=w1 -o /dev/null -w 'request dang do: %{http_code} sau %{time_total}s\n' http://10.9.0.11/slow & p=$!
+sleep 0.5; web_kill 1; wait $p
+grep '/slow' lb/haproxy.log | tail -1 | cut -d' ' -f3-
+web 1; sleep 3; st | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+
+web1 status=UP check=L7OK scur=0 qcur=0
+request dang do: 502 sau 0.529017s
+fe_http app/web1 0/0/0/-1/530 502 209 - - SHVN 1/1/0/0/0 0/0 "GET /slow HTTP/1.1"
+web1 status=UP check=L7OK scur=0 qcur=0
+```
+
+</Expected>
+
+Client nhận `502` ngay khi backend biến mất. Cờ `SH` (hai ký tự đầu; hai ký tự sau thuộc về cookie): server đóng kết nối trước khi trả header (`Tr` là `-1`). HAProxy không gửi lại request này sang `web2` vì nó đã tới backend và có thể đã được xử lý dở. Health check và `retries` không cứu được request **đang chạy**; chỉ `drain` trước khi dừng (cùng graceful shutdown phía ứng dụng, SB8.3) mới cứu được.
+
+<Check id="d21.2.lab-drain">Rút được một server bằng `set server ... state drain`, dùng `scur` biết lúc nào dừng an toàn, đưa nó trở lại bằng `ready`, và chỉ ra được dòng log `SH` khi dừng backend không qua drain.</Check>
+
+### 6. Mode tcp và PROXY protocol
+
+Thêm một khối `listen` chạy `mode tcp` ở port 9000, trỏ tới một cặp backend mới nghe port 9090:
+
+<Terminal where="vm">
+
+```bash
+cat >> lb/haproxy.cfg <<'EOF'
+
+listen tcp_in
+  mode tcp
+  option tcplog
+  bind 10.9.0.11:9000
+  server web1 10.9.0.21:9090 check
+  server web2 10.9.0.22:9090 check
+EOF
+web 1 9090; web 2 9090; sleep 1; hap_reload; sleep 2
+curl -s http://10.9.0.11:9000/ http://10.9.0.11:9000/
+curl -s http://10.9.0.11/ http://10.9.0.11/ | cut -d' ' -f1
+grep ' tcp_in ' lb/haproxy.log | tail -1 | cut -d' ' -f3-
+```
+
+</Terminal>
+
+<Predict question="Mỗi lệnh curl gửi hai request trên cùng một kết nối TCP. Qua port 9000 (tcp) và port 80 (http), hai request về cùng backend hay khác backend? Backend thấy client là ai?">
+
+```text
+backend=web1 peer=10.9.0.11 proxy_src=None xff=None
+backend=web1 peer=10.9.0.11 proxy_src=None xff=None
+backend=web1
+backend=web2
+tcp_in tcp_in/web1 1/0/45 410 -- 1/1/0/0/0 0/0
+```
+
+Ở `mode tcp`, HAProxy chọn backend một lần cho cả **kết nối**: hai request về cùng `web1`. Ở `mode http`, nó chọn lại cho từng request. Dòng log của `tcp_in` chỉ có thời gian và số byte (410), không có đường dẫn hay mã trả về, vì HAProxy không đọc nội dung. Và backend mù hoàn toàn về client: `peer` là HAProxy, `xff=None` vì không ai chèn header. (Backend đầu tiên có thể là `web2` trên máy bạn.)
+
+</Predict>
+
+Bật `send-proxy` trên một khối riêng trỏ vào `nc`, để nhìn tận mắt thứ HAProxy gửi đi:
+
+<Terminal where="vm">
+
+```bash
+cat >> lb/haproxy.cfg <<'EOF'
+
+listen tcp_raw
+  mode tcp
+  option tcplog
+  bind 10.9.0.11:9001
+  server web1 10.9.0.21:9091 send-proxy
+EOF
+hap_reload
+sudo ip netns exec web1 timeout 4 nc -l 10.9.0.21 9091 > /tmp/d21-raw.txt & p=$!
+sleep 0.5; curl -s -m 2 http://10.9.0.11:9001/hello; wait $p
+head -3 /tmp/d21-raw.txt | cat -A
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PROXY TCP4 10.9.0.1 10.9.0.11 56130 9001^M$
+GET /hello HTTP/1.1^M$
+Host: 10.9.0.11:9001^M$
+```
+
+</Expected>
+
+Trước request HTTP của client có thêm đúng một dòng: giao thức, IP nguồn, IP đích, port nguồn, port đích (port nguồn trên máy bạn sẽ khác; `^M$` là `\r\n` qua `cat -A`). Giờ bật `send-proxy` cho `tcp_in`, trong khi backend ở port 9090 **chưa** biết gì về PROXY protocol:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/:9090 check$/:9090 check send-proxy/' lb/haproxy.cfg; hap_reload; sleep 2
+curl -sS -m 3 http://10.9.0.11:9000/
+st tcp_in
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+curl: (1) Received HTTP/0.9 when not allowed
+web1 status=UP check=L4OK scur=0 qcur=0
+web2 status=UP check=L4OK scur=0 qcur=0
+```
+
+</Expected>
+
+Backend đọc dòng `PROXY TCP4 ...` như dòng đầu của một request HTTP, không hiểu, và trả về thứ mà curl từ chối. Mọi request đều hỏng, trong khi health check vẫn xanh (`L4OK`): check L4 chỉ bắt tay TCP rồi đóng, không gửi gì nên không va vào lỗi. Đây là dạng sự cố "dashboard xanh, người dùng lỗi" điển hình của check L4. Chạy lại backend ở chế độ hiểu PROXY protocol:
+
+<Terminal where="vm">
+
+```bash
+web_kill 1 9090; web_kill 2 9090
+web 1 9090 --proxy; web 2 9090 --proxy; sleep 3
+curl -s -m 3 http://10.9.0.11:9000/
+curl -sS -m 3 http://10.9.0.21:9090/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+backend=web2 peer=10.9.0.11 proxy_src=10.9.0.1 xff=None
+curl: (1) Received HTTP/0.9 when not allowed
+```
+
+</Expected>
+
+`peer` vẫn là HAProxy (kết nối TCP thật), nhưng `proxy_src=10.9.0.1` là IP client lấy từ dòng mở đầu. Lệnh thứ hai gọi **thẳng** vào backend, không qua HAProxy: backend nuốt dòng đầu của request làm đoạn PROXY và hỏng theo chiều ngược lại. Nếu lệnh đó tự gửi một dòng `PROXY TCP4 1.2.3.4 ...` hợp lệ, backend sẽ tin IP `1.2.3.4`. Port nhận PROXY protocol phải được firewall (D2.4) giới hạn cho riêng load balancer.
+
+<Check id="d21.2.lab-tcp-proxy">Chạy được HAProxy `mode tcp`, chứng minh được nó cân bằng theo kết nối, nhìn được dòng PROXY protocol bằng `nc`, và tái hiện được lỗi khi chỉ một đầu bật PROXY protocol trong lúc health check L4 vẫn xanh.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `hap: command not found`, `web: command not found`: terminal mới chưa nạp hàm. Chạy `. ~/masteva-d21/lab.sh; . ~/masteva-d21/lb/hap.sh`.
+- `socat ... No such file or directory` hoặc `Connection refused`: HAProxy của lab không chạy. Xem `tail lb/haproxy.log`, rồi chạy lại lệnh `sudo ip netns exec lb1 haproxy -W ...` ở bước 1.
+- `[ALERT] ... cannot bind socket (Address already in use)`: HAProxy của lab đang chạy rồi; dùng `hap_reload`. Nếu là port 80 hoặc 8404, có thể Nginx của D9.1 còn chạy: `sudo ~/masteva-d21/topo.sh up` dừng mọi thứ trong các namespace (rồi làm lại từ `web 1; web 2`).
+- `hap_reload` không in gì nhưng cấu hình không đổi: file có lỗi, và `hap_reload` kiểm bằng `haproxy -c -q` nên im lặng (mã thoát 1) rồi dừng. Chạy `haproxy -c -f lb/haproxy.cfg` để xem lỗi và cả các cảnh báo, sửa file rồi chạy lại.
+- Lệnh `wait` không trả về: bạn gõ `wait` trơn, nó chờ cả các backend. Bấm Ctrl+C; các backend vẫn chạy.
+- `st` cho thấy `DOWN` với `L4CON` ngay từ đầu: backend chưa chạy. `web 1; web 2` rồi chờ 2 giây.
+- Server kẹt ở `DRAIN` hoặc `MAINT` sau khi thử: `hap "set server app/web1 state ready"`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới dừng HAProxy và mọi backend trong các namespace của lab, xoá mạng lab và hai file tạm trong `/tmp`. Thư mục `~/masteva-d21` được giữ lại: D9.3 dùng `web/web.py` và `lb/hap.sh`.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+sudo ~/masteva-d21/topo.sh down
+rm -f /tmp/d21-jar /tmp/d21-raw.txt
+sleep 2; ip netns list | wc -l; pgrep -c haproxy
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+0
+```
+
+</Expected>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đặt inter, fall, rise bao nhiêu? Check càng dày càng tốt?">
+
+Không. `inter 1s fall 2` phát hiện trong 2 giây nhưng cũng loại một server chỉ vì hai lần trễ do GC hay mạng chập chờn, rồi `rise 2` đưa nó vào lại: server "nhấp nháy" và tải dồn qua dồn lại. Check dày còn tốn tài nguyên thật: 20 load balancer, mỗi cái check 200 server mỗi giây là 4.000 request mỗi giây chỉ để hỏi thăm, và nếu endpoint check đụng tới database thì chính health check thành một nguồn tải. Điểm xuất phát hợp lý cho dịch vụ web là `inter 2s fall 3 rise 2` (phát hiện trong khoảng 6 giây), kèm `retries` và `redispatch` che khoảng trống đó cho lỗi kết nối. Rút ngắn hơn chỉ khi đo được rằng 6 giây là quá dài so với mục tiêu của dịch vụ (D16). `slowstart 30s` trên server giúp chiều ngược lại: server vừa lên được tăng tải dần thay vì nhận ngay đủ phần, cho JVM kịp biên dịch các đoạn code nóng.
+
+</Reveal>
+
+<Reveal title="Khi nào dùng agent check hay check thụ động thay cho check HTTP?">
+
+`agent-check` cho server tự báo trạng thái qua một port riêng: nó trả lời `up`, `down`, `drain`, hoặc một trọng số như `50%`. Hợp khi backend biết rõ sức mình (đang quá tải, sắp tắt) và muốn tự giảm phần traffic thay vì chỉ có hai trạng thái sống, chết. Check thụ động (`observe layer7` cùng `error-limit`, `on-error mark-down`) là kiểu của Nginx: đếm lỗi của traffic thật. Nó bắt được lỗi mà endpoint check bỏ sót (chỉ hỏng ở đường dẫn thật), và phản ứng nhanh hơn `inter`. Hệ thống cẩn thận dùng cả hai: check chủ động để biết server chết cả khi không có traffic, check thụ động để loại nhanh server đang trả lỗi cho người dùng. Cái giá của check thụ động đã thấy ở D2.5: một endpoint chậm có thể loại oan mọi server.
+
+</Reveal>
+
+<Reveal title="Reload HAProxy có rớt kết nối không, và runtime API thay được reload tới đâu?">
+
+Với kiểu master và worker (`-W`, cũng là cách gói Ubuntu chạy), reload sinh worker mới nhận kết nối mới, worker cũ phục vụ nốt kết nối đang dở rồi thoát, giống Nginx ở D9.1; `hard-stop-after` là hạn chót cho worker cũ. Kết nối không rớt, nhưng trạng thái trong bộ nhớ thì mất: bộ đếm, bảng dính, và trạng thái `drain` đặt bằng tay, trừ khi dùng `server-state-file` và `peers`. Runtime API tránh được reload cho những việc hay làm nhất: rút và bật server, đổi trọng số, đổi địa chỉ và port của server (`set server ... addr`), thậm chí thêm và xoá server (`add server`, `del server`). Các công cụ tự động hoá và bộ điều khiển trong Kubernetes dựa vào đó để cập nhật danh sách backend hàng chục lần mỗi phút mà không sinh lại tiến trình. Thứ vẫn cần reload là thay đổi cấu trúc: thêm `frontend`, đổi `bind`, đổi luật ACL.
+
+</Reveal>
+
+<Reveal title="Xếp HAProxy ở đâu khi đã có Nginx, hay khi lên Kubernetes?">
+
+Ba cách xếp hay gặp. Một: HAProxy `mode tcp` ngoài cùng, chuyển nguyên TLS tới vài máy Nginx kết thúc TLS và lo logic HTTP; HAProxy gửi PROXY protocol để Nginx có IP client. Hai: HAProxy `mode http` làm tất cả (kết thúc TLS, định tuyến, giới hạn tốc độ bằng stick-table) và backend là ứng dụng; gọn hơn khi không cần file tĩnh hay cache. Ba: HAProxy làm load balancer cho thứ không phải HTTP, điển hình là API server của Kubernetes trên máy vật lý: ba control plane sau một HAProxy `mode tcp` có health check, và một địa chỉ IP ảo để chính HAProxy không thành điểm chết duy nhất. Mảnh thứ ba đó là D9.3 và K4. Trên cloud, NLB và ALB (D10) đóng vai L4 và L7 được quản lý sẵn, nhưng các khái niệm (health check, drain mà AWS gọi là deregistration delay, PROXY protocol trên NLB) giữ nguyên.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI chuyển một khối `upstream` của Nginx sang `backend` của HAProxy, giải thích một dòng log với cờ kết thúc lạ, hoặc viết script deploy gọi runtime API. AI hay viết cú pháp health check cũ (`option httpchk GET /healthz` một dòng; từ HAProxy 2.2 nên tách thành `http-check send` và `http-check expect`), hay quên `timeout` trong `defaults` (HAProxy cảnh báo và kết nối treo có thể sống mãi), hay bật `send-proxy` mà không nhắc phía backend, và hay dùng `disable server` (tức `maint`, ngắt cả phiên đang dính) khi ý bạn là `drain`. Kiểm lại bằng `haproxy -c -f`, đọc cảnh báo, rồi diễn tập như bước 5: giữ một request dài, chạy script, và xem log có dòng `SH` hay `502` nào không.
+
+</Callout>
+
+<Callout kind="link">
+
+D2.5 có health check thụ động của Nginx và phân biệt L4, L7; D9.1 có keepalive, timeout và reload phía Nginx. D2.4 giải thích vì sao NAT và proxy làm mất IP client. D9.3 đặt hai HAProxy sau một địa chỉ IP ảo bằng Keepalived. K4 dùng đúng cặp đó trước API server của cụm dựng bằng kubeadm. D10 có NLB, ALB với target group, health check và deregistration delay. SB8.3 dạy readiness và graceful shutdown, nửa còn lại của việc rút backend êm. D12 thu thập `/metrics` của HAProxy. D18 xếp `maxconn` cùng `timeout queue` vào nhóm load shedding ở biên, bên cạnh `limit_req` của D9.1.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d21.2.mastery-config">Tự viết được cấu hình HAProxy cho một API: `defaults` có đủ timeout, backend với health check HTTP, `maxconn` trên server, và giải thích được lựa chọn `balance`, `inter`, `fall` của mình.</Check>
+
+<Check id="d21.2.mastery-deploy">Thực hiện được một lượt thay backend không rớt request bằng runtime API (`drain`, chờ `scur` về 0, thay, `ready`), và dùng log chứng minh không có `502` nào.</Check>
+
+<Check id="d21.2.mastery-diagnose">Nhìn một dòng log HAProxy có `503` hoặc `502` kèm năm số thời gian và một trong ba cờ lab đã tạo ra (`SC`, `sQ`, `SH`) là nói được lỗi nằm ở hàng đợi, ở kết nối, hay trong backend; và nêu được `sH` khác `SH` ở đâu.</Check>
+
+</Mastery>

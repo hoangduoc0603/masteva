@@ -1,0 +1,960 @@
+---
+title: Pipeline, job và runner tự host trên Gitea Actions
+description: Dựng một hệ thống CI hoàn chỉnh trên máy mình - Gitea 28, Gitea Runner 5 và registry trong Docker - rồi viết pipeline test, build và push image cho một service Go, bắt pull request phải xanh mới merge được, xem một job làm được gì trên máy runner, và đối chiếu cú pháp với GitHub Actions, GitLab CI, Jenkins.
+id: d7.1
+step: d7
+prerequisites: [d4.2, d6.2]
+topics: [d7.pipeline-stage, d7.runner-tu-host, d7.github-actions-gitlab-ci-jenkins]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    gitea: 28.1.0
+    gitea-runner: 5.0.0
+    registry: 3.1.2
+    golang-image: 1.27.2-alpine
+    actions-checkout: v7.0.1
+    git: 2.39.3 (Apple Git-146)
+    jq: 1.8.2
+---
+
+<Goal>
+
+Hiểu một pipeline CI/CD gồm những phần nào và ai chạy nó, rồi tự dựng được cả hệ thống: máy chủ Git, runner, registry và một pipeline thật. Học xong bài này, bạn giải thích được:
+
+- Vì sao job đứng mãi ở trạng thái chờ dù file workflow không có lỗi.
+- Vì sao pull request đã được approve vẫn không merge được, và máy chủ biết CI đỏ từ đâu.
+- Vì sao một job CI trên runner tự host có thể đọc được token của chính runner và mọi container khác trên máy đó.
+- Một pipeline viết cho GitHub Actions chuyển sang GitLab CI hay Jenkins thì đổi những gì.
+
+</Goal>
+
+<Knowledge>
+
+### CI, CD và pipeline
+
+D4.2 dừng ở chỗ con người review pull request. Phần "máy kiểm" còn thiếu: mỗi thay đổi phải được build và test tự động trước khi vào nhánh chính, và sau khi vào thì phải thành một thứ triển khai được. Ba thuật ngữ hay bị dùng lẫn:
+
+| Thuật ngữ | Nghĩa | Điểm dừng |
+|---|---|---|
+| Continuous integration (CI) | Mọi người tích hợp vào nhánh chính ít nhất mỗi ngày; mỗi lần tích hợp được build và test tự động | Nhánh chính luôn build được, test xanh |
+| Continuous delivery | Mỗi commit trên nhánh chính tạo ra một artifact (gói triển khai được) đã qua mọi kiểm tra; đưa lên production là một quyết định bấm nút | Có artifact sẵn sàng; người quyết định lúc nào triển khai |
+| Continuous deployment | Như trên, nhưng bước cuối cũng tự động | Commit qua hết kiểm tra là tự lên production |
+
+**Pipeline** là chuỗi bước tự động đó, viết thành file nằm trong chính repo (pipeline as code), nên nó được review và có lịch sử như mọi thay đổi khác.
+
+```text
+ git push · pull request · tag · lịch · bấm tay                (sự kiện)
+        │
+        ▼
+ Máy chủ Git đọc file workflow tại đúng commit của sự kiện,
+ tạo một lượt chạy (run) gồm các job và xếp vào hàng đợi
+        │
+        ▼
+ ┌─ job: test ───────────┐  needs  ┌─ job: image ──────────────┐
+ │ step: checkout         │ ──────▶ │ step: checkout             │
+ │ step: go vet           │         │ step: docker build         │
+ │ step: go test          │         │ step: docker push          │──▶ registry
+ └────────────────────────┘         └────────────────────────────┘
+        ▲
+        │ runner hỏi máy chủ "có việc không?", nhận một job, chạy từng step
+        │ trong một container mới, gửi log và kết quả về
+      Runner
+```
+
+| Khái niệm | Là gì | Trong lab |
+|---|---|---|
+| Sự kiện (event, trigger) | Thứ khởi động pipeline | `push` lên `main`, `pull_request` |
+| Workflow (GitHub, Gitea) hay pipeline (GitLab, Jenkins) | Một file định nghĩa các job và điều kiện chạy | `.gitea/workflows/ci.yaml` |
+| Job | Nhóm step chạy trên **một** runner, trong một môi trường sạch; job khác nhau không chung file | `test`, `image` |
+| Step | Một lệnh shell (`run`) hoặc một action dựng sẵn (`uses`) | `go test ./...`, `actions/checkout` |
+| Stage | Nhóm job cùng một giai đoạn (kiểm tra, build, triển khai). GitLab và Jenkins có từ khoá riêng; GitHub và Gitea diễn đạt bằng `needs` giữa các job | `test` rồi mới `image` |
+| Runner (agent) | Tiến trình nhận job và chạy nó | container `d6-runner` |
+| Artifact | Thứ pipeline tạo ra để dùng tiếp: binary, image, báo cáo test | image `price-api:<commit>` |
+
+Ba nguyên tắc sắp xếp pipeline:
+
+- **Phản hồi nhanh, hỏng sớm.** Xếp kiểm tra rẻ lên trước (format, lint, unit test: vài chục giây), kiểm tra đắt ra sau (integration test, build image, quét). Người viết code cần biết mình làm hỏng gì trong vài phút. DORA lấy mốc: build và test tự động nên cho kết quả trong vài phút, nhiều nhất khoảng mười phút.
+- **Mọi thay đổi đi cùng một đường.** Không có lối build tay "cho nhanh". Thứ lên production là thứ pipeline tạo ra, từ một commit đã review.
+- **Môi trường của job phải tái lập được.** Job chạy trong image đã ghim phiên bản, không dựa vào thứ ai đó cài tay trên máy build.
+
+<Check id="d7.1.pipeline-anatomy">Phân biệt được CI, continuous delivery và continuous deployment, và kể được sự kiện, workflow, job, step, runner, artifact trong một pipeline cụ thể.</Check>
+
+### Runner: ai thật sự chạy job
+
+Máy chủ Git không chạy code của bạn. Nó chỉ giữ hàng đợi. **Runner** là một tiến trình riêng, có thể ở máy khác, làm vòng lặp: hỏi máy chủ có job nào khớp **label** của mình không, nhận job, chạy, gửi log về. Kết nối luôn đi **từ runner ra máy chủ**, nên runner nằm sau NAT hay trong mạng nội bộ vẫn chạy được mà không cần mở cổng vào.
+
+`runs-on: ubuntu-latest` trong workflow không phải tên hệ điều hành, mà là một label. Job chỉ được nhận bởi runner khai label đó; không runner nào khớp thì job nằm chờ mãi. Trên runner tự host, label còn quyết định job chạy **ở đâu**:
+
+| Cách chạy job | Job thấy gì | Cô lập | Dùng khi |
+|---|---|---|---|
+| Trên thẳng máy runner (`host`, shell executor) | File, công cụ, tiến trình của máy runner; thứ job trước để lại | Không có | Build cần phần cứng hay phần mềm đặc biệt (macOS, GPU) và code hoàn toàn tin được |
+| Trong container, dùng chung Docker daemon của máy runner | Một container sạch mỗi job; nhưng nếu job chạm được socket Docker thì thấy cả máy (lab kiểm chứng ở bước 6) | Giữa các job: có. Với máy runner: không | Lab; đội nhỏ, repo riêng, người push đều tin được |
+| Docker-in-Docker: runner có daemon riêng | Chỉ daemon của runner, không thấy container của máy chủ | Tốt hơn; container runner phải `--privileged` | README của Gitea Runner 5 ghi bản `-dind` là "recommended" |
+| Runner dùng một lần (ephemeral): máy ảo hoặc pod mới cho mỗi job | Một máy trắng, huỷ sau job | Tốt nhất | Runner dùng chung nhiều repo; repo nhận pull request từ người ngoài |
+
+So với runner do nhà cung cấp host (GitHub-hosted runner, shared runner của gitlab.com), runner tự host cho bạn ba thứ: vào được mạng nội bộ (registry, database test, máy đích để triển khai), phần cứng tuỳ ý, và cache nằm lại trên máy nên build nhanh. Đổi lại bạn nhận ba việc: vá và nâng cấp runner, dọn đĩa, và quan trọng nhất là **bảo mật**. Job CI là code tuỳ ý do người push quyết định. Chạy nó trên máy của bạn nghĩa là mọi thứ máy đó chạm tới được (mạng nội bộ, credential, job của repo khác) đều nằm trong tầm của người viết được workflow.
+
+<Callout kind="production">
+
+Tháng 01/2024, hai nhà nghiên cứu bảo mật John Stawinski và Adnan Khan công bố cách họ chiếm được hạ tầng CI của PyTorch qua chương trình bug bounty. Theo bài viết của họ: repo công khai `pytorch/pytorch` gắn nhiều runner tự host **không dùng một lần**; thiết lập mặc định của GitHub chỉ đòi duyệt workflow từ fork với người chưa từng đóng góp, nên chỉ cần một pull request sửa lỗi chính tả được merge là họ thành "người đã đóng góp". Pull request tiếp theo sửa file workflow để chạy code của họ trên runner, cài một tiến trình nền sống tiếp sau khi job kết thúc. Từ đó họ đọc được `GITHUB_TOKEN` có quyền ghi của các job khác chạy trên cùng runner (token nằm trong `.git/config` suốt lúc job chạy) và chứng minh sửa được release của PyTorch. Hai điều kiện làm nên lỗ hổng đều là cấu hình: runner sống qua nhiều job, và code từ fork được chạy trên nó. Phần Đào sâu bàn cách chặn; D6.5 quay lại pull request từ fork.
+
+</Callout>
+
+<Check id="d7.1.runner-model">Giải thích được runner nhận job thế nào, `runs-on` khớp với gì, và so sánh được bốn mức cô lập của runner tự host cùng rủi ro của từng mức.</Check>
+
+### Gitea Actions trong lab, và ba lựa chọn ngoài đời
+
+Lab dùng **Gitea Actions** vì nó chạy trọn trong Docker trên máy bạn, không cần tài khoản dịch vụ nào, và đọc **cùng cú pháp workflow với GitHub Actions**. Gitea đọc workflow ở `.gitea/workflows/` (không có thì đọc `.github/workflows/`), và action không ghi host như `actions/checkout` được tải từ `github.com`. Những khác biệt với GitHub Actions mà bài này và các bài sau chạm tới, theo tài liệu Gitea 28:
+
+| Điểm | GitHub Actions | Gitea Actions 28 |
+|---|---|---|
+| Runner | GitHub-hosted hoặc tự host | Chỉ tự host (Gitea Runner) |
+| `jobs.<id>.environment` | Environment có secret riêng, người duyệt, thời gian chờ | Bị bỏ qua |
+| OIDC (`permissions: id-token`) | Có | Không hỗ trợ |
+| Token của job đẩy image vào registry của chính nền tảng | `GITHUB_TOKEN` đẩy được lên GHCR | `GITEA_TOKEN` không đẩy được vào package registry; phải dùng token cá nhân |
+| Ref của sự kiện `pull_request` | `refs/pull/N/merge`: bản xem trước sau khi merge | `refs/pull/N/head`: đầu nhánh của PR |
+| `uses:` | `owner/repo@ref` | Thêm URL đầy đủ, `self:owner/repo@ref`, và `builtin:checkout` không cần tải action |
+
+Chủ đề này là chủ đề **chọn một**: ở công ty bạn sẽ gặp một trong ba hệ dưới đây. Khái niệm giống nhau, khác tên gọi và cách tổ chức:
+
+| Khái niệm | GitHub Actions | GitLab CI | Jenkins |
+|---|---|---|---|
+| File | `.github/workflows/*.yml` (nhiều file) | `.gitlab-ci.yml` (một file, `include` file khác) | `Jenkinsfile` (Groovy) |
+| Cấu trúc | workflow → job → step | pipeline → stage → job → `script` | pipeline → stage → step |
+| Thứ tự | `needs` giữa các job | `stages` tuần tự; `needs` để chạy sớm hơn | Thứ tự `stage`; khối `parallel` |
+| Chọn nơi chạy | `runs-on: <label>`, thêm `container:` | `tags:` chọn runner, `image:` chọn container | `agent { label '…' }` hoặc `agent { docker { image '…' } }` |
+| Tiến trình chạy job | Runner (GitHub-hosted hoặc tự host) | GitLab Runner với executor `shell`, `docker`, `kubernetes`… | Controller điều phối, agent chạy |
+| Điều kiện chạy | `on:` và `if:` | `rules:` | `when { … }` |
+| Tái sử dụng | Action (`uses:`), reusable workflow | `include:`, CI/CD component | Shared library |
+| Secret | `secrets.TEN` | CI/CD variable (masked, protected) | Credentials và `withCredentials` |
+| Mạnh ở | Kho action rất lớn, gắn liền GitHub | Tích hợp sẵn registry, environment, review app; tự host phổ biến ở Việt Nam | Tuỳ biến bằng plugin; có mặt nhiều ở doanh nghiệp lâu năm, ngân hàng |
+| Phải trả giá | Action của bên thứ ba là code lạ chạy trong pipeline (D6.5) | Một số tính năng kiểm soát cần gói trả phí | Tự vận hành controller, plugin và bản vá; Jenkins LTS hiện cần Java 21 hoặc 25 |
+
+Cùng pipeline "test rồi build image" của lab, viết bằng hai hệ kia. Hai đoạn này **không chạy trong lab**; cú pháp đã đối chiếu với tài liệu hiện hành của GitLab và Jenkins:
+
+```yaml
+# .gitlab-ci.yml
+stages: [test, build]
+
+test:
+  stage: test
+  image: golang:1.27.2-alpine
+  script:
+    - go vet ./...
+    - go test ./...
+
+image:
+  stage: build
+  image: docker:29.8.2-cli
+  services: [docker:29.8.2-dind]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+    - docker build --build-arg VERSION=$CI_COMMIT_SHORT_SHA -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+```
+
+```groovy
+// Jenkinsfile
+pipeline {
+  agent none
+  stages {
+    stage('Test') {
+      agent { docker { image 'golang:1.27.2-alpine' } }
+      steps {
+        sh 'go vet ./...'
+        sh 'go test ./...'
+      }
+    }
+    stage('Image') {
+      when { branch 'main' }
+      agent { label 'docker' }
+      steps {
+        sh 'docker build --build-arg VERSION=${GIT_COMMIT} -t registry.example.com/price-api:${GIT_COMMIT} .'
+        sh 'docker push registry.example.com/price-api:${GIT_COMMIT}'
+      }
+    }
+  }
+}
+```
+
+Hai lưu ý cho Jenkinsfile: `when { branch 'main' }` chỉ có nghĩa trong multibranch pipeline, nơi Jenkins tự tạo một job cho mỗi nhánh; và lệnh `docker push` cần đăng nhập registry trước, thường bằng một credential bọc trong `withCredentials` hoặc `docker.withRegistry`. Ví dụ GitLab dùng biến `CI_REGISTRY_USER`, `CI_REGISTRY_PASSWORD` mà GitLab tự cấp cho mỗi job để đăng nhập registry của chính project.
+
+Đọc ba file cạnh nhau sẽ thấy phần khó của CI không nằm ở cú pháp. Nó nằm ở các quyết định giống nhau ở mọi hệ: job nào chạy trước, chạy trong image nào, runner nào được chạm vào đâu, và thứ gì được coi là artifact.
+
+<Check id="d7.1.pick-ci">Ánh xạ được workflow, job, step, runner, điều kiện chạy và secret giữa GitHub Actions, GitLab CI và Jenkins, và kể được ít nhất ba điểm Gitea Actions khác GitHub Actions.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Workflow syntax for GitHub Actions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax): tra cứu `on`, `jobs`, `needs`, `if`, `runs-on`, `container`; Gitea Actions dùng cùng cú pháp.
+- [Compared to GitHub Actions (Gitea Documentation)](https://docs.gitea.com/usage/actions/comparison): danh sách chính thức những gì Gitea Actions thêm, thiếu và làm khác; đọc trước khi mang workflow từ GitHub sang.
+- [Gitea Runner](https://docs.gitea.com/runner/): ba cách chạy job (Docker, Docker-in-Docker, host), label, đăng ký, runner dùng một lần. Trang này mô tả runner 3.x và còn ghi kiểu dùng socket là "recommended"; [README của repo `gitea/runner`](https://gitea.com/gitea/runner) theo bản 5 thì khuyên dùng `-dind`.
+- [CI/CD YAML syntax reference (GitLab Docs)](https://docs.gitlab.com/ci/yaml/) và [Pipeline Syntax (Jenkins)](https://www.jenkins.io/doc/book/pipeline/syntax/): tra cứu khi bạn chọn GitLab CI hoặc Jenkins.
+- [Playing with Fire: How We Executed a Critical Supply Chain Attack on PyTorch](https://johnstawinski.com/2024/01/11/playing-with-fire-how-we-executed-a-critical-supply-chain-attack-on-pytorch/): bài gốc của vụ việc trong callout; đọc phần "Self-Hosted Runners" và "The Magical GITHUB_TOKEN".
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D4.2 (quen API của Gitea, bảo vệ nhánh) và D5.2 (Dockerfile của `price-api`, registry). Docker Desktop hoặc Docker Engine 29 đang chạy, có `git`, `curl`, `jq`, máy có mạng: lab tải image Gitea (khoảng 70 MB), Gitea Runner (19 MB), registry (19 MB), Go (72 MB), distroless (2 MB), và runner tải action `actions/checkout` từ `github.com` (kho công khai, không cần tài khoản). Dùng các cổng **9500** (Gitea), **9501** (registry), **9502** (chạy thử image). **Profile máy:** cả stack dùng khoảng 250 MiB RAM lúc nghỉ, mỗi job thêm 0,3–1 GB trong vài chục giây; máy 8 GB với Docker VM 4 GB là đủ vì runner chỉ chạy một job mỗi lúc (`capacity: 1`). Mọi lệnh chạy trong cùng một tab Terminal.
+
+Stack này được dùng tiếp tới hết chặng D6 và ở D7.1. Lab đóng hai vai như D4.2: **an** là tác giả và chủ repo, **binh** là reviewer.
+
+### 1. Gitea và registry trên một mạng riêng
+
+<Terminal where="mac" title="~/masteva-d7">
+
+```bash
+mkdir -p ~/masteva-d7 && cd ~/masteva-d7
+docker network create d6-net
+docker run -d --name d6-gitea --network d6-net -p 9500:3000 \
+  -e GITEA__security__INSTALL_LOCK=true \
+  -e GITEA__server__ROOT_URL=http://d6-gitea:3000/ \
+  -e GITEA__database__DB_TYPE=sqlite3 \
+  -e GITEA__service__DISABLE_REGISTRATION=true \
+  -v d6-gitea-data:/data gitea/gitea:28.1.0
+docker run -d --name d6-registry --network d6-net -p 9501:5000 \
+  -v d6-registry-data:/var/lib/registry registry:3.1.2
+until curl -sf localhost:9500/api/healthz >/dev/null; do sleep 1; done
+curl -s localhost:9500/api/v1/version; echo
+curl -s localhost:9501/v2/_catalog
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+522110e95576df1769a2a9cb08b3de73798ed289368c853cd5acee658ca3d4ea
+58f674da6da65338d237691bb47a69ef569d7babafcf52ad0c0df66ac29a1a92
+40dc8463faf4daf44430e6a88e173be9432f2e118097f6c42b37e42fc6f5fb55
+{"version":"28.1.0"}
+{"repositories":[]}
+```
+
+</Expected>
+
+Ba dòng đầu là mã network và container, trên máy bạn sẽ khác. Khác D4.2 ở hai chỗ:
+
+- Mọi thứ nằm trên network `d6-net`, để runner và các job container gọi Gitea bằng tên `d6-gitea` (DNS của network do người dùng tạo, D5.3 đã giải thích).
+- `ROOT_URL` là `http://d6-gitea:3000/` chứ không phải `localhost:9500`. Gitea đưa địa chỉ này cho job làm nơi clone code và gọi API; trong job container, `localhost` là chính container đó. Bạn vẫn gọi API và `git push` từ máy mình qua `localhost:9500`; chỉ giao diện web sẽ nhắc rằng địa chỉ đang dùng khác `ROOT_URL`.
+
+### 2. Người dùng, token và repo
+
+Giống bước 2 và 3 của D4.2, thêm ba hàm dùng suốt chặng: `wait_run` chờ lượt chạy mới xong rồi in kết quả từng job, `job_log` in log của một job, `runner_restart` khởi động lại runner sau khi sửa cấu hình của nó.
+
+<Terminal where="mac" title="~/masteva-d7/lab.sh">
+
+```bash
+for u in an binh; do
+  docker exec -u git d6-gitea gitea admin user create --username $u \
+    --email $u@example.com --random-password --must-change-password=false | tail -1
+done
+{
+  echo "AN_TOKEN=$(docker exec -u git d6-gitea gitea admin user generate-access-token \
+    -u an -t lab --scopes write:repository,write:user --raw)"
+  echo "BINH_TOKEN=$(docker exec -u git d6-gitea gitea admin user generate-access-token \
+    -u binh -t lab --scopes write:repository,read:user --raw)"
+} > gitea.env
+chmod 600 gitea.env
+echo 0 > .last_run
+cat > lab.sh <<'EOF'
+. "$HOME/masteva-d7/gitea.env"
+G=http://localhost:9500/api/v1
+R=$G/repos/an/price-api
+api_an()   { curl -s -H "Authorization: token $AN_TOKEN" -H 'Content-Type: application/json' "$@"; }
+api_binh() { curl -s -H "Authorization: token $BINH_TOKEN" -H 'Content-Type: application/json' "$@"; }
+an_git()   { git -c http.extraHeader="Authorization: token $AN_TOKEN" "$@"; }
+wait_run() {  # chờ lượt chạy mới hơn lượt đã xem, rồi in kết quả từng job
+  local id last; last=$(cat "$HOME/masteva-d7/.last_run" 2>/dev/null || echo 0)
+  until id=$(api_an "$R/actions/runs?limit=1" | jq -e '.workflow_runs[0].id') && [ "$id" -gt "$last" ]; do sleep 1; done
+  until [ "$(api_an "$R/actions/runs/$id" | jq -r .status)" = completed ]; do sleep 2; done
+  echo "$id" > "$HOME/masteva-d7/.last_run"
+  api_an "$R/actions/runs/$id/jobs" | jq -r '.jobs[] | "run \(.run_id)  \(.name): \(.conclusion)"'
+}
+runner_restart() {  # khởi động lại runner sau khi sửa runner-config.yaml; chờ container thấy đúng file mới đã
+  until docker exec d6-runner cat /config.yaml | cmp -s - "$HOME/masteva-d7/runner-config.yaml"; do sleep 1; done
+  docker restart d6-runner >/dev/null
+}
+job_log() {   # job_log <job> [run]: in log của job trong lượt chạy vừa xem (hoặc lượt [run]), bỏ cột thời gian
+  local id jid; id=${2:-$(cat "$HOME/masteva-d7/.last_run")}
+  jid=$(api_an "$R/actions/runs/$id/jobs" | jq --arg n "$1" '.jobs[] | select(.name == $n) | .id')
+  api_an "$R/actions/jobs/$jid/logs" | cut -c30-
+}
+EOF
+. ./lab.sh
+api_an -X POST -d '{"name":"price-api","private":true,"default_branch":"main"}' $G/user/repos \
+  | jq -c '{full_name, private, has_actions}'
+api_an -o /dev/null -w "collaborator binh: HTTP %{http_code}\n" \
+  -X PUT -d '{"permission":"write"}' $R/collaborators/binh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+New user 'an' has been successfully created!
+New user 'binh' has been successfully created!
+{"full_name":"an/price-api","private":true,"has_actions":true}
+collaborator binh: HTTP 204
+```
+
+</Expected>
+
+`wait_run` nhớ mã của lượt chạy đã xem trong file `.last_run` và chỉ nhận lượt có mã lớn hơn. Dòng `echo 0 > .last_run` đặt lại mốc đó: Gitea vừa dựng đánh số lượt chạy lại từ 1, nên một file `.last_run` còn sót từ lần làm trước sẽ khiến `wait_run` chờ mãi.
+
+`has_actions: true`: từ Gitea 1.21, Actions bật sẵn cho cả máy chủ và cho repo mới. Nhưng chưa có runner nào, nên lúc này workflow có được tạo cũng chỉ nằm chờ. Nếu mở tab Terminal mới, chạy lại `cd ~/masteva-d7 && . ./lab.sh`.
+
+### 3. Image cho job và runner
+
+Runner cần hai thứ: một **image để chạy job** và một lần **đăng ký** với Gitea. Image mặc định của Gitea (`runner-images:ubuntu-latest`) nặng gần 600 MB nén. Lab tự đóng một image nhỏ hơn, chứa đúng những gì pipeline cần: Go, Git, Docker CLI, và Node.js vì các action như `actions/checkout` viết bằng JavaScript.
+
+<Terminal where="mac" title="Image d6-ci và runner">
+
+```bash
+mkdir -p ci-image
+cat > ci-image/Dockerfile <<'EOF'
+FROM golang:1.27.2-alpine
+RUN apk add --no-cache git nodejs docker-cli docker-cli-buildx tar zstd curl jq
+EOF
+docker build -q -t d6-ci:1 ci-image
+cat > runner-config.yaml <<'EOF'
+runner:
+  capacity: 1
+  labels:
+    - "ubuntu-latest:docker://d6-ci:1"
+container:
+  network: d6-net
+EOF
+docker run -d --name d6-runner --network d6-net \
+  -e GITEA_INSTANCE_URL=http://d6-gitea:3000/ \
+  -e GITEA_RUNNER_REGISTRATION_TOKEN="$(docker exec -u git d6-gitea gitea actions generate-runner-token | tail -1)" \
+  -e GITEA_RUNNER_NAME=d6-runner -e CONFIG_FILE=/config.yaml \
+  -v "$PWD/runner-config.yaml":/config.yaml:ro -v d6-runner-data:/data \
+  -v /var/run/docker.sock:/var/run/docker.sock gitea/runner:5.0.0
+sleep 5
+docker logs d6-runner 2>&1 | grep -E 'registered|declare' | sed 's/^time="[^"]*" //'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+sha256:832a398e4a04f25463346fa5103ef6ad504195173cf5f7b09f1b179c6284ec31
+b63457d10bfd0eca07cc89a0b8ba676e8bf369348346e55e8f3da5ee9951d1bf
+level=info msg="Runner registered successfully."
+level=info msg="runner: d6-runner, with version: v5.0.0, with labels: [ubuntu-latest], declare successfully"
+```
+
+</Expected>
+
+Mã image và container trên máy bạn sẽ khác. Từng phần:
+
+- `gitea actions generate-runner-token` tạo **registration token** cấp toàn máy chủ: runner đăng ký bằng token này nhận job của mọi repo. Token dùng lại được cho nhiều runner cho tới khi bị đặt lại; runner đổi nó lấy định danh riêng, lưu trong file `.runner` ở volume `d6-runner-data`.
+- Label `ubuntu-latest:docker://d6-ci:1`: job ghi `runs-on: ubuntu-latest` sẽ chạy trong container tạo từ image `d6-ci:1`. Workflow viết cho GitHub chạy được nguyên trên runner này, nhưng "ubuntu-latest" ở đây là image của bạn, không phải máy ảo Ubuntu của GitHub. Thiếu công cụ nào thì thêm vào image, không cài trong job.
+- `container.network: d6-net`: runner tạo job container trên network này, nên job phân giải được `d6-gitea`.
+- `-v /var/run/docker.sock…`: runner dùng Docker của máy bạn để tạo job container. Đây là cách đơn giản nhất và cũng là cách **kém an toàn nhất**; bước 6 cho thấy vì sao, và vì sao README của Gitea Runner 5 khuyên dùng image `-dind`, nơi job không bao giờ nhận socket của máy chủ.
+- `capacity: 1`: runner chạy một job mỗi lúc, các job khác xếp hàng.
+
+<Check id="d7.1.lab-runner">Dựng được Gitea, registry và một runner tự host đã đăng ký, và giải thích được label, registration token, `container.network` trong cấu hình runner.</Check>
+
+### 4. Service, workflow và lượt chạy đầu tiên
+
+`price-api` là bản rút gọn của service ở D5.2 (đã nâng `golang.org/x/text` lên bản vá), thêm một hàm có unit test để pipeline có thứ mà kiểm.
+
+<Terminal where="mac" title="~/masteva-d7/price-api">
+
+```bash
+mkdir -p price-api/.gitea/workflows && cd price-api
+cat > main.go <<'EOF'
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
+)
+
+var version = "dev" // ghi đè lúc build: -ldflags "-X main.version=..."
+
+// Format định dạng số tiền kiểu Việt Nam: 1250000 -> "1.250.000 đ".
+func Format(amount int) string {
+	return message.NewPrinter(language.Vietnamese).Sprintf("%d đ", amount)
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("GET /price", func(w http.ResponseWriter, r *http.Request) {
+		host, _ := os.Hostname()
+		json.NewEncoder(w).Encode(map[string]string{
+			"price": Format(1250000), "version": version, "host": host,
+		})
+	})
+
+	srv := &http.Server{Addr: ":8080", Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	log.Printf("price-api %s listening on :8080", version)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	<-stop
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+}
+EOF
+cat > main_test.go <<'EOF'
+package main
+
+import "testing"
+
+func TestFormat(t *testing.T) {
+	cases := map[int]string{0: "0 đ", 999: "999 đ", 1250000: "1.250.000 đ"}
+	for in, want := range cases {
+		if got := Format(in); got != want {
+			t.Errorf("Format(%d) = %q, muốn %q", in, got, want)
+		}
+	}
+}
+EOF
+cat > go.mod <<'EOF'
+module example.com/price-api
+
+go 1.27
+
+require golang.org/x/text v0.42.0
+EOF
+cat > go.sum <<'EOF'
+golang.org/x/text v0.42.0 h1:JbOZXgfeCPU9gacVtYliJqOhD+zhrEqK4LfdpmlUZqI=
+golang.org/x/text v0.42.0/go.mod h1:ojzP1Z+2QtioaF8DTtO8K5q7JWVVYwZKenzujK0Zd0E=
+EOF
+cat > Dockerfile <<'EOF'
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY *.go ./
+ARG TARGETOS TARGETARCH VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/price-api .
+
+FROM gcr.io/distroless/static-debian13:nonroot
+COPY --from=build /out/price-api /price-api
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/price-api"]
+EOF
+printf '*\n!go.mod\n!go.sum\n!*.go\n' > .dockerignore
+```
+
+</Terminal>
+
+Dockerfile là bản của D5.2 bỏ health check. Giờ tới file workflow:
+
+<Terminal where="mac" title=".gitea/workflows/ci.yaml">
+
+```bash
+cat > .gitea/workflows/ci.yaml <<'EOF'
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+
+  image:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build và push image
+        run: |
+          IMAGE=localhost:9501/price-api:${GITHUB_SHA::12}
+          docker build --build-arg VERSION=${GITHUB_SHA::12} -t "$IMAGE" .
+          docker push "$IMAGE"
+EOF
+git init -q -b main .
+git config user.name "An Nguyen" && git config user.email an@example.com
+git add -A && git commit -q -m "price-api với pipeline test và build image"
+git remote add origin http://localhost:9500/an/price-api.git
+an_git push -q -u origin main
+wait_run
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+run 1  test: success
+run 1  image: success
+```
+
+</Expected>
+
+Lệnh `wait_run` đứng chờ khoảng một phút ở lần đầu: runner phải tải action, Go phải tải module và biên dịch thư viện chuẩn, Docker phải kéo base image. Đọc file workflow từ trên xuống:
+
+- `on`: chạy khi có push lên `main` và khi có pull request. Push lên nhánh khác mà chưa mở PR thì không chạy gì.
+- `test` và `image` là hai job. `needs: test` buộc `image` chờ `test` xanh; đây là "stage" theo cách của GitHub và Gitea Actions. Không có `needs`, hai job chạy độc lập (với `capacity: 1` thì lần lượt, không theo thứ tự nào).
+- `if: github.event_name == 'push'`: pull request chỉ được test, không được build và push image. Code chưa review không nên thành artifact trong registry.
+- Mỗi job tự `checkout`: job là một container mới, không thấy file của job trước. Muốn chuyển file giữa các job phải dùng artifact (D6.2).
+- `actions/checkout@3d3c42e5…  # v7.0.1`: action được ghim theo **commit SHA** đầy đủ, kèm chú thích phiên bản. D5.2 đã kể vụ `trivy-action` năm 2026 và vì sao không ghim theo tag; D6.5 làm lại vụ đó ngay trong lab.
+- Tag của image là 12 ký tự đầu của commit SHA. `${GITHUB_SHA::12}` là cú pháp cắt chuỗi của shell; Gitea đặt cả biến `GITHUB_*` lẫn `GITEA_*` cho tương thích.
+
+Xem lượt chạy qua API, như cách máy chủ ghi nhận nó:
+
+<Terminal where="mac">
+
+```bash
+api_an "$R/actions/runs/1" | jq -c '{event, status, conclusion, head_branch, sha: .head_sha[0:12]}'
+api_an "$R/actions/runs/1/jobs" | jq -r '.jobs[] | "\(.name)  runner=\(.runner_name)  \((.completed_at|fromdate) - (.started_at|fromdate)) giây  steps=\([.steps[].name] | join(" | "))"'
+api_an "$R/commits/main/status" | jq -c '{state, checks: [.statuses[] | "\(.context)=\(.status)"]}'
+job_log image | grep -E '^(image|name|network): |pushed|digest' | cut -c1-110
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"event":"push","status":"completed","conclusion":"success","head_branch":"main","sha":"8ef33b667363"}
+test  runner=d6-runner  37 giây  steps=Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 | Vet | Test
+image  runner=d6-runner  10 giây  steps=Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 | Build và push image
+{"state":"success","checks":["ci / test (push)=success","ci / image (push)=success"]}
+image: d6-ci:1
+name: GITEA-ACTIONS-TASK-2-WORKFLOW-ci-JOB-image-image-e53adcb14cbea1b70ebda41a5decf4752952625bf33b190c9fe56eb
+network: d6-net
+8ef33b667363: digest: sha256:195a6a5facb16b914e841ab1ea06eced8704b908ec9a0ca253a84effc39fa348 size: 856
+```
+
+</Expected>
+
+SHA, digest, số giây và tên container trên máy bạn sẽ khác. Ba điều đáng nhìn:
+
+- Mỗi job chạy trong một container riêng tạo từ `d6-ci:1` trên `d6-net`, có tên bắt đầu bằng `GITEA-ACTIONS-TASK-`, và bị xoá khi job xong.
+- Mỗi job để lại một **commit status** trên commit: `ci / test (push)`. Tên này ghép từ tên workflow, tên job và sự kiện. Bước 5 dùng nó làm điều kiện merge.
+- `docker build` trong job chạy trên Docker daemon của máy bạn, nên cache build nằm lại đó giữa các lượt chạy: từ lần thứ hai, job `image` chỉ mất vài giây. Dòng cuối là digest mà registry trả về khi nhận image. D6.2 bàn chuyện gì xảy ra khi runner không giữ được cache.
+
+Artifact của pipeline là một image trong registry, mang tên của đúng commit tạo ra nó:
+
+<Callout kind="danger">
+
+`docker rm` xoá vĩnh viễn container cùng log và lớp ghi của nó. Trong bài này, `docker rm -f` chỉ dùng cho container tên `d6-…` do lab vừa tạo.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+SHA=$(git rev-parse --short=12 HEAD)
+curl -s localhost:9501/v2/price-api/tags/list
+docker run -d --name d6-try -p 9502:8080 localhost:9501/price-api:$SHA >/dev/null
+sleep 2; curl -s localhost:9502/price
+docker rm -f d6-try >/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"name":"price-api","tags":["8ef33b667363"]}
+{"host":"9ff5e5bc612c","price":"1.250.000 đ","version":"8ef33b667363"}
+```
+
+</Expected>
+
+Trường `version` do service trả về trùng với commit trên `main`. Từ một container đang chạy, bạn lần ngược được tới đúng dòng code, đúng pull request, đúng lượt chạy pipeline đã tạo ra nó.
+
+<Check id="d7.1.lab-first-run">Viết được workflow hai job có `needs` và điều kiện `if`, đẩy lên để runner chạy, và đọc được kết quả, thời gian, commit status của lượt chạy qua API.</Check>
+
+### 5. Pull request đỏ thì không merge được
+
+Nối pipeline vào quy tắc bảo vệ nhánh của D4.2: ngoài approval, `main` đòi job `test` của pull request phải xanh.
+
+<Terminal where="mac">
+
+```bash
+api_an -X POST $R/branch_protections -d '{
+  "rule_name": "main", "enable_push": false, "required_approvals": 1,
+  "dismiss_stale_approvals": true, "block_admin_merge_override": true,
+  "enable_status_check": true, "status_check_contexts": ["ci / test (pull_request)"]
+}' | jq -c '{rule_name, enable_status_check, status_check_contexts}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"rule_name":"main","enable_status_check":true,"status_check_contexts":["ci / test (pull_request)"]}
+```
+
+</Expected>
+
+an thêm hàm làm tròn tới nghìn đồng, kèm test, rồi mở pull request:
+
+<Terminal where="mac">
+
+```bash
+git switch -q -c feature/round
+cat >> main.go <<'EOF'
+
+// Round làm tròn số tiền tới nghìn đồng gần nhất.
+func Round(amount int) int {
+	return amount / 1000 * 1000
+}
+EOF
+cat >> main_test.go <<'EOF'
+
+func TestRound(t *testing.T) {
+	cases := map[int]int{0: 0, 1499: 1000, 1500: 2000, 1250000: 1250000}
+	for in, want := range cases {
+		if got := Round(in); got != want {
+			t.Errorf("Round(%d) = %d, muốn %d", in, got, want)
+		}
+	}
+}
+EOF
+git commit -q -am "Làm tròn tới nghìn đồng"
+an_git push -q -u origin feature/round 2>&1 | grep -v '^remote:'
+api_an -X POST $R/pulls -d '{"title":"Làm tròn tới nghìn đồng","head":"feature/round","base":"main",
+  "body":"Giá hiển thị cần tròn nghìn. Có test cho 1.499 và 1.500."}' | jq -c '{number, state, mergeable}'
+wait_run
+job_log test | grep -E -- '--- FAIL|Round\(|^FAIL|^ok' | sed 's/^ *//'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"number":1,"state":"open","mergeable":true}
+run 2  test: failure
+run 2  image: skipped
+--- FAIL: TestRound (0.00s)
+main_test.go:18: Round(1500) = 1000, muốn 2000
+FAIL
+FAIL	example.com/price-api	0.003s
+FAIL
+```
+
+</Expected>
+
+Phép chia nguyên cắt bỏ phần lẻ chứ không làm tròn. Pipeline bắt được trong vài giây, và `image` bị `skipped` (ở PR nó vốn không chạy, và `test` đỏ thì job phụ thuộc cũng không chạy). `mergeable: true` chỉ nói không có conflict.
+
+<Predict question="binh không xem CI, approve luôn. an gọi merge. Rồi an sửa lỗi và đẩy commit mới, CI xanh, an gọi merge lần nữa. Hai lần merge trả về gì?">
+
+Cả hai đều bị từ chối, vì hai lý do khác nhau. Lần đầu: đủ approval nhưng status check bắt buộc đang đỏ. Lần hai: CI xanh nhưng approval cũ đã bị huỷ khi có commit mới (`dismiss_stale_approvals`, D4.2 bước 10). Hai hàng rào độc lập: máy kiểm thứ máy kiểm được, người duyệt đúng phiên bản cuối.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+api_binh -X POST -d '{"event":"APPROVED","body":"LGTM"}' $R/pulls/1/reviews | jq -c '{user: .user.login, state}'
+api_an -w '  HTTP %{http_code}\n' -X POST -d '{"Do":"squash"}' $R/pulls/1/merge
+perl -pi -e 's|return amount / 1000 \* 1000|return (amount + 500) / 1000 * 1000|' main.go
+git commit -q -am "Làm tròn thay vì cắt bỏ"
+an_git push -q 2>&1 | grep -v '^remote:'
+wait_run
+api_an -w '  HTTP %{http_code}\n' -X POST -d '{"Do":"squash"}' $R/pulls/1/merge
+api_binh -X POST -d '{"event":"APPROVED","body":"Đã xanh."}' $R/pulls/1/reviews | jq -c '{user: .user.login, state}'
+api_an -w 'HTTP %{http_code}\n' -X POST -d '{"Do":"squash","delete_branch_after_merge":true}' $R/pulls/1/merge
+wait_run
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"user":"binh","state":"APPROVED"}
+{"message":"Not all required status checks successful","url":"http://d6-gitea:3000/api/swagger"}  HTTP 405
+run 3  test: success
+run 3  image: skipped
+{"message":"Does not have enough approvals","url":"http://d6-gitea:3000/api/swagger"}  HTTP 405
+{"user":"binh","state":"APPROVED"}
+HTTP 200
+run 4  test: success
+run 4  image: success
+```
+
+</Expected>
+
+Lượt chạy 4 là sự kiện `push` lên `main` do chính lần merge tạo ra: lần này `image` chạy, và registry có thêm một tag mang SHA của commit squash. Cập nhật máy bạn và kiểm:
+
+<Terminal where="mac">
+
+```bash
+git switch -q main && an_git pull -q --ff-only --prune
+git log --oneline -2
+curl -s localhost:9501/v2/price-api/tags/list | jq -c '.tags | length'
+curl -sf -o /dev/null -w 'tag %{http_code}\n' localhost:9501/v2/price-api/manifests/$(git rev-parse --short=12 HEAD)
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+af4ba9c Làm tròn tới nghìn đồng (#1)
+8ef33b6 price-api với pipeline test và build image
+2
+tag 200
+```
+
+</Expected>
+
+Hash trên máy bạn sẽ khác. Registry có hai tag, và tag thứ hai là của đúng commit đầu nhánh `main`.
+
+<Check id="d7.1.lab-required-check">Đặt được status check bắt buộc cho nhánh chính, và tái hiện được hai tình huống bị chặn: CI đỏ dù đã approve, và CI xanh nhưng approval đã cũ.</Check>
+
+### 6. Một job thấy gì trên máy runner
+
+Giờ đóng vai người có quyền push một nhánh. Không cần sửa `main`, không cần ai review: chỉ cần một file workflow trên nhánh của mình.
+
+<Callout kind="danger">
+
+Chỉ chạy bước này trên Gitea và runner của chính bạn. Đọc token của runner hay gắn ổ đĩa của máy chạy Docker từ một job, trên runner dùng chung của công ty hay của người khác, là hành vi tấn công. Job dưới đây chỉ đếm và in tên, không sửa gì trên máy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+git switch -q -c probe/runner
+cat > .gitea/workflows/probe.yaml <<'EOF'
+name: probe
+on:
+  push:
+    branches: ['probe/**']
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: id -un; ls -l /var/run/docker.sock | cut -c1-10
+      - run: |
+          echo "container nhìn thấy: $(docker ps -q | wc -l)"
+          docker ps --format '{{.Names}}' | grep '^d6-' | sort
+      - run: |
+          echo "token đăng ký của runner: $(docker inspect d6-runner --format '{{json .Config.Env}}' \
+            | tr ',' '\n' | grep -c REGISTRATION_TOKEN) dòng"
+      - run: docker run --rm -v /:/host alpine:3.24.2 sh -c 'grep PRETTY_NAME /host/etc/os-release; ls /host | wc -l'
+      - run: docker run -d --name d6-left-behind alpine:3.24.2 sleep 300
+EOF
+git add -A && git commit -q -m "Thử xem job thấy gì"
+an_git push -q -u origin probe/runner 2>&1 | grep -v '^remote:'
+wait_run
+job_log probe | grep -v -E '^(::|shell:|\s*$)' | sed -n '/^root$/,$p' | grep -v -E '^(docker |echo |  |id )'
+docker ps -a --filter name=d6-left-behind --format '{{.Names}}' | wc -l
+```
+
+</Terminal>
+
+<Predict question="Job chạy trong container d6-ci, không được cấp quyền gì đặc biệt trong workflow. Nó đếm được bao nhiêu container, có đọc được biến môi trường của container runner không, có gắn được thư mục gốc của máy chạy Docker không?">
+
+```text
+run 5  probe: success
+root
+srw-rw----
+container nhìn thấy: 33
+d6-gitea
+d6-registry
+d6-runner
+token đăng ký của runner: 1 dòng
+PRETTY_NAME="Docker Desktop"
+39
+7f92b12ba0e85366aa68bdd1881cf259507e6ac88e637be85e3bee22312b5467
+Cleaning up container for job probe
+removing container d6-left-behind the job left behind
+Job succeeded
+       0
+```
+
+Cả ba đều được. Runner bản thường gắn socket Docker vào job container, nên job gọi được Docker daemon của máy bạn với toàn quyền:
+
+- Nó thấy **mọi** container trên máy, không chỉ của lab (con số 33 là của máy viết bài, đang chạy nhiều lab khác; trên máy bạn sẽ khác).
+- Nó đọc được biến môi trường của container runner, trong đó có registration token: đủ để đăng ký một runner giả nhận job của mọi repo trên máy chủ này.
+- Nó gắn được thư mục gốc của máy chạy Docker vào một container và liệt kê được 39 mục trong đó. Trên Docker Desktop đó là máy ảo Linux của Docker; trên một server Linux cài Docker Engine, đó là ổ đĩa thật của server, tức quyền root.
+
+Dòng `removing container d6-left-behind` là runner dọn container mà job tạo qua socket rồi bỏ lại, nên lệnh cuối đếm được 0. Việc dọn này giữ máy sạch; nó không phải ranh giới bảo mật.
+
+</Predict>
+
+Runner có sẵn công tắc cho việc này. Đặt `container.docker_host: "-"` thì runner vẫn dùng Docker để tạo job container nhưng **không gắn socket vào job**:
+
+<Terminal where="mac">
+
+```bash
+printf '  docker_host: "-"\n' >> ../runner-config.yaml && runner_restart
+RUN=$(cat ../.last_run)
+api_an -X POST -o /dev/null -w 'chạy lại: HTTP %{http_code}\n' "$R/actions/runs/$RUN/rerun"
+until [ "$(api_an "$R/actions/runs/$RUN" | jq -r .status)" = completed ]; do sleep 2; done
+api_an "$R/actions/runs/$RUN" | jq -r '"lượt \(.id), lần chạy \(.run_attempt): \(.conclusion)"'
+job_log probe | grep -E '^(ls: |container nhìn thấy|token đăng ký|Job failed)'
+cat > ../runner-config.yaml <<'EOF'
+runner:
+  capacity: 1
+  labels:
+    - "ubuntu-latest:docker://d6-ci:1"
+container:
+  network: d6-net
+EOF
+runner_restart
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+chạy lại: HTTP 201
+lượt 5, lần chạy 2: failure
+ls: /var/run/docker.sock: No such file or directory
+container nhìn thấy: 0
+token đăng ký của runner: 0 dòng
+Job failed
+```
+
+</Expected>
+
+Lệnh `rerun` chạy lại đúng lượt chạy vừa rồi qua API, không cần commit mới. Job vẫn là root trong container của nó, nhưng không còn socket: nó thấy 0 container, không đọc được token của runner, và bước `docker run` làm job đỏ. Cái giá là job cũng không build được image bằng `docker build`. Phần cuối ghi lại file cấu hình như cũ, vì các bài sau cần job gọi được Docker. `runner_restart` không khởi động lại ngay: file cấu hình được gắn vào container qua lớp chia sẻ file của Docker, và thay đổi có thể tới chậm một nhịp, nên hàm chờ tới khi container thấy đúng nội dung mới rồi mới `docker restart`. Vì cùng lý do, bài luôn ghi thêm hoặc ghi đè file này (`>>`, `cat >`), không dùng công cụ sửa tại chỗ kiểu `sed -i`, `perl -pi`: chúng tạo file mới rồi đổi tên, và trên Linux container vẫn giữ file cũ. Trên runner thật, trên runner thật, bạn giữ `docker_host: "-"` cho các job thường và dành một runner riêng, hoặc image `-dind`, cho job cần build image.
+
+Bài học: **ai sửa được file workflow trên bất kỳ nhánh nào thì chạy được code tuỳ ý với mọi quyền của runner**. Bảo vệ nhánh `main` không che được chỗ này, vì workflow của nhánh `probe/runner` chạy mà không cần merge. Với lab một người, cấu hình này chấp nhận được. Với runner dùng chung, chọn mức cô lập cao hơn trong bảng ở phần Kiến thức; phần Đào sâu nói cụ thể.
+
+<Check id="d7.1.lab-runner-risk">Chứng minh được bằng một workflow rằng job trên runner dùng chung socket Docker thấy mọi container của máy, đọc được token của runner và gắn được thư mục gốc của máy chạy Docker.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`wait_run` đứng mãi dù lượt chạy đã xong:** `.last_run` giữ một mã lớn hơn mã lượt chạy mới nhất, vì bạn dựng lại Gitea mà giữ thư mục `~/masteva-d7`. So `cat ~/masteva-d7/.last_run` với `api_an "$R/actions/runs?limit=1" | jq '.workflow_runs[0].id'`; nếu lệch thì `echo 0 > ~/masteva-d7/.last_run`.
+- **`wait_run` đứng mãi, lượt chạy ở trạng thái chờ:** không runner nào khớp label. Xem `docker logs d6-runner | tail`; kiểm `runs-on` trong workflow khớp tên label trong `runner-config.yaml`.
+- **`runner_restart` đứng mãi:** container `d6-runner` đang dừng (`docker start d6-runner`), hoặc `runner-config.yaml` vừa bị sửa bằng công cụ tạo file mới rồi đổi tên (`sed -i`, `perl -pi`, một số trình soạn thảo) nên container vẫn thấy file cũ. Chạy `docker restart d6-runner` một lần cho container gắn lại file.
+- **Runner báo `unregistered runner` hoặc đăng ký lại thất bại:** volume `d6-runner-data` giữ định danh của một Gitea cũ. Xoá container và volume của runner (`docker rm -f d6-runner && docker volume rm d6-runner-data`) rồi chạy lại bước 3.
+- **Job lỗi ở `checkout` với `Could not resolve host: d6-gitea`:** job container không nằm trên `d6-net`. Kiểm `container.network` trong `runner-config.yaml` và `docker restart d6-runner`.
+- **`Unable to clone https://github.com/actions/checkout`:** máy không ra được `github.com`. Thay dòng `uses` bằng `uses: builtin:checkout`, action có sẵn trong Gitea Runner, không cần tải.
+- **`docker push` trong job báo `connection refused`:** container `d6-registry` chưa chạy hoặc cổng 9501 bận. Lệnh `docker push` do Docker daemon của máy bạn thực hiện, nên `localhost:9501` là cổng trên máy bạn.
+- **`pull access denied for d6-ci`:** chưa build image `d6-ci:1` ở bước 3. Runner dùng image có sẵn trên máy, không kéo từ registry nào.
+
+</Callout>
+
+### Dọn dẹp
+
+D6.2 tới D6.5 và D7.1 dùng tiếp stack này. Nếu học tiếp ngay, chỉ cần quay về `main`. Muốn nghỉ, dừng các container (dữ liệu nằm trong volume, lần sau `docker start` lại):
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu">
+
+```bash
+git switch -q main
+docker stop d6-runner d6-registry d6-gitea
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá hẳn lab: mọi container có tên bắt đầu bằng `d6-` (Gitea, registry, runner, và các môi trường mà những bài sau tạo ra), volume của Gitea (user, repo, lịch sử pipeline), của registry (mọi image đã push) và của runner, network `d6-net`, image `d6-ci:1` và thư mục `~/masteva-d7`. Không khôi phục được. Chỉ chạy khi bạn đã học xong chặng D6 và D7.1.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn lab">
+
+```bash
+docker rm -f $(docker ps -aq --filter name='^d6-')
+docker volume rm d6-runner-data d6-registry-data d6-gitea-data
+docker network rm d6-net
+docker rmi -f d6-ci:1 $(docker images -q --filter reference='localhost:9501/price-api')
+rm -rf ~/masteva-d7
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Runner tự host cho một repo công khai, hoặc dùng chung cho cả công ty: cấu hình thế nào cho an toàn?">
+
+Đi từ câu hỏi "ai viết được workflow chạy trên runner này". Nếu câu trả lời rộng hơn "những người tôi tin như tin quyền root trên máy đó", cần đủ ba lớp. Một: **runner dùng một lần**, mỗi job một máy ảo hoặc pod mới rồi huỷ, để job trước không để lại tiến trình nền hay sửa công cụ cho job sau (Gitea Runner có `--ephemeral`, GitHub có `--ephemeral` và Actions Runner Controller, GitLab có executor `docker-autoscaler` và `kubernetes`). Hai: **không đưa socket Docker của máy chủ vào job**; cần build image thì dùng Docker-in-Docker của riêng runner, hoặc bộ build không cần daemon. Ba: **tách runner theo mức tin cậy**: runner có quyền triển khai production chỉ nhận job từ nhánh được bảo vệ, bằng label riêng và runner đăng ký ở cấp repo thay vì cấp toàn máy chủ; pull request từ fork phải được duyệt trước khi chạy. Tài liệu của GitHub nói thẳng rằng runner tự host gần như không bao giờ nên dùng cho repo công khai.
+
+</Reveal>
+
+<Reveal title="Vì sao pull request chỉ test mà không build image, trong khi build image cũng là một phép kiểm?">
+
+Build thử để biết Dockerfile còn chạy được là hợp lý, và nhiều đội làm vậy với `docker build` không kèm `push`. Thứ cần tránh là **đẩy** image của code chưa review vào registry dùng chung: nó chiếm chỗ, làm rối danh sách tag, và nếu quy trình triển khai lấy "image mới nhất" thì code chưa duyệt có đường lên môi trường thật. Tách bạch: pull request tạo ra **kết quả kiểm tra**; nhánh chính tạo ra **artifact**. Ngoại lệ có chủ đích là môi trường preview (D6.5): image của PR được đẩy vào một repo riêng trong registry, có hạn xoá.
+
+</Reveal>
+
+<Reveal title="Pipeline mất 25 phút. Nên bắt đầu rút ngắn từ đâu?">
+
+Đo trước: API của bước 4 cho thời gian từng job, log cho thời gian từng step. Thường thấy bốn nhóm. Chờ runner (job xếp hàng vì thiếu `capacity`): thêm runner hoặc tăng `capacity`. Tải lại dependency và build lại từ đầu mỗi lần: cache (D6.2). Job chạy nối tiếp dù không phụ thuộc nhau: bỏ `needs` thừa để chúng chạy song song, tách bộ test chậm thành nhiều job. Test chậm thật: chạy unit test trước, đẩy test tích hợp nặng sang job sau hoặc chỉ chạy trên `main`. Đừng rút ngắn bằng cách bỏ kiểm tra: pipeline nhanh mà không bắt được lỗi thì chỉ chuyển chi phí sang production.
+
+</Reveal>
+
+<Reveal title="Workflow nên gọi lệnh trực tiếp, hay gọi một script hoặc Makefile trong repo?">
+
+Giữ logic trong repo dưới dạng script hoặc target của `make`, còn file workflow chỉ điều phối: job nào, khi nào, trên runner nào, với secret nào. Lợi ích: lập trình viên chạy được đúng lệnh đó trên máy mình trước khi push; đổi hệ CI (ba đoạn mã ở phần Kiến thức) chỉ phải viết lại phần điều phối; và logic build được test như code. Dấu hiệu làm sai là file YAML có những khối `run` dài hàng chục dòng shell mà không ai chạy được ngoài CI.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết nháp workflow, chuyển một pipeline từ Jenkins sang GitHub Actions hay giải thích một log lỗi của runner là cách dùng tốt. AI hay sai ở mấy chỗ: dùng action theo tag (`actions/checkout@v4`) thay vì commit SHA, và hay đưa phiên bản action đã cũ; bịa tên input của action; coi Gitea Actions giống hệt GitHub Actions (dùng `environment:`, `id-token`, `GITHUB_TOKEN` để đẩy image, những thứ Gitea không hỗ trợ); và quên rằng mỗi job là một máy sạch nên file của job trước không còn. Kiểm lại bằng cách chạy thật trên một nhánh thử như bước 6, lấy SHA của action bằng `git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>^{}'`, và đối chiếu từng từ khoá với trang "Compared to GitHub Actions" của Gitea.
+
+</Callout>
+
+<Callout kind="link">
+
+D6.2 thêm cache, artifact và cách đánh phiên bản vào pipeline này. D6.3 dùng image do pipeline tạo để triển khai qua các môi trường. D6.5 quay lại bước 6 từ phía phòng thủ: ghim action, quyền token, secret, pull request từ fork. D7.1 lấy dữ liệu các lượt chạy ở đây để tính chỉ số DORA.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d7.1.mastery-pipeline">Tự viết được pipeline cho một service của mình: test trước, build artifact sau, chỉ tạo artifact từ nhánh chính, và giải thích được thứ tự đó bằng nguyên tắc phản hồi nhanh.</Check>
+
+<Check id="d7.1.mastery-gate">Nối được kết quả pipeline vào bảo vệ nhánh để pull request chỉ merge được khi vừa đủ approval vừa xanh, và đọc được lượt chạy, job, log qua API.</Check>
+
+<Check id="d7.1.mastery-runner">Đánh giá được một cấu hình runner tự host: job chạy ở đâu, chạm được những gì, ai viết được workflow cho nó, và đề xuất được mức cô lập phù hợp.</Check>
+
+</Mastery>

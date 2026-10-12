@@ -184,3 +184,42 @@ export function validateCodeRefs(text: string, steps: ReadonlyMap<string, number
   }
   return [...errors];
 }
+
+/**
+ * Khối `<Terminal where="mac">` là lệnh người học dán vào zsh tương tác của macOS, nơi `#` không mở chú thích
+ * (tuỳ chọn `interactivecomments` tắt mặc định): `sleep 5   # chờ…` thành lỗi cú pháp của `sleep` và không chờ gì.
+ * Báo mọi chú thích nằm ngoài thân heredoc; lời giải thích phải nằm ở văn bản quanh khối lệnh.
+ */
+export function validateShellComments(raw: string): string[] {
+  const errors: string[] = [];
+  let inTerminal = false;
+  let inFence = false;
+  let heredocEnd: string | undefined;
+  raw.split('\n').forEach((line, index) => {
+    if (/^<Terminal\b/.test(line)) {
+      inTerminal = /\bwhere="mac"/.test(line);
+      inFence = false;
+      heredocEnd = undefined;
+      return;
+    }
+    if (/^<\/Terminal>/.test(line)) inTerminal = false;
+    if (!inTerminal) return;
+    if (line.startsWith('```')) {
+      inFence = !inFence;
+      heredocEnd = undefined;
+      return;
+    }
+    if (!inFence) return;
+    if (heredocEnd !== undefined) {
+      if (line.trim() === heredocEnd) heredocEnd = undefined;
+      return;
+    }
+    // Bỏ chuỗi trong nháy để `echo 'a # b'` không bị bắt; `$#`, `${#x}`, `a#b` không có khoảng trắng đứng trước.
+    const bare = line.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+    if (/(^|\s)#/.test(bare)) {
+      errors.push(`dòng ${index + 1}: chú thích "#" trong <Terminal where="mac"> làm hỏng lệnh trên zsh của macOS; đưa lời giải thích ra văn bản`);
+    }
+    heredocEnd = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)/.exec(line)?.[1];
+  });
+  return errors;
+}

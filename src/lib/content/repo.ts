@@ -22,6 +22,7 @@ import {
   validateInternalLinks,
   validateLessonStructure,
   validateLock,
+  validateShellComments,
   validateTranslation,
 } from './validate';
 
@@ -228,6 +229,7 @@ export function checkContent(): ContentReport {
   for (const lesson of parsed.filter((p) => p.file.lang === DEFAULT_LANG)) {
     const where = path.relative(process.cwd(), lesson.file.file);
     validateCodeRefs(lesson.file.raw, codeCounts).forEach((e) => errors.push(`${where}: ${e}`));
+    validateShellComments(lesson.file.raw).forEach((e) => errors.push(`${where}: ${e}`));
   }
   const jsonFiles = [
     ...[...steps.keys()].map((id) => path.join(STEPS_DIR, id, 'meta.json')),

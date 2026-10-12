@@ -1,0 +1,951 @@
+---
+title: Scheduler, affinity, taint và toleration
+description: Scheduler chọn node cho pod bằng hai vòng lọc rồi chấm điểm; điều khiển lựa chọn đó bằng nodeSelector, node affinity, pod anti-affinity, taint và toleration, và hiểu vì sao pod Pending, vì sao rollout kẹt, vì sao node chết năm phút sau pod mới được chuyển đi.
+id: k5.1
+step: k5
+prerequisites: [k3.1]
+topics: [k5.affinity-taint]
+status: verified
+verified:
+  date: 2026-10-12
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    yq: 4.54.1
+    jq: 1.8.2
+---
+
+<Goal>
+
+K1.1 nói gọn một câu: scheduler chọn node cho pod. Bài này mở câu đó ra. Bạn sẽ thấy scheduler loại node nào, chấm điểm node còn lại ra sao, và dùng năm công cụ để lái quyết định đó: `nodeSelector`, node affinity, pod affinity và anti-affinity, taint, toleration. Học xong, bạn giải thích được:
+
+- Dòng `0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn't match…` nói gì về từng node.
+- Vì sao ba bản sao của một service có thể nằm chung một node, và chết cùng lúc với node đó.
+- Vì sao thêm toleration rồi mà pod vẫn không về node chuyên dụng.
+- Vì sao một rollout đứng yên mãi ở "1 out of 3 new replicas" khi dùng anti-affinity bắt buộc.
+- Vì sao một node chết mà khoảng sáu phút sau pod trên đó mới được tạo lại ở node khác.
+
+</Goal>
+
+<Knowledge>
+
+### Scheduler: lọc rồi chấm điểm
+
+Pod mới tạo chưa có `spec.nodeName`. **kube-scheduler** theo dõi những pod như thế và, với từng pod, đi qua hai vòng:
+
+```text
+ Pod chưa có spec.nodeName
+        |
+        v
+ Hàng đợi của scheduler (pod có priority cao đứng trước; K5.2)
+        |
+        v
+ 1. LỌC (filter): loại mọi node KHÔNG THỂ chạy pod này
+      NodeResourcesFit    request của pod có vừa phần còn trống của node?
+      TaintToleration     pod có chịu taint NoSchedule, NoExecute của node?
+      NodeAffinity        nodeSelector và node affinity bắt buộc có khớp label node?
+      InterPodAffinity    pod affinity, anti-affinity bắt buộc có thoả?
+      PodTopologySpread   ràng buộc trải đều loại DoNotSchedule (K5.2)
+        |
+        |   không còn node nào --> pod Pending, event FailedScheduling,
+        |                          scheduler thử preemption (K5.2) rồi xếp lại sau
+        v
+ 2. CHẤM ĐIỂM (score): mỗi plugin cho mỗi node còn lại 0..100 điểm,
+    nhân với trọng số của plugin, cộng lại
+      NodeResourcesFit    node còn trống nhiều thì điểm cao
+      NodeAffinity        node khớp điều kiện "ưu tiên" được cộng điểm
+      InterPodAffinity, PodTopologySpread, TaintToleration, ImageLocality...
+        |
+        v
+ 3. Chọn node điểm cao nhất (hoà thì chọn ngẫu nhiên trong nhóm đầu)
+    BIND: ghi spec.nodeName = node đó
+        |
+        v
+ kubelet của node thấy pod thuộc về mình và chạy container (K1.1)
+```
+
+Mỗi dòng trong hai vòng là một **plugin** của scheduling framework. Ba điều cần nhớ trước khi dùng bất kỳ công cụ nào:
+
+- **Lọc là luật, chấm điểm là sở thích.** Mọi tính năng lái scheduler đều rơi vào một trong hai loại. Loại bắt buộc sai thì pod `Pending`; loại ưu tiên sai thì pod vẫn chạy, chỉ ở chỗ bạn không muốn.
+- **Scheduler nhìn request, không nhìn mức dùng thật.** K1.2 đã nói điều này; ở đây nó thành con số: điểm `NodeResourcesFit` tính từ tổng request trên node.
+- **Scheduler quyết định một lần.** Pod đã chạy thì không bị dời khi điều kiện đổi. Chữ `IgnoredDuringExecution` trong tên các trường affinity nghĩa là vậy. Cụm lệch dần theo thời gian và không tự cân lại.
+
+Khi vòng lọc loại hết node, scheduler ghi lý do vào event `FailedScheduling`, đếm theo từng lý do:
+
+```text
+0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn't match Pod's node affinity/selector.
+```
+
+Đọc là: cụm có 4 node, 0 node dùng được; 1 node bị loại vì taint, 3 node bị loại vì không khớp selector. Tổng các con số bằng số node, vì mỗi node được ghi theo plugin đầu tiên loại nó.
+
+<Check id="k5.1.filter-score">Kể được hai vòng lọc và chấm điểm của scheduler, mỗi vòng trả lời câu hỏi gì, và đọc được từng vế của một event `FailedScheduling`.</Check>
+
+### Năm công cụ lái scheduler
+
+| Công cụ | Khai ở | Nói điều gì | Vòng |
+|---|---|---|---|
+| `nodeSelector` | Pod | "Chỉ chạy trên node có đủ các label này" | Lọc |
+| Node affinity | Pod | Như trên nhưng có toán tử (`In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, `Lt`) và có dạng ưu tiên kèm trọng số | Lọc hoặc chấm điểm |
+| Pod affinity, anti-affinity | Pod | "Ở gần" hoặc "tránh xa" các pod khớp một selector, tính theo một `topologyKey` | Lọc hoặc chấm điểm |
+| Taint | Node | "Pod nào không chịu được tôi thì đừng vào" (hoặc: ra khỏi đây) | Lọc (`NoSchedule`, `NoExecute`), chấm điểm (`PreferNoSchedule`) |
+| Toleration | Pod | "Tôi chịu được taint này" | Gỡ bỏ một lý do bị lọc |
+
+Affinity là pod **chọn** node. Taint là node **đuổi** pod. Hai hướng này độc lập, và nhiều lỗi cấu hình đến từ việc chỉ làm một hướng.
+
+**Node affinity** có hai dạng, tên dài nhưng đọc được theo từng nửa:
+
+| Trường | Nửa đầu | Nửa sau |
+|---|---|---|
+| `requiredDuringSchedulingIgnoredDuringExecution` | Bắt buộc lúc xếp: không khớp thì `Pending` | Pod đang chạy không bị đuổi khi label node đổi |
+| `preferredDuringSchedulingIgnoredDuringExecution` | Ưu tiên lúc xếp: mỗi điều kiện có `weight` 1 tới 100, node khớp được cộng điểm | Như trên |
+
+Trong dạng bắt buộc, các `nodeSelectorTerms` nối với nhau bằng HOẶC, các `matchExpressions` trong một term nối bằng VÀ. `nodeSelector` và affinity bắt buộc cùng khai thì node phải thoả cả hai.
+
+**Pod affinity và anti-affinity** so pod đang xếp với các pod **đã có** trên cụm. `topologyKey` là tên một label của node và định nghĩa thế nào là "cùng chỗ": `kubernetes.io/hostname` là cùng node, `topology.kubernetes.io/zone` là cùng zone. Luật "không hai pod `app=web` cùng node" viết là anti-affinity với selector `app=web` và `topologyKey: kubernetes.io/hostname`.
+
+Hai tính chất của anti-affinity bắt buộc gây bất ngờ, và lab sẽ cho bạn thấy cả hai:
+
+- Nó **đối xứng**. Scheduler xét cả luật của pod đang chạy: pod cũ nói "tôi không ở chung với `app=web`" thì pod mới mang label đó bị loại khỏi node ấy, kể cả khi chính pod mới không khai luật nào.
+- Số bản sao tối đa bằng số vùng. Ba node thì bản thứ tư `Pending`, và pod mới của một rollout cũng không có chỗ.
+
+Pod affinity còn đắt về tính toán: scheduler phải so pod với mọi pod khớp selector trên mọi node. Tài liệu Kubernetes không khuyên dùng nó trên cụm quá vài trăm node; topology spread (K5.2) trải pod với chi phí thấp hơn.
+
+<Callout kind="production">
+
+Tháng 1/2019, website và API của Moonlight gián đoạn nhiều đợt trong năm ngày. Theo [bản postmortem họ công bố](https://updates.moonlightwork.com/outage-post-mortem-87370), cụm có ba node và mỗi ứng dụng web chạy ba bản sao, với ý định mỗi node một bản để chịu được hai node hỏng. Nhưng scheduler đôi khi xếp cả ba bản lên cùng một node, cùng với những pod ngốn CPU khác. Node đó quá tải, gặp kernel panic và mất liên lạc; các pod được xếp lại sang node khác và lặp lại đúng chuỗi đó. Lúc nặng nhất, toàn bộ traffic bị mất. Cách họ khôi phục: thêm luật anti-affinity cho mọi Deployment quan trọng.
+
+Bài học rút ra ở đây (của bài này, không phải lời Moonlight): `replicas: 3` chỉ nói có ba pod, không nói chúng nằm ở đâu. Chấm điểm mặc định có xu hướng trải pod ra, nhưng đó là sở thích, không phải cam kết. Muốn "mỗi node tối đa một bản" là luật thì phải viết luật.
+
+</Callout>
+
+<Check id="k5.1.affinity">Phân biệt được `required` với `preferred`, giải thích được `IgnoredDuringExecution` và `topologyKey`, và nêu được hai hệ quả của anti-affinity bắt buộc.</Check>
+
+### Taint và toleration
+
+K1.4 đã giới thiệu taint `NoSchedule` của node control plane và toleration của DaemonSet. Phần đầy đủ gồm ba hiệu lực:
+
+| Hiệu lực | Với pod mới không có toleration | Với pod đang chạy không có toleration |
+|---|---|---|
+| `NoSchedule` | Bị lọc khỏi node | Không sao |
+| `PreferNoSchedule` | Node bị trừ điểm, vẫn có thể được chọn | Không sao |
+| `NoExecute` | Bị lọc khỏi node | **Bị xoá khỏi node** |
+
+Một toleration khớp taint theo `key`, `effect`, và `operator`: `Equal` so cả `value`, `Exists` chỉ cần có key. Với `NoExecute`, toleration có thêm `tolerationSeconds`: chịu được bao lâu rồi mới bị xoá; không ghi là chịu mãi.
+
+**Toleration chỉ là giấy phép vào, không phải lời mời.** Pod có toleration vẫn được chấm điểm trên mọi node như thường. Node chuyên dụng (cho một đội, cho GPU, cho việc nền) vì thế cần đủ hai chiều:
+
+| Mục tiêu | Cơ chế |
+|---|---|
+| Pod khác không được vào node này | Taint trên node, toleration chỉ trên pod được phép |
+| Pod được phép phải vào đúng node này | Label trên node, `nodeSelector` hoặc node affinity trên pod |
+
+Kubernetes tự dùng taint để báo tình trạng node. Những cái hay gặp:
+
+| Taint | Ai gắn, khi nào |
+|---|---|
+| `node.kubernetes.io/not-ready` | Node controller, khi kubelet báo node chưa sẵn sàng |
+| `node.kubernetes.io/unreachable` | Node controller, khi kubelet ngừng báo về |
+| `node.kubernetes.io/memory-pressure`, `disk-pressure`, `pid-pressure` | Kubelet, khi node thiếu tài nguyên (K1.2 nói về evict) |
+| `node.kubernetes.io/unschedulable` | Khi bạn `kubectl cordon` node (K5.2 dùng lúc drain) |
+
+Hai taint đầu có hiệu lực `NoExecute`, và mọi pod được API server tự thêm hai toleration cho chúng với `tolerationSeconds: 300`. Ghép với thời gian controller chờ trước khi kết luận node hỏng, ta có dòng thời gian khi một node chết đột ngột:
+
+```text
+t = 0            node mất điện hoặc mất mạng; kubelet ngừng báo về
+t ≈ 50 giây      hết --node-monitor-grace-period (mặc định 50s):
+                 node thành NotReady, nhận taint unreachable:NoExecute;
+                 pod trên node bị đánh dấu Ready=False nên rời khỏi Service
+t ≈ 50 + 300 s   hết tolerationSeconds mặc định: pod bị xoá,
+                 controller tạo pod thay, scheduler xếp sang node khác
+```
+
+Trong gần sáu phút đó, service chạy thiếu bản sao. Rút ngắn được bằng cách tự khai hai toleration với `tolerationSeconds` nhỏ hơn; cái giá là một lần mạng chập chờn hơn một phút cũng làm pod bị xếp lại. Bước 6 của lab đo cả hai trường hợp.
+
+<Check id="k5.1.taint">Kể được ba hiệu lực của taint, vì sao node chuyên dụng cần cả taint lẫn label, và dựng lại được dòng thời gian từ lúc node chết tới lúc pod được tạo lại.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Kubernetes Scheduler](https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/): hai bước filtering và scoring, và trang con Scheduling Framework cho biết plugin gắn vào điểm nào.
+- [Assigning Pods to Nodes](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/): `nodeSelector`, node affinity, pod affinity và anti-affinity, kèm `matchLabelKeys`.
+- [Taints and Tolerations](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/): ba hiệu lực, phần "Taint based Evictions" là nguồn của dòng thời gian trong bài.
+- [Well-Known Labels, Annotations and Taints](https://kubernetes.io/docs/reference/labels-annotations-taints/): tra tên chuẩn của label zone, hostname và các taint do hệ thống gắn.
+- [Outage post-mortem (Moonlight, 2019)](https://updates.moonlightwork.com/outage-post-mortem-87370): sự cố ba bản sao nằm chung một node, nguồn của callout production.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cần Docker đang chạy, cùng `kind`, `kubectl`, `yq`, `jq` đã cài ở D0.2. Cả năm bài của K5 dùng chung một cụm kind tên `k5-lab` gồm 1 control plane và 3 worker. Ba worker được gắn label zone giả: hai node ở `zone-a`, một node ở `zone-b`; bài này chưa dùng tới zone, K5.2 mới dùng.
+
+**Profile máy.** Cụm 4 node dùng khoảng 1,4 tới 1,6 GiB RAM của Docker khi chạy lab bài này (control plane khoảng 800 MiB, mỗi worker 200 tới 290 MiB). Máy 16 GB chạy thoải mái. Máy 8 GB: đặt Docker 4 GB, dừng VM Lima và các cụm kind khác. Đừng bỏ bớt worker: các bước dưới cần đủ ba.
+
+Mỗi node kind thấy toàn bộ CPU của Docker (máy viết bài: 6 CPU mỗi node). Vài con số trong output phụ thuộc điều đó; chỗ nào phụ thuộc bài sẽ ghi rõ.
+
+### 1. Tạo cụm 4 node và công cụ xem điểm
+
+File cấu hình có hai chỗ mới so với K1.1. `labels` gắn label lên node ngay lúc tạo. `kubeadmConfigPatches` bật log mức 10 cho scheduler, mức duy nhất in điểm của từng plugin; log ở mức này rất dài, **chỉ dùng trong lab**.
+
+<Terminal where="mac" title="~/masteva-k5/kind.yaml">
+
+```bash
+mkdir -p ~/masteva-k5/k5-1 && cd ~/masteva-k5
+cat > kind.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k5-lab
+kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    scheduler:
+      extraArgs:
+        - name: v
+          value: "10"
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraPortMappings:           # K5.3 dùng cổng này
+      - containerPort: 30080
+        hostPort: 9580
+        listenAddress: "127.0.0.1"
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    labels:
+      topology.kubernetes.io/zone: zone-a
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    labels:
+      topology.kubernetes.io/zone: zone-a
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    labels:
+      topology.kubernetes.io/zone: zone-b
+EOF
+export KUBECONFIG=~/masteva-k5/kubeconfig
+kind create cluster --config kind.yaml
+kubectl wait --for=condition=Ready node --all --timeout=180s
+kubectl create namespace k5
+kubectl config set-context --current --namespace k5
+kubectl get nodes -L topology.kubernetes.io/zone
+```
+
+</Terminal>
+
+Cuối output:
+
+<Expected>
+
+```text
+NAME                   STATUS   ROLES           AGE   VERSION   ZONE
+k5-lab-control-plane   Ready    control-plane   27s   v1.37.0   
+k5-lab-worker          Ready    <none>          16s   v1.37.0   zone-a
+k5-lab-worker2         Ready    <none>          16s   v1.37.0   zone-a
+k5-lab-worker3         Ready    <none>          16s   v1.37.0   zone-b
+```
+
+</Expected>
+
+Như các bài trước, kubeconfig nằm trong thư mục lab. **Mọi terminal dùng cho K5 phải chạy `export KUBECONFIG=~/masteva-k5/kubeconfig` trước**; context đã đặt sẵn namespace `k5`.
+
+Script dưới lọc log của scheduler lấy lần xếp gần nhất của một pod và in thành bảng: mỗi dòng một plugin, mỗi cột một node qua được vòng lọc.
+
+<Terminal where="mac" title="~/masteva-k5/xem-diem.sh">
+
+```bash
+cat > xem-diem.sh <<'EOF'
+#!/bin/sh
+# In điểm scheduler chấm cho từng node ở lần xếp gần nhất của pod $1 (namespace k5)
+kubectl -n kube-system logs kube-scheduler-k5-lab-control-plane --since="${2:-10m}" \
+  | grep -F "pod=\"k5/$1\"" \
+  | sed -n \
+      -e 's/.*"Attempting to schedule pod".*/RESET/p' \
+      -e 's/.*"Plugin scored node for pod".* plugin="\([^"]*\)" node="k5-lab-\([^"]*\)" score=\([0-9]*\).*/\1 \2 \3/p' \
+      -e 's/.*final score for pod".* node="k5-lab-\([^"]*\)" score=\([0-9]*\).*/TONG \1 \2/p' \
+      -e 's/.*"Successfully bound pod to node".* node="k5-lab-\([^"]*\)" evaluatedNodes=\([0-9]*\) feasibleNodes=\([0-9]*\).*/BOUND \1 \2 \3/p' \
+  | awk '
+      $1 == "RESET" { split("", s); split("", nodes); split("", plugins); np = 0; bound = ""; next }
+      $1 == "BOUND" { bound = "chọn " $2 " (xét " $3 " node, qua vòng lọc " $4 ")"; next }
+      { if (!($1 in plugins)) { plugins[$1] = 1; order[++np] = $1 }
+        nodes[$2] = 1; s[$1, $2] = $3 }
+      END {
+        n = 0; for (k in nodes) names[++n] = k
+        for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (names[j] < names[i]) { t = names[i]; names[i] = names[j]; names[j] = t }
+        if (n > 0) { printf "%-32s", "PLUGIN"; for (i = 1; i <= n; i++) printf "%-9s", names[i]; print "" }
+        for (p = 1; p <= np; p++) { printf "%-32s", order[p]; for (i = 1; i <= n; i++) printf "%-9s", s[order[p], names[i]]; print "" }
+        if (bound != "") print bound
+      }'
+EOF
+chmod +x xem-diem.sh
+```
+
+</Terminal>
+
+### 2. Xem scheduler lọc và chấm điểm
+
+Đặt trước một pod "nặng" lên `worker2` bằng `nodeSelector`, giữ chỗ 3 CPU (không dùng thật: image `pause` chỉ ngủ). Sau đó tạo một pod nhỏ không ràng buộc gì và xem scheduler chấm. Hai pod chỉ khác nhau ở `resources` và `nodeSelector`, nên tạo thẳng bằng `kubectl run --overrides`.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k5/k5-1
+kubectl run nang --image=registry.k8s.io/pause:3.10.1 --overrides='{"spec":{"terminationGracePeriodSeconds":0,
+  "nodeSelector":{"kubernetes.io/hostname":"k5-lab-worker2"},
+  "containers":[{"name":"nang","image":"registry.k8s.io/pause:3.10.1","resources":{"requests":{"cpu":"3","memory":"1Gi"}}}]}}'
+kubectl wait --for=condition=Ready pod/nang --timeout=90s
+kubectl run nho --image=registry.k8s.io/pause:3.10.1 --overrides='{"spec":{"terminationGracePeriodSeconds":0,
+  "containers":[{"name":"nho","image":"registry.k8s.io/pause:3.10.1","resources":{"requests":{"cpu":"100m","memory":"32Mi"}}}]}}'
+kubectl wait --for=condition=Ready pod/nho --timeout=90s
+../xem-diem.sh nang
+../xem-diem.sh nho
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/nang created
+pod/nang condition met
+pod/nho created
+pod/nho condition met
+chọn worker2 (xét 4 node, qua vòng lọc 1)
+PLUGIN                          worker   worker2  worker3  
+TaintToleration                 300      300      300      
+NodeResourcesFit                95       64       95       
+VolumeBinding                   0        0        0        
+DynamicResources                0        0        0        
+NodeResourcesBalancedAllocation 74       75       74       
+ImageLocality                   0        0        0        
+TONG                            469      439      469      
+chọn worker3 (xét 4 node, qua vòng lọc 3)
+```
+
+</Expected>
+
+Đối chiếu với sơ đồ:
+
+- Pod `nang` có `nodeSelector` theo hostname nên chỉ một node qua vòng lọc. Còn một ứng viên thì scheduler bỏ qua chấm điểm, vì thế không có bảng.
+- Pod `nho`: scheduler xét 4 node, 3 node qua vòng lọc. Node bị loại là control plane, vì taint `NoSchedule` mà K1.4 đã xem.
+- `NodeResourcesFit` của `worker2` chỉ 64 điểm trong khi hai node kia 95: `worker2` đã bị giữ chỗ 3 CPU và 1 GiB. Chiến lược mặc định là `LeastAllocated`, node càng trống điểm càng cao. Không ai đo CPU thật của `worker2`; pod `nang` không dùng chút CPU nào mà node vẫn mất điểm.
+- `TaintToleration` 300 là 100 điểm nhân trọng số 3 của plugin; ba node đều không có taint nên đều tối đa.
+- `worker` và `worker3` hoà 469 điểm. Scheduler chọn ngẫu nhiên một trong hai; máy bạn có thể ra `worker`. Điều chắc chắn là pod `nho` không vào `worker2`.
+
+Con số cụ thể phụ thuộc số CPU và RAM Docker cấp cho node, nên máy bạn sẽ khác vài điểm.
+
+<Check id="k5.1.lab-score">Đọc được bảng điểm của một pod: node nào bị lọc và vì sao, plugin nào tạo ra chênh lệch, và vì sao pod chỉ khớp một node thì không có bảng.</Check>
+
+### 3. `nodeSelector` và node affinity
+
+Gắn label `disktype=ssd` cho `worker2`, rồi tạo hai pod từ cùng một manifest: `can-ssd` cần `ssd`; lệnh `sed` đổi mọi chữ `ssd` thành `nvme` để ra pod `can-nvme`, cần `disktype=nvme` (chưa node nào có).
+
+<Terminal where="mac" title="~/masteva-k5/k5-1/selector.yaml">
+
+```bash
+kubectl delete pod nang nho
+kubectl label node k5-lab-worker2 disktype=ssd
+cat > selector.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: can-ssd
+spec:
+  terminationGracePeriodSeconds: 0
+  nodeSelector:
+    disktype: ssd
+  containers:
+    - { name: app, image: registry.k8s.io/pause:3.10.1 }
+EOF
+kubectl apply -f selector.yaml
+sed 's/ssd/nvme/g' selector.yaml | kubectl apply -f -
+kubectl wait --for=condition=Ready pod/can-ssd --timeout=90s
+kubectl get pods -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName
+kubectl events --for pod/can-nvme
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "nang" deleted from k5 namespace
+pod "nho" deleted from k5 namespace
+node/k5-lab-worker2 labeled
+pod/can-ssd created
+pod/can-nvme created
+pod/can-ssd condition met
+NAME       STATUS    NODE
+can-nvme   Pending   <none>
+can-ssd    Running   k5-lab-worker2
+LAST SEEN   TYPE      REASON             OBJECT         MESSAGE
+1s          Warning   FailedScheduling   Pod/can-nvme   0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.
+```
+
+</Expected>
+
+Đúng mẫu câu ở phần Kiến thức: 1 node vì taint, 3 node vì selector. Vế `preemption:` nói đuổi pod khác đi cũng không giúp được (K5.2).
+
+<Predict question="Bây giờ đổi label của worker2 từ `disktype=ssd` thành `disktype=nvme`. Pod `can-ssd` đang chạy trên node đó có bị đuổi không? Pod `can-nvme` thì sao?">
+
+`can-ssd` vẫn chạy: `nodeSelector` chỉ được xét lúc xếp (`IgnoredDuringExecution`). `can-nvme` được xếp vào `worker2` sau vài giây, không cần ai làm gì: scheduler xếp lại pod `Pending` khi node đổi label. Kết quả là một pod đang chạy trên node không còn khớp điều kiện của chính nó.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl label node k5-lab-worker2 disktype=nvme --overwrite
+kubectl wait --for=condition=Ready pod/can-nvme --timeout=90s
+kubectl get pods -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k5-lab-worker2 labeled
+pod/can-nvme condition met
+NAME       STATUS    NODE
+can-nvme   Running   k5-lab-worker2
+can-ssd    Running   k5-lab-worker2
+```
+
+</Expected>
+
+Giờ tới node affinity với cả hai dạng. Pod dưới bắt buộc chạy ở node có label zone, thích `zone-b` với trọng số 80 và thích đĩa `nvme` với trọng số 20:
+
+<Terminal where="mac" title="~/masteva-k5/k5-1/affinity.yaml">
+
+```bash
+kubectl delete pod can-ssd can-nvme
+cat > affinity.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: uu-tien
+spec:
+  terminationGracePeriodSeconds: 0
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:    # bắt buộc: vòng lọc
+        nodeSelectorTerms:
+          - matchExpressions:
+              - { key: topology.kubernetes.io/zone, operator: In, values: [zone-a, zone-b] }
+      preferredDuringSchedulingIgnoredDuringExecution:   # ưu tiên: vòng chấm điểm
+        - weight: 80
+          preference:
+            matchExpressions:
+              - { key: topology.kubernetes.io/zone, operator: In, values: [zone-b] }
+        - weight: 20
+          preference:
+            matchExpressions:
+              - { key: disktype, operator: In, values: [nvme] }
+  containers:
+    - name: app
+      image: registry.k8s.io/pause:3.10.1
+      resources:
+        requests: { cpu: 100m, memory: 32Mi }
+EOF
+kubectl apply -f affinity.yaml && kubectl wait --for=condition=Ready pod/uu-tien --timeout=90s
+../xem-diem.sh uu-tien | grep -E 'PLUGIN|NodeAffinity|TONG|chọn'
+kubectl delete pod uu-tien
+kubectl cordon k5-lab-worker3
+kubectl apply -f affinity.yaml && kubectl wait --for=condition=Ready pod/uu-tien --timeout=90s
+../xem-diem.sh uu-tien | grep -E 'PLUGIN|NodeAffinity|TONG|chọn'
+kubectl uncordon k5-lab-worker3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "can-ssd" deleted from k5 namespace
+pod "can-nvme" deleted from k5 namespace
+pod/uu-tien created
+pod/uu-tien condition met
+PLUGIN                          worker   worker2  worker3  
+NodeAffinity                    0        50       200      
+TONG                            469      519      669      
+chọn worker3 (xét 4 node, qua vòng lọc 3)
+pod "uu-tien" deleted from k5 namespace
+node/k5-lab-worker3 cordoned
+pod/uu-tien created
+pod/uu-tien condition met
+PLUGIN                          worker   worker2  
+NodeAffinity                    0        200      
+TONG                            469      669      
+chọn worker2 (xét 4 node, qua vòng lọc 2)
+node/k5-lab-worker3 uncordoned
+```
+
+</Expected>
+
+Plugin `NodeAffinity` cộng trọng số các điều kiện node thoả (`worker3`: 80, `worker2`: 20, `worker`: 0), rồi **chuẩn hoá** sao cho node cao nhất được 100, và nhân trọng số 2 của plugin. Vì thế `worker3` được 200 và `worker2` được 20/80 × 100 × 2 = 50.
+
+Lần hai, `worker3` bị `cordon` nên rớt ở vòng lọc. Giờ `worker2` là node cao nhất và nhận trọn 200 điểm. Trọng số chỉ có nghĩa **tương đối giữa các node còn lại**: pod không chờ node nó thích nhất, nó lấy node tốt nhất đang có. Muốn pod chờ thì phải dùng `required`.
+
+<Check id="k5.1.lab-node-affinity">Tái hiện được pod `Pending` vì `nodeSelector`, chứng minh được đổi label node không đuổi pod đang chạy, và giải thích được điểm `NodeAffinity` 0, 50, 200 từ hai trọng số 80 và 20.</Check>
+
+### 4. Pod anti-affinity và một rollout kẹt
+
+Triển khai `web` với 3 bản sao và luật bắt buộc "không hai pod `app=web` cùng node", rồi thử tăng lên 4. Đây là lần đầu các node kéo image `agnhost`, có thể mất một hai phút.
+
+<Terminal where="mac" title="~/masteva-k5/k5-1/web.yaml">
+
+```bash
+kubectl delete pod uu-tien
+kubectl label node k5-lab-worker2 disktype-
+cat > web.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      terminationGracePeriodSeconds: 0
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:   # bắt buộc
+            - labelSelector:
+                matchLabels: { app: web }       # tránh những pod này...
+              topologyKey: kubernetes.io/hostname   # ...trong phạm vi một node
+      containers:
+        - name: app
+          image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+          args: ["netexec", "--http-port=8080"]
+          resources:
+            requests: { cpu: 100m, memory: 32Mi }
+EOF
+kubectl apply -f web.yaml && kubectl rollout status deploy/web --timeout=300s | tail -1
+kubectl scale deploy/web --replicas=4 && sleep 5
+kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName
+kubectl events --for "$(kubectl get pods -l app=web --field-selector=status.phase=Pending -o name | head -1)" | cut -c1-230
+kubectl scale deploy/web --replicas=3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "uu-tien" deleted from k5 namespace
+node/k5-lab-worker2 unlabeled
+deployment.apps/web created
+deployment "web" successfully rolled out
+deployment.apps/web scaled
+NAME                  STATUS    NODE
+web-8db9664c4-747w4   Running   k5-lab-worker2
+web-8db9664c4-8v2vv   Pending   <none>
+web-8db9664c4-ddt5j   Running   k5-lab-worker
+web-8db9664c4-s7tsd   Running   k5-lab-worker3
+LAST SEEN   TYPE      REASON             OBJECT                    MESSAGE
+5s          Warning   FailedScheduling   Pod/web-8db9664c4-8v2vv   0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn't match pod anti-affinity rules. preemption: 0/4 nodes are available: 1 Preemption is n
+deployment.apps/web scaled
+```
+
+</Expected>
+
+Ba pod mỗi node một bản, lần nào cũng vậy: đây là luật, không còn là may rủi như ở sự cố Moonlight. Cái giá hiện ra ngay: bản thứ tư không có node. Và còn một cái giá kín hơn.
+
+<Predict question="Deployment đang có 3 pod trên 3 node, chiến lược rollout mặc định (`maxSurge: 25%`, `maxUnavailable: 25%`). Bạn đổi một biến môi trường để rollout bản mới. Chuyện gì xảy ra?">
+
+Rollout kẹt vĩnh viễn ở pod mới đầu tiên. Với 3 bản sao, `maxUnavailable` 25% làm tròn xuống thành 0 và `maxSurge` 25% làm tròn lên thành 1 (K1.1): Deployment phải tạo một pod mới **trước** khi được xoá pod cũ. Nhưng cả ba node đều đang có một pod `app=web`, nên pod mới không có chỗ. Pod cũ không được xoá vì pod mới chưa Ready; pod mới không Ready vì pod cũ chưa bị xoá.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl set env deploy/web PHIEN_BAN=2
+kubectl rollout status deploy/web --timeout=20s
+kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web env updated
+Waiting for deployment "web" rollout to finish: 1 out of 3 new replicas have been updated...
+error: timed out waiting for the condition
+NAME                   STATUS    NODE
+web-7c7bbf484b-kz5c5   Pending   <none>
+web-8db9664c4-747w4    Running   k5-lab-worker2
+web-8db9664c4-ddt5j    Running   k5-lab-worker
+web-8db9664c4-s7tsd    Running   k5-lab-worker3
+```
+
+</Expected>
+
+Người dùng không thấy lỗi gì vì ba pod cũ vẫn phục vụ, nên kiểu kẹt này hay bị phát hiện muộn: bản mới "đã deploy" mà không bao giờ chạy. Khi số bản sao bằng số node, cách sửa là cho phép thay tại chỗ: xoá một pod cũ trước, rồi mới tạo pod mới vào chỗ trống đó.
+
+<Terminal where="mac">
+
+```bash
+kubectl patch deploy web --type=merge \
+  -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+kubectl rollout status deploy/web --timeout=120s | tail -1
+kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName
+```
+
+</Terminal>
+
+Rollout đi qua, và ba pod mới vẫn mỗi node một bản. Cái giá của cách sửa này: trong lúc rollout chỉ còn 2 trên 3 pod phục vụ. Ba lựa chọn khi cần "mỗi node một bản":
+
+| Cách | Được | Mất |
+|---|---|---|
+| Anti-affinity `required` + `maxSurge: 0` | Bảo đảm tuyệt đối mỗi node tối đa một bản | Rollout giảm năng lực; số bản sao không vượt số node |
+| Anti-affinity `preferred` | Không bao giờ kẹt, không giới hạn số bản sao | Chỉ là sở thích: khi soạn bài, thử tăng lên 4 bản thì một node nhận 2 |
+| Topology spread (K5.2) | Nói được "lệch tối đa bao nhiêu", tính riêng cho từng bản rollout | Thêm vài tham số phải hiểu |
+
+Phần lớn service nên dùng dòng thứ ba; anti-affinity bắt buộc dành cho thứ thật sự không được ở chung, ví dụ các thành viên của một cụm database.
+
+<Check id="k5.1.lab-anti-affinity">Tái hiện được bản sao thứ tư `Pending` và rollout kẹt với anti-affinity bắt buộc, giải thích được vì sao kẹt bằng `maxSurge`, `maxUnavailable`, và gỡ được.</Check>
+
+### 5. Node chuyên dụng: taint, toleration, và chiều còn thiếu
+
+Dành `worker3` cho việc nền: gắn taint để pod thường không vào, gắn label để chọn được. `thuong` là 6 pod thường; `batch` là 3 pod có toleration.
+
+<Terminal where="mac" title="~/masteva-k5/k5-1/batch.yaml">
+
+```bash
+kubectl delete deploy web
+kubectl taint node k5-lab-worker3 dedicated=batch:NoSchedule
+kubectl label node k5-lab-worker3 dedicated=batch
+cat > batch.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: batch }
+  template:
+    metadata:
+      labels: { app: batch }
+    spec:
+      terminationGracePeriodSeconds: 0
+      tolerations:
+        - { key: dedicated, operator: Equal, value: batch, effect: NoSchedule }
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10.1
+          resources:
+            requests: { cpu: 100m, memory: 32Mi }
+EOF
+kubectl create deployment thuong --image=registry.k8s.io/pause:3.10.1 --replicas=6
+kubectl apply -f batch.yaml
+kubectl rollout status deploy/thuong --timeout=90s | tail -1
+kubectl rollout status deploy/batch --timeout=90s | tail -1
+kubectl get pods --sort-by=.spec.nodeName -o custom-columns=APP:.metadata.labels.app,NODE:.spec.nodeName
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "thuong" successfully rolled out
+deployment "batch" successfully rolled out
+APP      NODE
+batch    k5-lab-worker
+thuong   k5-lab-worker
+thuong   k5-lab-worker
+thuong   k5-lab-worker
+batch    k5-lab-worker2
+thuong   k5-lab-worker2
+thuong   k5-lab-worker2
+thuong   k5-lab-worker2
+batch    k5-lab-worker3
+```
+
+</Expected>
+
+(Các dòng `created`, `tainted`, `labeled` phía trên đã lược.) Taint làm đúng việc của nó: không pod `thuong` nào vào `worker3`. Nhưng `batch` chỉ có một pod trên node dành cho nó; hai pod kia nằm chen với pod thường. Toleration chỉ gỡ lý do bị lọc, còn chấm điểm vẫn trải pod ra. (Chia đúng 1, 1, 1 là kết quả của chấm điểm nên có thể khác trên máy bạn; điều chắc chắn là không có gì buộc cả ba về `worker3`.) Thêm chiều còn thiếu:
+
+<Terminal where="mac">
+
+```bash
+yq '.spec.template.spec.nodeSelector = {"dedicated": "batch"}' batch.yaml | kubectl apply -f -
+kubectl rollout status deploy/batch --timeout=90s | tail -1
+kubectl get pods -l app=batch -o custom-columns=APP:.metadata.labels.app,NODE:.spec.nodeName
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/batch configured
+deployment "batch" successfully rolled out
+APP     NODE
+batch   k5-lab-worker3
+batch   k5-lab-worker3
+batch   k5-lab-worker3
+```
+
+</Expected>
+
+<Check id="k5.1.lab-dedicated">Dựng được một node chuyên dụng bằng taint, label, toleration và `nodeSelector`, và chỉ ra bằng lệnh chuyện gì xảy ra khi thiếu `nodeSelector`.</Check>
+
+### 6. `NoExecute` và node chết
+
+`NoExecute` tác động cả lên pod đang chạy. Ba pod dưới cùng nằm trên `worker2`: một không có toleration, một chịu được 20 giây, một chịu mãi.
+
+<Terminal where="mac" title="~/masteva-k5/k5-1/noexec.yaml">
+
+```bash
+kubectl delete deploy batch thuong
+kubectl taint node k5-lab-worker3 dedicated-
+kubectl label node k5-lab-worker3 dedicated-
+cat > noexec.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: khong-chiu }
+spec:
+  terminationGracePeriodSeconds: 0
+  nodeSelector: { kubernetes.io/hostname: k5-lab-worker2 }
+  containers:
+    - { name: app, image: registry.k8s.io/pause:3.10.1 }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: chiu-20s }
+spec:
+  terminationGracePeriodSeconds: 0
+  nodeSelector: { kubernetes.io/hostname: k5-lab-worker2 }
+  tolerations:
+    - { key: bao-tri, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+  containers:
+    - { name: app, image: registry.k8s.io/pause:3.10.1 }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: chiu-mai }
+spec:
+  terminationGracePeriodSeconds: 0
+  nodeSelector: { kubernetes.io/hostname: k5-lab-worker2 }
+  tolerations:
+    - { key: bao-tri, operator: Exists, effect: NoExecute }
+  containers:
+    - { name: app, image: registry.k8s.io/pause:3.10.1 }
+EOF
+kubectl apply -f noexec.yaml
+kubectl wait --for=condition=Ready pod khong-chiu chiu-20s chiu-mai --timeout=90s
+kubectl get pod khong-chiu -o jsonpath='{.spec.tolerations}' | jq -c '.[]'
+kubectl taint node k5-lab-worker2 bao-tri=true:NoExecute
+sleep 5;  echo "--- sau 5 giây";  kubectl get pods --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
+sleep 25; echo "--- sau 30 giây"; kubectl get pods --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
+kubectl taint node k5-lab-worker2 bao-tri-
+kubectl delete pod chiu-mai
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"effect":"NoExecute","key":"node.kubernetes.io/not-ready","operator":"Exists","tolerationSeconds":300}
+{"effect":"NoExecute","key":"node.kubernetes.io/unreachable","operator":"Exists","tolerationSeconds":300}
+node/k5-lab-worker2 tainted
+--- sau 5 giây
+chiu-20s   Running
+chiu-mai   Running
+--- sau 30 giây
+chiu-mai   Running
+node/k5-lab-worker2 untainted
+pod "chiu-mai" deleted from k5 namespace
+```
+
+</Expected>
+
+(Các dòng `created`, `deleted`, `condition met` ở đầu output đã lược.) `khong-chiu` biến mất ngay, `chiu-20s` sau 20 giây, `chiu-mai` ở lại. Hai dòng JSON là hai toleration API server tự thêm vào pod `khong-chiu`, đúng con số 300 giây ở phần Kiến thức. Đó cũng là cơ chế xử lý node chết, và bước cuối đo nó.
+
+Tạo hai Deployment giống hệt nhau, đều thích `worker2` (ưu tiên, không bắt buộc, để pod thay thế sang được node khác). `cham` giữ mặc định 300 giây; `nhanh` tự khai 10 giây. Script `theo-doi-node.sh` in một dòng mỗi khi trạng thái đổi.
+
+<Terminal where="mac" title="~/masteva-k5/k5-1/node-chet.yaml">
+
+```bash
+cat > node-chet.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cham
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: cham }
+  template:
+    metadata:
+      labels: { app: cham }
+    spec:
+      terminationGracePeriodSeconds: 0
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: [k5-lab-worker2] }
+      containers:
+        - { name: app, image: registry.k8s.io/pause:3.10.1 }
+EOF
+kubectl apply -f node-chet.yaml
+sed 's/cham/nhanh/g' node-chet.yaml | yq '.spec.template.spec.tolerations = [
+  {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 10},
+  {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 10}]' \
+  | kubectl apply -f -
+kubectl rollout status deploy/cham --timeout=90s | tail -1
+kubectl rollout status deploy/nhanh --timeout=90s | tail -1
+cat > ../theo-doi-node.sh <<'EOF'
+#!/bin/sh
+# In một dòng mỗi khi trạng thái node $1 hoặc các pod trong namespace k5 thay đổi; chạy trong $2 giây
+T0=$(date +%s); PREV=""
+while [ $(( $(date +%s) - T0 )) -lt "${2:-120}" ]; do
+  NOW="node=$(kubectl get node "$1" --no-headers | awk '{print $2}') | $(kubectl get pods --no-headers \
+    -o custom-columns='APP:.metadata.labels.app,NODE:.spec.nodeName,READY:.status.conditions[?(@.type=="Ready")].status' \
+    | awk '{printf "%s@%s Ready=%s; ", $1, $2, $3}')"
+  [ "$NOW" != "$PREV" ] && echo "t=$(( $(date +%s) - T0 ))s  $NOW"
+  PREV="$NOW"; sleep 2
+done
+EOF
+chmod +x ../theo-doi-node.sh
+```
+
+</Terminal>
+
+Giả lập node chết bằng cách dừng kubelet bên trong container của node. Lệnh dưới chỉ đụng tới container `k5-lab-worker2` của kind; đừng chạy `systemctl stop kubelet` trên node của một cụm thật, vì mọi pod trên node đó sẽ bị coi là mất. Node không còn báo về, đúng như khi máy mất điện (container của pod thật ra vẫn chạy, nhưng control plane không biết điều đó).
+
+<Terminal where="mac">
+
+```bash
+docker exec k5-lab-worker2 systemctl stop kubelet
+../theo-doi-node.sh k5-lab-worker2 80
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+t=0s  node=Ready | cham@k5-lab-worker2 Ready=True; nhanh@k5-lab-worker2 Ready=True; 
+t=47s  node=NotReady | cham@k5-lab-worker2 Ready=False; nhanh@k5-lab-worker2 Ready=False; 
+t=55s  node=NotReady | cham@k5-lab-worker2 Ready=False; nhanh@k5-lab-worker3 Ready=False; 
+t=58s  node=NotReady | cham@k5-lab-worker2 Ready=False; nhanh@k5-lab-worker3 Ready=True; 
+```
+
+</Expected>
+
+Khớp với dòng thời gian: giây 47 node thành `NotReady` và cả hai pod thành `Ready=False`, tức đã bị rút khỏi Service; khoảng 10 giây sau `nhanh` có pod mới ở node khác, Ready ở giây 58. (Mốc đầu dao động quanh 50 giây tuỳ lần báo cuối của kubelet rơi vào lúc nào.) `cham` vẫn "nằm" trên node chết. Trong một lần chạy khác khi soạn bài, node `NotReady` ở giây 51 và `cham` được thay ở giây 350, tức sau đúng 300 giây. Bạn không cần chờ; bật kubelet lại. Node controller gỡ taint `unreachable` chậm hơn vài giây so với lúc node `Ready`, nên vòng `until` chờ tới khi node hết taint:
+
+<Terminal where="mac">
+
+```bash
+docker exec k5-lab-worker2 systemctl start kubelet
+kubectl wait --for=condition=Ready node/k5-lab-worker2 --timeout=90s
+until [ -z "$(kubectl get node k5-lab-worker2 -o jsonpath='{.spec.taints}')" ]; do sleep 2; done
+kubectl get pods -o custom-columns=APP:.metadata.labels.app,STATUS:.status.phase,NODE:.spec.nodeName
+```
+
+</Terminal>
+
+Kết quả: `cham` vẫn `Running` trên `worker2`, `nhanh` ở node khác. Node quay lại trước hạn 300 giây nên `cham` không hề bị đụng tới. Đó là lý do con số mặc định dài: phần lớn lần node "mất tích" là mạng chập chờn, và xếp lại hàng trăm pod vì một phút mất mạng còn tệ hơn chờ. Với service không trạng thái, khởi động nhanh, hạ xuống vài chục giây là hợp lý. Với pod có ổ đĩa `ReadWriteOnce` (K2.3) thì thận trọng: pod mới có thể không gắn được ổ khi node cũ chưa nhả.
+
+<Check id="k5.1.lab-noexecute">Quan sát được ba pod phản ứng khác nhau với một taint `NoExecute`, và đo được thời gian từ lúc node ngừng báo về tới lúc pod được tạo lại với `tolerationSeconds` 10 và mặc định.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Pod `Pending` | Đọc từng vế của event: `didn't match Pod's node affinity/selector` là label node sai hoặc thiếu; `had untolerated taint(s)` là mọi node khớp đều có taint pod không chịu; `didn't match pod anti-affinity rules` là hết node chưa có pod cùng nhóm | `kubectl events --for pod/<tên>`; `kubectl get nodes --show-labels`; `kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints` |
+| `xem-diem.sh` không in gì | Pod được xếp quá 10 phút trước, hoặc cụm tạo thiếu `kubeadmConfigPatches` | `./xem-diem.sh <pod> 60m`; `kubectl -n kube-system get pod kube-scheduler-k5-lab-control-plane -o yaml \| grep -- --v` |
+| Sau lab, node vẫn `NotReady` hoặc `SchedulingDisabled` | Chưa bật lại kubelet ở bước 6; còn `cordon` từ bước 3 | `docker exec k5-lab-worker2 systemctl start kubelet`; `kubectl uncordon k5-lab-worker3` |
+
+### Dọn dẹp
+
+K5.2 dùng tiếp cụm này. Xoá những gì bài này tạo, **giữ cụm**:
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K5.2">
+
+```bash
+kubectl delete deploy cham nhanh
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+```
+
+</Terminal>
+
+Cột `TAINTS` của ba worker phải là `<none>` trước khi sang bài sau; chỉ node control plane còn taint của nó.
+
+<Callout kind="danger">
+
+Khối dưới xoá cả cụm `k5-lab` và thư mục lab cùng mọi file trong đó. Chỉ chạy khi không học tiếp K5.2.
+
+</Callout>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k5-lab
+rm -rf ~/masteva-k5
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Pod đang chạy trên node không còn khớp điều kiện. Ai dọn?">
+
+Mặc định không ai cả. Scheduler chỉ xử lý pod chưa có node. Sau vài tuần, một cụm có thể lệch nhiều: node mới thêm vào thì trống, node cũ thì đầy; pod nằm ở node đã đổi label. Công cụ cho việc này là **Descheduler**, một dự án của SIG Scheduling chạy định kỳ, tìm pod vi phạm một chính sách (affinity không còn thoả, node quá tải so với node khác, lệch topology spread) và **evict** chúng để scheduler xếp lại. Nó đi qua Eviction API nên tôn trọng PodDisruptionBudget (K5.2). Dùng Descheduler là chấp nhận pod bị khởi động lại định kỳ, nên ứng dụng phải tắt êm như K1.3 đã dạy.
+
+</Reveal>
+
+<Reveal title="Thêm `matchLabelKeys` có gỡ được rollout kẹt ở bước 4 không?">
+
+Có, với một điều kiện. `matchLabelKeys: [pod-template-hash]` trong một term của pod anti-affinity bảo scheduler chỉ so với pod **cùng bản rollout** (cùng giá trị label `pod-template-hash` mà Deployment tự gắn). Pod bản mới khi đó không né pod bản cũ, nên chiến lược mặc định chạy được. Trường này ổn định ở Kubernetes 1.37.
+
+Điều kiện: **mọi** pod đang chạy phải mang luật có `matchLabelKeys`. Khi soạn bài, thử thêm trường này vào Deployment đang chạy luật cũ thì lần rollout đầu vẫn kẹt, với event `didn't satisfy existing pods anti-affinity rules`: pod cũ còn giữ luật cũ, và anti-affinity đối xứng. Tạo lại Deployment với luật mới ngay từ đầu thì các lần rollout sau đi qua, ba pod mới vẫn mỗi node một bản. Cùng lý do đó, đổi `required` thành `preferred` trên một Deployment đang kẹt cũng không gỡ được ngay: phải cho pod cũ rời đi trước, bằng `maxUnavailable: 1` như bước 4.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết đúng cú pháp affinity và toleration, và nên nhờ nó phần đó vì tên trường dài, dễ gõ sai. Chỗ hay sai: (1) đề xuất anti-affinity `required` theo hostname cho mọi service mà không hỏi số node, dẫn tới đúng kiểu rollout kẹt ở bước 4; (2) thêm toleration và coi như pod sẽ về node chuyên dụng, quên `nodeSelector`; (3) dùng label cũ `failure-domain.beta.kubernetes.io/zone` đã bỏ, thay vì `topology.kubernetes.io/zone`; (4) khai `tolerations` với `operator: Exists` và không có `key`, tức chịu mọi taint, kể cả taint của node đang hỏng. Kiểm bằng cụm thật: apply, xem pod nằm ở đâu, và thử một lần rollout cùng một lần tăng `replicas` trước khi tin.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.1 là nơi scheduler xuất hiện trong chuỗi `kubectl apply`; K1.2 dạy request, thứ mà `NodeResourcesFit` tính điểm; K1.4 dùng toleration cho DaemonSet. K5.2 tiếp tục với topology spread, PodDisruptionBudget, drain và preemption. K5.4 cho thấy cluster autoscaler chạy lại chính vòng lọc này để quyết định có thêm node không. K4 nói về vòng đời node, nơi `cordon` và taint được dùng hằng ngày. D21 dùng zone như một failure domain.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k5.1.mastery-pending">Gặp một pod `Pending`, đọc event `FailedScheduling` để nói từng node bị loại vì lý do gì, và chỉ ra phải sửa label, taint, request hay luật affinity.</Check>
+
+<Check id="k5.1.mastery-spread">Viết được luật cho một service 3 bản sao "mỗi node tối đa một bản", chọn giữa `required` và `preferred` có lý do, và chứng minh bằng một lần rollout rằng lựa chọn đó không làm kẹt.</Check>
+
+<Check id="k5.1.mastery-dedicated">Thiết kế được một nhóm node chuyên dụng cho một loại việc, gồm cả hai chiều taint với toleration và label với selector, và giải thích được chuyện gì xảy ra khi thiếu từng chiều.</Check>
+
+<Check id="k5.1.mastery-node-failure">Ước lượng được một service mất bao lâu để có lại đủ bản sao sau khi một node chết đột ngột, và nêu được nên hay không nên giảm `tolerationSeconds` cho service đó.</Check>
+
+</Mastery>

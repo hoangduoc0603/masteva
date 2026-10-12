@@ -1,0 +1,724 @@
+---
+title: "Keepalived và VIP: hai load balancer, một địa chỉ"
+description: Cho hai HAProxy dùng chung một địa chỉ IP ảo bằng Keepalived và VRRP, rồi làm hỏng theo ba kiểu (HAProxy chết, máy mất mạng, dừng để bảo trì) và đo số giây mất dịch vụ của từng kiểu; tái hiện split-brain bằng một luật firewall và xem vì sao nó khó thấy.
+id: d21.3
+step: d21
+prerequisites: [d21.2]
+topics: [d21.keepalived-vip]
+status: verified
+verified:
+  date: 2026-10-11
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    keepalived: 2.3.4
+    haproxy: 3.2.9
+    nftables: 1.1.6
+    iputils-arping: "20250605"
+    tcpdump: 4.99.6
+    curl: 8.18.0
+---
+
+<Goal>
+
+D9.2 cho backend chết mà dịch vụ vẫn sống. Còn lại một điểm chết duy nhất: chính load balancer. Bài này đặt hai load balancer sau **một** địa chỉ IP, cách làm chuẩn ở datacenter tự vận hành. Học xong, bạn giải thích được:
+
+- Vì sao client không cần biết gì khi địa chỉ `10.9.0.10` chuyển từ máy này sang máy kia, và gói ARP nào làm việc đó.
+- Vì sao máy chính mất mạng thì dịch vụ gián đoạn hơn 3 giây, còn dừng nó có chủ đích thì chưa tới 1 giây; con số 3,61 trong công thức từ đâu ra.
+- Vì sao Keepalived phải theo dõi cả HAProxy chứ không chỉ theo dõi máy.
+- Split-brain là gì, vì sao một luật firewall thiếu gây ra nó, và vì sao với HTTP nó có thể tồn tại hàng tuần không ai thấy.
+- Vì sao cách này không dùng được trong mạng ảo của cloud.
+
+</Goal>
+
+<Knowledge>
+
+### Load balancer cũng là một điểm chết
+
+Thêm load balancer thứ hai thì dễ; khó là cho client biết phải tới cái nào. Bốn cách thường gặp:
+
+| Cách | Client tới đâu | Khi một load balancer chết | Dùng ở đâu |
+|---|---|---|---|
+| DNS trả nhiều bản ghi A | Một trong các IP, tuỳ client | Client còn giữ IP chết tới hết TTL và cache riêng của nó (D2.2) | Bổ sung, không đủ một mình |
+| **IP ảo (VIP) với VRRP** | Một IP; máy nào giữ IP thì nhận | Máy dự phòng nhận IP sau vài giây | Datacenter tự vận hành, mạng L2 chung. Bài này |
+| ECMP, BGP anycast | Một IP; router chia cho nhiều máy cùng lúc | Router ngừng gửi tới máy chết | Quy mô lớn; cần router hỗ trợ (GLB ở D9.2, MetalLB chế độ BGP ở K4) |
+| Load balancer của cloud | Tên DNS hoặc IP do nhà cung cấp quản lý | Nhà cung cấp lo | AWS, GCP, Azure (D10) |
+
+**VIP (virtual IP)** là một địa chỉ không thuộc hẳn về máy nào. Tại mỗi thời điểm, đúng một máy gắn nó lên card mạng và trả lời ARP cho nó. Hai load balancer chạy cấu hình giống hệt nhau; máy giữ VIP nhận toàn bộ traffic (**active-passive**).
+
+<Check id="d21.3.why-vip">So sánh được bốn cách để client tìm tới load balancer còn sống, và nói được VIP với VRRP đòi hỏi gì ở hạ tầng mạng.</Check>
+
+### VRRP và Keepalived
+
+**VRRP** (Virtual Router Redundancy Protocol, bản hiện hành là RFC 9568) là giao thức để một nhóm máy thoả thuận ai giữ VIP. **Keepalived** là phần mềm cài VRRP trên Linux.
+
+- Máy đang giữ VIP (**MASTER**) gửi một gói **advertisement** mỗi `advert_int` giây tới địa chỉ multicast `224.0.0.18`, giao thức IP số 112 (không phải TCP hay UDP).
+- Máy dự phòng (**BACKUP**) chỉ nghe. Im lặng quá lâu thì nó tự lên MASTER.
+- Mỗi máy có một `priority` (1–254). Máy priority cao hơn thắng. Cùng `virtual_router_id` là cùng một nhóm.
+
+"Quá lâu" là bao lâu thì có công thức:
+
+```text
+ Master_Down_Interval = 3 × advert_int + skew        skew = (256 − priority) / 256 giây
+
+ lb2 có priority 100, advert_int 1 giây:  3 × 1 + 156/256 = 3,61 giây
+```
+
+`skew` làm máy có priority cao hết kiên nhẫn sớm hơn, để khi có nhiều máy dự phòng thì máy tốt nhất lên trước. Khi lên MASTER, máy mới gắn VIP vào card mạng rồi phát **gratuitous ARP**: một gói ARP không ai hỏi, báo cho cả mạng "`10.9.0.10` giờ ở địa chỉ MAC của tôi". Switch và mọi máy cùng mạng cập nhật bảng ARP (D2.1), và gói tiếp theo của client đi tới máy mới.
+
+```text
+ thời gian ──►
+ lb1 (prio 110)  MASTER  adv  adv  adv  ✗ mất mạng
+ lb2 (prio 100)  BACKUP   ·    ·    ·   ·····chờ 3,61 giây·····► MASTER: gắn VIP, phát gratuitous ARP
+ client → VIP    lb1     lb1  lb1  lb1   ✗ ✗ ✗ ✗ ✗ ✗ ✗ ✗ ✗ ✗ ✗      lb2  lb2  lb2
+                                         └── khoảng mất dịch vụ ──┘
+```
+
+Không phải lần đổi chủ nào cũng tốn 3,6 giây. Lab đo ba trường hợp:
+
+| Chuyện gì xảy ra | Máy dự phòng biết bằng cách nào | Mất dịch vụ |
+|---|---|---|
+| Máy chính chết hoặc mất mạng | Hết `Master_Down_Interval` không nghe thấy gì | Tối đa khoảng 3,6 giây |
+| HAProxy trên máy chính chết, máy còn sống | `track_script` của máy chính thất bại, nó tự nhường | Thời gian script phát hiện (`interval × fall`), cộng dưới 1 giây |
+| Dừng Keepalived có chủ đích (bảo trì) | Máy chính gửi advertisement với priority 0: "tôi nghỉ" | Chỉ còn `skew`, khoảng 0,6 tới 0,7 giây |
+
+Trường hợp giữa là lý do **`track_script`** tồn tại. VRRP chỉ biết máy còn sống hay không. HAProxy treo hoặc chết mà Keepalived vẫn chạy thì VIP nằm lại trên một máy không phục vụ được gì. `track_script` chạy một lệnh kiểm tra theo chu kỳ; lệnh thất bại thì instance chuyển sang trạng thái **FAULT**, bỏ VIP và nhường cho máy kia.
+
+Khi máy chính quay lại, mặc định nó **giành lại** VIP vì priority cao hơn (preempt). Thêm `nopreempt` để máy đang giữ cứ giữ tiếp: mỗi lần đổi chủ là một lần đứt các kết nối đang mở, nên nhiều đội chọn không đổi lại tự động.
+
+<Callout kind="production">
+
+Trên máy vật lý không có load balancer của cloud, nên địa chỉ của API server trong một cụm Kubernetes nhiều control plane phải tự dựng. Tài liệu [High Availability Considerations](https://github.com/kubernetes/kubeadm/blob/main/docs/ha-considerations.md) của kubeadm mô tả đúng cấu trúc của bài này: một nhóm máy cùng quản lý một IP ảo, mỗi máy chạy một bản load balancer, và cặp keepalived với haproxy được gọi là tổ hợp "đã có từ lâu, quen thuộc và được kiểm chứng kỹ". Tài liệu cũng nêu hai điều bài này sẽ cho bạn thấy: keepalived giữ IP ảo dựa trên một script kiểm tra sức khoẻ, và các máy chia nhau IP ảo phải nằm cùng subnet. Một ví dụ ở Việt Nam về hạ tầng kiểu này: trong [case study của KubeSphere](https://kubesphere.io/case/vng/), đội ZaloPay viết rằng vì quyền riêng tư dữ liệu, các cụm của họ đều triển khai trên máy bare metal, và họ dựng cụm sẵn sàng cao dùng HAProxy để cân bằng tải (case study không nói họ giữ IP ảo bằng gì). K4 dựng cấu trúc keepalived và haproxy cho một cụm kubeadm ba control plane.
+
+</Callout>
+
+<Check id="d21.3.vrrp">Giải thích được advertisement, priority, `Master_Down_Interval` và gratuitous ARP; tính được thời gian mất dịch vụ khi máy chính chết với một `advert_int` và priority cho trước; nói được `track_script` giải quyết việc gì.</Check>
+
+### Split-brain
+
+**Split-brain** là khi hai máy cùng tin mình là MASTER và cùng giữ VIP. VRRP không có trọng tài: máy dự phòng lên MASTER chỉ vì **không nghe thấy** máy chính, mà không nghe thấy chưa chắc là máy chính đã chết.
+
+| Nguyên nhân hay gặp | Cách phòng |
+|---|---|
+| Firewall trên máy chặn giao thức 112 hoặc multicast (bật `ufw`, áp bộ luật mới mà quên) | Mở VRRP giữa các load balancer; kiểm bằng `tcpdump vrrp` trên **máy dự phòng** |
+| Switch lọc multicast, hoặc hai máy nằm ở hai mạng không chuyển multicast | Dùng `unicast_peer`: gửi advertisement thẳng tới IP của máy kia |
+| Đường mạng giữa hai máy đứt nhưng cả hai vẫn tới được client | Cho VRRP chạy trên đường mạng mà traffic cũng đi qua; `track_interface` cho các card quan trọng |
+| Hai cụm khác nhau trên cùng VLAN vô tình dùng chung `virtual_router_id` | Cấp phát `virtual_router_id` có sổ sách; bật `authentication` chỉ để chống nhầm, không phải để bảo mật |
+
+Hậu quả tuỳ thứ đứng sau VIP:
+
+- **Load balancer HTTP không trạng thái:** cả hai máy đều phục vụ được, nên phần lớn request vẫn thành công. Triệu chứng là thứ khó truy: bảng ARP của các máy trong mạng nhảy qua lại giữa hai địa chỉ MAC, kết nối sống lâu bị reset bất chợt, bảng dính và bộ đếm giới hạn tốc độ tách làm hai. Split-brain kiểu này có thể tồn tại rất lâu mà không ai để ý.
+- **Thứ có trạng thái** (database chính, NFS): hai máy cùng nhận ghi là hỏng dữ liệu. Vì vậy đừng dùng VRRP trơn để quyết định máy nào là database chính; việc đó cần một cơ chế có **đa số** (quorum) như etcd, hoặc cắt nguồn máy kia trước khi tiếp quản (fencing).
+
+<Callout kind="production">
+
+GitHub mất dịch vụ nhiều giờ ngày 22/12/2012, và [bản tường trình của họ](https://github.blog/news-insights/the-library/downtime-last-saturday/) là ví dụ kinh điển về cơ chế chống split-brain quyết sai khi mạng phân mảnh. Các máy chủ file của họ chạy theo cặp chính, phụ, có cơ chế tắt nguồn máy kia trước khi tiếp quản để không bao giờ hai máy cùng ghi. Theo bài viết, một sự cố mạng làm các cặp máy mất liên lạc với nhau; chúng ra lệnh tắt máy bạn và cố nhận tài nguyên, nhưng một số lệnh không tới nơi vì mạng đang hỏng. Khi mạng hồi phục, nhiều cặp ở trạng thái cả hai máy cùng cho rằng mình phải là máy chính, và chúng tắt lẫn nhau: nhiều cặp kết thúc với **cả hai** máy cùng dừng. Cặp máy đó không dùng VRRP, nhưng bài học giống hệt: "không nghe thấy máy kia" không có nghĩa là "máy kia đã chết", và cơ chế hai máy tự quyết sẽ quyết sai khi chính đường liên lạc hỏng.
+
+</Callout>
+
+<Check id="d21.3.split-brain">Kể được ba nguyên nhân gây split-brain với VRRP và cách phòng từng cái, và giải thích được vì sao split-brain ở load balancer không trạng thái khó thấy còn ở database thì hỏng dữ liệu.</Check>
+
+### Vì sao cloud không dùng VRRP
+
+VRRP dựa vào hai thứ của mạng Ethernet thật: multicast để các máy nghe nhau, và gratuitous ARP để "cướp" một địa chỉ IP. Mạng ảo của cloud (VPC) không phải Ethernet thật. Nó là mạng định nghĩa bằng phần mềm ở tầng 3: mỗi địa chỉ IP được gán cho một card mạng ảo **qua API**, và hạ tầng bên dưới chuyển gói theo bảng gán đó chứ không theo ARP.
+
+- [Tài liệu VPC của Google Cloud](https://cloud.google.com/vpc/docs/vpc) ghi: mạng VPC không hỗ trợ địa chỉ broadcast hay multicast trong mạng. [FAQ mạng ảo của Azure](https://learn.microsoft.com/en-us/azure/virtual-network/virtual-networks-faq) trả lời thẳng: multicast và broadcast không được hỗ trợ. Mạng ảo của các nhà cung cấp khác, kể cả AWS, cùng một kiểu thiết kế; kiểm tài liệu của nhà cung cấp bạn dùng trước khi kết luận.
+- Một máy tự gắn thêm địa chỉ IP và phát gratuitous ARP thì không có gì xảy ra: hạ tầng không biết địa chỉ đó thuộc về máy ấy, và gói gửi tới nó không được chuyển.
+
+Vì vậy trên cloud: dùng load balancer được quản lý (D10), vốn đã chạy trên nhiều máy ở nhiều vùng sẵn sàng. Trường hợp buộc phải tự chạy cặp máy chính, phụ, Keepalived vẫn dùng được với `unicast_peer` để bầu chọn, nhưng việc chuyển địa chỉ phải làm bằng một lời gọi API của nhà cung cấp trong script `notify_master`, không phải bằng ARP.
+
+<Check id="d21.3.cloud">Giải thích được VRRP cần gì ở tầng mạng mà VPC của cloud không có, và nói được trên cloud thay nó bằng gì.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [RFC 9568: Virtual Router Redundancy Protocol (VRRP) Version 3](https://www.rfc-editor.org/rfc/rfc9568): mục 6 định nghĩa `Master_Down_Interval`, `Skew_Time` và máy trạng thái; mục 8.1 về ARP.
+- [keepalived.conf(5)](https://manpages.ubuntu.com/manpages/resolute/en/man5/keepalived.conf.5.html): mọi từ khoá của `vrrp_instance` và `vrrp_script` (`track_script`, `nopreempt`, `unicast_peer`, `notify_master`).
+- [kubeadm: High Availability Considerations](https://github.com/kubernetes/kubeadm/blob/main/docs/ha-considerations.md): cấu hình Keepalived và HAProxy làm VIP cho API server, thứ K4 dùng lại.
+- [GitHub: Downtime last Saturday](https://github.blog/news-insights/the-library/downtime-last-saturday/): tường trình sự cố 22/12/2012, đọc phần cặp máy chủ file tắt lẫn nhau.
+- [KubeSphere: case study VNG (ZaloPay)](https://kubesphere.io/case/vng/): một đội ở Việt Nam chạy Kubernetes trên bare metal với HAProxy; nguồn của ví dụ trong callout.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM Lima (2 CPU, 2 GiB) có `~/masteva-d21/topo.sh`, `lab.sh` của D9.1 và `web/web.py`, `lb/hap.sh` của D9.2. Thiếu hai file sau thì chạy ba khối lệnh đầu phần Thực hành của D9.2 (cài gói, tạo `web.py`, tạo `hap.sh`); thiếu hai file đầu thì làm phần Chuẩn bị của D9.1 tới hết khối `lab.sh`. Lab chạy hai HAProxy, hai Keepalived và hai backend Python, tốn khoảng 120 MB; máy 8 GB không cần thu gọn. `nftables` và `tcpdump` có sẵn trong image Ubuntu của Lima.
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y keepalived haproxy iputils-arping nftables tcpdump curl
+sudo systemctl disable --now keepalived haproxy     # lab chạy riêng trong namespace
+sudo ~/masteva-d21/topo.sh up
+mkdir -p ~/masteva-d21/vip && cd ~/masteva-d21
+. ./lab.sh; . lb/hap.sh
+web 1; web 2
+keepalived --version 2>&1 | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Keepalived v2.3.4 (06/10,2025)
+```
+
+</Expected>
+
+```text
+                              ┌─ lb1 10.9.0.11  HAProxy + Keepalived, priority 110 ─┐
+ VM (client) ── br-d9 ────────┤        VIP 10.9.0.10: máy nào MASTER thì giữ        ├── web1 10.9.0.21
+   10.9.0.1                   └─ lb2 10.9.0.12  HAProxy + Keepalived, priority 100 ─┘   web2 10.9.0.22
+```
+
+### 1. Hai load balancer, một VIP
+
+Hai HAProxy chạy cùng một cấu hình, chỉ khác tên trong header `X-LB` để ta biết máy nào trả lời. `bind :80` nghe trên mọi địa chỉ của máy, nên HAProxy sẵn sàng nhận traffic của VIP ngay khi VIP được gắn vào. `monitor-uri` là một đường dẫn do **chính HAProxy** trả `200`, không đi tới backend.
+
+<Terminal where="vm" title="~/masteva-d21/vip/haproxy.cfg">
+
+```bash
+cat > vip/haproxy.cfg <<'EOF'
+global
+  log stdout format raw local0
+
+defaults
+  mode http
+  log global
+  option httplog
+  timeout connect 1s
+  timeout client  30s
+  timeout server  10s
+  retries 3
+  option redispatch
+
+frontend fe_http
+  bind :80
+  monitor-uri /lb-health
+  http-response set-header X-LB NAME
+  default_backend app
+
+backend app
+  option httpchk
+  http-check send meth GET uri /healthz
+  default-server check inter 1s fall 2 rise 2
+  server web1 10.9.0.21:8080
+  server web2 10.9.0.22:8080
+EOF
+```
+
+</Terminal>
+
+Cấu hình Keepalived cũng dùng chung, khác `priority`:
+
+<Terminal where="vm" title="~/masteva-d21/vip/keepalived.conf">
+
+```bash
+cat > vip/keepalived.conf <<'EOF'
+global_defs {
+  router_id NAME
+  script_user root
+  enable_script_security
+}
+
+vrrp_script chk_haproxy {
+  script "/usr/bin/curl -fs -o /dev/null -m 1 http://127.0.0.1/lb-health"
+  interval 1      # chạy mỗi giây
+  fall 2          # 2 lần hỏng liên tiếp: coi là hỏng
+  rise 2          # 2 lần tốt liên tiếp: coi là tốt
+}
+
+vrrp_instance VI_1 {
+  state BACKUP             # cả hai khởi đầu là BACKUP, priority quyết định ai lên
+  interface eth0
+  virtual_router_id 51
+  priority PRIO
+  advert_int 1
+  virtual_ipaddress {
+    10.9.0.10/24
+  }
+  track_script {
+    chk_haproxy
+  }
+}
+EOF
+for n in 1 2; do
+  sed "s/NAME/lb$n/" vip/haproxy.cfg > vip/haproxy-lb$n.cfg
+  sed "s/NAME/lb$n/; s/PRIO/$((120 - n * 10))/" vip/keepalived.conf > vip/keepalived-lb$n.conf
+done
+grep '^  priority' vip/keepalived-lb?.conf
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+vip/keepalived-lb1.conf:  priority 110
+vip/keepalived-lb2.conf:  priority 100
+```
+
+</Expected>
+
+Script kiểm tra hỏi `/lb-health` của HAProxy **trên chính máy đó**. Nó cố ý không đi qua backend: nếu script trượt vì backend hỏng, cả hai load balancer cùng trượt và VIP không còn chỗ nào để về, trong khi đổi máy giữ VIP chẳng sửa được backend. `enable_script_security` bắt script phải là file chỉ `root` sửa được; `/usr/bin/curl` thoả điều đó.
+
+Các hàm của bài: `hapx` và `ka` chạy HAProxy và Keepalived trong namespace `lb<n>`; `vipwho` cho biết mỗi máy đang ở trạng thái nào và có giữ VIP không; `klog` gộp log của hai Keepalived theo thời gian.
+
+<Terminal where="vm" title="~/masteva-d21/vip/vip.sh">
+
+```bash
+cat > vip/vip.sh <<'EOF'
+# Hàm của lab D9.3. Nạp bằng: . ~/masteva-d21/lab.sh; . ~/masteva-d21/lb/hap.sh; . ~/masteva-d21/vip/vip.sh
+V=$HOME/masteva-d21/vip
+hapx() { sudo ip netns exec "lb$1" haproxy -W -f "$V/haproxy-lb$1.cfg" -p "$V/haproxy-lb$1.pid" > "$V/haproxy-lb$1.log" 2>&1 & }
+ka() {
+  sudo ip netns exec "lb$1" keepalived -P -n -l -f "$V/keepalived-lb$1.conf" \
+    -p "/run/keepalived-lb$1.pid" -r "/run/vrrp-lb$1.pid" -b "/run/bfd-lb$1.pid" \
+    > "$V/keepalived-lb$1.log" 2>&1 &
+}
+vipwho() {
+  for n in 1 2; do
+    echo "lb$n: $(grep -a -o 'Entering [A-Z]* STATE' "$V/keepalived-lb$n.log" | tail -1 | cut -d' ' -f2)" \
+         "VIP=$(sudo ip -n "lb$n" -br addr show eth0 | grep -c -F '10.9.0.10/24')"
+  done
+}
+klog() {   # klog <mẫu> [số dòng]: các dòng log khớp mẫu của cả hai máy, theo thời gian
+  for n in 1 2; do
+    grep -a -E "$1" "$V/keepalived-lb$n.log" | cut -d' ' -f4,6- | sed "s/ / lb$n /"
+  done | sort | tail -n "${2:-4}"
+}
+EOF
+. vip/vip.sh
+hapx 1; hapx 2; ka 1; ka 2
+sleep 8; vipwho
+klog 'Entering' 4
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lb1: MASTER VIP=1
+lb2: BACKUP VIP=0
+10:04:23 lb1 (VI_1) Entering BACKUP STATE
+10:04:23 lb2 (VI_1) Entering BACKUP STATE
+10:04:26 lb1 (VI_1) Entering MASTER STATE
+```
+
+</Expected>
+
+Cả hai vào BACKUP ngay khi script kiểm tra báo tốt, và chờ nghe. Không ai lên tiếng, `lb1` có priority cao hơn nên hết kiên nhẫn trước (sau 3 giây cộng `skew` của nó) và lên MASTER; `lb2` nghe thấy advertisement của `lb1` thì ở yên. Các cờ khi chạy Keepalived: `-n -l` chạy ở tiền cảnh và ghi log ra đầu ra chuẩn, `-P` chỉ chạy phần VRRP, `-p`, `-r` và `-b` đặt file PID riêng cho từng máy vì hai Keepalived của lab dùng chung thư mục `/run`: thiếu một trong ba, hai tiến trình khởi động cùng lúc sẽ tranh nhau một file khoá và một cái thoát với `daemon is already running`. Trên máy thật chỉ cần `systemctl enable --now keepalived` với cấu hình ở `/etc/keepalived/keepalived.conf`.
+
+Nhìn VIP từ phía client và trên dây:
+
+<Terminal where="vm">
+
+```bash
+curl -s -i http://10.9.0.10/ | grep -i -E '^x-lb|^backend' | cut -d' ' -f1-2
+ip neigh show 10.9.0.10 | cut -d' ' -f1-5
+sudo ip -n lb1 -br link show eth0 | awk '{print "MAC cua lb1:", $3}'
+sudo timeout 3 tcpdump -ni br-d9 -c 2 vrrp 2>/dev/null | cut -d' ' -f2-
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+x-lb: lb1
+backend=web1 peer=10.9.0.11
+10.9.0.10 dev br-d9 lladdr 5e:0f:dd:59:8f:a8
+MAC cua lb1: 5e:0f:dd:59:8f:a8
+IP 10.9.0.11 > 224.0.0.18: VRRPv2, Advertisement, vrid 51, prio 110, authtype none, intvl 1s, length 20
+IP 10.9.0.11 > 224.0.0.18: VRRPv2, Advertisement, vrid 51, prio 110, authtype none, intvl 1s, length 20
+```
+
+</Expected>
+
+Client gọi `10.9.0.10`, bảng ARP của VM trỏ địa chỉ đó tới MAC của `lb1`, và `lb1` trả lời. Trên dây, `lb1` phát advertisement mỗi giây tới `224.0.0.18` với `prio 110`. Keepalived 2.3 mặc định nói VRRP bản 2; bản 3 (`vrrp_version 3`) cho phép `advert_int` dưới một giây. Địa chỉ MAC trên máy bạn sẽ khác.
+
+<Check id="d21.3.lab-vip">Dựng được hai HAProxy sau một VIP bằng Keepalived, xác định được máy đang là MASTER bằng log, `ip addr` và bảng ARP của client, và bắt được advertisement VRRP bằng `tcpdump`.</Check>
+
+### 2. HAProxy chết, máy còn sống
+
+Công cụ đo của bài gọi VIP khoảng 10 lần mỗi giây và chỉ in ra khi người trả lời thay đổi:
+
+<Terminal where="vm" title="~/masteva-d21/vip/probe.sh">
+
+```bash
+cat > vip/probe.sh <<'EOF'
+#!/usr/bin/env bash
+# probe.sh <giây>: gọi VIP khoảng 10 lần mỗi giây; in mỗi lần đổi người trả lời và khoảng mất dịch vụ
+end=$(( $(date +%s) + ${1:-10} )); prev=""; total=0; fail=0; lost_at=0
+while (( $(date +%s) < end )); do
+  now=$(date +%s.%N)
+  who=$(curl -s -m 0.2 -o /dev/null -D - http://10.9.0.10/ | tr -d '\r' | awk 'tolower($1) == "x-lb:" { print $2 }')
+  who=${who:-LOI}; total=$((total + 1))
+  [[ $who == LOI ]] && fail=$((fail + 1))
+  if [[ $who != "$prev" ]]; then
+    note=""
+    [[ $prev == LOI ]] && note=$(awk -v a="$lost_at" -v b="$now" 'BEGIN { printf "  (mat dich vu %.1f giay)", b - a }')
+    [[ $who == LOI ]] && lost_at=$now
+    printf '%s  %s%s\n' "$(date -d "@$now" +%T)" "$who" "$note"
+    prev=$who
+  fi
+  sleep 0.1
+done
+echo "tong=$total loi=$fail"
+EOF
+chmod +x vip/probe.sh
+( sleep 3; sudo kill "$(cat vip/haproxy-lb1.pid)" ) &
+vip/probe.sh 10
+klog 'STATE|chk_haproxy' 4
+vipwho
+```
+
+</Terminal>
+
+<Predict question="Keepalived trên lb1 vẫn chạy và vẫn gửi advertisement. Làm sao lb2 biết phải tiếp quản, và mất khoảng bao lâu?">
+
+```text
+10:04:29  lb1
+10:04:32  LOI
+10:04:34  lb2  (mat dich vu 2.5 giay)
+tong=81 loi=18
+10:04:33 lb1 Script `chk_haproxy` now returning 7
+10:04:34 lb1 (VI_1) Entering FAULT STATE
+10:04:34 lb1 VRRP_Script(chk_haproxy) failed (exited with status 7)
+10:04:34 lb2 (VI_1) Entering MASTER STATE
+lb1: FAULT VIP=0
+lb2: MASTER VIP=1
+```
+
+`lb2` không tự biết; chính `lb1` nhường. Script kiểm tra trên `lb1` thất bại hai lần liên tiếp (curl thoát mã 7: không kết nối được), instance chuyển sang FAULT, bỏ VIP và ngừng làm MASTER; `lb2` tiếp quản gần như ngay sau đó. Khoảng mất dịch vụ là thời gian script phát hiện (`interval × fall`, khoảng 2 giây) cộng một nhịp chuyển; các lần đo của bài cho từ 1,7 tới 2,6 giây. Thiếu `track_script`, VIP sẽ nằm lại trên `lb1` và mọi request bị từ chối cho tới khi có người sửa. Giờ giấc và con số chính xác trên máy bạn sẽ khác chút ít.
+
+</Predict>
+
+Chạy lại HAProxy trên `lb1` và xem nó giành lại VIP:
+
+<Terminal where="vm">
+
+```bash
+( sleep 2; hapx 1 ) &
+vip/probe.sh 8
+klog 'STATE' 2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10:04:39  lb2
+10:04:46  lb1
+tong=68 loi=0
+10:04:46 lb1 (VI_1) Entering MASTER STATE
+10:04:46 lb2 (VI_1) Entering BACKUP STATE
+```
+
+</Expected>
+
+Script trên `lb1` tốt lại hai lần (`rise 2`), instance rời FAULT, và vì priority 110 cao hơn 100, `lb1` giành lại VIP (preempt). Lần đổi chủ này gần như không ai thấy: hai máy đều đang sống, máy mới gắn VIP và phát gratuitous ARP, máy cũ bỏ VIP. Trong bốn lần đo của bài, ba lần không request nào lỗi và một lần lỗi đúng một request (`probe.sh` khi đó in thêm một dòng `LOI` dài 0,4 giây). Request ngắn hầu như không bị ảnh hưởng; kết nối TCP đang mở tới `lb2` thì đứt, vì `lb1` không biết gì về chúng. Đó là lý do nhiều hệ thống đặt `nopreempt`.
+
+<Check id="d21.3.lab-track">Đo được thời gian mất dịch vụ khi HAProxy trên máy MASTER chết, chỉ ra được trong log lúc script thất bại và lúc instance vào FAULT, và giải thích được vì sao script kiểm tra không nên phụ thuộc backend.</Check>
+
+### 3. Máy chính mất mạng
+
+"Rút dây" của `lb1` bằng cách tắt đầu veth phía switch. Lần này `lb1` không kịp nói gì:
+
+<Terminal where="vm">
+
+```bash
+( sleep 3; sudo ip link set v-lb1 down ) &
+vip/probe.sh 10
+klog 'STATE' 2
+```
+
+</Terminal>
+
+<Predict question="lb2 có priority 100, advert_int là 1 giây. Dịch vụ gián đoạn khoảng bao lâu?">
+
+```text
+10:04:47  lb1
+10:04:50  LOI
+10:04:53  lb2  (mat dich vu 3.3 giay)
+tong=69 loi=10
+10:04:50 lb1 (VI_1) Entering FAULT STATE
+10:04:53 lb2 (VI_1) Entering MASTER STATE
+```
+
+Công thức cho `3 × 1 + (256 − 100) / 256` = 3,61 giây, tính từ advertisement **cuối cùng** `lb2` nhận được. Dây đứt ở một lúc bất kỳ giữa hai advertisement, nên client thấy từ khoảng 2,6 tới 3,6 giây. `lb2` phải chờ đủ `Master_Down_Interval` vì nó không phân biệt được "máy chính chết" với "một gói advertisement bị rớt". `lb1` cũng tự vào FAULT vì card mạng của nó mất tín hiệu, nhưng `lb2` không nghe được điều đó. Muốn nhanh hơn thì giảm `advert_int` (cần `vrrp_version 3` để xuống dưới 1 giây); cái giá là một lần mạng chập chờn ngắn cũng đủ gây đổi chủ.
+
+</Predict>
+
+Cắm dây lại:
+
+<Terminal where="vm">
+
+```bash
+( sleep 2; sudo ip link set v-lb1 up ) &
+vip/probe.sh 10
+vipwho
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10:04:57  lb2
+10:05:02  lb1
+tong=85 loi=0
+lb1: MASTER VIP=1
+lb2: BACKUP VIP=0
+```
+
+</Expected>
+
+Card mạng của `lb1` có tín hiệu lại, instance rời FAULT, và sau vài giây `lb1` giành lại VIP như ở bước 2.
+
+<Check id="d21.3.lab-failover">Đo được thời gian mất dịch vụ khi máy MASTER mất mạng và đối chiếu được với `Master_Down_Interval` tính từ `advert_int` và priority.</Check>
+
+### 4. Dừng có chủ đích để bảo trì
+
+Cần khởi động lại `lb1` để vá kernel. Dừng Keepalived của nó một cách tử tế bằng `SIGTERM`:
+
+<Terminal where="vm">
+
+```bash
+( sleep 3; sudo kill "$(sudo cat /run/keepalived-lb1.pid)" ) &
+vip/probe.sh 8
+sudo timeout 6 tcpdump -ni br-d9 -c 1 'vrrp and src 10.9.0.12' 2>/dev/null | cut -d' ' -f2-11
+ka 1; sleep 8; vipwho
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10:05:07  lb1
+10:05:10  LOI
+10:05:10  lb2  (mat dich vu 0.7 giay)
+tong=65 loi=2
+IP 10.9.0.12 > 224.0.0.18: VRRPv2, Advertisement, vrid 51, prio 100,
+lb1: MASTER VIP=1
+lb2: BACKUP VIP=0
+```
+
+</Expected>
+
+Chỉ 0,7 giây và 2 request lỗi. Khi nhận `SIGTERM`, Keepalived gửi một advertisement cuối với **priority 0**, nghĩa là "tôi nghỉ, đừng chờ". `lb2` bỏ qua phần `3 × advert_int` và chỉ chờ `skew` (156/256 giây) rồi lên MASTER; `tcpdump` cho thấy giờ `lb2` là máy phát advertisement. Bài học vận hành: bảo trì thì dừng Keepalived trước (hoặc `systemctl stop keepalived`), đừng tắt máy đột ngột hay `kill -9`. Lệnh cuối chạy lại Keepalived trên `lb1`; nó giành lại VIP sau vài giây.
+
+<Check id="d21.3.lab-graceful">Chứng minh được bằng số đo rằng dừng Keepalived bằng `SIGTERM` cho thời gian mất dịch vụ ngắn hơn nhiều so với mất mạng, và giải thích được vai trò của advertisement priority 0.</Check>
+
+Lần nào `lb1` quay lại nó cũng giành lại VIP, tức thêm một lần đổi chủ. Thử `nopreempt`: thêm vào cả hai máy, chạy lại hai Keepalived, rồi lặp lại đúng thao tác dừng và chạy lại `lb1`:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/^  advert_int 1/&\n  nopreempt/' vip/keepalived-lb1.conf vip/keepalived-lb2.conf
+for n in 1 2; do sudo kill "$(sudo cat /run/keepalived-lb$n.pid)"; done; sleep 2
+ka 1; ka 2; sleep 8; vipwho
+sudo kill "$(sudo cat /run/keepalived-lb1.pid)"; sleep 2
+ka 1; sleep 8; vipwho
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lb1: MASTER VIP=1
+lb2: BACKUP VIP=0
+lb1: BACKUP VIP=0
+lb2: MASTER VIP=1
+```
+
+</Expected>
+
+Lúc cả hai cùng khởi động, `lb1` vẫn lên trước nhờ priority cao hơn. Nhưng sau khi nó dừng và quay lại, `lb2` đang giữ VIP thì cứ giữ: `lb1` ở yên trong BACKUP dù priority 110 lớn hơn 100. `nopreempt` chỉ có tác dụng khi `state` là `BACKUP`, lý do cấu hình của bài đặt cả hai máy như vậy. Cái giá là VIP không còn "ở đâu thì biết đấy": phải hỏi (`vipwho`, hoặc giám sát) mới biết máy nào đang giữ. Trả cấu hình về như cũ cho bước 5:
+
+<Terminal where="vm">
+
+```bash
+sed -i '/^  nopreempt/d' vip/keepalived-lb1.conf vip/keepalived-lb2.conf
+for n in 1 2; do sudo kill "$(sudo cat /run/keepalived-lb$n.pid)"; done; sleep 2
+ka 1; ka 2; sleep 8; vipwho
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lb1: MASTER VIP=1
+lb2: BACKUP VIP=0
+```
+
+</Expected>
+
+<Check id="d21.3.lab-nopreempt">Bật được `nopreempt` trên cả hai máy và chứng minh được máy có priority cao hơn không giành lại VIP khi quay lại; nói được cái giá của lựa chọn này.</Check>
+
+### 5. Split-brain từ một luật firewall
+
+Kịch bản có thật: ai đó áp một bộ luật firewall mới lên `lb2` và quên mở VRRP. Luật dưới đây chỉ chặn giao thức 112 đi **vào** `lb2`; mọi thứ khác vẫn thông.
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec lb2 nft -f - <<'EOF'
+table inet lab {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    ip protocol vrrp counter drop
+  }
+}
+EOF
+sleep 5; vipwho
+sudo arping -I br-d9 -c 3 10.9.0.10 | grep -o '\[.*\]' | sort | uniq -c
+vip/probe.sh 5
+klog 'lower priority' 2 | cut -c1-110
+```
+
+</Terminal>
+
+<Predict question="lb2 không còn nghe thấy lb1. Sau 5 giây, máy nào giữ VIP? Client có thấy lỗi không?">
+
+```text
+lb1: MASTER VIP=1
+lb2: MASTER VIP=1
+      1 [26:12:A5:56:28:06]
+      3 [5E:0F:DD:59:8F:A8]
+10:05:30  lb1
+tong=42 loi=0
+10:05:33 lb1 (VI_1) Received advert from 10.9.0.12 with lower priority 100, ours 110, forcing new election
+10:05:34 lb1 (VI_1) Received advert from 10.9.0.12 with lower priority 100, ours 110, forcing new election
+```
+
+**Cả hai** là MASTER và cùng gắn `10.9.0.10`. Hỏi ARP cho địa chỉ đó thì hai địa chỉ MAC khác nhau cùng trả lời (số câu trả lời của mỗi máy thay đổi theo lần chạy). Vậy mà client không thấy một lỗi nào: cả hai máy đều phục vụ được. Trong lab này `lb1` còn nghe thấy advertisement của `lb2`, biết có kẻ tranh chấp nên phát lại gratuitous ARP mỗi giây, kéo bảng ARP của client về phía mình; có lần chạy `probe.sh` vẫn bắt được vài request do `lb2` trả lời xen vào. Dashboard tỉ lệ lỗi HTTP hoàn toàn xanh. Thứ duy nhất báo động là dòng `forcing new election` lặp lại trong log của `lb1`, và việc hai máy cùng có VIP.
+
+</Predict>
+
+Split-brain kiểu này là món nợ ngầm: kết nối sống lâu đứt bất chợt khi bảng ARP ở đâu đó lật sang máy kia, và nếu sau VIP là thứ có trạng thái thì hai máy đã cùng nhận ghi. Cách phát hiện đáng tin là giám sát **số máy đang giữ VIP**: khác 1 là báo động (D12). Gỡ luật và xem hệ thống tự lành:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec lb2 nft delete table inet lab
+sleep 3; vipwho
+klog 'higher priority|BACKUP STATE' 2 | cut -c1-100
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lb1: MASTER VIP=1
+lb2: BACKUP VIP=0
+10:05:35 lb2 (VI_1) Entering BACKUP STATE
+10:05:35 lb2 (VI_1) Master received advert from 10.9.0.11 with higher priority 110, ours 100
+```
+
+</Expected>
+
+Vừa nghe lại được `lb1`, `lb2` thấy priority cao hơn và lùi về BACKUP ngay. Trên máy thật, luật cần có là cho phép giao thức `vrrp` (và `ah` nếu dùng authentication kiểu cũ) giữa các load balancer, cả chiều vào lẫn chiều ra.
+
+<Check id="d21.3.lab-split-brain">Tái hiện được split-brain bằng một luật firewall, chứng minh được nó bằng `ip addr` trên hai máy và `arping` từ client, và chỉ ra được dấu hiệu trong log khi tỉ lệ lỗi HTTP vẫn bằng 0.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `vipwho: command not found`, `web: command not found`: terminal mới chưa nạp hàm. Chạy `. ~/masteva-d21/lab.sh; . ~/masteva-d21/lb/hap.sh; . ~/masteva-d21/vip/vip.sh`.
+- `vipwho` in dòng trống thay cho trạng thái, và log (`vip/keepalived-lb1.log`) có `daemon is already running`: Keepalived của máy đó đang chạy rồi, hoặc lần trước bị `kill -9` để lại file PID trong `/run`. Dừng bằng `sudo ip netns pids lb1 | xargs -r sudo kill` (đổi `lb1` thành máy cần dừng), chạy lại `hapx 1; ka 1`.
+- Cả hai máy là MASTER ngay từ bước 1: VRRP không tới được máy kia. Kiểm `sudo ip netns exec lb2 nft list ruleset` (còn luật của bước 5), và `sudo tcpdump -ni br-d9 vrrp` phải thấy đúng một nguồn phát.
+- `lb1` kẹt ở FAULT: HAProxy của nó không chạy (`hapx 1`), hoặc `v-lb1` còn tắt (`sudo ip link set v-lb1 up`).
+- `probe.sh` in toàn `LOI`: không máy nào giữ VIP hoặc backend chưa chạy. Chạy `vipwho`, rồi `curl http://10.9.0.21:8080/`.
+- Log có `Unsafe permissions found for script` hoặc `Disabling track script`: script kiểm tra không thuộc `root`. Bài dùng thẳng `/usr/bin/curl` để tránh chuyện này; nếu bạn thay bằng script riêng, đặt nó ở nơi chỉ `root` ghi được.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới dừng mọi tiến trình trong các namespace của lab (HAProxy, Keepalived, backend), xoá mạng lab và các file PID của Keepalived trong `/run`. Thư mục `~/masteva-d21` được giữ lại.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+sudo ~/masteva-d21/topo.sh down
+sudo rm -f /run/keepalived-lb?.pid /run/vrrp-lb?.pid /run/bfd-lb?.pid
+sleep 2; ip netns list | wc -l; pgrep -c 'keepalived|haproxy'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+0
+```
+
+</Expected>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Active-passive lãng phí một máy. Làm active-active được không?">
+
+Với VRRP, cách quen thuộc là **hai VIP**: `lb1` là MASTER của VIP thứ nhất và BACKUP của VIP thứ hai, `lb2` ngược lại, và DNS trả cả hai địa chỉ. Bình thường mỗi máy gánh nửa tải; một máy chết thì máy kia giữ cả hai VIP. Nhớ rằng khi đó máy còn lại gánh **toàn bộ** tải, nên mỗi máy vẫn phải đủ sức chạy một mình: bạn dùng được cả hai máy, không tiết kiệm được máy nào. Active-active thật sự với một địa chỉ cần sự giúp đỡ của router: nhiều máy cùng quảng bá một IP qua BGP và router chia traffic bằng ECMP. Đó là cách của GLB ở GitHub và của MetalLB chế độ BGP (K4). Nó mở rộng được tới hàng chục máy, đổi lại phải có router hỗ trợ BGP và một cách băm ổn định để kết nối không đổi máy giữa chừng.
+
+</Reveal>
+
+<Reveal title="Đổi máy giữ VIP thì các kết nối đang mở ra sao?">
+
+Chúng đứt. Kết nối TCP sống trong bộ nhớ của HAProxy trên máy cũ; máy mới nhận gói của một kết nối nó chưa từng thấy và trả `RST`. Client HTTP tử tế mở kết nối mới và thử lại, nên API ngắn gần như không ảnh hưởng. WebSocket, gRPC stream, kết nối database qua HAProxy `mode tcp` đều phải nối lại. Vì vậy: đặt `nopreempt` để chỉ đổi chủ khi thật cần; bảo trì vào giờ thấp điểm bằng cách dừng Keepalived như bước 4; và bảo đảm client có nối lại kèm lùi dần (SB7.2). Có kỹ thuật đồng bộ bảng kết nối giữa hai máy (conntrackd cho firewall, IPVS sync), nhưng với proxy L7 thì trạng thái của một kết nối nằm trong tiến trình, không đồng bộ được.
+
+</Reveal>
+
+<Reveal title="Vì sao ba máy với VRRP vẫn không cho quorum?">
+
+VRRP là bầu chọn theo priority, không phải theo đa số. Mỗi máy tự quyết dựa trên việc nó nghe thấy ai. Ba máy bị chia thành hai nhóm không nghe được nhau thì mỗi nhóm có một MASTER, bất kể nhóm đó có một hay hai máy. Các hệ thống cần đúng một chủ tại mọi thời điểm (database chính, bộ lập lịch) dùng thuật toán đồng thuận như Raft trong etcd: một bên chỉ được làm chủ khi **đa số** thành viên xác nhận, nên nhóm thiểu số tự biết mình không có quyền. Patroni dùng etcd để chọn PostgreSQL chính chính vì lẽ đó (D19). VRRP hợp với thứ mà hai chủ cùng lúc chỉ gây phiền chứ không gây hỏng: router mặc định, load balancer không trạng thái.
+
+</Reveal>
+
+<Reveal title="Trong Kubernetes thì VIP nằm ở đâu?">
+
+Ở hai chỗ. Thứ nhất là trước API server của cụm tự dựng: `kubeadm init --control-plane-endpoint` cần một địa chỉ ổn định cho ba control plane, và trên máy vật lý đó là VIP do Keepalived giữ trước HAProxy `mode tcp`, hoặc kube-vip (một tiến trình làm cả hai việc, chạy như static pod). Thứ hai là Service kiểu `LoadBalancer`: MetalLB chế độ L2 làm đúng việc của bài này, một node trả lời ARP cho IP của Service và node khác tiếp quản bằng gratuitous ARP khi nó chết. Khác biệt là MetalLB chọn node qua danh sách thành viên của cụm thay vì VRRP. Cả hai đều thừa hưởng giới hạn của VIP tầng 2: một node gánh toàn bộ traffic vào của IP đó, và đổi chủ mất vài giây. K4 dựng cả hai.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết `keepalived.conf` cho một cặp máy từ mô tả, hoặc giải thích một đoạn log đổi trạng thái. AI hay đặt `state MASTER` trên một máy kèm `nopreempt` (Keepalived bỏ qua `nopreempt` khi `state` không phải `BACKUP`), hay viết `vrrp_script` dùng `killall -0 haproxy` hoặc `pidof` (chỉ biết tiến trình còn, không biết nó còn phục vụ), hay thêm `authentication` kiểu `PASS` như một biện pháp bảo mật (mật khẩu đi dạng rõ trên dây), và hay quên luật firewall cho giao thức 112. Kiểm lại bằng `keepalived -t -f <file>` để bắt lỗi cú pháp, rồi diễn tập đủ ba kiểu hỏng của bài và một lần chặn VRRP để chắc rằng bạn nhìn ra split-brain trên hệ thống giám sát của mình.
+
+</Callout>
+
+<Callout kind="link">
+
+D2.1 dạy ARP và bảng neighbor; D2.4 dạy nftables, thứ vừa gây ra split-brain ở bước 5; D2.5 có bonding, lớp dự phòng ở tầng card mạng nằm dưới VIP. D9.2 là HAProxy đứng sau VIP này. K4 dùng Keepalived và HAProxy làm địa chỉ của API server, và MetalLB cho Service. D10 thay cả cụm này bằng NLB, ALB trên cloud. D19 bàn failover của database, nơi split-brain là mất dữ liệu. D12 và D16 giám sát số máy giữ VIP và số lần đổi chủ.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d21.3.mastery-design">Thiết kế được một cặp load balancer sau VIP cho một dịch vụ: chọn `advert_int`, priority, có hay không `nopreempt`, script kiểm tra gì, luật firewall nào phải mở; và ước lượng được thời gian mất dịch vụ cho từng kiểu hỏng.</Check>
+
+<Check id="d21.3.mastery-drill">Tự diễn tập được ba kiểu failover (dịch vụ chết, máy mất mạng, dừng có chủ đích), đo số giây và số request lỗi của từng kiểu, và đối chiếu với con số tính trước.</Check>
+
+<Check id="d21.3.mastery-split-brain">Phát hiện được split-brain trên một cặp máy đang chạy bằng `ip addr`, `arping`, `tcpdump vrrp` và log Keepalived, tìm ra nguyên nhân, và nói được vì sao không dùng VRRP để chọn database chính.</Check>
+
+</Mastery>

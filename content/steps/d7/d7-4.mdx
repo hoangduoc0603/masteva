@@ -1,0 +1,794 @@
+---
+title: Migration database trong pipeline và feature flag
+description: Đưa migration PostgreSQL thành một bước của pipeline với quyền riêng, thêm cổng CI chạy bản đang ở prod trên schema mới để chặn migration phá vỡ, lui ứng dụng mà không lui schema; rồi tách triển khai khỏi phát hành bằng feature flag bật theo phần trăm người dùng và tắt trong một giây.
+id: d7.4
+step: d7
+prerequisites: [d7.3]
+topics: [d7.migration-database-pipeline, d7.feature-flag]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    gitea: 28.1.0
+    gitea-runner: 5.0.0
+    postgres-image: 18-alpine (PostgreSQL 18.6)
+    psql-trong-job: "18.6"
+    pgx: v5.11.0
+    golang-image: 1.27.2-alpine
+    jq: 1.8.2
+---
+
+<Goal>
+
+Xử lý hai thứ mà rolling, blue-green và canary của D6.3 không tự lo được: database dùng chung giữa bản cũ và bản mới, và tính năng chưa muốn cho mọi người thấy. Học xong bài này, bạn giải thích được:
+
+- Vì sao lui ứng dụng về bản trước thì dễ, còn lui schema thì gần như không bao giờ nên làm.
+- Vì sao một migration `RENAME COLUMN` qua hết test của chính nhánh đó mà vẫn làm sập production, và phép kiểm nào bắt được nó trước khi merge.
+- Vì sao ứng dụng không nên có quyền `ALTER TABLE` trên database của chính nó.
+- Vì sao "đã triển khai" và "đã phát hành" là hai việc khác nhau, và tắt một tính năng lỗi bằng cờ nhanh hơn rollback bao nhiêu.
+
+</Goal>
+
+<Knowledge>
+
+### Schema không lui được như code
+
+Image là bất biến và không có trạng thái: triển khai lại digest cũ là có lại hành vi cũ. Database thì khác. Một migration đã chạy là dữ liệu đã đổi dạng; "chạy ngược" `DROP COLUMN` không trả lại dữ liệu, và trong lúc bạn loay hoay, bản mới vẫn đang ghi. Vì vậy pipeline coi schema là thứ **chỉ tiến**, và đặt toàn bộ gánh nặng lên một quy tắc mà SB5.5 đã dạy: **mỗi migration phải tương thích với cả bản code đang chạy lẫn bản sắp chạy**. Đổi tên cột, đổi kiểu, bỏ cột đều đi qua expand/contract trong nhiều bản phát hành. Bài này không dạy lại kỹ thuật đó; nó trả lời ba câu của người dựng pipeline: migration chạy **ở đâu**, bằng **quyền gì**, và **cái gì chặn** một migration vi phạm quy tắc.
+
+```text
+ Bản N đang chạy ở prod ──────────────────────────────┐
+                                                       │ phải chạy được trên schema N+1
+ Pull request: migration V(n+1) + code N+1            ▼
+   ├─ job test:    code N+1 với schema N+1          (test của nhánh, luôn xanh)
+   └─ job compat:  image của bản N với schema N+1   (cổng của bài này)
+
+ Triển khai mỗi môi trường:  1. migrate (quyền DDL)  ──▶  2. đổi bản ứng dụng (quyền DML)
+ Cần lui:                    chỉ lui bước 2; schema N+1 ở lại, vì bản N chạy được trên nó
+```
+
+Trong sơ đồ, **DDL** (data definition language) là các lệnh đổi cấu trúc: `CREATE`, `ALTER`, `DROP`. **DML** (data manipulation language) là các lệnh đọc ghi dữ liệu: `SELECT`, `INSERT`, `UPDATE`, `DELETE`.
+
+**Migration chạy ở đâu?**
+
+| Cách | Hoạt động | Hợp khi | Cái giá |
+|---|---|---|---|
+| Ứng dụng tự chạy lúc khởi động | Mặc định của Spring Boot với Flyway (SB5.5) | Một instance, đội nhỏ | Ứng dụng cần quyền DDL; nhiều replica cùng khởi động phải tranh khoá; khởi động chậm theo migration; migration lỗi làm ứng dụng không lên |
+| Bước riêng trong pipeline, trước bước đổi bản | Job chạy công cụ migration với credential riêng | Đa số service; lab làm cách này | Runner phải tới được database; cần thứ tự rõ giữa migrate và deploy |
+| Job hoặc init container của nền tảng | Kubernetes Job chạy trước khi rolling Deployment (K1.4) | Triển khai qua GitOps, runner không vào được mạng database | Phải xử lý Job lỗi và chạy lại |
+| Tách hẳn khỏi phát hành | Thay đổi dài (backfill hàng trăm triệu dòng, tạo index lớn) chạy riêng, có theo dõi | Bảng lớn | Cần công cụ đổi schema trực tuyến và quy trình riêng |
+
+Các quy tắc pipeline phải ép, dù dùng Flyway, Liquibase, Atlas hay script tự viết:
+
+- **Migration đi cùng artifact.** File migration nằm trong repo, cùng commit với code cần nó, và được thăng cấp qua dev, staging, prod theo đúng thứ tự như image.
+- **Đã áp thì không sửa.** Sửa một file đã chạy ở môi trường nào đó làm các môi trường lệch nhau. Sai thì viết migration mới.
+- **Hai danh tính.** Tài khoản chạy migration sở hữu bảng và có quyền DDL; tài khoản của ứng dụng chỉ đọc ghi dữ liệu. Ứng dụng bị chiếm quyền không xoá được bảng, và một lỗi code không tự ý đổi schema.
+- **Không giữ khoá lâu.** Đặt `lock_timeout` để migration thất bại nhanh thay vì đứng chờ khoá và chặn mọi truy vấn xếp sau nó (SB5.5 đã cho thấy hàng đợi khoá).
+- **Một lúc một migration.** Hai pipeline cùng migrate một database phải tuần tự. Flyway dùng khoá của database cho việc này.
+
+<Callout kind="production">
+
+Ngày 27/11/2021, GitHub gián đoạn 2 giờ 50 phút. Theo báo cáo độ sẵn sàng tháng đó của hãng: một schema migration trên một bảng MySQL lớn, loại việc thường kéo dài hàng tuần ở GitHub, tới bước cuối là đổi tên để đưa bảng mới vào chỗ bảng cũ. Ở bước đó, một phần đáng kể read replica rơi vào deadlock, các replica còn lại không gánh nổi tải và hỏng theo. Đội vận hành chọn ưu tiên toàn vẹn dữ liệu: rút lưu lượng khỏi các replica hỏng cho tới khi chúng xử lý xong lệnh đổi tên. Hãng tạm dừng mọi schema migration sau sự cố, và nêu hướng khắc phục là chia nhỏ cluster để migration chạy được theo kiểu canary trên một phần. Migration là thay đổi production như mọi thay đổi khác: cần chạy thử trên dữ liệu cỡ thật, cần phạm vi ảnh hưởng nhỏ, và bước "vô hại" cuối cùng vẫn có thể là bước nguy hiểm nhất.
+
+</Callout>
+
+<Check id="d7.4.migration-pipeline">Giải thích được vì sao schema chỉ tiến, so sánh được bốn chỗ chạy migration, và kể được các quy tắc pipeline phải ép: đi cùng artifact, không sửa file đã áp, hai danh tính, `lock_timeout`, tuần tự.</Check>
+
+### Feature flag: triển khai chưa phải là phát hành
+
+**Triển khai** (deploy) là đưa code lên production. **Phát hành** (release) là cho người dùng thấy hành vi mới. Khi hai việc dính vào nhau, mỗi lần merge là một lần đánh cược. **Feature flag** tách chúng: code mới nằm sau một điều kiện đọc lúc chạy, mặc định tắt. D4.2 đã nói trunk-based development cần thứ này để merge code dở dang mỗi ngày.
+
+```text
+ request (user=42) ──▶ flagOn("discount", "42")?
+                          │   đọc luật từ kho cờ (cache vài giây)
+                          │   enabled = true, percent = 10
+                          │   hash("discount:42") % 100 = 73  ≥ 10  ──▶ tắt cho user này
+                          ▼
+                       code cũ            (user 7: hash = 4 < 10 ──▶ code mới)
+```
+
+| Loại cờ | Mục đích | Ai đổi | Sống bao lâu |
+|---|---|---|---|
+| Release | Giấu tính năng đang làm dở; bật dần 1% → 10% → 100% | Đội phát triển | Ngày tới vài tuần; **phải xoá** sau khi bật hết |
+| Ops (kill switch) | Tắt nhanh một phần tốn tài nguyên hoặc đang lỗi | Người trực vận hành | Lâu dài |
+| Experiment | Thử nghiệm A/B, đo hành vi | Sản phẩm, dữ liệu | Hết thí nghiệm |
+| Permission | Mở tính năng cho nhóm khách hàng, gói trả phí | Kinh doanh | Lâu dài |
+
+Bốn quyết định kỹ thuật:
+
+- **Luật nằm ở đâu.** Biến môi trường hay file cấu hình: đơn giản nhưng đổi cờ là triển khai lại, mất tác dụng của kill switch. Bảng trong database (lab): đổi tức thì, đủ cho một service. Dịch vụ cờ (Unleash, flagd, các dịch vụ thương mại): có giao diện, phân quyền, nhật ký, luật theo nhóm người dùng. **OpenFeature** là chuẩn API trung lập của CNCF để code không gắn chặt vào một nhà cung cấp.
+- **Chia phần trăm thế nào.** Băm một khoá ổn định (mã người dùng) rồi so với ngưỡng. Cùng một người luôn rơi vào cùng một bên, và tăng 10% lên 50% chỉ **thêm** người, không đảo người đã có.
+- **Kho cờ chết thì sao.** Ứng dụng cache giá trị đã đọc và có giá trị mặc định an toàn (thường là tắt). Không để mỗi request phụ thuộc vào một lần gọi mạng tới kho cờ.
+- **Kill switch không được đi qua pipeline.** Lúc cần nó nhất là lúc pipeline, registry hay runner có thể cũng đang hỏng.
+
+Cờ có giá của nó: mỗi cờ nhân đôi số đường chạy cần test, cờ cũ không xoá thành nợ khó hiểu, và **bật cờ là một thay đổi production** cần được ghi lại và làm từng nấc như một lần triển khai (chặng D13).
+
+<Callout kind="production">
+
+Ngày 12/06/2025, nhiều dịch vụ Google Cloud lỗi trên toàn cầu trong nhiều giờ. Theo báo cáo sự cố của Google: ngày 29/05, một tính năng kiểm tra quota mới được thêm vào Service Control và phát hành lần lượt từng vùng, nhưng đường code mới chỉ chạy khi có một loại dữ liệu chính sách nhất định nên suốt đợt phát hành không hề được thực thi. Nó thiếu xử lý lỗi và **không nằm sau feature flag**. Ngày 12/06, một thay đổi chính sách có trường rỗng được ghi vào kho dữ liệu, sao chép ra toàn cầu trong vài giây, kích hoạt đường code đó và làm tiến trình sập lặp lại ở mọi vùng. Nhóm trực xác định nguyên nhân trong 10 phút và chuẩn bị "nút đỏ" tắt đường code; nút sẵn sàng sau khoảng 25 phút kể từ đầu sự cố và triển khai xong ở khoảng phút thứ 40. Báo cáo viết rằng nếu có flag, lỗi đã bị bắt ở staging, và cam kết mọi thay đổi với binary quan trọng phải nằm sau feature flag, mặc định tắt. Hai bài học khớp với lab: code mới cần cờ để bật dần, và công tắc tắt phải nhanh hơn sự cố.
+
+</Callout>
+
+<Check id="d7.4.feature-flag">Phân biệt được triển khai với phát hành, kể được bốn loại cờ và tuổi thọ của chúng, giải thích được cách chia phần trăm bằng băm, và nói được vì sao kill switch không được phụ thuộc pipeline.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [DORA: Database change management](https://dora.dev/capabilities/database-change-management/): vì sao đưa thay đổi database vào version control và pipeline, và những cách làm sai thường gặp.
+- [Parallel Change](https://martinfowler.com/bliki/ParallelChange.html): mô tả gốc của expand, migrate, contract; đọc cùng SB5.5.
+- [Feature Toggles (aka Feature Flags)](https://martinfowler.com/articles/feature-toggles.html): bài kinh điển của Pete Hodgson; đọc phần phân loại theo tuổi thọ và mức động, và phần quản lý nợ cờ.
+- [OpenFeature: Introduction](https://openfeature.dev/docs/reference/intro/): khái niệm evaluation context, provider, và vì sao cần một API chuẩn cho cờ.
+- [GitHub Availability Report: November 2021](https://github.blog/news-insights/company-news/github-availability-report-november-2021/) và [Google Cloud incident ow5i3PPK96RduMcb1SsW](https://status.cloud.google.com/incidents/ow5i3PPK96RduMcb1SsW): hai báo cáo gốc của hai callout.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D6.3; stack và ba môi trường `d6-dev`, `d6-staging`, `d6-prod` đang chạy, repo ở nhánh `main`, đã chạy khối dọn `d6-lb` của D6.3. Máy có mạng: Go tải thêm driver PostgreSQL, Docker kéo `postgres:18-alpine` (khoảng 120 MB). **Profile máy:** thêm khoảng 60 MiB RAM cho PostgreSQL; job `compat` chạy thêm một PostgreSQL tạm trong vài giây. Lab mở ba pull request và chạy workflow `deploy` mười lần, mỗi lần chừng 10 giây.
+
+SB5.5 dùng Flyway. Image Flyway hiện nặng khoảng 500 MB, nên lab thay bằng một script 12 dòng trên `psql`, giữ đúng quy ước đặt tên file `V<số>__<mô tả>.sql` của Flyway: bạn thấy rõ pipeline làm gì, và đổi sang Flyway chỉ là thay một lệnh.
+
+### 1. PostgreSQL, hai role, secret, và image job có psql
+
+<Terminal where="mac" title="Database và secret">
+
+```bash
+cd ~/masteva-d7 && . ./lab.sh
+{ echo "MIGRATOR_PASSWORD=$(openssl rand -hex 12)"; echo "APP_PASSWORD=$(openssl rand -hex 12)"; } > db.env
+chmod 600 db.env && . ./db.env
+docker run -q -d --name d6-db --network d6-net -e POSTGRES_PASSWORD="$(openssl rand -hex 12)" \
+  -v d6-db-data:/var/lib/postgresql postgres:18-alpine >/dev/null
+until docker exec d6-db psql -U postgres -h 127.0.0.1 -c 'SELECT 1' >/dev/null 2>&1; do sleep 0.5; done
+docker exec -i d6-db psql -U postgres -q -v ON_ERROR_STOP=1 <<EOF
+CREATE ROLE migrator LOGIN PASSWORD '$MIGRATOR_PASSWORD';
+CREATE ROLE app LOGIN PASSWORD '$APP_PASSWORD';
+CREATE DATABASE price_dev OWNER migrator;
+CREATE DATABASE price_staging OWNER migrator;
+CREATE DATABASE price_prod OWNER migrator;
+EOF
+for e in dev staging prod; do
+  docker exec d6-db psql -U postgres -d price_$e -q -c "ALTER DEFAULT PRIVILEGES FOR ROLE migrator
+    IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app"
+done
+api_an -X PUT -o /dev/null -w "secret MIGRATOR_PASSWORD: HTTP %{http_code}\n" \
+  "$R/actions/secrets/MIGRATOR_PASSWORD" -d "{\"data\":\"$MIGRATOR_PASSWORD\"}"
+api_an -X PUT -o /dev/null -w "secret APP_PASSWORD: HTTP %{http_code}\n" \
+  "$R/actions/secrets/APP_PASSWORD" -d "{\"data\":\"$APP_PASSWORD\"}"
+api_an "$R/actions/secrets" | jq -c '.[] | keys'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+secret MIGRATOR_PASSWORD: HTTP 201
+secret APP_PASSWORD: HTTP 201
+["created_at","description","name"]
+["created_at","description","name"]
+```
+
+</Expected>
+
+Một máy PostgreSQL, ba database, mỗi môi trường một cái. Hai role: `migrator` sở hữu database và mọi bảng nó tạo; `app` chỉ được `SELECT`, `INSERT`, `UPDATE`, `DELETE` trên các bảng đó (nhờ `ALTER DEFAULT PRIVILEGES`, không migration nào phải tự cấp quyền). Mật khẩu của tài khoản `postgres` được sinh ngẫu nhiên và không ghi vào file nào của lab, nhưng nó vẫn nằm trong biến môi trường của container: ai chạy được `docker inspect d6-db` là đọc được, đúng kiểu lộ mà D6.1 bước 6 đã cho thấy. Trong lab, việc quản trị đi qua `docker exec` trên chính máy database.
+
+Hai mật khẩu được đưa vào **secret của repo** qua API. Dòng cuối cho thấy API liệt kê secret chỉ trả tên và ngày tạo: giá trị ghi vào được nhưng không đọc lại được. D6.5 đi sâu vào secret trong CI.
+
+Job cần `psql`. D6.1 đã nói: thiếu công cụ thì thêm vào image của job.
+
+<Terminal where="mac" title="Image d6-ci:2">
+
+```bash
+cat > ci-image/Dockerfile <<'EOF'
+FROM golang:1.27.2-alpine
+RUN apk add --no-cache git nodejs docker-cli docker-cli-buildx tar zstd curl jq postgresql18-client
+EOF
+docker build -q -t d6-ci:2 ci-image >/dev/null
+cat > runner-config.yaml <<'EOF'
+runner:
+  capacity: 1
+  labels:
+    - "ubuntu-latest:docker://d6-ci:2"
+container:
+  network: d6-net
+  sweep: false
+EOF
+runner_restart
+docker run --rm d6-ci:2 psql --version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+psql (PostgreSQL) 18.6
+```
+
+</Expected>
+
+### 2. Service đọc giá từ database, migration chạy trước khi đổi bản
+
+Một pull request làm bốn việc: migration đầu tiên, script áp migration, code đọc giá từ bảng `products`, và nối tất cả vào script triển khai.
+
+<Terminal where="mac" title="db/ và store.go">
+
+```bash
+cd price-api && git switch -q main && git switch -q -c feature/db
+mkdir -p db/migration
+cat > db/migration/V1__products.sql <<'EOF'
+CREATE TABLE products (
+  sku   text PRIMARY KEY,
+  name  text NOT NULL,
+  price integer NOT NULL
+);
+INSERT INTO products VALUES ('A1', 'Bàn phím cơ', 1250499);
+EOF
+cat > db/migrate.sh <<'EOF'
+#!/bin/sh
+# migrate.sh <url>: áp các file db/migration/V*.sql chưa chạy, theo thứ tự, mỗi file một transaction
+set -eu
+URL=$1 DIR=$(dirname "$0")/migration
+psql "$URL" -q -v ON_ERROR_STOP=1 -c "CREATE TABLE IF NOT EXISTS schema_history (
+  version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
+for f in $(ls "$DIR"/V*.sql | sort -V); do
+  v=$(basename "$f" .sql)
+  [ -z "$(psql "$URL" -qAt -c "SELECT 1 FROM schema_history WHERE version = '$v'")" ] || continue
+  psql "$URL" -q -v ON_ERROR_STOP=1 --single-transaction \
+    -c "SET lock_timeout = '3s'" -f "$f" -c "INSERT INTO schema_history (version) VALUES ('$v')"
+  echo "migrate: đã áp $v"
+done
+EOF
+cat > store.go <<'EOF'
+package main
+
+import (
+	"database/sql"
+	"os"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+// db là nil khi không có DATABASE_URL: service trả giá mặc định như trước.
+var db = openDB()
+
+func openDB() *sql.DB {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		return nil
+	}
+	d, err := sql.Open("pgx", url) // chưa kết nối; lỗi lộ ra ở truy vấn đầu tiên
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+
+// listPrice đọc giá niêm yết của sản phẩm mẫu.
+func listPrice() (int, error) {
+	if db == nil {
+		return 1250499, nil
+	}
+	var p int
+	err := db.QueryRow("SELECT price FROM products WHERE sku = 'A1'").Scan(&p)
+	return p, err
+}
+EOF
+perl -0pi -e 's|(\t\thost, _ := os.Hostname\(\)\n)|\t\tp, err := listPrice()\n\t\tif err != nil {\n\t\t\tw.WriteHeader(http.StatusInternalServerError)\n\t\t\tjson.NewEncoder(w).Encode(map[string]string{"error": err.Error(), "version": version})\n\t\t\treturn\n\t\t}\n$1|; s|Round\(1250499\)|Round(p)|' main.go
+git diff main.go | grep '^[+-][^+-]'
+docker run --rm -v "$PWD":/src -w /src golang:1.27.2-alpine \
+  sh -c 'go get github.com/jackc/pgx/v5@v5.11.0 2>/dev/null; go mod tidy 2>/dev/null; go vet ./... && go test ./... | tail -1'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
++		p, err := listPrice()
++		if err != nil {
++			w.WriteHeader(http.StatusInternalServerError)
++			json.NewEncoder(w).Encode(map[string]string{"error": err.Error(), "version": version})
++			return
++		}
+-			"price": Format(Round(1250499)), "version": version,
++			"price": Format(Round(p)), "version": version,
+ok  	example.com/price-api	0.004s
+```
+
+</Expected>
+
+`migrate.sh` làm đúng phần lõi của mọi công cụ migration: một bảng `schema_history` ghi file nào đã áp; mỗi file chạy trong **một transaction** cùng dòng ghi lịch sử, nên hoặc cả hai xong hoặc không gì cả; `lock_timeout` 3 giây để không đứng chờ khoá; chạy lại bao nhiêu lần cũng chỉ áp phần còn thiếu. Nó thiếu hai thứ Flyway có: kiểm checksum của file đã áp, và khoá để hai lần chạy không chồng nhau.
+
+Giờ nối vào triển khai. `deploy.sh` chạy migration bằng `migrator` rồi mới đổi container, và đưa cho ứng dụng chuỗi kết nối của `app`. Pipeline thêm job `compat`, giải thích ở bước 3.
+
+<Terminal where="mac" title="deploy.sh, hai workflow, db/compat.sh">
+
+```bash
+perl -0pi -e 's|(docker rm -f "d6-\$ENV")|DB="\@d6-db:5432/price_\$ENV"\nsh "\$(dirname "\$0")/../db/migrate.sh" "postgres://migrator:\${MIGRATOR_PASSWORD:?}\$DB"\n\n$1|; s|(  --env-file )|  -e DATABASE_URL="postgres://app:\${APP_PASSWORD:?}\$DB" \\\n$1|' deploy/deploy.sh
+git diff deploy/deploy.sh | grep '^+[^+]'
+for f in ci deploy; do cat >> .gitea/workflows/$f.yaml <<'EOF'
+        env:
+          MIGRATOR_PASSWORD: ${{ secrets.MIGRATOR_PASSWORD }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+EOF
+done
+cat >> .gitea/workflows/ci.yaml <<'EOF'
+
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Bản đang chạy ở prod có chịu được schema mới không
+        run: sh db/compat.sh
+EOF
+cat > db/compat.sh <<'EOF'
+#!/bin/sh
+# compat.sh: áp mọi migration của nhánh này lên một database trắng,
+# rồi chạy đúng image đang ở prod trên schema đó và gọi thử.
+set -eu
+PROD=$(docker inspect d6-prod --format '{{index .Config.Labels "digest"}}' 2>/dev/null || true)
+[ -n "$PROD" ] || { echo "compat: prod chưa chạy gì, bỏ qua"; exit 0; }
+
+N=d6-compat-$GITHUB_RUN_ID
+URL=postgres://postgres:compat@$N-db:5432/postgres
+trap 'docker rm -f $N-db $N-app >/dev/null 2>&1' EXIT
+docker run -q -d --name $N-db --network d6-net -e POSTGRES_PASSWORD=compat postgres:18-alpine >/dev/null
+until psql "$URL" -c 'SELECT 1' >/dev/null 2>&1; do sleep 0.5; done
+sh "$(dirname "$0")/migrate.sh" "$URL"
+
+docker run -q -d --name $N-app --network d6-net -e DATABASE_URL="$URL" "localhost:9501/price-api@$PROD" >/dev/null
+sleep 1
+CODE=$(curl -s -o /tmp/compat.json -w '%{http_code}' "http://$N-app:8080/price")
+if [ "$CODE" = 200 ]; then
+  echo "compat: bản prod $(jq -r .version /tmp/compat.json) chạy được trên schema mới"
+else
+  echo "LỖI: bản prod trả $CODE trên schema mới: $(jq -r .error /tmp/compat.json)"; exit 1
+fi
+EOF
+git add -A && git commit -q -m "Đọc giá từ PostgreSQL; migration chạy trong pipeline"
+ship "Đọc giá từ PostgreSQL; migration chạy trong pipeline"
+job_log deploy-dev | grep -E '^(migrate|dev)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
++DB="@d6-db:5432/price_$ENV"
++sh "$(dirname "$0")/../db/migrate.sh" "postgres://migrator:${MIGRATOR_PASSWORD:?}$DB"
++  -e DATABASE_URL="postgres://app:${APP_PASSWORD:?}$DB" \
+PR #8: Đọc giá từ PostgreSQL; migration chạy trong pipeline
+run 27  test: success
+run 27  image: skipped
+run 27  deploy-dev: skipped
+run 27  compat: success
+merge: HTTP 200
+run 28  test: success
+run 28  image: success
+run 28  deploy-dev: success
+run 28  compat: success
+migrate: đã áp V1__products
+dev: phiên bản f2d84b61371e, sha256:78dfb532eef9
+```
+
+</Expected>
+
+Trong workflow, `${{ secrets.MIGRATOR_PASSWORD }}` chỉ được đưa vào **đúng step** cần nó, dưới dạng biến môi trường. `${MIGRATOR_PASSWORD:?}` trong script làm job dừng ngay nếu biến rỗng, thay vì chạy tiếp với mật khẩu trống.
+
+Phát hành bản này thành `1.2.0`, thăng cấp lên prod, rồi thử ranh giới giữa hai role:
+
+<Callout kind="danger">
+
+Dòng cuối của khối dưới chạy `DROP TABLE products` trên database của prod, bằng tài khoản `app`. Nó được kỳ vọng **thất bại**, vì `app` không sở hữu bảng. Nếu ở bước 1 bạn lỡ tạo database với chủ là `app`, lệnh này sẽ xoá bảng thật. Chỉ chạy trên database của lab.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+git tag v1.2.0 && an_git push -q origin v1.2.0 2>&1 | grep -v '^remote:'; wait_run
+deploy staging 1.2.0
+deploy prod 1.2.0
+sql() { docker exec d6-db psql -U postgres -d price_prod -Atc "$1"; }
+sql "UPDATE products SET price = 1990000 WHERE sku = 'A1'"
+curl -s localhost:9512/price
+docker run --rm --network d6-net -e PGPASSWORD=$APP_PASSWORD postgres:18-alpine \
+  psql -h d6-db -U app -d price_prod -c 'DROP TABLE products'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+run 29  release: success
+run 30  deploy: success
+migrate: đã áp V1__products
+staging: phiên bản f2d84b61371e, sha256:78dfb532eef9
+run 31  deploy: success
+migrate: đã áp V1__products
+prod: phiên bản f2d84b61371e, sha256:78dfb532eef9
+UPDATE 1
+{"env":"prod","host":"dab5fc33b8ea","price":"1.990.000 đ","version":"f2d84b61371e"}
+ERROR:  must be owner of table products
+```
+
+</Expected>
+
+Mỗi môi trường tự áp `V1` vào database của nó khi bản 1.2.0 tới nơi: migration đi cùng artifact. Giá ở prod đến từ database (vừa đổi thành 1.990.000). Và tài khoản `app`, thứ nằm trong biến môi trường của container đang phục vụ Internet, không bỏ được bảng. Lệnh cuối chạy `psql` từ một container khác trên `d6-net`, nên nó đăng nhập qua mạng bằng mật khẩu của `app` như ứng dụng thật (kết nối từ `127.0.0.1` bên trong container database thì image PostgreSQL không hỏi mật khẩu).
+
+<Check id="d7.4.lab-migrate">Đưa được migration thành một bước trước khi đổi bản trong script triển khai, với role riêng cho migration và cho ứng dụng, mật khẩu đi qua secret của CI, và mỗi môi trường tự áp migration khi artifact tới.</Check>
+
+### 3. Migration phá vỡ, và cổng chặn nó
+
+Đội muốn đổi tên cột `price` thành `list_price` để chuẩn bị cho giá sau giảm. Cách đầu tiên ai cũng nghĩ tới: đổi tên cột, đổi câu truy vấn, một pull request.
+
+Trước đó, biến job `compat` thành status check bắt buộc như job `test`:
+
+<Terminal where="mac">
+
+```bash
+api_an -X PATCH "$R/branch_protections/main" \
+  -d '{"status_check_contexts": ["ci / test (pull_request)", "ci / compat (pull_request)"]}' | jq -c .status_check_contexts
+git switch -q -c feature/list-price
+echo 'ALTER TABLE products RENAME COLUMN price TO list_price;' > db/migration/V2__rename_price.sql
+perl -pi -e 's/SELECT price FROM/SELECT list_price FROM/' store.go
+git add -A && git commit -q -m "Đổi tên cột price thành list_price"
+an_git push -q -u origin feature/list-price 2>&1 | grep -v '^remote:'
+PR=$(api_an -X POST "$R/pulls" -d '{"title":"Đổi tên cột price thành list_price","head":"feature/list-price","base":"main"}' | jq .number)
+wait_run
+job_log compat | grep -E '^(migrate|compat|LỖI)'
+api_binh -X POST -d '{"event":"APPROVED"}' "$R/pulls/$PR/reviews" >/dev/null
+api_an -w '  HTTP %{http_code}\n' -X POST -d '{"Do":"squash"}' "$R/pulls/$PR/merge"
+```
+
+</Terminal>
+
+<Predict question="Code mới đọc list_price, migration mới tạo list_price. Job test xanh. Job compat chạy image đang ở prod (1.2.0) trên schema sau migration. Nó trả gì?">
+
+```text
+["ci / test (pull_request)","ci / compat (pull_request)"]
+run 32  test: success
+run 32  image: skipped
+run 32  deploy-dev: skipped
+run 32  compat: failure
+migrate: đã áp V1__products
+migrate: đã áp V2__rename_price
+LỖI: bản prod trả 500 trên schema mới: ERROR: column "price" does not exist (SQLSTATE 42703)
+{"message":"Not all required status checks successful","url":"http://d6-gitea:3000/api/swagger"}  HTTP 405
+```
+
+Đỏ, và pull request không merge được dù đã có approval. Nhánh này tự nó nhất quán: code mới với schema mới chạy tốt, nên mọi test của nhánh đều xanh. Lỗi nằm ở tổ hợp mà nhánh không chứa: **code cũ với schema mới**. Tổ hợp đó tồn tại thật ở production trong khoảng giữa bước migrate và bước đổi bản (và lâu hơn nhiều nếu phải lui, hoặc đang rolling, canary). `compat.sh` dựng đúng tổ hợp đó: database trắng, mọi migration của nhánh, rồi **image đang chạy ở prod** lấy theo digest.
+
+</Predict>
+
+<Check id="d7.4.lab-compat-gate">Tái hiện được một migration đổi tên cột qua hết test của nhánh nhưng bị cổng tương thích chặn, và giải thích được cổng đó kiểm tổ hợp nào mà test thường không kiểm.</Check>
+
+### 4. Expand, thăng cấp, rồi lui ứng dụng mà không lui schema
+
+Sửa ngay trên nhánh đó theo bước expand của SB5.5: thêm cột mới, chép dữ liệu, một trigger giữ hai cột khớp nhau. Code mới đọc `list_price`; code cũ vẫn thấy `price`.
+
+<Terminal where="mac" title="db/migration/V2__list_price_expand.sql">
+
+```bash
+git rm -q db/migration/V2__rename_price.sql
+cat > db/migration/V2__list_price_expand.sql <<'EOF'
+-- Expand: thêm cột mới, chép dữ liệu, giữ hai cột khớp nhau cho tới khi không còn bản nào đọc cột cũ.
+ALTER TABLE products ADD COLUMN list_price integer;
+UPDATE products SET list_price = price;
+
+CREATE FUNCTION products_sync_price() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.list_price := COALESCE(NEW.list_price, NEW.price);
+    NEW.price := COALESCE(NEW.price, NEW.list_price);
+  ELSIF NEW.list_price IS DISTINCT FROM OLD.list_price THEN
+    NEW.price := NEW.list_price;
+  ELSE
+    NEW.list_price := NEW.price;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER products_sync_price BEFORE INSERT OR UPDATE ON products
+  FOR EACH ROW EXECUTE FUNCTION products_sync_price();
+EOF
+git add -A && git commit -q -m "Expand: thêm list_price, giữ price"
+an_git push -q 2>&1 | grep -v '^remote:'
+wait_run
+job_log compat | grep -E '^(compat|LỖI)'
+api_binh -X POST -d '{"event":"APPROVED"}' "$R/pulls/$PR/reviews" >/dev/null
+api_an -o /dev/null -w "merge: HTTP %{http_code}\n" -X POST \
+  -d '{"Do":"squash","delete_branch_after_merge":true}' "$R/pulls/$PR/merge"
+git switch -q main && an_git pull -q --ff-only --prune && wait_run
+NEXT=$(git rev-parse --short=12 HEAD)
+deploy staging $NEXT
+deploy prod $NEXT
+curl -s localhost:9512/price
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+run 33  test: success
+run 33  image: skipped
+run 33  deploy-dev: skipped
+run 33  compat: success
+compat: bản prod f2d84b61371e chạy được trên schema mới
+merge: HTTP 200
+run 34  test: success
+run 34  image: success
+run 34  deploy-dev: success
+run 34  compat: success
+run 35  deploy: success
+migrate: đã áp V2__list_price_expand
+staging: phiên bản a79358d2097c, sha256:82ca51d4860a
+run 36  deploy: success
+migrate: đã áp V2__list_price_expand
+prod: phiên bản a79358d2097c, sha256:82ca51d4860a
+{"env":"prod","host":"fb04322e23fd","price":"1.990.000 đ","version":"a79358d2097c"}
+```
+
+</Expected>
+
+Bản mới đang ở prod, đọc cột mới. Giờ giả sử bản mới có lỗi ở chỗ khác và phải lui về `1.2.0`. Schema đã ở V2 và **ở lại V2**:
+
+<Terminal where="mac">
+
+```bash
+deploy staging 1.2.0 | tail -1
+deploy prod 1.2.0 | tail -1
+curl -s localhost:9512/price
+sql "UPDATE products SET price = 2100000 WHERE sku = 'A1'; SELECT price, list_price FROM products"
+sql "SELECT version FROM schema_history ORDER BY 1"
+deploy staging $NEXT | tail -1
+deploy prod $NEXT | tail -1
+curl -s localhost:9512/price
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+staging: phiên bản f2d84b61371e, sha256:78dfb532eef9
+prod: phiên bản f2d84b61371e, sha256:78dfb532eef9
+{"env":"prod","host":"d635cb3f405d","price":"1.990.000 đ","version":"f2d84b61371e"}
+UPDATE 1
+2100000|2100000
+V1__products
+V2__list_price_expand
+staging: phiên bản a79358d2097c, sha256:82ca51d4860a
+prod: phiên bản a79358d2097c, sha256:82ca51d4860a
+{"env":"prod","host":"4c81c25b4643","price":"2.100.000 đ","version":"a79358d2097c"}
+```
+
+</Expected>
+
+Bản cũ chạy bình thường trên schema mới: đó chính là điều job `compat` đã chứng minh trước khi merge. Trong lúc bản cũ chạy, một lần ghi vào cột cũ (`price = 2100000`) được trigger chép sang cột mới, nên khi tiến lại bản mới, nó thấy đúng giá vừa đổi. Lịch sử schema không lùi bước nào; lần `deploy` lui không áp migration nào vì không có gì để áp.
+
+Bước contract (bỏ cột `price` và trigger) thuộc về một bản phát hành sau, khi không còn bản nào đọc cột cũ, kể cả bản bạn có thể phải lui về. Lúc đó job `compat` vẫn làm việc của nó: nếu prod còn chạy bản đọc `price`, pull request bỏ cột sẽ đỏ.
+
+<Check id="d7.4.lab-rollback-app">Phát hành được một thay đổi schema theo expand, chứng minh được bản ứng dụng cũ vẫn chạy khi lui về trên schema mới, và giải thích được khi nào mới được làm bước contract.</Check>
+
+### 5. Feature flag: triển khai tắt, bật dần, tắt khẩn cấp
+
+Tính năng mới: giảm giá 10%. Nó được merge và triển khai lên prod trong trạng thái **tắt**, sau cờ `discount` lưu trong bảng `flags`.
+
+<Terminal where="mac" title="flags.go và V3__flags.sql">
+
+```bash
+git switch -q -c feature/discount
+cat > db/migration/V3__flags.sql <<'EOF'
+CREATE TABLE flags (
+  name    text PRIMARY KEY,
+  enabled boolean NOT NULL DEFAULT false,
+  percent integer NOT NULL DEFAULT 0 CHECK (percent BETWEEN 0 AND 100)
+);
+INSERT INTO flags (name) VALUES ('discount');
+EOF
+cat > flags.go <<'EOF'
+package main
+
+import (
+	"hash/fnv"
+	"sync"
+	"time"
+)
+
+type flag struct {
+	enabled bool
+	percent int
+}
+
+var (
+	flagMu    sync.Mutex
+	flagCache map[string]flag
+	flagAt    time.Time
+)
+
+// flagOn cho biết cờ name có bật cho user này không.
+// Đọc bảng flags và cache 1 giây. Không có database, chưa có bảng, không có cờ: coi như tắt.
+// Truy vấn lỗi giữa chừng: giữ giá trị đã biết.
+func flagOn(name, user string) bool {
+	flagMu.Lock()
+	defer flagMu.Unlock()
+	if db != nil && time.Since(flagAt) > time.Second {
+		flagAt = time.Now()
+		if rows, err := db.Query("SELECT name, enabled, percent FROM flags"); err == nil {
+			fresh := map[string]flag{}
+			for rows.Next() {
+				var n string
+				var f flag
+				rows.Scan(&n, &f.enabled, &f.percent)
+				fresh[n] = f
+			}
+			rows.Close()
+			flagCache = fresh
+		}
+	}
+	f := flagCache[name]
+	if !f.enabled {
+		return false
+	}
+	h := fnv.New32a()
+	h.Write([]byte(name + ":" + user))
+	return int(h.Sum32()%100) < f.percent
+}
+EOF
+perl -0pi -e 's|(\t\thost, _ := os.Hostname\(\)\n)|\t\tif flagOn("discount", r.URL.Query().Get("user")) {\n\t\t\tp = p * 90 / 100 // giảm 10%\n\t\t}\n$1|' main.go
+git add -A && git commit -q -m "Giảm giá 10% sau cờ discount (đang tắt)"
+ship "Giảm giá 10% sau cờ discount (đang tắt)" | tail -4
+NEXT=$(git rev-parse --short=12 HEAD)
+deploy staging $NEXT | tail -1
+deploy prod $NEXT | tail -1
+discounted() { for u in $(seq 1 200); do curl -s "localhost:9512/price?user=$u"; done | grep -c '1.890.000' || true; }
+echo "được giảm giá: $(discounted)/200"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+run 42  test: success
+run 42  image: success
+run 42  deploy-dev: success
+run 42  compat: success
+staging: phiên bản a87f7e14ab2d, sha256:226c91e87331
+prod: phiên bản a87f7e14ab2d, sha256:226c91e87331
+được giảm giá: 0/200
+```
+
+</Expected>
+
+Code giảm giá đang chạy ở production, và 200 người dùng thử không ai thấy nó: **đã triển khai, chưa phát hành**. Việc phát hành giờ là một câu `UPDATE`, không cần pipeline:
+
+<Terminal where="mac">
+
+```bash
+first12() { for u in $(seq 1 12); do curl -s "localhost:9512/price?user=$u" | jq -r .price | cut -c1-5 | tr '\n' ' '; done; echo; }
+sql "UPDATE flags SET enabled = true, percent = 10 WHERE name = 'discount'"; sleep 1.2
+echo "10%: $(discounted)/200"; first12
+sql "UPDATE flags SET percent = 50 WHERE name = 'discount'"; sleep 1.2
+echo "50%: $(discounted)/200"; first12
+t0=$(date +%s)
+sql "UPDATE flags SET enabled = false WHERE name = 'discount'"
+until [ "$(curl -s 'localhost:9512/price?user=2' | jq -r .price)" = "2.100.000 đ" ]; do sleep 0.1; done
+echo "tắt mất $(( $(date +%s) - t0 )) giây; được giảm giá: $(discounted)/200"
+```
+
+</Terminal>
+
+<Predict question="Ở 10%, người dùng số 2 và số 10 được giảm giá. Tăng lên 50% thì hai người đó còn được giảm không? Tắt cờ mất bao lâu so với một lần lui bằng pipeline?">
+
+```text
+UPDATE 1
+10%: 22/200
+2.100 1.890 2.100 2.100 2.100 2.100 2.100 2.100 2.100 1.890 2.100 2.100 
+UPDATE 1
+50%: 98/200
+2.100 1.890 1.890 2.100 1.890 1.890 1.890 1.890 1.890 1.890 2.100 2.100 
+UPDATE 1
+tắt mất 1 giây; được giảm giá: 0/200
+```
+
+Còn. Phần trăm được tính bằng cách băm `"discount:<mã người dùng>"` ra một số từ 0 tới 99 rồi so với ngưỡng. Số băm của một người không đổi, nên nâng ngưỡng từ 10 lên 50 chỉ thêm người mới, và mỗi người luôn thấy cùng một giá khi tải lại trang. Với 200 người, 10% ra 22 và 50% ra 98: gần đúng tỉ lệ, không chính xác tuyệt đối, vì băm chỉ đều khi mẫu lớn.
+
+Tắt mất chừng một giây (lệnh in 0 hoặc 1): thời gian cache của `flagOn`. Một lần lui bằng pipeline ở bước 4 là hai lượt chạy workflow, mỗi lượt khoảng 10 giây, và cần Gitea, runner, registry đều sống. Kill switch chỉ cần database, thứ mà nếu chết thì service cũng đã chết.
+
+</Predict>
+
+`sleep 1.2` chờ cache hết hạn trước khi đếm. Ba thứ trong `flagOn` đáng chép sang hệ thống thật: mặc định **tắt** khi không biết; lỗi đọc kho cờ thì giữ giá trị cũ thay vì đổi hành vi; và không request nào phải chờ kho cờ quá một lần mỗi giây.
+
+<Check id="d7.4.lab-flag">Triển khai được một tính năng ở trạng thái tắt, bật dần theo phần trăm người dùng mà mỗi người thấy kết quả ổn định, và tắt được trong khoảng một giây không qua pipeline.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Job báo `MIGRATOR_PASSWORD: parameter not set`:** secret chưa được tạo, hoặc step thiếu khối `env:`. Kiểm `api_an "$R/actions/secrets" | jq '.[].name'` và phần cuối của file workflow.
+- **`ERROR: role "migrator" already exists` ở bước 1, rồi `password authentication failed` trong job:** volume `d6-db-data` còn từ lần làm trước, hoặc bạn đã tạo lại `db.env` sau khi tạo role, nên cả hai mật khẩu trong secret đều lệch với database. Gọn nhất là xoá database bằng khối "Xoá database của lab" ở cuối bài rồi làm lại bước 1. Muốn giữ dữ liệu thì đặt lại **cả hai** role theo `db.env`: `. ~/masteva-d7/db.env; docker exec d6-db psql -U postgres -c "ALTER ROLE migrator PASSWORD '$MIGRATOR_PASSWORD'" -c "ALTER ROLE app PASSWORD '$APP_PASSWORD'"`. Chỉ sửa `migrator` thì bước migrate qua nhưng ứng dụng vẫn không đăng nhập được.
+- **Job đứng ở trạng thái chờ sau khi đổi sang `d6-ci:2`:** runner chưa khởi động lại, hoặc image chưa build. `docker image ls d6-ci` phải có tag `2`.
+- **`compat` báo `psql: command not found`:** runner vẫn dùng `d6-ci:1`. Xem `cat ~/masteva-d7/runner-config.yaml`.
+- **`compat` đỏ với `connection refused` thay vì lỗi cột:** PostgreSQL tạm chưa kịp khởi động trên máy chậm. Tăng `sleep 1` trước lệnh `curl` trong `compat.sh`.
+- **Sửa một file migration đã áp rồi không thấy gì đổi:** `migrate.sh` chỉ nhìn tên file. Đó là lý do quy tắc là viết file mới; Flyway sẽ báo lỗi checksum trong trường hợp này.
+- **Đếm `discounted` ra 0 ngay sau khi bật cờ:** cache một giây chưa hết hạn, hoặc bạn bật cờ ở database khác (`sql` trỏ vào `price_prod`).
+
+</Callout>
+
+### Dọn dẹp
+
+D7.1 dùng tiếp toàn bộ stack, kể cả database. Không có gì cần dọn ở bài này. Khi xoá hẳn lab bằng khối cuối D6.1, khối đó xoá mọi container `d6-…`; chạy thêm lệnh dưới để xoá dữ liệu của PostgreSQL và image `d6-ci:2`.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá container `d6-db` cùng volume `d6-db-data` (cả ba database của lab) và image `d6-ci:2`. Không khôi phục được. Đừng chạy nếu bạn còn học D6.5 hoặc D7.1.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá database của lab">
+
+```bash
+docker rm -f d6-db && docker volume rm d6-db-data && docker rmi d6-ci:2
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Job compat chỉ gọi một endpoint. Như vậy đã đủ tin chưa?">
+
+Chưa đủ cho hệ thống thật, nhưng ý tưởng mở rộng được thẳng. Thay một lệnh `curl` bằng bộ **test tích hợp của bản đang ở prod**: lấy image test (hoặc checkout đúng tag đang chạy), chạy nó với database đã áp migration của nhánh. Mọi truy vấn mà bản cũ thực hiện trong test đều được thử trên schema mới. Hai giới hạn cần biết. Một: nó chỉ bắt lỗi **tương thích**, không bắt lỗi **vận hành**; `ALTER TABLE` viết lại bảng 200 triệu dòng dưới khoá `ACCESS EXCLUSIVE` chạy ngon trên database trắng. Loại đó cần chạy thử trên bản sao dữ liệu cỡ thật và công cụ soát migration (lint) trong CI. Hai: nó so với **một** phiên bản. Nếu prod đang canary hai bản, hoặc có client di động không cập nhật, phải thử với mọi bản còn sống.
+
+</Reveal>
+
+<Reveal title="Migration chạy trong pipeline rồi, vậy ai chạy migration dài như tạo index trên bảng lớn?">
+
+Không phải job triển khai. Một lệnh chạy 40 phút không nên giữ một lượt deploy mở 40 phút, và `CREATE INDEX CONCURRENTLY` không chạy được trong transaction mà đa số công cụ bọc quanh mỗi file (SB5.5 đã gặp với Flyway). Cách tổ chức thường thấy: tách migration thành hai loại ngay từ quy ước. Loại **nhanh** (thêm cột nullable, tạo bảng) đi cùng pipeline như lab. Loại **dài** (backfill, index, đổi kiểu) là một thay đổi riêng, chạy bằng job riêng có theo dõi tiến độ và có thể tạm dừng, xong trước khi bản code cần nó được phát hành. Với MySQL, các công cụ như gh-ost làm việc này bằng bảng bóng; chính bước đổi tên bảng cuối cùng của kiểu công cụ đó là chỗ GitHub vấp năm 2021.
+
+</Reveal>
+
+<Reveal title="Cờ nằm trong database của chính service. Khi nào thì nên chuyển sang một dịch vụ cờ?">
+
+Khi một trong những điều sau xuất hiện. Nhiều service cùng cần một cờ (bật tính năng đi qua ba service): bảng riêng từng service sẽ lệch nhau. Người không có quyền vào database cần bật tắt (sản phẩm, hỗ trợ khách hàng): cần giao diện, phân quyền, nhật ký ai đổi gì. Luật phức tạp hơn phần trăm: theo quốc gia, gói dịch vụ, danh sách khách hàng thử nghiệm. Hoặc cần thí nghiệm có đo lường. Khi chuyển, viết code qua API của OpenFeature để kho cờ là thứ thay được, giữ nguyên ba nguyên tắc của `flagOn` (mặc định an toàn, cache, lỗi thì giữ giá trị cũ), và nhớ rằng dịch vụ cờ giờ nằm trên đường sống của mọi request: nó cần độ sẵn sàng cao hơn mọi service dùng nó.
+
+</Reveal>
+
+<Reveal title="Cờ discount bật 100% được một tháng. Còn việc gì phải làm?">
+
+Xoá nó. Cờ release là giàn giáo: xong nhà mà không dỡ thì thành nợ. Mỗi cờ còn đó là một nhánh `if` mà người đọc code phải hiểu, một tổ hợp mà test phải phủ, và một công tắc mà ai đó có thể gạt nhầm. Quy trình gọn: khi tạo cờ release, tạo luôn việc xoá cờ có hạn; sau khi bật 100% và qua một chu kỳ ổn định, mở pull request bỏ nhánh `else` và lời gọi `flagOn`, rồi một migration xoá dòng cờ. Cờ ops và permission thì ở lại lâu dài, nên cần tên rõ, tài liệu và chủ sở hữu. Đừng dùng lại tên cờ cũ cho việc mới: một bản code cũ còn sót đâu đó sẽ hiểu cờ theo nghĩa cũ.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết migration expand/contract cho một thay đổi cụ thể, viết trigger đồng bộ hai cột, hay soát một file migration tìm lệnh khoá bảng là cách dùng tốt. AI hay sai ở chỗ: gộp đổi schema phá vỡ và đổi code vào một bước rồi nói "triển khai cùng lúc"; đề xuất "down migration" như đường lui mặc định; cho ứng dụng dùng chung tài khoản với migration; viết cờ đọc từ biến môi trường rồi gọi nó là kill switch; chia phần trăm bằng số ngẫu nhiên mỗi request (người dùng thấy giá nhảy qua lại) thay vì băm mã người dùng. Kiểm lại bằng chính các phép thử của lab: chạy bản đang ở prod trên schema mới, lui ứng dụng rồi đọc lại dữ liệu, và gọi cùng một người dùng nhiều lần khi cờ ở 10%.
+
+</Callout>
+
+<Callout kind="link">
+
+SB5.5 dạy expand/contract với Flyway trên một ứng dụng Spring Boot, kể cả tạo index không khoá bảng. D6.3 cho thấy vì sao hai bản phải sống chung. D6.5 bàn tiếp về secret đã dùng ở bước 1. D7.1 đếm các lượt triển khai và lượt lui của bài này thành chỉ số. D13 coi việc đổi cờ và đổi cấu hình là thay đổi cần phát hành từng nấc; K1.4 chạy migration bằng Job.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d7.4.mastery-migration">Thiết kế được chỗ chạy migration trong pipeline của một service: bước nào, bằng tài khoản nào, cổng nào chặn migration không tương thích, và việc gì phải tách khỏi lượt triển khai.</Check>
+
+<Check id="d7.4.mastery-rollback">Lập được kế hoạch phát hành cho một thay đổi schema sao cho lui ứng dụng lúc nào cũng an toàn, và chứng minh được bằng cách chạy bản cũ trên schema mới.</Check>
+
+<Check id="d7.4.mastery-flag">Đưa được một tính năng ra production sau cờ: mặc định tắt, bật dần theo người dùng, có công tắc tắt không phụ thuộc pipeline, và có kế hoạch xoá cờ.</Check>
+
+</Mastery>

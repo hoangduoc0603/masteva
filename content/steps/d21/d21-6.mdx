@@ -1,0 +1,609 @@
+---
+title: "Envoy: proxy nhận cấu hình qua API"
+description: Chạy Envoy với toàn bộ cấu hình nạp qua xDS dạng file, rồi đổi danh sách backend, route và thiết lập của cluster lúc đang chạy mà PID không đổi; xem Envoy từ chối một bản cấu hình hỏng, loại backend trả lỗi bằng outlier detection, hỏi thăm chủ động bằng health check, và vẫn phục vụ khi mọi backend trượt check.
+id: d21.6
+step: d21
+prerequisites: [d21.2]
+topics: [d21.envoy]
+status: verified
+verified:
+  date: 2026-10-11
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    envoy: 1.39.3
+    python: 3.14.4
+    curl: 8.18.0
+---
+
+<Goal>
+
+Đây là bài tuỳ chọn và là bài chốt chặng D9. Nginx và HAProxy đọc file rồi reload; Envoy được thiết kế để một chương trình khác điều khiển nó qua API. Bạn sẽ không viết cấu hình Envoy bằng tay ngoài đời, nhưng cần hiểu nó đủ để gỡ lỗi một gateway hay service mesh dựng trên nó. Học xong, bạn giải thích được:
+
+- Vì sao Envoy đổi được backend, route, thậm chí cả listener mà không sinh lại tiến trình, và xDS là gì.
+- Điều gì xảy ra khi control plane gửi cho Envoy một bản cấu hình hỏng.
+- Outlier detection khác health check chủ động ở đâu, và vì sao nên dùng cả hai.
+- Vì sao Envoy vẫn gửi traffic khi **mọi** backend trượt health check, trái hẳn HAProxy ở D9.2.
+- Khi nào chọn Nginx, khi nào HAProxy, khi nào Envoy.
+
+</Goal>
+
+<Knowledge>
+
+### Envoy và mô hình cấu hình
+
+**Envoy** là một proxy L4 và L7 do Lyft viết và mở mã nguồn tháng 9/2016. Nó vào CNCF tháng 9/2017 ([bài công bố của CNCF](https://www.cncf.io/blog/2017/09/13/cncf-hosts-envoy/) ghi cả hai mốc) và lên mức Graduated tháng 11/2018. Ở vai trò proxy, nó làm được phần lớn việc của Nginx và HAProxy; khác biệt nằm ở cách nhận cấu hình và ở lượng số liệu nó phơi ra.
+
+| | Nginx (bản mở) | HAProxy | Envoy |
+|---|---|---|---|
+| Cấu hình | File, đổi là reload (sinh worker mới) | File, kèm runtime API cho từng server | **API (xDS)**: mọi thứ đổi được lúc chạy, không reload |
+| Sinh ra cho | Web server, reverse proxy | Load balancer | Proxy giữa các service, do một chương trình khác điều khiển |
+| Số liệu, tracing | Ít, cần module | Nhiều | Rất chi tiết tới từng cluster, có sẵn tracing phân tán |
+| Mở rộng | Module C, Lua | Lua, SPOE | Filter (C++, Wasm, Lua), gọi dịch vụ ngoài để xác thực hay giới hạn tốc độ |
+| Người viết cấu hình | Người | Người | Thường là máy: YAML dài, không sinh ra để viết tay |
+
+Cấu hình Envoy là một cây bốn tầng. Tên các tầng xuất hiện ở mọi tài liệu, số liệu và thông báo lỗi của Envoy cũng như của Istio, Envoy Gateway:
+
+```text
+ listener        nhận kết nối ở một IP:port
+   └─ filter chain    chuỗi bộ lọc xử lý kết nối; với HTTP là bộ quản lý kết nối HTTP (HCM)
+        └─ route          bảng định tuyến: host và đường dẫn nào đi tới cluster nào
+             └─ cluster       một nhóm backend cùng vai trò: thuật toán, health check, outlier detection
+                  └─ endpoint     địa chỉ IP:port của từng backend
+```
+
+<Check id="d21.6.model">So sánh được cách Nginx, HAProxy và Envoy nhận thay đổi cấu hình, và kể được bốn tầng listener, route, cluster, endpoint của cấu hình Envoy.</Check>
+
+### xDS: cấu hình là dữ liệu chảy vào
+
+**xDS** là họ API để Envoy nhận từng tầng của cây trên từ bên ngoài. "x" là chỗ thay chữ:
+
+| API | Tài nguyên | Đổi khi nào trong một cụm Kubernetes |
+|---|---|---|
+| LDS | Listener | Thêm port, thêm chứng chỉ, đổi chuỗi filter |
+| RDS | Route | Ai đó sửa `HTTPRoute` |
+| CDS | Cluster | Thêm một Service, đổi chính sách cân bằng tải hay health check |
+| EDS | Endpoint | Pod được tạo, bị xoá, đổi trạng thái sẵn sàng: **liên tục** |
+| SDS | Chứng chỉ và khoá | Xoay chứng chỉ (D9.4) |
+
+Một tài nguyên có thể đến theo ba cách. **Tĩnh:** viết thẳng trong file khởi động (bootstrap). **Từ file:** Envoy theo dõi một file và nạp lại khi file được thay; không cần thêm phần mềm nào, lab dùng cách này. **Từ control plane qua gRPC:** Envoy mở một luồng tới control plane và nhận cập nhật đẩy xuống; đây là cách của mọi hệ thống thật.
+
+```text
+ Kubernetes API ──► control plane (Envoy Gateway, istiod) ──xDS qua gRPC──► Envoy ──► pod
+ (HTTPRoute, Service,   dịch tài nguyên của cụm                              áp cấu hình mới
+  EndpointSlice)        thành listener, route, cluster, endpoint             trong tiến trình đang chạy
+```
+
+Hai tính chất của xDS quyết định cách bạn gỡ lỗi:
+
+- **Envoy kiểm từng bản cập nhật trước khi áp.** Bản hỏng bị từ chối (NACK), Envoy giữ bản tốt gần nhất và tiếp tục phục vụ. Traffic không sao, nhưng thay đổi bạn vừa làm **không có hiệu lực**, và dấu vết ở phía Envoy là một bộ đếm `update_rejected` cùng một dòng log; control plane nhận được NACK, nhưng nó có báo lại cho bạn hay không thì tuỳ từng control plane. "Tôi đã apply mà không thấy gì đổi" trong một mesh thường là chuyện này.
+- **Các API độc lập nhau.** Route mới có thể tới trước cluster mà nó trỏ vào; trong khoảnh khắc đó request nhận `503`. Control plane tử tế gửi theo thứ tự (cluster và endpoint trước, route sau), hoặc dùng ADS để gom mọi thứ vào một luồng có thứ tự.
+
+<Callout kind="production">
+
+Slack kể việc chuyển tầng load balancer cho WebSocket từ HAProxy sang Envoy trong bài [Migrating Millions of Concurrent Websockets to Envoy](https://slack.engineering/migrating-millions-of-concurrent-websockets-to-envoy/) (03/2021). Theo bài viết, danh sách backend của họ đổi thường xuyên, và với tầng WebSocket họ sinh danh sách đó vào file cấu hình rồi reload HAProxy. Mỗi lần reload tạo một lứa tiến trình mới nhận kết nối mới, còn tiến trình cũ phải được giữ chạy nhiều giờ để các kết nối WebSocket sống lâu tự kết thúc, tránh ngắt người dùng. Họ phải định kỳ dọn tiến trình HAProxy cũ và giới hạn tần suất reload. Lý do chọn Envoy được nêu thẳng: cluster và endpoint cấu hình động nên danh sách backend đổi không cần reload. Đây đúng là hiện tượng bạn đã thấy ở bước 5 của D9.1 (worker cũ nằm lại vì một kết nối dài), nhân lên hàng triệu kết nối. Bài viết cũng kể họ không đổi một lần: các vùng đầu tiên được chuyển theo nấc 10%, 25%, 50%, 75%, 100%, mỗi vùng khoảng một tuần, và cả đợt kéo dài 6 tháng. Lưu ý bối cảnh: đó là lý do của năm 2021. D9.2 đã nói HAProxy nay thêm và xoá server lúc đang chạy được bằng `add server`, `del server` của runtime API, nên riêng chuyện "đổi danh sách backend phải reload" không còn đúng với HAProxy hiện tại.
+
+</Callout>
+
+<Check id="d21.6.xds">Kể được LDS, RDS, CDS, EDS, SDS mang tài nguyên gì; nói được ba cách một tài nguyên tới Envoy; và giải thích được Envoy làm gì với một bản cập nhật hỏng.</Check>
+
+### Health check, outlier detection và panic
+
+Envoy có cả hai kiểu phát hiện backend hỏng mà D2.5 và D9.2 đã bàn, dưới tên riêng:
+
+| | Health check chủ động | Outlier detection (thụ động) |
+|---|---|---|
+| Nguồn tin | Envoy tự gọi một đường dẫn theo chu kỳ | Kết quả của request thật |
+| Phát hiện | Backend chết hoặc tự báo không khoẻ, kể cả khi không có traffic | Backend trả `5xx` liên tiếp, quá hạn, chậm bất thường so với các bản khác |
+| Loại trong bao lâu | Tới khi check tốt lại đủ `healthy_threshold` lần liên tiếp | Một khoảng `base_ejection_time`, lần sau dài hơn, rồi **tự cho quay lại** |
+| Điểm yếu | Endpoint check có thể vẫn tốt trong khi request thật lỗi | Phải có người dùng ăn lỗi thì mới biết, và lại ăn lỗi mỗi lần backend được cho quay lại |
+
+Dùng cả hai là mặc định hợp lý: health check giữ backend chết ở ngoài vòng, outlier detection bắt loại lỗi mà endpoint check không thấy.
+
+Một điểm Envoy khác hẳn HAProxy: **panic threshold**. Khi tỉ lệ backend khoẻ của một cluster tụt dưới ngưỡng (mặc định 50%), Envoy cho rằng thông tin sức khoẻ không còn đáng tin và **chia traffic cho mọi backend, kể cả cái đang bị đánh dấu hỏng**. Lý lẽ giống load balancer của AWS trong callout ở D2.5: nếu hầu hết backend cùng trượt check, nhiều khả năng lỗi nằm ở check hoặc ở một phụ thuộc chung, và dồn toàn bộ traffic vào vài backend còn "khoẻ" sẽ hạ nốt chúng. HAProxy ở D9.2 thì trả `503` khi hết server. Không cách nào đúng tuyệt đối; bạn cần biết proxy của mình hành xử kiểu nào.
+
+<Check id="d21.6.health">Phân biệt được health check chủ động với outlier detection của Envoy, và giải thích được panic threshold cùng lý do Envoy vẫn gửi traffic khi quá nửa backend bị đánh dấu hỏng.</Check>
+
+### Chọn proxy nào
+
+Lý do service mesh và các bản cài Gateway API chọn Envoy đến từ hai mục trên. Trong một cụm Kubernetes, danh sách pod đổi liên tục; với Nginx, mỗi thay đổi là sinh lại file và reload, và D9.1 đã cho thấy cái giá khi có nhiều kết nối sống lâu. Envoy nhận một bản EDS và áp ngay. Cộng thêm số liệu đồng nhất cho mọi lời gọi và khả năng chèn filter, nó thành nền chung: K2.2 đã dùng kết quả của kiến trúc này khi bạn viết `HTTPRoute` và Envoy Gateway dịch sang xDS; service mesh ở K11 đặt một Envoy cạnh mỗi pod hoặc trên mỗi node.
+
+| Bạn cần | Chọn | Vì |
+|---|---|---|
+| Web server, file tĩnh, reverse proxy cho vài ứng dụng, cache HTTP | Nginx (hoặc Caddy khi muốn HTTPS tự động) | Cấu hình ngắn, người đọc được, review trong Git; D9.1, D9.5 |
+| Load balancer trước một nhóm máy, kể cả database hay API server của Kubernetes; cần hàng đợi, drain, số liệu tới từng server | HAProxy | Sinh ra cho việc này; D9.2, D9.3 |
+| Gateway của cụm Kubernetes, service mesh, hoặc bất kỳ nơi nào cấu hình do phần mềm sinh và đổi liên tục | Envoy, qua một control plane | Cấu hình động, số liệu chi tiết; K2.2, K11. Không phải bản cài Gateway API nào cũng dùng Envoy: K2.2 đã kể NGINX Gateway Fabric và Traefik |
+
+Envoy không thay hai cái kia. Nó không phục vụ file tĩnh, không có cache HTTP ở mức của Nginx, và thiếu control plane thì nó chỉ là một file YAML rất dài. Với một site có mười backend đổi mỗi tuần một lần, `reload` là đủ.
+
+<Check id="d21.6.choice">Giải thích được vì sao service mesh và Gateway API dùng Envoy, và nêu được một tình huống mà Nginx hoặc HAProxy vẫn là lựa chọn tốt hơn.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Envoy: What is Envoy](https://www.envoyproxy.io/docs/envoy/latest/intro/what_is_envoy): mục tiêu thiết kế và danh sách tính năng, đọc để biết Envoy tự định vị thế nào.
+- [Envoy: xDS configuration API overview](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/operations/dynamic_configuration): từ cấu hình tĩnh hoàn toàn tới động hoàn toàn, từng loại API.
+- [Envoy: Configuration: Dynamic from filesystem](https://www.envoyproxy.io/docs/envoy/latest/start/quick-start/configuration-dynamic-filesystem): dạng xDS qua file mà lab dùng, kèm lưu ý phải thay file bằng thao tác đổi tên.
+- [Envoy: Outlier detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier) và [Panic threshold](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/panic_threshold): các kiểu loại backend và cách tính thời gian loại; khi nào Envoy bỏ qua thông tin sức khoẻ.
+- [Slack: Migrating Millions of Concurrent Websockets to Envoy](https://slack.engineering/migrating-millions-of-concurrent-websockets-to-envoy/): lý do và cách một hệ thống lớn chuyển từ HAProxy sang Envoy; nguồn của callout trong bài.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM Lima (2 CPU, 2 GiB) có `~/masteva-d21/topo.sh`, `lab.sh` của D9.1 và `web/web.py`, `lb/hap.sh` của D9.2 (thiếu thì chạy phần Chuẩn bị của D9.1 tới hết khối `lab.sh`, và ba khối lệnh đầu phần Thực hành của D9.2). Bài không cần gì của D9.3 tới D9.5. Binary Envoy nặng khoảng 100 MB, khi chạy tốn khoảng 65 MB RAM; máy 8 GB không cần thu gọn.
+
+Envoy không có trong kho của Ubuntu. Dự án phát hành binary tĩnh trên GitHub; lab tải thẳng file đó. Binary tải ngoài kho không được `apt` kiểm chữ ký, mà nó sắp được chạy bằng `root`, nên khối lệnh đối chiếu SHA-256 với giá trị trong `checksums.txt.asc` của bản phát hành v1.39.3 trước khi cho chạy (D14 dạy kiểm cả chữ ký của file checksum đó):
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y curl
+sudo ~/masteva-d21/topo.sh up
+mkdir -p ~/masteva-d21/envoy && cd ~/masteva-d21/envoy
+. ~/masteva-d21/lab.sh; . ~/masteva-d21/lb/hap.sh
+web 1; web 2
+M=$(uname -m); [ "$M" = aarch64 ] && M=aarch_64
+[ -f envoy ] || curl -fsSL -o envoy "https://github.com/envoyproxy/envoy/releases/download/v1.39.3/envoy-1.39.3-linux-$M"
+case "$M" in
+  aarch_64) SUM=02ba9588283be771c9743cae6d013e45714cda2ca970be968a5a9f4db25ea446 ;;
+  x86_64)   SUM=f61653fb5f7645129d3092a82f21ce3e6f70d0a75fe2e861b0e7417790f2c200 ;;
+esac
+echo "$SUM  envoy" | sha256sum -c && chmod +x envoy
+./envoy --version | grep -o '/1\.[0-9.]*/'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+envoy: OK
+/1.39.3/
+```
+
+</Expected>
+
+Nếu dòng đầu là `envoy: FAILED`, file tải về hỏng hoặc không phải file dự án phát hành: xoá nó và tải lại, đừng chạy.
+
+```text
+ VM (client) ──► lb2 10.9.0.12  Envoy :80, trang quản trị :9901 ──┬─► web1 10.9.0.21:8080  web.py
+                 cấu hình: envoy.yaml (khởi động)                  └─► web2 10.9.0.22:8080  web.py
+                           lds.yaml, cds.yaml, eds.yaml (xDS qua file)
+```
+
+`web.py` của D9.2 trả tên backend ở `/`, và trả `503` ở `/healthz` khi có file `web/<tên>.down`; bài dùng file đó để làm một backend "hỏng".
+
+Các hàm của bài. Ba hàm `lds`, `cds`, `eds` đóng vai control plane: mỗi hàm sinh một file tài nguyên. Chúng ghi qua `put`, vốn ghi ra file tạm rồi **đổi tên** đè lên file thật: Envoy phản ứng với thao tác đổi tên, và đổi tên là nguyên tử nên Envoy không bao giờ đọc phải file viết dở.
+
+<Terminal where="vm" title="~/masteva-d21/envoy/envoy.sh">
+
+```bash
+cat > ~/masteva-d21/envoy/envoy.sh <<'EOS'
+# Hàm của lab D9.6. Nạp bằng: . ~/masteva-d21/lab.sh; . ~/masteva-d21/lb/hap.sh; . ~/masteva-d21/envoy/envoy.sh
+EV=$HOME/masteva-d21/envoy
+A=http://10.9.0.12:9901
+put() { cat > "$EV/$1.tmp" && mv "$EV/$1.tmp" "$EV/$1"; }
+
+lds() {   # lds [mã]: listener :80, route "/" tới cluster app; có tham số thì thêm route /admin trả thẳng <mã>
+  local admin=""
+  [ -n "${1:-}" ] && admin="
+            - match: { prefix: \"/admin\" }
+              direct_response: { status: $1, body: { inline_string: \"cam vao\\n\" } }"
+  put lds.yaml <<EOF
+resources:
+- "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+  name: http
+  address: { socket_address: { address: 10.9.0.12, port_value: 80 } }
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.http_connection_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+        stat_prefix: ingress
+        route_config:
+          virtual_hosts:
+          - name: all
+            domains: ["*"]
+            routes:$admin
+            - match: { prefix: "/" }
+              route: { cluster: app }
+        http_filters:
+        - name: envoy.filters.http.router
+          typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
+EOF
+}
+
+cds() {   # cds [đoạn YAML]...: cluster app lấy endpoint qua EDS; mỗi tham số là một đoạn thiết lập thêm
+  { cat <<EOF
+resources:
+- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+  name: app
+  type: EDS
+  lb_policy: ROUND_ROBIN
+  eds_cluster_config:
+    eds_config: { path_config_source: { path: $EV/eds.yaml } }
+EOF
+    printf '%s\n' "$@"; } | put cds.yaml
+}
+
+eds() {   # eds <ip>...: danh sách endpoint của cluster app
+  { echo 'resources:'
+    echo '- "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment'
+    echo '  cluster_name: app'
+    echo '  endpoints:'
+    echo '  - lb_endpoints:'
+    for ip in "$@"; do
+      echo "    - endpoint: { address: { socket_address: { address: $ip, port_value: 8080 } } }"
+    done; } | put eds.yaml
+}
+
+hit()   { for i in $(seq "${1:-4}"); do curl -s http://10.9.0.12/ | cut -d' ' -f1; done | sort | uniq -c; }
+codes() { for i in $(seq "$1"); do curl -s -o /dev/null -w '%{http_code}\n' "http://10.9.0.12$2"; done | sort | uniq -c; }
+hosts() { curl -s $A/clusters | grep -o 'app::[0-9.:]*::health_flags.*'; }
+xstat() { curl -s $A/stats | grep -E "$1"; }
+EOS
+. ~/masteva-d21/envoy/envoy.sh
+```
+
+</Terminal>
+
+`hit` gọi `/` vài lần và đếm theo backend trả lời; `codes` đếm theo mã trả về; `hosts` và `xstat` đọc trang quản trị của Envoy: trạng thái từng endpoint và các bộ đếm.
+
+### 1. Bootstrap rỗng, mọi thứ đến qua xDS
+
+File khởi động chỉ nói ba điều: Envoy này tên gì, trang quản trị ở đâu, và lấy listener, cluster từ file nào. Không có listener hay backend nào trong đó.
+
+<Terminal where="vm" title="~/masteva-d21/envoy/envoy.yaml">
+
+```bash
+cat > envoy.yaml <<EOF
+node: { id: lab-envoy, cluster: lab }
+admin:
+  address: { socket_address: { address: 10.9.0.12, port_value: 9901 } }
+dynamic_resources:
+  lds_config: { path_config_source: { path: $EV/lds.yaml } }
+  cds_config: { path_config_source: { path: $EV/cds.yaml } }
+EOF
+lds; cds; eds 10.9.0.21
+./envoy --mode validate -c envoy.yaml 2>&1 | tail -1
+sudo ip netns exec lb2 ./envoy -c envoy.yaml --concurrency 1 --log-level warn > envoy.log 2>&1 &
+sleep 3
+hit; hosts; pgrep -x envoy
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configuration 'envoy.yaml' OK
+      4 backend=web1
+app::10.9.0.21:8080::health_flags::healthy
+2434
+```
+
+</Expected>
+
+Envoy đọc `lds.yaml` để có listener ở port 80 và bảng route, `cds.yaml` để có cluster `app`, và cluster đó lại trỏ sang `eds.yaml` để có danh sách endpoint, lúc này chỉ có `web1`. Mở `envoy.sh` ra xem hàm `lds`: ngần ấy dòng YAML cho một việc Nginx làm trong năm dòng, vì cấu hình này sinh ra cho máy viết. Con số cuối là PID của Envoy; trên máy bạn nó khác, hãy nhớ nó. `--concurrency 1` cho Envoy chạy một luồng xử lý để kết quả của lab dễ đọc; mặc định nó tạo một luồng cho mỗi CPU, mỗi luồng tự xoay vòng backend riêng nên bốn request có thể chia 3 và 1.
+
+Giờ đóng vai control plane: thêm `web2` vào danh sách endpoint.
+
+<Terminal where="vm">
+
+```bash
+eds 10.9.0.21 10.9.0.22; sleep 1
+hit; hosts; pgrep -x envoy
+xstat 'cluster.app.(update_success|membership_change)|cds.update_success|lds.update_success'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+      2 backend=web1
+      2 backend=web2
+app::10.9.0.21:8080::health_flags::healthy
+app::10.9.0.22:8080::health_flags::healthy
+2434
+cluster.app.membership_change: 2
+cluster.app.update_success: 2
+cluster_manager.cds.update_success: 1
+listener_manager.lds.update_success: 1
+```
+
+</Expected>
+
+Traffic chia cho cả hai backend và **PID không đổi**: không reload, không tiến trình mới, không kết nối nào bị bỏ lại ở một thế hệ cũ. Bộ đếm ghi lại đúng chuyện vừa xảy ra: EDS của cluster `app` được nạp hai lần (lần đầu và lần cập nhật), còn CDS và LDS mỗi cái một lần. Thay file bằng một luồng gRPC, thay bạn bằng một chương trình theo dõi EndpointSlice, là có đúng thứ Envoy Gateway làm ở K2.2.
+
+<Check id="d21.6.lab-eds">Chạy được Envoy với listener, cluster và endpoint đều nạp qua xDS dạng file, đổi danh sách endpoint lúc đang chạy, và dùng PID cùng bộ đếm `update_success` chứng minh không có lần khởi động lại nào.</Check>
+
+### 2. Đổi route qua LDS, và một bản cấu hình hỏng
+
+Thêm một route: mọi đường dẫn bắt đầu bằng `/admin` bị Envoy trả thẳng `403`, không tới backend.
+
+<Terminal where="vm">
+
+```bash
+curl -s -o /dev/null -w 'truoc: %{http_code}\n' http://10.9.0.12/admin/users
+lds 403; sleep 1
+curl -s -w 'sau: %{http_code}\n' http://10.9.0.12/admin/users
+hit 2; pgrep -x envoy
+xstat 'lds.update_(success|rejected|failure)|listener_in_place_updated'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+truoc: 200
+cam vao
+sau: 403
+      1 backend=web1
+      1 backend=web2
+2434
+listener_manager.lds.update_failure: 0
+listener_manager.lds.update_rejected: 0
+listener_manager.lds.update_success: 2
+listener_manager.listener_in_place_updated: 1
+```
+
+</Expected>
+
+Bảng route nằm trong listener, nên đây là một bản cập nhật LDS. Envoy nhận ra chỉ chuỗi filter thay đổi và cập nhật listener tại chỗ (`listener_in_place_updated`), không đóng socket đang nghe. Trong hệ thống thật, route thường tách riêng thành RDS để đổi route không đụng tới listener.
+
+Giờ gửi hai bản cấu hình hỏng, theo hai kiểu: một bản sai kiểu dữ liệu (mã trả về là chữ), một bản đúng cú pháp nhưng sai giá trị (mã `9999`).
+
+<Terminal where="vm">
+
+```bash
+lds bon-tram; sleep 1
+xstat 'lds.update_(success|rejected|failure)'
+lds 9999; sleep 1
+xstat 'lds.update_(success|rejected|failure)'
+curl -s -o /dev/null -w '/admin: %{http_code}\n' http://10.9.0.12/admin/users; hit 2
+grep -o 'Filesystem config update [a-z]*' envoy.log
+lds 403; sleep 1; xstat 'lds.update_success'
+```
+
+</Terminal>
+
+<Predict question="Envoy đang chạy với cấu hình tốt thì nhận hai bản hỏng liên tiếp. Request tới /admin và tới / lúc này nhận gì?">
+
+```text
+listener_manager.lds.update_failure: 1
+listener_manager.lds.update_rejected: 0
+listener_manager.lds.update_success: 2
+listener_manager.lds.update_failure: 1
+listener_manager.lds.update_rejected: 1
+listener_manager.lds.update_success: 2
+/admin: 403
+      1 backend=web1
+      1 backend=web2
+Filesystem config update failure
+Filesystem config update rejected
+listener_manager.lds.update_success: 3
+```
+
+Vẫn như trước: `/admin` trả `403`, `/` vẫn chia cho hai backend. Envoy không áp bản nào trong hai bản hỏng và giữ bản tốt gần nhất. Bản đầu không đọc nổi thành tài nguyên nên tính là `update_failure`; bản sau đọc được nhưng không qua kiểm tra giá trị nên tính là `update_rejected`, và với control plane thật đây là lúc Envoy gửi NACK. Tài liệu của Envoy định nghĩa hai bộ đếm này theo góc nhìn của control plane qua gRPC: `update_failure` là không lấy được cấu hình vì lỗi mạng, `update_rejected` là lấy được nhưng sai schema hoặc không qua validation. Cả hai để lại cảnh báo trong `envoy.log`, kèm lý do cụ thể (mở file ra đọc khi cần). So với Nginx ở D9.1: cùng nguyên tắc giữ cấu hình cũ khi cấu hình mới hỏng, nhưng ở đây không có ai gõ lệnh để thấy lỗi ngay. Trong một cụm, thay đổi của bạn "không có tác dụng" và ở phía Envoy, thứ báo cho bạn biết là bộ đếm này. Lệnh cuối gửi lại bản tốt.
+
+</Predict>
+
+<Check id="d21.6.lab-lds">Thêm được một route lúc Envoy đang chạy bằng cách cập nhật LDS, và chứng minh được bằng bộ đếm `update_failure`, `update_rejected` rằng bản cấu hình hỏng bị bỏ qua trong khi traffic vẫn chạy theo bản cũ.</Check>
+
+### 3. Outlier detection: loại backend đang trả lỗi
+
+Cập nhật cluster qua CDS để bật outlier detection: ba lần `5xx` liên tiếp thì loại backend 5 giây. Rồi làm `web2` hỏng và gửi 20 request tới đúng đường dẫn đang lỗi:
+
+<Terminal where="vm">
+
+```bash
+OUTLIER='  outlier_detection: { consecutive_5xx: 3, interval: 1s, base_ejection_time: 5s, max_ejection_percent: 100 }'
+cds "$OUTLIER"; sleep 1
+xstat 'cds.update_success'; pgrep -x envoy
+touch ../web/web2.down
+codes 20 /healthz
+hosts
+xstat 'outlier_detection.ejections_(active|enforced_total)'
+```
+
+</Terminal>
+
+<Predict question="web2 trả 503 cho /healthz, web1 trả 200, Envoy chia đều. Trong 20 request, khoảng bao nhiêu cái nhận 503?">
+
+```text
+cluster_manager.cds.update_success: 2
+2434
+     17 200
+      3 503
+app::10.9.0.21:8080::health_flags::healthy
+app::10.9.0.22:8080::health_flags::/failed_outlier_check
+cluster.app.outlier_detection.ejections_active: 1
+cluster.app.outlier_detection.ejections_enforced_total: 1
+```
+
+Không phải 10. Sau lần `503` thứ ba liên tiếp từ `web2`, Envoy loại nó (`failed_outlier_check`) và mọi request còn lại về `web1`. Với một luồng xử lý như lab, con số là đúng 3; chạy Envoy mặc định (hai luồng trên VM này), bài mẫu thấy từ 3 tới 6 cái `503` vì các luồng nhận tin loại backend lệch nhau một nhịp. Chú ý ba người dùng đầu tiên **đã** nhận lỗi: phát hiện thụ động luôn có nạn nhân.
+
+</Predict>
+
+Chờ hết thời gian loại rồi gửi lại:
+
+<Terminal where="vm">
+
+```bash
+sleep 12
+codes 20 /healthz
+xstat 'outlier_detection.ejections_enforced_total'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+     17 200
+      3 503
+cluster.app.outlier_detection.ejections_enforced_total: 2
+```
+
+</Expected>
+
+Lại có `503`: hết thời gian loại, Envoy cho `web2` quay lại để thử, ba người dùng nữa nhận `503`, và nó bị loại lần hai. Theo tài liệu của Envoy, thời gian loại bằng `base_ejection_time` nhân với số lần đã bị loại, nên backend hỏng dai dẳng bị giữ ở ngoài ngày càng lâu. Outlier detection không biết backend đã khoẻ lại hay chưa; cách duy nhất nó biết là thử bằng traffic thật.
+
+<Check id="d21.6.lab-outlier">Bật được outlier detection qua một bản cập nhật CDS, tái hiện được việc một backend trả `5xx` bị loại sau vài request, và giải thích được vì sao lỗi xuất hiện lại sau khi hết thời gian loại.</Check>
+
+### 4. Health check chủ động và panic
+
+Thêm health check chủ động vào cluster (giữ outlier detection): mỗi giây gọi `/healthz`; trả mã ngoài `200` thì backend bị đánh dấu **ngay ở lần check đó**, hai lần tốt liên tiếp thì cho lại. `unhealthy_threshold: 2` trong cấu hình chỉ áp cho lỗi kết nối và quá hạn: theo tài liệu của Envoy, với check HTTP mà backend trả một mã không mong đợi thì ngưỡng này bị bỏ qua.
+
+<Terminal where="vm">
+
+```bash
+HC='  health_checks:
+  - { timeout: 1s, interval: 1s, unhealthy_threshold: 2, healthy_threshold: 2, http_health_check: { path: /healthz } }'
+cds "$OUTLIER" "$HC"; sleep 4
+hosts
+codes 20 /healthz
+hit
+rm ../web/web2.down; sleep 4; hosts
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+app::10.9.0.21:8080::health_flags::healthy
+app::10.9.0.22:8080::health_flags::/failed_active_hc
+     20 200
+      4 backend=web1
+app::10.9.0.21:8080::health_flags::healthy
+app::10.9.0.22:8080::health_flags::healthy
+```
+
+</Expected>
+
+`web2` bị đánh dấu `failed_active_hc` trước khi có request nào, và ở ngoài vòng chừng nào `/healthz` của nó còn lỗi: 20 request không cái nào nhận `503`. Xoá file `.down`, hai lần check tốt liên tiếp, nó tự quay lại. Health check che được điểm yếu của outlier detection ở bước 3; chiều ngược lại, outlier detection che cho trường hợp `/healthz` vẫn tốt mà request thật thì lỗi.
+
+Cuối cùng, cho **cả hai** backend trượt health check, như khi endpoint check phụ thuộc một thứ dùng chung đang hỏng:
+
+<Terminal where="vm">
+
+```bash
+touch ../web/web1.down ../web/web2.down; sleep 4
+hosts
+hit
+xstat 'cluster.app.(lb_healthy_panic|membership_healthy|membership_total)'
+rm ../web/web1.down ../web/web2.down
+```
+
+</Terminal>
+
+<Predict question="Ở D9.2, khi cả hai backend trượt health check, HAProxy trả 503 cho mọi request. Envoy thì sao?">
+
+```text
+app::10.9.0.21:8080::health_flags::/failed_active_hc
+app::10.9.0.22:8080::health_flags::/failed_active_hc
+      2 backend=web1
+      2 backend=web2
+cluster.app.lb_healthy_panic: 4
+cluster.app.membership_healthy: 0
+cluster.app.membership_total: 2
+```
+
+Envoy **vẫn phục vụ**, chia cho cả hai backend dù cả hai đều mang cờ `failed_active_hc`. Số backend khoẻ là 0 trên 2, dưới ngưỡng panic 50%, nên Envoy bỏ qua thông tin sức khoẻ; `lb_healthy_panic` đếm đúng 4 request đi qua chế độ này. Trong lab, đó là quyết định đúng: hai backend vẫn trả lời `/` bình thường, chỉ có endpoint check là sai. Nếu chúng chết thật, người dùng nhận `503` từ Envoy thay vì từ HAProxy, không tệ hơn. Điều cần nhớ khi gỡ lỗi: thấy traffic vẫn tới một backend mang cờ hỏng thì xem `lb_healthy_panic` trước khi nghi health check không chạy.
+
+</Predict>
+
+<Check id="d21.6.lab-health-panic">Thêm được health check chủ động vào cluster qua CDS, chứng minh được backend hỏng bị loại mà không request nào lỗi, và tái hiện được chế độ panic khi mọi backend trượt check.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `lds: command not found`, `web: command not found`: terminal mới chưa nạp hàm. Chạy `. ~/masteva-d21/lab.sh; . ~/masteva-d21/lb/hap.sh; . ~/masteva-d21/envoy/envoy.sh` rồi `cd ~/masteva-d21/envoy`.
+- `curl` tới `10.9.0.12` bị từ chối, `pgrep -x envoy` không in gì: Envoy đã thoát. Xem `tail envoy.log`. `cannot bind '10.9.0.12:80'` nghĩa là còn tiến trình của bài trước trong `lb2`: `sudo ip netns pids lb2 | xargs -r sudo kill` rồi chạy lại lệnh `sudo ip netns exec lb2 ./envoy ...` ở bước 1.
+- `hit` in dòng trống, `codes` in `503`: Envoy chạy nhưng không có endpoint khoẻ, hoặc backend chưa chạy. Kiểm `hosts` và `curl http://10.9.0.21:8080/`; chạy `web 1; web 2`.
+- Sửa file `.yaml` bằng trình soạn thảo mà Envoy không nạp: nhiều trình soạn thảo ghi đè tại chỗ, không đổi tên. Dùng các hàm `lds`, `cds`, `eds`, hoặc sửa một bản sao rồi `mv` đè lên.
+- Bộ đếm khác bài một đơn vị: bạn đã chạy một lệnh hai lần. Bộ đếm của Envoy chỉ tăng; thứ cần so là nó có tăng sau thao tác của bạn không.
+- `curl: (22)` hoặc lỗi tải ở phần Chuẩn bị trên máy Intel: kiểm `uname -m` in `x86_64`; tên file phát hành là `envoy-1.39.3-linux-x86_64`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới dừng Envoy và mọi backend trong các namespace của lab rồi xoá mạng lab. Thư mục `~/masteva-d21` được giữ lại; binary Envoy 100 MB nằm ở `~/masteva-d21/envoy/envoy`, xoá riêng file đó bằng `rm ~/masteva-d21/envoy/envoy` nếu cần chỗ.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+rm -f ~/masteva-d21/web/web1.down ~/masteva-d21/web/web2.down
+sudo ~/masteva-d21/topo.sh down
+sleep 2; ip netns list | wc -l; pgrep -c 'envoy|python3'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+0
+```
+
+</Expected>
+
+Đây là bài cuối của D9. Tắt VM bằng `limactl stop <tên VM>` trên máy Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Control plane thật gửi cấu hình khác lab ở đâu?">
+
+Ba điểm. Một, nó dùng gRPC chứ không dùng file: Envoy mở một luồng hai chiều, control plane đẩy tài nguyên xuống kèm số phiên bản, Envoy trả lời ACK hoặc NACK cho từng bản. Nhờ vậy control plane biết Envoy nào đang chạy bản nào, điều lab không có. Hai, nó lo **thứ tự**: thêm cluster và endpoint trước khi thêm route trỏ vào; gỡ route trước khi gỡ cluster. Gom mọi loại tài nguyên vào một luồng (ADS) là cách phổ biến để giữ thứ tự đó. Ba, nó chỉ gửi phần thay đổi (delta xDS) khi cụm lớn: một mesh vài nghìn service mà mỗi lần một pod đổi lại gửi toàn bộ danh sách endpoint cho mọi Envoy là tự gây quá tải. Khi gỡ lỗi Istio hay Envoy Gateway, hai câu hỏi đầu tiên là "control plane đã gửi chưa" và "Envoy đã nhận và chấp nhận chưa"; câu sau trả lời bằng `/config_dump` và các bộ đếm `update_rejected` bạn vừa dùng.
+
+</Reveal>
+
+<Reveal title="Hot restart của Envoy khác reload của Nginx thế nào?">
+
+Phần lớn thay đổi không cần gì cả, vì xDS áp trong tiến trình đang chạy. Khi phải thay chính binary hoặc file bootstrap, Envoy có hot restart: tiến trình mới khởi động cạnh tiến trình cũ, nhận lại các socket đang nghe qua một kênh riêng, tiến trình cũ ngừng nhận kết nối mới và có một khoảng thời gian (mặc định 10 phút) để kết nối đang dở kết thúc. Về ý tưởng nó giống reload của Nginx và HAProxy; khác ở chỗ nó hiếm khi phải dùng tới, và các bộ đếm được chuyển từ tiến trình cũ sang mới thay vì về 0. Trong Kubernetes, người ta thường không hot restart mà thay hẳn pod: pod mới lên, pod cũ được rút khỏi danh sách endpoint rồi mới bị dừng (K1.3).
+
+</Reveal>
+
+<Reveal title="Vì sao outlier detection có max_ejection_percent?">
+
+Vì phát hiện thụ động dễ loại oan hàng loạt. Nếu một phụ thuộc chung chậm đi, mọi backend cùng trả `5xx` hoặc cùng quá hạn, và một bộ phát hiện ngây thơ sẽ loại sạch cả cluster: đúng kịch bản "một endpoint chậm hạ cả dịch vụ" của Nginx ở D2.5. `max_ejection_percent` (mặc định 10%) chặn trên số backend được phép bị loại cùng lúc; lab đặt 100 để với hai backend vẫn loại được một cái. Trên production, để mặc định hoặc nâng vừa phải, và nhớ rằng nó cộng hưởng với panic threshold: loại càng nhiều thì càng gần ngưỡng mà Envoy bỏ qua mọi thông tin sức khoẻ. Hai cơ chế cùng nhắm một mục tiêu: không để công cụ bảo vệ biến một sự cố một phần thành sự cố toàn bộ.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một đoạn `/config_dump`, một cờ trong `/clusters`, hoặc dịch một khối `upstream` của Nginx sang cluster của Envoy để hiểu khái niệm tương ứng. AI hay viết cấu hình theo API v2 đã bị gỡ (thiếu `typed_config` và `@type`), hay quên filter `envoy.filters.http.router` ở cuối chuỗi (không có nó, request không đi đâu cả), hay nhầm `hosts` kiểu cũ với `load_assignment`, và hay mô tả panic threshold như một lỗi cần tắt. Kiểm lại bằng `envoy --mode validate -c <file>` cho bootstrap, và với tài nguyên động thì nhìn bộ đếm `update_rejected` sau khi nạp như ở bước 2. Với Envoy do control plane quản lý, đừng sửa cấu hình Envoy: sửa tài nguyên của control plane (`HTTPRoute`, chính sách của mesh) rồi kiểm kết quả trong `/config_dump`.
+
+</Callout>
+
+<Callout kind="link">
+
+D9.1 cho thấy cái giá của reload khi có kết nối sống lâu, lý do Envoy tồn tại; D9.2 có health check chủ động, drain và hành vi `503` khi hết server của HAProxy để đối chiếu với panic; D2.5 có callout về fail open của load balancer AWS. D9.4 xoay chứng chỉ, việc mà Envoy làm qua SDS. D9.5 nhắc Coraza, WAF gắn được vào Envoy. K2.2 dùng Envoy Gateway qua Gateway API; K11 là service mesh, nơi mỗi pod có một Envoy và control plane gửi xDS cho hàng nghìn proxy. D12 thu thập `/stats` ở dạng Prometheus (`/stats/prometheus`).
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d21.6.mastery-debug">Với một Envoy đang chạy, dùng `/clusters`, `/stats` và log trả lời được ba câu hỏi: nó đang có những endpoint nào và cái nào bị loại vì sao; bản cấu hình gần nhất có được chấp nhận không; traffic có đang ở chế độ panic không.</Check>
+
+<Check id="d21.6.mastery-explain">Giải thích được cho một đồng nghiệp quen Nginx vì sao sửa một `HTTPRoute` không làm gateway reload, bằng các khái niệm listener, route, cluster, endpoint và xDS.</Check>
+
+<Check id="d21.6.mastery-proxy-choice">Với một yêu cầu cụ thể (site tĩnh, load balancer cho database, gateway của cụm Kubernetes), chọn được giữa Nginx, HAProxy và Envoy và nêu được lý do dựa trên cách mỗi cái nhận cấu hình.</Check>
+
+</Mastery>

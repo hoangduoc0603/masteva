@@ -1,0 +1,691 @@
+---
+title: Log tập trung với Loki và Alloy, LogQL và thời gian lưu
+description: Dùng Grafana Alloy đọc log của mọi container rồi đẩy về Loki 3 với hai label và structured metadata, truy vấn bằng LogQL, tìm mọi dòng của một request qua trace id, thấy vì sao label sai làm nổ số stream, rồi đặt thời gian lưu theo loại log và xoay vòng log cục bộ; so với Elasticsearch và OpenSearch.
+id: d12.5
+step: d12
+prerequisites: [d12.4]
+topics: [d12.loki-elk, d12.log-tap-trung-luu-tru]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    loki: 3.7.8
+    alloy: 1.20.1
+    grafana: 13.2.3
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Đưa log của cả cụm về một nơi, hỏi được nó bằng một ngôn ngữ truy vấn, và quyết định có chủ đích log nào giữ bao lâu. Học xong bài này, bạn giải thích được:
+
+- Vì sao `docker logs` không đủ, và log đi qua những chặng nào từ stdout của ứng dụng tới màn hình tìm kiếm.
+- Vì sao Loki rẻ hơn Elasticsearch khi lưu nhưng chậm hơn khi tìm một chuỗi bất kỳ, và nên chọn cái nào.
+- Vì sao đưa `trace_id` vào label làm hỏng Loki, và đặt nó ở đâu để vẫn tìm được.
+- Vì sao một máy chạy Docker có thể đầy đĩa vì log dù Loki đã đặt thời gian lưu.
+
+</Goal>
+
+<Knowledge>
+
+### Đường đi của log
+
+SB8.1 dừng ở chỗ ứng dụng in ra stdout một dòng JSON cho mỗi sự kiện. Từ đó trở đi là việc của hạ tầng:
+
+```text
+ ứng dụng ──stdout──▶ Docker (driver json-file) ──▶ file trên đĩa của máy
+                                                     │  /var/lib/docker/containers/<id>/<id>-json.log
+                                                     ▼
+                                    bộ thu (Alloy): tìm container, gắn label, xử lý dòng
+                                                     │  HTTP push, theo lô
+                                                     ▼
+                                    kho log (Loki): nén thành chunk, đánh index theo label
+                                                     ▲
+                                    Grafana, API: truy vấn bằng LogQL
+```
+
+`docker logs` chỉ đọc file ở chặng đầu. Ba lý do nó không đủ:
+
+- **Log chết theo container.** `docker rm`, hay trên Kubernetes là pod bị thay, xoá luôn file. Đúng lúc cần đọc nhất (container vừa chết và được tạo lại) thì log không còn.
+- **Mỗi máy một kho.** Mười máy là mười lần SSH và `grep`; không ghép được dòng thời gian của một request đi qua ba service.
+- **Không ai dọn.** File log cục bộ mặc định lớn mãi tới khi đầy đĩa (bước 6).
+
+**Bộ thu** (agent) chạy trên mỗi máy, đọc log tại chỗ rồi đẩy đi. Công cụ đã đổi nhiều trong hai năm qua, và tài liệu cũ dễ dẫn sai:
+
+| Bộ thu | Tình trạng tháng 10/2026 |
+|---|---|
+| Promtail | Hết hỗ trợ từ 02/03/2026. Không dùng cho hệ thống mới |
+| Grafana Agent | Đã lưu trữ (archived) |
+| **Grafana Alloy** | Thay cho cả hai; là một bản phân phối của OpenTelemetry Collector do Grafana đóng gói, cấu hình bằng các **component** nối thành pipeline. Bài này dùng |
+| OpenTelemetry Collector, Fluent Bit | Lựa chọn trung lập với nhà cung cấp; đều đẩy được vào Loki, Elasticsearch, OpenSearch |
+
+<Check id="d12.5.log-pipeline">Vẽ lại được đường đi của một dòng log từ stdout tới kho log, và nêu được ba lý do `docker logs` không đủ cho vận hành.</Check>
+
+### Loki hay Elasticsearch, OpenSearch
+
+Hai trường phái khác nhau ở một quyết định: **đánh index cái gì**.
+
+```text
+ Elasticsearch / OpenSearch                      Loki
+ mỗi dòng log là một document                    mỗi tập label là một stream
+ tách từ, lập inverted index cho MỌI trường      chỉ index LABEL; nội dung nén thành chunk
+   "timeout" → doc 17, 204, 9981…                  {service="shop-1", level="ERROR"} → chunk 41, 42
+ tìm: tra index, ra ngay                         tìm: chọn stream bằng label, rồi quét nội dung
+```
+
+| | Elasticsearch, OpenSearch | Loki |
+|---|---|---|
+| Index | Toàn văn, mọi trường | Chỉ label (và thời gian) |
+| Ghi | Tốn CPU và đĩa cho index; index có thể lớn ngang dữ liệu gốc | Rẻ: nén và ghi; index rất nhỏ |
+| Lưu | Đĩa gắn vào node (có tầng nóng, ấm, lạnh) | Object storage (S3, GCS…) là mặc định cho production |
+| Tìm một chuỗi bất kỳ trong mọi log | Nhanh | Phải quét; nhanh khi label và khoảng thời gian đã thu hẹp phạm vi |
+| Phân tích, tổng hợp theo trường tuỳ ý | Mạnh (aggregation, dashboard của Kibana, OpenSearch Dashboards) | Có qua LogQL nhưng hạn chế hơn |
+| Vận hành | Cụm JVM: shard, replica, heap, mapping | Một binary cho quy mô nhỏ; tách thành phần khi lớn |
+| Giấy phép | Elasticsearch: AGPL-3.0, SSPL hoặc ELv2 tuỳ chọn; OpenSearch: Apache-2.0 | AGPL-3.0 |
+| Hợp với | Tìm kiếm tự do trên log, phân tích bảo mật (SIEM), đội đã quen ELK | Log của ứng dụng đi kèm metric và trace, lượng lớn, ngân sách chặt |
+
+"ELK" là Elasticsearch, Logstash, Kibana; bộ này rất phổ biến ở Việt Nam. Nếu chọn nhánh này cho hệ thống mới, OpenSearch (tách ra từ Elasticsearch 7.10, giấy phép Apache-2.0) là lựa chọn cần cân nhắc ngang hàng. Bài này làm lab với Loki vì nó vừa profile máy của chặng (70 đến 220 MiB trong lab, so với vài GiB heap của một node Elasticsearch hay OpenSearch; con số sau là ước lượng, bài không đo) và dùng chung Grafana. Phần lớn điều học được ở đây chuyển sang nhánh kia nguyên vẹn: bộ thu, log có cấu trúc, trace id, thời gian lưu.
+
+<Check id="d12.5.loki-vs-elk">So sánh được Loki với Elasticsearch và OpenSearch về thứ được index, chi phí ghi và lưu, tốc độ tìm, và chọn được cho một tình huống cụ thể.</Check>
+
+### Label, stream và structured metadata
+
+Trong Loki, mỗi tổ hợp label khác nhau là một **stream**, có chunk và mục index riêng. Đây là cardinality của D12.2, với hậu quả nặng hơn: nghìn stream nhỏ nghĩa là nghìn chunk tí hon, index phình, cả ghi lẫn đọc đều chậm. Quy tắc của Loki vì vậy ngược với trực giác của người quen Elasticsearch: **càng ít label càng tốt**.
+
+| Đặt ở | Dùng cho | Ví dụ trong lab |
+|---|---|---|
+| **Label** | Thứ mô tả **nguồn** log, ít giá trị, hay dùng để chọn | `service`, `container`, `level` |
+| **Structured metadata** | Giá trị nhiều và đa dạng nhưng cần lọc chính xác; gắn vào từng dòng, không tạo stream | `trace_id` |
+| **Nội dung dòng** | Mọi thứ còn lại; lọc lúc truy vấn bằng parser | `route`, `status`, `duration_ms`, thông điệp |
+
+Structured metadata có từ Loki 3 (cần schema `v13` và index `tsdb`, là cấu hình của lab). Trước đó chỉ có hai lựa chọn tồi: đưa trace id vào label, hoặc quét toàn văn để tìm nó.
+
+### LogQL
+
+LogQL cố ý giống PromQL. Một truy vấn log gồm bộ chọn stream rồi một chuỗi bước xử lý nối bằng `|`:
+
+```text
+{service=~"shop-.+", level="ERROR"}  |= "checkout"  | json  | duration_ms > 85  | line_format "{{.route}} {{.duration_ms}}"
+└── 1. chọn stream bằng label ─────┘ └ 2. lọc dòng ┘ └ 3. ─┘ └ 4. lọc theo ───┘ └── 5. định dạng lại ──────────────────────┘
+        (dùng index, rẻ)               (quét, nhanh)  tách     trường đã tách
+                                                      trường
+```
+
+Thứ tự là hiệu năng: bộ chọn stream càng hẹp thì càng ít chunk phải mở; lọc dòng (`|=`, `!=`, `|~` cho regex) nên đứng trước parser (`| json`, `| logfmt`, `| pattern`) vì so chuỗi rẻ hơn phân tích JSON.
+
+Bọc một truy vấn log trong hàm khoảng thời gian thì nó thành **truy vấn metric**, trả về số như PromQL: `count_over_time({…}[1m])`, `rate({…}[1m])`, `sum by (service) (…)`, và `| unwrap duration_ms` để tính trên một trường số.
+
+<Check id="d12.5.labels-logql">Quyết định được một trường nên là label, structured metadata hay để trong nội dung dòng, và đọc được từng bước của một truy vấn LogQL.</Check>
+
+### Thời gian lưu và vòng đời của log
+
+Log nằm ở ít nhất hai nơi, mỗi nơi cần một chính sách riêng:
+
+| Nơi | Mặc định | Cần đặt |
+|---|---|---|
+| File cục bộ của Docker (driver `json-file`) | Không giới hạn kích thước, không xoay vòng | `max-size`, `max-file` cho từng container hoặc trong `daemon.json` |
+| Kho log tập trung (Loki) | Giữ mãi | `retention_period`, và bật compactor để việc xoá thật sự diễn ra |
+
+Trong Loki, thành phần **compactor** vừa gộp index vừa xoá dữ liệu quá hạn. `retention_period` là mặc định cho mọi stream; `retention_stream` đặt riêng theo bộ chọn label. Đó là lý do nên nghĩ về thời gian lưu **ngay khi thiết kế label**: bạn chỉ đặt được chính sách riêng cho thứ bạn chọn được bằng label.
+
+Không phải log nào cũng đáng giữ như nhau:
+
+| Loại | Ví dụ | Thời gian lưu thường gặp | Lý do |
+|---|---|---|---|
+| Debug, log chi tiết của ứng dụng | Từng bước xử lý | Vài ngày | Chỉ có giá trị khi đang điều tra |
+| Log vận hành | Request, lỗi | Vài tuần đến vài tháng | So sánh trước và sau sự cố, phân tích xu hướng |
+| Log truy cập và log kiểm toán | Ai đăng nhập, từ đâu, làm gì | Theo quy định, thường từ một năm | Điều tra bảo mật, yêu cầu pháp lý |
+
+Hai lực kéo ngược chiều: chi phí và quyền riêng tư kéo về phía giữ ngắn (log có dữ liệu cá nhân thì thời gian lưu cũng là nghĩa vụ phải giải trình), còn điều tra và tuân thủ kéo về phía giữ dài. Cách dung hoà là **tách stream**: log kiểm toán đi riêng, có cấu trúc chặt, giữ lâu trên lưu trữ rẻ; log ứng dụng ồn ào giữ ngắn.
+
+Một mốc cụ thể ở Việt Nam: Nghị định 333/2026/NĐ-CP (ban hành và có hiệu lực 19/08/2026, quy định chi tiết Luật An ninh mạng) tại Điều 16 khoản 6 yêu cầu doanh nghiệp cung cấp dịch vụ trên mạng viễn thông, mạng Internet lưu nhật ký hệ thống sao cho **truy xuất được ít nhất 12 tháng** (điểm c); nhật ký phải gồm tối thiểu thông tin về tài khoản người sử dụng dịch vụ, thời gian đăng nhập và đăng xuất, địa chỉ IP, cổng nguồn khi đăng nhập và đăng xuất, và nhật ký xử lý thông tin được đăng tải (điểm b). Nghị định còn các mốc lưu trữ khác cho những loại dữ liệu khác, ví dụ 24 tháng cho dữ liệu phải lưu theo yêu cầu (Điều 20 khoản 1) và 12 tháng cho nhật ký cấp phát, quản lý địa chỉ IP của doanh nghiệp viễn thông, Internet (Điều 22 khoản 3). Bài đọc bản đăng Công báo ngày 04/09/2026, kiểm ngày 11/10/2026. Đây là thông tin để bạn biết phải hỏi ai, không phải tư vấn pháp lý: hệ thống của bạn có thuộc phạm vi không, "nhật ký hệ thống" gồm những log nào, do bộ phận pháp chế và an toàn thông tin xác định. Về kỹ thuật, điều cần rút ra là con số 12 tháng áp cho **một loại** log, và stack phải cho phép giữ riêng loại đó.
+
+<Callout kind="production">
+
+Ngày 14/11/2024, Cloudflare mất khoảng 55% log lẽ ra phải gửi cho khách hàng trong chừng 3,5 giờ. Theo bài tường trình của họ: một thay đổi cấu hình có lỗi khiến dịch vụ chuyển tiếp log (Logfwdr) nhận một cấu hình **rỗng**; một cơ chế dự phòng viết từ thời traffic còn nhỏ xử lý trường hợp đó theo kiểu "fail open", tức gửi log của **mọi** khách hàng thay vì chỉ những khách có cấu hình. Thay đổi được hoàn lại trong chưa đầy năm phút, nhưng tầng đệm phía sau (Buftee), vốn tạo một bộ đệm cho mỗi khách hàng, phải gánh số bộ đệm gấp khoảng 40 lần và ngừng phản hồi. Bài tường trình nói rõ: Buftee có sẵn cơ chế chống đúng kiểu quá tải này, nhưng chúng **chưa được cấu hình**. Phần diễn giải của bài: "mỗi khách một bộ đệm" có cùng hình dạng với "mỗi tập label một stream"; một thay đổi làm số đơn vị đó tăng đột ngột thì đánh sập cả đường ống, và giới hạn bảo vệ (bước 5 thử một cái của Loki) chỉ có tác dụng khi được bật và được thử.
+
+</Callout>
+
+<Check id="d12.5.retention">Kể được log nằm ở những nơi nào trên đường đi và mỗi nơi cần chính sách gì, phân loại được log theo thời gian lưu, và nêu được yêu cầu 12 tháng của Nghị định 333/2026 cùng giới hạn của thông tin đó.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Understand labels (Grafana Loki documentation)](https://grafana.com/docs/loki/latest/get-started/labels/) và [What is structured metadata](https://grafana.com/docs/loki/latest/get-started/labels/structured-metadata/): quy tắc chọn label, cardinality, và khi nào dùng structured metadata.
+- [Query Loki (Grafana Loki documentation)](https://grafana.com/docs/loki/latest/query/): tham chiếu LogQL; đọc "Log queries" trước, rồi "Metric queries".
+- [Log retention (Grafana Loki documentation)](https://grafana.com/docs/loki/latest/operations/storage/retention/): compactor, `retention_period`, `retention_stream` và thứ tự ưu tiên.
+- [Migrate from Promtail to Grafana Alloy](https://grafana.com/docs/alloy/latest/set-up/migrate/from-promtail/): lệnh chuyển cấu hình Promtail sang Alloy và các khác biệt.
+- [JSON File logging driver (Docker Docs)](https://docs.docker.com/engine/logging/drivers/json-file/): `max-size`, `max-file` và mặc định không xoay vòng.
+- [Cloudflare incident on November 14, 2024, resulting in lost logs](https://blog.cloudflare.com/cloudflare-incident-on-november-14-2024-resulting-in-lost-logs/): bài tường trình trong callout.
+- [Nghị định 333/2026/NĐ-CP (Công báo số 499, ngày 04/09/2026)](https://congbaocdn.chinhphu.vn/180507251028987904/2026/9/4/470335-1787890927_v1_1788486330_signed.pdf): văn bản gốc; yêu cầu về nhật ký hệ thống nằm ở Điều 16 khoản 6.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D12.4; cụm đang chạy với Grafana. Lab tải image Loki (40 MB nén) và Alloy (194 MB); bước 6 dùng thêm `alpine:3.24.2` (đã có nếu bạn học D5, nếu chưa thì Docker tự kéo, khoảng 4 MB). Dùng thêm cổng **9554** (Loki) và **9556** (giao diện của Alloy). **Profile máy:** theo số đo từng container trong các lần chạy của bài, Loki dùng 70 đến 220 MiB, Alloy 80 đến 300 MiB; cả cụm 0,6 đến 1 GiB (lần chạy cuối của bài: 872 MiB). Máy 8 GB: nếu chật, tạm dừng node_exporter và Alertmanager bằng `docker compose stop node-exporter alertmanager webhook`, bài này không cần chúng.
+
+### 1. Loki, Alloy và datasource
+
+<Terminal where="mac" title="~/masteva-d12">
+
+```bash
+cd ~/masteva-d12
+mkdir -p loki alloy
+cat > loki/loki.yaml <<'EOF'
+auth_enabled: false
+server:
+  http_listen_port: 3100
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+schema_config:
+  configs:
+    - from: 2026-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+limits_config:
+  retention_period: 168h
+  retention_stream:
+    - selector: '{service="nginx"}'
+      priority: 1
+      period: 24h
+  max_label_names_per_series: 10
+  discover_service_name: []
+  shard_streams:
+    enabled: false
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 1m
+  retention_enabled: true
+  delete_request_store: filesystem
+analytics:
+  reporting_enabled: false
+EOF
+cat > alloy/config.alloy <<'EOF'
+// 1. Tìm container qua Docker API, chỉ lấy của project Compose "d12".
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=d12"]
+  }
+}
+
+// 2. Đổi nhãn của Docker thành label của Loki: chỉ giữ hai label, ít giá trị.
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+// 3. Đọc log của các container đó.
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.json.receiver]
+}
+
+// 4. Xử lý từng dòng: level thành label, trace_id thành structured metadata.
+loki.process "json" {
+  stage.json {
+    expressions = { level = "level", trace_id = "trace_id" }
+  }
+  stage.labels {
+    values = { level = "" }
+  }
+  stage.structured_metadata {
+    values = { trace_id = "" }
+  }
+  forward_to = [loki.write.loki.receiver]
+}
+
+// 5. Gửi tới Loki.
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+EOF
+cat > grafana/provisioning/datasources/loki.yaml <<'EOF'
+apiVersion: 1
+datasources:
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+EOF
+cat > compose.logs.yaml <<'EOF'
+services:
+  loki:
+    image: grafana/loki:3.7.8
+    container_name: d12-loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./loki:/etc/loki:ro
+      - loki-data:/loki
+    ports: ["127.0.0.1:9554:3100"]
+  alloy:
+    image: grafana/alloy:v1.20.1
+    container_name: d12-alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy:/etc/alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    ports: ["127.0.0.1:9556:12345"]
+    depends_on: [loki]
+  nginx:
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  loki-data:
+  alloy-data:
+EOF
+echo 'COMPOSE_FILE=compose.yaml:compose.prom.yaml:compose.node.yaml:compose.alert.yaml:compose.logs.yaml' > .env
+docker compose up -d 2>&1 | grep -E '(loki|alloy) +Started|nginx +Recreated'
+docker compose restart grafana 2>&1 | tail -1
+until [ "$(curl -s localhost:9554/ready)" = "ready" ]; do sleep 3; done; echo "loki: ready"
+curl -s localhost:9556/api/v0/web/components | jq -r '.[] | "\(.health.state)  \(.localID)"'
+sleep 20
+curl -s localhost:9554/loki/api/v1/labels | jq -c .data
+curl -s localhost:9554/loki/api/v1/label/service/values | jq -c .data
+curl -s localhost:9554/loki/api/v1/label/level/values | jq -c .data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d12-nginx Recreated 
+ Container d12-loki Started 
+ Container d12-alloy Started 
+ Container d12-grafana Started 
+loki: ready
+healthy  discovery.docker.containers
+healthy  discovery.relabel.containers
+healthy  loki.write.loki
+healthy  loki.process.json
+healthy  loki.source.docker.containers
+["container","level","service"]
+["alertmanager","alloy","loki","nginx","node-exporter","prometheus","shop-1","shop-2","stock","webhook"]
+["ERROR","INFO","WARN"]
+```
+
+</Expected>
+
+Loki mất chừng 20 giây mới `ready`. Đọc ba file:
+
+- **`loki.yaml`:** một tiến trình, ghi ra đĩa cục bộ (production dùng object storage), schema `v13` với index `tsdb`. `auth_enabled: false` nghĩa là một tenant duy nhất. Khối `limits_config` và `compactor` là phần thời gian lưu, bước 6 quay lại. `discover_service_name: []` và `shard_streams` tắt hai tính năng tự thêm label, để danh sách label đúng là thứ bài đặt ra.
+- **`config.alloy`:** năm component nối đuôi nhau qua `targets` và `forward_to`, đọc từ trên xuống đúng như đường đi của log. Component 1 chỉ lấy container của project `d12`, nên log của các container khác trên máy không bị gom nhầm. Component 2 giữ đúng hai label. Component 4 đọc JSON của từng dòng: `level` thành label (ba giá trị), `trace_id` thành structured metadata. Dòng không phải JSON (log của Prometheus, Loki) đi qua nguyên vẹn, không có `level`.
+- **Alloy cần đọc Docker socket** để biết có container nào và lấy log của chúng. Gắn socket ở chế độ chỉ đọc không giới hạn được lời gọi API: tiến trình nào nói chuyện được với Docker API thì tạo được container có toàn quyền trên máy, tức gần như là root. Chỉ chạy bộ thu từ image bạn tin và đã ghim phiên bản.
+- **Datasource Loki** thêm vào Grafana cũng bằng file; Grafana phải khởi động lại vì datasource chỉ được đọc lúc khởi động.
+
+Alloy đọc cả log **cũ** của các container đang tồn tại, nên `level` đã có `ERROR` và `WARN` từ các lần tiêm lỗi ở bài trước. Giao diện của Alloy ở `http://localhost:9556` vẽ pipeline thành đồ thị, tiện khi gỡ lỗi.
+
+<Check id="d12.5.lab-pipeline">Dựng được Alloy và Loki, đọc được cấu hình Alloy theo từng component, và kiểm được pipeline đang khoẻ cùng các label đang có.</Check>
+
+### 2. LogQL
+
+Như `pq` cho Prometheus, script `lq` gọi API của Loki. Truy vấn log (bắt đầu bằng `{`) in các dòng mới nhất kèm tên service; tham số thứ hai là khoảng thời gian nhìn lại (mặc định 5 phút), thứ ba là số dòng tối đa của cả kết quả (mặc định 3; đó là tham số `limit` của API, Loki lấy các dòng mới nhất trong mọi stream khớp). Truy vấn metric in mỗi chuỗi một dòng với giá trị tại thời điểm hiện tại.
+
+<Terminal where="mac">
+
+```bash
+cat > lq <<'EOF'
+#!/bin/sh
+case "$1" in
+  "{"*) R=$(curl -s localhost:9554/loki/api/v1/query_range --data-urlencode "query=$1" \
+          --data-urlencode "since=${2:-5m}" --data-urlencode "limit=${3:-3}")
+        echo "$R" | jq -r '[.data.result[] | .stream.service as $s | .values[] | [.[0], $s, .[1]]]
+          | sort | reverse | .[] | "\(.[1])  \(.[2])"' 2>/dev/null || echo "LỖI: $R" ;;
+  *)    R=$(curl -s localhost:9554/loki/api/v1/query --data-urlencode "query=$1")
+        echo "$R" | jq -r '.data.result[] | "\(.metric | to_entries | map("\(.key)=\(.value)") | join(" "))  =>  \(.value[1] | tonumber | . * 100 | round / 100)"' 2>/dev/null || echo "LỖI: $R" ;;
+esac
+EOF
+chmod +x lq
+./lq '{service="nginx"}'
+./lq '{service=~"shop-.+"} |= "checkout"'
+./lq '{service=~"shop-.+"} | json | route="/api/checkout" | duration_ms > 85 | line_format "{{.container}} {{.route}} {{.duration_ms}}ms trace={{.trace_id}}"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+nginx  {"time":"2026-10-11T06:26:38+00:00","service":"nginx","method":"GET","path":"/api/products","status":200,"duration_s":0.016,"upstream":"172.22.0.3:8080"}
+nginx  {"time":"2026-10-11T06:26:38+00:00","service":"nginx","method":"GET","path":"/api/products","status":200,"duration_s":0.016,"upstream":"172.22.0.3:8080"}
+nginx  {"time":"2026-10-11T06:26:38+00:00","service":"nginx","method":"GET","path":"/api/products","status":200,"duration_s":0.018,"upstream":"172.22.0.4:8080"}
+shop-2  {"time":"2026-10-11T06:26:38.516997965Z","level":"INFO","msg":"request","service":"shop","method":"GET","route":"/api/checkout","status":200,"duration_ms":63,"trace_id":"5fa48c28bbff3e44e6c70f8fde133c5d"}
+shop-1  {"time":"2026-10-11T06:26:38.464881715Z","level":"INFO","msg":"request","service":"shop","method":"GET","route":"/api/checkout","status":200,"duration_ms":61,"trace_id":"eb055ad96657206b1fcc4ee5ceac99ec"}
+shop-2  {"time":"2026-10-11T06:26:38.39944659Z","level":"INFO","msg":"request","service":"shop","method":"GET","route":"/api/checkout","status":200,"duration_ms":46,"trace_id":"3a97147172554a947e9418ff8c98078c"}
+shop-1  d12-shop-1 /api/checkout 90ms trace=7a6aeab0f6c56ff7f9eb04265075b009
+shop-1  d12-shop-1 /api/checkout 95ms trace=30103d0a6f05fe877d6c7afe4908cc4b
+shop-2  d12-shop-2 /api/checkout 89ms trace=e74d65a6ff30f20ad4f1ff9ffdc987c4
+```
+
+</Expected>
+
+Ba truy vấn, ba mức:
+
+1. **Chỉ bộ chọn stream.** Log của `nginx`, mới nhất trước. Label `service` ở đây là tên service trong Compose (`shop-1`, `shop-2`), khác trường `"service":"shop"` nằm trong nội dung dòng.
+2. **Thêm lọc dòng** `|= "checkout"`: so chuỗi trên dòng thô của hai stream `shop`, không cần hiểu JSON.
+3. **Parser và lọc theo trường.** `| json` biến mọi khoá JSON thành trường dùng được ngay trong truy vấn; `duration_ms > 85` so sánh số; `line_format` in lại gọn. Nhờ log có cấu trúc từ gốc (SB8.1), không phải viết regex nào.
+
+Dòng, giờ và trace id của bạn sẽ khác.
+
+### 3. Từ log ra số
+
+Cho `shop-2` lỗi 40% trong một phút rồi đếm từ log:
+
+<Terminal where="mac">
+
+```bash
+curl -s -X POST 'localhost:9559/admin/fault?error=40'
+sleep 70
+./lq 'sum by (service) (count_over_time({service=~".+"}[1m]))'
+./lq 'sum by (service) (rate({service=~"shop-.+"} | json | status >= 500 [1m]))'
+./pq 'sum by (instance) (rate(http_requests_total{job="shop", status=~"5.."}[1m]))'
+./lq 'quantile_over_time(0.95, {service=~"shop-.+"} | json | route="/api/checkout" | unwrap duration_ms [1m]) by (service)'
+curl -s -X POST localhost:9559/admin/fault
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+error=40% delay=0ms
+service=loki  =>  12
+service=nginx  =>  1180
+service=shop-1  =>  590
+service=shop-2  =>  590
+service=stock  =>  179
+service=shop-2  =>  3.92
+instance=shop-2:8080  =>  3.927
+instance=shop-1:8080  =>  0
+service=shop-1  =>  85.9
+service=shop-2  =>  84.75
+error=0% delay=0ms
+```
+
+</Expected>
+
+- **Dòng log mỗi phút theo service.** `nginx` ghi một dòng cho mỗi request (1.180 dòng, tức gần 1.200 mỗi phút ở 20 request mỗi giây), hai `shop` chia nhau cũng chừng ấy, `stock` chỉ nhận phần `checkout`. Đây là con số quyết định hoá đơn lưu trữ: log tăng theo traffic, còn metric ở D12.1 thì không.
+- **Số dòng lỗi mỗi giây** tính từ log của `shop-2` (3,92), và ngay dưới là cùng đại lượng tính từ counter của Prometheus (3,927): hai con số gần như trùng nhau. Dòng `shop-1 => 0` của Prometheus là chuỗi 5xx còn lại từ các lỗi 502 ở D12.4, nay không tăng nữa. Cùng một sự thật, hai cái giá: Prometheus trả lời từ vài chuỗi số đã cộng sẵn, Loki phải mở chunk và phân tích JSON từng dòng. Dashboard và alert nên dựa vào metric; LogQL kiểu này dành cho thứ **không có** metric, hoặc để đối chiếu.
+- **p95 tính từ log** bằng `unwrap duration_ms`: 86 và 85 ms, chính xác tới từng mili giây vì có đủ từng quan sát, không bị sai số bucket như con số 97 ms ở D12.3. Đổi lại, nó quét toàn bộ log của khoảng thời gian đó.
+
+Alert `HighErrorRatio` của D12.4 sẽ kêu rồi tự hết trong lúc này; đó là hệ thống đang làm đúng việc.
+
+<Check id="d12.5.lab-logql">Viết được truy vấn LogQL có bộ chọn stream, lọc dòng, parser và lọc theo trường, và tính được tỉ lệ lỗi cùng percentile từ log.</Check>
+
+### 4. Một request, mọi service
+
+Lấy trace id của một request `checkout` bất kỳ rồi tìm mọi dòng mang nó:
+
+<Terminal where="mac">
+
+```bash
+T=$(docker logs d12-shop-1 2>&1 | grep checkout | tail -1 | jq -r .trace_id); echo "trace_id=$T"
+sleep 5
+./lq "{service=~\".+\"} | trace_id=\"$T\"" 5m 10
+./lq "{service=~\".+\"} |= \"$T\"" 5m 10 | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trace_id=0a915dc57647e8ac4fec3a973dc34d38
+shop-1  {"time":"2026-10-11T06:27:48.96720647Z","level":"INFO","msg":"request","service":"shop","method":"GET","route":"/api/checkout","status":200,"duration_ms":63,"trace_id":"0a915dc57647e8ac4fec3a973dc34d38"}
+stock  {"time":"2026-10-11T06:27:48.966991095Z","level":"INFO","msg":"request","service":"stock","method":"GET","route":"/reserve","status":200,"duration_ms":17,"trace_id":"0a915dc57647e8ac4fec3a973dc34d38"}
+       2
+```
+
+</Expected>
+
+Một truy vấn, hai service, đúng hai dòng của cùng một request. Đây là việc `docker logs` không làm được.
+
+Hai cách viết cho cùng kết quả. `| trace_id="…"` lọc theo **structured metadata** mà Alloy đã gắn ở bước 1: không cần `| json`, và Loki so trên trường đã tách sẵn. `|= "…"` quét chuỗi trên nội dung dòng: vẫn đúng, chậm hơn khi dữ liệu lớn, và sẽ khớp nhầm nếu chuỗi đó tình cờ nằm ở trường khác. Nginx chưa có mặt trong kết quả vì nó chưa ghi trace id; D12.6 bổ sung.
+
+<Check id="d12.5.lab-trace-id">Từ một trace id, tìm được mọi dòng log của request đó trên mọi service, và giải thích được vì sao trace id nằm ở structured metadata.</Check>
+
+### 5. Stream và cardinality
+
+Đếm stream hiện có, rồi thử làm điều không nên: đẩy thẳng vào Loki ba dòng log mà `trace_id` là **label**.
+
+<Terminal where="mac">
+
+```bash
+curl -sG localhost:9554/loki/api/v1/series --data-urlencode 'match[]={service=~".+"}' | jq -r '.data | length'
+curl -sG localhost:9554/loki/api/v1/series --data-urlencode 'match[]={service="shop-2"}' | jq -c '.data[]'
+NOW=$(date +%s)000000000
+curl -s -X POST localhost:9554/loki/api/v1/push -H 'Content-Type: application/json' -d '{"streams":[
+  {"stream":{"service":"demo","trace_id":"aaa1"},"values":[["'$NOW'","request 1"]]},
+  {"stream":{"service":"demo","trace_id":"bbb2"},"values":[["'$NOW'","request 2"]]},
+  {"stream":{"service":"demo","trace_id":"ccc3"},"values":[["'$NOW'","request 3"]]}]}' -w 'push: %{http_code}\n'
+sleep 3
+curl -sG localhost:9554/loki/api/v1/series --data-urlencode 'match[]={service="demo"}' | jq -r '.data | length'
+curl -s -X POST localhost:9554/loki/api/v1/push -H 'Content-Type: application/json' -d '{"streams":[
+  {"stream":{"service":"demo","a":"1","b":"2","c":"3","d":"4","e":"5","f":"6","g":"7","h":"8","i":"9","j":"10"},"values":[["'$NOW'","quá nhiều label"]]}]}' -w '\npush: %{http_code}\n'
+```
+
+</Terminal>
+
+<Predict question="Cả cụm 11 service đang có bao nhiêu stream? Ba dòng log demo tạo thêm mấy stream? Dòng có 11 label thì sao?">
+
+```text
+18
+{"container":"d12-shop-2","level":"INFO","service":"shop-2"}
+{"container":"d12-shop-2","level":"ERROR","service":"shop-2"}
+{"container":"d12-shop-2","level":"WARN","service":"shop-2"}
+push: 204
+3
+entry for stream '{a="1", b="2", c="3", d="4", e="5", f="6", g="7", h="8", i="9", j="10", service="demo"}' has 11 label names; limit 10
+
+push: 400
+```
+
+- Cả cụm chỉ có **18 stream** dù đã ghi hàng chục nghìn dòng: số stream bằng số tổ hợp (service, container, level) thật sự xuất hiện. `shop-2` có ba: `INFO`, `WARN` (dòng "fault injected") và `ERROR`.
+- Ba dòng demo tạo **ba stream**, mỗi stream một dòng. Với 20 request mỗi giây, `trace_id` làm label sinh hơn 1,7 triệu stream mỗi ngày, mỗi stream vài chục byte: đúng kiểu dữ liệu làm index phình và chunk vụn. Loki có giới hạn số stream cho mỗi tenant (`max_global_streams_per_user`) để chặn việc này.
+- Dòng có 11 label bị **từ chối** với mã 400 vì `max_label_names_per_series: 10` trong cấu hình của lab (mặc định 15). Đây là loại giới hạn bảo vệ mà callout ở phần Kiến thức nhắc tới: nó chỉ có ích khi được đặt và bạn biết nó phản ứng thế nào.
+
+</Predict>
+
+Stream `demo` sẽ tự hết hạn theo thời gian lưu mặc định.
+
+<Check id="d12.5.lab-streams">Đếm được số stream của Loki, chứng minh được trên lab rằng một label có giá trị duy nhất cho mỗi request tạo một stream cho mỗi dòng, và thấy được một giới hạn bảo vệ từ chối dữ liệu.</Check>
+
+### 6. Thời gian lưu, ở cả hai nơi
+
+<Terminal where="mac">
+
+```bash
+curl -s localhost:9554/config | grep -E '^  (retention_period|retention_enabled|compaction_interval):'
+curl -s localhost:9554/config | grep -A3 '^  retention_stream:'
+curl -s localhost:9554/metrics | grep -E '^loki_compactor_apply_retention_operation_total'
+docker run --rm -v d12_loki-data:/loki:ro alpine:3.24.2 du -sh /loki/chunks /loki/compactor
+docker inspect d12-shop-1 --format '{{json .HostConfig.LogConfig}}'
+docker inspect d12-nginx --format '{{json .HostConfig.LogConfig}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  compaction_interval: 1m0s
+  retention_enabled: true
+  retention_period: 1w
+  retention_period: 0s
+  retention_stream:
+  - period: 1d
+    priority: 1
+    selector: '{service="nginx"}'
+loki_compactor_apply_retention_operation_total{status="success"} 1
+1.6M	/loki/chunks
+64.0K	/loki/compactor
+{"Type":"json-file","Config":{}}
+{"Type":"json-file","Config":{"max-file":"3","max-size":"10m"}}
+```
+
+</Expected>
+
+**Trong Loki:**
+
+- `/config` in cấu hình đang chạy thật, sau khi gộp mặc định; dùng nó để chắc rằng thứ bạn viết là thứ Loki hiểu. Hai dòng `retention_period` thuộc hai khối khác nhau: `1w` (168 giờ) nằm trong `limits_config`, là mặc định của lab cho mọi stream; `0s` thuộc `table_manager`, thành phần quản lý thời gian lưu kiểu cũ mà cấu hình index `tsdb` không dùng tới.
+- `retention_stream` ghi đè cho stream khớp `{service="nginx"}`: log truy cập, nhiều nhất và ít giá trị lâu dài nhất trong lab, chỉ giữ 1 ngày (mức tối thiểu Loki cho phép là 24 giờ). Một hệ thống thật có thể làm ngược lại cho stream kiểm toán: giữ 12 tháng trong khi mặc định là 30 ngày.
+- `retention_enabled: true` là dòng dễ quên nhất. Không có nó, `retention_period` chỉ là con số trong file: compactor gộp index nhưng không xoá gì. Counter `apply_retention_operation_total` tăng cho thấy compactor đang chạy vòng áp chính sách; nếu bạn chưa thấy dòng này, chờ vài phút rồi hỏi lại, vì lượt đầu chạy sau khi index đầu tiên được ghi ra đĩa.
+- Việc xoá diễn ra sau khi dữ liệu quá hạn, nên lab không chờ được để thấy dung lượng giảm; `du` cho biết hiện Loki đang dùng bao nhiêu.
+
+**Trên máy chạy Docker:**
+
+- `shop-1` có `"Config":{}`: driver `json-file` **không giới hạn**. File log của nó lớn mãi cho tới khi container bị xoá hoặc đĩa đầy: mỗi dòng log của lab chiếm hơn 200 byte, nên 10 request mỗi giây đã là khoảng 200 MB mỗi ngày, và traffic thật là nhiều GB.
+- `nginx` có `max-size` 10 MB và giữ 3 file, nhờ khối `logging` trong `compose.logs.yaml` (đó là lý do bước 1 tạo lại container này): tối đa 30 MB, phần cũ tự bị xoay vòng. Alloy đã đẩy log đi trước đó nên không mất gì. Trên máy chủ, đặt mặc định cho mọi container trong `/etc/docker/daemon.json` (`log-driver`, `log-opts`) thay vì nhắc từng service.
+
+Hai chính sách này độc lập: Loki xoá đúng hạn không làm file cục bộ nhỏ đi, và ngược lại.
+
+<Check id="d12.5.lab-retention">Kiểm được cấu hình thời gian lưu đang có hiệu lực trong Loki, đặt được thời gian lưu riêng cho một stream, và giới hạn được kích thước log cục bộ của một container.</Check>
+
+### 7. Xem trong Grafana
+
+Mở `http://localhost:9553`, vào **Explore**, chọn datasource **Loki**, dán `{service=~"shop-.+"} | json | status >= 500` rồi chạy: bạn có biểu đồ số dòng theo thời gian và danh sách log, bấm vào một dòng để xem các trường. Phần kiểm bằng dòng lệnh gọi đúng đường đó, qua Grafana:
+
+<Terminal where="mac">
+
+```bash
+curl -s localhost:9553/api/datasources | jq -c '.[] | {name, type}'
+NOW=$(date +%s)
+curl -s localhost:9553/api/ds/query -H 'Content-Type: application/json' -d '{
+  "from": "'$((NOW-300))'000", "to": "'$NOW'000",
+  "queries": [{"refId": "A", "datasource": {"uid": "loki"}, "queryType": "range", "maxLines": 2,
+    "expr": "{service=~\"shop-.+\"} | json | status >= 500"}]}' \
+  | jq -c '.results.A | {status, lines: (.frames[0].data.values[2] | length)}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"name":"Loki","type":"loki"}
+{"name":"Prometheus","type":"prometheus"}
+{"status":200,"lines":2}
+```
+
+</Expected>
+
+<Check id="d12.5.lab-grafana">Thêm được Loki làm datasource của Grafana bằng file và chạy được một truy vấn LogQL qua Grafana.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Alloy báo `permission denied … /var/run/docker.sock`:** trên Linux, socket thuộc nhóm `docker`; image Alloy chạy bằng root nên thường không gặp, trừ khi bạn đổi `user:`. Trên Docker Desktop không cần chỉnh gì.
+- **Một component của Alloy `unhealthy`:** mở `http://localhost:9556`, bấm vào component để đọc lỗi; hoặc `docker logs d12-alloy 2>&1 | grep -i error | tail -3`. Sai cú pháp file `.alloy` thì Alloy không khởi động.
+- **`./lq` in rỗng:** bộ chọn không khớp stream nào, hoặc không có dòng trong khoảng thời gian nhìn lại (tham số thứ hai, mặc định 5 phút). Liệt kê giá trị label bằng lệnh ở cuối bước 1.
+- **`LỖI: parse error …`:** LogQL bắt buộc có ít nhất một bộ so khớp không rỗng trong ngoặc nhọn; `{}` hoặc `{service=~".*"}` bị từ chối, dùng `.+`.
+- **Loki log `error getting ingester clients … empty ring` lúc khởi động:** vô hại trong vài giây đầu, trước khi nó `ready`.
+- **Danh sách label có thêm `service_name` hoặc `__stream_shard__`:** cấu hình thiếu `discover_service_name: []` hoặc `shard_streams`. Không sai, chỉ là thêm label ngoài ý muốn.
+
+</Callout>
+
+### Dọn dẹp
+
+D12.6 dùng tiếp toàn bộ cụm. Nếu nghỉ giữa chừng:
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu">
+
+```bash
+cd ~/masteva-d12 && docker compose stop
+```
+
+</Terminal>
+
+Muốn dọn hẳn thì dùng khối lệnh ở cuối D12.1; `docker compose down -v` xoá cả volume `d12_loki-data` và `d12_alloy-data`.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao level được làm label còn status và route thì không?">
+
+Ba tiêu chí: số giá trị, tần suất dùng để **chọn**, và có cần chính sách riêng không. `level` có ba, bốn giá trị, gần như truy vấn nào khi có sự cố cũng bắt đầu bằng "chỉ lấy ERROR", và bạn có thể muốn giữ ERROR lâu hơn DEBUG; cả ba tiêu chí đều đạt. `status` có vài chục giá trị và `route` phụ thuộc ứng dụng: nhân với `service`, `container`, `level` thì số stream tăng nhanh, trong khi lọc bằng `| json | status >= 500` sau khi đã chọn đúng service vẫn đủ nhanh. Khi lượng log của một service lớn tới mức quét không nổi, cách xử lý đầu tiên là thu hẹp khoảng thời gian và thêm lọc dòng, sau đó mới cân nhắc thêm label; tài liệu của Loki nêu rõ label nên là thứ mô tả nguồn log, không phải nội dung.
+
+</Reveal>
+
+<Reveal title="Gom log bằng agent trên máy hay để ứng dụng đẩy thẳng?">
+
+Ứng dụng in ra stdout rồi để agent thu là mặc định tốt: ứng dụng không cần biết kho log ở đâu, không treo khi kho log chậm, và log của tiến trình chết bất ngờ (panic, OOM) vẫn nằm lại trong file để agent đọc. Đẩy thẳng từ ứng dụng (thư viện gửi tới Loki hoặc OTLP) bớt một thành phần, hợp với môi trường không có chỗ đặt agent như hàm serverless, nhưng buộc mỗi ứng dụng tự lo đệm, thử lại và áp lực ngược. Trên Kubernetes, agent chạy dạng DaemonSet (K1.4) đọc log của mọi pod trên node; bài này là phiên bản một máy của mô hình đó.
+
+</Reveal>
+
+<Reveal title="Dữ liệu nhạy cảm lọt vào log thì làm gì?">
+
+Phòng trước: không ghi mật khẩu, token, số thẻ, nội dung request đầy đủ; SB8.1 đã nêu ở phía ứng dụng. Lớp thứ hai là bộ thu: Alloy có các stage thay thế hoặc bỏ dòng theo mẫu (`stage.replace`, `stage.drop`), đặt trước khi log rời máy. Khi đã lọt vào kho: Loki có API xoá theo truy vấn, do compactor thực hiện, còn bản sao ở file cục bộ, ở các bản sao lưu và ở hệ thống hạ nguồn thì phải lần riêng. Thời gian lưu ngắn cho log ứng dụng vì vậy cũng là một biện pháp an toàn: thứ lọt vào sẽ tự biến mất sau vài ngày thay vì nằm đó nhiều năm. Và coi bí mật đã vào log là đã lộ: đổi nó.
+
+</Reveal>
+
+<Reveal title="Yêu cầu giữ 12 tháng thì có phải giữ mọi log 12 tháng trong Loki không?">
+
+Về kỹ thuật thì không nên, và câu trả lời về phạm vi thuộc về pháp chế như phần Kiến thức đã nói. Giữ mọi dòng debug 12 tháng là trả tiền lưu trữ cho thứ không ai đọc, đồng thời giữ lâu hơn cần thiết dữ liệu cá nhân có thể nằm trong đó. Cách làm phổ biến: xác định đúng loại log thuộc yêu cầu (đăng nhập, đăng xuất, địa chỉ IP, thao tác quản trị), cho nó một stream riêng có cấu trúc cố định, đặt `retention_stream` 12 tháng hoặc hơn trên object storage, có thể bật khoá chống xoá (object lock) nếu cần chứng minh tính toàn vẹn. Phần còn lại theo mặc định ngắn. Điều khoản nói "truy xuất được", nên cũng phải thử: định kỳ tìm lại một sự kiện 11 tháng tuổi. D16 đi sâu vào chi phí và phân tầng lưu trữ; D24 đặt yêu cầu này trong bức tranh tuân thủ chung.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI giúp nhiều ở hai việc: viết LogQL từ mô tả ("dòng lỗi của checkout chậm hơn 1 giây, đếm theo service") và chuyển cấu hình giữa các bộ thu. Chỗ hay sai: sinh cấu hình **Promtail** hoặc Grafana Agent (đã hết hỗ trợ) thay vì Alloy; cú pháp Alloy cũ hoặc tên component không tồn tại; gợi ý label `trace_id`, `user_id`, `path` "để tìm cho nhanh"; cấu hình Loki dùng `boltdb-shipper` và schema `v11` của bản 2; quên `retention_enabled`. Kiểm lại: Alloy có lệnh `alloy fmt` và từ chối khởi động khi cấu hình sai; `curl …/config` của Loki cho thấy cấu hình thật; đếm stream như bước 5 trước và sau khi thêm label; và hỏi lại AI phiên bản nó đang viết cho.
+
+</Callout>
+
+<Callout kind="link">
+
+D12.6 cho Nginx ghi trace id, thêm trace vào Grafana và làm cho trace id trong log thành đường link sang trace. SB8.1 là phía ứng dụng: log JSON, MDC, không ghi dữ liệu nhạy cảm. K1.4 chạy bộ thu dạng DaemonSet. D16 bàn chi phí log ở quy mô lớn (lọc, lấy mẫu, phân tầng lưu trữ); D24 bàn tuân thủ. D1.1 đã dùng `journalctl` cho log của systemd trên một máy: cùng nhu cầu, chưa tập trung.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d12.5.mastery-pipeline">Tự dựng được đường ống log cho một cụm container: bộ thu, kho log, label có chủ đích, và giải thích được lựa chọn giữa Loki với Elasticsearch hoặc OpenSearch.</Check>
+
+<Check id="d12.5.mastery-query">Từ một triệu chứng (lỗi tăng, một request cụ thể hỏng), viết được truy vấn LogQL tìm ra các dòng liên quan trên nhiều service, và biết khi nào nên dùng metric thay vì log.</Check>
+
+<Check id="d12.5.mastery-retention">Lập được chính sách thời gian lưu theo loại log cho một hệ thống, gồm log cục bộ, kho tập trung và log phải giữ theo quy định, và kiểm được chính sách đó đang có hiệu lực.</Check>
+
+</Mastery>

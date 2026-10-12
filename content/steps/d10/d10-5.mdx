@@ -1,0 +1,833 @@
+---
+title: Kiểm thử và review IaC, Pulumi và CloudFormation
+description: Dựng các lớp kiểm tra cho mã hạ tầng từ rẻ tới đắt, gồm fmt và validate, unit test bằng provider giả, integration test tạo tài nguyên thật rồi tự dọn, đọc plan dưới dạng JSON để chặn hành động xoá ngoài ý muốn, quét cấu hình bằng Trivy và Checkov, rồi đặt Terraform, OpenTofu cạnh Pulumi và CloudFormation.
+id: d10.5
+step: d10
+prerequisites: [d10.2, d10.4]
+topics: [d10.kiem-thu-iac, d10.pulumi-cloudformation]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    opentofu: 1.13.1 (image ghcr.io/opentofu/opentofu)
+    terraform: 1.16.5 (image hashicorp/terraform)
+    provider-docker: kreuzwerker/docker 4.6.0
+    trivy: 0.75.0
+    checkov: 3.3.26
+    jq: 1.8.2
+---
+
+<Goal>
+
+Đưa được một thay đổi hạ tầng qua các lớp kiểm tra trước khi nó chạm vào thứ đang chạy, và biết mỗi lớp bắt được gì, bỏ sót gì. Học xong bài này, bạn giải thích được:
+
+- Vì sao `validate` báo "valid" mà `apply` vẫn hỏng, và lớp kiểm tra nào bắt được phần còn lại.
+- Vì sao test của module chạy được trên máy không có Docker, không có tài khoản cloud.
+- Vì sao một pull request "chỉ nâng phiên bản module" lại xoá một container, và làm sao để máy chặn điều đó trước người.
+- Vì sao cùng một bộ mã, máy quét này báo 0 lỗi còn máy quét kia báo 11.
+
+</Goal>
+
+<Knowledge>
+
+### Các lớp kiểm tra, từ rẻ tới đắt
+
+Mã ứng dụng sai thì test đỏ. Mã hạ tầng sai thì một database biến mất. Vì `apply` là bước đắt và khó quay lại, mọi lỗi nên bị bắt ở lớp rẻ nhất có thể:
+
+| Lớp | Lệnh | Bắt được | Cần gì | Thời gian |
+|---|---|---|---|---|
+| Định dạng | `tofu fmt -check` | Mã lệch chuẩn trình bày; diff sạch hơn khi review | Không gì cả | Dưới 1 giây |
+| Hợp lệ | `tofu validate` | Sai cú pháp, tham chiếu tới thứ không tồn tại, sai kiểu, thiếu tham số bắt buộc | Provider đã `init` | Vài giây |
+| Quét cấu hình | `trivy config`, `checkov` | Cấu hình rủi ro đã biết: cổng mở ra Internet, đĩa không mã hoá, thiếu giới hạn tài nguyên | Chỉ cần file mã | Vài giây |
+| Unit test | `tofu test` với `command = plan` | Logic của module: đặt tên, tính cổng, `validation` có chặn đúng không | Provider; có thể là provider giả | Vài giây |
+| Đọc plan | `tofu plan -out`, `tofu show -json` | Thay đổi này sẽ **làm gì** với hạ tầng đang có: xoá, thay thế, sửa | State và quyền đọc thật | Chục giây tới vài phút |
+| Integration test | `tofu test` với `command = apply` | Provider và API thật có nhận cấu hình không: trùng tên, sai quyền, thuộc tính không hợp nhau | Môi trường thật để tạo và xoá | Vài phút, có thể tốn tiền |
+| Policy as code | OPA, Conftest, Sentinel | Quy tắc riêng của tổ chức trên plan | Bộ quy tắc | Chặng D22 |
+
+Hai lớp đầu không biết gì về hạ tầng thật: `validate` nói mã **tự nhất quán**, không nói nó đúng. Lớp "đọc plan" là lớp duy nhất nhìn vào state của môi trường cụ thể, nên là lớp duy nhất thấy được "thay đổi này xoá container đang chạy".
+
+<Check id="d10.5.layers">Kể được các lớp kiểm tra của IaC theo thứ tự chi phí, mỗi lớp bắt được loại lỗi nào và cần gì để chạy.</Check>
+
+### `tofu test`: kiểm thử module
+
+Từ Terraform 1.6 và OpenTofu 1.6, công cụ có sẵn khung test. File test có đuôi `.tftest.hcl`, thường đặt trong thư mục `tests/` của module, gồm các khối `run`:
+
+```hcl
+run "ten_tinh_huong" {
+  command = plan            # hoặc apply (mặc định)
+
+  variables {               # ghi đè biến cho riêng lượt này
+    replicas = 2
+  }
+
+  assert {
+    condition     = docker_container.web[1].name == "t-dev-web-1"
+    error_message = "Câu này hiện ra khi điều kiện sai."
+  }
+}
+```
+
+| Thành phần | Tác dụng |
+|---|---|
+| `command = plan` | Chỉ lập plan rồi kiểm các giá trị đã biết lúc plan. Nhanh, không tạo gì |
+| `command = apply` | Tạo tài nguyên thật, kiểm cả giá trị chỉ có sau khi tạo. Khi file test chạy xong, công cụ **tự destroy** mọi thứ nó đã tạo |
+| `expect_failures = [var.x]` | Lượt test **đạt** khi `validation` của biến đó (hoặc một `precondition`, `check`) báo lỗi. Dùng để thử chính các hàng rào |
+| `mock_provider "docker" {}` | Thay provider bằng bản giả: không gọi API nào, giá trị "biết sau khi apply" được sinh ngẫu nhiên. Có ở Terraform từ 1.7, OpenTofu từ 1.8 |
+
+State của test nằm trong bộ nhớ, không đụng tới state thật. Unit test với provider giả chạy được ở bất kỳ đâu, kể cả runner CI không có quyền gì; đổi lại nó chỉ kiểm được logic của bạn, không kiểm được API có chấp nhận cấu hình hay không. Integration test bù phần đó và phải có nơi để tạo thật: một tài khoản sandbox, hoặc như trong lab, Docker trên máy.
+
+<Check id="d10.5.testing">Giải thích được cấu trúc của một file `.tftest.hcl`, khác biệt giữa lượt `plan` và lượt `apply`, và `mock_provider`, `expect_failures` dùng để làm gì.</Check>
+
+### Đọc plan trong pull request
+
+Với IaC, thứ cần review không chỉ là diff của mã mà là **plan**: cùng một diff cho ra plan khác nhau ở mỗi môi trường, tuỳ state. Quy trình chuẩn:
+
+```text
+ mở PR ──▶ CI: fmt, validate, quét, test ──▶ CI: plan -out=tfplan  (chỉ ĐỌC hạ tầng)
+                                              │  tofu show -json tfplan ▶ kiểm tự động
+                                              ▼
+                               plan đăng vào PR ──▶ người review đọc
+                                              │
+ merge vào nhánh chính ──▶ pipeline: apply ĐÚNG file tfplan đã duyệt, có khoá state, tuần tự
+```
+
+Khi đọc plan, tìm theo thứ tự: dòng tổng kết (`to add, to change, to destroy`) có khớp với điều PR nói nó làm không; mọi `must be replaced` và `will be destroyed`, nhất là trên tài nguyên chứa dữ liệu; thuộc tính nào `forces replacement`; và những resource bạn **không** ngờ sẽ thấy trong plan. `tofu show -json tfplan` xuất plan ở dạng máy đọc được; mỗi phần tử của `resource_changes` có `address` và `change.actions` (`["create"]`, `["update"]`, `["delete"]`, hoặc `["delete","create"]` cho thay thế), nên vài dòng `jq` là đủ để pipeline tự dừng khi có hành động xoá chưa được cho phép.
+
+Hai điều về file plan: nó chứa giá trị thật của biến và thuộc tính, kể cả secret, nên là artifact phải giới hạn quyền đọc; và nó cũ đi khi state đổi, nên apply phải dùng đúng file đã duyệt và từ chối nếu file đã lỗi thời (D11.1).
+
+<Callout kind="production">
+
+Tại KubeCon Europe 2019, David Xia kể lại việc đội hạ tầng Spotify xoá nhầm cụm Kubernetes production của chính mình. Theo slide của bài nói: lần đầu, anh xoá một cụm production 50 node đang chạy hàng chục workload; dựng lại mất 3,25 giờ vì script tạo cụm có lỗi, tài liệu thiếu và sai, quy trình tạo cụm không chạy tiếp được từ giữa chừng. "Một tháng sau", khi đội đang đưa các cụm vào mã để phòng chuyện xoá nhầm, hai dòng tiếp theo của slide ghi: họ đã "unknowingly modified global state during review builds", và hai PR được merge sai thứ tự. Khi cố tạo lại cụm bằng cách merge PR còn lại, việc tạo thất bại vì thiếu quyền; đội cấp quyền đủ nhưng khác trước, và điều đó làm cách Terraform nhìn các cụm thay đổi. Người dùng cuối không bị ảnh hưởng: khi đó Kubernetes ở Spotify còn là beta, các đội được khuyên chỉ chuyển một phần instance của mỗi dịch vụ sang, và hệ thống service discovery chuyển lưu lượng về các instance ngoài Kubernetes.
+
+Slide "Codified Our Infrastructure" liệt kê cách họ sửa quy trình sau đó: thêm linter và validator; đăng kết quả dry run thành bình luận trên pull request; bắt buộc status check đạt, nhánh phải cập nhật và có review chấp thuận trước khi merge; và cho build của PR thất bại khi kết quả dry run chứa những từ khoá như "destroy". Bước 4 của lab dựng lại hai ý trong danh sách đó: plan đưa ra cho người đọc, và một script chặn hành động xoá.
+
+Slide không nói cơ chế nào đã để build của PR sửa được state dùng chung; phần sau là bài học rút ra của bài. Build của một pull request là build của mã **chưa được duyệt**. Nếu build đó ghi được vào state dùng chung hay sửa được hạ tầng, review mất ý nghĩa. Vì vậy bước chạy trên PR chỉ `plan` bằng thông tin xác thực chỉ đọc; `apply` chỉ chạy từ nhánh chính, tuần tự, có khoá state (D11.3), để thứ tự merge cũng là thứ tự áp dụng.
+
+</Callout>
+
+<Check id="d10.5.plan-review">Mô tả được quy trình plan trên PR rồi apply sau merge, kể được những điều cần tìm trong một plan, và vì sao build của PR không được có quyền ghi.</Check>
+
+### Quét cấu hình
+
+Máy quét cấu hình (Trivy với lệnh `config`, Checkov; `tfsec` đã gộp vào Trivy) đọc file `.tf` và đối chiếu từng resource với một bộ quy tắc viết sẵn: security group mở cổng 22 cho `0.0.0.0/0`, database truy cập được từ Internet, bucket không mã hoá, container không đặt giới hạn tài nguyên. Nó không cần `init`, không cần thông tin xác thực, nên chạy được ngay ở bước đầu của pipeline.
+
+D5.2 đã nêu giới hạn của máy quét lỗ hổng; máy quét cấu hình có giới hạn cùng dạng:
+
+| Máy quét biết | Máy quét không biết |
+|---|---|
+| Resource thuộc loại nó có quy tắc, với giá trị viết thẳng trong mã | Loại resource nó **chưa có quy tắc**: kết quả là "0 lỗi", giống hệt khi mã sạch |
+| Mẫu cấu hình rủi ro phổ biến | Ngữ cảnh: cổng mở kia là cố ý cho một load balancer công khai hay là sơ suất |
+| Mức nghiêm trọng theo bộ quy tắc | Giá trị chỉ biết lúc chạy; cấu hình đúng từng cái nhưng ghép lại thì sai |
+
+Dùng trong pipeline như ở D5.2: chặn theo ngưỡng (`--severity HIGH,CRITICAL --exit-code 1`), và ghi ngoại lệ **ngay cạnh mã, kèm lý do và hạn**: `#trivy:ignore:<mã>:exp:<ngày>` phía trên khối bị báo, hoặc `#checkov:skip=<mã>:<lý do>` bên trong resource. Quy tắc riêng của tổ chức (mọi tài nguyên phải có nhãn `owner`, chỉ được dùng ba vùng) viết bằng policy as code ở chặng D22.
+
+<Check id="d10.5.scanning">Giải thích được máy quét cấu hình làm việc thế nào, vì sao "0 lỗi" có thể là điểm mù, và cách ghi một ngoại lệ có lý do và hạn.</Check>
+
+### Pulumi và CloudFormation
+
+Terraform và OpenTofu không phải lựa chọn duy nhất. Hai cái tên bạn sẽ gặp:
+
+| | Terraform, OpenTofu | Pulumi | AWS CloudFormation |
+|---|---|---|---|
+| Viết bằng | HCL, ngôn ngữ khai báo riêng | Ngôn ngữ lập trình thông dụng: TypeScript, Python, Go, C#, Java; hoặc YAML | Template YAML hoặc JSON; hoặc sinh từ mã bằng AWS CDK |
+| Phạm vi | Mọi nền tảng có provider | Mọi nền tảng có provider (nhiều provider được chuyển từ provider của Terraform) | Chủ yếu tài nguyên AWS |
+| State | File state do bạn đặt ở backend | Pulumi Cloud theo mặc định, hoặc backend tự quản (S3, GCS, file); secret trong state được mã hoá sẵn | Do dịch vụ AWS giữ, theo từng **stack**; bạn không thấy file state |
+| Xem trước | `plan` | `pulumi preview` | Change set |
+| Phát hiện drift | `plan`, `plan -refresh-only` | `pulumi refresh`, `pulumi preview` | Tính năng drift detection của stack |
+| Khi apply lỗi giữa chừng | Dừng lại, state ghi phần đã xong, bạn sửa rồi chạy tiếp | Tương tự | Mặc định **tự rollback** cả stack về trạng thái trước |
+| Giấy phép | BSL 1.1 (Terraform), MPL 2.0 (OpenTofu) | Apache 2.0 cho công cụ; Pulumi Cloud là dịch vụ thương mại | Dịch vụ của AWS, không tính phí riêng cho tài nguyên AWS |
+| Hợp khi | Nhiều nền tảng, đội vận hành, cần hệ sinh thái module và tuyển người dễ | Đội phát triển muốn dùng ngôn ngữ, IDE và khung test quen thuộc; hạ tầng có logic sinh động | Chỉ dùng AWS, muốn mọi thứ nằm trong AWS và được AWS hỗ trợ |
+
+Ba công cụ chung một mô hình: mô tả mong muốn, lưu trạng thái đã tạo, xem trước khác biệt, rồi áp. Mọi khái niệm của chặng này (state và khoá, drift, import, review bản xem trước, tách môi trường) có mặt ở cả ba dưới tên khác. Khác biệt đáng cân nhắc nhất không phải cú pháp mà là: ai giữ state, và đội của bạn đọc được loại mã nào khi có sự cố lúc nửa đêm. Ngôn ngữ lập trình đầy đủ cho phép trừu tượng hoá mạnh, và cũng cho phép viết ra mã hạ tầng mà chỉ tác giả hiểu. CDK for Terraform, cầu nối cho phép viết Terraform bằng ngôn ngữ lập trình, đã bị HashiCorp ngừng và lưu trữ repo từ 12/2025; đừng bắt đầu dự án mới với nó.
+
+Bạn gặp CloudFormation ở chặng D10 dù không chọn nó: nhiều dịch vụ và công cụ của AWS (SAM, CDK, các bộ dựng sẵn trong console) tạo stack CloudFormation phía sau.
+
+<Check id="d10.5.alternatives">So sánh được Terraform, OpenTofu với Pulumi và CloudFormation theo ngôn ngữ, nơi giữ state, cách xem trước và hành vi khi lỗi, và nêu được khi nào mỗi công cụ hợp hơn.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Command: test (OpenTofu Docs)](https://opentofu.org/docs/cli/commands/test/): toàn bộ cú pháp file test: `run`, `assert`, `expect_failures`, `mock_provider`, `override_resource`, và cách công cụ dọn tài nguyên.
+- [JSON Output Format (OpenTofu Docs)](https://opentofu.org/docs/internals/json-format/): cấu trúc của `tofu show -json`, phần "Change Representation" liệt kê mọi giá trị của `actions`.
+- [Misconfiguration Scanning (Trivy Docs)](https://trivy.dev/latest/docs/scanner/misconfiguration/): các loại file Trivy quét, cách viết ngoại lệ trong mã và trong file cấu hình.
+- [Concepts (Pulumi Docs)](https://www.pulumi.com/docs/iac/concepts/) và [What is CloudFormation? (AWS)](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/Welcome.html): điểm bắt đầu nếu đội bạn dùng một trong hai công cụ này.
+- [Slide bài nói "How Spotify Accidentally Deleted All its Kube Clusters with No User Impact" (PDF, KubeCon Europe 2019)](https://github.com/sbueringer/kubecon-slides/blob/master/slides/2019-kubecon-eu/Keynote%20How%20Spotify%20Accidentally%20Deleted%20All%20its%20Kube%20Clusters%20with%20No%20User%20Impact%20-%20David%20Xia%2C%20Infrastructure%20Engineer%2C%20Spotify%20-%20KubeCon%20Europe%202019%20Keynote%20-%20David%20Xia%20-%20How%20Spotify%20Accidentally%20Deleted%20All%20Its%20Kube%20Clusters%20with%20No%20User%20Impac.pdf) và [bản ghi keynote](https://www.youtube.com/watch?v=ix0Tw8uinWs): nguồn của callout; xem slide "A Month Later" và "Codified Our Infrastructure".
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D11.2 (repo `~/masteva-d10/modules` có tag `v1.1.0`) và D11.4 (thư mục `~/masteva-d10/k8s/shop` còn các file `.tf`; cụm kind không cần chạy). Bước quét dùng image Trivy 0.75.0 (nén khoảng 59 MB), lần chạy đầu tải thêm bộ quy tắc của nó; phần Checkov là tuỳ chọn vì image của nó nặng 184 MB nén, 835 MB trên đĩa. Dùng các cổng **9547, 9548, 9549**. **Profile máy:** mọi bước dùng dưới 300 MB RAM; không cần thu gọn cho máy 8 GB.
+
+<Terminal where="mac" title="Mỗi terminal mới">
+
+```bash
+source ~/masteva-d10/env.sh
+cd ~/masteva-d10/modules/web-app
+git -C .. tag
+tofu init -no-color | grep -E 'successfully'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+v1.0.0
+v1.1.0
+OpenTofu has been successfully initialized!
+```
+
+</Expected>
+
+### 1. `fmt` và `validate`
+
+Thêm vào module một output mới, viết vội:
+
+<Terminal where="mac">
+
+```bash
+cat >> outputs.tf <<'EOF'
+
+output "container_names" {
+  description="Tên các container web"
+  value=docker_container.wbe[*].name
+}
+EOF
+tofu fmt -check -diff; echo "fmt: exit=$?"
+tofu validate -no-color; echo "validate: exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+outputs.tf
+--- old/outputs.tf
++++ new/outputs.tf
+@@ -9,6 +9,6 @@
+ }
+
+ output "container_names" {
+-  description="Tên các container web"
+-  value=docker_container.wbe[*].name
++  description = "Tên các container web"
++  value       = docker_container.wbe[*].name
+ }
+fmt: exit=3
+
+Error: Reference to undeclared resource
+
+  on outputs.tf line 13, in output "container_names":
+  13:   value=docker_container.wbe[*].name
+
+There is no managed resource "docker_container" "wbe" definition in the root
+module.
+validate: exit=1
+```
+
+</Expected>
+
+`fmt -check` không sửa gì, chỉ in tên file lệch chuẩn kèm diff và trả exit 3: đủ để CI từ chối. `validate` bắt được lỗi thật: `docker_container.wbe` không tồn tại. Nó phát hiện mà không cần Docker hay state, chỉ cần schema của provider đã tải lúc `init`. Sửa cả hai:
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/wbe/web/' outputs.tf
+tofu fmt
+tofu fmt -check && tofu validate -no-color
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+outputs.tf
+Success! The configuration is valid.
+```
+
+</Expected>
+
+`tofu fmt` không kèm `-check` tự viết lại file và in tên file nó đã sửa. Chạy nó trước mỗi commit, hoặc để trình soạn thảo chạy khi lưu.
+
+<Check id="d10.5.lab-fmt-validate">Dùng được `fmt -check` và `validate` để bắt lỗi trình bày và lỗi tham chiếu, và nói được `validate` không kiểm được gì.</Check>
+
+### 2. Unit test bằng provider giả
+
+<Terminal where="mac" title="~/masteva-d10/modules/web-app/tests/unit.tftest.hcl">
+
+```bash
+mkdir -p tests
+cat > tests/unit.tftest.hcl <<'EOF'
+# Unit test: chỉ plan, provider giả, không cần Docker
+mock_provider "docker" {}
+
+variables {
+  name        = "t"
+  environment = "dev"
+  base_port   = 9547
+}
+
+run "dat_ten_va_cong_theo_quy_uoc" {
+  command = plan
+
+  variables {
+    replicas = 2
+  }
+
+  assert {
+    condition     = docker_container.web[1].name == "t-dev-web-1"
+    error_message = "Tên container phải có dạng <name>-<environment>-web-<i>."
+  }
+
+  assert {
+    condition     = docker_container.web[1].ports[0].external == 9548
+    error_message = "Container thứ i phải dùng cổng base_port + i."
+  }
+
+  assert {
+    condition     = length(output.urls) == 2
+    error_message = "Output urls phải có một phần tử cho mỗi container."
+  }
+}
+
+run "tu_choi_moi_truong_la" {
+  command = plan
+
+  variables {
+    environment = "qa"
+  }
+
+  expect_failures = [var.environment]
+}
+
+run "tu_choi_qua_nhieu_replica" {
+  command = plan
+
+  variables {
+    replicas = 9
+  }
+
+  expect_failures = [var.replicas]
+}
+EOF
+tofu test -no-color
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+tests/unit.tftest.hcl... pass
+  run "dat_ten_va_cong_theo_quy_uoc"... pass
+  run "tu_choi_moi_truong_la"... pass
+  run "tu_choi_qua_nhieu_replica"... pass
+
+Success! 3 passed, 0 failed.
+```
+
+</Expected>
+
+Ba lượt, cả ba chỉ lập plan với provider giả, nên không container nào được tạo. Lượt đầu kiểm quy ước đặt tên và cách tính cổng. Hai lượt sau kiểm **hàng rào**: chúng đạt khi `validation` từ chối giá trị sai; nếu ai đó nới lỏng điều kiện trong `variables.tf`, hai lượt này sẽ đỏ.
+
+Giờ gây một lỗi hồi quy: một người "tối ưu" cách tính cổng.
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/external = var.base_port \+ count.index$/external = var.base_port + count.index + 1/' main.tf
+tofu validate -no-color
+tofu test -no-color 2>&1 | grep -vE '^$'
+perl -pi -e 's/count.index \+ 1$/count.index/' main.tf
+tofu test -no-color | tail -n 1
+```
+
+</Terminal>
+
+<Predict question="Mã sau khi sửa vẫn hợp lệ. validate nói gì, test nói gì?">
+
+```text
+Success! The configuration is valid.
+tests/unit.tftest.hcl... fail
+  run "dat_ten_va_cong_theo_quy_uoc"... fail
+Error: Test assertion failed
+  on tests/unit.tftest.hcl line 23, in run "dat_ten_va_cong_theo_quy_uoc":
+  23:     condition     = docker_container.web[1].ports[0].external == 9548
+    ├────────────────
+    │ docker_container.web[1].ports[0].external is 9549
+    ├────────────────
+    │ Diff:
+    │     9549 -> 9548
+Container thứ i phải dùng cổng base_port + i.
+  run "tu_choi_moi_truong_la"... pass
+  run "tu_choi_qua_nhieu_replica"... pass
+Failure! 2 passed, 1 failed.
+Success! 3 passed, 0 failed.
+```
+
+`validate` vẫn báo hợp lệ: `base_port + count.index + 1` là một biểu thức đúng cú pháp, đúng kiểu. Test thì đỏ, với đúng câu `error_message` bạn viết, vị trí của `assert`, và giá trị thực tế của vế trái. Đây là khoảng trống giữa "mã tự nhất quán" và "mã làm đúng điều đã hứa", và unit test lấp nó với chi phí vài giây. Sau khi trả lại công thức, cả ba lượt lại xanh. Thứ tự các khối trong output của bạn có thể khác: bảng kết quả đi ra stdout, thông báo lỗi đi ra stderr, và hai luồng trộn vào nhau tuỳ thời điểm.
+
+</Predict>
+
+<Check id="d10.5.lab-unit-test">Viết được unit test cho module bằng `mock_provider`, kiểm cả logic lẫn `validation`, và tái hiện được một lỗi hồi quy mà `validate` bỏ sót còn test bắt được.</Check>
+
+### 3. Integration test: tạo thật rồi tự dọn
+
+<Terminal where="mac" title="~/masteva-d10/modules/web-app/tests/integration.tftest.hcl">
+
+```bash
+cat > tests/integration.tftest.hcl <<'EOF'
+# Integration test: apply thật lên Docker, công cụ tự destroy khi xong
+variables {
+  name        = "d11-test"
+  environment = "dev"
+  base_port   = 9547
+}
+
+run "tao_that_mot_container" {
+  command = apply
+
+  assert {
+    condition     = docker_container.web[0].network_data[0].network_name == "d11-test-dev"
+    error_message = "Container phải nằm trong mạng của ứng dụng."
+  }
+
+  assert {
+    condition     = output.container_names == ["d11-test-dev-web-0"]
+    error_message = "Output container_names sai."
+  }
+}
+EOF
+tofu test -no-color
+docker ps -a --filter name=d11-test --format '{{.Names}}' | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+tests/integration.tftest.hcl... pass
+  run "tao_that_mot_container"... pass
+tests/unit.tftest.hcl... pass
+  run "dat_ten_va_cong_theo_quy_uoc"... pass
+  run "tu_choi_moi_truong_la"... pass
+  run "tu_choi_qua_nhieu_replica"... pass
+
+Success! 4 passed, 0 failed.
+       0
+```
+
+</Expected>
+
+Cả hai file test đều chạy (với `terraform test`, mỗi file có thêm dòng `in progress` và `tearing down`; kết quả như nhau). File mới không có `mock_provider`, nên lượt `apply` gọi Docker thật: tạo mạng, kéo image, chạy container, rồi kiểm `network_data`, một thuộc tính chỉ có sau khi container tồn tại. Xong file, công cụ destroy mọi thứ; dòng cuối đếm container tên `d11-test…` còn lại: `0`. Đây là lớp bắt được những lỗi mà provider giả không thể thấy, như trùng cổng hay image không tồn tại; cái giá là thời gian và một nơi để tạo thật. Nếu test bị ngắt giữa chừng, tài nguyên có thể sót lại: công cụ in danh sách những thứ nó không dọn được, và bạn phải xoá tay.
+
+Phát hành phiên bản module có test:
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/module_version = "1.1.0"/module_version = "1.2.0"/' main.tf
+echo '.terraform.lock.hcl' >> ../.gitignore
+git -C .. add . && git -C .. commit -q -m "web-app 1.2.0: output container_names, test" && git -C .. tag v1.2.0
+git -C .. log --oneline --decorate | head -n 1
+git -C .. ls-files
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+5bed232 (HEAD -> main, tag: v1.2.0) web-app 1.2.0: output container_names, test
+.gitignore
+web-app/main.tf
+web-app/outputs.tf
+web-app/tests/integration.tftest.hcl
+web-app/tests/unit.tftest.hcl
+web-app/variables.tf
+web-app/versions.tf
+```
+
+</Expected>
+
+Thư mục `tests/` đi cùng module trong Git. File khoá provider sinh ra khi chạy test thì không: với module dùng chung, root gọi nó mới là nơi khoá phiên bản provider (D11.2).
+
+<Check id="d10.5.lab-integration-test">Viết được integration test tạo tài nguyên thật, kiểm một thuộc tính chỉ có sau khi tạo, và xác nhận được công cụ đã tự dọn.</Check>
+
+### 4. Đọc plan như một reviewer, rồi để máy đọc
+
+Dựng một môi trường `staging` đang chạy module 1.1.0 với hai container:
+
+<Terminal where="mac" title="~/masteva-d10/review/main.tf">
+
+```bash
+mkdir -p ~/masteva-d10/review && cd ~/masteva-d10/review
+cat > main.tf <<EOF
+terraform {
+  required_version = ">= 1.9"
+
+  required_providers {
+    docker = {
+      source  = "kreuzwerker/docker"
+      version = "~> 4.6"
+    }
+  }
+}
+
+provider "docker" {
+  host = "unix:///var/run/docker.sock"
+}
+
+module "shop" {
+  source = "git::file://$LAB/modules//web-app?ref=v1.1.0"
+
+  name        = "d11-review"
+  environment = "staging"
+  replicas    = 2
+  base_port   = 9548
+}
+EOF
+tofu init -no-color | grep -E 'successfully'
+tofu apply -no-color -auto-approve | grep -E '^Apply'
+curl -s localhost:9548; curl -s localhost:9549
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+OpenTofu has been successfully initialized!
+Apply complete! Resources: 4 added, 0 changed, 0 destroyed.
+d11-review-staging-web-0 (web-app 1.1.0)
+d11-review-staging-web-1 (web-app 1.1.0)
+```
+
+</Expected>
+
+Một pull request tới với mô tả: "Nâng module web-app lên 1.2.0, giảm staging còn một replica cho đỡ tốn". Diff là hai dòng. CI lập plan, lưu ra file, rồi xuất JSON:
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/ref=v1.1.0/ref=v1.2.0/; s/replicas    = 2/replicas    = 1/' main.tf
+tofu init -no-color | grep -E 'successfully'
+tofu plan -no-color -out=tfplan | grep -E '^  # |^Plan:'
+tofu show -json tfplan > plan.json
+jq -r '.resource_changes[] | select(.change.actions != ["no-op"]) | "\(.change.actions | join("+"))\t\(.address)"' plan.json
+```
+
+</Terminal>
+
+<Predict question="PR nói: nâng phiên bản module và bớt một replica. Plan có mấy hành động xoá?">
+
+```text
+OpenTofu has been successfully initialized!
+  # module.shop.docker_container.web[0] must be replaced
+  # module.shop.docker_container.web[1] will be destroyed
+  # (because index [1] is out of range for count)
+Plan: 1 to add, 0 to change, 2 to destroy.
+delete+create	module.shop.docker_container.web[0]
+delete	module.shop.docker_container.web[1]
+```
+
+Hai, không phải một. Bớt replica xoá `web[1]`, đúng như mô tả. Nhưng nâng module cũng **thay thế** `web[0]`: phiên bản mới đổi nội dung file được nạp vào container, một thuộc tính buộc tạo lại. Trong vài giây `web[0]` bị thay, staging không còn container nào phục vụ. Mô tả của PR không nhắc điều đó vì người viết nhìn diff của mã, không nhìn plan. Bản JSON nói cùng nội dung ở dạng máy đọc được: `delete+create` là thay thế, `delete` là xoá.
+
+</Predict>
+
+Biến nhận xét đó thành một kiểm tra tự động:
+
+<Terminal where="mac" title="~/masteva-d10/review/plan-gate.sh">
+
+```bash
+cat > plan-gate.sh <<'EOF'
+#!/usr/bin/env bash
+# Dừng pipeline khi plan có hành động xoá hoặc thay thế chưa được cho phép.
+set -euo pipefail
+plan_json=$1
+destructive=$(jq -r '.resource_changes[]
+  | select(.change.actions | index("delete"))
+  | "  \(.change.actions | join("+"))  \(.address)"' "$plan_json")
+if [ -n "$destructive" ] && [ "${ALLOW_DESTROY:-no}" != "yes" ]; then
+  echo "Plan có hành động xoá hoặc thay thế:" >&2
+  echo "$destructive" >&2
+  echo "Nếu đúng ý, ghi rõ trong PR và chạy lại với ALLOW_DESTROY=yes." >&2
+  exit 1
+fi
+echo "Không có hành động xoá ngoài ý muốn."
+EOF
+bash plan-gate.sh plan.json; echo "exit=$?"
+ALLOW_DESTROY=yes bash plan-gate.sh plan.json; echo "exit=$?"
+tofu apply -no-color tfplan | grep -E '^Apply'
+curl -s localhost:9548
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Plan có hành động xoá hoặc thay thế:
+  delete+create  module.shop.docker_container.web[0]
+  delete  module.shop.docker_container.web[1]
+Nếu đúng ý, ghi rõ trong PR và chạy lại với ALLOW_DESTROY=yes.
+exit=1
+Không có hành động xoá ngoài ý muốn.
+exit=0
+Apply complete! Resources: 1 added, 0 changed, 2 destroyed.
+d11-review-staging-web-0 (web-app 1.2.0)
+```
+
+</Expected>
+
+Lần chạy đầu dừng với exit 1 và liệt kê hai resource: pipeline đỏ, tác giả PR phải đọc plan. Sau khi tác giả ghi rõ việc thay thế là có chủ ý và reviewer đồng ý, biến `ALLOW_DESTROY=yes` (trong CI thường là một nhãn trên PR hoặc một bước duyệt tay) cho qua, và `apply` chạy **đúng file `tfplan` đã được xem**. Đây là ý cuối trong danh sách của Spotify ở callout (cho build thất bại khi dry run có "destroy"), làm trên dữ liệu JSON thay vì tìm từ khoá. Script này là dạng tối giản của policy as code: chặng D22 viết các quy tắc như vậy bằng OPA, với ngoại lệ theo loại resource thay vì một công tắc chung. `plan.json` và `tfplan` chứa giá trị thật của mọi thuộc tính; trong pipeline, giữ chúng là artifact riêng tư và có hạn.
+
+<Check id="d10.5.lab-plan-review">Xuất được plan ra JSON, liệt kê được hành động theo từng resource bằng `jq`, và viết được một kiểm tra chặn hành động xoá chưa được cho phép.</Check>
+
+### 5. Quét cấu hình
+
+Dùng lại Trivy đã ghim digest từ D5.2. Quét trước một mẫu AWS: máy quét chỉ đọc file, nên không cần `init`, không cần tài khoản AWS, và không gì được tạo.
+
+<Terminal where="mac" title="~/masteva-d10/scan/aws-sample/main.tf">
+
+```bash
+mkdir -p ~/masteva-d10/scan/aws-sample && cd ~/masteva-d10/scan
+cat > aws-sample/main.tf <<'EOF'
+# Mẫu chỉ để quét tĩnh: không init, không apply
+resource "aws_security_group" "bastion" {
+  name        = "bastion"
+  description = "SSH vào bastion"
+  vpc_id      = "vpc-0123456789abcdef0"
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_db_instance" "orders" {
+  identifier                  = "orders"
+  engine                      = "postgres"
+  instance_class              = "db.t4g.micro"
+  allocated_storage           = 20
+  username                    = "app"
+  manage_master_user_password = true
+  publicly_accessible         = true
+  skip_final_snapshot         = true
+}
+EOF
+docker pull -q aquasec/trivy:0.75.0
+docker image inspect aquasec/trivy:0.75.0 --format '{{index .RepoDigests 0}}'
+TRIVY=aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+scan() { docker run --rm -v "$1":/src:ro -v d11-trivy-cache:/root/.cache/ $TRIVY config --quiet "${@:2}" /src; }
+scan "$PWD/aws-sample" --format json | jq -r '.Results[]?.Misconfigurations[]? | "\(.Severity)\t\(.ID)\t\(.Title)"' | sort
+scan "$PWD/aws-sample" --severity HIGH,CRITICAL --exit-code 1 > /dev/null; echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+docker.io/aquasec/trivy:0.75.0
+aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+HIGH	AWS-0080	RDS encryption has not been enabled at a DB Instance level.
+HIGH	AWS-0107	Security groups should not allow unrestricted ingress to SSH or RDP from any IP address.
+HIGH	AWS-0180	RDS Publicly Accessible
+LOW	AWS-0133	Enable Performance Insights to detect potential problems
+MEDIUM	AWS-0077	RDS Cluster and RDS instance should have backup retention longer than default 1 day
+MEDIUM	AWS-0176	RDS IAM Database Authentication Disabled
+MEDIUM	AWS-0177	RDS Deletion Protection Disabled
+exit=1
+```
+
+</Expected>
+
+Nếu digest in ra khác dòng `TRIVY=…`, dừng lại như D5.2 đã dặn. Trivy báo các cấu hình rủi ro của hai resource, trong đó các mục HIGH: SSH mở cho mọi địa chỉ, database truy cập được từ Internet, đĩa database không mã hoá. Để ý mục `AWS-0177`, deletion protection bị tắt: đúng lớp bảo vệ vắng mặt trong hai sự cố của D11.1 và D11.3. `exit=1` là thứ làm pipeline dừng. Sửa những gì sửa được, và ghi ngoại lệ có hạn cho cái chưa sửa được:
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/publicly_accessible         = true/publicly_accessible         = false\n  storage_encrypted           = true\n  deletion_protection         = true/; s/skip_final_snapshot         = true/skip_final_snapshot         = false/' aws-sample/main.tf
+perl -pi -e 's/^  ingress \{/  #trivy:ignore:AWS-0107:exp:2030-12-31 VPN chưa xong, bỏ ngoại lệ khi có VPN\n  ingress {/' aws-sample/main.tf
+scan "$PWD/aws-sample" --format json | jq -r '.Results[]?.Misconfigurations[]? | "\(.Severity)\t\(.ID)\t\(.Title)"' | sort
+scan "$PWD/aws-sample" --severity HIGH,CRITICAL --exit-code 1 > /dev/null; echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+LOW	AWS-0133	Enable Performance Insights to detect potential problems
+MEDIUM	AWS-0077	RDS Cluster and RDS instance should have backup retention longer than default 1 day
+MEDIUM	AWS-0176	RDS IAM Database Authentication Disabled
+exit=0
+```
+
+</Expected>
+
+Không còn mục HIGH nào, `exit=0`. Dòng `#trivy:ignore:AWS-0107:exp:2030-12-31` tắt đúng một quy tắc cho đúng khối `ingress` bên dưới, tới ngày ghi trong `exp`; sau ngày đó mục này tự hiện lại. Lab đặt hạn xa để kết quả của bài không đổi theo ngày bạn chạy; ngoài đời đặt hạn một tới ba tháng, để ngoại lệ tự hết hiệu lực và buộc có người xem lại. Lý do nằm ngay trong mã, nên người review thấy nó trong diff.
+
+Giờ quét mã Kubernetes của D11.4:
+
+<Terminal where="mac">
+
+```bash
+scan ~/masteva-d10/k8s/shop | grep -E 'terraform|Misconfigurations' | head -n 3
+```
+
+</Terminal>
+
+<Predict question="Deployment của D11.4 không đặt giới hạn CPU, RAM, không có securityContext, không có probe. Trivy báo mấy lỗi?">
+
+```text
+│ Target │   Type    │ Misconfigurations │
+│ .      │ terraform │         0         │
+```
+
+Không lỗi nào. Không phải vì mã tốt: bộ quy tắc Terraform của Trivy 0.75.0 nhắm vào tài nguyên của các cloud, và không có quy tắc cho resource `kubernetes_*` của provider `kubernetes`. "0" ở đây nghĩa là "không có quy tắc nào áp dụng", và báo cáo không phân biệt điều đó với "đã kiểm, đạt".
+
+</Predict>
+
+Một máy quét khác có bộ quy tắc khác. Phần này là tuỳ chọn vì image Checkov nặng:
+
+<Terminal where="mac" title="Tuỳ chọn: Checkov trên cùng thư mục">
+
+```bash
+docker run --rm -v ~/masteva-d10/k8s/shop:/src:ro bridgecrew/checkov:3.3.26 \
+  -d /src --framework terraform --compact --quiet | grep -E '^Passed|^Check' | sort -r | head -n 6
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Passed checks: 17, Failed checks: 11, Skipped checks: 0
+Check: CKV_K8S_9: "Readiness Probe Should be Configured"
+Check: CKV_K8S_8: "Liveness Probe Should be Configured"
+Check: CKV_K8S_43: "Image should use digest"
+Check: CKV_K8S_30: "Apply security context to your pods and containers"
+Check: CKV_K8S_29: "Apply security context to your pods, deployments and daemon_sets"
+```
+
+</Expected>
+
+Cùng thư mục, Checkov 3.3.26 báo 11 kiểm tra không đạt trên `kubernetes_deployment_v1.web`: thiếu request và limit, thiếu probe, thiếu securityContext, image không ghim digest (K1 và K2 dạy cách sửa từng mục). Kết luận không phải "Checkov tốt hơn Trivy": trên mẫu AWS cả hai đều có quy tắc (khi viết bài, Checkov báo 10 kiểm tra không đạt trên bản `aws-sample` đã sửa, trong đó vẫn có cổng 22 mở, vì dòng `#trivy:ignore` chỉ Trivy hiểu). Kết luận là phải biết máy quét của mình **phủ loại resource nào**, và thử nó trên một mẫu cố ý viết sai trước khi tin vào con số 0.
+
+<Check id="d10.5.lab-scan">Quét được mã IaC bằng Trivy với ngưỡng chặn, ghi được ngoại lệ có lý do và hạn, và chứng minh được bằng hai máy quét rằng "0 lỗi" có thể là điểm mù của bộ quy tắc.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`Error: Module not installed`** khi `tofu test` hoặc `tofu validate`: chưa `tofu init` trong thư mục module.
+- **`Error: Reference to undeclared resource`** trong file test: địa chỉ trong `assert` viết theo góc nhìn bên trong module (`docker_container.web[0]`), không có tiền tố `module.`.
+- **`Error: Unknown condition value`** trong lượt `command = plan`: điều kiện dùng một giá trị chỉ biết sau khi apply. Chuyển lượt đó sang `apply`, hoặc kiểm một thuộc tính đã biết lúc plan.
+- **Integration test báo `port is already allocated`:** cổng 9547 đang bận. Xem `docker ps --filter publish=9547`.
+- **Test bị ngắt và để lại container `d11-test-…`:** xoá bằng `docker rm -f` kèm tên, rồi `docker network rm d11-test-dev`.
+- **`jq: error … Cannot iterate over null`** khi đọc `plan.json`: plan không có thay đổi nào, hoặc file là `tfplan` nhị phân chứ không phải bản đã qua `tofu show -json`.
+- **Trivy báo `FATAL … failed to download`:** mạng chặn nơi phát hành bộ quy tắc. Chạy lại sau ít phút; volume `d11-trivy-cache` giữ phần đã tải.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá container và mạng của thư mục `review`, rồi xoá mọi thứ còn lại của **cả chặng**: volume `d11-trivy-cache` và `d11-plugin-cache`, mạng `d11-tools`, và toàn bộ thư mục `~/masteva-d10` (mã, repo module, file state). Chỉ chạy khi bạn đã xong D11.1 tới D11.5. Các image (`opentofu`, `terraform`, `nginx`, `postgres`, `seaweedfs`, `trivy`) được giữ lại; xoá bằng `docker rmi` nếu cần chỗ.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-d10/review && tofu destroy -no-color -auto-approve | grep -E '^Destroy'
+docker ps -a --filter name=d11- --format '{{.Names}}'
+docker volume rm d11-trivy-cache d11-plugin-cache
+docker network rm d11-tools
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Destroy complete! Resources: 3 destroyed.
+d11-trivy-cache
+d11-plugin-cache
+d11-tools
+```
+
+</Expected>
+
+<Terminal where="mac" title="Xoá thư mục lab của cả chặng">
+
+```bash
+cd ~ && rm -rf ~/masteva-d10
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nên viết bao nhiêu test cho IaC? Có cần phủ như mã ứng dụng không?">
+
+Không. Phần lớn mã IaC là khai báo phẳng: một resource với các thuộc tính viết thẳng. Test lại rằng `name = "x"` cho ra tên `x` là kiểm chính công cụ. Viết test ở nơi có **logic của bạn**: phép tính (cổng, CIDR, tên ghép), điều kiện (`count = var.enabled ? 1 : 0`), vòng lặp `for_each` trên dữ liệu đầu vào, và mọi khối `validation`, `precondition`. Module dùng chung càng nhiều người gọi thì càng đáng test, vì một lỗi hồi quy nhân lên theo số nơi dùng. Root module của từng môi trường thường không cần unit test; lớp bảo vệ của nó là plan được đọc và kiểm tự động. Integration test đắt, nên chạy theo lịch hoặc trước khi phát hành phiên bản module, không chạy cho mọi commit.
+
+</Reveal>
+
+<Reveal title="Kiểm tra tự động trên plan có thay được người review không?">
+
+Nó thay được phần người làm tệ: đọc sót một dòng `-/+` trong plan dài nghìn dòng, hay duyệt vì tin mô tả PR. Nó không thay được phán đoán: máy biết plan có thay thế database, không biết lần thay thế đó đã có kế hoạch di trú dữ liệu chưa. Cách ghép hợp lý: máy chặn cứng những thứ không bao giờ được xảy ra mà không có duyệt riêng (xoá hoặc thay tài nguyên dữ liệu, mở cổng quản trị ra Internet), và tóm tắt plan thành vài dòng ở đầu PR; người đọc phần tóm tắt, đối chiếu với mục đích của PR, và chỉ đào sâu vào các resource bị đánh dấu. Trong sự cố của D11.1, từ lúc plan chạy tới lúc apply là 48 giây; một cổng chặn "thay thế resource database cần duyệt riêng" sẽ buộc quãng đó dài ra.
+
+</Reveal>
+
+<Reveal title="Sự cố Spotify: 'review build sửa global state' phòng thế nào trong pipeline hiện đại?">
+
+Slide không nói cơ chế nào đã để build của PR sửa được global state; nó liệt kê những gì đội thay đổi sau đó (đăng dry run vào PR, bắt nhánh cập nhật, bắt có review chấp thuận, cho build thất bại khi dry run có từ khoá như "destroy"). Phần dưới là cách dựng các ý đó trong một pipeline hiện nay, không phải mô tả hệ thống của họ. Ba lớp. Một: **tách quyền theo loại build**. Job chạy trên PR nhận thông tin xác thực chỉ đọc (đọc state, đọc hạ tầng để refresh); chỉ job trên nhánh chính, sau merge, nhận quyền ghi. Với OIDC (chặng D6), điều kiện này nằm ở phía cloud: role ghi chỉ tin token phát cho nhánh `main`. Hai: **một hàng đợi cho mỗi state**, để hai PR merge sát nhau được apply tuần tự theo thứ tự merge, và khoá state (D11.3) là lưới cuối. Ba: **plan lại ngay trước apply** hoặc apply đúng file plan của commit đã merge; plan lập từ một nhánh cũ, trước khi PR khác được merge, không còn mô tả đúng điều sẽ xảy ra. Atlantis và các nền tảng tương tự (chặng D22) gói ba lớp này lại.
+
+</Reveal>
+
+<Reveal title="Đội chỉ dùng AWS. Vì sao vẫn nhiều nơi chọn Terraform thay vì CloudFormation?">
+
+Vài lý do thường gặp, không phải lúc nào cũng đúng cho mọi đội. Hạ tầng hiếm khi chỉ có AWS: còn DNS ở nhà cung cấp khác, GitHub, hệ thống giám sát, Kubernetes; một công cụ quản được tất cả thì chỉ cần một quy trình review. Plan của Terraform chi tiết tới từng thuộc tính và đọc được trước khi tạo gì; hệ sinh thái module và người đã biết công cụ cũng lớn hơn. Ngược lại, CloudFormation có những thứ Terraform không có: state do AWS giữ nên không có chuyện mất hay khoá kẹt, tự rollback khi lỗi, StackSets để rải một stack ra nhiều tài khoản, và hỗ trợ chính thức từ AWS. Đội nhỏ thuần AWS, dùng CDK, không muốn vận hành kho state, chọn CloudFormation là hợp lý. Điều nên tránh là dùng cả hai cho cùng một tài nguyên: hai công cụ, hai "nguồn sự thật", và mỗi bên coi thay đổi của bên kia là drift.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nên nhờ AI viết file `.tftest.hcl` từ `variables.tf` và mô tả hành vi mong muốn, tóm tắt một `plan.json` dài thành danh sách thay đổi theo mức rủi ro, hoặc giải thích một mã lỗi của máy quét. AI hay sai ở: viết `assert` trên giá trị chỉ biết sau apply trong lượt `plan`, nhầm cú pháp `mock_provider` giữa các phiên bản, đề xuất tắt quy tắc quét bằng ngoại lệ không lý do không hạn, và tóm tắt plan mà **bỏ sót** dòng thay thế vì nó "trông giống cập nhật". Vì vậy đừng để bản tóm tắt của AI thay cho kiểm tra bằng `jq` trên `resource_changes`: con số hành động `delete` phải đến từ dữ liệu, không từ lời kể. Với Pulumi và CloudFormation, AI hay trộn cú pháp giữa các công cụ; chạy `pulumi preview` hoặc tạo change set trước khi tin.
+
+</Callout>
+
+<Callout kind="link">
+
+Chặng D6 đặt các lớp này vào pipeline: fmt, validate, quét và test trên mọi PR, plan đăng vào PR, apply sau merge, và cấp quyền cho pipeline vào cloud bằng OIDC thay khoá tĩnh. Chặng D10 áp cả chặng này lên AWS, nơi máy quét có nhiều quy tắc nhất. Chặng D15 viết policy cho cụm bằng Kyverno. Chặng D22 dùng OPA và Conftest trên plan, Atlantis cho quy trình PR, Terragrunt cho nhiều root. K1.2, K1.3 và K2.4 dạy cách sửa các mục Checkov báo ở bước 5: request và limit, probe, securityContext.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d10.5.mastery-pipeline">Thiết kế được chuỗi kiểm tra cho một repo IaC: lớp nào chạy trên PR, lớp nào sau merge, mỗi lớp cần quyền gì và dừng pipeline khi nào.</Check>
+
+<Check id="d10.5.mastery-test">Tự viết được unit test và integration test cho một module của mình, và chọn được đâu là chỗ đáng test.</Check>
+
+<Check id="d10.5.mastery-review">Review được một plan thật: đối chiếu với mục đích của thay đổi, chỉ ra mọi hành động xoá và thay thế, và giải thích được vì sao một kết quả quét "0 lỗi" chưa chắc là sạch.</Check>
+
+</Mastery>

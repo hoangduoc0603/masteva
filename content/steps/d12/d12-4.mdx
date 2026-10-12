@@ -1,0 +1,811 @@
+---
+title: Grafana dashboard as code, alert theo triệu chứng và Alertmanager
+description: Dựng Grafana 13 hoàn toàn bằng file (datasource, dashboard RED có biến), viết alert rule của Prometheus theo triệu chứng thay vì nguyên nhân, rồi cho Alertmanager định tuyến, gom nhóm, ức chế và tắt tiếng cảnh báo, đọc payload thật ở một webhook cục bộ.
+id: d12.4
+step: d12
+prerequisites: [d12.3]
+topics: [d12.grafana, d12.alert-theo-trieu-chung, d12.alertmanager-routing]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    prometheus: 3.15.0
+    alertmanager: 0.34.1
+    grafana: 13.2.3
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biến số liệu thành thứ con người dùng được: một dashboard đọc trong mười giây, và một cảnh báo chỉ kêu khi cần người xử lý. Học xong bài này, bạn giải thích được:
+
+- Vì sao dashboard sửa tay trên giao diện là nợ, và làm thế nào để Git là nơi duy nhất định nghĩa dashboard.
+- Vì sao một instance chết lúc 3 giờ sáng không nên gọi ai dậy, còn 5% request lỗi thì có.
+- Vì sao một sự cố sinh ra năm alert mà người trực chỉ nhận một thông báo.
+- `for`, `group_wait`, `group_interval`, `repeat_interval` khác nhau thế nào, và mỗi cái làm chậm thông báo bao lâu.
+
+</Goal>
+
+<Knowledge>
+
+### Grafana và dashboard as code
+
+**Grafana** không lưu số liệu. Nó là lớp hiển thị: mỗi **datasource** là một kết nối tới nơi giữ dữ liệu (Prometheus, Loki, Tempo, PostgreSQL…), mỗi **panel** của dashboard gửi một truy vấn bằng ngôn ngữ của datasource đó rồi vẽ kết quả. Phần PromQL bạn viết ở D12.3 dùng lại nguyên vẹn.
+
+Grafana cho phép bấm chuột tạo mọi thứ và lưu vào database riêng của nó. Cách đó nhanh lúc đầu và đắt về sau: không ai biết ai sửa panel nào, môi trường staging và production lệch nhau, mất database là mất hết. **Provisioning** là cách ngược lại: Grafana đọc cấu hình từ file lúc khởi động và định kỳ.
+
+| Thứ | File | Ghi chú |
+|---|---|---|
+| Datasource | `provisioning/datasources/*.yaml` | Đặt `uid` cố định để dashboard tham chiếu ổn định giữa các môi trường |
+| Nơi tìm dashboard | `provisioning/dashboards/*.yaml` | Khai một "provider" trỏ tới thư mục chứa file JSON |
+| Dashboard | Một file JSON mỗi dashboard | Là thứ Grafana xuất ra ở **Export**; đưa vào Git, review như code |
+
+Vòng làm việc thường gặp: dựng thử panel trên giao diện, xuất JSON, đưa vào repo qua pull request; Grafana tự nạp file mới.
+
+Provisioning là cách **đưa** định nghĩa từ Git vào Grafana, chưa phải hàng rào chống sửa tay. Tài liệu của Grafana viết rằng với `allowUiUpdates: false` thì không lưu được thay đổi lên dashboard provisioned, và API cũ đúng là từ chối với thông báo `Cannot save provisioned dashboard`. Nhưng trên Grafana 13.2.3, bước 2 của lab cho thấy nhóm API mới (`/apis/dashboard.grafana.app/…`) vẫn nhận bản sửa từ tài khoản có quyền Editor, và bản sửa đó sống qua cả lần khởi động lại, cho tới khi **nội dung file** thay đổi. Hàng rào thật gồm hai thứ: phân quyền (đa số người dùng chỉ cần quyền Viewer) và đối chiếu định kỳ giữa Grafana với Git để phát hiện chỗ lệch.
+
+Hai khái niệm cần cho bài:
+
+- **Biến** (variable): một ô chọn trên đầu dashboard, giá trị lấy từ truy vấn như `label_values(http_requests_total, job)`. Panel tham chiếu bằng `$job`. Một dashboard phục vụ mọi service thay vì chép ra mười bản.
+- **`$__rate_interval`**: cửa sổ mà Grafana tự tính cho `rate`, luôn đủ ít nhất bốn lần nhịp scrape và giãn ra khi bạn xem khoảng thời gian dài. Nó cần biết nhịp scrape, khai ở datasource.
+
+Một dashboard tốt trả lời một câu hỏi. Dashboard của service đi theo RED (D12.3): ba panel đầu là Rate, Errors, Duration; chi tiết theo instance và tài nguyên nằm bên dưới hoặc ở dashboard khác. Bức tường năm mươi biểu đồ không ai đọc nổi trong lúc có sự cố.
+
+<Check id="d12.4.grafana-as-code">Giải thích được datasource, panel, biến, và vì sao nên provisioning datasource và dashboard bằng file thay vì tạo tay.</Check>
+
+### Alert theo triệu chứng, không theo nguyên nhân
+
+Một cảnh báo gọi người dậy là một khoản chi: nó ngắt việc, và mỗi lần báo nhầm làm người trực tin nó ít đi. Khi đủ nhiều cảnh báo vô ích, người ta tắt tiếng cả kênh, và cảnh báo thật chìm theo; hiện tượng đó gọi là **alert fatigue**. Vì vậy câu hỏi đầu tiên cho mỗi alert: người nhận phải **làm gì ngay**?
+
+| | Alert theo nguyên nhân | Alert theo triệu chứng |
+|---|---|---|
+| Ví dụ | CPU trên 90%, một instance chết, đĩa I/O cao, pod khởi động lại | Tỉ lệ lỗi trên 5%, p95 trên 300 ms, hàng đợi không vơi |
+| Đo cái gì | Một thứ **có thể** gây hại | Thứ người dùng **đang** chịu |
+| Báo nhầm | Nhiều: hệ thống có dự phòng thì hỏng một phần vẫn phục vụ tốt | Ít: đã kêu là có người bị ảnh hưởng |
+| Bỏ sót | Nhiều: chỉ bắt được nguyên nhân bạn đã nghĩ tới | Ít: nguyên nhân gì cũng lộ ra ở triệu chứng |
+| Nên đi đâu | Ticket xử lý trong giờ làm, hoặc chỉ hiện trên dashboard | Gọi người trực (page) |
+
+Triệu chứng chính là RED của service nhìn từ phía người dùng. Nguyên nhân vẫn đáng thu thập: khi alert triệu chứng kêu, dashboard và các alert mức thấp cho bạn manh mối. Ngoại lệ hợp lý cho alert nguyên nhân mức cao là thứ **chắc chắn** thành sự cố và cần thời gian xử lý: đĩa sẽ đầy trong bốn giờ, chứng chỉ hết hạn trong bảy ngày.
+
+Một **alert rule** của Prometheus là một biểu thức PromQL được chạy định kỳ; mỗi chuỗi nó trả về là một alert:
+
+```text
+ biểu thức không trả gì        trả về chuỗi            vẫn trả về sau khi hết `for`
+      inactive  ───────────────▶  pending  ───────────────────▶  firing ──▶ gửi Alertmanager
+          ▲                          │                              │
+          └──── biểu thức hết trả về (hoặc sau `keep_firing_for`) ───┘
+```
+
+- **`for`**: điều kiện phải đúng liên tục bấy lâu mới `firing`. Nó lọc gai ngắn. Đặt quá ngắn thì alert nhấp nháy; quá dài thì biết tin muộn.
+- **`labels`**: gắn thêm vào alert, dùng để định tuyến (`severity`, `team`).
+- **`annotations`**: văn bản cho người đọc, dùng được template: giá trị hiện tại, link runbook. Alert không có runbook là alert chưa viết xong.
+
+<Check id="d12.4.symptom-alerts">Phân loại được một alert là triệu chứng hay nguyên nhân, quyết định được nó nên gọi người hay thành ticket, và giải thích được ba trạng thái của alert cùng vai trò của `for`.</Check>
+
+### Alertmanager: từ alert tới thông báo
+
+Prometheus chỉ **phát hiện**. Việc ai nhận, qua kênh nào, gom thế nào, lúc nào im là của **Alertmanager**. Tách hai phần cho phép nhiều Prometheus dùng chung một nơi quyết định thông báo.
+
+```text
+Prometheus ──alert (gửi lại định kỳ cho tới khi hết)──▶ Alertmanager
+   1. nhận       alert cùng tập label được coi là một; lần gửi sau chỉ làm mới nó
+   2. route      đi theo cây, khớp label → chọn receiver
+   3. group      vào nhóm theo group_by; nhóm chờ group_wait rồi mới "xả"
+   ─────────────── mỗi lần nhóm xả, từng alert trong nhóm đi tiếp ───────────────
+   4. inhibit    có alert nguồn đang kêu thì alert đích bị giữ lại
+   5. silence    khớp một silence còn hạn thì bị giữ lại
+   6. khử trùng lặp thông báo: nhóm không đổi và chưa tới repeat_interval thì không gửi lại
+   7. gửi        tới receiver (webhook, email, Slack, PagerDuty…), lỗi thì thử lại
+```
+
+Thứ tự này lấy từ mã nguồn của bản 0.34.1 (hàm dựng pipeline trong `notify/notify.go`), và nó giải thích hai điều bạn sẽ thấy trong lab. Inhibit và silence nằm **sau** bước gom nhóm, nên alert bị ức chế hay bị tắt tiếng vẫn có mặt trong Alertmanager với trạng thái `suppressed`; chúng chỉ không đi tới bước gửi. Và hai bước đó được xét lại ở **mỗi lần nhóm xả**, nên một alert đang bị giữ sẽ được gửi ở lần xả kế tiếp nếu alert nguồn vừa hết hoặc silence vừa hết hạn. Giữa bước 4 và 5 còn một bước lọc theo khung giờ (`mute_time_intervals`, `active_time_intervals`) mà bài không dùng.
+
+| Khái niệm | Làm gì | Ví dụ trong lab |
+|---|---|---|
+| **Route** | Cây quy tắc; alert đi từ gốc, vào nhánh con đầu tiên khớp `matchers` | `severity="page"` tới `oncall`, còn lại tới `tickets` |
+| **`group_by`** | Alert có cùng giá trị các label này vào chung một thông báo | `[alertname]`: hai service cùng lỗi, một thông báo |
+| **`group_wait`** | Chờ bấy lâu từ alert đầu tiên của nhóm rồi mới gửi, để gom alert tới sau | 30 giây (cũng là mặc định) |
+| **`group_interval`** | Khoảng cách tối thiểu giữa hai thông báo của cùng nhóm khi nhóm có thay đổi | 30 giây (mặc định 5 phút) |
+| **`repeat_interval`** | Nhắc lại nếu nhóm vẫn kêu mà không đổi gì | 1 giờ (mặc định 4 giờ) |
+| **Inhibit** | Khi có alert nguồn, ẩn alert đích có cùng các label trong `equal` | Alert `page` của một job ẩn alert `ticket` của job đó |
+| **Silence** | Tắt tiếng theo matcher, có thời hạn, người tạo và lý do | Bảo trì `shop-2` trong 10 phút |
+
+Thời gian từ lúc sự cố bắt đầu tới lúc có thông báo là tổng của nhiều lớp: nhịp scrape, cửa sổ `rate`, `for`, rồi `group_wait`. Mỗi lớp đều có lý do, nhưng cộng lại dễ thành năm, mười phút mà không ai chủ ý.
+
+Vài điều về lựa chọn công cụ:
+
+- Grafana cũng có hệ alert riêng (Grafana Alerting), tiện khi cần alert trên nhiều loại datasource. Bài dùng rule của Prometheus cùng Alertmanager vì đó là bộ đôi mà kube-prometheus-stack cài sẵn và phần lớn hệ thống đang chạy.
+- Lịch trực và leo thang không phải việc của Alertmanager. Grafana OnCall bản mã nguồn mở đã bị lưu trữ; thường thì Alertmanager đẩy sang một dịch vụ trực (PagerDuty, Opsgenie…) hoặc kênh chat. Tổ chức trực và xử lý sự cố là nội dung của D17.
+
+<Callout kind="production">
+
+Từ 28 đến 31/10/2021, Roblox ngừng hoạt động 73 giờ. Theo bản tường trình của công ty, nguyên nhân gốc nằm ở cụm Consul; điều làm việc chẩn đoán kéo dài là các hệ thống giám sát quan trọng, lẽ ra cho thấy rõ hơn nguyên nhân, lại **phụ thuộc vào chính các hệ thống đang hỏng, trong đó có Consul**. Bản tường trình gọi đó là phụ thuộc vòng giữa hệ thống telemetry và Consul, và ghi trong phần khắc phục: telemetry không còn phụ thuộc vào hệ thống mà nó giám sát. Bài học cho bài này (diễn giải của bài, không phải lời Roblox): Prometheus, Alertmanager và đường gửi thông báo cũng là hệ thống có thể chết, và khi chết thì chúng **im lặng**, giống hệt lúc mọi thứ đều ổn. Cách tối thiểu là một alert luôn kêu (thường đặt tên `Watchdog`, biểu thức `vector(1)`) gửi đều tới một dịch vụ bên ngoài; dịch vụ đó báo động khi **ngừng** nhận được tín hiệu. D16 dựng đầy đủ việc giám sát hệ thống giám sát.
+
+</Callout>
+
+<Check id="d12.4.alertmanager-concepts">Kể được đúng thứ tự các bước một alert đi qua trong Alertmanager (nhận, route, group, inhibit, silence, khử trùng lặp thông báo, gửi), giải thích được vì sao alert bị ức chế vẫn hiện ở trạng thái `suppressed`, và phân biệt được `group_wait`, `group_interval`, `repeat_interval`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Provision Grafana (Grafana documentation)](https://grafana.com/docs/grafana/latest/administration/provisioning/): định dạng file cho datasource và dashboard provider; đọc hai phần "Data sources" và "Dashboards".
+- [Alerting rules (Prometheus)](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/): cú pháp rule, `for`, `keep_firing_for`, template trong annotation.
+- [Alertmanager (Prometheus)](https://prometheus.io/docs/alerting/latest/alertmanager/) và [Configuration](https://prometheus.io/docs/alerting/latest/configuration/): khái niệm grouping, inhibition, silence; tham chiếu đầy đủ của `route`, `receivers`, `inhibit_rules`.
+- [Monitoring Distributed Systems (Site Reliability Engineering, Google)](https://sre.google/sre-book/monitoring-distributed-systems/): chương kinh điển về triệu chứng với nguyên nhân và về việc mỗi lần gọi người phải kèm việc làm được ngay.
+- [Roblox Return to Service](https://about.roblox.com/newsroom/2022/01/roblox-return-to-service-10-28-10-31-2021): bản tường trình trong callout; đọc phần "Telemetry Improvements".
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D12.3: cụm đang chạy, có recording rule `job:http_requests_errors:ratio_rate1m` và script `pq`. Lab tải image Grafana (424 MB nén, lớn nhất trong chặng) và Alertmanager (36 MB). Dùng thêm cổng **9552** (Alertmanager) và **9553** (Grafana). **Profile máy:** Grafana là thành phần nặng và thất thường nhất của chặng: không giới hạn thì các lần đo của bài và của người duyệt cho từ 135 tới 820 MiB, cao nhất lúc vừa khởi động và khi có trình duyệt mở dashboard. Lab vì vậy đặt trần cho nó (`mem_limit` 640 MiB cùng `GOMEMLIMIT`), và nó dao động từ 260 đến 520 MiB; Alertmanager dùng 8 đến 32 MiB. Cả cụm của bài này 490 đến 750 MiB (lần chạy cuối của bài: 487 MiB, trong đó Grafana 258). Máy 8 GB với Docker VM 4 GB vẫn đủ nếu không chạy cụm nào khác.
+
+### 1. Grafana, Alertmanager và webhook, tất cả bằng file
+
+<Terminal where="mac" title="~/masteva-d12">
+
+```bash
+cd ~/masteva-d12
+mkdir -p grafana/provisioning/datasources grafana/provisioning/dashboards grafana/dashboards alertmanager
+cat > grafana/provisioning/datasources/prometheus.yaml <<'EOF'
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+EOF
+cat > grafana/provisioning/dashboards/files.yaml <<'EOF'
+apiVersion: 1
+providers:
+  - name: d12
+    folder: D12
+    type: file
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+cat > grafana/dashboards/shop-red.json <<'EOF'
+{
+  "uid": "shop-red",
+  "title": "Shop RED",
+  "tags": ["d12", "red"],
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "job", "type": "query", "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": { "query": "label_values(http_requests_total, job)", "refId": "job" },
+        "refresh": 2, "current": { "text": "shop", "value": "shop" } },
+      { "name": "route", "type": "query", "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": { "query": "label_values(http_requests_total{job=\"$job\"}, route)", "refId": "route" },
+        "refresh": 2, "includeAll": true, "multi": true, "current": { "text": "All", "value": "$__all" } }
+    ]
+  },
+  "panels": [
+    { "id": 1, "type": "timeseries", "title": "Rate: request mỗi giây theo route",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [ { "refId": "A", "legendFormat": "{{route}}",
+        "expr": "sum by (route) (rate(http_requests_total{job=\"$job\", route=~\"$route\"}[$__rate_interval]))" } ] },
+    { "id": 2, "type": "timeseries", "title": "Errors: tỉ lệ request 5xx",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 }, "overrides": [] },
+      "targets": [ { "refId": "A", "legendFormat": "5xx",
+        "expr": "sum(rate(http_requests_total{job=\"$job\", route=~\"$route\", status=~\"5..\"}[$__rate_interval])) / sum(rate(http_requests_total{job=\"$job\", route=~\"$route\"}[$__rate_interval]))" } ] },
+    { "id": 3, "type": "timeseries", "title": "Duration: p50, p95, p99",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "legendFormat": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"$job\", route=~\"$route\"}[$__rate_interval])))" },
+        { "refId": "B", "legendFormat": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"$job\", route=~\"$route\"}[$__rate_interval])))" },
+        { "refId": "C", "legendFormat": "p99", "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"$job\", route=~\"$route\"}[$__rate_interval])))" } ] }
+  ]
+}
+EOF
+cat > alertmanager/alertmanager.yml <<'EOF'
+route:
+  receiver: tickets
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 30s
+  repeat_interval: 1h
+  routes:
+    - matchers: ['severity="page"']
+      receiver: oncall
+
+receivers:
+  - name: oncall
+    webhook_configs:
+      - url: http://webhook:8080/oncall
+  - name: tickets
+    webhook_configs:
+      - url: http://webhook:8080/tickets
+
+inhibit_rules:
+  - source_matchers: ['severity="page"']
+    target_matchers: ['severity="ticket"']
+    equal: [job]
+EOF
+cat > compose.alert.yaml <<'EOF'
+services:
+  grafana:
+    image: grafana/grafana:13.2.3
+    container_name: d12-grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GOMEMLIMIT: 300MiB
+    mem_limit: 640m
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:9553:3000"]
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    container_name: d12-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=http://localhost:9552
+    volumes: ["./alertmanager:/etc/alertmanager:ro"]
+    ports: ["127.0.0.1:9552:9093"]
+  webhook:
+    image: d12-shop:1.0.0
+    container_name: d12-webhook
+    environment: { MODE: webhook }
+EOF
+echo 'COMPOSE_FILE=compose.yaml:compose.prom.yaml:compose.node.yaml:compose.alert.yaml' > .env
+docker compose up -d 2>&1 | grep -E '(grafana|alertmanager|webhook).*Started'
+until curl -sf localhost:9553/api/health >/dev/null; do sleep 2; done
+curl -s localhost:9553/api/health | jq -c .
+curl -s localhost:9553/api/datasources | jq -c '.[] | {name, uid, type, url, readOnly}'
+curl -s localhost:9553/api/search | jq -c '.[] | {type, title, uid, folderTitle}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d12-webhook Started 
+ Container d12-alertmanager Started 
+ Container d12-grafana Started 
+{"database":"ok","version":"13.2.3","commit":"90ffed056f0884267356c12a0eeb72a022af53f1"}
+{"name":"Prometheus","uid":"prometheus","type":"prometheus","url":"http://prometheus:9090","readOnly":true}
+{"type":"dash-folder","title":"D12","uid":"fg0vp2fqou0w0d","folderTitle":null}
+{"type":"dash-db","title":"Shop RED","uid":"shop-red","folderTitle":"D12"}
+```
+
+</Expected>
+
+Grafana vừa khởi động lần đầu đã có datasource và dashboard, không ai bấm gì. Đọc các file:
+
+- **Datasource:** `uid: prometheus` cố định, vì mọi panel tham chiếu datasource bằng uid. `access: proxy` nghĩa là máy chủ Grafana gọi Prometheus qua mạng nội bộ; trình duyệt của bạn không cần và không được thấy Prometheus. `timeInterval: 5s` bằng nhịp scrape, để `$__rate_interval` tính đúng. `editable: false` hiện thành `readOnly: true`.
+- **Provider:** quét thư mục dashboard mỗi 10 giây, đặt vào thư mục "D12" trên giao diện, không cho lưu đè từ giao diện.
+- **Dashboard:** hai biến `job` và `route` (biến sau phụ thuộc biến trước, chọn được nhiều giá trị), ba panel đúng thứ tự R, E, D. Truy vấn là PromQL của D12.3, chỉ thay giá trị cứng bằng `$job`, `$route` và cửa sổ bằng `$__rate_interval`. uid thư mục `D12` do Grafana sinh nên sẽ khác trên máy bạn.
+- **Grafana trong lab** cho vào thẳng với quyền Editor và tắt form đăng nhập: không có tài khoản nào để lộ, và cổng chỉ nghe trên `127.0.0.1`. Quyền Editor là để dùng được màn hình Explore ở hai bài sau; bước 2 cho thấy cái giá của nó. Production dùng đăng nhập qua SSO và phân quyền theo đội.
+- **Trần bộ nhớ của Grafana:** `mem_limit: 640m` là giới hạn của container; `GOMEMLIMIT: 300MiB` bảo bộ thu gom rác của Go (ngôn ngữ viết Grafana) cố giữ heap dưới mức đó, để tiến trình tự kiềm chế trước khi chạm trần và bị kernel giết. Không có hai dòng này, Grafana vẫn chạy nhưng có lúc chiếm hơn 800 MiB.
+- **`webhook`** là binary `shop` chạy ở chế độ in nguyên văn mọi request nhận được ra stdout. Nó đóng vai Slack hay PagerDuty để bạn thấy đúng thứ Alertmanager gửi.
+
+### 2. Dashboard là file, và ai sửa được nó
+
+Mở `http://localhost:9553`, vào **Dashboards › D12 › Shop RED**: ba biểu đồ có dữ liệu, hai ô chọn `job` và `route` ở trên. Thử đổi `job` sang `stock`. Phần kiểm bằng dòng lệnh làm bốn việc: đọc dashboard, thử lưu đè qua API cũ, thử lại qua API mới, rồi xem bản sửa tay sống được bao lâu.
+
+<Terminal where="mac">
+
+```bash
+curl -s localhost:9553/api/dashboards/uid/shop-red | jq -c '{provisioned: .meta.provisioned, file: .meta.provisionedExternalId, panels: [.dashboard.panels[].title], variables: [.dashboard.templating.list[].name]}'
+curl -s localhost:9553/api/dashboards/uid/shop-red | jq '{dashboard: (.dashboard | .title = "Sửa tay qua API cũ"), overwrite: true}' \
+  | curl -s -X POST localhost:9553/api/dashboards/db -H 'Content-Type: application/json' -d @-; echo
+D=localhost:9553/apis/dashboard.grafana.app/v2/namespaces/default/dashboards
+curl -s $D/shop-red | jq '.spec.title = "Sửa tay qua API mới"' \
+  | curl -s -o /dev/null -w 'PUT: %{http_code}\n' -X PUT $D/shop-red -H 'Content-Type: application/json' -d @-
+sleep 25
+curl -s localhost:9553/api/search | jq -r '.[] | select(.type == "dash-db") | "sau 25 giây: \(.title)"'
+docker compose restart grafana 2>&1 | tail -1
+until curl -sf localhost:9553/api/health >/dev/null; do sleep 2; done; sleep 15
+curl -s localhost:9553/api/search | jq -r '.[] | select(.type == "dash-db") | "sau khi khởi động lại: \(.title)"'
+curl -s $D | jq -r '.items[] | (.metadata.annotations["grafana.app/updatedBy"] // "") as $by | select($by != "" and ($by | startswith("access-policy:") | not)) | "LỆCH: \(.metadata.name) bị sửa bởi \($by)"'
+```
+
+</Terminal>
+
+<Predict question="Dashboard này provisioned với allowUiUpdates: false. Lời gọi nào bị từ chối? Bản sửa tay có bị file ghi đè lại sau chu kỳ quét 10 giây, hay sau khi khởi động lại không?">
+
+```text
+{"provisioned":true,"file":"shop-red.json","panels":["Rate: request mỗi giây theo route","Errors: tỉ lệ request 5xx","Duration: p50, p95, p99"],"variables":["job","route"]}
+{"message":"Cannot save provisioned dashboard"}
+PUT: 200
+sau 25 giây: Sửa tay qua API mới
+ Container d12-grafana Started 
+sau khi khởi động lại: Sửa tay qua API mới
+LỆCH: shop-red bị sửa bởi anonymous:0
+```
+
+- Grafana biết dashboard này đến từ file `shop-red.json`.
+- **API cũ** (`POST /api/dashboards/db`) từ chối: `Cannot save provisioned dashboard`. Đây là hành vi mà tài liệu mô tả.
+- **API mới** trả `200`: tiêu đề đã đổi, bằng tài khoản anonymous quyền Editor của lab.
+- Bản sửa tay **không** bị ghi đè sau hai chu kỳ quét, và còn nguyên sau khi Grafana khởi động lại. Cách giải thích khớp với những gì bài quan sát được: dashboard mang annotation `grafana.app/sourceChecksum` đúng bằng MD5 của file; `touch` file (đổi giờ sửa, không đổi nội dung) không làm gì; chỉ khi nội dung file đổi thì bản trong database mới bị ghi đè. Tức bộ nạp so file với dấu vết lần nạp trước, không so với dashboard đang nằm trong database.
+- Dòng cuối là một phép **đối chiếu**: liệt kê dashboard có dấu người sửa. Annotation `grafana.app/updatedBy` ghi ai sửa lần cuối: `anonymous:0` hoặc `user:…` khi là người, `access-policy:service` khi chính bộ nạp file ghi. Chạy định kỳ lệnh như vậy, hoặc so JSON trong Grafana với JSON trong Git, là cách biết có ai đã sửa tay.
+
+Bài chỉ khẳng định điều đã chạy trên 13.2.3; hành vi này có thể đổi ở bản khác, nên hãy thử lại đúng hai lời gọi trên với phiên bản bạn dùng. Một phép thử khác của bài: đổi quyền anonymous thành `Viewer` thì lời gọi `PUT` nhận `403`, trong khi dashboard vẫn xem được. Đó là hàng rào thật; lab giữ Editor vì D12.5 và D12.6 cần Explore.
+
+</Predict>
+
+Giờ sửa theo cách đúng: sửa file. Nội dung file đổi thì bộ nạp ghi đè bản trong database, kể cả bản sửa tay:
+
+<Terminal where="mac">
+
+```bash
+D=localhost:9553/apis/dashboard.grafana.app/v2/namespaces/default/dashboards
+perl -pi -e 's/"title": "Shop RED"/"title": "Shop RED (lab D12)"/' grafana/dashboards/shop-red.json
+sleep 25
+curl -s localhost:9553/api/search | jq -c '.[] | select(.type == "dash-db") | {title, uid}'
+curl -s $D | jq -r '.items[] | (.metadata.annotations["grafana.app/updatedBy"] // "") as $by | select($by != "" and ($by | startswith("access-policy:") | not)) | "LỆCH: \(.metadata.name)"' | wc -l
+BODY='{"from": "now-1m", "to": "now", "queries": [{"refId": "A", "datasource": {"uid": "prometheus"}, "instant": true, "expr": "sum by (route) (rate(http_requests_total{job=\"shop\", route=~\"/.+\"}[1m]))"}]}'
+until curl -s localhost:9553/api/ds/query -H 'Content-Type: application/json' -d "$BODY" | jq -e '.results.A.frames | length > 0' >/dev/null 2>&1; do sleep 3; done
+curl -s localhost:9553/api/ds/query -H 'Content-Type: application/json' -d "$BODY" \
+  | jq -c '.results.A.frames[] | {route: .schema.fields[1].labels.route, value: .data.values[1][0]}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"title":"Shop RED (lab D12)","uid":"shop-red"}
+       0
+{"route":"/api/checkout","value":3.745417851906825}
+{"route":"/api/products","value":16.2725821513989}
+```
+
+</Expected>
+
+- Trong vòng một chu kỳ quét, tiêu đề là của file, uid giữ nguyên nên link cũ không gãy, và phép đối chiếu không còn dòng nào (`0`). Trong thực tế, bước `perl` này là một commit đi qua pull request (D4.2).
+- Hệ quả cho vận hành: muốn "đưa dashboard về đúng Git" khi phát hiện lệch thì phải có một thay đổi ở file; khởi động lại Grafana không làm việc đó.
+- Hai lời gọi cuối chạy một truy vấn **qua Grafana**, đúng đường panel vẫn đi: trình duyệt hỏi Grafana, Grafana hỏi Prometheus. Vòng `until` chờ plugin datasource sẵn sàng sau lần khởi động lại. Kết quả trùng với `./pq` ở D12.3.
+
+Panel Errors cho thấy đợt lỗi bạn tiêm ở D12.3 (nếu còn trong khoảng thời gian đang xem) rồi nằm ở 0. Đổi biến `job` sang `stock`, service chưa từng trả lỗi, thì panel đó hiện "No data": "không có dữ liệu khác 0" của D12.3, giờ nhìn bằng mắt.
+
+<Check id="d12.4.lab-grafana">Dựng được Grafana có sẵn datasource và dashboard RED chỉ bằng file; chứng minh được trên lab API nào từ chối và API nào chấp nhận việc sửa một dashboard provisioned, bản sửa tay sống tới khi nào; và viết được lệnh phát hiện dashboard bị sửa tay.</Check>
+
+### 3. Alert rule
+
+Bốn rule: hai triệu chứng mức `page`, hai nguyên nhân mức `ticket`.
+
+<Terminal where="mac">
+
+```bash
+cat > prometheus/rules/alerts.yml <<'EOF'
+groups:
+  - name: shop-symptoms
+    rules:
+      - alert: HighErrorRatio
+        expr: job:http_requests_errors:ratio_rate1m > 0.05
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }}: {{ $value | humanizePercentage }} request lỗi 5xx"
+          runbook: "https://wiki.example.com/runbooks/high-error-ratio"
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, le) (rate(http_request_duration_seconds_bucket[1m]))) > 0.3
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.job }}: p95 là {{ $value | humanizeDuration }}"
+  - name: shop-causes
+    rules:
+      - alert: InstanceDown
+        expr: up{job=~"shop|stock"} == 0
+        for: 15s
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} không scrape được"
+      - alert: InstanceErrors
+        expr: |
+          sum by (job, instance) (rate(http_requests_total{status=~"5.."}[1m]))
+            / sum by (job, instance) (rate(http_requests_total[1m])) > 0.05
+        for: 30s
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanizePercentage }} request lỗi 5xx"
+EOF
+cat >> prometheus/prometheus.yml <<'EOF'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+EOF
+docker compose exec -T prometheus promtool check rules /etc/prometheus/rules/alerts.yml
+docker compose exec -T alertmanager amtool check-config /etc/alertmanager/alertmanager.yml | head -1
+curl -s -X POST localhost:9551/-/reload -w 'reload: %{http_code}\n'
+sleep 10
+curl -s 'localhost:9551/api/v1/rules?type=alert' | jq -r '.data.groups[] | .name as $g | .rules[] | "\($g)  \(.name)  for=\(.duration)s  severity=\(.labels.severity)  \(.state)"'
+curl -s localhost:9551/api/v1/alertmanagers | jq -r '.data.activeAlertmanagers[].url'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Checking /etc/prometheus/rules/alerts.yml
+  SUCCESS: 4 rules found
+
+Checking '/etc/alertmanager/alertmanager.yml'  SUCCESS
+reload: 200
+shop-causes  InstanceDown  for=15s  severity=ticket  inactive
+shop-causes  InstanceErrors  for=30s  severity=ticket  inactive
+shop-symptoms  HighErrorRatio  for=30s  severity=page  inactive
+shop-symptoms  SlowRequests  for=30s  severity=page  inactive
+http://alertmanager:9093/api/v2/alerts
+```
+
+</Expected>
+
+- `HighErrorRatio` dùng thẳng recording rule của D12.3: dashboard, alert và báo cáo cùng một định nghĩa "tỉ lệ lỗi". Ngưỡng 5% và `for: 30s` là số của lab; production thường để `for` vài phút và lấy ngưỡng từ SLO (D7.2, D16).
+- Annotation dùng template: `$labels` là label của alert, `$value` là giá trị của biểu thức lúc đánh giá, `humanizePercentage` và `humanizeDuration` định dạng lại cho người đọc.
+- `InstanceErrors` cùng phép tính nhưng chia theo `instance`: nó trả lời "ở đâu", không trả lời "người dùng có khổ không", nên chỉ mức `ticket`.
+- Khối `alerting` cho Prometheus biết gửi alert tới đâu. Cả bốn rule đang `inactive`.
+
+Cấu hình Alertmanager đã viết ở bước 1: gốc cây route gửi mọi thứ tới `tickets`; nhánh con bắt `severity="page"` gửi tới `oncall`.
+
+### 4. Nguyên nhân không kèm triệu chứng
+
+Dừng một instance, như một máy chết trong đêm. Hai script nhỏ để theo dõi: `alerts` in trạng thái alert ở Prometheus, `am` gọi `amtool` trong container Alertmanager.
+
+<Terminal where="mac">
+
+```bash
+cat > alerts <<'EOF'
+#!/bin/sh
+curl -s localhost:9551/api/v1/alerts | jq -r '[.data.alerts[] | "\(.labels.alertname){\(.labels.instance // .labels.job)}=\(.state)"] | sort | join("  ") | if . == "" then "(không có alert)" else . end'
+EOF
+cat > am <<'EOF'
+#!/bin/sh
+cd "$(dirname "$0")" && docker compose exec -T alertmanager amtool --alertmanager.url=http://localhost:9093 "$@"
+EOF
+chmod +x alerts am
+docker compose stop shop-2 2>&1 | tail -1
+for i in 1 2 3 4; do sleep 10; echo "+$((i*10))s  $(./alerts)"; done
+for i in $(seq 30); do curl -s -o /dev/null -w '%{http_code}\n' localhost:9550/api/products; done | sort | uniq -c
+sleep 30
+docker logs d12-webhook 2>&1 | tail -1 | cut -d' ' -f1
+docker logs d12-webhook 2>&1 | tail -1 | cut -d' ' -f2- | jq '{receiver, status, groupLabels, alerts: [.alerts[] | {status, labels, annotations}]}'
+```
+
+</Terminal>
+
+<Predict question="shop-2 chết. Alert nào kêu, sau bao lâu? Người dùng thấy gì? Thông báo đi tới oncall hay tickets?">
+
+```text
+ Container d12-shop-2 Stopped 
++10s  InstanceDown{shop-2:8080}=pending
++20s  InstanceDown{shop-2:8080}=pending
++30s  InstanceDown{shop-2:8080}=firing
++40s  InstanceDown{shop-2:8080}=firing
+  30 200
+/tickets
+{
+  "receiver": "tickets",
+  "status": "firing",
+  "groupLabels": {
+    "alertname": "InstanceDown"
+  },
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "InstanceDown",
+        "env": "lab",
+        "instance": "shop-2:8080",
+        "job": "shop",
+        "severity": "ticket"
+      },
+      "annotations": {
+        "summary": "shop-2:8080 không scrape được"
+      }
+    }
+  ]
+}
+```
+
+`InstanceDown` vào `pending` ở lần đánh giá đầu tiên thấy `up == 0`, rồi `firing` sau `for: 15s`; thông báo tới webhook sau đó 30 giây (`group_wait`). Alert triệu chứng **không** kêu, và có lý do: 30 request qua Nginx đều `200`, vì `shop-1` gánh hết. Không người dùng nào bị ảnh hưởng, nên thông báo đi tới `/tickets` cho người xử lý trong giờ làm, không tới `/oncall`.
+
+Nếu rule này mang `severity: page`, bạn vừa gọi một người dậy để báo rằng hệ thống dự phòng đã làm đúng việc của nó. Nhân với vài chục node và vài lần tự khởi động lại mỗi tuần, đó là cách alert fatigue bắt đầu.
+
+</Predict>
+
+Payload là thứ mọi receiver nhận được: `status`, các label dùng để gom nhóm, và danh sách `alerts` với label cùng annotation. Kênh chat hay công cụ trực dựng tin nhắn từ chính các trường này.
+
+<Terminal where="mac">
+
+```bash
+docker compose start shop-2 2>&1 | tail -1
+sleep 45
+./alerts
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d12-shop-2 Started 
+(không có alert)
+```
+
+</Expected>
+
+<Check id="d12.4.lab-cause">Tái hiện được tình huống một instance chết mà người dùng không bị ảnh hưởng, và giải thích được vì sao alert đó chỉ nên là ticket.</Check>
+
+### 5. Triệu chứng: gom nhóm và ức chế
+
+Giờ là sự cố thật: `shop-2` và `stock` cùng trả lỗi 40%.
+
+<Terminal where="mac">
+
+```bash
+curl -s -X POST 'localhost:9559/admin/fault?error=40'
+curl -s -X POST 'localhost:9560/admin/fault?error=40'
+for i in 1 2 3 4 5 6 7 8; do sleep 10; echo "+$((i*10))s  $(./alerts)"; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+error=40% delay=0ms
+error=40% delay=0ms
++10s  (không có alert)
++20s  HighErrorRatio{shop}=pending  HighErrorRatio{stock}=pending  InstanceErrors{shop-2:8080}=pending  InstanceErrors{stock:8080}=pending
++30s  HighErrorRatio{shop}=pending  HighErrorRatio{stock}=pending  InstanceErrors{shop-2:8080}=pending  InstanceErrors{stock:8080}=pending
++40s  HighErrorRatio{shop}=pending  HighErrorRatio{stock}=pending  InstanceErrors{shop-2:8080}=pending  InstanceErrors{stock:8080}=pending
++50s  HighErrorRatio{shop}=firing  HighErrorRatio{stock}=firing  InstanceErrors{shop-1:8080}=pending  InstanceErrors{shop-2:8080}=firing  InstanceErrors{stock:8080}=firing
++60s  HighErrorRatio{shop}=firing  HighErrorRatio{stock}=firing  InstanceErrors{shop-1:8080}=pending  InstanceErrors{shop-2:8080}=firing  InstanceErrors{stock:8080}=firing
++70s  HighErrorRatio{shop}=firing  HighErrorRatio{stock}=firing  InstanceErrors{shop-1:8080}=pending  InstanceErrors{shop-2:8080}=firing  InstanceErrors{stock:8080}=firing
++80s  HighErrorRatio{shop}=firing  HighErrorRatio{stock}=firing  InstanceErrors{shop-1:8080}=firing  InstanceErrors{shop-2:8080}=firing  InstanceErrors{stock:8080}=firing
+```
+
+</Expected>
+
+Dòng thời gian trên máy bạn sẽ lệch vài giây, nhưng thứ tự thì giống: tỉ lệ lỗi tính trên cửa sổ 1 phút cần chừng 10 đến 20 giây để vượt 5%, rồi `pending` đúng 30 giây của `for`, rồi `firing`. Từ lúc sự cố bắt đầu tới lúc alert kêu là gần một phút, và Alertmanager còn giữ thông báo thêm 30 giây của `group_wait`: tổng cộng khoảng một phút rưỡi, dù mọi con số đều "ngắn". `InstanceErrors` của `shop-1` xuất hiện muộn vì `shop-1` không tự lỗi: nó trả 502 cho `checkout` khi `stock` lỗi.
+
+Năm alert đang kêu. Người trực nhận gì?
+
+<Terminal where="mac">
+
+```bash
+sleep 45
+docker logs d12-webhook 2>&1 | grep -o '^/[a-z]*' | sort | uniq -c
+docker logs d12-webhook 2>&1 | grep '^/oncall' | tail -1 | cut -d' ' -f2- | jq '{receiver, status, groupLabels, commonLabels, alerts: [.alerts[] | {status, job: .labels.job, summary: .annotations.summary}]}'
+./am alert query
+./am alert query --inhibited
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   1 /oncall
+   2 /tickets
+{
+  "receiver": "oncall",
+  "status": "firing",
+  "groupLabels": {
+    "alertname": "HighErrorRatio"
+  },
+  "commonLabels": {
+    "alertname": "HighErrorRatio",
+    "severity": "page"
+  },
+  "alerts": [
+    {
+      "status": "firing",
+      "job": "shop",
+      "summary": "shop: 20.04% request lỗi 5xx"
+    },
+    {
+      "status": "firing",
+      "job": "stock",
+      "summary": "stock: 26.02% request lỗi 5xx"
+    }
+  ]
+}
+Alertname       Starts At                Summary                        State   
+HighErrorRatio  2026-10-11 06:20:57 UTC  stock: 48.94% request lỗi 5xx  active  
+HighErrorRatio  2026-10-11 06:20:57 UTC  shop: 28.36% request lỗi 5xx   active  
+Alertname       Starts At                Summary                              State       
+InstanceErrors  2026-10-11 06:20:55 UTC  shop-2:8080: 46% request lỗi 5xx     suppressed  
+InstanceErrors  2026-10-11 06:20:55 UTC  stock:8080: 48.94% request lỗi 5xx   suppressed  
+InstanceErrors  2026-10-11 06:21:25 UTC  shop-1:8080: 8.364% request lỗi 5xx  suppressed  
+```
+
+</Expected>
+
+- **Gom nhóm:** thông báo mới nhất tới `/oncall` chứa **cả hai** alert `HighErrorRatio` (job `shop` và `stock`), vì `group_by: [alertname]` đặt chúng chung nhóm. Hai alert bắt đầu cách nhau vài giây; `group_wait: 30s` giữ thông báo lại để gom. Nếu alert thứ hai tới sau khi thông báo đầu đã đi, nó được gửi trong một thông báo cập nhật sau `group_interval`, vẫn kèm đủ cả hai; khi đó bạn thấy 2 dòng `/oncall` thay vì 1.
+- **Ức chế:** ba alert `InstanceErrors` có mặt trong Alertmanager nhưng ở trạng thái `suppressed`, và số dòng `/tickets` vẫn là 2 (thông báo `InstanceDown` lúc kêu và lúc hết ở bước 4). Quy tắc inhibit nói: khi một job đã có alert `page`, đừng gửi thêm các alert `ticket` của chính job đó. Chúng vẫn xem được bằng `amtool` và trên giao diện `http://localhost:9552` để phục vụ điều tra.
+- **Con số 2 đó phụ thuộc thời điểm.** Inhibit chỉ có tác dụng nếu alert nguồn đã kêu **vào lúc nhóm của alert đích xả**. `InstanceErrors` và `HighErrorRatio` cùng `for: 30s` nhưng vượt ngưỡng lệch nhau vài giây; nhóm `InstanceErrors` xả lần đầu sau `group_wait` 30 giây, và ở các lần chạy của bài `HighErrorRatio` luôn kịp kêu trong khoảng đó. Nếu trên máy bạn nó kêu muộn hơn, một thông báo `InstanceErrors` lọt tới `/tickets` và bạn thấy 3. Lúc hết sự cố cũng có khe hở tương tự: alert `page` hết trước alert `ticket` vài giây, và nếu nhóm `ticket` xả đúng trong khe đó thì một thông báo được gửi đi. Inhibit giảm nhiễu chứ không bảo đảm im lặng tuyệt đối.
+- `commonLabels` chỉ còn những label mà mọi alert trong nhóm đều có; `job` khác nhau nên rơi ra.
+
+Kết quả: một sự cố, năm alert, **một** thông báo gọi người, nội dung nói đúng triệu chứng và phạm vi.
+
+<Check id="d12.4.lab-symptom">Theo dõi được một alert đi từ pending tới firing, chỉ ra được trong payload thật các alert được gom nhóm, và chứng minh được alert mức thấp bị ức chế.</Check>
+
+### 6. Hết sự cố
+
+<Terminal where="mac">
+
+```bash
+curl -s -X POST localhost:9559/admin/fault
+curl -s -X POST localhost:9560/admin/fault
+sleep 120
+./alerts
+docker logs d12-webhook 2>&1 | grep '^/oncall' | tail -1 | cut -d' ' -f2- | jq -c '{status, alerts: [.alerts[] | {status, job: .labels.job}]}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+error=0% delay=0ms
+error=0% delay=0ms
+(không có alert)
+{"status":"resolved","alerts":[{"status":"resolved","job":"shop"},{"status":"resolved","job":"stock"}]}
+```
+
+</Expected>
+
+Lỗi ngừng ngay, nhưng tỉ lệ trên cửa sổ 1 phút cần gần một phút mới tụt dưới 5%; lúc đó alert biến mất khỏi Prometheus và Alertmanager gửi thông báo `resolved`. Thông báo hết sự cố có ích cho kênh chat; với công cụ trực, nó tự đóng sự vụ. Có thể tắt riêng cho từng receiver bằng `send_resolved: false`.
+
+### 7. Silence khi bảo trì
+
+Bạn sắp bảo trì `shop-2` trong 10 phút và biết trước `InstanceDown` sẽ kêu. Tắt tiếng đúng alert đó, đúng instance đó, có thời hạn:
+
+<Terminal where="mac">
+
+```bash
+docker logs d12-webhook 2>&1 | grep -c '^/tickets'
+./am silence add alertname=InstanceDown instance=shop-2:8080 --duration=10m --author=lab --comment='Bảo trì shop-2'
+docker compose stop shop-2 2>&1 | tail -1
+sleep 45
+./alerts
+curl -s localhost:9552/api/v2/alerts | jq -r '.[] | "\(.labels.alertname){\(.labels.instance)}  \(.status.state)  silencedBy=\(.status.silencedBy | length)"'
+docker logs d12-webhook 2>&1 | grep -c '^/tickets'
+./am silence query
+docker compose start shop-2 2>&1 | tail -1
+sleep 30
+./am silence expire $(./am silence query -q)
+./am silence query
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2
+a501a368-5fd2-45f4-abaf-01628b0897c6
+ Container d12-shop-2 Stopped 
+InstanceDown{shop-2:8080}=firing
+InstanceDown{shop-2:8080}  suppressed  silencedBy=1
+2
+ID                                    Matchers                                         Ends At                  Created By  Comment         
+a501a368-5fd2-45f4-abaf-01628b0897c6  alertname="InstanceDown" instance="shop-2:8080"  2026-10-11 06:34:20 UTC  lab         Bảo trì shop-2  
+ Container d12-shop-2 Started 
+ID  Matchers  Ends At  Created By  Comment  
+```
+
+</Expected>
+
+Alert vẫn `firing` ở Prometheus (silence không sửa sự thật), nhưng ở Alertmanager nó `suppressed` bởi một silence, và số thông báo `/tickets` không đổi. Số đếm đầu và cuối trên máy bạn có thể lớn hơn 2 nếu bước 6 để lọt một thông báo `InstanceErrors`; điều cần thấy là hai số **bằng nhau**. Lệnh `expire` kết thúc silence sớm sau khi `shop-2` đã chạy lại và alert đã hết; ID sẽ khác trên máy bạn.
+
+Silence khác với xoá rule hay sửa ngưỡng ở ba điểm: nó hẹp (đúng matcher), nó tự hết hạn, và nó ghi lại ai tắt cùng lý do. Một silence không thời hạn là cách một alert quan trọng biến mất vĩnh viễn.
+
+<Check id="d12.4.lab-silence">Tạo được silence có thời hạn và lý do cho đúng một alert, chứng minh được alert bị tắt tiếng không sinh thông báo, và kết thúc silence.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Grafana mở ra nhưng không có dashboard:** sai đường dẫn volume hoặc JSON hỏng. Xem `docker logs d12-grafana 2>&1 | grep -i -E 'provision|dashboard' | tail -5`.
+- **Panel báo không tìm thấy datasource:** `uid` trong file datasource khác `uid` trong JSON của dashboard. Sửa file datasource rồi `docker compose restart grafana` (datasource chỉ được đọc lúc khởi động).
+- **Log Grafana có `Failed to read plugin provisioning files` và `can't read alerting provisioning files`:** vô hại; lab không tạo hai thư mục `plugins` và `alerting`.
+- **Alert `firing` ở Prometheus nhưng webhook không nhận gì:** kiểm `curl -s localhost:9551/api/v1/alertmanagers` có URL chưa (thiếu khối `alerting` hoặc chưa reload), rồi `./am alert query` xem alert đã tới Alertmanager chưa, có bị `suppressed` không.
+- **`./am` báo `service "alertmanager" is not running`:** file `.env` chưa có `compose.alert.yaml`, hoặc container đã dừng; chạy `docker compose up -d`.
+- **Alert kêu rồi tắt liên tục:** `for` quá ngắn so với độ nhiễu của biểu thức. Tăng `for`, nới cửa sổ `rate`, hoặc thêm `keep_firing_for` để alert không tắt ngay khi biểu thức hết đúng trong chốc lát.
+
+</Callout>
+
+### Dọn dẹp
+
+D12.5 dùng tiếp toàn bộ cụm. Nếu nghỉ giữa chừng:
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu">
+
+```bash
+cd ~/masteva-d12 && docker compose stop
+```
+
+</Terminal>
+
+Muốn dọn hẳn thì dùng khối lệnh ở cuối D12.1.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đặt for bao lâu là vừa?">
+
+`for` trả lời câu "điều kiện phải kéo dài bao lâu thì tôi mới tin". Quá ngắn: một lần deploy làm lỗi nhảy lên mười giây cũng gọi người. Quá dài: sự cố mười lăm phút mới được biết sau phút thứ mười. Cách nghĩ thực dụng: lấy thời gian mà hệ thống **tự hồi phục** trong các tình huống bình thường (khởi động lại pod, chuyển leader, deploy) rồi đặt `for` dài hơn mức đó một chút. Nhớ rằng `for` cộng dồn với cửa sổ `rate`: `rate(…[5m])` cùng `for: 5m` nghĩa là một sự cố hoàn toàn cũng mất gần mười phút mới báo. D16 thay cặp "ngưỡng cố định cộng `for`" bằng burn rate nhiều cửa sổ: sự cố nặng báo trong vài phút, sự cố nhẹ kéo dài vẫn bị bắt.
+
+</Reveal>
+
+<Reveal title="group_by nên gồm những label nào?">
+
+`group_by` quyết định một thông báo chứa gì. Gom quá rộng (`group_by: []` hoặc chỉ `[severity]`) thì mọi thứ dồn vào một thông báo khổng lồ, alert mới bị lẫn vào nhóm đang kêu và chỉ được báo ở lần `group_interval` tiếp theo. Gom quá hẹp (giá trị đặc biệt `group_by: ['...']`, tức mỗi alert một thông báo) thì một cụm 200 node mất mạng bắn 200 tin. Thường dùng `[alertname, cluster]` hoặc `[alertname, service]`: mỗi loại sự cố trên mỗi phạm vi là một thông báo. Lab chỉ dùng `[alertname]` để thấy hai job vào chung nhóm.
+
+</Reveal>
+
+<Reveal title="Inhibit sai thì hậu quả gì?">
+
+Inhibit là công cụ mạnh và nguy hiểm theo đúng nghĩa đó: nó làm alert **không được gửi**. Quy tắc của lab ẩn mọi alert `ticket` của một job khi job đó có bất kỳ alert `page` nào, kể cả alert `ticket` không liên quan tới sự cố đang diễn ra. Ở lab điều đó chấp nhận được; ở production nên hẹp hơn: ghi rõ alert nguồn và alert đích bằng `alertname`, và luôn có `equal` để chỉ ẩn trong cùng phạm vi (cùng cluster, cùng service). Thiếu `equal`, một alert `page` ở cụm A sẽ ẩn alert ở cụm B. Sau mỗi thay đổi inhibit, thử lại như bước 5: gây lỗi, rồi xem `amtool alert query --inhibited`.
+
+</Reveal>
+
+<Reveal title="Alert rule có test được như code không?">
+
+Có. `promtool test rules` nhận một file mô tả chuỗi đầu vào theo thời gian (ví dụ `http_requests_total{status="500"}` tăng 10 mỗi phút) và trạng thái alert mong đợi ở từng mốc, rồi chạy rule trên dữ liệu giả đó mà không cần Prometheus. Đặt nó vào CI (chặng D6) cùng `promtool check rules` và `amtool check-config`: rule sai cú pháp, sai ngưỡng hay sai label định tuyến bị chặn ở pull request thay vì được phát hiện khi sự cố xảy ra mà không ai được gọi. Cây route của Alertmanager cũng thử được bằng `amtool config routes test severity=page`, lệnh in ra receiver sẽ nhận.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI sinh JSON dashboard và file rule rất nhanh, và đây là việc hợp để giao: mô tả panel hoặc điều kiện, nhận bản nháp, rồi kiểm. Chỗ hay sai: JSON theo schema của Grafana cũ hoặc bịa trường không tồn tại; tham chiếu datasource bằng tên thay vì `uid`; alert theo nguyên nhân kiểu "CPU > 80%" gắn `severity: critical`; thiếu `for`; cấu hình Alertmanager dùng `match:` và `match_re:` (đã thay bằng `matchers`); inhibit không có `equal`. Kiểm lại bằng công cụ: `promtool check rules`, `amtool check-config`, `amtool config routes test`, nạp dashboard vào Grafana lab rồi mở xem, và quan trọng nhất là **gây sự cố thật** như bước 4 và 5 để thấy thông báo nào tới đâu.
+
+</Callout>
+
+<Callout kind="link">
+
+D12.5 thêm log vào Grafana, D12.6 thêm trace và nối ba tín hiệu ngay trên dashboard này. D7.2 định nghĩa SLI và SLO, là nguồn của các ngưỡng alert; D16 viết alert theo burn rate và giám sát chính hệ thống giám sát. D17 lo phần con người: lịch trực, vai trò khi có sự cố, runbook, postmortem. Chặng D6 đưa `promtool` và `amtool` vào pipeline.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d12.4.mastery-dashboard">Tự dựng được một dashboard RED có biến cho một service, lưu dưới dạng file được provisioning, và giải thích được từng panel trả lời câu hỏi gì.</Check>
+
+<Check id="d12.4.mastery-alerts">Với một service cho trước, viết được bộ alert gồm triệu chứng mức gọi người và nguyên nhân mức ticket, có `for`, annotation và runbook, và bảo vệ được từng lựa chọn.</Check>
+
+<Check id="d12.4.mastery-routing">Cấu hình được Alertmanager định tuyến theo mức độ, gom nhóm, ức chế và tắt tiếng, rồi chứng minh bằng một sự cố giả rằng người trực nhận đúng một thông báo.</Check>
+
+</Mastery>

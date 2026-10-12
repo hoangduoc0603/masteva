@@ -1,0 +1,770 @@
+---
+title: OpenTelemetry Collector, trace đầu-cuối với Tempo và nối ba tín hiệu
+description: Đặt OpenTelemetry Collector giữa ứng dụng và backend với pipeline receiver, processor, exporter; lưu trace vào Tempo 3, cho Nginx tham gia trace bằng module OTel, xem Collector giữ span khi backend chết, tìm request chậm bằng TraceQL, rồi đi từ exemplar trên metric tới trace và tới log của đúng request đó.
+id: d12.6
+step: d12
+prerequisites: [d12.5]
+topics: [d12.opentelemetry-collector, d12.log-metric-trace]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    otel-collector-contrib: 0.162.0
+    tempo: 3.1.0
+    nginx-image: 1.30.5-alpine-otel
+    prometheus: 3.15.0
+    loki: 3.7.8
+    grafana: 13.2.3
+    opentelemetry-go: 1.47.0
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Hoàn thiện mảnh cuối của hệ thống quan sát: nhận trace từ mọi thành phần qua một đường ống có kiểm soát, lưu lại, và nối nó với metric và log đã có. Học xong bài này, bạn giải thích được:
+
+- Vì sao không cho ứng dụng gửi thẳng span tới backend, và Collector đứng giữa thì thêm được gì.
+- Vì sao `memory_limiter` đứng đầu và `batch` đứng cuối chuỗi processor, và chuyện gì xảy ra với span khi backend chết hai phút.
+- Vì sao trace bị đứt ở reverse proxy, và làm thế nào để Nginx thành một span trong trace.
+- Từ một chấm trên biểu đồ độ trễ, đi tới đúng request đó và đúng các dòng log của nó bằng cách nào.
+
+</Goal>
+
+<Knowledge>
+
+### OpenTelemetry gồm những mảnh nào
+
+Nhắc lại từ D12.1: một **trace** là hành trình của một request qua các service; nó gồm nhiều **span**, mỗi span là một đoạn việc có tên, thời lượng và span cha; mọi span của một trace chung một **trace id**, và trace id đi từ service này sang service kia trong header `traceparent`.
+
+**OpenTelemetry** là bộ chuẩn và công cụ để tạo, truyền và thu các tín hiệu đó. Phía ứng dụng có ba mảnh (SB8.2 dùng cả ba trong code Spring Boot; ứng dụng mẫu của chặng dùng bản Go): **API và SDK** tạo span, chuẩn **W3C Trace Context** (header `traceparent`) truyền ngữ cảnh giữa các service, và **OTLP** là giao thức gửi dữ liệu đi (gRPC cổng 4317, HTTP cổng 4318). Ứng dụng có thể gửi thẳng tới kho trace, như SB8.2 gửi tới Jaeger. Mảnh thứ tư, của hạ tầng, là **Collector**: một tiến trình nhận dữ liệu đo, xử lý, rồi chuyển tới một hay nhiều nơi lưu.
+
+| | Ứng dụng gửi thẳng backend | Qua Collector |
+|---|---|---|
+| Đổi backend, thêm backend thứ hai | Sửa cấu hình và triển khai lại mọi service | Sửa một file của Collector |
+| Backend chậm hoặc chết | Mỗi ứng dụng tự đệm, tự thử lại, tốn bộ nhớ của ứng dụng | Collector đệm và thử lại; ứng dụng gửi xong là quên |
+| Gắn thuộc tính chung (môi trường, vùng, cụm) | Mỗi đội tự làm, không đều | Một processor, áp cho tất cả |
+| Lọc, che dữ liệu nhạy cảm, lấy mẫu | Rải rác trong code | Tập trung, kiểm soát được |
+| Bí mật để gọi backend (API key) | Nằm ở mọi service | Chỉ nằm ở Collector |
+| Chi phí | Không thêm thành phần | Thêm một thứ phải vận hành và giám sát |
+
+Collector không chỉ dành cho trace: cùng mô hình nhận, xử lý, gửi áp cho metric và log. Alloy ở D12.5 là một bản phân phối của chính nó.
+
+### Pipeline: receiver, processor, exporter
+
+Cấu hình Collector khai báo các **component** rồi nối chúng thành **pipeline**, mỗi pipeline cho một loại tín hiệu:
+
+```text
+                 ┌──────────────────── pipeline "traces" ────────────────────┐
+ shop, stock ──▶ │ receiver        processors                    exporters   │
+   OTLP/HTTP     │  otlp  ──▶ memory_limiter ▶ resource ▶ batch ─┬▶ otlp_grpc/tempo ──▶ Tempo
+ nginx ────────▶ │ (4317,                                        └▶ debug (in ra log)│
+   OTLP/gRPC     │  4318)                                                    │
+                 └───────────────────────────────────────────────────────────┘
+```
+
+| Loại | Việc | Trong lab |
+|---|---|---|
+| **Receiver** | Cửa vào: nghe hoặc đi lấy dữ liệu | `otlp` (gRPC và HTTP) |
+| **Processor** | Biến đổi trên đường đi, chạy theo đúng thứ tự khai trong pipeline | `memory_limiter`, `resource`, `batch` |
+| **Exporter** | Cửa ra: gửi tới backend; mỗi exporter có hàng đợi và cơ chế thử lại riêng | `otlp_grpc/tempo`, `debug` |
+| **Connector** | Vừa là exporter của pipeline này vừa là receiver của pipeline kia, ví dụ sinh metric từ span | Không dùng |
+
+Component khai báo mà không nằm trong pipeline nào thì không chạy. Tên dạng `loại/tên` (`otlp_grpc/tempo`) cho phép có nhiều bản của cùng một loại.
+
+Thứ tự processor là quyết định thiết kế:
+
+- **`memory_limiter` đứng đầu.** Nó đo bộ nhớ của Collector; vượt ngưỡng thì **từ chối** dữ liệu mới ngay tại cửa, để bên gửi thử lại sau, thay vì nhận hết rồi bị hệ điều hành giết vì hết bộ nhớ. Đứng sau các processor khác thì dữ liệu đã kịp chiếm bộ nhớ trước khi bị chặn.
+- **`batch` đứng cuối.** Gom span thành lô rồi mới giao cho exporter: ít lời gọi mạng hơn, nén tốt hơn. Đứng cuối để các processor phía trước (lọc, lấy mẫu) không phải xử lý lại lô. Processor này đang trên đường bị thay: changelog của Collector v0.158.0 gọi nó là "legacy `batchprocessor`" và giới thiệu một processor mới (tên `queue_batch` từ v0.162.0) dùng chung cấu hình với hàng đợi của exporter; song song đó exporter đã tự gom lô được bằng khối `sending_queue::batch`. Image contrib 0.162.0 của lab chưa có `queue_batch` (lệnh `components` không liệt kê), nên bài dùng `batch`; khi nâng cấp, đọc changelog trước.
+
+Sau `batch`, mỗi exporter giữ một **hàng đợi** trong bộ nhớ và **thử lại** khi backend không nhận. Mặc định hàng đợi chứa 1.000 lô và việc thử lại kéo dài tối đa 5 phút; quá mức đó dữ liệu bị bỏ. Bước 4 của lab cho backend chết để xem cơ chế này.
+
+Ba điều về phiên bản, vì Collector vẫn ở dòng 0.x và đổi nhanh:
+
+- Có hai bản phân phối chính thức: **core** (ít component) và **contrib** (vài trăm component, image nặng). Lab dùng contrib cho tiện; production nên tự đóng gói một bản chỉ chứa component mình dùng.
+- Luôn ghim phiên bản chính xác. Tên component thay đổi giữa các bản: từ v0.144.0, hai exporter `otlp` và `otlphttp` được đổi tên thành `otlp_grpc` và `otlp_http`; tên cũ còn chạy dưới dạng alias đã bị đánh dấu deprecated (bài đã thử `validate` với tên `otlp` trên 0.162.0).
+- `otelcol validate` kiểm cấu hình mà không chạy; đưa nó vào CI như `promtool` ở D12.4.
+
+<Check id="d12.6.collector-pipeline">Giải thích được receiver, processor, exporter và pipeline, vì sao `memory_limiter` đứng đầu còn `batch` đứng cuối, và Collector làm gì khi backend không nhận dữ liệu.</Check>
+
+### Đặt Collector ở đâu
+
+| Kiểu | Vị trí | Dùng khi |
+|---|---|---|
+| **Agent** | Cạnh ứng dụng: một bản trên mỗi máy, hoặc sidecar, hoặc DaemonSet | Cần thu tại chỗ (log file, metric của máy), gắn thông tin về máy và pod, đệm sát nguồn |
+| **Gateway** | Một cụm Collector dùng chung, sau load balancer | Điểm tập trung cho chính sách: lấy mẫu, che dữ liệu, định tuyến, giữ bí mật của backend |
+
+Lab chạy một Collector kiểu gateway. Hệ thống lớn thường có cả hai tầng: agent chuyển về gateway. D16 dựng kiến trúc đó cùng **tail sampling**, tức quyết định giữ hay bỏ một trace sau khi đã thấy toàn bộ nó.
+
+### Kho trace: Tempo hay Jaeger
+
+| | Grafana Tempo 3 | Jaeger 2 |
+|---|---|---|
+| Lưu ở | Object storage hoặc đĩa cục bộ; không lập index theo từng thuộc tính | Tuỳ backend: bộ nhớ, Badger, Cassandra, Elasticsearch, OpenSearch… |
+| Tìm | Theo trace id, hoặc TraceQL quét dữ liệu dạng cột | Theo service, operation, tag trên index của backend |
+| Giao diện | Grafana | Giao diện riêng của Jaeger; cũng làm datasource của Grafana được |
+| Kiến trúc | Một binary cho quy mô nhỏ; tách thành phần khi lớn | Từ v2 được xây trên chính OpenTelemetry Collector |
+| Giấy phép | AGPL-3.0 | Apache-2.0, dự án CNCF đã graduated |
+| Hợp với | Đội đã dùng Grafana, Loki; lượng trace lớn, lưu rẻ | Cần giao diện trace độc lập; đã có Elasticsearch hoặc Cassandra |
+
+Cả hai nhận OTLP, nên đổi giữa chúng là sửa một exporter trong Collector. SB8.2 đã dùng Jaeger; bài này dùng Tempo để trace nằm chung Grafana với metric và log.
+
+### Trace đầu-cuối và chỗ nó hay đứt
+
+Một trace chỉ liền mạch khi **mọi** chặng trên đường đi làm đủ hai việc: đọc `traceparent` của request tới, và ghi `traceparent` mới (cùng trace id, span id của chính nó) vào request gọi đi. Chỗ đứt đầu tiên là trong code: một HTTP client không được thư viện OpenTelemetry bọc thì không ghi header (SB8.2 tái hiện lỗi này). Phía hạ tầng có thêm một chỗ đứt quen thuộc: **reverse proxy, load balancer, API gateway**. Proxy thường chuyển tiếp nguyên header nên trace không đứt hẳn, nhưng bản thân proxy vô hình: thời gian chờ ở proxy, lần thử lại sang upstream khác, lỗi 502 do proxy tự sinh đều không có span nào ghi lại, và log của proxy không có trace id để nối. Bước 3 sửa điều đó cho Nginx bằng module `ngx_otel_module`.
+
+**Lấy mẫu** (sampling) quyết định trace nào được giữ. Cách đơn giản nhất là **head sampling**: SDK ở service đầu tiên quyết định theo một xác suất ngay khi tạo span đầu, ghi quyết định vào cờ của `traceparent`, và các service sau làm theo (D12.1 đã thử với cờ `00`). Nó rẻ, nhưng không biết trước request nào sẽ lỗi. Lab giữ 100% vì traffic nhỏ. Ở traffic thật, giữ hết là khoản chi lớn nhất của tracing.
+
+### Nối ba tín hiệu
+
+Giá trị của ba tín hiệu nằm ở chỗ đi được từ cái này sang cái kia mà không phải dò bằng mắt theo giờ:
+
+```text
+              exemplar (trace_id gắn vào một mẫu của histogram)
+   METRIC ─────────────────────────────────────────────────▶ TRACE
+   "p95 của checkout tăng"                                    "request này chậm ở span stock"
+                                                              │  ▲
+                              tìm log theo trace_id của trace │  │ trace_id trong dòng log
+                                                              ▼  │
+                                                              LOG
+                                                   "dòng lỗi của đúng request đó"
+```
+
+| Từ | Tới | Cơ chế | Ai cung cấp |
+|---|---|---|---|
+| Log | Trace | Trường `trace_id` trong dòng log | Ứng dụng ghi (SB8.1, SB8.2); Loki giữ dạng structured metadata (D12.5) |
+| Trace | Log | Truy vấn log theo trace id và khoảng thời gian của trace | Cấu hình datasource Tempo trong Grafana |
+| Metric | Trace | **Exemplar**: một trace id mẫu đính kèm một quan sát của histogram | Ứng dụng gắn lúc `Observe`; Prometheus lưu khi bật `exemplar-storage` |
+
+Exemplar là mảnh ít người biết nhất. Metric đã gộp mất danh tính từng request; exemplar giữ lại **một** ví dụ cho mỗi bucket ở mỗi lần scrape, đủ để từ "bucket chậm đang đầy lên" nhảy tới một request thật nằm trong bucket đó. Nó chỉ đi được qua định dạng OpenMetrics hoặc protobuf; ứng dụng mẫu đã bật sẵn từ D12.1.
+
+<Callout kind="production">
+
+Tháng 06/2024, dự án OpenTelemetry công bố advisory GHSA-c74f-6mfw-mm4v (CVE-2024-36129) cho chính Collector: receiver HTTP và gRPC tự giải nén request (gzip, zstd, zlib, snappy, deflate) mà không giới hạn kích thước sau giải nén. Theo advisory, trong thử nghiệm, 10 GB dữ liệu toàn số 0 nén bằng zstd còn 329 KB; gửi một request như vậy làm Collector dùng hết bộ nhớ của máy thử (32 GB) ngay lập tức và bị OOM kill, và kẻ tấn công không cần xác thực. Hậu quả được ghi là dừng toàn bộ việc thu thập telemetry. Lỗi được sửa ở các bản phân phối chính thức từ v0.102.1; advisory ghi không có cách giảm nhẹ nào ngoài nâng cấp. Phần diễn giải của bài: Collector là điểm mà mọi tín hiệu đi qua, nên nó chết là mù hoàn toàn; cổng OTLP không nên mở ra mạng không tin cậy, phiên bản phải được ghim và cập nhật có chủ đích, và `memory_limiter` là lớp phòng thủ cần có nhưng không thay được việc vá (trong trường hợp này dữ liệu phình ra trước khi tới processor).
+
+</Callout>
+
+<Check id="d12.6.correlation">Kể được ba đường nối giữa metric, log và trace cùng cơ chế của từng đường, và giải thích được exemplar là gì.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Collector (OpenTelemetry)](https://opentelemetry.io/docs/collector/) và [Configuration](https://opentelemetry.io/docs/collector/configuration/): khái niệm và cú pháp receiver, processor, exporter, pipeline.
+- [Deploy the Collector (OpenTelemetry)](https://opentelemetry.io/docs/collector/deployment/): các kiểu triển khai agent, gateway và đánh đổi.
+- [Memory Limiter Processor (opentelemetry-collector)](https://github.com/open-telemetry/opentelemetry-collector/tree/main/processor/memorylimiterprocessor): cách tính `limit_mib`, `spike_limit_mib` và vì sao nó phải đứng đầu.
+- [Module ngx_otel_module (nginx)](https://nginx.org/en/docs/ngx_otel_module.html): các chỉ thị `otel_exporter`, `otel_trace`, `otel_trace_context` và biến `$otel_trace_id`.
+- [TraceQL (Grafana Tempo documentation)](https://grafana.com/docs/tempo/latest/traceql/): ngôn ngữ truy vấn trace dùng ở bước 5.
+- [Denial of Service via Zip/Decompression Bomb sent over HTTP or gRPC (GHSA-c74f-6mfw-mm4v)](https://github.com/open-telemetry/opentelemetry-collector/security/advisories/GHSA-c74f-6mfw-mm4v): advisory trong callout.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D12.5; cụm đang chạy với Prometheus, Grafana, Loki, Alloy; có các script `pq` và `lq`; có `openssl` (macOS có sẵn). Lab tải image Collector contrib (97 MB nén) và Tempo (34 MB). Dùng thêm cổng **9555** (Tempo) và **9557** (metric của Collector). **Profile máy:** theo số đo trong các lần chạy của bài, Collector dùng 55 đến 180 MiB, Tempo 70 đến 215 MiB; cả cụm 14 container dùng khoảng 0,95 GiB ở lần đo của bài (bước 7), có lúc lên tới 1,3 GiB. Máy 16 GB chạy đủ. Máy 8 GB với Docker VM 4 GB vẫn chạy được nếu không có cụm nào khác; nếu chật, dừng `node-exporter`, `alertmanager`, `webhook` cho cả bài, và có thể dừng thêm `loki`, `alloy` ở các bước 1 đến 5 rồi bật lại cho bước 6.
+
+### 1. Collector và Tempo
+
+<Terminal where="mac" title="~/masteva-d12">
+
+```bash
+cd ~/masteva-d12
+mkdir -p otelcol tempo
+cat > otelcol/config.yaml <<'EOF'
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 150
+    spike_limit_mib: 30
+  resource:
+    attributes:
+      - key: deployment.environment.name
+        value: lab
+        action: upsert
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+
+exporters:
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp_grpc/tempo, debug]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+EOF
+cat > tempo/tempo.yaml <<'EOF'
+server:
+  http_listen_port: 3200
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+overrides:
+  defaults:
+    compaction:
+      block_retention: 24h
+usage_report:
+  reporting_enabled: false
+EOF
+cat > compose.traces.yaml <<'EOF'
+x-otel: &otel
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otelcol:4318
+
+services:
+  shop-1:
+    environment: *otel
+  shop-2:
+    environment: *otel
+  stock:
+    environment: *otel
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:0.162.0
+    container_name: d12-otelcol
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes: ["./otelcol:/etc/otelcol:ro"]
+    ports: ["127.0.0.1:9557:8888"]
+    depends_on: [tempo]
+  tempo:
+    image: grafana/tempo:3.1.0
+    container_name: d12-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo:/etc/tempo:ro
+      - tempo-data:/var/tempo
+    ports: ["127.0.0.1:9555:3200"]
+
+volumes:
+  tempo-data:
+EOF
+echo 'COMPOSE_FILE=compose.yaml:compose.prom.yaml:compose.node.yaml:compose.alert.yaml:compose.logs.yaml:compose.traces.yaml' > .env
+docker run --rm -v "$PWD/otelcol:/etc/otelcol:ro" otel/opentelemetry-collector-contrib:0.162.0 validate --config=/etc/otelcol/config.yaml; echo "validate: exit=$?"
+docker compose up -d 2>&1 | grep -E '(otelcol|tempo|shop-1|shop-2|stock) +(Started|Recreated)'
+until [ "$(curl -s localhost:9555/ready)" = "ready" ]; do sleep 3; done; echo "tempo: ready"
+curl -s localhost:9555/status/config | grep block_retention
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+validate: exit=0
+ Container d12-shop-2 Recreated 
+ Container d12-stock Recreated 
+ Container d12-shop-1 Recreated 
+ Container d12-tempo Started 
+ Container d12-shop-2 Started 
+ Container d12-stock Started 
+ Container d12-shop-1 Started 
+ Container d12-otelcol Started 
+tempo: ready
+            block_retention: 1d
+                block_retention: 336h0m0s
+                compacted_block_retention: 1h0m0s
+        block_retention: 336h0m0s
+        compacted_block_retention: 1h0m0s
+```
+
+</Expected>
+
+- **`otelcol/config.yaml`** là đúng sơ đồ ở phần Kiến thức. `memory_limiter` đặt trần 150 MiB cho heap của Collector; từ 120 MiB (trần trừ đi `spike_limit_mib`) nó đã bắt đầu từ chối dữ liệu mới. `resource` gắn thuộc tính `deployment.environment.name=lab` vào mọi span, thứ mà không ứng dụng nào phải tự biết. `batch` gửi mỗi 2 giây hoặc khi đủ 512 span. Exporter `debug` in một dòng tóm tắt cho mỗi lô ra log của Collector; bỏ nó ở production. Khối `telemetry` mở metric của chính Collector ở cổng 8888.
+- **`tempo.yaml`** chạy Tempo một tiến trình, ghi ra đĩa cục bộ, giữ trace 24 giờ (mặc định 14 ngày). Lệnh cuối đọc lại cấu hình đang có hiệu lực: dòng `block_retention: 1d` đầu tiên là giá trị bài đặt trong `overrides`, được ưu tiên hơn các dòng `336h0m0s`, là mặc định chung của bộ phận nén và dọn dữ liệu. Bài không chờ được 24 giờ để thấy dữ liệu bị xoá; đây chỉ là bằng chứng khoá cấu hình được nhận. Collector nói chuyện với nó bằng OTLP/gRPC không TLS trong mạng nội bộ của lab; production bật TLS và xác thực.
+- **`compose.traces.yaml`** thêm đúng một biến môi trường cho ba service: `OTEL_EXPORTER_OTLP_ENDPOINT`. SDK của OpenTelemetry trong mọi ngôn ngữ đều đọc biến chuẩn này; code của `shop` từ D12.1 chỉ gửi span khi nó được đặt. Compose gộp biến mới vào `environment` đã có nên phải tạo lại ba container. Đây là toàn bộ thay đổi phía ứng dụng: nó biết địa chỉ Collector, không biết gì về Tempo.
+
+Tempo cần 15 đến 30 giây mới `ready`.
+
+### 2. Trace đầu tiên
+
+Script `trace` lấy một trace từ API của Tempo và in mỗi span một dòng: service, loại span, thời lượng, tên.
+
+<Terminal where="mac">
+
+```bash
+cat > trace <<'EOF'
+#!/bin/sh
+curl -s "localhost:9555/api/traces/$1" | jq -r '
+  [.batches[]? | (.resource.attributes[] | select(.key == "service.name") | .value.stringValue) as $svc
+   | .scopeSpans[].spans[]
+   | {start: (.startTimeUnixNano | tonumber), svc: $svc, name, kind: (.kind | sub("SPAN_KIND_"; "")),
+      ms: (((.endTimeUnixNano | tonumber) - (.startTimeUnixNano | tonumber)) / 1e6 | round)}]
+  | sort_by(.start) | .[] | "\(.svc)\t\(.kind)\t\(.ms) ms\t\(.name)"'
+EOF
+chmod +x trace
+sleep 15
+T=$(docker logs d12-shop-1 2>&1 | grep checkout | tail -1 | jq -r .trace_id); echo "trace_id=$T"
+sleep 10
+./trace $T
+docker logs d12-otelcol 2>&1 | grep '"otelcol.component.id": "debug"' | tail -1 | grep -o '"resource spans.*'
+curl -s localhost:9557/metrics | grep -E '^otelcol_(receiver_accepted_spans|exporter_sent_spans|processor_batch_batch_send_size_count)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trace_id=3f195398ef22989a5976635d872c4c4c
+shop	SERVER	65 ms	GET /api/checkout
+shop	CLIENT	34 ms	HTTP GET
+stock	SERVER	34 ms	GET /reserve
+"resource spans": 3, "spans": 145}
+otelcol_exporter_sent_spans{exporter="debug"} 529
+otelcol_exporter_sent_spans{exporter="otlp_grpc/tempo",server_address="tempo",server_port="4317"} 529
+otelcol_processor_batch_batch_send_size_count{processor="batch"} 4
+otelcol_receiver_accepted_spans{receiver="otlp",transport="http"} 667
+```
+
+</Expected>
+
+Trace id lấy từ một dòng log, và Tempo trả về đúng trace đó: ba span, hai service. `shop` nhận `GET /api/checkout` mất 65 ms, trong đó lời gọi sang `stock` (span CLIENT) mất 34 ms, và `stock` tự xử lý cũng 34 ms sau khi làm tròn. Phần chênh giữa span CLIENT và span SERVER của `stock`, ở đây dưới 1 ms, là thời gian trên mạng. Số của bạn sẽ khác.
+
+Hai dòng cuối là cách **giám sát chính Collector**: nó đã nhận 667 span qua HTTP, gửi đi 529 trong 4 lô (phần chênh đang nằm chờ lô kế tiếp); dòng `debug` cho thấy lô gần nhất gồm 145 span từ 3 nguồn. Nếu số nhận tăng mà số gửi đứng yên, đường ống đang tắc.
+
+<Check id="d12.6.lab-pipeline">Viết được cấu hình Collector có pipeline trace hoàn chỉnh, kiểm bằng `validate`, và đọc được số span nhận vào, gửi ra từ metric của chính Collector.</Check>
+
+### 3. Cho Nginx vào trace
+
+Trace hiện bắt đầu ở `shop`: Nginx phía trước vô hình. Image `nginx:…-otel` có sẵn module OpenTelemetry; bật nó và thêm trace id vào log truy cập. File dưới là `nginx.conf` của D12.1 với một dòng `load_module`, một trường trong `log_format` và bốn chỉ thị `otel_*`:
+
+<Terminal where="mac">
+
+```bash
+cat > nginx/nginx.conf <<'EOF'
+load_module modules/ngx_otel_module.so;
+worker_processes 1;
+events { worker_connections 1024; }
+
+http {
+  log_format json escape=json
+    '{"time":"$time_iso8601","service":"nginx","method":"$request_method",'
+    '"path":"$uri","status":$status,"duration_s":$request_time,"upstream":"$upstream_addr",'
+    '"trace_id":"$otel_trace_id"}';
+  access_log /dev/stdout json;
+
+  otel_exporter { endpoint otelcol:4317; }
+  otel_service_name nginx;
+  otel_trace on;
+  otel_trace_context propagate;
+
+  resolver 127.0.0.11 valid=5s;
+  upstream shop {
+    zone shop 64k;
+    server shop-1:8080 resolve;
+    server shop-2:8080 resolve;
+  }
+  server {
+    listen 80;
+    location /api/ { proxy_pass http://shop; }
+  }
+}
+EOF
+docker compose exec -T nginx nginx -t
+docker compose restart nginx 2>&1 | tail -1
+sleep 3
+T=$(openssl rand -hex 16); echo "trace_id=$T"
+curl -s -H "traceparent: 00-$T-$(openssl rand -hex 8)-01" localhost:9550/api/checkout
+docker logs d12-nginx 2>&1 | grep $T
+sleep 10
+./trace $T
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+ Container d12-nginx Started 
+trace_id=62e82e4f15efb395ff2b45a033bf4567
+{"order":"created"}
+{"time":"2026-10-11T06:28:49+00:00","service":"nginx","method":"GET","path":"/api/checkout","status":200,"duration_s":0.061,"upstream":"172.22.0.14:8080","trace_id":"62e82e4f15efb395ff2b45a033bf4567"}
+nginx	SERVER	61 ms	/api/
+shop	SERVER	61 ms	GET /api/checkout
+shop	CLIENT	19 ms	HTTP GET
+stock	SERVER	18 ms	GET /reserve
+```
+
+</Expected>
+
+Lần này trace id do **bạn** sinh ra, gửi trong header `traceparent` như một client đã có tracing. `otel_trace_context propagate` bảo Nginx làm đủ hai việc: nhận ngữ cảnh từ request tới (nên trace id trong log Nginx trùng cái bạn gửi), và ghi ngữ cảnh mới xuống upstream (nên `shop` và `stock` nối tiếp vào cùng trace). Không có header thì Nginx tự sinh trace id mới. Trace giờ có bốn span qua ba service; span của Nginx bao trùm span của `shop`, và phần chênh giữa hai span (ở đây dưới 1 ms) là thời gian Nginx tự tốn.
+
+Log truy cập của Nginx giờ có `trace_id`, và Alloy của D12.5 tự đưa nó vào structured metadata mà không phải sửa gì: cấu hình ở đó đọc trường `trace_id` của mọi dòng JSON.
+
+Trong hệ thống thật, có nhận `traceparent` từ Internet hay không là một quyết định: nhận thì nối được trace với client của đối tác, nhưng cũng cho người ngoài quyền chọn trace id và cờ lấy mẫu. Ở biên công khai thường đặt `otel_trace_context inject` (luôn bắt đầu trace mới), chỉ dùng `propagate` cho proxy nội bộ.
+
+<Check id="d12.6.lab-nginx">Bật được tracing cho Nginx, chứng minh được một trace đi liền từ header của client qua proxy tới hai service, và giải thích được `propagate` làm hai việc gì.</Check>
+
+### 4. Backend chết, Collector giữ hàng
+
+<Terminal where="mac">
+
+```bash
+docker compose stop tempo 2>&1 | tail -1
+T=$(openssl rand -hex 16); echo "trace_id=$T"
+curl -s -o /dev/null -w '%{http_code}\n' -H "traceparent: 00-$T-$(openssl rand -hex 8)-01" localhost:9550/api/checkout
+sleep 15
+docker logs --since 15s d12-otelcol 2>&1 | grep -c 'Exporting failed. Will retry'
+curl -s localhost:9557/metrics | grep -E '^otelcol_exporter_queue_(size|capacity)'
+docker compose start tempo 2>&1 | tail -1
+until [ "$(curl -s localhost:9555/ready)" = "ready" ]; do sleep 3; done
+sleep 30
+curl -s localhost:9557/metrics | grep -E '^otelcol_exporter_queue_size'
+./trace $T
+```
+
+</Terminal>
+
+<Predict question="Tempo dừng đúng lúc request này chạy. Người dùng nhận mã gì? Trace của nó có mất không?">
+
+```text
+ Container d12-tempo Stopped 
+trace_id=1ea7966c3dd93373776defb0baba2a77
+200
+11
+otelcol_exporter_queue_capacity{data_type="traces",exporter="otlp_grpc/tempo"} 1000
+otelcol_exporter_queue_size{data_type="traces",exporter="otlp_grpc/tempo"} 6
+ Container d12-tempo Started 
+otelcol_exporter_queue_size{data_type="traces",exporter="otlp_grpc/tempo"} 0
+nginx	SERVER	58 ms	/api/
+shop	SERVER	58 ms	GET /api/checkout
+shop	CLIENT	29 ms	HTTP GET
+stock	SERVER	28 ms	GET /reserve
+```
+
+- Người dùng nhận **200**. Ứng dụng giao span cho Collector rồi thôi; kho trace sống hay chết không ảnh hưởng đường xử lý request. Đây là lý do chính để có Collector.
+- Trong 15 giây, exporter báo `Exporting failed. Will retry` 11 lần, và hàng đợi giữ 6 lô trên sức chứa 1.000. Mỗi lần thử lại cách nhau xa dần.
+- Tempo quay lại, hàng đợi về 0, và trace của request gửi **trong lúc backend chết** có đủ bốn span. Không mất gì.
+
+Số lần thử lại và số lô trong hàng đợi của bạn sẽ khác; nếu `queue_size` chưa về 0 thì chờ thêm ít giây rồi hỏi lại.
+
+</Predict>
+
+Giới hạn của cơ chế này: hàng đợi nằm trong bộ nhớ nên Collector khởi động lại là mất; đầy 1.000 lô hoặc thử lại quá 5 phút thì lô bị bỏ. Cho sự cố dài hơn, Collector có hàng đợi ghi ra đĩa (extension `file_storage`), và lúc đó `memory_limiter` là thứ ngăn Collector tự chết vì ôm quá nhiều.
+
+<Check id="d12.6.lab-outage">Tái hiện được việc backend trace ngừng mà request vẫn thành công và trace không mất, và đọc được hàng đợi của exporter từ metric.</Check>
+
+### 5. TraceQL: tìm request chậm
+
+Cho `stock` chậm thêm 300 ms, rồi hỏi Tempo: trace nào có span của `stock` dài hơn 300 ms?
+
+<Terminal where="mac">
+
+```bash
+curl -s -X POST 'localhost:9560/admin/fault?delay=300'
+Q='{ resource.service.name = "stock" && duration > 300ms }'
+until [ "$(curl -sG localhost:9555/api/search --data-urlencode "q=$Q" | jq '.traces | length' 2>/dev/null)" -gt 0 ] 2>/dev/null; do sleep 5; done
+curl -sG localhost:9555/api/search --data-urlencode "q=$Q" --data-urlencode 'limit=3' \
+  | jq -r '.traces[] | "\(.traceID)  \(.rootServiceName)  \(.rootTraceName)  \(.durationMs) ms"'
+S=$(curl -sG localhost:9555/api/search --data-urlencode "q=$Q" --data-urlencode 'limit=1' | jq -r '.traces[0].traceID')
+./trace $S
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+error=0% delay=300ms
+1431d11f7158612ae236039389322c97  nginx  /api/  361 ms
+1b4585a91d3492eab0019655468bde9b  nginx  /api/  382 ms
+efa2e3b1a18da4a8c404f8f7d2edd2e  nginx  /api/  361 ms
+nginx	SERVER	361 ms	/api/
+shop	SERVER	362 ms	GET /api/checkout
+shop	CLIENT	323 ms	HTTP GET
+stock	SERVER	322 ms	GET /reserve
+```
+
+</Expected>
+
+TraceQL chọn **span** theo điều kiện trong ngoặc nhọn: `resource.service.name` là thuộc tính của nguồn phát, `duration` là thời lượng của span. Kết quả là các trace chứa span khớp, kèm service gốc và tổng thời gian. Mở một trace ra, nguyên nhân hiện ngay: request mất 361 ms, trong đó 322 ms nằm ở `stock`. Metric p95 của `shop` chỉ nói được "checkout chậm"; trace nói "chậm vì `stock`", điều mà nhìn từ metric của riêng `shop` không thấy.
+
+Vòng `until` chờ tới khi Tempo tìm thấy ít nhất một trace khớp. Ở lab này, trace mới tra theo id được sau vài giây, nhưng phải chừng nửa phút tới một phút mới xuất hiện trong kết quả tìm kiếm; chạy tìm kiếm ngay sau khi tiêm độ trễ sẽ ra rỗng. Trace id trong kết quả tìm kiếm của Tempo có thể ngắn hơn 32 ký tự vì nó bỏ số 0 ở đầu; API lấy trace vẫn nhận. **Giữ nguyên độ trễ này cho bước sau.**
+
+<Check id="d12.6.lab-traceql">Viết được một truy vấn TraceQL tìm trace theo service và thời lượng span, và chỉ ra được span chậm trong trace tìm thấy.</Check>
+
+### 6. Từ biểu đồ tới trace tới log
+
+Trước hết, cho Grafana biết ba datasource liên quan với nhau thế nào. Ba file ở D12.4 và D12.5 được viết lại, mỗi file thêm một khối:
+
+<Terminal where="mac">
+
+```bash
+cat > grafana/provisioning/datasources/tempo.yaml <<'EOF'
+apiVersion: 1
+datasources:
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        customQuery: true
+        query: '{service=~".+"} | trace_id="$${__trace.traceId}"'
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+EOF
+cat > grafana/provisioning/datasources/loki.yaml <<'EOF'
+apiVersion: 1
+datasources:
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      derivedFields:
+        - name: trace
+          matcherType: label
+          matcherRegex: trace_id
+          datasourceUid: tempo
+          url: '$${__value.raw}'
+EOF
+cat > grafana/provisioning/datasources/prometheus.yaml <<'EOF'
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+EOF
+docker compose restart grafana 2>&1 | tail -1
+until curl -sf localhost:9553/api/health >/dev/null; do sleep 2; done
+curl -s localhost:9553/api/datasources | jq -c '.[] | {name, type, links: (.jsonData | keys - ["timeInterval"])}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d12-grafana Started 
+{"name":"Loki","type":"loki","links":["derivedFields"]}
+{"name":"Prometheus","type":"prometheus","links":["exemplarTraceIdDestinations"]}
+{"name":"Tempo","type":"tempo","links":["tracesToLogsV2"]}
+```
+
+</Expected>
+
+Ba khối là ba mũi tên của sơ đồ ở phần Kiến thức:
+
+- **Prometheus, `exemplarTraceIdDestinations`:** label `trace_id` của exemplar là link sang Tempo.
+- **Loki, `derivedFields`:** trường `trace_id` (đọc từ structured metadata, nên `matcherType: label`) thành nút mở trace bên cạnh mỗi dòng log.
+- **Tempo, `tracesToLogsV2`:** từ một span, chạy truy vấn LogQL lọc theo trace id, nới 5 phút về hai phía.
+
+`$$` là cách viết ký tự `$` trong file provisioning để Grafana không coi đó là biến môi trường.
+
+Giờ đi trọn vòng bằng dòng lệnh, đúng thứ tự bạn sẽ bấm trên giao diện: hỏi Prometheus exemplar của request `checkout` chậm nhất trong phút vừa qua, lấy trace id của nó, mở trace, rồi tìm log.
+
+<Terminal where="mac">
+
+```bash
+NOW=$(date +%s)
+E=$(curl -sG localhost:9551/api/v1/query_exemplars \
+  --data-urlencode 'query=http_request_duration_seconds_bucket{job="shop", route="/api/checkout"}' \
+  --data-urlencode "start=$((NOW-60))" --data-urlencode "end=$NOW" \
+  | jq -c '[.data[] | .seriesLabels.instance as $i | .exemplars[] | {instance: $i, seconds: (.value | tonumber), trace_id: .labels.trace_id}] | max_by(.seconds)')
+echo "$E"
+T=$(echo "$E" | jq -r .trace_id)
+sleep 10
+./trace $T
+./lq "{service=~\".+\"} | trace_id=\"$T\"" 5m 10
+curl -s -X POST localhost:9560/admin/fault
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"instance":"shop-2:8080","seconds":0.389896501,"trace_id":"f0b9344ef2ddb7a4ae2dd05cc66e1026"}
+nginx	SERVER	391 ms	/api/
+shop	SERVER	390 ms	GET /api/checkout
+shop	CLIENT	339 ms	HTTP GET
+stock	SERVER	337 ms	GET /reserve
+nginx  {"time":"2026-10-11T06:30:01+00:00","service":"nginx","method":"GET","path":"/api/checkout","status":200,"duration_s":0.391,"upstream":"172.22.0.3:8080","trace_id":"f0b9344ef2ddb7a4ae2dd05cc66e1026"}
+shop-2  {"time":"2026-10-11T06:30:01.149938504Z","level":"INFO","msg":"request","service":"shop","method":"GET","route":"/api/checkout","status":200,"duration_ms":389,"trace_id":"f0b9344ef2ddb7a4ae2dd05cc66e1026"}
+stock  {"time":"2026-10-11T06:30:01.149398254Z","level":"INFO","msg":"request","service":"stock","method":"GET","route":"/reserve","status":200,"duration_ms":337,"trace_id":"f0b9344ef2ddb7a4ae2dd05cc66e1026"}
+error=0% delay=0ms
+```
+
+</Expected>
+
+Ba lệnh, ba tín hiệu, một request:
+
+1. **Metric:** Prometheus trả về exemplar: một quan sát 390 ms trên `shop-2`, kèm trace id. Đây là thứ `ObserveWithExemplar` trong code ở D12.1 đã gắn vào histogram.
+2. **Trace:** trace đó cho thấy 337 trong 391 ms nằm ở `stock`. Lệnh chờ 10 giây trước khi hỏi Tempo, vì exemplar có thể thuộc một request vừa xong mà span chưa kịp tới nơi.
+3. **Log:** ba dòng của đúng request ấy, từ Nginx, `shop-2` và `stock`. Ở D12.5 chỉ có hai; dòng của Nginx có mặt nhờ bước 3.
+
+Trên giao diện, cùng hành trình đó là ba cú bấm. Mở `http://localhost:9553`, vào **Explore**, chọn **Prometheus**, chạy `histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job="shop"}[1m])))` và bật **Exemplars** trong tuỳ chọn của truy vấn: các chấm hiện trên đường biểu diễn; bấm một chấm ở vùng cao, chọn link sang Tempo. Trong màn hình trace, bấm vào span của `stock` rồi bấm link **Related logs** (tên của nó trên Grafana 13.2.3, theo ghi nhận của người duyệt bài; bài kiểm phần này qua API chứ không qua giao diện): Grafana mở Loki với truy vấn theo trace id. Ngược lại, từ một dòng log trong Loki, nút `trace` cạnh trường `trace_id` mở thẳng trace. Tên nút có thể đổi giữa các bản Grafana; ba khối cấu hình ở trên là thứ quyết định chúng có xuất hiện hay không.
+
+<Check id="d12.6.lab-correlation">Đi được trọn vòng từ một exemplar trên metric tới trace rồi tới log của cùng một request, bằng dòng lệnh và trên Grafana, và chỉ ra được cấu hình nào tạo ra mỗi đường nối.</Check>
+
+### 7. Cả cụm tốn bao nhiêu
+
+<Terminal where="mac">
+
+```bash
+docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}' $(docker compose ps -q) | sed 's| / .*||' | sort -t "$(printf '\t')" -k2 -h -r
+docker stats --no-stream --format '{{.MemUsage}}' $(docker compose ps -q) | awk '{ v = $1; if (v ~ /GiB/) { sub("GiB", "", v); s += v * 1024 } else { sub("MiB", "", v); s += v } } END { printf "Tổng: %.0f MiB\n", s }'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d12-grafana	249.6MiB
+d12-tempo	212.7MiB
+d12-loki	120.8MiB
+d12-prometheus	106.7MiB
+d12-alloy	71.84MiB
+d12-otelcol	71.31MiB
+d12-alertmanager	20.98MiB
+d12-node-exporter	20.7MiB
+d12-stock	15.1MiB
+d12-shop-2	13MiB
+d12-shop-1	12.5MiB
+d12-loadgen	11.11MiB
+d12-webhook	7.145MiB
+d12-nginx	5.766MiB
+Tổng: 944 MiB
+```
+
+</Expected>
+
+Mười bốn container, 944 MiB, trong đó phần ứng dụng thật (ba service, Nginx, bộ sinh tải) chưa tới 60 MiB: ở quy mô lab, hệ thống quan sát nặng gấp khoảng mười sáu lần thứ nó quan sát. Con số dao động tuỳ thời điểm đo, chủ yếu theo Grafana, Tempo và Loki; trần 640 MiB của Grafana (D12.4) giữ cho tổng không vượt quá chừng 1,3 GiB. Trước khi có trần đó, một lần chạy của bài đo được 1.326 MiB. Tỉ lệ đó đảo chiều khi ứng dụng lớn lên, nhưng bài học giữ nguyên: observability là một hệ thống phải được cấp tài nguyên, giám sát và tính tiền như mọi hệ thống khác. D16 làm việc đó ở quy mô lớn.
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`validate` báo không biết component `otlp_grpc`:** bạn dùng bản Collector cũ hơn bài; ở các bản đó exporter tên `otlp`. Ghim đúng 0.162.0, hoặc đổi tên trong cả khối `exporters` lẫn pipeline.
+- **Tempo không lên, log có `field compactor not found in type app.Config`:** cấu hình viết cho Tempo 2. Tempo 3 bỏ khối `compactor`; thời gian lưu đặt như file của bài.
+- **Log Tempo lặp `error calling scheduler … no jobs found` ở mức error:** vô hại; bộ phận nén dữ liệu của Tempo 3 chạy một tiến trình hỏi việc mà chưa có việc.
+- **`./trace` in rỗng:** span chưa kịp tới Tempo (lô gửi mỗi 2 giây, Tempo cần vài giây nữa), hoặc Tempo vừa khởi động lại chưa sẵn sàng. Chờ 10 giây rồi gọi lại. Nếu vẫn rỗng, xem `otelcol_exporter_send_failed_spans` ở cổng 9557.
+- **Trace chỉ có span của `nginx`, hoặc chỉ của `shop`:** ba service chưa được tạo lại với `OTEL_EXPORTER_OTLP_ENDPOINT` (kiểm bằng `docker compose config | grep OTEL`), hoặc Nginx chưa khởi động lại sau khi sửa `nginx.conf`.
+- **`query_exemplars` trả mảng rỗng:** Prometheus thiếu cờ `--enable-feature=exemplar-storage` (đã đặt ở D12.2), hoặc chưa có request `checkout` nào trong 60 giây qua.
+
+</Callout>
+
+### Dọn dẹp
+
+Đây là bài cuối của chặng. Nếu còn muốn nghịch, `docker compose stop` giữ lại mọi thứ.
+
+<Callout kind="danger">
+
+Các lệnh dưới đây xoá toàn bộ container của project Compose `d12`, năm volume của nó (bốn volume có tên `d12_prometheus-data`, `d12_loki-data`, `d12_alloy-data`, `d12_tempo-data` và một volume vô danh của Alertmanager, cùng mọi metric, log, trace và silence đã lưu), image `d12-shop:1.0.0` và cả thư mục `~/masteva-d12` gồm mọi file cấu hình bạn đã viết trong sáu bài. Lệnh cuối xoá các image của chặng để lấy lại hơn 4 GB đĩa; bỏ dòng đó, hoặc bỏ bớt tên, nếu bạn còn dùng chúng (`golang`, distroless và `alpine` cũng được dùng ở D5).
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp cả chặng">
+
+```bash
+cd ~/masteva-d12 && docker compose down -v
+docker rmi d12-shop:1.0.0
+cd ~ && rm -rf ~/masteva-d12
+docker rmi prom/prometheus:v3.15.0 prom/alertmanager:v0.34.1 prom/node-exporter:v1.12.1 grafana/grafana:13.2.3 grafana/loki:3.7.8 grafana/alloy:v1.20.1 grafana/tempo:3.1.0 otel/opentelemetry-collector-contrib:0.162.0 nginx:1.30.5-alpine-otel golang:1.27.2-alpine gcr.io/distroless/static-debian13:nonroot alpine:3.24.2
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nên lấy mẫu ở đâu: SDK hay Collector?">
+
+Ở SDK (head sampling), quyết định được đưa ra ở span đầu tiên và truyền đi trong cờ của `traceparent`: rẻ nhất, vì trace bị bỏ không tốn gì cả, nhưng mù: 99% trace bị bỏ bao gồm 99% trace lỗi. Ở Collector (tail sampling), toàn bộ span của một trace được giữ lại trong bộ nhớ một lúc, rồi mới quyết định theo nội dung: giữ mọi trace có lỗi, mọi trace chậm hơn một giây, và 1% phần còn lại. Cái giá: mọi span vẫn phải được sinh ra và gửi tới Collector, Collector cần bộ nhớ để chờ, và mọi span của một trace phải tới **cùng một** Collector, nên khi có nhiều bản phải có một tầng định tuyến theo trace id phía trước. Cách thường gặp là kết hợp: head sampling ở mức vừa phải để chặn chi phí từ gốc, tail sampling ở gateway để chọn trace đáng giữ. D16 dựng cấu hình đó.
+
+</Reveal>
+
+<Reveal title="Collector chết thì sao?">
+
+Ứng dụng không chết theo: SDK gửi span ở chế độ nền, có hàng đợi nhỏ, đầy thì bỏ span chứ không chặn request. Thứ mất là dữ liệu trong khoảng đó, và nếu Collector là điểm duy nhất thì mất cho mọi service. Ba việc làm cho nó bớt mong manh: chạy nhiều bản sau một load balancer (Collector kiểu gateway không giữ trạng thái, trừ khi làm tail sampling), đặt giới hạn bộ nhớ của container cao hơn `limit_mib` của `memory_limiter` một khoảng để nó kịp từ chối trước khi bị giết, và giám sát chính nó: các metric ở cổng 8888 (span nhận, gửi, gửi lỗi, độ dài hàng đợi) cho Prometheus scrape như mọi target khác, kèm alert khi số gửi lỗi tăng hoặc hàng đợi không vơi.
+
+</Reveal>
+
+<Reveal title="Metric và log có nên cũng đi qua Collector không?">
+
+Có thể, và nhiều đội đang đi theo hướng một đường ống cho cả ba tín hiệu: ứng dụng nói OTLP, Collector chuyển metric tới Prometheus hoặc một backend tương thích, log tới Loki hay OpenSearch, trace tới Tempo. Lợi ích là một chỗ để gắn thuộc tính và áp chính sách, và ứng dụng chỉ cần một SDK. Cái giá ở thời điểm này: metric đẩy qua OTLP mất tín hiệu `up` và mô hình pull của D12.2 (Collector cũng scrape được, bằng receiver `prometheus`), quy ước tên và kiểu của OpenTelemetry khác Prometheus ở vài chỗ nên dashboard có sẵn phải chỉnh, và log qua OTLP đòi ứng dụng đổi cách ghi. Lab giữ ba đường riêng vì mỗi đường là cách phổ biến nhất của tín hiệu đó hôm nay. Khi hợp nhất, hãy làm từng tín hiệu một và so số liệu hai đường trong một thời gian.
+
+</Reveal>
+
+<Reveal title="Trace id trong log của Nginx và của ứng dụng trùng nhau, nhưng nếu giữa chúng có hàng đợi thì sao?">
+
+Header HTTP chỉ nối được các lời gọi đồng bộ. Khi request ghi một tin vào Kafka rồi trả về, và một consumer xử lý tin đó mười giây sau, không có header nào đi theo trừ khi bên gửi ghi ngữ cảnh trace vào **header của tin nhắn** và bên nhận đọc ra. Thư viện instrument của OpenTelemetry cho Kafka, RabbitMQ làm việc đó; span của consumer khi ấy thường được nối bằng **link** tới span của producer thay vì là con trực tiếp, vì một lô tin có thể thuộc nhiều trace. Phía hạ tầng, điều cần nhớ là mọi thành phần chuyển tiếp tin (proxy, bộ định tuyến tin nhắn, job chuyển đổi) phải giữ nguyên header của tin. Roadmap Microservices đi sâu phần này.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết cấu hình Collector nhanh và thường đúng cấu trúc, nên hãy nhờ nó dựng pipeline từ mô tả rồi kiểm. Chỗ hay sai, phần lớn vì Collector đổi liên tục: tên component cũ hoặc đã bị gỡ (`logging` thay cho `debug`, exporter `jaeger`, `loki` đã bỏ), khai component mà quên đưa vào `service.pipelines`, đặt `batch` trước `memory_limiter`, dùng component chỉ có ở contrib trong khi bạn chạy core, cấu hình Tempo của bản 2 cho Tempo 3, và chỉ thị Nginx của module `opentelemetry` bên thứ ba thay cho `ngx_otel_module` chính thức. Kiểm lại: `otelcol validate` bắt gần hết lỗi cấu hình; `otelcol components` liệt kê component thật có trong bản bạn dùng; rồi gửi một request có `traceparent` tự sinh như bước 3 và xem nó có ra đủ span ở backend không.
+
+</Callout>
+
+<Callout kind="link">
+
+Chặng D12 kết thúc ở đây: ba tín hiệu và ứng dụng mẫu (D12.1), Prometheus (D12.2, D12.3), Grafana và Alertmanager (D12.4), Loki (D12.5), Collector và Tempo (bài này). SB8.2 là phía ứng dụng của tracing. D16 làm lại hệ thống này ở quy mô lớn: SLO và burn rate, lưu metric dài hạn, cardinality, Collector hai tầng với tail sampling, chi phí log, giám sát hệ thống giám sát. D17 dùng nó trong lúc có sự cố. Roadmap Kubernetes cài cùng các thành phần bằng kube-prometheus-stack và OpenTelemetry Operator.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d12.6.mastery-collector">Tự viết được cấu hình Collector cho một hệ thống: chọn receiver, thứ tự processor, exporter, giải thích được từng lựa chọn và chứng minh được nó chịu được việc backend ngừng tạm thời.</Check>
+
+<Check id="d12.6.mastery-e2e">Làm cho một trace đi liền qua reverse proxy và nhiều service, tìm được trace chậm bằng truy vấn, và chỉ ra được bước chiếm thời gian.</Check>
+
+<Check id="d12.6.mastery-correlation">Từ một cảnh báo về độ trễ, đi được tới một request cụ thể, tới bước chậm trong trace của nó, tới các dòng log liên quan, và nói được mỗi bước dựa vào cấu hình nào.</Check>
+
+</Mastery>

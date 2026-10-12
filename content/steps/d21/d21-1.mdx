@@ -1,0 +1,910 @@
+---
+title: "Nginx trên production: worker, keepalive, buffer, giới hạn tốc độ"
+description: Đẩy tải vào một Nginx đứng trước hai backend để thấy từng giới hạn lộ ra thế nào trong log, gồm worker_connections, file descriptor, port nguồn khi không giữ kết nối tới backend; rồi đo buffer với client chậm, giới hạn tốc độ trả 429 và reload không rớt request nào.
+id: d21.1
+step: d21
+prerequisites: [d2.5]
+topics: [d21.nginx-production]
+status: verified
+verified:
+  date: 2026-10-11
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    nginx: 1.28.3
+    hey: 0.1.4
+    iproute2: 6.19.0
+    curl: 8.18.0
+---
+
+<Goal>
+
+D2.5 dựng được một Nginx chạy đúng. Bài này làm cho nó chịu được tải thật: biết Nginx chạm trần nào trước, trần đó hiện ra thành dòng log nào, và chỉnh ở đâu. Học xong, bạn giải thích được:
+
+- Vì sao Nginx còn thừa CPU mà client vẫn bị ngắt kết nối hoặc nhận `500`, và hai dòng `worker_connections are not enough`, `Too many open files` khác nhau ở đâu.
+- Vì sao thiếu ba dòng cấu hình keepalive là mỗi request mở một kết nối TCP mới tới backend, và chuyện đó dẫn tới `Cannot assign requested address` của D2.1 thế nào.
+- Vì sao một client mạng chậm không giữ chân backend khi Nginx bật buffer, và nhìn `rt`, `urt` trong access log là biết chậm ở phía nào.
+- Vì sao `limit_req` trả `503` chứ không phải `429` nếu bạn không đổi, và `burst`, `nodelay` thay đổi hành vi ra sao.
+- Vì sao `reload` không rớt request còn `restart` thì có.
+
+</Goal>
+
+<Knowledge>
+
+### Master, worker và event loop
+
+Nginx chạy một tiến trình **master** và nhiều tiến trình **worker**. Master chạy bằng `root` để mở port 80, 443 và đọc khoá TLS, rồi giao việc phục vụ cho worker chạy bằng user thường (`www-data` trên Ubuntu). Mỗi worker là **một luồng duy nhất** chạy một vòng lặp sự kiện (event loop, dùng `epoll` của Linux): nó không chờ từng kết nối mà hỏi kernel "kết nối nào vừa có dữ liệu" rồi xử lý lần lượt. Nhờ vậy một worker giữ được hàng nghìn kết nối cùng lúc, khác mô hình một thread cho mỗi request của Tomcat (SB12.2).
+
+```text
+                 nginx: master process (root)
+                 đọc cấu hình, mở port, sinh và thay worker
+                    │ fork                    │ fork
+        ┌───────────┴──────────┐   ┌──────────┴───────────┐
+        │ worker (www-data)    │   │ worker (www-data)    │   worker_processes auto:
+        │ 1 luồng, 1 event loop│   │ 1 luồng, 1 event loop│   mỗi CPU một worker
+        └───┬──────────────┬───┘   └──────────────────────┘
+   kết nối từ client    kết nối tới backend
+   └──── cùng tính vào worker_connections, mỗi kết nối một file descriptor ────┘
+```
+
+Hệ quả của mô hình này:
+
+- Một việc **chặn** trong worker (đọc đĩa chậm, module Lua gọi mạng đồng bộ) làm đứng mọi kết nối của worker đó. Nginx vì thế không chạy logic nghiệp vụ.
+- `worker_processes auto` tạo số worker bằng số CPU của máy. Nginx đếm CPU của **máy**, không đọc giới hạn CPU của cgroup (D1.5), nên trong container bị giới hạn 2 CPU trên node 64 CPU, `auto` sinh 64 worker. Ở đó hãy ghi số cụ thể.
+
+Số kết nối Nginx giữ được bị chặn bởi nhiều tầng. Chạm tầng nào, log báo một kiểu:
+
+| Giới hạn | Mặc định | Chạm trần thì thấy gì | Chỉnh ở đâu |
+|---|---|---|---|
+| `worker_connections` | 512 (file mẫu của Ubuntu đặt 768) | `[warn] ... worker_connections are not enough`, client bị reset kết nối | Khối `events` |
+| File descriptor của worker (`RLIMIT_NOFILE`) | 1024 (thừa kế từ shell hoặc systemd) | `[crit] accept4() failed (24: Too many open files)`, request nhận `500` | `worker_rlimit_nofile`, hoặc `LimitNOFILE=` trong unit systemd (D1.1) |
+| Hàng đợi `accept` (backlog) | `listen ... backlog=511`, trần `net.core.somaxconn` 4096 | Client chậm ở bước bắt tay, `ListenOverflows` tăng trong `nstat -az TcpExtListenOverflows` | Tham số `backlog=` của `listen` |
+| Port nguồn tới backend | 28.232 port cho mỗi cặp (IP nguồn, IP và port backend) | `[crit] connect() ... failed (99: Cannot assign requested address)`, request nhận `502` | Giữ kết nối tới backend (mục sau) |
+
+Một request được proxy dùng **hai** kết nối trong worker: một từ client, một tới backend. Vì vậy số client phục vụ cùng lúc xấp xỉ `worker_processes × worker_connections ÷ 2`, và `worker_rlimit_nofile` nên ít nhất gấp đôi `worker_connections` (còn file log, file tạm).
+
+<Check id="d21.1.worker-model">Vẽ được quan hệ master, worker, event loop và kể được bốn giới hạn về số kết nối kèm dòng log báo hiệu của từng giới hạn.</Check>
+
+### Giữ kết nối tới backend
+
+Nginx 1.28 (bản Ubuntu 26.04 đóng gói) và mọi bản trước 1.29.7 mặc định nói HTTP/1.0 với backend và gửi `Connection: close`: **mỗi request một kết nối TCP mới**. Cái giá:
+
+- Mỗi request tốn thêm một lần bắt tay ba bước (và một lần bắt tay TLS nếu backend dùng HTTPS).
+- Mỗi kết nối đóng để lại một socket `TIME-WAIT` 60 giây ở bên đóng trước (D2.1). Ở vài nghìn request mỗi giây tới cùng một backend, dải 28.232 port nguồn cạn, và `connect()` lỗi `Cannot assign requested address`.
+
+Trên các bản đó, bật keepalive cần ba dòng, thiếu một dòng là không có tác dụng:
+
+```nginx
+upstream app {
+  server 10.9.0.21:8080;
+  keepalive 64;                      # số kết nối RẢNH mỗi worker giữ lại, không phải trần
+}
+location / {
+  proxy_pass http://app;
+  proxy_http_version 1.1;            # HTTP/1.0 không có keepalive chuẩn
+  proxy_set_header Connection "";    # xoá "Connection: close" mà Nginx tự thêm
+}
+```
+
+`keepalive 64` nghĩa là mỗi worker cất tối đa 64 kết nối rảnh để dùng lại; khi tải cần nhiều hơn, Nginx vẫn mở thêm và đóng bớt khi vượt con số này. Đặt quá nhỏ so với số request đồng thời thì phần vượt vẫn đóng mở liên tục.
+
+Mặc định này đã đổi từ **Nginx 1.29.7** (mainline, 03/2026) và có trong nhánh stable **1.30** (04/2026): `proxy_http_version` mặc định là `1.1`, header `Connection` không còn được gửi, và khối `upstream` tự có `keepalive 32 local` (tham số `local` không cho các `location` khác nhau dùng chung kết nối đã cất). Nghĩa là nếu bạn cài Nginx từ repo của nginx.org hoặc chạy image `nginx:stable`, keepalive tới backend có sẵn và bước 2 của lab sẽ không cho ra con số "mỗi request một kết nối"; bước đó tái hiện đúng trên 1.28 của Ubuntu 26.04. Viết đủ ba dòng vẫn là thói quen tốt: cấu hình chạy giống nhau trên cả hai đời, và bạn chủ động chọn được con số thay cho 32. Nguồn: [CHANGES của nhánh 1.30](https://nginx.org/en/CHANGES-1.30).
+
+Một bẫy khi đã bật: nếu backend đóng kết nối rảnh **sớm hơn** Nginx (ví dụ Tomcat đóng sau `keepAliveTimeout`, còn Nginx giữ 60 giây theo `keepalive_timeout` của khối `upstream`), sẽ có lúc Nginx gửi request vào đúng kết nối backend vừa đóng. Log ghi `upstream prematurely closed connection`, và request không idempotent như `POST` nhận `502` vì Nginx không tự gửi lại. Quy tắc: bên **mở** kết nối (Nginx) phải có thời gian chờ rảnh ngắn hơn bên nhận (backend).
+
+<Check id="d21.1.upstream-keepalive">Viết được ba dòng bật keepalive tới backend trên Nginx 1.28, giải thích được `keepalive 64` giới hạn cái gì, và nói được vì sao timeout rảnh của Nginx phải ngắn hơn của backend.</Check>
+
+### Buffer và timeout
+
+**Buffer** là chỗ Nginx chứa tạm request và response. Mặc định cả hai chiều đều bật:
+
+- Chiều request (`proxy_request_buffering on`): Nginx đọc **hết** body của client rồi mới mở kết nối tới backend. `client_max_body_size` (mặc định 1 MB) là kích thước body tối đa; vượt thì `413`.
+- Chiều response (`proxy_buffering on`): Nginx đọc hết response từ backend nhanh nhất có thể, vào bộ nhớ (`proxy_buffers`, mặc định 8 vùng, mỗi vùng một trang nhớ 4 KB hoặc 8 KB) rồi tràn ra file tạm (tối đa `proxy_max_temp_file_size`, mặc định 1 GB), và trả dần cho client theo tốc độ của client.
+
+```text
+ proxy_buffering on (mặc định)                    proxy_buffering off
+ client chậm ◄─── Nginx ◄═══ backend              client chậm ◄─── Nginx ◄─── backend
+   4 giây          │     0,02 giây                  4 giây                4 giây
+                   └─ giữ response trong bộ nhớ / file tạm
+ backend rảnh ngay, nhận request khác              một thread của backend bị giữ suốt 4 giây
+```
+
+Buffer là thứ bảo vệ backend kiểu một thread mỗi request: 200 client 3G tải file chậm không chiếm 200 thread Tomcat. Tắt buffer cho những đường dẫn mà client cần nhận từng mẩu ngay: Server-Sent Events, streaming, long polling (`proxy_buffering off` theo `location`, hoặc backend gửi header `X-Accel-Buffering: no`). Header response lớn hơn `proxy_buffer_size` (mặc định 4 KB hoặc 8 KB, hay gặp khi cookie hoặc JWT phình to) thì Nginx trả `502` với `upstream sent too big header`.
+
+**Timeout** của Nginx tính giữa **hai lần đọc hoặc ghi liên tiếp**, không phải tổng thời gian của request. D2.5 đã dùng `proxy_connect_timeout` và `proxy_read_timeout` ở phía backend; phía client có bốn cái nữa:
+
+| Directive | Mặc định | Đếm cái gì | Quá hạn thì |
+|---|---|---|---|
+| `client_header_timeout` | 60s | Thời gian đọc xong header request | `408`, đóng kết nối |
+| `client_body_timeout` | 60s | Giữa hai lần đọc body | `408` |
+| `send_timeout` | 60s | Giữa hai lần ghi response cho client | Đóng kết nối |
+| `keepalive_timeout` | 75s | Kết nối client rảnh giữa hai request | Đóng kết nối |
+
+Mặc định 60 giây là rộng rãi cho một client tử tế và quá rộng cho kẻ tấn công kiểu Slowloris: mở hàng nghìn kết nối rồi gửi header từng byte để giữ chỗ. Hạ `client_header_timeout` xuống vài giây là cách phòng rẻ nhất. SB12.2 đã nêu nguyên tắc chuỗi timeout ngắn dần từ ngoài vào trong; ở tầng này nghĩa là `proxy_read_timeout` không nên dài hơn thời gian client hoặc load balancer phía trước còn chờ.
+
+<Check id="d21.1.buffer-timeout">Giải thích được buffer response bảo vệ backend khỏi client chậm thế nào, kể được ba trường hợp nên tắt buffer, và nói được timeout của Nginx đếm khoảng nào.</Check>
+
+### Giới hạn tốc độ và số kết nối
+
+`limit_req` giới hạn **số request mỗi giây** theo một khoá (thường là IP client) bằng thuật toán leaky bucket: request chảy ra khỏi xô với tốc độ `rate`, xô chứa được `burst` request đang chờ.
+
+```nginx
+limit_req_zone $binary_remote_addr zone=req_ip:10m rate=10r/s;   # trong http
+limit_req zone=req_ip burst=20 nodelay;                          # trong server hoặc location
+```
+
+| Cấu hình | Request vượt `rate` |
+|---|---|
+| Không `burst` | Bị từ chối ngay. `rate=10r/s` nghĩa là mỗi 100 ms một request; hai request cách nhau 10 ms thì cái thứ hai bị từ chối |
+| `burst=20` | 20 request đầu được **xếp hàng** và nhả ra đúng nhịp 10 mỗi giây (cái cuối chờ 2 giây); phần còn lại bị từ chối |
+| `burst=20 nodelay` | 20 request đầu được chuyển **ngay**; chỗ trong xô hồi lại theo `rate`. Hợp với API: chịu được một nhịp dồn, không làm chậm ai |
+| `burst=20 delay=8` | Lai giữa hai kiểu trên: 8 request đầu được chuyển ngay, 12 request kế tiếp xếp hàng theo nhịp `rate`, phần còn lại bị từ chối |
+
+`limit_conn` giới hạn **số kết nối đang mở** theo khoá, hợp với việc tốn tài nguyên lâu (tải file, báo cáo). Hai điểm hay sai:
+
+- Request bị từ chối nhận **`503`** theo mặc định. Client và hệ thống giám sát không phân biệt được với lỗi thật của server. Đặt `limit_req_status 429` và `limit_conn_status 429` (`429 Too Many Requests`, RFC 6585).
+- Vùng nhớ `zone` nằm trong **từng** máy Nginx. Hai Nginx sau một load balancer nghĩa là giới hạn thực tế gấp đôi. Giới hạn chính xác theo người dùng hay API key trên nhiều máy cần chỗ lưu chung (SB13.3 dùng Bucket4j với Redis). Và khoá `$binary_remote_addr` chỉ có nghĩa khi Nginx thấy IP thật: sau một proxy hay CDN khác, mọi request đến từ vài IP, phải khôi phục IP bằng module `realip` với đúng danh sách proxy tin cậy, ví dụ `set_real_ip_from 10.0.0.0/8; real_ip_header X-Forwarded-For; real_ip_recursive on;`. D2.5 đã giải thích vì sao chỉ được tin header này khi nó đến từ proxy của bạn.
+
+<Callout kind="production">
+
+Stripe kể cách họ giới hạn tốc độ API trong bài [Scaling your API with rate limiters](https://stripe.com/blog/rate-limiters) (2017). Theo bài viết, bộ giới hạn số request mỗi giây "liên tục được kích hoạt", đã từ chối hàng triệu request trong một tháng, đặc biệt là request ở chế độ test khi script của người dùng vô tình chạy quá đà. Họ dùng thêm một bộ giới hạn **số request đang xử lý đồng thời** cho các endpoint tốn CPU: trước khi có nó, họ thường xuyên gặp tranh chấp tài nguyên ở những endpoint đắt nhất. Hai bộ giới hạn đó tương ứng với `limit_req` và `limit_conn` trong bài này, với hai khác biệt: Stripe dùng thuật toán token bucket (SB13.3) chứ không phải leaky bucket của `limit_req`, và họ làm ở tầng ứng dụng với Redis để giới hạn theo từng người dùng; Nginx làm ở tầng ngoài cùng theo IP, rẻ hơn nhiều nhưng thô hơn. Hệ thống thật thường có cả hai.
+
+</Callout>
+
+<Check id="d21.1.rate-limit">Giải thích được `rate`, `burst`, `nodelay` của `limit_req`, vì sao nên trả `429` thay cho `503`, và vì sao giới hạn theo IP ở từng máy Nginx không thay được giới hạn theo người dùng ở ứng dụng.</Check>
+
+### Log thời gian và reload
+
+Bốn biến thời gian trong access log đủ để biết một request chậm ở đoạn nào:
+
+| Biến | Đo từ đâu tới đâu | Cao bất thường nghĩa là |
+|---|---|---|
+| `$request_time` (`rt`) | Byte đầu tiên của request tới khi gửi xong byte cuối cho client | Tổng. So với ba số dưới |
+| `$upstream_connect_time` (`uct`) | Bắt tay TCP (và TLS) với backend | Backend đầy hàng đợi accept, mạng tới backend có vấn đề, hoặc không có keepalive |
+| `$upstream_header_time` (`uht`) | Tới khi nhận xong header response | Backend xử lý chậm |
+| `$upstream_response_time` (`urt`) | Tới khi nhận xong cả response | `urt` lớn hơn `uht` nhiều: response to hoặc backend ghi chậm |
+
+`rt` lớn mà `urt` nhỏ: backend xong sớm, thời gian nằm ở đường về client (client chậm, response to). `rt` xấp xỉ `urt`: thời gian nằm ở backend.
+
+**Reload** (`nginx -s reload`, tức `SIGHUP` tới master) là cách áp cấu hình mới. D2.5 đã mô tả cơ chế: master kiểm cấu hình, sinh worker mới, worker cũ ngừng nhận kết nối mới và phục vụ nốt request đang dở rồi thoát. Thêm ba điều cho production:
+
+- Worker cũ chỉ thoát khi **hết** kết nối đang dở. WebSocket hay tải file dài giữ worker cũ sống hàng giờ; reload nhiều lần thì các thế hệ worker cũ chồng lên nhau và ngốn bộ nhớ. `worker_shutdown_timeout 30s` đặt hạn chót.
+- `restart` (`systemctl restart`, hay `stop` rồi `start`) đóng socket đang nghe: request đang dở bị cắt, kết nối mới bị từ chối trong lúc khởi động lại. Chỉ cần khi đổi thứ reload không áp được, ví dụ nâng cấp binary; ngay cả khi đó Nginx có quy trình thay binary bằng `SIGUSR2` không rớt kết nối.
+- Reload với cấu hình sai thì Nginx **giữ cấu hình cũ** và tiếp tục chạy, nhưng bạn có được báo hay không tuỳ loại lỗi. Lỗi cú pháp (directive gõ sai): `nginx -s reload` tự đọc file trước khi gửi signal, in `[emerg]` và thoát mã 1; còn `kill -HUP` chỉ gửi signal, luôn "thành công". `systemctl reload nginx` thì tuỳ unit: gói Ubuntu khai `ExecReload=/usr/sbin/nginx ... -s reload` (xem bằng `systemctl cat nginx`) nên báo được lỗi cú pháp; unit nào reload bằng `kill -HUP` thì không. Lỗi chỉ lộ ra khi master áp cấu hình (ví dụ `listen` vào một IP máy không có): `nginx -s reload` thoát mã 0, master ghi `[emerg] bind() ... failed` vào `error.log` và lặng lẽ giữ cấu hình cũ. `nginx -t` bắt được cả hai loại (bài mẫu đã thử cả hai). Luôn `nginx -t` trước, và kiểm `error.log` sau.
+
+<Check id="d21.1.timing-reload">Nhìn `rt`, `uct`, `uht`, `urt` của một dòng log là nói được request chậm ở client, ở mạng tới backend hay trong backend; và kể được reload khác restart ở đâu.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [nginx: Core functionality](https://nginx.org/en/docs/ngx_core_module.html): `worker_processes`, `worker_connections`, `worker_rlimit_nofile`, `worker_shutdown_timeout`.
+- [nginx: Module ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html): mục `keepalive` kèm ví dụ cấu hình, `keepalive_requests`, `keepalive_timeout` của khối `upstream`.
+- [nginx: Module ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html): `proxy_buffering`, `proxy_buffers`, `proxy_request_buffering`, các timeout và giá trị mặc định của từng bản.
+- [nginx: Module ngx_http_limit_req_module](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html): `burst`, `nodelay`, `delay`, `limit_req_dry_run`, và kích thước `zone`.
+- [nginx: Controlling nginx](https://nginx.org/en/docs/control.html): các signal, trình tự reload và thay binary không dừng dịch vụ.
+- [Stripe: Scaling your API with rate limiters](https://stripe.com/blog/rate-limiters): bốn loại giới hạn Stripe dùng trên production và lý do của từng loại; nguồn của callout trong bài.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM Lima của D0.1 đang chạy (Ubuntu 26.04, 2 CPU, 2 GiB). Bài không dùng file nào của D2. Lab chạy ba Nginx nhỏ và công cụ đo tải `hey`, tốn khoảng 150 MB RAM; máy 8 GB không cần thu gọn. `hey` gửi một số request cố định với số kết nối đồng thời cho trước; SB12.1 đã dạy đo tải bài bản bằng k6, ở đây chỉ cần một công cụ nhẹ để tạo áp lực và đếm mã trả về.
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y nginx hey netcat-openbsd curl
+sudo systemctl disable --now nginx     # lab chạy Nginx riêng trong namespace
+mkdir -p ~/masteva-d21/{nginx,web} && cd ~/masteva-d21
+nginx -v
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+nginx version: nginx/1.28.3 (Ubuntu)
+```
+
+</Expected>
+
+Mạng lab của cả chặng D9 là một switch ảo (bridge `br-d9`) trong VM, bốn "máy" là bốn network namespace cắm vào nó. VM đóng vai client.
+
+```text
+ VM (client) 10.9.0.1 ── br-d9 ─┬─ lb1  10.9.0.11   Nginx của bài này
+                                ├─ lb2  10.9.0.12   (dùng từ D9.3)
+                                ├─ web1 10.9.0.21   backend :8080
+                                └─ web2 10.9.0.22   backend :8080
+```
+
+<Terminal where="vm" title="~/masteva-d21/topo.sh">
+
+```bash
+cat > ~/masteva-d21/topo.sh <<'EOF'
+#!/usr/bin/env bash
+# Mạng lab D9: VM (client) và các "máy" lb1, lb2, web1, web2 cắm chung một switch ảo
+set -euo pipefail
+
+declare -A HOSTS=([lb1]=11 [lb2]=12 [web1]=21 [web2]=22)
+
+down() {
+  for ns in "${!HOSTS[@]}"; do
+    ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null || true
+    ip link del "v-$ns" 2>/dev/null || true     # xoá một đầu veth thì đầu kia mất theo
+    ip netns del "$ns" 2>/dev/null || true
+  done
+  ip link del br-d9 2>/dev/null || true
+}
+
+up() {
+  down
+  ip link add br-d9 type bridge
+  ip addr add 10.9.0.1/24 dev br-d9
+  ip link set br-d9 up
+  for ns in "${!HOSTS[@]}"; do
+    ip netns add "$ns"
+    ip link add "v-$ns" type veth peer name eth0 netns "$ns"
+    ip link set "v-$ns" master br-d9 up
+    ip -n "$ns" addr add "10.9.0.${HOSTS[$ns]}/24" dev eth0
+    ip -n "$ns" link set lo up
+    ip -n "$ns" link set eth0 up
+  done
+}
+
+case "${1:-}" in
+  up) up ;;
+  down) down ;;
+  *) echo "Cách dùng: sudo $0 up|down" >&2; exit 2 ;;
+esac
+EOF
+chmod +x ~/masteva-d21/topo.sh
+sudo ~/masteva-d21/topo.sh up
+ping -c1 -W1 10.9.0.21 | sed -n 2p
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+64 bytes from 10.9.0.21: icmp_seq=1 ttl=64 time=0.073 ms
+```
+
+</Expected>
+
+Ba hàm dùng suốt bài nằm trong một file để nạp lại được ở terminal mới (`. ~/masteva-d21/lab.sh`). `load` chạy `hey` và rút output của nó còn một dòng; `ngx` gọi Nginx của lab trong namespace `lb1`; `accepts` hỏi mỗi backend đã nhận bao nhiêu kết nối và bao nhiêu request.
+
+<Terminal where="vm" title="~/masteva-d21/lab.sh">
+
+```bash
+cat > ~/masteva-d21/lab.sh <<'EOF'
+# Hàm dùng chung của lab D9.1. Nạp bằng: . ~/masteva-d21/lab.sh
+load() {   # chạy hey, in: tốc độ, độ trễ, số response theo mã, số request lỗi kết nối
+  hey "$@" | awk '
+    /Slowest:/      { max = $2 * 1000 }
+    /Requests\/sec/ { rps = $2 }
+    /50% in/        { p50 = $3 * 1000 }
+    /^  \[[0-9]+\].*responses/      { codes = codes "  " $1 " " $2 }
+    /^  \[[0-9]+\]/ && !/responses/ { gsub(/[\[\]]/, "", $1); err += $1 }
+    END { printf "req/s=%d p50=%.1fms max=%.0fms |%s | loi ket noi: %d\n", rps, p50, max, codes, err }'
+}
+ngx() { sudo ip netns exec lb1 nginx -c "$HOME/masteva-d21/nginx/nginx.conf" "$@"; }
+accepts() {
+  for n in 1 2; do
+    curl -s "http://10.9.0.2$n:8080/status" |
+      awk -v n="$n" 'NR == 3 { printf "web%s: accepts=%d requests=%d   ", n, $1, $3 }'
+  done; echo
+}
+EOF
+. ~/masteva-d21/lab.sh
+```
+
+</Terminal>
+
+Hai backend cũng là Nginx, vì cần một backend đủ nhanh để nút cổ chai nằm ở proxy. Mỗi backend trả một dòng tên mình, phục vụ một file 20 MB ở `/big`, và có `stub_status` ở `/status` để đếm kết nối. File lớn đặt ở `/srv` vì worker chạy bằng `www-data` không đọc được thư mục home của bạn.
+
+<Terminal where="vm" title="~/masteva-d21/web/web.conf">
+
+```bash
+cd ~/masteva-d21
+cat > web/web.conf <<'EOF'
+user www-data;
+worker_processes 1;
+worker_rlimit_nofile 16384;
+pid LAB/web/NAME.pid;
+error_log LAB/web/NAME.error.log warn;
+events { worker_connections 4096; }
+http {
+  access_log off;
+  keepalive_requests 1000000;
+  server {
+    listen IP:8080;
+    location /        { return 200 "backend=NAME\n"; }
+    location /big     { alias /srv/masteva-d21/big.bin; }
+    location /status  { stub_status; }
+  }
+}
+EOF
+sudo mkdir -p /srv/masteva-d21
+head -c 20000000 /dev/urandom | sudo tee /srv/masteva-d21/big.bin >/dev/null
+for n in 1 2; do
+  sed "s#LAB#$HOME/masteva-d21#g; s#NAME#web$n#g; s#IP#10.9.0.2$n#g" web/web.conf > web/web$n.conf
+  sudo ip netns exec web$n nginx -c $HOME/masteva-d21/web/web$n.conf
+done
+curl -s http://10.9.0.21:8080/; accepts
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+backend=web1
+web1: accepts=2 requests=2   web2: accepts=1 requests=1   
+```
+
+</Expected>
+
+`accepts` là số kết nối TCP backend đã nhận, `requests` là số request. Hai số bằng nhau nghĩa là mỗi request đi một kết nối riêng. Chính lệnh `accepts` cũng tốn một kết nối mỗi lần gọi.
+
+### 1. Hai cái trần đầu tiên: worker_connections và file descriptor
+
+Bắt đầu bằng một cấu hình cố tình chật: một worker, 64 kết nối. Log có đủ bốn biến thời gian của phần Kiến thức.
+
+<Terminal where="vm" title="~/masteva-d21/nginx/nginx.conf">
+
+```bash
+cat > nginx/nginx.conf <<'EOF'
+user www-data;
+worker_processes 1;
+pid LAB/nginx/nginx.pid;
+error_log LAB/nginx/error.log warn;
+
+events { worker_connections 64; }
+
+http {
+  log_format timing '$remote_addr "$request" $status $body_bytes_sent '
+                    'rt=$request_time uct=$upstream_connect_time uht=$upstream_header_time '
+                    'urt=$upstream_response_time up=$upstream_addr';
+  access_log LAB/nginx/access.log timing;
+
+  upstream app {
+    server 10.9.0.21:8080;
+    server 10.9.0.22:8080;
+  }
+
+  server {
+    listen 10.9.0.11:80;
+    location / {
+      proxy_pass http://app;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $remote_addr;
+    }
+  }
+}
+EOF
+sed -i "s#LAB#$HOME/masteva-d21#g" nginx/nginx.conf
+ngx -t 2>&1 | tail -1 | cut -d' ' -f5-
+ngx
+load -n 2000 -c 20 http://10.9.0.11/
+load -n 2000 -c 100 http://10.9.0.11/
+sudo tail -1 nginx/error.log | cut -d' ' -f3,5-
+```
+
+</Terminal>
+
+<Predict question="Lượt đầu có 20 kết nối đồng thời, lượt sau 100. Worker có 64 chỗ. Lượt nào lỗi, và client thấy lỗi kiểu gì?">
+
+```text
+test is successful
+req/s=17294 p50=1.1ms max=5ms |  [200] 2000 | loi ket noi: 0
+req/s=18178 p50=2.5ms max=30ms |  [200] 1565 | loi ket noi: 435
+[warn] 64 worker_connections are not enough, reusing connections
+```
+
+20 client cần 40 chỗ (mỗi request một kết nối vào, một kết nối ra backend) nên vừa. 100 client thì không: khi hết chỗ, Nginx đóng bớt kết nối keepalive đang rảnh của client để lấy chỗ (`reusing connections`), và `hey` thấy `connection reset by peer` khi gửi request tiếp vào kết nối vừa bị đóng. Client không nhận mã lỗi HTTP nào, chỉ thấy kết nối đứt. Số request lỗi mỗi lần chạy một khác; CPU của VM lúc này còn thừa.
+
+</Predict>
+
+Nâng `worker_connections` lên 4096 rồi tăng tải lên 600 kết nối đồng thời:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/worker_connections 64;/worker_connections 4096;/' nginx/nginx.conf
+ngx -t 2>&1 | grep warn | cut -d' ' -f2-
+ngx -s reload 2>/dev/null; sleep 1
+grep 'Max open files' /proc/$(pgrep -P "$(sudo cat nginx/nginx.pid)" | head -1)/limits
+load -n 24000 -c 600 http://10.9.0.11/
+sudo grep -o '[a-z0-9]*() failed (24: Too many open files)[a-z ]*' nginx/error.log | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[warn] 4096 worker_connections exceed open file resource limit: 1024
+Max open files            1024                 524288               files     
+req/s=19520 p50=25.5ms max=524ms |  [200] 23640  [500] 360 | loi ket noi: 0
+      1 accept4() failed (24: Too many open files)
+    663 socket() failed (24: Too many open files) while connecting to upstream
+```
+
+</Expected>
+
+Nginx đã báo trước ngay ở `nginx -t`: 4096 kết nối vượt giới hạn 1024 file descriptor của tiến trình. Dưới tải, 600 client cần khoảng 1.200 descriptor. Worker nhận được kết nối của client nhưng không mở nổi socket tới backend (`socket() failed`), thử sang backend kia cũng vậy, và trả `500`; có lúc nó không `accept` nổi kết nối mới (dòng `accept4()`, không phải lần chạy nào cũng có). Các con số thay đổi theo lần chạy. Cột thứ hai của `/proc/<pid>/limits` là giới hạn mềm đang áp dụng. Giới hạn này không thuộc về Nginx mà của tiến trình (D1.1), nên có hai chỗ nâng: `LimitNOFILE=` trong unit systemd, hoặc để Nginx tự nâng cho worker:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/^worker_processes 1;/worker_processes auto;\nworker_rlimit_nofile 16384;/' nginx/nginx.conf
+ngx -t 2>&1 | grep -c warn
+ngx -s reload 2>/dev/null; sleep 1
+for p in $(pgrep -P "$(sudo cat nginx/nginx.pid)"); do grep 'Max open files' /proc/$p/limits; done
+load -n 24000 -c 600 http://10.9.0.11/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+Max open files            16384                16384                files     
+Max open files            16384                16384                files     
+req/s=23187 p50=22.2ms max=98ms |  [200] 24000 | loi ket noi: 0
+```
+
+</Expected>
+
+`worker_processes auto` cho hai worker trên VM 2 CPU; mỗi worker có 4096 kết nối và 16.384 file descriptor. Con số req/s phụ thuộc máy và thay đổi giữa các lần chạy; thứ cần nhìn là cột mã trả về và số lỗi.
+
+<Check id="d21.1.lab-limits">Tái hiện được hai lỗi `worker_connections are not enough` và `Too many open files`, đọc được giới hạn của worker trong `/proc/<pid>/limits`, và sửa bằng `worker_connections`, `worker_rlimit_nofile`.</Check>
+
+### 2. Mỗi request một kết nối tới backend
+
+Cấu hình hiện tại chưa có keepalive tới backend (trên Nginx 1.28; từ 1.30, keepalive có sẵn và bạn sẽ thấy ngay kết quả của khối lệnh thứ hai bên dưới). Đếm số kết nối backend nhận trước và sau 24.000 request:
+
+<Terminal where="vm">
+
+```bash
+accepts
+load -n 24000 -c 50 http://10.9.0.11/
+accepts
+sudo ip netns exec lb1 ss -s | sed -n 2p
+sudo ip netns exec web1 ss -s | sed -n 2p
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web1: accepts=25596 requests=25596   web2: accepts=25614 requests=25614   
+req/s=25393 p50=1.8ms max=8ms |  [200] 24000 | loi ket noi: 0
+web1: accepts=37597 requests=37597   web2: accepts=37615 requests=37615   
+TCP:   1180 (estab 0, closed 1179, orphaned 0, timewait 1173)
+TCP:   8195 (estab 0, closed 8194, orphaned 0, timewait 8188)
+```
+
+</Expected>
+
+Mỗi backend nhận 12.000 request qua **12.001 kết nối mới** (một cái là của lệnh `accepts`). Nửa giây tải để lại hàng nghìn socket `TIME-WAIT` ở cả hai phía: bên nào gửi `FIN` trước thì bên đó giữ (D2.1), và với HTTP/1.0 phần lớn là backend. Con số ở `web1` dừng quanh 8192 vì đó là trần `net.ipv4.tcp_max_tw_buckets` của namespace này: vượt trần, kernel bỏ luôn `TIME-WAIT` của các kết nối sau. Con số ở `lb1` thay đổi nhiều giữa các lần chạy (bài mẫu thấy từ vài trăm tới hơn 5.000).
+
+Với dải 28.232 port và nửa giây tải của lab, chưa có gì hỏng. Trên production, tải kéo dài hàng giờ và port bị giữ theo từng cặp (IP của Nginx, IP và port của backend): khi cạn, `connect()` lỗi `Cannot assign requested address`, và Nginx tính đó là một lần lỗi của backend. Với `max_fails=1` mặc định, backend bị loại 10 giây như ở D2.5, nên vài lỗi cạn port **khuếch đại** thành `502` hàng loạt. Bài mẫu đã thử thu dải port nguồn của `lb1` xuống còn 200 port (`net.ipv4.ip_local_port_range`, một `sysctl` có giá trị riêng cho từng network namespace) rồi chạy lại đúng lượt tải trên bảy lần: bốn lần không lỗi nào, ba lần còn lại lần lượt có 52, 8.033 và 23.898 trên 24.000 request nhận `502`. Kết quả không ổn định vì nó phụ thuộc bên nào đóng kết nối trước ở từng request, nên bài không đưa nó thành một bước; điều ổn định là cách sửa dưới đây.
+
+Bật keepalive tới backend bằng ba dòng của phần Kiến thức:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/^    server 10.9.0.22:8080;/    server 10.9.0.22:8080;\n    keepalive 64;/' nginx/nginx.conf
+sed -i 's/^      proxy_pass http:\/\/app;/      proxy_pass http:\/\/app;\n      proxy_http_version 1.1;\n      proxy_set_header Connection "";/' nginx/nginx.conf
+ngx -t 2>&1 | tail -1 | cut -d' ' -f5-
+ngx -s reload 2>/dev/null; sleep 1
+accepts
+load -n 24000 -c 50 http://10.9.0.11/
+accepts
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+test is successful
+web1: accepts=37598 requests=37598   web2: accepts=37616 requests=37616   
+req/s=43403 p50=1.0ms max=6ms |  [200] 24000 | loi ket noi: 0
+web1: accepts=37646 requests=49600   web2: accepts=37665 requests=49616   
+```
+
+</Expected>
+
+Cùng 24.000 request, mỗi backend chỉ nhận thêm khoảng 50 kết nối thay vì 12.000: hơn 12.000 request đi trên vài chục kết nối được dùng lại. Chạy lại lượt tải thêm lần nữa, số kết nối mới còn ít hơn (bài mẫu thấy 11 tới 21) vì các kết nối rảnh đã nằm sẵn trong kho của worker. `keepalive 64` đủ cho 50 kết nối đồng thời của lượt tải này; đặt nhỏ hơn số đồng thời thì phần vượt vẫn đóng mở liên tục. Thông lượng tăng vì bỏ được một lần bắt tay cho mỗi request, và không còn hàng nghìn socket `TIME-WAIT` sinh ra mỗi giây.
+
+<Check id="d21.1.lab-keepalive">Đo được số kết nối mới tới backend và số socket `TIME-WAIT` trước và sau khi bật keepalive bằng `stub_status` và `ss -s`, và kể được chuỗi cạn port nguồn, `connect()` lỗi, backend bị loại, `502` hàng loạt.</Check>
+
+### 3. Client chậm, buffer và timeout
+
+Tải file 20 MB với tốc độ bị bóp còn 4 MB mỗi giây, đóng vai một client mạng chậm, rồi xem Nginx ghi gì:
+
+<Terminal where="vm">
+
+```bash
+curl -s -o /dev/null --limit-rate 4M -w '%{http_code} %{time_total}s\n' http://10.9.0.11/big
+sudo tail -1 nginx/access.log | cut -d' ' -f5-
+sudo tail -1 nginx/error.log | cut -d' ' -f3,6-14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 4.504360s
+200 20000000 rt=3.534 uct=0.000 uht=0.000 urt=0.013 up=10.9.0.22:8080
+[warn] an upstream response is buffered to a temporary file
+```
+
+</Expected>
+
+Client mất 4,5 giây, Nginx thấy request kéo dài 3,5 giây (`rt`), nhưng backend chỉ bận **vài chục mili giây** (`urt`; các lần đo của bài cho từ 13 tới 107 ms). Nginx hút cả 20 MB về trong khoảng đó, phần không vừa bộ nhớ ghi ra file tạm (dòng `[warn]`), rồi trả dần cho client. `rt` nhỏ hơn thời gian client đo được vì Nginx tính xong khi đã đẩy hết dữ liệu vào bộ đệm gửi của kernel. Tắt buffer cho đúng request đó:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/^      proxy_pass http:\/\/app;/      proxy_pass http:\/\/app;\n      proxy_buffering off;/' nginx/nginx.conf
+ngx -s reload 2>/dev/null; sleep 1
+curl -s -o /dev/null --limit-rate 4M -w '%{http_code} %{time_total}s\n' http://10.9.0.11/big
+sudo tail -1 nginx/access.log | cut -d' ' -f5-
+sed -i '/proxy_buffering off;/d' nginx/nginx.conf
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 4.504836s
+200 20000000 rt=3.406 uct=0.000 uht=0.001 urt=3.518 up=10.9.0.21:8080
+```
+
+</Expected>
+
+`urt` giờ xấp xỉ `rt`: backend bị giữ suốt 3,5 giây vì một client chậm (hai số lệch nhau một chút vì được chốt ở hai thời điểm khác nhau). Với backend là Nginx thì không sao; với Tomcat đó là một thread trong pool bị chiếm. Dòng `sed` cuối bỏ `proxy_buffering off`; bước 4 nạp cấu hình mới nên không cần reload ở đây.
+
+<Check id="d21.1.lab-buffer">Dùng `rt` và `urt` trong access log chứng minh được buffer response giải phóng backend khỏi client chậm, và chỉ ra được dòng log báo response tràn ra file tạm.</Check>
+
+### 4. Cấu hình hoàn chỉnh: timeout phía client và giới hạn tốc độ
+
+Viết lại cấu hình với đủ các phần đã bàn. Các directive `proxy_*` chuyển lên mức `server` để ba `location` cùng thừa kế.
+
+<Terminal where="vm" title="~/masteva-d21/nginx/nginx.conf">
+
+```bash
+cat > nginx/nginx.conf <<'EOF'
+user www-data;
+worker_processes auto;
+worker_rlimit_nofile 16384;
+pid LAB/nginx/nginx.pid;
+error_log LAB/nginx/error.log warn;
+
+events { worker_connections 4096; }
+
+http {
+  log_format timing '$remote_addr "$request" $status $body_bytes_sent '
+                    'rt=$request_time uct=$upstream_connect_time uht=$upstream_header_time '
+                    'urt=$upstream_response_time up=$upstream_addr';
+  access_log LAB/nginx/access.log timing;
+
+  client_header_timeout 5s;
+  client_body_timeout 10s;
+  send_timeout 10s;
+  keepalive_timeout 30s;
+  client_max_body_size 1m;
+
+  limit_req_zone  $binary_remote_addr zone=req_ip:10m rate=10r/s;
+  limit_conn_zone $binary_remote_addr zone=conn_ip:10m;
+  limit_req_status 429;
+  limit_conn_status 429;
+
+  upstream app {
+    server 10.9.0.21:8080;
+    server 10.9.0.22:8080;
+    keepalive 64;
+  }
+
+  server {
+    listen 10.9.0.11:80;
+
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_connect_timeout 1s;
+    proxy_read_timeout 10s;
+
+    location /       { proxy_pass http://app; }
+    location /api/   { limit_req zone=req_ip; proxy_pass http://app; }
+    location /big    { limit_conn conn_ip 2; proxy_pass http://app; }
+  }
+}
+EOF
+sed -i "s#LAB#$HOME/masteva-d21#g" nginx/nginx.conf
+ngx -t 2>&1 | tail -1 | cut -d' ' -f5-
+ngx -s reload 2>/dev/null; sleep 1
+time ( (printf 'GET / HTTP/1.1\r\nHost: x\r\n'; sleep 8) | nc -q0 10.9.0.11 80 )
+sudo tail -1 nginx/access.log | cut -d' ' -f2-
+head -c 1500000 /dev/zero | curl -s -o /dev/null -w '%{http_code}\n' --data-binary @- http://10.9.0.11/upload
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+test is successful
+
+real	0m8.006s
+user	0m0.004s
+sys	0m0.005s
+"GET / HTTP/1.1" 408 0 rt=5.007 uct=- uht=- urt=- up=-
+413
+```
+
+</Expected>
+
+Lệnh `nc` gửi hai dòng header rồi im lặng, không bao giờ gửi dòng trống kết thúc header. Nginx chờ đúng 5 giây (`client_header_timeout`) rồi ghi `408` và đóng kết nối; `up=-` cho thấy backend không hề bị động tới. `nc` còn chạy tới hết `sleep 8` vì nó chỉ thoát khi đầu vào của nó đóng. Request thứ hai gửi body 1,5 MB, vượt `client_max_body_size 1m`, nhận `413` trước khi tới backend.
+
+Giờ tới giới hạn tốc độ. `/api/` đang là `rate=10r/s` không `burst`. Gửi 50 request qua 5 kết nối, nhanh hết mức:
+
+<Terminal where="vm">
+
+```bash
+load -n 50 -c 5 http://10.9.0.11/api/orders
+sudo grep limiting nginx/error.log | tail -1 | cut -d' ' -f3,6-12
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+req/s=12216 p50=0.1ms max=3ms |  [200] 1  [429] 49 | loi ket noi: 0
+[error] limiting requests, excess: 0.980 by zone "req_ip",
+```
+
+</Expected>
+
+Chỉ **một** request qua. `10r/s` không có nghĩa "10 request đầu của mỗi giây": Nginx theo dõi tới từng mili giây, và request tới sớm hơn 100 ms sau request trước bị từ chối. Client thật gửi theo cụm (một trang web tải 10 tài nguyên cùng lúc), nên `limit_req` không có `burst` gần như luôn sai. Thử `burst=20`, rồi thêm `nodelay`, mỗi lần 50 request cùng lúc:
+
+<Terminal where="vm">
+
+```bash
+sleep 3
+sed -i 's/limit_req zone=req_ip;/limit_req zone=req_ip burst=20;/' nginx/nginx.conf
+ngx -s reload 2>/dev/null; sleep 1
+load -n 50 -c 50 http://10.9.0.11/api/orders
+sleep 3
+sed -i 's/burst=20;/burst=20 nodelay;/' nginx/nginx.conf
+ngx -s reload 2>/dev/null; sleep 1
+load -n 50 -c 50 http://10.9.0.11/api/orders
+sleep 3
+load -z 5s -c 1 -q 8 http://10.9.0.11/api/orders
+```
+
+</Terminal>
+
+<Predict question="Cả hai lượt đều cho 21 request qua và từ chối 29. Khác nhau ở đâu? Lượt thứ ba gửi đều 8 request mỗi giây trong 5 giây thì sao?">
+
+```text
+req/s=24 p50=3.8ms max=2012ms |  [200] 21  [429] 29 | loi ket noi: 0
+req/s=5779 p50=3.0ms max=6ms |  [200] 21  [429] 29 | loi ket noi: 0
+req/s=7 p50=0.7ms max=1ms |  [200] 40 | loi ket noi: 0
+```
+
+21 là một request đúng nhịp cộng 20 chỗ của `burst`. Không có `nodelay`, 20 request đó bị giữ lại và nhả ra mỗi 100 ms một cái: cái cuối chờ 2 giây (`max=2012ms`). Có `nodelay`, cả 21 được chuyển ngay (`max=6ms`), còn chỗ trong xô vẫn hồi lại theo nhịp 10 mỗi giây. Client đi đúng luật ở 8 request mỗi giây thì không bao giờ gặp `429`. Các lệnh `sleep 3` để xô kịp rỗng giữa hai lần thử.
+
+</Predict>
+
+Cuối cùng là `limit_conn`: `/big` cho mỗi IP tối đa hai kết nối cùng lúc. Mở bốn lượt tải song song:
+
+<Terminal where="vm">
+
+```bash
+for i in 1 2 3 4; do
+  curl -s -o /dev/null --limit-rate 4M -w '%{http_code} %{time_total}s\n' http://10.9.0.11/big &
+done | sort
+wait
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 4.504897s
+200 4.506168s
+429 0.001083s
+429 0.004761s
+```
+
+</Expected>
+
+Hai lượt đầu chiếm hai chỗ trong 4,5 giây; hai lượt sau bị từ chối trong vài mili giây. Giới hạn này tính theo số request **đang xử lý**, nên nó tự thích nghi với việc nặng nhẹ khác nhau, điều mà `limit_req` không làm được.
+
+<Check id="d21.1.lab-limit">Cấu hình được `limit_req` với `burst`, `nodelay` và `limit_conn` trả `429`, và dùng công cụ tải chứng minh được khác biệt giữa ba kiểu: không `burst`, `burst`, `burst nodelay`.</Check>
+
+### 5. Reload và restart dưới tải
+
+Chạy tải 7 giây với 50 kết nối, trong lúc đó reload năm lần:
+
+<Terminal where="vm">
+
+```bash
+( for i in 1 2 3 4 5; do sleep 1; ngx -s reload 2>/dev/null; done ) &
+load -z 7s -c 50 http://10.9.0.11/
+wait
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+req/s=47526 p50=0.9ms max=12ms |  [200] 332776 | loi ket noi: 0
+```
+
+</Expected>
+
+Hàng trăm nghìn request, năm lần đổi toàn bộ worker, không request nào lỗi. Xem một worker cũ đang làm nốt việc: bắt đầu một lượt tải 4,5 giây rồi reload giữa chừng.
+
+<Terminal where="vm">
+
+```bash
+curl -s -o /dev/null --limit-rate 4M -w '%{http_code} %{size_download} bytes\n' http://10.9.0.11/big &
+sleep 1; ngx -s reload 2>/dev/null; sleep 1
+ps --ppid "$(sudo cat nginx/nginx.pid)" -o etimes,args
+wait
+sleep 1; ps --ppid "$(sudo cat nginx/nginx.pid)" -o args | grep -c 'shutting down'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ELAPSED COMMAND
+      3 nginx: worker process is shutting down
+      1 nginx: worker process
+      1 nginx: worker process
+200 20000000 bytes
+0
+```
+
+</Expected>
+
+Sau reload có ba worker: hai worker mới (1 giây tuổi) nhận mọi kết nối mới, và một worker cũ ở trạng thái `is shutting down` giữ lại chỉ để gửi nốt file cho client kia. File về đủ 20 MB, rồi worker cũ thoát. Nếu đó là một kết nối WebSocket sống 6 giờ, worker cũ cũng sống 6 giờ, trừ khi có `worker_shutdown_timeout`.
+
+So với dừng rồi chạy lại, cũng dưới tải:
+
+<Terminal where="vm">
+
+```bash
+( sleep 2; ngx -s stop 2>/dev/null; ngx ) &
+load -z 5s -c 50 http://10.9.0.11/
+wait
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+req/s=48023 p50=0.9ms max=12ms |  [200] 239789 | loi ket noi: 359
+```
+
+</Expected>
+
+Nginx chỉ vắng mặt vài chục mili giây, và ngần đó đủ để hàng trăm request bị từ chối hoặc đứt giữa chừng (con số thay đổi theo lần chạy). Trên máy thật khoảng vắng dài hơn nhiều: Nginx phải đọc lại chứng chỉ, mở lại vùng nhớ dùng chung, và các bộ đếm `limit_req` cùng trạng thái backend bị xoá sạch.
+
+<Check id="d21.1.lab-reload">Chứng minh được bằng số đo rằng reload dưới tải không làm lỗi request còn stop rồi start thì có, và chỉ ra được worker cũ đang `shutting down` trong `ps`.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `load: command not found` hoặc `ngx: command not found`: terminal mới chưa nạp hàm. Chạy `. ~/masteva-d21/lab.sh`.
+- `nginx: [emerg] bind() to 10.9.0.11:80 failed (99: Cannot assign requested address)`: bạn chạy `nginx` ngoài namespace `lb1`, hoặc mạng lab chưa dựng. Dùng hàm `ngx`; dựng lại mạng bằng `sudo ~/masteva-d21/topo.sh up` (lệnh này dừng mọi Nginx của lab, phải chạy lại hai backend và `ngx`).
+- `nginx: [emerg] bind() ... failed (98: Address already in use)`: Nginx của lab đang chạy rồi; dùng `ngx -s reload`.
+- `nginx: [error] invalid PID number "" in ".../nginx.pid"` khi reload: Nginx của lab chưa chạy. Chạy `ngx`.
+- Mọi request `502` với `up=app`: hai backend đang bị loại sau một lần lỗi kết nối. Kiểm hai backend còn chạy bằng `accepts`, rồi chờ 10 giây.
+- `/big` trả `403`: file không nằm ở `/srv/masteva-d21/big.bin` hoặc `www-data` không đọc được. Kiểm bằng `ls -l /srv/masteva-d21`.
+- Số `429` ở bước 4 khác bài: lượt thử trước chưa kịp hồi xô. Chờ vài giây rồi chạy lại.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới dừng mọi tiến trình trong bốn namespace của lab, xoá mạng lab và xoá file 20 MB ở `/srv/masteva-d21`. Thư mục `~/masteva-d21` (cấu hình, log, `topo.sh`) được giữ lại cho các bài sau của D9.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+sudo ~/masteva-d21/topo.sh down
+sudo rm -rf /srv/masteva-d21
+ip netns list | wc -l; pgrep -c nginx
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+0
+```
+
+</Expected>
+
+Học tiếp D9.2 thì chưa cần tắt VM. Xong buổi: `limactl stop <tên VM>` trên máy Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đặt worker_connections và keepalive bao nhiêu là vừa?">
+
+Bắt đầu từ số đo, không phải từ con số trên mạng. Số kết nối client đồng thời ở giờ cao điểm (từ `stub_status` hoặc metric `connections_active`) nhân hai cho phần tới backend, cộng dự phòng, chia cho số worker là `worker_connections`. Bộ nhớ không phải rào cản: theo trang giới thiệu của nginx.org, 10.000 kết nối keepalive rảnh tốn khoảng 2,5 MB, nên 16.384 kết nối mỗi worker là bình thường. `keepalive` trong `upstream` nên gần với số request đồng thời tới backend chia cho số worker; đặt 64 cho một dịch vụ 2.000 request đồng thời thì phần lớn kết nối vẫn đóng mở liên tục. Dấu hiệu đặt thiếu: `uct` trong access log thường xuyên khác 0, và số `accepts` ở backend tăng gần bằng số request như bước 2. Đừng quên chiều ngược lại: mỗi kết nối rảnh Nginx giữ là một kết nối backend phải giữ, và 10 máy Nginx với 4 worker, `keepalive 256` có thể chiếm 10.240 kết nối của một backend.
+
+</Reveal>
+
+<Reveal title="Vì sao có lúc một worker gánh gần hết tải còn các worker khác ngồi chơi?">
+
+Mặc định các worker cùng chờ trên **một** socket nghe, và cách kernel đánh thức tiến trình đang chờ `epoll` thiên về tiến trình vừa chờ gần nhất. Dưới tải vừa phải, worker vừa xong việc quay lại chờ và được chọn tiếp, nên tải dồn vào một hai worker. Cloudflare phân tích hiện tượng này trong bài [Why does one NGINX worker take all the load?](https://blog.cloudflare.com/the-sad-state-of-linux-socket-balancing/). Tham số `reuseport` của `listen` cho mỗi worker một socket riêng và kernel chia kết nối mới theo băm, đều hơn nhiều. Cái giá cũng nằm trong bài đó: kết nối đã nằm trong hàng đợi của một worker đang bận phải chờ đúng worker ấy, nên độ trễ đuôi có thể xấu đi khi một worker bị chặn. Đo trước khi bật.
+
+</Reveal>
+
+<Reveal title="Nên trả 429 kèm thông tin gì, và client nên làm gì với nó?">
+
+SB13.3 đã dạy trả `429` kèm `Retry-After` ở tầng ứng dụng, nơi bộ đếm biết chính xác còn bao lâu thì có token. Ở tầng Nginx thì khác: `limit_req` không tự thêm header này; muốn có thì dùng `error_page 429 = @limited` với một `location` trả header cố định. Phía client, phản ứng đúng là lùi lại theo cấp số nhân có ngẫu nhiên (SB7.2), không phải thử lại ngay: một client thử lại ngay lập tức khi gặp `429` chỉ làm xô luôn đầy. Về giám sát, tách `429` khỏi `5xx`: `5xx` tăng là có sự cố, `429` tăng là có ai đó gửi quá nhiều hoặc ngưỡng đặt quá chặt. Trước khi bật giới hạn mới trên production, chạy với `limit_req_dry_run on` vài ngày: Nginx ghi log những request lẽ ra bị chặn mà không chặn thật.
+
+</Reveal>
+
+<Reveal title="Nginx trong container và trong Kubernetes thì những gì ở bài này còn đúng?">
+
+Còn đúng gần hết, đổi chỗ đặt. `worker_processes auto` đếm CPU của node nên phải ghi số theo giới hạn CPU của container. `RLIMIT_NOFILE` do container runtime đặt (Docker thường cho rất cao), nên `worker_rlimit_nofile` ít khi là vấn đề, nhưng vẫn nên ghi rõ. Dải port nguồn là `sysctl` của network namespace của pod: kiểm trong pod chứ không phải trên node. Reload vẫn là cách áp cấu hình: các bộ điều khiển dựng trên Nginx sinh file cấu hình rồi reload, và với nhiều kết nối WebSocket thì gặp đúng chuyện worker cũ chồng chất ở bước 5. Đó là một lý do các gateway mới dùng Envoy, vốn nhận cấu hình qua API mà không cần sinh lại tiến trình (D9.6).
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI rà một file `nginx.conf` theo danh sách của bài (keepalive tới backend, timeout phía client, mã trả về của `limit_req`, `worker_rlimit_nofile`) hoặc viết `log_format` JSON cho hệ thống log. AI hay viết `keepalive` trong `upstream` mà quên `proxy_http_version 1.1` và `Connection ""` (trên Nginx 1.28 là không có tác dụng), hay đưa các "bộ tối ưu" chép từ blog cũ như `worker_connections 65535` không kèm `worker_rlimit_nofile`, `multi_accept on`, `tcp_tw_recycle` (sysctl này đã bị gỡ khỏi kernel từ bản 4.12), và hay đặt `limit_req` không có `burst`. Kiểm lại như bài: `nginx -t` đọc cảnh báo, đếm `accepts` ở backend trước và sau một lượt tải, và bắn 50 request cùng lúc vào đường dẫn có giới hạn để xem tỉ lệ `429`.
+
+</Callout>
+
+<Callout kind="link">
+
+D2.1 giải thích `TIME-WAIT` và dải port nguồn; D2.5 dựng Nginx với `upstream`, health check thụ động và `502`, `504`. D1.1 có `LimitNOFILE` của systemd; D1.5 có `sysctl` theo namespace. D9.2 chuyển sang HAProxy với health check chủ động và rút backend không rớt request; D9.5 đặt một tầng cache và WAF trước origin. SB12.2 tính thread pool và chuỗi timeout phía ứng dụng; SB13.3 giới hạn tốc độ theo người dùng bằng Bucket4j và Redis. D12 đưa các số `rt`, `urt` và tỉ lệ `429`, `5xx` lên dashboard. D18 đặt `limit_req`, `limit_conn` vào bức tranh chung về quá tải: đây là load shedding ở biên.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d21.1.mastery-diagnose">Với một Nginx đang trả lỗi dưới tải, nhìn `error.log` và access log là phân biệt được bốn nguyên nhân: thiếu `worker_connections`, thiếu file descriptor, cạn port nguồn tới backend, và backend chậm; nói được chỉnh gì cho từng cái.</Check>
+
+<Check id="d21.1.mastery-config">Tự viết được cấu hình Nginx production cho một API: worker và file descriptor, keepalive tới backend, timeout phía client, `limit_req` có `burst` trả `429`, log có đủ bốn biến thời gian; kiểm bằng `nginx -t` và một lượt tải.</Check>
+
+<Check id="d21.1.mastery-measure">Dùng một công cụ tải và `stub_status` đo được tác dụng của một thay đổi cấu hình (số kết nối mới tới backend, tỉ lệ mã trả về, độ trễ) thay vì tin vào cảm giác.</Check>
+
+</Mastery>

@@ -1,0 +1,686 @@
+---
+title: PromQL cho vận hành, histogram, recording rule, RED và USE
+description: Tính percentile từ histogram và thấy vì sao trung bình lẫn "trung bình của p95" đều nói dối, bật native histogram của Prometheus 3, tránh ba cái bẫy của rate, viết recording rule, rồi áp phương pháp RED cho service và USE cho máy bằng node_exporter.
+id: d12.3
+step: d12
+prerequisites: [d12.2]
+topics: [d12.prometheus-promql, d12.phuong-phap-red-use]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    prometheus: 3.15.0
+    node-exporter: 1.12.1
+    client_golang: 1.25.0
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biến các counter và histogram thô thành những con số trả lời được câu hỏi vận hành, và biết nên hỏi những câu nào. Học xong bài này, bạn giải thích được:
+
+- Vì sao thời gian phản hồi trung bình 216 ms không mô tả trải nghiệm của bất kỳ người dùng nào, và vì sao cộng p95 của các instance rồi chia đôi cũng sai.
+- Vì sao `histogram_quantile` trả 488 ms trong khi không request nào chậm quá 430 ms.
+- Vì sao một truy vấn "tỉ lệ lỗi" trả về rỗng thay vì 0, và điều đó ảnh hưởng gì tới dashboard và alert.
+- Với một service, phải đo ba thứ gì trước tiên; với một máy, ba thứ gì.
+
+</Goal>
+
+<Knowledge>
+
+### `rate` tính thế nào, và ba cái bẫy
+
+`rate(c[1m])` lấy mọi mẫu của counter `c` trong một phút qua, cộng bù các lần counter về 0 (D12.2 đã thấy), lấy mức tăng giữa mẫu đầu và mẫu cuối rồi chia cho số giây. Vì mẫu đầu và mẫu cuối hiếm khi nằm đúng mép cửa sổ, Prometheus ngoại suy thêm một chút ra hai mép; do đó kết quả có thể là số lẻ dù counter chỉ tăng từng đơn vị.
+
+| Hàm | Dùng mẫu nào trong cửa sổ | Hợp với |
+|---|---|---|
+| `rate(c[5m])` | Tất cả, lấy trung bình cả cửa sổ | Alert, recording rule, dashboard: mượt, không lệ thuộc một mẫu |
+| `irate(c[5m])` | Chỉ hai mẫu cuối | Biểu đồ phóng to để thấy gai ngắn; không dùng cho alert vì một lần scrape lệch là đủ nhảy |
+| `increase(c[5m])` | Như `rate`, nhân lại với độ dài cửa sổ | "Bao nhiêu lỗi trong 5 phút qua"; cũng ngoại suy nên có thể ra số lẻ |
+
+Ba cái bẫy, bước 5 của lab tái hiện cả ba:
+
+1. **Cửa sổ quá ngắn.** Cần ít nhất hai mẫu trong cửa sổ. Với nhịp scrape 5 giây, `[5s]` thường chỉ chứa một mẫu và truy vấn trả về **rỗng**, không báo lỗi. Quy ước: cửa sổ ít nhất bốn lần nhịp scrape.
+2. **`rate` trên gauge.** Gauge giảm là chuyện bình thường, nhưng `rate` coi mỗi lần giảm là một lần counter về 0 và cho ra con số vô nghĩa. Với gauge dùng `avg_over_time`, `max_over_time`, hoặc `delta` và `deriv`. Prometheus 3 đính kèm một ghi chú vào kết quả khi tên metric không giống counter.
+3. **Cộng trước, `rate` sau.** `rate(sum(c)[1m:])` thấy tổng tụt xuống khi một instance khởi động lại và hiểu nhầm là **cả tổng** về 0. Luôn `sum(rate(c[1m]))`.
+
+<Check id="d12.3.rate-traps">Phân biệt được `rate`, `irate`, `increase`, và giải thích được ba cái bẫy: cửa sổ quá ngắn, `rate` trên gauge, cộng trước khi `rate`.</Check>
+
+### Từ bucket tới percentile
+
+Thời gian phản hồi được mô tả bằng **percentile**: p95 là giá trị mà 95% request nhanh hơn, p50 là trung vị. Trung bình che mất request chậm (99 request 50 ms và một request 5 giây cho trung bình 99,5 ms), còn percentile do từng instance tự tính thì không cộng hay lấy trung bình được để ra percentile của cả service; SB8.2 bàn hai điều này ở phía ứng dụng. Phía Prometheus, percentile được tính **lúc truy vấn** từ các bucket:
+
+```text
+histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[1m])))
+                          └── 2. cộng bucket của mọi instance ──┘└── 1. tốc độ tăng của từng bucket ──┘
+   3. tìm bucket chứa quan sát thứ 95%, rồi nội suy tuyến tính giữa hai mép của bucket đó
+
+   bucket      (0.1 ; 0.25]     (0.25 ; 0.5]      (0.5 ; 1]
+   số quan sát       0          ██████████ 50%        0
+                                 ▲            ▲
+                         giả định trải đều: p95 = 0.25 + 0.9 × 0.25 = 0.475
+                         (thực tế chúng dồn ở 0.405–0.425)
+```
+
+Ba hệ quả:
+
+- **Gộp bucket trước, tính quantile sau.** Bucket là counter nên cộng được giữa các instance; percentile thì không. `avg(histogram_quantile(…))` theo từng instance cho ra một con số không có ý nghĩa thống kê.
+- **Sai số nằm ở mép bucket.** Hàm chỉ biết quan sát rơi vào bucket nào, không biết ở đâu trong bucket, nên nó giả định trải đều. Bucket càng rộng, sai số càng lớn. Chọn ngưỡng bucket sát với mục tiêu của bạn: nếu cam kết là 300 ms thì phải có một ngưỡng đúng 0,3.
+- **`le` phải còn trong `by`.** Bỏ `le` khi cộng là mất luôn histogram.
+
+Đếm tỉ lệ request nhanh hơn một ngưỡng thì không cần nội suy, miễn ngưỡng trùng một mép bucket: `sum(rate(…_bucket{le="0.25"}[5m])) / sum(rate(…_count[5m]))`. Đây là dạng SLI mà D7.2 định nghĩa và D16 dùng.
+
+<Check id="d12.3.histogram-quantile">Viết được truy vấn p95 gộp nhiều instance, giải thích được vì sao phải giữ `le` và cộng trước khi tính, và nêu được nguồn sai số của `histogram_quantile`.</Check>
+
+### Native histogram
+
+Histogram cổ điển buộc bạn chọn ngưỡng từ trước, và mỗi ngưỡng là một chuỗi. **Native histogram** lưu cả phân bố trong **một** chuỗi, với các bucket hẹp theo cấp số nhân mà thư viện tự chia; ở lab, code khai hệ số 1,1, tức mỗi bucket rộng hơn bucket trước tối đa 10% (thư viện làm tròn xuống bậc chuẩn gần nhất là 2^(1/8) ≈ 1,09: tám bucket cho mỗi lần giá trị gấp đôi), nên sai số tương đối của percentile cũng bị chặn quanh mức đó, ở mọi tầm giá trị.
+
+| | Histogram cổ điển | Native histogram |
+|---|---|---|
+| Số chuỗi cho một tổ hợp label | Số ngưỡng + 3 (lab: 12) | 1 |
+| Ngưỡng bucket | Chọn tay, cố định trong code | Tự động, theo cấp số nhân |
+| Truy vấn | `histogram_quantile(0.95, sum by (le) (rate(x_bucket[1m])))` | `histogram_quantile(0.95, sum(rate(x[1m])))` |
+| Định dạng scrape | Văn bản | Protobuf (Prometheus tự thương lượng) |
+| Hệ sinh thái | Mọi nơi | Cần Prometheus, thư viện client và backend lưu trữ đều hỗ trợ |
+
+Ở Prometheus 3.15, bật bằng cấu hình `scrape_native_histograms: true`, không cần feature flag. Khi ứng dụng phát cả hai dạng (như `shop`), thêm `always_scrape_classic_histograms: true` để giữ song song trong lúc chuyển đổi: dashboard và alert cũ dùng `_bucket` vẫn chạy.
+
+<Check id="d12.3.native-histogram">So sánh được native histogram với histogram cổ điển về số chuỗi, độ chính xác và cách truy vấn.</Check>
+
+### Phép toán giữa hai vector, và "không có dữ liệu" khác 0
+
+Tỉ lệ lỗi là phép chia hai vector: `sum by (job) (rate(lỗi)) / sum by (job) (rate(tất cả))`. PromQL ghép từng cặp phần tử có **cùng tập label** ở hai vế; phần tử không tìm được cặp bị loại khỏi kết quả, không báo lỗi. Hai tình huống hay gặp:
+
+- **Hai vế khác tập label.** `node_load1 / count(node_cpu_seconds_total{mode="idle"})`: vế trái có `instance`, `job`; vế phải sau `count` không còn label nào; không cặp nào khớp, kết quả rỗng. Sửa bằng cách giữ label chung ở cả hai vế (`count by (instance)`) và nói rõ ghép theo gì (`/ on (instance)`).
+- **Một vế chưa từng tồn tại.** Counter có label `status="500"` chỉ xuất hiện sau lỗi 5xx **đầu tiên**. Trước đó, tử số không có chuỗi nào, và "tỉ lệ lỗi" là rỗng chứ không phải 0. Với alert `> 0.05` thì rỗng là im lặng, đúng ý. Với dashboard, bảng hiện "No data" dễ bị đọc nhầm là hỏng. Khi một phép chia ra 0/0, kết quả là `NaN`.
+
+<Check id="d12.3.vector-matching">Giải thích được vì sao một phép chia PromQL trả về rỗng, và sửa được bằng `by` và `on`.</Check>
+
+### Recording rule
+
+**Recording rule** bảo Prometheus định kỳ chạy một truy vấn và ghi kết quả thành chuỗi mới. Dùng khi:
+
+- Truy vấn nặng (gộp hàng nghìn chuỗi bucket) mà dashboard và alert gọi lặp lại.
+- Cần một định nghĩa **duy nhất** cho "tỉ lệ lỗi của service": dashboard, alert và báo cáo cùng đọc một chuỗi thì không thể lệch nhau.
+- Cần giữ dữ liệu gộp lâu hơn dữ liệu thô, hoặc gửi đi nơi khác.
+
+Quy ước tên `level:metric:operations`: `job_route:http_requests:rate1m` là metric `http_requests`, đã gộp tới mức còn hai label `job` và `route`, bằng phép `rate` trên cửa sổ 1 phút. Rule chỉ có dữ liệu từ lúc được tạo; nó không tính lùi về quá khứ.
+
+### RED và USE: đo gì trước tiên
+
+Hai phương pháp là hai danh sách kiểm tra, cho hai loại đối tượng:
+
+| | **RED** (Tom Wilkie) | **USE** (Brendan Gregg) |
+|---|---|---|
+| Áp cho | Service phục vụ request | Tài nguyên: CPU, bộ nhớ, đĩa, mạng, pool, hàng đợi |
+| Đo | **R**ate: request mỗi giây · **E**rrors: tỉ lệ request lỗi · **D**uration: phân bố thời gian phản hồi | **U**tilization: phần trăm thời gian hoặc dung lượng đang dùng · **S**aturation: lượng việc phải **chờ** · **E**rrors: số lỗi của tài nguyên |
+| Trả lời | Người dùng có đang khổ không | Vì sao, cái gì đang là nút cổ chai |
+| Trong lab | `http_requests_total`, `http_request_duration_seconds` | node_exporter: `node_cpu_*`, `node_memory_*`, `node_pressure_*`, `node_filesystem_*` |
+
+"Bốn tín hiệu vàng" trong sách SRE của Google (latency, traffic, errors, saturation) là RED cộng thêm saturation. Cách dùng: dashboard và alert của service dựng theo RED vì nó đo **triệu chứng**; khi RED xấu đi, lần theo USE của từng tài nguyên bên dưới để tìm **nguyên nhân**. D1.4 đã làm USE bằng tay với `vmstat`, `iostat` và PSI trên một máy; ở đây cùng những con số đó được thu liên tục và truy vấn được cho cả đội máy.
+
+Phân biệt utilization với saturation là phần hay bị bỏ qua: CPU 100% mà không ai phải chờ là máy được dùng hết công suất; CPU 70% mà tiến trình xếp hàng (load cao, PSI cao) mới là vấn đề. Và tài nguyên không chỉ là phần cứng: file descriptor, thread, kết nối trong pool, hạn mức của hệ điều hành đều có utilization và saturation.
+
+<Callout kind="production">
+
+Ngày 25/11/2020, Amazon Kinesis ở vùng US-EAST-1 gặp sự cố kéo dài nhiều giờ. Theo bản tóm tắt của AWS: mỗi server front-end tạo một thread hệ điều hành cho **mỗi** server khác trong đội; khi thêm máy vào đội, số thread trên mọi server vượt quá mức tối đa mà cấu hình hệ điều hành cho phép, và các server không còn dựng được bản đồ định tuyến. Trong danh sách việc làm sau sự cố có mục thêm cảnh báo chi tiết cho lượng thread tiêu thụ, chuyển sang server lớn hơn để giảm số máy và số thread, và thử nghiệm tăng giới hạn thread. Bản tóm tắt cũng ghi CloudWatch bị ảnh hưởng theo, khiến alarm của khách hàng rơi vào trạng thái `INSUFFICIENT_DATA`. Phần diễn giải của bài: đây là một tài nguyên có giới hạn cứng (số thread, theo cấu hình hệ điều hành) mà utilization tăng theo kích thước đội máy, đúng loại mà USE yêu cầu liệt kê và đo trước khi nó chạm trần.
+
+</Callout>
+
+<Check id="d12.3.red-use">Kể được ba thành phần của RED và của USE, nói được mỗi phương pháp áp cho đối tượng nào, và phân biệt được utilization với saturation bằng ví dụ.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Query functions (Prometheus)](https://prometheus.io/docs/prometheus/latest/querying/functions/): định nghĩa chính xác của `rate`, `irate`, `increase`, `histogram_quantile`, `histogram_fraction`.
+- [Histograms and summaries (Prometheus)](https://prometheus.io/docs/practices/histograms/): sai số của quantile, cách chọn bucket, khi nào dùng summary.
+- [Native Histograms (Prometheus)](https://prometheus.io/docs/specs/native_histograms/): đặc tả; đọc phần giới thiệu và phần về schema, hệ số bucket.
+- [Recording rules (Prometheus)](https://prometheus.io/docs/practices/rules/): quy ước đặt tên `level:metric:operations` kèm ví dụ.
+- [The USE Method (Brendan Gregg)](https://www.brendangregg.com/usemethod.html): bài gốc của phương pháp, có bảng tài nguyên cần kiểm cho Linux.
+- [Summary of the Amazon Kinesis Event in the Northern Virginia (US-EAST-1) Region](https://aws.amazon.com/message/11201/): bản tóm tắt sự cố trong callout; đọc đoạn về số thread và danh sách việc làm sau sự cố.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D12.2; thư mục `~/masteva-d12` còn nguyên với script `pq`. **Profile máy:** thêm node_exporter (15 đến 22 MiB); cả cụm vẫn dưới 250 MiB RAM, máy 8 GB chạy được.
+
+### 1. Khởi động lại cụm
+
+<Terminal where="mac" title="~/masteva-d12">
+
+```bash
+cd ~/masteva-d12
+docker compose up -d 2>&1 | grep -c -E 'Running|Started'
+curl -s -X POST localhost:9558/admin/fault
+curl -s -X POST localhost:9559/admin/fault
+sleep 60
+./pq 'sum(rate(http_requests_total{job="shop"}[1m]))'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+6
+error=0% delay=0ms
+error=0% delay=0ms
+  =>  20
+```
+
+</Expected>
+
+Hai lệnh `POST /admin/fault` không tham số đưa cả hai instance về trạng thái không lỗi, không trễ. Chờ một phút để cửa sổ `[1m]` đầy; con số quanh 20.
+
+### 2. Từ bucket tới percentile
+
+<Terminal where="mac">
+
+```bash
+./pq 'http_request_duration_seconds_bucket{instance="shop-1:8080", route="/api/checkout"}' | sed 's/.*job=shop //'
+./pq 'histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket{job="shop", route=~"/api/.+"}[1m])))'
+./pq 'histogram_quantile(0.5, sum by (le, route) (rate(http_request_duration_seconds_bucket{job="shop", route=~"/api/.+"}[1m])))'
+./pq 'sum by (route) (rate(http_request_duration_seconds_sum{job="shop", route=~"/api/.+"}[1m])) / sum by (route) (rate(http_request_duration_seconds_count{job="shop", route=~"/api/.+"}[1m]))'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+le=0.005 method=GET route=/api/checkout  =>  0
+le=0.01 method=GET route=/api/checkout  =>  0
+le=0.025 method=GET route=/api/checkout  =>  0
+le=0.05 method=GET route=/api/checkout  =>  38
+le=0.1 method=GET route=/api/checkout  =>  233
+le=0.25 method=GET route=/api/checkout  =>  234
+le=0.5 method=GET route=/api/checkout  =>  234
+le=1.0 method=GET route=/api/checkout  =>  234
+le=2.5 method=GET route=/api/checkout  =>  234
+le=+Inf method=GET route=/api/checkout  =>  234
+route=/api/checkout  =>  0.097
+route=/api/products  =>  0.024
+route=/api/checkout  =>  0.071
+route=/api/products  =>  0.015
+route=/api/checkout  =>  0.066
+route=/api/products  =>  0.015
+```
+
+</Expected>
+
+Mười dòng đầu là histogram của `checkout` trên `shop-1` đã nằm trong Prometheus: mỗi bucket một chuỗi, phân biệt bằng label `le`, giá trị cộng dồn. Ba truy vấn sau gộp cả hai instance:
+
+- **p95**: 97 ms cho `checkout`, 24 ms cho `products` (con số thứ hai có thể là khoảng 40 ms trên máy bạn; đoạn dưới giải thích).
+- **p50**: 71 ms và 15 ms.
+- **Trung bình** (`_sum` chia `_count`): 66 ms và 15 ms.
+
+Code cho `products` ngủ ngẫu nhiên 5 đến 25 ms, nên p95 thật khoảng 24 ms cộng chút thời gian xử lý, tức nằm **sát mép** bucket 0,025. Ở lần chạy của bài, gần hết quan sát còn nằm trong bucket hẹp `(0.01; 0.025]` nên kết quả 0,024 khớp. Nhưng chỉ cần request trễ thêm một, hai mili giây là một phần trong số đó trượt qua mép sang bucket `(0.025; 0.05]`, và p95 nội suy nhảy lên khoảng 0,04. Một lần chạy lại độc lập của chính lab này, trên cùng máy lúc tải thấp, cho 0,025 ở bước này và 0,040 đến 0,043 ở các bước sau, khi chỉ 83 đến 87% request còn nằm dưới 25 ms; mười lăm phút sau, cùng truy vấn lại ra 0,024. Vì vậy mọi con số 0,024 của `products` trong bài (ở đây, và ở các bước 3, 4, 6, 7) có thể là khoảng 0,04 trên máy bạn, và đổi qua lại giữa các lần hỏi. Đó không phải lab hỏng: giá trị thật chỉ xê dịch 1 đến 2 ms, còn con số Prometheus báo nhảy 16 ms vì quan sát đổi bucket. Đây chính là sai số ở mép bucket mà phần Kiến thức mô tả; bước 4 cho thấy native histogram thu hẹp nó thế nào. Với `checkout` (20 đến 60 ms của nó cộng 10 đến 40 ms của `stock`), p95 thật quanh 90 ms; Prometheus nói 97 vì gần hết quan sát rơi vào bucket rộng `(0.05; 0.1]` và bị coi là trải đều trong đó. Bước 4 quay lại sai số này.
+
+### 3. Một instance chậm
+
+Tiêm 400 ms độ trễ vào **một** trong hai instance, rồi hỏi "service này chậm cỡ nào" theo bốn cách:
+
+<Terminal where="mac">
+
+```bash
+curl -s -X POST 'localhost:9559/admin/fault?delay=400'
+sleep 75
+Q='rate(http_request_duration_seconds_bucket{job="shop", route="/api/products"}[1m])'
+./pq 'sum(rate(http_request_duration_seconds_sum{job="shop", route="/api/products"}[1m])) / sum(rate(http_request_duration_seconds_count{job="shop", route="/api/products"}[1m]))'
+./pq "histogram_quantile(0.5, sum by (le) ($Q))"
+./pq "histogram_quantile(0.95, sum by (le, instance) ($Q))"
+./pq "avg(histogram_quantile(0.95, sum by (le, instance) ($Q)))"
+./pq "histogram_quantile(0.95, sum by (le) ($Q))"
+```
+
+</Terminal>
+
+<Predict question="Một nửa request giờ mất khoảng 415 ms, nửa kia 15 ms. Trung bình và p95 của cả service là bao nhiêu? Lấy trung bình p95 của hai instance có ra p95 của service không?">
+
+```text
+error=0% delay=400ms
+  =>  0.216
+  =>  0.251
+instance=shop-1:8080  =>  0.024
+instance=shop-2:8080  =>  0.488
+  =>  0.256
+  =>  0.475
+```
+
+- **Trung bình 216 ms**: không request nào mất 216 ms. Một nửa mất 15, một nửa mất 415; trung bình mô tả một người dùng không tồn tại.
+- **p50 là 251 ms** ở lần chạy này, và ở lần chạy khác có thể là 25 ms. Hai nhóm request gần đúng 50/50, nên trung vị rơi ngay ranh giới: vài request lệch sang bên nào là nó nhảy sang nhóm đó (và khi rơi vào nhóm chậm, nó nằm ở mép dưới 0,25 của bucket). Một percentile đứng đúng chỗ phân bố bị đứt thì không ổn định; đó là lý do không nên nhìn riêng một percentile.
+- **p95 từng instance**: 24 ms và 488 ms (của `shop-1` có thể là khoảng 40 ms trên máy bạn, vì lý do ở bước 2; khi đó "trung bình của hai p95" ở dòng dưới ra khoảng 264 thay vì 256, vẫn sai như nhau). Con số này chỉ đúng tay vào `shop-2`.
+- **Trung bình của hai p95: 256 ms.** Sai: p95 đúng của cả service, tính từ bucket đã gộp, là **475 ms**. Lệch gần gấp đôi, và sẽ lệch tuỳ ý khi các instance nhận lượng request khác nhau.
+- Cả 488 lẫn 475 đều **cao hơn thực tế**: request chậm mất 405 đến 425 ms, nên p95 thật khoảng 424 ms. Chúng rơi vào bucket `(0.25; 0.5]`, và `histogram_quantile` nội suy như thể chúng trải đều trong khoảng đó.
+
+</Predict>
+
+Giữ nguyên độ trễ này cho bước sau.
+
+<Check id="d12.3.lab-quantile">Tính được p50, p95 và trung bình từ histogram cho cả service và cho từng instance, và chỉ ra được bằng số liệu vì sao trung bình và trung bình của percentile gây hiểu nhầm.</Check>
+
+### 4. Native histogram
+
+Thêm hai dòng vào khối `global` rồi nạp lại cấu hình:
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/^(  evaluation_interval: 5s)$/$1\n  scrape_native_histograms: true\n  always_scrape_classic_histograms: true/' prometheus/prometheus.yml
+head -5 prometheus/prometheus.yml
+docker compose exec -T prometheus promtool check config /etc/prometheus/prometheus.yml
+curl -s -X POST localhost:9551/-/reload -w 'reload: %{http_code}\n'
+sleep 75
+./pq 'count by (__name__) ({__name__=~"http_request_duration_seconds.*"})'
+./pq 'histogram_quantile(0.95, sum by (instance) (rate(http_request_duration_seconds{job="shop", route="/api/products"}[1m])))'
+./pq 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds{job="shop", route="/api/products"}[1m])))'
+./pq 'histogram_fraction(0, 0.1, sum(rate(http_request_duration_seconds{job="shop", route="/api/products"}[1m])))'
+curl -s -X POST localhost:9559/admin/fault
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  scrape_native_histograms: true
+  always_scrape_classic_histograms: true
+Checking /etc/prometheus/prometheus.yml
+ SUCCESS: /etc/prometheus/prometheus.yml is valid prometheus config file syntax
+
+reload: 200
+__name__=http_request_duration_seconds_bucket  =>  70
+__name__=http_request_duration_seconds_sum  =>  7
+__name__=http_request_duration_seconds_count  =>  7
+__name__=http_request_duration_seconds  =>  7
+instance=shop-1:8080  =>  0.024
+instance=shop-2:8080  =>  0.448
+  =>  0.438
+  =>  0.502
+error=0% delay=0ms
+```
+
+</Expected>
+
+- `promtool check config` kiểm cú pháp trước khi nạp; `POST /-/reload` (nhờ cờ `--web.enable-lifecycle` ở D12.2) nạp lại mà không khởi động lại, không mất dữ liệu. Gửi `SIGHUP` cho tiến trình cũng cho kết quả đó.
+- Có thêm metric tên trần `http_request_duration_seconds`: **7 chuỗi** native chứa cùng thông tin với 84 chuỗi cổ điển (70 bucket, 7 `_sum`, 7 `_count`).
+- Truy vấn không còn `_bucket` và `le`. p95 của `shop-2` là 448 ms, của cả service 438 ms: gần giá trị thật 424 ms hơn hẳn 488 và 475 của bucket cổ điển, và sai số nằm trong mức 10% mà hệ số 1,1 hứa.
+- Với `shop-1`, native histogram cũng xử lý được chỗ sát mép ở bước 2: trong lần chạy lại mà bucket cổ điển báo 0,040 đến 0,043 cho `products`, native histogram báo 0,028 đến 0,029, sát giá trị thật hơn nhiều, vì bucket của nó quanh mức 25 ms chỉ rộng vài mili giây thay vì 25 ms. Ở lần chạy của bài, hai cách cùng cho 0,024.
+- `histogram_fraction(0, 0.1, …)` trả lời thẳng "bao nhiêu phần request nhanh hơn 100 ms": 50%, không cần 0,1 là một ngưỡng định sẵn.
+
+Lệnh cuối gỡ độ trễ. Từ đây Prometheus thu cả hai dạng; các bước sau và D12.4 vẫn dùng `_bucket` cho quen với phần lớn hệ thống đang chạy.
+
+<Check id="d12.3.lab-native">Bật được native histogram bằng cấu hình và nạp lại không downtime, so sánh được số chuỗi và độ chính xác với histogram cổ điển.</Check>
+
+### 5. Ba cái bẫy của `rate`
+
+<Terminal where="mac">
+
+```bash
+curl -s localhost:9551/api/v1/query --data-urlencode 'query=rate(http_requests_in_flight[1m])' | jq -r '.infos[]'
+./pq 'max_over_time(http_requests_in_flight{job="shop"}[1m])'
+./pq 'sum(rate(http_requests_total{job="shop"}[5s]))'
+./pq 'sum(rate(http_requests_total{job="shop"}[20s]))'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: "http_requests_in_flight" (1:6)
+env=lab instance=shop-1:8080 job=shop  =>  1
+env=lab instance=shop-2:8080 job=shop  =>  4
+  =>  20.066
+```
+
+</Expected>
+
+- **Bẫy gauge:** Prometheus vẫn chạy `rate` trên gauge, nhưng đính kèm một ghi chú trong trường `infos` của API (giao diện hiện nó dưới ô truy vấn). Câu hỏi đúng cho gauge này là "một phút qua, cao nhất có mấy request chạy cùng lúc": `max_over_time`. `shop-2` lên tới 4 vì lúc nãy mỗi request của nó nằm lại 400 ms.
+- **Bẫy cửa sổ:** truy vấn `[5s]` không in gì, không báo lỗi; `[20s]` ra gần 20. Một panel dashboard trống vì lý do này rất dễ bị đọc thành "không có traffic".
+
+Bẫy thứ ba cần một lần khởi động lại:
+
+<Terminal where="mac">
+
+```bash
+docker compose restart shop-1 2>&1 | tail -1
+sleep 25
+./pq 'sum(rate(http_requests_total{job="shop"}[1m]))'
+./pq 'rate(sum(http_requests_total{job="shop"})[1m:5s])'
+```
+
+</Terminal>
+
+<Predict question="shop-1 vừa khởi động lại, traffic thật vẫn 20 request mỗi giây. Hai cách viết cho ra bao nhiêu?">
+
+```text
+ Container d12-shop-1 Started 
+  =>  19.363
+  =>  83.455
+```
+
+`sum(rate(…))` cho 19,4: mỗi chuỗi được xử lý counter reset riêng rồi mới cộng. `rate(sum(…))` cho **83,5**: tổng của hai instance tụt xuống khi counter của `shop-1` về 0, `rate` coi đó là cả tổng bị đặt lại và cộng nguyên giá trị cũ vào mức tăng. Con số bịa này lớn hay nhỏ tuỳ counter đã đếm tới đâu, nên trên một service chạy lâu nó thành một cái gai khổng lồ đúng lúc deploy. Cú pháp `[1m:5s]` là subquery, và việc phải dùng tới nó để `rate` một kết quả gộp đã là dấu hiệu đang đi sai hướng.
+
+</Predict>
+
+<Check id="d12.3.lab-traps">Tái hiện được ba cái bẫy của `rate` trên lab và viết lại được truy vấn đúng cho từng trường hợp.</Check>
+
+### 6. Recording rule
+
+Ba truy vấn RED của service, ghi thành ba chuỗi có tên:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p prometheus/rules
+cat > prometheus/rules/red.yml <<'EOF'
+groups:
+  - name: shop-red
+    rules:
+      - record: job_route:http_requests:rate1m
+        expr: sum by (job, route) (rate(http_requests_total[1m]))
+      - record: job:http_requests_errors:ratio_rate1m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[1m]))
+            / sum by (job) (rate(http_requests_total[1m]))
+      - record: job_route:http_request_duration_seconds:p95_1m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (job, route, le) (rate(http_request_duration_seconds_bucket[1m])))
+EOF
+cat >> prometheus/prometheus.yml <<'EOF'
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+EOF
+docker compose exec -T prometheus promtool check rules /etc/prometheus/rules/red.yml
+curl -s -X POST localhost:9551/-/reload -w 'reload: %{http_code}\n'
+sleep 60
+curl -s localhost:9551/api/v1/rules | jq -r '.data.groups[].rules[] | "\(.health)  \(.name)"'
+./pq 'job_route:http_requests:rate1m{route=~"/.+"}'
+./pq 'job_route:http_request_duration_seconds:p95_1m{route=~"/.+"}'
+./pq 'job:http_requests_errors:ratio_rate1m'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Checking /etc/prometheus/rules/red.yml
+  SUCCESS: 3 rules found
+
+reload: 200
+ok  job_route:http_requests:rate1m
+ok  job:http_requests_errors:ratio_rate1m
+ok  job_route:http_request_duration_seconds:p95_1m
+__name__=job_route:http_requests:rate1m job=shop route=/api/checkout  =>  4.345
+__name__=job_route:http_requests:rate1m job=shop route=/api/products  =>  15.654
+__name__=job_route:http_requests:rate1m job=stock route=/reserve  =>  4.345
+__name__=job_route:http_request_duration_seconds:p95_1m job=shop route=/api/checkout  =>  0.097
+__name__=job_route:http_request_duration_seconds:p95_1m job=shop route=/api/products  =>  0.024
+__name__=job_route:http_request_duration_seconds:p95_1m job=stock route=/reserve  =>  0.048
+```
+
+</Expected>
+
+Nhóm rule chạy mỗi `evaluation_interval` (5 giây). Kết quả là chuỗi thường, truy vấn như mọi metric khác; bộ lọc `route=~"/.+"` chỉ để bỏ dòng `route=other` còn lại từ bước 7 của D12.2.
+
+Hai dòng p95 của `products` (ở đây 0,024) có thể là khoảng 0,04 trên máy bạn, như bước 2 đã giải thích.
+
+Truy vấn cuối cùng, tỉ lệ lỗi, **không in gì**: rule vẫn `ok` nhưng không sinh ra chuỗi nào, vì chưa có request 5xx nào nên tử số là vector rỗng. Đây là tình huống "không có dữ liệu khác 0" ở phần Kiến thức; bước sau cho nó dữ liệu.
+
+<Check id="d12.3.lab-recording">Viết được recording rule theo quy ước `level:metric:operations`, kiểm bằng `promtool`, nạp lại và truy vấn được kết quả.</Check>
+
+### 7. RED cho service
+
+Cho `shop-2` trả lỗi 500 với 40% request, rồi đọc ba con số RED:
+
+<Terminal where="mac">
+
+```bash
+curl -s -X POST 'localhost:9559/admin/fault?error=40'
+sleep 75
+./pq 'job_route:http_requests:rate1m{job="shop", route=~"/.+"}'
+./pq 'job:http_requests_errors:ratio_rate1m'
+./pq 'job_route:http_request_duration_seconds:p95_1m{job="shop", route=~"/.+"}'
+./pq 'sum by (instance) (rate(http_requests_total{job="shop", status=~"5.."}[1m])) / sum by (instance) (rate(http_requests_total{job="shop"}[1m]))'
+curl -s -X POST localhost:9559/admin/fault
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+error=40% delay=0ms
+__name__=job_route:http_requests:rate1m job=shop route=/api/checkout  =>  3.746
+__name__=job_route:http_requests:rate1m job=shop route=/api/products  =>  16.255
+__name__=job:http_requests_errors:ratio_rate1m job=shop  =>  0.202
+__name__=job_route:http_request_duration_seconds:p95_1m job=shop route=/api/checkout  =>  0.097
+__name__=job_route:http_request_duration_seconds:p95_1m job=shop route=/api/products  =>  0.024
+instance=shop-2:8080  =>  0.395
+error=0% delay=0ms
+```
+
+</Expected>
+
+- **Rate** vẫn 20 request mỗi giây và **Duration** không đổi vì lỗi (nếu p95 của `products` trên máy bạn nhảy giữa 0,024 và 0,04 thì đó là chuyện mép bucket ở bước 2, không liên quan tới lỗi vừa tiêm): nếu chỉ theo dõi hai thứ này, sự cố vô hình.
+- **Errors**: 20,2% request của service lỗi. Chuỗi tỉ lệ lỗi giờ đã tồn tại.
+- Truy vấn chia theo `instance` khoanh vùng ngay: chỉ `shop-2` có lỗi, 39,5%. `shop-1` không xuất hiện trong kết quả, cũng vì nó chưa từng trả 5xx.
+
+Ba con số của RED là thứ D12.4 vẽ lên dashboard và đặt alert.
+
+<Check id="d12.3.lab-red">Đọc được ba con số RED của một service từ recording rule, và khoanh vùng được instance gây lỗi bằng cách đổi `by`.</Check>
+
+### 8. USE cho máy và cho tiến trình
+
+node_exporter đọc `/proc` và `/sys` của máy rồi phát thành metric. Chạy nó trong container thì phải cho nó nhìn thấy máy thật: dùng chung PID namespace và gắn thư mục gốc của máy vào `/host`. Service được khai ở một file Compose riêng, thêm vào `COMPOSE_FILE` như D12.2 đã làm với Prometheus.
+
+<Terminal where="mac">
+
+```bash
+cat > compose.node.yaml <<'EOF'
+services:
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    container_name: d12-node-exporter
+    command: ["--path.rootfs=/host"]
+    pid: host
+    volumes: ["/:/host:ro"]
+EOF
+echo 'COMPOSE_FILE=compose.yaml:compose.prom.yaml:compose.node.yaml' > .env
+cat > prometheus/targets/node.yml <<'EOF'
+- targets: ["node-exporter:9100"]
+  labels:
+    job: node
+EOF
+docker compose up -d 2>&1 | grep -E 'node-exporter.*Started'
+sleep 75
+./pq 'up{job="node"}'
+./pq 'count({job="node"})'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d12-node-exporter Started 
+__name__=up instance=node-exporter:9100 job=node  =>  1
+  =>  1413
+```
+
+</Expected>
+
+Một exporter, 1.413 chuỗi. Giờ đi theo bảng USE, mỗi tài nguyên ba câu hỏi:
+
+<Terminal where="mac">
+
+```bash
+./pq '1 - avg(rate(node_cpu_seconds_total{mode="idle"}[1m]))'
+./pq 'node_load1 / count(node_cpu_seconds_total{mode="idle"})'
+./pq 'node_load1 / on (instance) count by (instance) (node_cpu_seconds_total{mode="idle"})'
+./pq 'rate(node_pressure_cpu_waiting_seconds_total[1m])'
+./pq '1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes'
+./pq 'rate(node_pressure_memory_waiting_seconds_total[1m])'
+./pq 'rate(node_vmstat_oom_kill[5m])'
+./pq '1 - node_filesystem_avail_bytes{mountpoint="/var/lib/docker"} / node_filesystem_size_bytes{mountpoint="/var/lib/docker"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  =>  0.556
+instance=node-exporter:9100  =>  1.422
+instance=node-exporter:9100 job=node  =>  0.3
+instance=node-exporter:9100 job=node  =>  0.414
+instance=node-exporter:9100 job=node  =>  0.004
+instance=node-exporter:9100 job=node  =>  0
+device=/dev/vda1 fstype=ext4 instance=node-exporter:9100 job=node mountpoint=/var/lib/docker  =>  0.812
+```
+
+</Expected>
+
+| Tài nguyên | Utilization | Saturation | Errors |
+|---|---|---|---|
+| CPU | Dòng 1: phần thời gian CPU không rảnh | Dòng 2: load 1 phút chia số CPU; dòng 3: phần thời gian có tiến trình phải chờ CPU (PSI, D1.4 đã đọc bằng tay) | Hiếm khi cần |
+| Bộ nhớ | Dòng 4: phần bộ nhớ không còn "available" | Dòng 5: PSI của bộ nhớ, tức thời gian chờ thu hồi trang | Dòng 6: số lần OOM kill mỗi giây |
+| Đĩa (dung lượng) | Dòng 7: phần đã dùng của hệ thống file chứa dữ liệu Docker | Với I/O: `node_pressure_io_waiting_seconds_total` | `node_filesystem_device_error` |
+
+Truy vấn thứ hai (`node_load1 / count(…)`) **không in gì**: vế trái có label `instance` và `job`, vế phải sau `count` không còn label nào, nên không cặp nào ghép được. Truy vấn thứ ba giữ `instance` ở cả hai vế và ghi rõ `on (instance)`; đó là dòng 2 của kết quả.
+
+Lần đo này minh hoạ đúng khác biệt giữa utilization và saturation: CPU chỉ bận 56%, nhưng load gấp 1,4 lần số CPU và 30% thời gian có tiến trình phải chờ CPU. Lúc đo, máy ảo này còn chạy nhiều container khác ngoài lab; chỉ nhìn 56% thì không thấy chúng đang tranh nhau. Một lần chạy lại khi máy ảo rảnh hơn cho CPU 15%, load 0,21 lần số CPU và PSI 1,6%: ba con số cùng thấp, không có gì phải chờ. Con số trên máy bạn sẽ khác hẳn: "máy" ở đây là máy ảo Linux của Docker Desktop, nên CPU và bộ nhớ là của mọi container đang chạy trong đó, không phải của macOS. Đĩa đầy tới 81% là dấu hiệu nên chạy `docker system df` rồi dọn image cũ.
+
+Truy vấn đĩa lọc `mountpoint="/var/lib/docker"` vì trong máy ảo của Docker Desktop đó là nơi gắn ổ dữ liệu. Trên máy chủ Linux, hệ thống file cần theo dõi thường là `mountpoint="/"` hoặc phân vùng riêng của dữ liệu; liệt kê bằng `./pq 'node_filesystem_size_bytes'` rồi chọn (bài chưa chạy lab này trên Linux).
+
+USE cũng áp được cho từng tiến trình, bằng các metric `process_*` mà thư viện client tự phát:
+
+<Terminal where="mac">
+
+```bash
+./pq 'rate(process_cpu_seconds_total{job=~"shop|stock"}[1m])'
+./pq 'process_resident_memory_bytes{job=~"shop|stock"} / 1024 / 1024'
+./pq 'go_goroutines{job="shop"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+env=lab instance=shop-1:8080 job=shop  =>  0.004
+env=lab instance=shop-2:8080 job=shop  =>  0.004
+env=lab instance=stock:8080 job=stock  =>  0.002
+env=lab instance=shop-1:8080 job=shop  =>  22.434
+env=lab instance=shop-2:8080 job=shop  =>  23.969
+env=lab instance=stock:8080 job=stock  =>  26.84
+__name__=go_goroutines env=lab instance=shop-1:8080 job=shop  =>  15
+__name__=go_goroutines env=lab instance=shop-2:8080 job=shop  =>  12
+```
+
+</Expected>
+
+Mỗi instance dùng chưa tới 1% của một CPU và 22 đến 27 MiB bộ nhớ thường trú, với 12 đến 15 goroutine. Trên máy chủ Linux và trên Kubernetes, số liệu theo **container** (CPU, bộ nhớ so với limit, số lần bị throttle) đến từ cAdvisor, vốn nằm sẵn trong kubelet.
+
+<Callout kind="pitfall">
+
+Hai điều lab này phát hiện trên Docker Desktop, đều do Docker chạy trong một máy ảo:
+
+- Cấu hình node_exporter hay được chép từ tài liệu dùng `-v /:/host:ro,rslave`. Trên Docker Desktop lệnh đó thất bại với `path / is mounted on / but it is not a shared or slave mount`; bỏ `rslave` thì chạy. Trên máy chủ Linux thật, giữ `rslave` để exporter thấy được ổ đĩa gắn thêm sau khi nó khởi động.
+- cAdvisor (đã thử bản 0.60.6, gắn đủ `/`, `/sys`, `/var/lib/docker` và Docker socket) chạy được nhưng metric chỉ có id cgroup dạng `/docker/198fcb26…`, không có nhãn tên container, nên bài không dùng. Log của nó ghi `Registration of the docker container factory failed: unable to create containerd client … dial unix /run/containerd/containerd.sock: connect: no such file or directory`; bài dừng ở triệu chứng đó, chưa tìm cách khắc phục. Trên máy chủ Linux với Docker Engine cài trực tiếp, hãy kiểm lại trước khi dựa vào nó.
+
+</Callout>
+
+<Check id="d12.3.lab-use">Chạy được node_exporter, viết được truy vấn utilization, saturation và errors cho CPU, bộ nhớ và đĩa, và sửa được một phép chia trả về rỗng do lệch label.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`reload: 500`** hoặc Prometheus không nhận rule mới: file cấu hình hoặc file rule sai cú pháp; cấu hình cũ vẫn được giữ. Chạy lại `promtool check config` và `promtool check rules`, đọc `docker logs d12-prometheus 2>&1 | tail -5`.
+- **Chạy lại bài lần hai, `prometheus.yml` có hai khối `rule_files` hoặc bốn dòng native histogram:** lệnh `perl` và `cat >>` không tự kiểm trùng. Mở file xoá phần lặp, hoặc tạo lại file từ bước 1 của D12.2.
+- **`histogram_quantile` trả `NaN`:** không có quan sát nào trong cửa sổ (0 chia 0), thường gặp ở `route=other`. Lọc route hoặc nới cửa sổ.
+- **Recording rule `ok` nhưng truy vấn rỗng:** biểu thức của rule không trả chuỗi nào, như tỉ lệ lỗi trước lỗi đầu tiên. Dán biểu thức vào `./pq` để xem từng vế.
+- **`up{job="node"}` là 0 với `no such host`:** file `.env` chưa có `compose.node.yaml`, nên `docker compose up -d` không tạo container. Chạy `docker compose config --services` để xem Compose đang thấy những service nào.
+
+</Callout>
+
+### Dọn dẹp
+
+D12.4 dùng tiếp toàn bộ cụm, rule và dữ liệu. Nếu nghỉ giữa chừng:
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu">
+
+```bash
+cd ~/masteva-d12 && docker compose stop
+```
+
+</Terminal>
+
+Muốn dọn hẳn thì dùng khối lệnh ở cuối D12.1; `docker compose down -v` đọc `.env` nên gỡ luôn cả node_exporter.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Chọn cửa sổ của rate bao nhiêu là vừa?">
+
+Cửa sổ là sự đánh đổi giữa độ nhạy và độ nhiễu. Ngắn (1 phút) thì phản ứng nhanh nhưng giật theo từng đợt request; dài (5 đến 10 phút) thì mượt nhưng một sự cố hai phút bị pha loãng tới mức khó thấy. Giới hạn dưới là kỹ thuật: ít nhất bốn lần nhịp scrape, để mất một lần scrape vẫn còn đủ mẫu. Với dashboard, Grafana tính hộ bằng biến `$__rate_interval` (D12.4). Với alert, cửa sổ đi cùng `for` quyết định bạn biết tin sau bao lâu; D16 dùng nhiều cửa sổ cùng lúc (burn rate) để vừa nhanh vừa ít báo nhầm. Một điểm hay quên: `rate(x[1m])` trong recording rule đã đóng cứng cửa sổ; cần cửa sổ khác thì viết rule khác, không "rate lại" được từ kết quả.
+
+</Reveal>
+
+<Reveal title="Đã có native histogram, có nên bỏ histogram cổ điển ngay không?">
+
+Chưa chắc. Native histogram cần cả chuỗi công cụ hỗ trợ: thư viện client của ngôn ngữ bạn dùng, Prometheus bật cấu hình scrape, backend lưu dài hạn (Mimir, Thanos…) nhận được qua remote write, và dashboard, alert viết lại theo cú pháp mới. Lộ trình an toàn là điều lab vừa làm: phát cả hai dạng, bật `always_scrape_classic_histograms`, chuyển dần truy vấn, rồi mới tắt dạng cũ để thu lại số chuỗi. Một lựa chọn trung gian không cần sửa ứng dụng là `convert_classic_histograms_to_nhcb`: Prometheus gói các bucket cổ điển vào một chuỗi native với đúng các ngưỡng cũ, giảm số chuỗi nhưng không tăng độ chính xác.
+
+</Reveal>
+
+<Reveal title="RED không có saturation, vậy khi nào service cần đo saturation?">
+
+Khi service có hàng đợi hoặc giới hạn đồng thời của riêng nó: thread pool, pool kết nối database, semaphore giới hạn số request đang chạy, hàng đợi tin nhắn. Khi đó RED chỉ xấu đi **sau khi** hàng đợi đã đầy; đo độ dài hàng đợi hoặc tỉ lệ pool đang dùng (`http_requests_in_flight` trong lab là một dạng đơn giản) cho bạn cảnh báo sớm hơn. SB12.2 đã phân tích thread pool của Tomcat và pool của Hikari theo đúng hướng này. Với service gọi service khác, RED còn nên được đo ở **phía gọi**: tỉ lệ lỗi mà `shop` thấy khi gọi `stock` bao gồm cả timeout và lỗi mạng mà `stock` không bao giờ đếm được.
+
+</Reveal>
+
+<Reveal title="Recording rule có làm tăng cardinality không?">
+
+Có: mỗi rule sinh chuỗi mới, và chúng nằm trong TSDB như mọi chuỗi khác. Rule gộp bỏ label (`sum by (job, route)`) sinh ít chuỗi hơn nhiều so với đầu vào, nên thường là có lợi. Rule giữ nguyên mọi label chỉ để "đổi tên cho đẹp" thì nhân đôi số chuỗi mà không được gì. Kiểm bằng `count by (__name__) ({__name__=~".+:.+"})` để xem các chuỗi có dấu hai chấm chiếm bao nhiêu. Một quy tắc thực dụng: chỉ thêm rule khi có dashboard hoặc alert cụ thể cần nó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết PromQL từ mô tả bằng lời ("p99 theo route, gộp mọi instance") tiết kiệm nhiều thời gian, và nhờ nó giải thích một truy vấn dài cũng tốt. Lỗi AI hay mắc trùng với các bẫy của bài: quên `le` trong `by` của `histogram_quantile`, lấy `avg` của percentile, `rate` trên gauge, cửa sổ `[30s]` cho nhịp scrape 30 giây, phép chia hai vế lệch label, và dùng `> 0` cho tỉ lệ lỗi mà không tính tới trường hợp rỗng. Nó cũng hay bịa tên metric của node_exporter theo phiên bản cũ (`node_cpu` thay vì `node_cpu_seconds_total`). Kiểm lại: chạy từng vế của phép chia riêng bằng `./pq` để xem label, so kết quả với một con số bạn tự biết (lab bắn đúng 20 request mỗi giây), và `curl …/metrics | grep` để chắc metric tồn tại.
+
+</Callout>
+
+<Callout kind="link">
+
+D12.4 đưa ba chuỗi RED vừa ghi lên dashboard Grafana và viết alert từ chúng. D1.4 là bản làm tay của USE trên một máy (`vmstat`, `iostat`, PSI). SB12.1 và SB12.2 dùng cùng tư duy percentile và saturation để đo tải ứng dụng Spring. D7.2 định nghĩa SLI từ dạng "tỉ lệ request tốt"; D16 xây SLO và alert theo burn rate trên các recording rule kiểu này; D18 dùng USE để lập kế hoạch dung lượng.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d12.3.mastery-promql">Tự viết được truy vấn request mỗi giây, tỉ lệ lỗi và p95 cho một service nhiều instance, giải thích được từng phần của truy vấn và các bẫy đã tránh.</Check>
+
+<Check id="d12.3.mastery-rules">Đóng gói được các truy vấn đó thành recording rule đặt tên đúng quy ước, kiểm và nạp lại không downtime.</Check>
+
+<Check id="d12.3.mastery-red-use">Với một service và máy chạy nó, liệt kê được các chỉ số RED và USE cần có, và dùng chúng để đi từ "người dùng thấy chậm" tới "tài nguyên nào đang nghẽn".</Check>
+
+</Mastery>

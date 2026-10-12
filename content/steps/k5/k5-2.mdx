@@ -1,0 +1,886 @@
+---
+title: Topology spread, PodDisruptionBudget, drain và preemption
+description: Trải pod đều theo zone bằng topology spread constraints, giữ service sống khi rút node bằng PodDisruptionBudget, hiểu vì sao kubectl drain treo, và dùng PriorityClass để pod quan trọng đẩy pod khác ra khi cụm hết chỗ.
+id: k5.2
+step: k5
+prerequisites: [k5.1]
+topics: [k5.topology-spread-pdb, k5.priority-preemption]
+status: verified
+verified:
+  date: 2026-10-12
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    yq: 4.54.1
+---
+
+<Goal>
+
+K5.1 dạy cách đặt một pod vào đúng node. Bài này lo cho cả nhóm pod của một service qua ba loại biến động: mất một zone, rút một node để bảo trì, và cụm hết chỗ. Học xong, bạn giải thích được:
+
+- Vì sao sáu bản sao "trải đều trên ba node" vẫn mất hai phần ba khi một zone hỏng.
+- Vì sao sau vài lần deploy, service đã khai trải đều theo zone lại lệch.
+- Vì sao `kubectl drain` đứng mãi ở dòng `Cannot evict pod as it would violate the pod's disruption budget`, và bốn cấu hình dẫn tới đó.
+- Vì sao một pod vừa tạo có thể làm pod đang chạy của đội khác bị xoá, và PodDisruptionBudget không cản được.
+
+</Goal>
+
+<Knowledge>
+
+### Trải pod theo vùng: topology spread constraints
+
+Node không hỏng độc lập. Các node chung một zone, một rack, một bộ nguồn thường mất cùng lúc; đó là một **failure domain** (vùng hỏng chung). Trên cụm, mỗi loại vùng là một label của node: `kubernetes.io/hostname` cho node, `topology.kubernetes.io/zone` cho zone.
+
+Chấm điểm mặc định của scheduler có trải pod, nhưng lỏng: nó coi như bạn khai sẵn hai ràng buộc mềm, lệch tối đa 3 theo node và 5 theo zone. Với ít bản sao, ràng buộc lỏng thế gần như không nói gì về zone. Anti-affinity của K5.1 thì quá cứng: mỗi vùng tối đa một pod. **Topology spread constraints** nằm giữa: bạn nói được "số pod giữa các vùng lệch nhau không quá N".
+
+```text
+ maxSkew: 1, topologyKey: topology.kubernetes.io/zone
+
+           zone-a                        zone-b
+   worker        worker2                worker3
+   [P] [P]       [P]                    [P] [P] [P]        đếm: 3 | 3
+
+ skew của một vùng = số pod ở vùng đó - số pod ở vùng ít nhất
+
+ Pod thứ 7 vào zone-a:  4 | 3  -> skew 1, không vượt maxSkew: được
+ Pod thứ 8 vào zone-a:  5 | 3  -> skew 2, vượt maxSkew: không được, phải vào zone-b
+```
+
+| Trường | Ý nghĩa |
+|---|---|
+| `topologyKey` | Label của node định nghĩa "vùng". Node thiếu label này bị bỏ qua |
+| `labelSelector` | Đếm những pod nào. Gần như luôn là label của chính Deployment |
+| `maxSkew` | Độ lệch tối đa cho phép giữa vùng đông nhất và vùng thưa nhất |
+| `whenUnsatisfiable` | `DoNotSchedule`: luật, vi phạm thì `Pending` (vòng lọc). `ScheduleAnyway`: sở thích, chỉ trừ điểm (vòng chấm điểm) |
+| `matchLabelKeys` | Chỉ đếm pod có cùng giá trị các label này với pod đang xếp. Dùng với `pod-template-hash` để mỗi bản rollout được tính riêng |
+| `minDomains` | Số vùng tối thiểu phải có. Ít vùng hơn thì coi như có một vùng đang 0 pod. Chỉ dùng với `DoNotSchedule` |
+| `nodeTaintsPolicy` | `Ignore` (mặc định): node có taint vẫn được tính là vùng. `Honor`: bỏ qua node mà pod không chịu được taint |
+
+Ba điều tài liệu nói lướt nhưng gây sự cố thật, cả ba có trong lab:
+
+- **Chỉ xét lúc xếp pod.** Giống mọi luật của scheduler, ràng buộc không được xét lại khi pod bị xoá. Rollout tạo pod mới trong lúc pod cũ còn đó, và pod cũ cũng được đếm; rollout xong, phân bố của pod mới có thể lệch quá `maxSkew`. `matchLabelKeys: [pod-template-hash]` sửa đúng chỗ này.
+- **Zone không nhận được pod vẫn được tính.** Với `nodeTaintsPolicy` mặc định, một zone mà mọi node đều bị `cordon` hoặc đầy vẫn là một vùng với số pod đứng yên. Các zone khác không được vượt nó quá `maxSkew`, nên pod mới `Pending` dù cụm còn chỗ.
+- **Zone ≠ node.** Trải đều theo zone không trải đều theo node: một zone ít node sẽ dồn pod lên node đó. Cần cả hai thì khai hai ràng buộc.
+
+<Check id="k5.2.topology-spread">Tính được skew từ số pod ở mỗi vùng, phân biệt được `DoNotSchedule` với `ScheduleAnyway`, và nêu được `matchLabelKeys`, `minDomains` giải quyết chuyện gì.</Check>
+
+### Gián đoạn tự nguyện và PodDisruptionBudget
+
+Pod biến mất vì hai nhóm nguyên nhân, và Kubernetes chỉ điều tiết được một nhóm:
+
+| | Không tự nguyện | Tự nguyện |
+|---|---|---|
+| Ví dụ | Node chết, kernel panic, hết bộ nhớ, mất mạng | Rút node để nâng cấp hoặc vá, autoscaler gỡ node thừa (K5.4), Descheduler |
+| Ai gây ra | Hạ tầng | Một người hoặc một controller, **qua Eviction API** |
+| Chặn được không | Không; chỉ giảm thiệt hại bằng trải pod | Có: PodDisruptionBudget |
+
+**PodDisruptionBudget (PDB)** là lời khai của chủ ứng dụng: "trong các pod khớp selector này, lúc nào cũng phải còn ít nhất `minAvailable` pod khoẻ" (hoặc "thiếu tối đa `maxUnavailable`"). Bên muốn rút pod không xoá thẳng mà gọi **Eviction API**; API server tính `disruptionsAllowed` từ PDB và từ chối nếu hết ngân sách.
+
+```text
+ kubectl drain <node>
+   1. cordon: đánh dấu node không nhận pod mới (taint unschedulable:NoSchedule)
+   2. với mỗi pod trên node (bỏ qua pod của DaemonSet):
+        POST /api/v1/namespaces/<ns>/pods/<pod>/eviction
+          |
+          v
+        API server: PDB của pod này còn disruptionsAllowed > 0 ?
+          còn   -> pod bị xoá theo trình tự tắt êm (K1.3);
+                   controller tạo pod thay, scheduler xếp sang node khác;
+                   pod thay Ready thì ngân sách mới hồi lại
+          hết   -> trả 429; drain chờ 5 giây rồi thử lại, không giới hạn số lần
+   3. node hết pod: "node/<node> drained". Node vẫn cordon tới khi bạn uncordon
+```
+
+PDB **không** chặn những đường không đi qua Eviction API:
+
+- `kubectl delete pod`, hoặc xoá cả Deployment.
+- Rollout của Deployment: nó theo `maxUnavailable` riêng của chiến lược rollout (K1.1), không theo PDB.
+- Node chết.
+- Preemption (phần dưới): scheduler chỉ cố tránh vi phạm PDB, không bảo đảm.
+
+Vòng thử lại ở bước 2 không có điểm dừng, nên PDB sai là `drain` treo. Bốn cấu hình dẫn tới đó:
+
+| Cấu hình | Vì sao ngân sách luôn bằng 0 |
+|---|---|
+| `maxUnavailable: 0`, hoặc `minAvailable` bằng số bản sao | Không pod nào được phép vắng |
+| Một bản sao với `minAvailable: 1` | Như trên; muốn bảo vệ thì phải có từ hai bản sao |
+| Pod không bao giờ Ready (đang `CrashLoopBackOff`, probe sai) | Số pod khoẻ đã dưới mức cần; chính sách mặc định `IfHealthyBudget` không cho rút cả pod đang hỏng. Đặt `unhealthyPodEvictionPolicy: AlwaysAllow` để pod chưa Ready luôn rút được |
+| Topology spread `DoNotSchedule` mà node đang rút là node duy nhất của một zone | Pod thay không có chỗ hợp lệ nên `Pending`; ngân sách không hồi |
+
+<Callout kind="production">
+
+Năm 2019, loveholidays nâng cấp cụm GKE từ 1.10 lên 1.12. Theo [bài tường thuật của kỹ sư thực hiện](https://deploy.live/blog/the-shipwreck-of-gke-cluster-upgrade/), ông ước tính 2 tới 2,5 giờ cho cả control plane lẫn các node pool. Hai node pool đầu, mỗi pool 7 node, trôi chảy ở mức khoảng 5 phút mỗi node. Sau đó mọi thứ chậm hẳn: có node mất hơn 15 phút mới rút xong. Hai cấu hình ông nêu là làm drain chậm: pod dùng `emptyDir` khiến drain không dám rút, và ứng dụng đặt `terminationGracePeriodSeconds` tới 5 tới 10 phút. Ông nêu PodDisruptionBudget theo chiều ngược lại, như một cách làm drain **nhanh hơn**: PDB cho phép vắng vài pod cùng lúc thì drain không phải chờ từng pod thay sẵn sàng rồi mới rút pod kế. Danh sách [k8s.af](https://k8s.af/) ghi nhận kết cục: lần bảo trì dự kiến hai giờ kéo dài bảy giờ.
+
+Điều rút ra (của bài này): thời gian nâng cấp một cụm bằng thời gian drain một node nhân với số node, và thời gian drain do **ứng dụng** quyết định qua PDB cùng grace period: PDB quá chặt thì drain chậm hoặc treo, PDB cho vắng vài pod thì drain nhanh. K4 dạy quy trình nâng cấp; phần chuẩn bị của quy trình đó là rà PDB của mọi workload, theo bước 5 của lab.
+
+</Callout>
+
+<Check id="k5.2.pdb">Phân biệt được gián đoạn tự nguyện với không tự nguyện, kể được các bước của `kubectl drain`, những đường mà PDB không chặn, và bốn cấu hình làm drain treo.</Check>
+
+### Priority và preemption
+
+Khi cụm hết chỗ, pod nào được chạy? Mặc định là pod đến trước. **PriorityClass** cho bạn nói khác đi: mỗi class là một con số, pod tham chiếu class qua `priorityClassName`, và con số được chép vào `spec.priority` của pod lúc tạo.
+
+Con số đó có ba tác dụng:
+
+- **Thứ tự trong hàng đợi** của scheduler: pod priority cao được xếp trước.
+- **Preemption** (chiếm chỗ): pod priority cao không có node thì scheduler xoá pod priority thấp hơn để lấy chỗ.
+- **Thứ tự evict của kubelet** khi node thiếu tài nguyên, như K1.2 đã nhắc.
+
+```text
+ Pod P (priority 100000) không qua vòng lọc ở node nào
+        |
+        v
+ Scheduler tìm: "node nào, nếu xoá bớt pod có priority THẤP HƠN P, thì P vừa?"
+        |
+        v
+ Chọn node ít thiệt hại nhất: ưu tiên phương án không vi phạm PDB,
+ rồi nạn nhân có priority thấp nhất, rồi ít nạn nhân nhất
+        |
+        v
+ Ghi status.nominatedNodeName cho P; xoá các nạn nhân
+ (nạn nhân vẫn được tắt êm theo grace period của chúng)
+        |
+        v
+ Nạn nhân đi hết, P được xếp ở lượt sau.
+ Controller của nạn nhân tạo pod thay; pod thay Pending nếu cụm vẫn hết chỗ
+```
+
+Các trường của PriorityClass:
+
+| Trường | Ý nghĩa |
+|---|---|
+| `value` | Số nguyên; lớn hơn là ưu tiên hơn. Pod không khai class nào có priority 0 |
+| `globalDefault` | `true` thì pod **tạo từ nay** không khai class nào sẽ nhận class này. Chỉ một class được đặt. Pod đã tồn tại không đổi |
+| `preemptionPolicy` | `PreemptLowerPriority` (mặc định), hoặc `Never`: đứng trước trong hàng đợi nhưng không xoá pod của ai |
+
+Cụm có sẵn hai class cho thành phần hệ thống, `system-cluster-critical` và `system-node-critical`, với giá trị từ 2 tỉ trở lên; class bạn tự tạo không được vượt 1 tỉ.
+
+<Callout kind="production">
+
+Ngày 19/07/2019, dịch vụ Hosted Prometheus của Grafana Cloud gián đoạn 26 phút. Theo [postmortem của Grafana Labs](https://grafana.com/blog/2019/07/24/how-a-production-outage-was-caused-using-kubernetes-pod-priorities/), hôm trước họ thêm bốn PriorityClass vào cụm và đặt class `medium` làm mặc định. Các pod Ingester production đang chạy được tạo **trước** đó nên không có priority nào. Hôm sau, một kỹ sư dựng thêm một cụm Cortex mới trên cùng cụm Kubernetes, vốn không đủ chỗ. Ingester của cụm mới nhận priority `medium`, cao hơn Ingester production, và chiếm chỗ một pod production. ReplicaSet tạo pod thay; pod thay giờ có priority `medium` và lại chiếm chỗ một Ingester production khác. Chuỗi đó lần lượt đẩy toàn bộ Ingester production ra. Họ khôi phục bằng cách tăng số node của cụm.
+
+Hai điều postmortem tự rút ra: không nên đặt một class làm mặc định trước khi gắn priority cao cho workload quan trọng đang chạy; và thay đổi cấu hình cấp cụm, không thuộc namespace nào, cần được rà kỹ hơn thay đổi thường.
+
+</Callout>
+
+<Check id="k5.2.priority">Kể được ba tác dụng của priority, các bước của một lần preemption, và giải thích được vì sao đặt `globalDefault` trên một cụm đang chạy là thay đổi rủi ro.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Pod Topology Spread Constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/): định nghĩa skew, từng trường, ràng buộc mặc định của cụm và phần "Known limitations".
+- [Disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/): gián đoạn tự nguyện và không tự nguyện, PodDisruptionBudget, và ví dụ từng bước một lần drain có PDB.
+- [Pod Priority and Preemption](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/): PriorityClass, cơ chế preemption và phần "PodDisruptionBudget is supported, but not guaranteed".
+- [How a Production Outage Was Caused Using Kubernetes Pod Priorities (Grafana Labs)](https://grafana.com/blog/2019/07/24/how-a-production-outage-was-caused-using-kubernetes-pod-priorities/): postmortem của sự cố preemption dùng trong bài.
+- [The shipwreck of GKE Cluster Upgrade (loveholidays)](https://deploy.live/blog/the-shipwreck-of-gke-cluster-upgrade/): lần nâng cấp node kéo dài vì drain chậm, nguồn của callout về PDB.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k5-lab` của K5.1: 3 worker, trong đó `worker` và `worker2` thuộc `zone-a`, `worker3` thuộc `zone-b`. Nếu đã xoá cụm, làm lại bước 1 của K5.1. Cả ba worker phải không có taint và không bị `cordon`.
+
+**Profile máy.** Khoảng 1,7 GiB RAM của Docker. Bước 6 cần Docker cấp từ 3 CPU trở lên (mỗi node kind thấy toàn bộ số CPU đó); lệnh trong bài tự đọc con số này.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k5/kubeconfig
+mkdir -p ~/masteva-k5/k5-2 && cd ~/masteva-k5/k5-2
+kubectl get nodes -L topology.kubernetes.io/zone --no-headers | awk '{print $1, $2, $NF}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k5-lab-control-plane Ready v1.37.0
+k5-lab-worker Ready zone-a
+k5-lab-worker2 Ready zone-a
+k5-lab-worker3 Ready zone-b
+```
+
+</Expected>
+
+Script `dem-pod.sh` đếm pod theo zone và node, dùng suốt bài:
+
+<Terminal where="mac" title="~/masteva-k5/dem-pod.sh">
+
+```bash
+cat > ../dem-pod.sh <<'EOF'
+#!/bin/sh
+# Đếm pod theo zone và node cho label app=$1 (mặc định web), kèm số pod Pending
+kubectl get pods -l app="${1:-web}" --no-headers -o custom-columns=NODE:.spec.nodeName,PHASE:.status.phase \
+  | awk '$1 == "<none>" { pending++; next }
+         { n[$1]++ }
+         END { za = n["k5-lab-worker"] + n["k5-lab-worker2"]; zb = n["k5-lab-worker3"]
+               printf "zone-a=%d (worker=%d, worker2=%d)  zone-b=%d (worker3=%d)  Pending=%d\n",
+                 za, n["k5-lab-worker"], n["k5-lab-worker2"], zb, n["k5-lab-worker3"], pending }'
+EOF
+chmod +x ../dem-pod.sh
+```
+
+</Terminal>
+
+### 1. Trải theo zone
+
+Trước hết xem mặc định làm gì với 6 bản sao, rồi thêm ràng buộc theo zone.
+
+<Terminal where="mac" title="~/masteva-k5/k5-2/web.yaml">
+
+```bash
+cat > web.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 6
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: app
+          image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+          args: ["netexec", "--http-port=8080"]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          resources:
+            requests: { cpu: 100m, memory: 32Mi }
+EOF
+kubectl apply -f web.yaml && kubectl rollout status deploy/web --timeout=120s | tail -1
+../dem-pod.sh
+yq '.spec.template.spec.topologySpreadConstraints = [{
+      "maxSkew": 1,
+      "topologyKey": "topology.kubernetes.io/zone",
+      "whenUnsatisfiable": "DoNotSchedule",
+      "labelSelector": {"matchLabels": {"app": "web"}}}]' web.yaml > web-zone.yaml
+sed -n '/topologySpreadConstraints/,$p' web-zone.yaml
+kubectl delete deploy web && kubectl wait --for=delete pod -l app=web --timeout=60s
+kubectl apply -f web-zone.yaml && kubectl rollout status deploy/web --timeout=120s | tail -1
+../dem-pod.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web created
+deployment "web" successfully rolled out
+zone-a=4 (worker=2, worker2=2)  zone-b=2 (worker3=2)  Pending=0
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: web
+deployment.apps "web" deleted from k5 namespace
+deployment.apps/web created
+deployment "web" successfully rolled out
+zone-a=3 (worker=1, worker2=2)  zone-b=3 (worker3=3)  Pending=0
+```
+
+</Expected>
+
+Mặc định cho 2, 2, 2 theo node: trông đều, nhưng theo zone là 4 và 2. Mất `zone-a` là mất hai phần ba service. Với ràng buộc, mỗi zone 3 pod, và mất zone nào cũng còn một nửa. Đổi lại, `worker3` gánh 3 pod một mình: trải theo zone không phải trải theo node. Trong `zone-a`, chia 1 và 2 hay 2 và 1 là tuỳ chấm điểm.
+
+<Check id="k5.2.lab-zone">Chỉ ra được bằng số đếm rằng phân bố mặc định đều theo node nhưng lệch theo zone, và sửa được bằng một topology spread constraint.</Check>
+
+### 2. Rollout làm lệch, và `matchLabelKeys`
+
+<Predict question="Deployment đang 3 | 3 với `maxSkew: 1`, `DoNotSchedule`. Bạn rollout một bản mới. Xong rollout, sáu pod mới còn chia 3 | 3 không?">
+
+Không bắt buộc. Trong lúc rollout, pod cũ và pod mới cùng mang `app=web` nên cùng được đếm. Mỗi pod mới chỉ cần hợp lệ **tại lúc nó được xếp**, tính cả pod cũ. Khi pod cũ bị xoá dần, không ai xét lại. Ở bước này kết quả là 2 | 4: skew 2, vượt `maxSkew`, mà không có pod nào `Pending` hay cảnh báo nào.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl set env deploy/web PHIEN_BAN=2
+kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 2; ../dem-pod.sh
+yq '.spec.template.spec.topologySpreadConstraints[0].matchLabelKeys = ["pod-template-hash"]' \
+  web-zone.yaml > web-zone-mlk.yaml
+kubectl apply -f web-zone-mlk.yaml && kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 2; ../dem-pod.sh
+kubectl set env deploy/web PHIEN_BAN=3
+kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 2; ../dem-pod.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web env updated
+deployment "web" successfully rolled out
+zone-a=2 (worker=2, worker2=0)  zone-b=4 (worker3=4)  Pending=0
+deployment.apps/web configured
+deployment "web" successfully rolled out
+zone-a=3 (worker=1, worker2=2)  zone-b=3 (worker3=3)  Pending=0
+deployment.apps/web env updated
+deployment "web" successfully rolled out
+zone-a=3 (worker=1, worker2=2)  zone-b=3 (worker3=3)  Pending=0
+```
+
+</Expected>
+
+Lần rollout đầu cho 2 | 4. Con số chính xác phụ thuộc thứ tự pod cũ bị xoá nên máy bạn có thể khác; mọi lần rollout thử khi viết bài (năm lần, trên hai cụm) đều ra 2 | 4. Sau khi thêm `matchLabelKeys: [pod-template-hash]`, mỗi bản rollout được đếm riêng: pod mới chỉ so với pod mới, nên rollout xong là 3 | 3, và giữ nguyên qua lần rollout kế. Deployment tự gắn label `pod-template-hash` cho pod của từng ReplicaSet, bạn không phải làm gì thêm.
+
+<Check id="k5.2.lab-rollout-skew">Tái hiện được phân bố lệch sau một lần rollout dù có `DoNotSchedule`, và sửa bằng `matchLabelKeys`.</Check>
+
+### 3. `DoNotSchedule`, `ScheduleAnyway` và `minDomains`
+
+Giả lập `zone-b` hết chỗ bằng cách `cordon` node duy nhất của nó, rồi tăng lên 10 bản sao.
+
+<Terminal where="mac">
+
+```bash
+kubectl cordon k5-lab-worker3
+kubectl scale deploy/web --replicas=10 && sleep 8
+../dem-pod.sh
+kubectl events --for "$(kubectl get pods -l app=web --field-selector=status.phase=Pending -o name | head -1)" | cut -c1-235
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k5-lab-worker3 cordoned
+deployment.apps/web scaled
+zone-a=4 (worker=2, worker2=2)  zone-b=3 (worker3=3)  Pending=3
+LAST SEEN   TYPE      REASON             OBJECT                     MESSAGE
+8s          Warning   FailedScheduling   Pod/web-6bff46b976-gf6td   0/4 nodes are available: 1 node(s) had untolerated taint(s), 1 node(s) were unschedulable, 2 node(s) didn't match pod topology spread constraints. preemption: 0/4 node
+```
+
+</Expected>
+
+Hai node của `zone-a` còn trống gần hết mà 3 pod vẫn `Pending`. `zone-b` đứng ở 3 pod và vẫn được tính là một vùng, nên `zone-a` chỉ được lên 4. Đây là cái giá của `DoNotSchedule`: lúc một zone trục trặc, đúng lúc cần thêm năng lực nhất, ràng buộc lại cản việc tăng pod ở zone còn khoẻ.
+
+Đổi sang `ScheduleAnyway`. Việc sửa template gây một lần rollout, trong lúc `worker3` vẫn bị `cordon`:
+
+<Terminal where="mac">
+
+```bash
+yq '.spec.replicas = 10 | .spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable = "ScheduleAnyway"' \
+  web-zone-mlk.yaml | kubectl apply -f -
+kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 2; ../dem-pod.sh
+kubectl uncordon k5-lab-worker3 && sleep 10
+../dem-pod.sh
+kubectl rollout restart deploy/web && kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 2; ../dem-pod.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web configured
+deployment "web" successfully rolled out
+zone-a=10 (worker=5, worker2=5)  zone-b=0 (worker3=0)  Pending=0
+node/k5-lab-worker3 uncordoned
+zone-a=10 (worker=5, worker2=5)  zone-b=0 (worker3=0)  Pending=0
+deployment.apps/web restarted
+deployment "web" successfully rolled out
+zone-a=5 (worker=1, worker2=4)  zone-b=5 (worker3=5)  Pending=0
+```
+
+</Expected>
+
+Không pod nào `Pending`, nhưng cả 10 pod dồn về `zone-a`. Và khi `zone-b` nhận pod trở lại, **không có gì tự cân lại**: 10 | 0 đứng yên cho tới khi có người `rollout restart`. `ScheduleAnyway` đổi "thiếu năng lực" lấy "lệch âm thầm"; dùng nó thì cần thứ gì đó phát hiện và sửa lệch, như Descheduler (K5.1) hoặc một cảnh báo trên số pod theo zone.
+
+Cuối cùng là `minDomains`. Lab chỉ có 2 zone; khai `minDomains: 3` nghĩa là "tôi cần ít nhất 3 zone":
+
+<Terminal where="mac">
+
+```bash
+kubectl delete deploy web && kubectl wait --for=delete pod -l app=web --timeout=60s
+yq '.spec.template.spec.topologySpreadConstraints[0].minDomains = 3' web-zone-mlk.yaml | kubectl apply -f -
+sleep 10; ../dem-pod.sh
+kubectl delete deploy web && kubectl wait --for=delete pod -l app=web --timeout=60s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps "web" deleted from k5 namespace
+pod/web-6667fdcb7b-2wn4j condition met
+pod/web-6667fdcb7b-djf97 condition met
+pod/web-6667fdcb7b-pld8p condition met
+pod/web-6667fdcb7b-rf4b9 condition met
+pod/web-6667fdcb7b-wmqzk condition met
+pod/web-6667fdcb7b-xbfc5 condition met
+deployment.apps/web created
+zone-a=1 (worker=0, worker2=1)  zone-b=1 (worker3=1)  Pending=4
+deployment.apps "web" deleted from k5 namespace
+```
+
+</Expected>
+
+Thiếu một zone thì scheduler coi zone thiếu đó đang có 0 pod. Với `maxSkew: 1`, mỗi zone thật chỉ được 1 pod; 4 pod còn lại chờ. `minDomains` có nghĩa khi đi cùng cluster autoscaler (K5.4): pod `Pending` là tín hiệu để autoscaler thêm node ở zone mới, thay vì dồn hết vào các zone đang có.
+
+<Check id="k5.2.lab-unsatisfiable">Tái hiện được pod `Pending` vì một zone bị `cordon` dù zone khác còn chỗ, thấy được `ScheduleAnyway` dồn pod về một zone và không tự cân lại, và giải thích được kết quả của `minDomains: 3` trên cụm 2 zone.</Check>
+
+### 4. Drain có PodDisruptionBudget
+
+<Callout kind="danger">
+
+Từ đây tới hết bài có những lệnh làm gián đoạn workload thật nếu chạy nhầm cụm: `kubectl drain` rút mọi pod khỏi một node, `kubectl delete pod` xoá pod bất kể PDB, và bước 6 tạo PriorityClass, một object cấp cụm có thể khiến pod của người khác bị đẩy ra. Trước khi chạy, kiểm `kubectl config current-context` in ra `kind-k5-lab`.
+
+</Callout>
+
+Dựng lại `web` với 6 bản sao, readiness chậm 8 giây (để thấy rõ thứ tự), và một PDB cho phép vắng tối đa 1 pod.
+
+<Terminal where="mac" title="~/masteva-k5/k5-2/web-pdb.yaml">
+
+```bash
+yq '.spec.template.spec.containers[0].readinessProbe.initialDelaySeconds = 8' web.yaml > web-pdb.yaml
+cat >> web-pdb.yaml <<'EOF'
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: web }
+EOF
+kubectl apply -f web-pdb.yaml && kubectl rollout status deploy/web --timeout=120s | tail -1
+../dem-pod.sh
+kubectl get pdb web
+kubectl drain k5-lab-worker --ignore-daemonsets
+../dem-pod.sh
+kubectl get nodes --no-headers | awk '{print $1, $2}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web created
+poddisruptionbudget.policy/web created
+deployment "web" successfully rolled out
+zone-a=4 (worker=2, worker2=2)  zone-b=2 (worker3=2)  Pending=0
+NAME   MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web    N/A             1                 1                     11s
+node/k5-lab-worker cordoned
+Warning: ignoring DaemonSet-managed Pods: kube-system/kindnet-jsxlw, kube-system/kube-proxy-bxnl2
+evicting pod k5/web-868886d699-dh4wq
+evicting pod k5/web-868886d699-8rp7c
+pod/web-868886d699-dh4wq evicted
+error when evicting pods/"web-868886d699-8rp7c" -n "k5" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod k5/web-868886d699-8rp7c
+error when evicting pods/"web-868886d699-8rp7c" -n "k5" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod k5/web-868886d699-8rp7c
+error when evicting pods/"web-868886d699-8rp7c" -n "k5" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod k5/web-868886d699-8rp7c
+pod/web-868886d699-8rp7c evicted
+node/k5-lab-worker drained
+zone-a=3 (worker=0, worker2=3)  zone-b=3 (worker3=3)  Pending=0
+k5-lab-control-plane Ready
+k5-lab-worker Ready,SchedulingDisabled
+k5-lab-worker2 Ready
+k5-lab-worker3 Ready
+```
+
+</Expected>
+
+Đọc theo sơ đồ ở phần Kiến thức. Drain gọi evict cho cả hai pod trên `worker` cùng lúc. Pod đầu được rút, ngân sách về 0. Pod thứ hai bị từ chối, và drain thử lại mỗi 5 giây. Sau ba lần thử, khoảng 15 giây, pod thay của pod đầu đã Ready ở node khác (readiness mất 8 giây), ngân sách hồi về 1, và pod thứ hai được rút. Dòng `error` ở đây không phải lỗi: đó là PDB đang làm việc. Suốt quá trình, service không lúc nào dưới 5 pod khoẻ.
+
+`--ignore-daemonsets` là bắt buộc trên mọi cụm thật: pod của DaemonSet không rút đi đâu được, drain sẽ từ chối chạy nếu thiếu cờ này. Node `worker` giờ `SchedulingDisabled`; nâng cấp hay vá xong thì trả nó về:
+
+<Terminal where="mac">
+
+```bash
+kubectl uncordon k5-lab-worker
+kubectl rollout status deploy/web --timeout=60s | tail -1
+../dem-pod.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k5-lab-worker uncordoned
+deployment "web" successfully rolled out
+zone-a=3 (worker=0, worker2=3)  zone-b=3 (worker3=3)  Pending=0
+```
+
+</Expected>
+
+`worker` quay lại và trống trơn. Một lần nữa, không ai cân lại; sau khi drain lần lượt cả cụm, node được rút cuối cùng thường là node trống nhất.
+
+<Check id="k5.2.lab-drain">Rút được một node với PDB đang bảo vệ service, và giải thích được từng dòng `evicting`, `error … will retry`, `evicted` bằng ngân sách của PDB và thời gian pod thay trở nên Ready.</Check>
+
+### 5. Drain treo vì PDB sai
+
+Một cấu hình hay gặp vì nghe có vẻ an toàn: "lúc nào cũng phải đủ 6 trên 6".
+
+<Terminal where="mac">
+
+```bash
+kubectl patch pdb web --type=merge -p '{"spec":{"maxUnavailable":null,"minAvailable":6}}'
+sleep 2; kubectl get pdb web
+kubectl drain k5-lab-worker2 --ignore-daemonsets --timeout=20s 2>&1 | grep -E '^(node|evicting|error)' | cut -c1-150 | sort | uniq -c
+kubectl get nodes --no-headers | awk '{print $1, $2}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+poddisruptionbudget.policy/web patched
+NAME   MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web    6               N/A               0                     40s
+   4 error when evicting pods/"web-868886d699-hdn8t" -n "k5" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+   1 error when evicting pods/"web-868886d699-hdn8t" -n "k5": global timeout reached: 20s
+   4 error when evicting pods/"web-868886d699-q2fqw" -n "k5" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+   1 error when evicting pods/"web-868886d699-q2fqw" -n "k5": global timeout reached: 20s
+   4 error when evicting pods/"web-868886d699-rcfss" -n "k5" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+   1 error when evicting pods/"web-868886d699-rcfss" -n "k5": global timeout reached: 20s
+   1 error: unable to drain node "k5-lab-worker2" due to error: [error when evicting pods/"web-868886d699-hdn8t" -n "k5": global timeout reached: 20s, erro
+   5 evicting pod k5/web-868886d699-hdn8t
+   5 evicting pod k5/web-868886d699-q2fqw
+   5 evicting pod k5/web-868886d699-rcfss
+   1 node/k5-lab-worker2 cordoned
+k5-lab-control-plane Ready
+k5-lab-worker Ready
+k5-lab-worker2 Ready,SchedulingDisabled
+k5-lab-worker3 Ready
+```
+
+</Expected>
+
+`ALLOWED DISRUPTIONS` bằng 0 là dấu hiệu nhìn thấy trước được: `kubectl get pdb -A` trước mỗi đợt bảo trì, cột đó bằng 0 ở đâu thì drain sẽ treo ở đó. Không có `--timeout`, lệnh chạy mãi; pipeline nâng cấp tự động cũng chờ mãi theo. Chú ý dòng cuối: drain thất bại nhưng node **vẫn bị cordon**. Một đợt nâng cấp bỏ dở để lại các node không nhận pod, và cụm mất dần năng lực mà không ai để ý.
+
+<Predict question="PDB đang có `ALLOWED DISRUPTIONS: 0`. Lệnh `kubectl delete pod` trên một pod của `web` có bị chặn không?">
+
+Không. PDB chỉ đứng ở Eviction API. `delete` là một lời gọi API khác và đi thẳng. Vì thế "drain kẹt thì delete tay cho nhanh" luôn làm được, và luôn bỏ qua đúng sự bảo vệ mà chủ ứng dụng đã khai.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl delete "$(kubectl get pods -l app=web --field-selector spec.nodeName=k5-lab-worker2 -o name | head -1)"
+kubectl get pdb web -o yaml | yq '.status | pick(["currentHealthy", "desiredHealthy", "disruptionsAllowed", "expectedPods"])'
+kubectl patch pdb web --type=merge -p '{"spec":{"minAvailable":null,"maxUnavailable":1}}'
+kubectl drain k5-lab-worker2 --ignore-daemonsets --timeout=90s 2>&1 | tail -1
+kubectl uncordon k5-lab-worker2
+kubectl delete -f web-pdb.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "web-868886d699-hdn8t" deleted from k5 namespace
+currentHealthy: 5
+desiredHealthy: 6
+disruptionsAllowed: 0
+expectedPods: 6
+poddisruptionbudget.policy/web patched
+node/k5-lab-worker2 drained
+node/k5-lab-worker2 uncordoned
+deployment.apps "web" deleted from k5 namespace
+poddisruptionbudget.policy "web" deleted from k5 namespace
+```
+
+</Expected>
+
+Sau lệnh `delete`, số pod khoẻ còn 5 trong khi PDB đòi 6: ngân sách đã bị vi phạm mà không ai hỏi nó. Sửa PDB về `maxUnavailable: 1` thì drain đi qua. Với service nhiều bản sao, `maxUnavailable` theo phần trăm (ví dụ `25%`) bền hơn một con số cố định, vì nó tự theo số bản sao khi autoscaler đổi quy mô (K5.3).
+
+<Check id="k5.2.lab-drain-stuck">Tái hiện được drain treo vì PDB có ngân sách 0, nhận ra node bị bỏ lại ở trạng thái `cordon`, chứng minh được `kubectl delete pod` vượt qua PDB, và sửa PDB để drain chạy được.</Check>
+
+### 6. Priority và preemption
+
+Làm đầy cụm bằng việc nền priority thấp, rồi đưa một pod quan trọng vào. Mỗi pod `nen` xin số CPU của node trừ 1, nên mỗi worker vừa đúng một pod và không còn chỗ cho pod 2 CPU. Biến `ALLOC` đọc số CPU thật của node để lab chạy đúng trên máy có số CPU khác; cần từ 3 CPU trở lên, vì với 2 CPU pod `quan-trong` (xin 2 CPU) không vừa node nào kể cả khi đã đẩy pod `nen` ra.
+
+<Terminal where="mac" title="~/masteva-k5/k5-2/priority.yaml">
+
+```bash
+kubectl get priorityclass
+ALLOC=$(kubectl get node k5-lab-worker -o jsonpath='{.status.allocatable.cpu}')
+echo "mỗi node có $ALLOC CPU, mỗi pod nen xin $((ALLOC - 1))"
+cat > priority.yaml <<EOF
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: { name: thap }
+value: 100
+description: "Việc nền, bị đẩy ra trước"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: { name: cao }
+value: 100000
+description: "Service phục vụ người dùng"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: { name: cao-khong-chen }
+value: 100000
+preemptionPolicy: Never
+description: "Đứng trước trong hàng đợi nhưng không đẩy pod khác"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: nen }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: nen }
+  template:
+    metadata:
+      labels: { app: nen }
+    spec:
+      priorityClassName: thap
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10.1
+          resources:
+            requests: { cpu: "$((ALLOC - 1))", memory: 64Mi }
+EOF
+kubectl apply -f priority.yaml && kubectl rollout status deploy/nen --timeout=90s | tail -1
+kubectl get pods -o custom-columns=NAME:.metadata.name,PRIORITY:.spec.priority,STATUS:.status.phase,NODE:.spec.nodeName
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME                      VALUE        GLOBAL-DEFAULT   AGE     PREEMPTIONPOLICY
+system-cluster-critical   2000000000   false            7m38s   PreemptLowerPriority
+system-node-critical      2000001000   false            7m38s   PreemptLowerPriority
+mỗi node có 6 CPU, mỗi pod nen xin 5
+priorityclass.scheduling.k8s.io/thap created
+priorityclass.scheduling.k8s.io/cao created
+priorityclass.scheduling.k8s.io/cao-khong-chen created
+deployment.apps/nen created
+deployment "nen" successfully rolled out
+NAME                   PRIORITY   STATUS    NODE
+nen-799bbbc454-94qlm   100        Running   k5-lab-worker3
+nen-799bbbc454-984p8   100        Running   k5-lab-worker2
+nen-799bbbc454-cnl2s   100        Running   k5-lab-worker
+```
+
+</Expected>
+
+Trước tiên, pod quan trọng dùng class **không** chiếm chỗ:
+
+<Terminal where="mac" title="~/masteva-k5/k5-2/quan-trong.yaml">
+
+```bash
+cat > quan-trong.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: quan-trong
+spec:
+  priorityClassName: cao-khong-chen
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: app
+      image: registry.k8s.io/pause:3.10.1
+      resources:
+        requests: { cpu: "2", memory: 64Mi }
+EOF
+kubectl apply -f quan-trong.yaml && sleep 5
+kubectl get pod quan-trong -o custom-columns=NAME:.metadata.name,PRIORITY:.spec.priority,STATUS:.status.phase
+kubectl events --for pod/quan-trong | cut -c1-200
+kubectl delete pod quan-trong
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/quan-trong created
+NAME         PRIORITY   STATUS
+quan-trong   100000     Pending
+LAST SEEN   TYPE      REASON             OBJECT           MESSAGE
+5s          Warning   FailedScheduling   Pod/quan-trong   0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient cpu. preemption: not eligible due to preemptionPolicy=Never.
+pod "quan-trong" deleted from k5 namespace
+```
+
+</Expected>
+
+Priority 100000 nhưng vẫn `Pending`, và event nói rõ lý do: `preemptionPolicy=Never`. Class kiểu này hợp cho việc muốn được chạy sớm nhất khi có chỗ mà không được phép phá việc khác, ví dụ job phân tích dữ liệu.
+
+Giờ bảo vệ việc nền bằng một PDB không cho vắng pod nào, rồi tạo lại pod quan trọng với class `cao`.
+
+<Predict question="Ba pod `nen` có PDB `maxUnavailable: 0`. Pod `quan-trong` (class `cao`, cần 2 CPU) không vừa node nào. PDB có cứu được pod `nen` không?">
+
+Không. Scheduler ưu tiên phương án không vi phạm PDB, nhưng ở đây node nào cũng chỉ có nạn nhân được PDB che, nên nó vẫn chọn một node và xoá pod `nen` trên đó. Preemption không đi qua Eviction API. Tài liệu Kubernetes gọi đây là "supported, but not guaranteed".
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl create pdb nen --selector=app=nen --max-unavailable=0
+sleep 2; kubectl get pdb nen
+sed 's/cao-khong-chen/cao/' quan-trong.yaml | kubectl apply -f -
+kubectl wait --for=condition=Ready pod/quan-trong --timeout=60s
+kubectl get pods -o custom-columns=NAME:.metadata.name,PRIORITY:.spec.priority,STATUS:.status.phase,NODE:.spec.nodeName
+kubectl events | grep -E 'Preempted|potential placement' | cut -c1-220
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+poddisruptionbudget.policy/nen created
+NAME   MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+nen    N/A             0                 0                     2s
+pod/quan-trong created
+pod/quan-trong condition met
+NAME                   PRIORITY   STATUS    NODE
+nen-799bbbc454-94qlm   100        Running   k5-lab-worker3
+nen-799bbbc454-984p8   100        Running   k5-lab-worker2
+nen-799bbbc454-r8hhc   100        Pending   <none>
+quan-trong             100000     Running   k5-lab-worker
+1s                       Normal    Preempted              Pod/nen-799bbbc454-cnl2s       Preempted by pod e6417147-6d9b-42da-8a6a-9a6bb3dae9dd on node k5-lab-worker
+1s                       Warning   FailedScheduling       Pod/quan-trong                 0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient cpu. preemption: found a potential placement for pod on
+```
+
+</Expected>
+
+Trong vài giây: scheduler tìm thấy chỗ trên `worker` nếu bỏ 1 nạn nhân, pod `nen` ở đó nhận event `Preempted`, và `quan-trong` chạy trên node ấy. Deployment `nen` tạo pod thay (`r8hhc`), pod này `Pending` vì cụm hết chỗ; nó có priority 100 nên không đẩy được ai. Node nào bị chọn là tuỳ scheduler, máy bạn có thể khác; pod nạn nhân cũng có thể còn hiện một hai giây với trạng thái `Succeeded` trước khi biến mất khỏi danh sách.
+
+Đây cũng chính là cơ chế của sự cố Grafana: thay pod `quan-trong` bằng một Deployment lớn có priority cao hơn workload đang chạy, và từng pod của workload đó bị đẩy ra, lần lượt, không có PDB nào cản được.
+
+<Check id="k5.2.lab-preemption">Tái hiện được pod priority cao `Pending` với `preemptionPolicy: Never` và chiếm chỗ với chính sách mặc định, đọc được event ở cả hai phía, và chứng minh được PDB không chặn preemption.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Pod `Pending`, event có `didn't match pod topology spread constraints` | Một vùng không nhận được pod (cordon, taint, đầy) nhưng vẫn được tính; hoặc `minDomains` lớn hơn số vùng | `../dem-pod.sh`; `kubectl get nodes -L topology.kubernetes.io/zone` |
+| Phân bố lệch dù có `DoNotSchedule` | Rollout hoặc scale-down sau khi xếp; thiếu `matchLabelKeys` | `../dem-pod.sh` sau rollout; `kubectl rollout restart` để cân lại |
+| `drain` lặp `Cannot evict pod` | PDB có `ALLOWED DISRUPTIONS` 0 | `kubectl get pdb -A`; `kubectl get pdb <tên> -o yaml` xem `status` |
+| `drain` báo `cannot delete DaemonSet-managed Pods` | Thiếu `--ignore-daemonsets` | Thêm cờ |
+| `drain` báo `cannot delete Pods with local storage` | Pod dùng `emptyDir`; drain không chắc dữ liệu đó bỏ được | Thêm `--delete-emptydir-data` khi biết dữ liệu là tạm |
+| Pod thường `Pending` sau lab | Còn pod `nen` giữ gần hết CPU, hoặc còn node `cordon` | `kubectl get deploy -A`; `kubectl get nodes` |
+| Pod của mình bị xoá, event `Preempted` | Pod priority cao hơn cần chỗ | `kubectl get pods -A -o custom-columns=NAME:.metadata.name,PRIO:.spec.priority` |
+
+### Dọn dẹp
+
+K5.3 dùng tiếp cụm này. Xoá những gì bài này tạo, kể cả ba PriorityClass (chúng thuộc cấp cụm, không nằm trong namespace nào):
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K5.3">
+
+```bash
+kubectl delete pod quan-trong
+kubectl delete pdb nen
+kubectl delete -f priority.yaml
+kubectl wait --for=delete pod -l app=nen --timeout=60s
+kubectl get nodes --no-headers | awk '{print $1, $2}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "quan-trong" deleted from k5 namespace
+poddisruptionbudget.policy "nen" deleted from k5 namespace
+priorityclass.scheduling.k8s.io "thap" deleted
+priorityclass.scheduling.k8s.io "cao" deleted
+priorityclass.scheduling.k8s.io "cao-khong-chen" deleted
+deployment.apps "nen" deleted from k5 namespace
+pod/nen-799bbbc454-94qlm condition met
+pod/nen-799bbbc454-984p8 condition met
+pod/nen-799bbbc454-r8hhc condition met
+k5-lab-control-plane Ready
+k5-lab-worker Ready
+k5-lab-worker2 Ready
+k5-lab-worker3 Ready
+```
+
+</Expected>
+
+Không node nào còn `SchedulingDisabled`. Nếu dừng hẳn ở đây, xoá cụm bằng khối lệnh cuối bài K5.1.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao rút node duy nhất của một zone lại treo khi có `DoNotSchedule` và PDB?">
+
+Ghép hai cơ chế của bài lại. Service chia 3 | 3 với `maxSkew: 1`, `DoNotSchedule`, và PDB `maxUnavailable: 1`. Rút `worker3`, node duy nhất của `zone-b`: pod đầu tiên được evict, còn 3 | 2. Pod thay không thể vào `zone-a` (sẽ thành 4 | 2, skew 2) và không thể vào `zone-b` (node đang cordon), nên `Pending`. Ngân sách của PDB không hồi, hai pod còn lại không rút được, drain treo. Khi soạn bài, thử thêm tổ hợp này cho đúng kết quả đó: 1 pod evicted, 1 pod `Pending`, 2 pod kẹt lại, `ALLOWED DISRUPTIONS: 0`.
+
+Không cấu hình nào trong hai cái sai khi đứng riêng. Cách tránh: mỗi zone có ít nhất hai node; hoặc dùng `ScheduleAnyway` cho ràng buộc theo zone và chấp nhận lệch tạm; hoặc thêm `nodeTaintsPolicy: Honor` để node đang cordon không còn được tính là vùng. Khi thử thêm trường này, cùng lần drain đó đi qua: cả sáu pod dồn về `zone-a` cho tới khi `worker3` quay lại.
+
+</Reveal>
+
+<Reveal title="Nên đặt PDB bao nhiêu cho một service?">
+
+Bắt đầu từ câu hỏi: service chịu được mất bao nhiêu pod cùng lúc mà vẫn đủ năng lực? Nếu 6 pod chạy ở 50% tải thì mất 2 pod vẫn ổn, PDB `maxUnavailable: 2` hoặc `33%`. PDB chặt hơn mức cần chỉ làm bảo trì chậm đi; PDB bằng 0 là chặn bảo trì. Ba quy tắc thực dụng: service một bản sao thì đừng tạo PDB, hãy chấp nhận gián đoạn ngắn hoặc tăng lên hai bản sao; dùng phần trăm khi số bản sao do autoscaler quyết định; và thêm `unhealthyPodEvictionPolicy: AlwaysAllow` để một ứng dụng đang hỏng không chặn việc rút node (khi soạn bài, thử thêm một Deployment có probe luôn thất bại: drain treo với chính sách mặc định, và đi qua ngay khi đổi sang `AlwaysAllow`).
+
+</Reveal>
+
+<Reveal title="Pod bị preempt có được tắt êm không?">
+
+Có. Nạn nhân nhận `SIGTERM` và được chờ hết `terminationGracePeriodSeconds` của nó như mọi lần xoá khác (K1.3). Hệ quả là pod priority cao phải chờ đúng khoảng đó: nạn nhân có grace period 10 phút thì pod quan trọng `Pending` thêm tới 10 phút, với `status.nominatedNodeName` đã ghi sẵn. Chỗ được nhường cũng không được giữ riêng: nếu trong lúc chờ có pod priority còn cao hơn xuất hiện, nó có thể lấy chỗ đó. Vì vậy workload priority thấp nên có grace period ngắn, và phải chịu được việc bị cắt ngang; K1.4 đã nói việc trong Job phải idempotent vì lý do tương tự.
+
+</Reveal>
+
+<Reveal title="Nên có bao nhiêu PriorityClass, và ai được dùng class cao?">
+
+Ít. Ba hoặc bốn mức là đủ cho hầu hết tổ chức: hạ tầng dùng chung (ingress, DNS, agent quan sát), service phục vụ người dùng, service nội bộ, việc nền. Nhiều mức hơn thì không ai nhớ được mức nào đẩy được mức nào. Vấn đề thật là kiểm soát: mặc định, ai tạo được pod cũng ghi được `priorityClassName` bất kỳ, kể cả class cao nhất, và từ đó đẩy được pod của đội khác. ResourceQuota có `scopeSelector` theo PriorityClass (K5.5) chỉ giải quyết một nửa: nó giới hạn số pod dùng class `cao` **trong namespace có quota đó**; namespace không có quota nào cho class ấy vẫn tạo pod dùng nó thoải mái. Muốn mặc định là cấm, API server phải được cấu hình `limitedResources` của plugin admission ResourceQuota cho scope `PriorityClass` (khi đó chỉ namespace có quota khớp mới tạo được pod dùng class này), hoặc dùng một chính sách admission từ chối `priorityClassName` ngoài danh sách cho phép. Cả hai là cấu hình admission của cụm, thuộc K8.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết PDB và topology spread đúng cú pháp, và hay sai ở con số. Chỗ cần soát: (1) PDB `minAvailable` bằng đúng `replicas`, hoặc PDB cho Deployment một bản sao; (2) topology spread thiếu `matchLabelKeys`, và `labelSelector` không khớp label của pod nên ràng buộc không đếm được gì; (3) `whenUnsatisfiable: DoNotSchedule` theo zone cho cụm chỉ có một node mỗi zone; (4) đề xuất `globalDefault: true` cho một class mới trên cụm đang chạy; (5) "sửa" drain kẹt bằng `--force --disable-eviction`, tức bỏ qua PDB. Kiểm bằng lab: sau khi apply, chạy `kubectl get pdb` xem `ALLOWED DISRUPTIONS`, đếm pod theo zone sau một lần rollout, và thử `kubectl drain --dry-run=server` trên một node.
+
+</Callout>
+
+<Callout kind="link">
+
+K5.1 là nền: vòng lọc, chấm điểm, taint và `cordon`. K1.1 dạy `maxSurge`, `maxUnavailable` của rollout, thứ hoạt động độc lập với PDB; K1.3 dạy trình tự tắt êm mà cả eviction lẫn preemption đều dùng. K4 dùng `drain` trong quy trình nâng cấp và vá node. K5.4: cluster autoscaler tôn trọng PDB khi gỡ node, và dùng pod `Pending` làm tín hiệu thêm node. K5.5 dạy ResourceQuota, gồm quota theo scope PriorityClass và chỗ nó dừng lại; K8 dạy chính sách admission để chặn hẳn việc dùng một PriorityClass. D21 bàn về failure domain ở tầm kiến trúc.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k5.2.mastery-spread">Viết được topology spread constraints cho một service chạy trên ba zone, chọn `DoNotSchedule` hay `ScheduleAnyway` có lý do, và kiểm được phân bố sau một lần rollout.</Check>
+
+<Check id="k5.2.mastery-pdb">Trước một đợt nâng cấp node, rà được PDB của cả cụm, chỉ ra workload nào sẽ làm `drain` treo và vì sao, và đề xuất được con số PDB hợp lý cho từng cái.</Check>
+
+<Check id="k5.2.mastery-priority">Thiết kế được một bộ PriorityClass cho một cụm dùng chung, nêu được cách đưa nó vào cụm đang chạy mà không lặp lại sự cố của Grafana, và giải thích được vì sao PDB không bảo vệ khỏi preemption.</Check>
+
+</Mastery>

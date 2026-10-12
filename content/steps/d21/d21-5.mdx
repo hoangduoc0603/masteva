@@ -1,0 +1,779 @@
+---
+title: "CDN và WAF"
+description: Dựng một tầng cache Nginx trước origin để thấy cache key, TTL và Cache-Control quyết định HIT hay MISS, làm mới nội dung trước hạn, phục vụ bản cũ khi origin chết và chặn đàn request dội về origin; rồi bật ModSecurity với OWASP CRS từ chế độ chỉ ghi nhận tới chặn thật, gặp false positive và viết luật loại trừ.
+id: d21.5
+step: d21
+prerequisites: [d21.1]
+topics: [d21.cdn-waf]
+status: verified
+verified:
+  date: 2026-10-11
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    nginx: 1.28.3
+    libmodsecurity: 3.0.14
+    modsecurity-crs: 3.3.8
+    jq: 1.8.1
+    python: 3.14.4
+    curl: 8.18.0
+---
+
+<Goal>
+
+Trước các proxy của ba bài vừa rồi thường còn hai lớp nữa: một lớp trả nội dung thay cho bạn (CDN) và một lớp lọc request độc hại (WAF). Bạn hiếm khi tự xây CDN, nhưng phải hiểu nó đủ để không cache nhầm trang cá nhân của người dùng hay tự gây sự cố bằng một luật WAF. Học xong bài này, bạn giải thích được:
+
+- Vì sao cùng một URL lúc thì `HIT` lúc thì `MISS`, và header nào của origin quyết định chuyện đó.
+- Vì sao thêm `?utm_source=...` vào link làm tỉ lệ cache tụt, và vì sao trang có `Set-Cookie` không được cache.
+- Vì sao sửa file trên origin rồi người dùng vẫn thấy bản cũ, và ba cách xử lý.
+- Vì sao một object hết hạn có thể kéo theo hàng nghìn request cùng dội về origin, và origin shield giải quyết gì.
+- Vì sao WAF phải chạy ở chế độ chỉ ghi nhận trước khi chặn, và sửa false positive mà không tắt cả bộ luật.
+
+</Goal>
+
+<Knowledge>
+
+### CDN là một tầng cache đặt gần người dùng
+
+**CDN** (content delivery network) là hàng trăm cụm máy (PoP) rải khắp thế giới, mỗi cụm là một reverse proxy có cache. Người dùng ở Đà Nẵng được dẫn (bằng DNS hoặc anycast) tới PoP gần nhất; PoP trả nội dung từ cache nếu có, không thì lấy từ **origin** (máy chủ của bạn), trả cho người dùng và giữ lại một bản.
+
+```text
+ người dùng ──► PoP gần nhất (edge) ──có trong cache, còn hạn──► trả ngay            HIT
+                      │
+                      └─ không có / hết hạn ──► [origin shield] ──► origin           MISS, EXPIRED
+                                                 một tầng cache chung              rồi lưu vào cache
+                                                 đứng trước origin
+```
+
+Ba thứ CDN mang lại: độ trễ thấp (bắt tay TCP và TLS với máy ở gần), origin nhẹ tải (phần lớn request không tới nơi), và một lớp đệm hấp thụ đột biến lẫn tấn công. Bài này mô phỏng một PoP bằng `proxy_cache` của Nginx; cơ chế quyết định cache giống nhau ở mọi CDN vì cùng theo chuẩn HTTP caching (RFC 9111).
+
+Origin điều khiển cache bằng header **`Cache-Control`** của response:
+
+| Giá trị | Trình duyệt | Cache dùng chung (CDN, proxy) |
+|---|---|---|
+| `max-age=N` | Giữ N giây | Giữ N giây |
+| `s-maxage=N` | Bỏ qua | Giữ N giây (ưu tiên hơn `max-age`) |
+| `public` | Được giữ | Được giữ, kể cả response cho request có `Authorization` |
+| `private` | Được giữ | **Không** được giữ: nội dung riêng của một người |
+| `no-store` | Không giữ | Không giữ |
+| `no-cache` | Giữ, nhưng phải hỏi lại origin trước mỗi lần dùng | Như trình duyệt |
+| `stale-while-revalidate=N`, `stale-if-error=N` | Cho phép dùng bản đã hết hạn trong lúc đang làm mới, hoặc khi origin lỗi (RFC 5861) | Như trình duyệt |
+
+"Hỏi lại" là request có điều kiện: cache gửi `If-None-Match` kèm `ETag` của bản nó giữ, origin trả `304 Not Modified` không kèm thân nếu chưa đổi. Trạng thái cache của một request trong Nginx (`$upstream_cache_status`; CDN nào cũng có header tương tự):
+
+| Trạng thái | Nghĩa |
+|---|---|
+| `MISS` | Chưa có trong cache, lấy từ origin |
+| `HIT` | Trả từ cache, origin không biết gì |
+| `EXPIRED` | Có nhưng hết hạn, lấy lại từ origin |
+| `STALE`, `UPDATING` | Trả bản hết hạn vì origin lỗi, hoặc vì có request khác đang làm mới |
+| `BYPASS` | Cấu hình yêu cầu bỏ qua cache cho request này |
+
+<Check id="d21.5.cache-control">Kể được đường đi của một request qua CDN, và nói được `max-age`, `s-maxage`, `private`, `no-store`, `no-cache` tác động thế nào tới trình duyệt và tới cache dùng chung.</Check>
+
+### Cache key, làm mới và bảo vệ origin
+
+**Cache key** là thứ định danh một object trong cache, mặc định gồm host và URL **kể cả query string**. Hai hệ quả ngược chiều:
+
+- `/app.js?v=1` và `/app.js?v=2` là hai object: đổi tham số là có ngay bản mới. Đây là nền của kỹ thuật đặt phiên bản vào URL.
+- `/logo.png?utm_source=zalo` và `/logo.png?utm_source=facebook` cũng là hai object dù nội dung y hệt. Tham số theo dõi làm cache phân mảnh, tỉ lệ `HIT` tụt. CDN cho cấu hình bỏ qua hoặc sắp xếp tham số khi tạo key.
+
+Nguy hiểm hơn là cache thứ **không được** cache. Một trang cá nhân bị cache theo URL sẽ được trả cho người dùng tiếp theo. Hai lớp phòng: origin luôn gửi `private` hoặc `no-store` cho nội dung theo người dùng, và tầng cache từ chối những dấu hiệu rõ ràng (Nginx mặc định không cache response có `Set-Cookie`, và chỉ cache `GET`, `HEAD`). Header `Vary` của response thêm header của request vào key (`Vary: Accept-Encoding`); `Vary: Cookie` hay `Vary: User-Agent` thì gần như vô hiệu cache.
+
+Khi nội dung đổi trước khi hết TTL, có ba cách, xếp theo mức nên dùng:
+
+| Cách | Làm thế nào | Hợp với |
+|---|---|---|
+| Phiên bản trong URL | `app.3f9a1c.js` kèm `max-age=31536000, immutable`; HTML trỏ sang tên mới | File tĩnh do công cụ build sinh ra. Không bao giờ phải purge |
+| TTL ngắn, dùng bản cũ khi đang làm mới | `max-age=60, stale-while-revalidate=600` | HTML, API công khai |
+| Purge | Gọi API của CDN xoá theo URL, theo nhãn (surrogate key, cache tag), hoặc xoá hết | Sửa gấp nội dung sai. Purge toàn bộ là dội cả lượng traffic về origin |
+
+Cuối cùng là bảo vệ origin. Khi một object nóng hết hạn, mọi request tới trong lúc nó đang được làm mới đều là `EXPIRED` và cùng đi về origin: **cache stampede**. Với 200 PoP độc lập, chuyện này xảy ra 200 lần cho mỗi object. Ba cơ chế chống:
+
+- **Gộp request** (`proxy_cache_lock`): chỉ một request đi lấy object chưa có, số còn lại chờ kết quả.
+- **Dùng bản cũ trong lúc làm mới** (`proxy_cache_use_stale updating`): một request đi làm mới, số còn lại nhận ngay bản cũ.
+- **Origin shield:** một tầng cache chung đứng giữa các PoP và origin. 200 PoP hỏi shield, shield hỏi origin một lần.
+
+Cùng họ với chúng là **dùng bản cũ khi origin lỗi** (`proxy_cache_use_stale error timeout http_5xx`): origin sập thì người dùng vẫn nhận được trang cũ thay vì `502`.
+
+<Check id="d21.5.cache-key-purge">Giải thích được cache key gồm gì và hai cách nó gây hại (phân mảnh, cache nhầm nội dung riêng), chọn được cách làm mới nội dung cho file tĩnh và cho HTML, và nói được cache stampede là gì cùng ba cơ chế chống.</Check>
+
+### WAF và OWASP CRS
+
+**WAF** (web application firewall) đọc từng request HTTP (URL, header, thân) và chặn những request khớp mẫu tấn công: SQL injection, XSS, đọc file hệ thống, chèn lệnh. Nó là lớp phòng thủ bổ sung: lỗi SQL injection được sửa ở code bằng câu truy vấn có tham số, WAF chặn bớt trong lúc lỗi chưa được vá và chặn phần lớn công cụ quét tự động.
+
+**OWASP CRS** (Core Rule Set) là bộ luật mở mà hầu hết WAF dùng hoặc mô phỏng theo. Động cơ chạy luật trong bài là **ModSecurity 3** (dự án của OWASP từ 2024) gắn vào Nginx; **Coraza** là động cơ viết bằng Go đọc cùng cú pháp luật, gắn được vào Caddy, HAProxy, Envoy (D9.6). Ba khái niệm của CRS:
+
+- **Chấm điểm bất thường (anomaly scoring).** Một luật khớp không chặn ngay mà cộng điểm (mức nghiêm trọng nhất là 5). Cuối cùng, luật `949110` so tổng điểm với ngưỡng (mặc định 5) và mới quyết định chặn. Nhờ vậy bạn nới được ngưỡng trong lúc tinh chỉnh.
+- **Paranoia level** 1 tới 4. Mức 1 (mặc định) ít báo nhầm; mức cao bật thêm luật chặt hơn và báo nhầm nhiều hơn hẳn. Lên mức 2 trở đi cần người tinh chỉnh liên tục.
+- **Hai chế độ:** `DetectionOnly` chỉ ghi log những gì lẽ ra bị chặn; `On` chặn thật (`403`).
+
+**False positive** là request hợp lệ bị coi là tấn công, và là lý do chính khiến WAF bị tắt sau vài tuần: người viết bài dán một đoạn HTML, khách hàng có tên chứa dấu nháy, API nhận JSON có đoạn giống SQL. Quy trình triển khai đúng: chạy `DetectionOnly` trên traffic thật vài tuần, đọc log, viết **luật loại trừ hẹp nhất có thể** (bỏ một nhóm luật cho một tham số ở một đường dẫn), rồi mới bật `On`. Tắt cả một luật trên toàn site vì một trang báo nhầm là mở lại lỗ cho mọi trang khác.
+
+<Callout kind="production">
+
+Ngày 05/12/2025, Cloudflare trả lỗi `500` cho một phần khách hàng trong khoảng 25 phút, ảnh hưởng chừng 28% lưu lượng HTTP họ phục vụ, và nguyên nhân nằm ở chính tầng WAF. Theo [bản tường trình](https://blog.cloudflare.com/5-december-2025-outage/), để che cho khách hàng trước một lỗ hổng nghiêm trọng của React Server Components, họ tăng bộ đệm mà WAF dùng để đọc thân request từ 128 KB lên 1 MB; thay đổi này đi qua hệ thống triển khai dần. Giữa chừng, họ thấy công cụ kiểm thử luật WAF nội bộ không hỗ trợ kích thước mới và quyết định tắt nó bằng một thay đổi thứ hai, lần này qua hệ thống cấu hình toàn cầu, thứ không triển khai dần mà lan tới toàn bộ máy chủ trong vài giây. Thay đổi đó chạm vào một lỗi đã nằm trong module xử lý luật nhiều năm, và mọi request của khách hàng dùng thế hệ proxy cũ có bật bộ luật được quản lý đều nhận `500`. Trong các việc họ cam kết làm có đưa cấu hình ra từng phần kèm kiểm tra sức khoẻ như với code, và thay kiểu hỏng "hard-fail" bằng "fail-open" ở tầng xử lý request. Điều rút ra, theo cách đọc của bài này: WAF nằm trên đường đi của **mọi** request, nên bất kỳ thay đổi nào của nó, kể cả "chỉ tắt một công cụ thử nghiệm", là một lần deploy vào đường nóng nhất của hệ thống. Chế độ chỉ ghi nhận ở bước 5 giúp bạn tìm false positive; nó không bảo vệ bạn khỏi một luật hay một cấu hình làm hỏng chính động cơ WAF. Việc đó cần triển khai từng phần và một cách gỡ nhanh. (D3.2 kể vụ ngừng dịch vụ năm 2019 của cùng hệ thống ở góc biểu thức chính quy.)
+
+</Callout>
+
+<Check id="d21.5.waf">Giải thích được chấm điểm bất thường, paranoia level và hai chế độ của WAF; mô tả được quy trình đưa WAF vào production mà không chặn nhầm người dùng; và nói được vì sao WAF không thay được việc sửa lỗi trong code.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [RFC 9111: HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111): mục 3 (khi nào được lưu), mục 4 (khi nào được dùng lại) và mục 5.2 (các chỉ thị `Cache-Control`).
+- [nginx: Module ngx_http_proxy_module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html): các directive `proxy_cache_*` dùng trong bài, đặc biệt `proxy_cache_use_stale`, `proxy_cache_lock`, `proxy_cache_bypass`.
+- [OWASP CRS: Anomaly Scoring](https://coreruleset.org/docs/2-how-crs-works/2-1-anomaly_scoring/) và [False Positives and Tuning](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/): cách bộ luật chấm điểm và cách viết luật loại trừ. Tài liệu mô tả CRS 4.x.
+- [Cloudflare outage on December 5, 2025](https://blog.cloudflare.com/5-december-2025-outage/): một thay đổi cấu hình ở tầng WAF làm lỗi 28% lưu lượng, và những gì họ thay đổi sau đó; nguồn của callout trong bài.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM Lima (2 CPU, 2 GiB) có `~/masteva-d21/topo.sh` của D9.1. Lab chạy một Nginx có ModSecurity và một origin Python, tốn khoảng 150 MB. Máy 8 GB không cần thu gọn.
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y nginx libnginx-mod-http-modsecurity modsecurity-crs jq curl
+sudo systemctl disable --now nginx
+sudo ~/masteva-d21/topo.sh up
+mkdir -p ~/masteva-d21/cdn/waf && cd ~/masteva-d21/cdn
+echo '10.9.0.11 shop.lab.internal # masteva-d21' | sudo tee -a /etc/hosts >/dev/null
+dpkg-query -W -f '${Package} ${Version}\n' libmodsecurity3t64 modsecurity-crs
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+libmodsecurity3t64 3.0.14-1build2
+modsecurity-crs 3.3.8-1
+```
+
+</Expected>
+
+Ubuntu 26.04 đóng gói CRS 3.3, nhánh mà [chính sách bảo mật của dự án](https://github.com/coreruleset/coreruleset/security/policy) ghi là hết hỗ trợ từ quý 3/2026; các nhánh còn được vá là 4.x (bản mới nhất và bản LTS 4.25, tới quý 3/2027). Lab dùng 3.3 chỉ để học khái niệm (chấm điểm, paranoia level, loại trừ), vốn giữ nguyên ở 4.x; trên production hãy cài 4.x từ trang phát hành của CRS. Lưu ý khi đọc tài liệu ở coreruleset.org: nó mô tả 4.x, nơi các gói loại trừ dựng sẵn cho từng ứng dụng đã tách ra thành plugin.
+
+```text
+ VM (client) ──► lb1 10.9.0.11  shop.lab.internal        ──► web1 10.9.0.21:8080  origin.py
+                 Nginx: WAF (bước 5) rồi cache (bước 1)
+```
+
+Origin trả mỗi đường dẫn một kiểu `Cache-Control`, và ghi vào thân response đây là lần thứ mấy **origin** phải trả đường dẫn đó, để nhìn là biết response tới từ cache hay từ origin:
+
+<Terminal where="vm" title="~/masteva-d21/cdn/origin.py">
+
+```bash
+cat > origin.py <<'EOF'
+#!/usr/bin/env python3
+"""Origin của lab D9.5. Cách chạy: origin.py <ip> [port]
+Thân response ghi: phiên bản nội dung (đọc từ version.txt cạnh script), origin nào trả,
+và đây là lần thứ mấy origin phải trả đường dẫn đó."""
+import collections
+import http.server
+import os
+import sys
+import time
+
+IP = sys.argv[1]
+PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+HERE = os.path.dirname(os.path.abspath(__file__))
+HITS = collections.Counter()
+RULES = {                       # đường dẫn -> (Cache-Control, header thêm)
+    "/static/app.js": ("public, max-age=5", {}),
+    "/static/logo":   ("public, max-age=3600", {}),
+    "/api/time":      ("no-store", {}),
+    "/profile":       ("private, max-age=60", {}),
+    "/login":         ("public, max-age=60", {"Set-Cookie": "sid=abc123; HttpOnly"}),
+    "/report":        ("public, max-age=5", {}),      # chậm: mất 2 giây để tạo
+}                               # đường dẫn khác: không có Cache-Control
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/hits":
+            text = " ".join(f"{k}={v}" for k, v in sorted(HITS.items()))
+            cc, extra = "no-store", {}
+        else:
+            HITS[path] += 1
+            if path == "/report":
+                time.sleep(2)
+            version = open(os.path.join(HERE, "version.txt")).read().strip()
+            text = f"{self.path} noi dung={version} origin={IP} lan={HITS[path]}"
+            cc, extra = RULES.get(path, (None, {}))
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        body = (text + "\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if cc:
+            self.send_header("Cache-Control", cc)
+        for k, v in extra.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_POST = do_GET
+
+    def log_message(self, fmt, *args):
+        pass
+
+class Server(http.server.ThreadingHTTPServer):
+    request_queue_size = 128
+
+Server((IP, PORT), Handler).serve_forever()
+EOF
+echo v1 > version.txt
+```
+
+</Terminal>
+
+Các hàm của bài. `get` in ba thứ cho mỗi request: mã trả về, trạng thái cache (header `X-Cache`), và dòng thân của origin. `origin` chạy origin trong namespace `web<n>`; `hits` hỏi thẳng origin đã phải trả mỗi đường dẫn bao nhiêu lần.
+
+<Terminal where="vm" title="~/masteva-d21/cdn/cdn.sh">
+
+```bash
+cat > cdn.sh <<'EOF'
+# Hàm của lab D9.5. Nạp bằng: . ~/masteva-d21/cdn/cdn.sh
+C=$HOME/masteva-d21/cdn
+E=http://shop.lab.internal
+ngx() { sudo ip netns exec lb1 nginx -c "$C/nginx.conf" "$@"; }
+reload() { ngx -t 2>&1 | grep -E 'emerg|failed'; ngx -s reload 2>/dev/null; sleep "${1:-1}"; }
+origin() { sudo ip netns exec "web$1" python3 "$C/origin.py" "10.9.0.2$1" >/dev/null 2>&1 & }
+hits() { curl -s http://10.9.0.21:8080/hits; }
+get() {
+  curl -s -D - "$@" | tr -d '\r' | awk '
+    NR == 1 { s = $2 } tolower($1) == "x-cache:" { c = $2 } /noi dung=/ { b = $0 }
+    END { printf "%s %s %s\n", s, c, b }'
+}
+keys() { sudo grep -a -h -m1 '^KEY' -r /var/cache/masteva-d21-edge | sort; }
+wafl() {   # wafl [n]: n giao dịch cuối trong audit log của WAF, kèm các luật đã khớp
+  sudo tail -n "${1:-1}" /var/log/masteva-d21/audit.log | jq -r '.transaction |
+    "\(.request.method) \(.request.uri | .[0:44]) -> \(.response.http_code)",
+    (.messages[] | "  \(.details.ruleId) \(.message)")'
+}
+EOF
+. ./cdn.sh
+origin 1; sleep 1; curl -s http://10.9.0.21:8080/static/app.js; hits
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/static/app.js noi dung=v1 origin=10.9.0.21 lan=1
+/static/app.js=1
+```
+
+</Expected>
+
+### 1. Một tầng cache trước origin
+
+Cấu hình chính `include` ba file phụ để các bước sau thêm dòng vào mà không phải sửa file chính. `proxy_cache_path` khai báo nơi lưu (trên đĩa) và một vùng nhớ dùng chung tên `edge` giữ chỉ mục.
+
+<Terminal where="vm" title="~/masteva-d21/cdn/nginx.conf">
+
+```bash
+touch modules.conf server-extra.conf cache-extra.conf
+cat > nginx.conf <<'EOF'
+include LAB/cdn/modules.conf;
+user www-data;
+worker_processes 1;
+pid LAB/cdn/nginx.pid;
+error_log LAB/cdn/error.log warn;
+events { worker_connections 1024; }
+
+http {
+  access_log off;
+  proxy_cache_path /var/cache/masteva-d21-edge levels=1:2 keys_zone=edge:10m
+                   max_size=100m inactive=10m use_temp_path=off;
+
+  server {
+    listen 10.9.0.11:80;
+    server_name shop.lab.internal;
+    include LAB/cdn/server-extra.conf;
+
+    location / {
+      proxy_pass http://10.9.0.21:8080;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header Host $host;
+
+      proxy_cache edge;
+      proxy_cache_key $scheme$host$request_uri;
+      add_header X-Cache $upstream_cache_status always;
+      include LAB/cdn/cache-extra.conf;
+    }
+  }
+}
+EOF
+sed -i "s#LAB#$HOME/masteva-d21#g" nginx.conf
+ngx -t 2>&1 | tail -1 | cut -d' ' -f5-; ngx; sleep 1
+get $E/static/app.js; get $E/static/app.js
+sleep 6
+get $E/static/app.js; get $E/static/app.js
+```
+
+</Terminal>
+
+<Predict question="Origin gửi max-age=5 cho /static/app.js. Bốn request: hai cái liền nhau, chờ 6 giây, hai cái nữa. Cái nào tới được origin?">
+
+```text
+test is successful
+200 MISS /static/app.js noi dung=v1 origin=10.9.0.21 lan=2
+200 HIT /static/app.js noi dung=v1 origin=10.9.0.21 lan=2
+200 EXPIRED /static/app.js noi dung=v1 origin=10.9.0.21 lan=3
+200 HIT /static/app.js noi dung=v1 origin=10.9.0.21 lan=3
+```
+
+Request thứ nhất và thứ ba. `MISS`: chưa có, lấy từ origin (lần 2; lần 1 là lệnh `curl` gọi thẳng lúc nãy) rồi lưu. `HIT`: trả từ cache, thân vẫn ghi `lan=2` vì origin không được hỏi. Sau 6 giây object quá `max-age=5`: `EXPIRED`, lấy lại (`lan=3`), và request kế tiếp lại `HIT`. Không có dòng cấu hình nào về thời hạn: Nginx tự đọc `Cache-Control` của origin.
+
+</Predict>
+
+`max_size=100m` là dung lượng tối đa trên đĩa (đầy thì bỏ object lâu không dùng nhất); `inactive=10m` xoá object không ai hỏi trong 10 phút dù còn hạn. `levels=1:2` chia file cache vào thư mục con hai tầng để một thư mục không chứa hàng triệu file.
+
+<Check id="d21.5.lab-hit-miss">Dựng được tầng cache bằng `proxy_cache`, và dùng header `X-Cache` cùng bộ đếm của origin chứng minh được request nào tới origin, request nào không.</Check>
+
+### 2. Cái gì không được cache, và cache key
+
+Gọi mỗi đường dẫn hai lần:
+
+<Terminal where="vm">
+
+```bash
+for p in /api/time /profile /login /page; do get $E$p; get $E$p; done | cut -d' ' -f1-3 | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+      2 200 MISS /api/time
+      2 200 MISS /profile
+      2 200 MISS /login
+      2 200 MISS /page
+```
+
+</Expected>
+
+Không cái nào được cache, mỗi cái một lý do:
+
+| Đường dẫn | Origin gửi | Vì sao không cache |
+|---|---|---|
+| `/api/time` | `no-store` | Origin cấm lưu |
+| `/profile` | `private, max-age=60` | Nội dung riêng: trình duyệt được giữ, cache dùng chung thì không |
+| `/login` | `public, max-age=60` kèm `Set-Cookie` | Nginx không cache response có `Set-Cookie`, dù `Cache-Control` cho phép: cookie phiên của người này không được trả cho người khác |
+| `/page` | Không có `Cache-Control` | Nginx không tự đoán thời hạn. Muốn cache phải khai `proxy_cache_valid 200 1m`, và khi đó bạn chịu trách nhiệm về việc nó có an toàn không |
+
+Giờ tới cache key. Gọi cùng một file với query string khác nhau, rồi liệt kê các key đang nằm trong cache:
+
+<Terminal where="vm">
+
+```bash
+get "$E/static/logo?v=1"; get "$E/static/logo?v=1"
+get "$E/static/logo?v=2"
+get "$E/static/logo?v=1&utm_source=zalo"
+keys
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 MISS /static/logo?v=1 noi dung=v1 origin=10.9.0.21 lan=1
+200 HIT /static/logo?v=1 noi dung=v1 origin=10.9.0.21 lan=1
+200 MISS /static/logo?v=2 noi dung=v1 origin=10.9.0.21 lan=2
+200 MISS /static/logo?v=1&utm_source=zalo noi dung=v1 origin=10.9.0.21 lan=3
+KEY: httpshop.lab.internal/static/app.js
+KEY: httpshop.lab.internal/static/logo?v=1
+KEY: httpshop.lab.internal/static/logo?v=1&utm_source=zalo
+KEY: httpshop.lab.internal/static/logo?v=2
+```
+
+</Expected>
+
+Mỗi file cache bắt đầu bằng key của nó: đúng chuỗi `$scheme$host$request_uri` ghép lại. Ba biến thể query string là ba object, origin phải trả ba lần cho cùng một nội dung. `?v=2` là chủ ý (đổi phiên bản); `utm_source` là rác làm loãng cache. Sửa bằng cách tạo key từ `$uri` cộng những tham số có nghĩa (ví dụ `$scheme$host$uri$arg_v`), hoặc bật tuỳ chọn bỏ tham số theo dõi của CDN.
+
+<Check id="d21.5.lab-cache-key">Chỉ ra được bốn lý do khiến một response không được cache trong lab, và chứng minh được query string là một phần của cache key bằng cách liệt kê key trong thư mục cache.</Check>
+
+### 3. Nội dung đổi trước khi hết hạn
+
+`/static/logo` có `max-age=3600`. Đổi nội dung trên origin:
+
+<Terminal where="vm">
+
+```bash
+echo v2 > version.txt
+curl -s "http://10.9.0.21:8080/static/logo?v=1" | cut -d' ' -f2-3
+get "$E/static/logo?v=1" | cut -d' ' -f1-5
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+noi dung=v2
+200 HIT /static/logo?v=1 noi dung=v1
+```
+
+</Expected>
+
+Origin đã có `v2`, người dùng vẫn nhận `v1` và sẽ tiếp tục như vậy gần một giờ. Bản mở của Nginx không có lệnh purge (directive `proxy_cache_purge` chỉ có ở bản thương mại). Cách thay thế là `proxy_cache_bypass`: khi biến chỉ định khác rỗng, Nginx bỏ qua cache, lấy từ origin, **và ghi đè** bản trong cache. Lab dùng một header làm tín hiệu:
+
+<Terminal where="vm">
+
+```bash
+echo 'proxy_cache_bypass $http_x_refresh;' >> cache-extra.conf; reload
+get -H 'X-Refresh: 1' "$E/static/logo?v=1" | cut -d' ' -f1-5
+get "$E/static/logo?v=1" | cut -d' ' -f1-5
+get "$E/static/logo?v=2" | cut -d' ' -f1-5
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 BYPASS /static/logo?v=1 noi dung=v2
+200 HIT /static/logo?v=1 noi dung=v2
+200 HIT /static/logo?v=2 noi dung=v1
+```
+
+</Expected>
+
+Request có `X-Refresh` làm mới đúng **một** key. Dòng cuối là cái giá của purge theo URL: `?v=2` là key khác và vẫn giữ bản cũ; phải làm mới từng biến thể, trên từng máy cache. Vì vậy CDN có purge theo nhãn, và vì vậy file tĩnh nên mang phiên bản trong tên để khỏi bao giờ cần purge. Trên hệ thống thật, đừng để ai cũng gửi được header làm mới: giới hạn theo IP nội bộ hoặc một giá trị bí mật, nếu không đó là công cụ cho kẻ muốn dội tải về origin.
+
+<Check id="d21.5.lab-refresh">Tái hiện được việc người dùng nhận nội dung cũ sau khi origin đã đổi, làm mới được một key bằng `proxy_cache_bypass`, và giải thích được vì sao cách này không mở rộng tốt bằng phiên bản trong URL.</Check>
+
+### 4. Đàn request và origin chết
+
+`/report` mất 2 giây để tạo và có `max-age=5`. Nạp nó vào cache, chờ hết hạn, rồi cho 20 client cùng hỏi:
+
+<Terminal where="vm">
+
+```bash
+get $E/report | cut -d' ' -f1-2; sleep 6
+for i in $(seq 20); do get $E/report & done | cut -d' ' -f1-2 | sort | uniq -c
+hits | grep -o '/report=[0-9]*'
+```
+
+</Terminal>
+
+<Predict question="20 request cùng tới lúc object vừa hết hạn, mỗi lần tạo mất 2 giây. Origin phải tạo báo cáo bao nhiêu lần?">
+
+```text
+200 MISS
+     20 200 EXPIRED
+/report=21
+```
+
+Hai mươi lần (cộng một lần nạp ban đầu là 21). Cả 20 request thấy object hết hạn và cùng đi về origin: đây là cache stampede. Với một truy vấn báo cáo nặng, khoảnh khắc object hết hạn là khoảnh khắc database nhận 20 truy vấn giống hệt nhau cùng lúc.
+
+</Predict>
+
+Giờ tới origin chết. Dừng origin rồi hỏi một object đã hết hạn:
+
+<Terminal where="vm">
+
+```bash
+get $E/static/app.js | cut -d' ' -f1-2; sleep 6
+sudo ip netns pids web1 | xargs -r sudo kill; sleep 0.5
+get $E/static/app.js | cut -d' ' -f1-2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 EXPIRED
+502 EXPIRED
+```
+
+</Expected>
+
+Cache còn giữ nguyên bản cũ của `app.js` trên đĩa, nhưng vì nó hết hạn và origin không trả lời, người dùng nhận `502`. Thêm hai dòng: cho phép dùng bản cũ khi origin lỗi hoặc đang được làm mới, và gộp các request tới object chưa có trong cache:
+
+<Terminal where="vm">
+
+```bash
+cat >> cache-extra.conf <<'EOF'
+proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+proxy_cache_lock on;
+EOF
+reload
+get $E/static/app.js | cut -d' ' -f1-5
+get $E/api/time | cut -d' ' -f1-2
+origin 1; sleep 1
+get $E/report | cut -d' ' -f1-2; sleep 6
+for i in $(seq 20); do get $E/report & done | cut -d' ' -f1-2 | sort | uniq -c
+hits | grep -o '/report=[0-9]*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 STALE /static/app.js noi dung=v2
+502 MISS
+200 EXPIRED
+      1 200 EXPIRED
+     19 200 UPDATING
+/report=2
+```
+
+</Expected>
+
+- Origin vẫn đang chết ở hai lệnh đầu. `app.js` được trả từ bản cũ (`STALE`): người dùng không biết origin sập. `/api/time` là `no-store`, không có bản nào để dùng, nên vẫn `502`: cache chỉ che được những gì cache được.
+- Sau khi origin chạy lại (bộ đếm của nó bắt đầu lại từ đầu), 20 request tới object hết hạn chỉ sinh **một** request về origin: một cái đi làm mới (`EXPIRED`), 19 cái nhận ngay bản cũ (`UPDATING`). `proxy_cache_lock` lo trường hợp còn lại, khi object chưa hề có trong cache: một request đi lấy, số khác chờ.
+
+Một origin shield chính là thêm một tầng cache như thế này giữa các PoP và origin.
+
+<Check id="d21.5.lab-stale-stampede">Đo được số request tới origin khi một object nóng hết hạn, trước và sau khi bật `proxy_cache_use_stale updating`; và chứng minh được tầng cache trả bản cũ khi origin chết, trừ nội dung `no-store`.</Check>
+
+### 5. WAF: ghi nhận trước, chặn sau
+
+Gắn ModSecurity vào Nginx và nạp CRS. File luật của bài nạp cấu hình nền của gói (`/etc/nginx/modsecurity.conf`), cấu hình của CRS, một file loại trừ của riêng ta (còn rỗng, bước 6 dùng tới), các luật của CRS, rồi đặt chế độ và nơi ghi audit log. Worker của Nginx chạy bằng `www-data`, nên thư mục log phải thuộc user đó.
+
+<Terminal where="vm" title="~/masteva-d21/cdn/waf/main.conf">
+
+```bash
+sudo install -d -o www-data /var/log/masteva-d21
+touch waf/exclusions.conf
+cat > waf/main.conf <<'EOF'
+Include /etc/nginx/modsecurity.conf
+Include /etc/modsecurity/crs/crs-setup.conf
+Include LAB/cdn/waf/exclusions.conf
+Include /usr/share/modsecurity-crs/rules/*.conf
+
+SecRuleEngine DetectionOnly
+SecAuditEngine RelevantOnly
+SecAuditLogRelevantStatus "^$"
+SecAuditLogFormat JSON
+SecAuditLogParts AHZ
+SecAuditLog /var/log/masteva-d21/audit.log
+EOF
+sed -i "s#LAB#$HOME/masteva-d21#g" waf/main.conf
+echo 'load_module /usr/lib/nginx/modules/ngx_http_modsecurity_module.so;' > modules.conf
+printf 'modsecurity on;\nmodsecurity_rules_file %s/waf/main.conf;\n' "$C" > server-extra.conf
+reload 2
+get "$E/page?id=1" | cut -d' ' -f1-2
+get --get --data-urlencode "id=1' OR '1'='1" "$E/page" | cut -d' ' -f1-2
+wafl
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 MISS
+200 MISS
+GET /page?id=1%27+OR+%271%27%3d%271 -> 200
+  942100 SQL Injection Attack Detected via libinjection
+  949110 Inbound Anomaly Score Exceeded (Total Score: 5)
+```
+
+</Expected>
+
+Request thứ hai mang mẫu SQL injection kinh điển trong tham số `id`. Ở `DetectionOnly`, nó vẫn đi tới origin và nhận `200`, nhưng audit log ghi lại: luật `942100` nhận ra SQL injection và cộng 5 điểm, luật `949110` thấy tổng điểm chạm ngưỡng 5. `SecAuditEngine RelevantOnly` chỉ ghi những giao dịch có luật khớp; request sạch không để lại gì. Đây là chế độ để chạy vài tuần trên traffic thật. Giờ bật chặn:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/^SecRuleEngine .*/SecRuleEngine On/' waf/main.conf; reload 2
+get --get --data-urlencode "id=1' OR '1'='1" "$E/page" | cut -d' ' -f1
+get "$E/page?file=../../etc/passwd" | cut -d' ' -f1
+get "$E/static/logo?v=1" | cut -d' ' -f1-2
+wafl 2
+sudo grep -a -c 'ModSecurity: Access denied' error.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+403
+403
+200 HIT
+GET /page?id=1%27+OR+%271%27%3d%271 -> 403
+  942100 SQL Injection Attack Detected via libinjection
+  949110 Inbound Anomaly Score Exceeded (Total Score: 5)
+GET /page?file=../../etc/passwd -> 403
+  930100 Path Traversal Attack (/../)
+  930110 Path Traversal Attack (/../)
+  930110 Path Traversal Attack (/../)
+  930120 OS File Access Attempt
+  932160 Remote Command Execution: Unix Shell Code Found
+  949110 Inbound Anomaly Score Exceeded (Total Score: 30)
+2
+```
+
+</Expected>
+
+Hai request tấn công nhận `403` và không tới origin; request thường vẫn qua và vẫn được trả từ cache. Request đọc `/etc/passwd` khớp nhiều luật ở hai nhóm (930 là truy cập file, 932 là chèn lệnh), tổng 30 điểm. Mỗi lần chặn cũng để lại một dòng `ModSecurity: Access denied` trong `error.log` của Nginx. WAF chạy trước tầng cache: request bị chặn không được trả từ cache, và response `403` không bị lưu lại.
+
+<Check id="d21.5.lab-waf-block">Bật được ModSecurity với CRS trên Nginx, đọc được trong audit log luật nào khớp và tổng điểm của một request, và chuyển được từ `DetectionOnly` sang `On` để chặn một request SQL injection mẫu.</Check>
+
+### 6. False positive và luật loại trừ
+
+Site có trang quản trị để soạn nội dung, và người soạn dán một đoạn HTML hoàn toàn hợp lệ:
+
+<Terminal where="vm">
+
+```bash
+HTML='<p onclick="track()">Xin chao</p><script src="/static/app.js"></script>'
+get --data-urlencode "title=Trang chu" --data-urlencode "html=$HTML" "$E/admin/pages" | cut -d' ' -f1
+wafl
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+403
+POST /admin/pages -> 403
+  941100 XSS Attack Detected via libinjection
+  941110 XSS Filter - Category 1: Script Tag Vector
+  941120 XSS Filter - Category 2: Event Handler Vector
+  941160 NoScript XSS InjectionChecker: HTML Injection
+  949110 Inbound Anomaly Score Exceeded (Total Score: 20)
+```
+
+</Expected>
+
+WAF không sai về mặt kỹ thuật: thẻ `<script>` và `onclick` trong tham số đúng là hình dạng của XSS. Nhưng ở trang này, gửi HTML là chức năng. Nếu WAF đã bật `On` từ ngày đầu, người soạn nội dung là người đầu tiên báo site hỏng. Cách sửa tồi là tắt cả nhóm luật 941 trên toàn site. Cách sửa đúng là một luật loại trừ hẹp: chỉ ở đường dẫn `/admin/pages`, chỉ với tham số `html`, bỏ các luật mang nhãn `attack-xss`. Luật này dùng hành động `ctl:` để đổi cách các luật khác chạy **trong request đang xét**, nên theo tài liệu CRS nó phải được nạp trước các luật của CRS; vì vậy nó nằm trong `exclusions.conf`, file mà `main.conf` đã `Include` phía trên dòng nạp luật CRS.
+
+<Terminal where="vm">
+
+```bash
+cat > waf/exclusions.conf <<'EOF'
+# Trang soạn nội dung của quản trị viên: tham số html được phép chứa HTML
+SecRule REQUEST_URI "@beginsWith /admin/pages" \
+  "id:10001,phase:1,pass,nolog,ctl:ruleRemoveTargetByTag=attack-xss;ARGS:html"
+EOF
+reload 2
+get --data-urlencode "title=Trang chu" --data-urlencode "html=$HTML" "$E/admin/pages" | cut -d' ' -f1
+get --data-urlencode "title=$HTML" --data-urlencode "html=ok" "$E/admin/pages" | cut -d' ' -f1
+get --data-urlencode "title=x' OR '1'='1" --data-urlencode "html=$HTML" "$E/admin/pages" | cut -d' ' -f1
+get --get --data-urlencode "q=$HTML" "$E/page" | cut -d' ' -f1
+```
+
+</Terminal>
+
+<Predict question="Bốn request sau khi có luật loại trừ: HTML trong html; HTML trong title; SQL injection trong title; HTML trong tham số q của /page. Cái nào qua?">
+
+```text
+200
+403
+403
+403
+```
+
+Chỉ cái đầu. Luật loại trừ mở đúng một ô: XSS, tham số `html`, đường dẫn `/admin/pages`. Cùng đoạn HTML đó ở tham số `title` vẫn bị chặn; SQL injection ở trang đó vẫn bị chặn (nhãn khác); và cùng đoạn HTML ở trang công khai vẫn bị chặn. Trang quản trị giờ dựa vào các lớp khác để an toàn: đăng nhập, phân quyền, và việc ứng dụng lọc HTML khi hiển thị.
+
+</Predict>
+
+<Check id="d21.5.lab-waf-tune">Tái hiện được một false positive của CRS, tìm được mã các luật gây ra nó trong audit log, và viết được luật loại trừ giới hạn theo đường dẫn, tham số và nhóm luật; chứng minh được phần còn lại vẫn được bảo vệ.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `get: command not found`, `$E` rỗng: terminal mới chưa nạp hàm. Chạy `. ~/masteva-d21/cdn/cdn.sh` rồi `cd ~/masteva-d21/cdn`.
+- `get` in dòng trống ở cột đầu, hoặc `curl: (6) Could not resolve host: shop.lab.internal`: thiếu dòng trong `/etc/hosts`. Chạy lại lệnh `echo ... | sudo tee -a /etc/hosts` ở phần Chuẩn bị.
+- Mọi thứ `502`: origin không chạy. `origin 1`, rồi `hits`.
+- `reload` in dòng có `[emerg]`: file vừa sửa sai cú pháp; Nginx vẫn chạy cấu hình cũ. Lỗi `unknown directive "modsecurity"` nghĩa là `modules.conf` chưa có dòng `load_module`.
+- `Rules error ... Invalid input: IncludeOptional`: bạn `Include` file `owasp-crs.load` của gói, vốn viết cho ModSecurity 2 trên Apache. Nạp `crs-setup.conf` và `rules/*.conf` như bài.
+- `wafl` báo `No such file` hoặc không in gì: chưa có request nào khớp luật, hoặc thư mục `/var/log/masteva-d21` không thuộc `www-data` (ModSecurity không ghi được, xem `error.log`).
+- Trạng thái cache khác bài (`HIT` thay vì `MISS`): cache còn lại từ lần chạy trước. Dừng Nginx (`ngx -s quit`), xoá bằng lệnh ở phần Dọn dẹp, chạy lại.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới dừng mọi tiến trình trong các namespace của lab, xoá mạng lab, **xoá thư mục cache `/var/cache/masteva-d21-edge` và thư mục log `/var/log/masteva-d21`**, và xoá dòng có nhãn `# masteva-d21` khỏi `/etc/hosts`. Kiểm kỹ hai đường dẫn trước khi chạy: đây là `rm -rf` với `sudo`. Thư mục `~/masteva-d21` được giữ lại.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+sudo ~/masteva-d21/topo.sh down
+sudo rm -rf /var/cache/masteva-d21-edge /var/log/masteva-d21
+sudo sed -i '/# masteva-d21$/d' /etc/hosts
+sleep 2; ip netns list | wc -l; pgrep -c nginx
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+0
+```
+
+</Expected>
+
+Bài cuối của chặng, D9.6, là chủ đề tuỳ chọn về Envoy. Dừng ở đây thì tắt VM bằng `limactl stop <tên VM>` trên máy Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nên đặt TTL bao nhiêu cho HTML, API và file tĩnh?">
+
+File tĩnh có mã băm trong tên: một năm và `immutable`, vì nội dung của một URL không bao giờ đổi. HTML là thứ trỏ tới các file đó, nên nó phải mới: TTL ngắn ở CDN (vài chục giây tới vài phút) kèm `stale-while-revalidate`, và `no-cache` hoặc TTL rất ngắn ở trình duyệt, vì bạn purge được CDN nhưng không purge được trình duyệt của người dùng. Tách hai con số bằng `s-maxage` (cho CDN) và `max-age` (cho trình duyệt). API công khai, đọc nhiều (danh mục sản phẩm, tỉ giá): vài giây tới vài chục giây đã cắt được phần lớn tải, vì ở 1.000 request mỗi giây thì TTL 5 giây nghĩa là origin thấy một trong 5.000 request. API theo người dùng: `private` hoặc `no-store`, không ngoại lệ. Sai lầm đắt nhất là đặt TTL dài cho HTML rồi phát hiện một lỗi: bạn không gỡ được nó khỏi trình duyệt đã tải.
+
+</Reveal>
+
+<Reveal title="Cache poisoning là gì, và cache key liên quan thế nào?">
+
+Cache poisoning là làm cho cache lưu một response độc rồi trả nó cho mọi người. Cơ chế chung: ứng dụng dùng một phần của request để tạo response, nhưng phần đó **không nằm trong cache key**. Ví dụ ứng dụng đọc header `X-Forwarded-Host` để sinh đường dẫn tới file JavaScript; kẻ tấn công gửi request với header đó trỏ về máy của hắn, response chứa đường dẫn độc được cache theo URL, và người dùng tiếp theo nhận nó dù không gửi header nào. Phòng bằng ba việc: ứng dụng không tin header mà proxy của bạn không tự đặt (D2.5), tầng cache xoá hoặc chuẩn hoá các header lạ trước khi chuyển về origin, và mọi đầu vào ảnh hưởng tới response phải nằm trong key hoặc trong `Vary`. Họ hàng của nó là cache deception: lừa cache lưu trang riêng của nạn nhân bằng một URL trông như file tĩnh (`/profile/x.css`), khi ứng dụng bỏ qua phần đuôi còn CDN cache theo đuôi `.css`. Đó là lý do bước 2 nhấn vào `private` ở phía origin: đừng để quyết định cache phụ thuộc vào hình dạng URL.
+
+</Reveal>
+
+<Reveal title="WAF đặt ở đâu, và nên hỏng theo kiểu mở hay đóng?">
+
+Ba chỗ thường gặp: trong CDN (Cloudflare, AWS WAF trước CloudFront hoặc ALB), trong reverse proxy của bạn (ModSecurity hoặc Coraza trong Nginx, HAProxy, Envoy), và ở Gateway của cụm Kubernetes. Càng ở ngoài càng chặn sớm và càng không tốn tài nguyên của bạn, nhưng càng ít biết về ứng dụng. Nhiều nơi dùng hai lớp: bộ luật chung ở CDN, luật riêng theo ứng dụng ở gần ứng dụng. Về kiểu hỏng: WAF nằm trong đường đi (như bài này) mà lỗi thì mọi request lỗi theo, như vụ Cloudflare trong callout. WAF gọi ra ngoài (một dịch vụ kiểm tra riêng, ví dụ qua `ext_authz` của Envoy hay SPOE của HAProxy) cho bạn chọn: quá hạn thì cho qua (fail open, ưu tiên sẵn sàng) hay chặn (fail closed, ưu tiên an toàn). Trang bán hàng thường chọn mở; cổng thanh toán thường chọn đóng. Dù chọn gì, hãy đặt giới hạn thời gian và giám sát độ trễ mà WAF thêm vào, vì mỗi request đi qua vài trăm luật có biểu thức chính quy.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một dòng audit log của ModSecurity, viết luật loại trừ CRS từ mô tả, hoặc đề xuất `Cache-Control` cho từng loại nội dung của một site. AI hay "sửa" false positive bằng `SecRuleRemoveById` cho toàn site hoặc hạ `SecRuleEngine` về `DetectionOnly`, hay viết `proxy_cache_valid any 10m` mà không loại trừ trang có đăng nhập (đúng công thức của rò rỉ dữ liệu), và hay dùng directive `proxy_cache_purge` vốn chỉ có ở bản thương mại. Kiểm lại: với cache, gọi mỗi loại trang hai lần bằng hai cookie khác nhau và nhìn `X-Cache`; với WAF, chạy lại bốn request của bước 6 sau mỗi luật loại trừ.
+
+</Callout>
+
+<Callout kind="link">
+
+D2.3 và J10.1 dạy HTTP và header; D2.5 dạy vì sao không tin header do client gửi. D9.1 có `rt`, `urt` để đo tác dụng của cache. D9.4 kết thúc TLS ở tầng trước cache. SB9 cache ở tầng ứng dụng với Redis, cùng bài toán TTL và stampede ở một tầng khác. Trên cloud, CDN và WAF thường là dịch vụ được quản lý (ví dụ CloudFront và AWS WAF) đặt trước load balancer của D10. D9.6 giới thiệu Envoy, proxy nằm dưới phần lớn gateway và service mesh hiện nay. D13 và D17 áp nguyên tắc deploy từng phần cho cả luật WAF.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d21.5.mastery-cache-policy">Lập được chính sách cache cho một site có file tĩnh, HTML, API công khai và trang theo người dùng: header nào cho loại nào, cache key gồm gì, làm mới bằng cách nào; và kiểm được bằng `curl` rằng trang riêng không bao giờ `HIT`.</Check>
+
+<Check id="d21.5.mastery-waf-rollout">Đưa được một WAF với CRS vào trước một ứng dụng theo đúng trình tự: chỉ ghi nhận, đọc log, viết luật loại trừ hẹp, bật chặn; và giải thích được cho đồng nghiệp vì sao không tắt luật trên toàn site.</Check>
+
+</Mastery>

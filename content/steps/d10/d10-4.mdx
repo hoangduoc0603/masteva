@@ -1,0 +1,746 @@
+---
+title: Drift, import và tái cấu trúc mã mà không phá tài nguyên
+description: Sửa tay một Deployment và ConfigMap trên cụm kind rồi xem plan thấy gì và không thấy gì, chọn giữa kéo về, nhận vào mã và bỏ qua có chủ đích, đưa một tài nguyên tạo tay vào state bằng khối import kèm cấu hình sinh tự động, rồi đổi tên và gỡ resource khỏi mã bằng moved và removed.
+id: d10.4
+step: d10
+prerequisites: [d10.1, d0.2]
+topics: [d10.drift-import]
+status: verified
+verified:
+  date: 2026-10-11
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    opentofu: 1.13.1 (image ghcr.io/opentofu/opentofu)
+    terraform: 1.16.5 (image hashicorp/terraform)
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    provider-kubernetes: hashicorp/kubernetes 3.3.0
+---
+
+<Goal>
+
+Giữ được mã IaC và hạ tầng thật khớp nhau khi có người sửa tay, khi có tài nguyên sinh ra ngoài mã, và khi chính mã cần sắp xếp lại. Học xong bài này, bạn giải thích được:
+
+- Vì sao một lần `apply` không liên quan lại "phá" bản sửa nóng mà đồng nghiệp làm lúc nửa đêm.
+- Vì sao plan báo "No changes" trong khi trên cụm có một tài nguyên không ai khai báo.
+- Vì sao đổi tên một resource trong mã làm công cụ đòi xoá rồi tạo lại nó, và cách tránh.
+- Vì sao cấu hình do công cụ sinh ra khi import chưa dùng ngay được.
+
+</Goal>
+
+<Knowledge>
+
+### Drift: thực tế lệch khỏi mã
+
+**Drift** là khi hạ tầng thật không còn giống điều mã mô tả. Nguồn thường gặp:
+
+- Sửa tay lúc sự cố: tăng số replica, mở thêm một cổng, sửa một biến cấu hình trên console.
+- Một hệ thống khác được phép sửa: autoscaler đổi số replica, operator thêm annotation.
+- Một lần `apply` lỗi giữa chừng, hoặc một công cụ IaC khác quản cùng tài nguyên.
+- Tài nguyên được tạo ngoài mã ngay từ đầu.
+
+D11.1 đã vẽ ba thứ công cụ so với nhau. Drift nằm ở cạnh bên phải:
+
+```text
+   Cấu hình .tf  ◀───── plan so sánh ─────▶  State  ◀───── refresh ─────▶  Thực tế
+   replicas = 2                              replicas = 2                  replicas = 4
+                                             (ghi lúc apply)               (ai đó vừa scale tay)
+
+   plan = refresh trước (state thành 4), rồi so với cấu hình (2)  ⇒  ~ replicas: 4 -> 2
+```
+
+Mặc định, `plan` luôn refresh trước, nên nó thấy drift và đề xuất **kéo thực tế về theo mã**. Điều đó đúng khi mã là nguồn sự thật, và nguy hiểm khi bản sửa tay là thứ đang giữ hệ thống sống. Nhưng plan không thấy mọi thứ:
+
+| Chuyện xảy ra ngoài mã | Plan có thấy không |
+|---|---|
+| Sửa một thuộc tính của resource **đang được quản** | Có: `~ update in-place`, hoặc `-/+` nếu thuộc tính đó không sửa tại chỗ được |
+| Xoá một resource đang được quản | Có: `+ create` |
+| Tạo một tài nguyên **mới**, không có trong state | **Không.** Công cụ chỉ hỏi về những gì state liệt kê |
+| Sửa một thuộc tính mà provider không đọc về, hoặc bạn đã `ignore_changes` | Không |
+
+Dòng thứ ba là lý do "plan sạch" không có nghĩa "hạ tầng đúng như mã": một security group tạo tay, một IAM user tạo tay, một ConfigMap tạo tay đều vô hình với plan.
+
+<Check id="d10.4.drift">Định nghĩa được drift, kể được bốn nguồn sinh ra nó, và nói được loại thay đổi ngoài mã nào plan nhìn thấy, loại nào không.</Check>
+
+### Ba cách trả lời một drift
+
+| Cách | Làm gì | Khi nào |
+|---|---|---|
+| **Kéo về** | `apply` như bình thường; thực tế quay lại theo mã | Bản sửa tay là nhầm lẫn, hoặc không được phép |
+| **Nhận vào mã** | Sửa mã cho khớp thực tế, plan hết khác biệt, commit | Bản sửa tay là đúng (hotfix lúc sự cố) và cần giữ |
+| **Bỏ qua có chủ đích** | `lifecycle { ignore_changes = [thuộc tính] }` | Một hệ thống khác là chủ của thuộc tính đó: autoscaler, operator |
+
+`tofu plan -refresh-only` chỉ làm nửa đầu của plan: so state với thực tế và in ra cái gì đã đổi bên ngoài, không đề xuất sửa gì. `apply -refresh-only` ghi các giá trị mới vào state. Nó **không giải quyết** drift: mã vẫn nói điều cũ, nên plan thường sau đó vẫn đòi kéo về. Dùng nó để xem "bên ngoài đã đổi gì" mà không lẫn với thay đổi đang dở trong mã.
+
+Phát hiện sớm bằng cách chạy plan theo lịch. `tofu plan -detailed-exitcode` trả exit code 0 khi không có gì khác, 1 khi lỗi, **2 khi có khác biệt**: một job chạy mỗi giờ và báo khi gặp 2 là đủ làm bộ phát hiện drift. Phòng từ gốc thì dựa vào quyền: người chỉ có quyền đọc trên production, thay đổi đi qua pipeline, và một đường "phá kính" có ghi nhận cho lúc khẩn cấp (chặng D15).
+
+<Callout kind="production">
+
+Ngày 04/04/2025, CircleCI gián đoạn 1 giờ 33 phút (00:16 tới 01:49 UTC): khách hàng không vào được giao diện và không khởi chạy được build. Theo postmortem của họ: hạ tầng, gồm cả WAF, gần như đều được quản bằng Terraform, nhưng một cấu hình IAM sai cho phép một role sửa trực tiếp mà không qua công cụ IaC. Trong lúc xem xét giám sát bảo mật định kỳ, một người vận hành sửa cấu hình WAF bằng tay trong khi tin rằng mình chỉ thực hiện thao tác đọc; rule mới chặn lưu lượng hợp lệ tới `api.circleci.com` và `circleci.com`. Nhóm điều tra không ưu tiên xem WAF, vì cho rằng mọi thay đổi đều phải đi qua pipeline Terraform và pipeline không ghi nhận thay đổi nào. Lúc 01:35, quy trình tự động phát hiện drift của Terraform chạy và chỉ ra đúng khác biệt giữa cấu hình khai báo với cấu hình đang chạy; rule bị gỡ lúc 01:41. Postmortem ghi: gần 80 phút từ lúc thay đổi tới lúc phát hiện. Hai việc khắc phục đầu tiên: siết IAM để không ai sửa trực tiếp được hạ tầng do IaC quản, và làm cho phát hiện drift báo nhanh hơn với các thành phần quan trọng.
+
+Bài học cho bài này, phần suy ra của bài: câu "mọi thay đổi đều qua IaC" chỉ đúng tới mức quyền truy cập ép được nó đúng, và bộ phát hiện drift tự động là thứ tìm ra nguyên nhân khi con người đã loại nó khỏi danh sách nghi vấn.
+
+</Callout>
+
+<Check id="d10.4.responses">Chọn được giữa kéo về, nhận vào mã và `ignore_changes` cho một drift cụ thể, giải thích được `-refresh-only` làm gì và không làm gì, và dùng được `-detailed-exitcode` để phát hiện drift theo lịch.</Check>
+
+### Import: đưa tài nguyên có sẵn vào state
+
+Tài nguyên tạo ngoài mã (trước khi đội dùng IaC, hoặc tạo tay lúc gấp) cần được đưa vào quản lý mà không xoá đi tạo lại. **Import** ghi một tài nguyên đang tồn tại vào state, gắn với một địa chỉ trong mã.
+
+| Cách | Viết thế nào | Đặc điểm |
+|---|---|---|
+| Khối `import` | `import { to = <địa chỉ>, id = "<id phía provider>" }` trong file `.tf` | Đi qua `plan` và `apply` như mọi thay đổi: xem trước được, review được, chạy trong pipeline được. Có ở cả hai công cụ |
+| Lệnh `tofu import <địa chỉ> <id>` | Dòng lệnh | Ghi thẳng vào state, không có bước xem trước. Cách cũ |
+
+`id` do từng loại resource quy định: với ConfigMap của Kubernetes là `<namespace>/<tên>`, với một máy EC2 là instance id. Import chỉ đưa tài nguyên vào **state**; bạn vẫn phải có khối `resource` mô tả nó trong mã. `tofu plan -generate-config-out=<file>` sinh khối đó từ trạng thái thật. Bản sinh ra là **bản nháp**: nó liệt kê mọi thuộc tính, kể cả giá trị mặc định và thuộc tính chỉ đọc, và có thể không qua được `validate`. Việc của bạn là dọn nó về đúng những gì bạn muốn quản.
+
+Thước đo một lần import xong: plan báo `N to import, 0 to add, 0 to change, 0 to destroy`. Còn dòng `~` nào nghĩa là mã và thực tế chưa khớp, và apply sẽ **sửa** tài nguyên vừa nhận về.
+
+<Check id="d10.4.import">Giải thích được import làm gì với state và với mã, viết được khối `import`, và nêu được vì sao cấu hình sinh tự động chỉ là bản nháp.</Check>
+
+### Tái cấu trúc: `moved` và `removed`
+
+Địa chỉ của resource (`kubernetes_config_map_v1.web`) là khoá trong state. Đổi tên trong mã, đưa resource vào module, hay chuyển `count` sang `for_each` đều đổi địa chỉ, và công cụ hiểu là: địa chỉ cũ biến mất (xoá), địa chỉ mới xuất hiện (tạo). Với một database, đó là mất dữ liệu vì một lần dọn mã.
+
+| Muốn | Khối khai báo | Lệnh mệnh lệnh tương đương |
+|---|---|---|
+| Đổi địa chỉ, giữ nguyên tài nguyên | `moved { from = <cũ>, to = <mới> }` | `tofu state mv <cũ> <mới>` |
+| Thôi quản lý, **không xoá** tài nguyên | `removed { from = <địa chỉ>` kèm `lifecycle { destroy = false } }` | `tofu state rm <địa chỉ>` |
+| Bắt đầu quản lý tài nguyên có sẵn | `import { to = …, id = … }` | `tofu import` |
+
+Nên dùng khối khai báo: thay đổi nằm trong mã, hiện trong plan, qua review, và tự áp cho **mọi** state dùng bộ mã đó (dev, staging, prod, bản của từng người gọi module). Lệnh `state mv`, `state rm` sửa thẳng một state, không ai xem trước, và phải nhớ chạy lại ở từng môi trường. Khối `moved` nên để lại trong mã cho tới khi mọi môi trường đã apply qua; với module dùng chung thì để lâu hơn, vì bạn không biết người gọi nào chưa nâng cấp.
+
+<Check id="d10.4.refactor">Giải thích được vì sao đổi tên resource dẫn tới xoá và tạo lại, và dùng được `moved`, `removed` đúng chỗ thay cho lệnh `state mv`, `state rm`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Import (OpenTofu Docs)](https://opentofu.org/docs/language/import/): cú pháp khối `import`, cách dùng với `for_each`, và trang con "Generating Configuration" về `-generate-config-out`.
+- [Refactoring (OpenTofu Docs)](https://opentofu.org/docs/language/modules/develop/refactoring/): mọi trường hợp dùng `moved`: đổi tên, vào module, `count` sang `for_each`, và khi nào được xoá khối `moved`.
+- [Command: plan (OpenTofu Docs)](https://opentofu.org/docs/cli/commands/plan/): các chế độ `-refresh-only`, `-destroy`, cờ `-detailed-exitcode`, `-replace`.
+- [Manage resource drift (HashiCorp Developer)](https://developer.hashicorp.com/terraform/tutorials/state/resource-drift): bài hướng dẫn của Terraform về cùng chủ đề trên AWS; đọc để thấy drift trên tài nguyên cloud.
+- [CircleCI UI Loading & build triggering issues (CircleCI Status, 04/04/2025)](https://status.circleci.com/incidents/zh1qd6lrntl7): postmortem trong callout: dòng thời gian, nguyên nhân gốc và phần về phát hiện drift.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D11.1 (`env.sh`, mạng `d11-tools`) và D0.2 (có `kind`, `kubectl`). Lab dựng cụm kind `d11-lab` một node; nếu máy chưa có image node thì tải thêm khoảng 350 MB. Dùng cổng **9545** cho API server. Tài nguyên trong lab là object của Kubernetes: Deployment giữ N bản sao của một pod, ConfigMap giữ cấu hình dạng khoá và giá trị. K1.1 và K1.2 dạy kỹ hai loại này; ở đây bạn chỉ cần biết `replicas` là số bản sao và `data` là nội dung cấu hình. **Profile máy:** cụm một node dùng khoảng 700 MB RAM; máy 8 GB nên tắt các cụm kind khác trước khi làm.
+
+### 0. Cụm kind và hai file kubeconfig
+
+<Terminal where="mac" title="~/masteva-d10/k8s">
+
+```bash
+source ~/masteva-d10/env.sh
+mkdir -p ~/masteva-d10/k8s && cd ~/masteva-d10/k8s
+export KUBECONFIG=~/masteva-d10/k8s/kubeconfig
+cat > kind.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 9545
+nodes:
+  - role: control-plane
+EOF
+kind create cluster --name d11-lab --config kind.yaml 2>&1 | grep -E 'Ready|Set kubectl'
+kind get kubeconfig --name d11-lab --internal > kubeconfig-internal
+docker network connect d11-tools d11-lab-control-plane
+grep 'server:' kubeconfig kubeconfig-internal
+kubectl wait --for=condition=Ready node --all --timeout=120s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Set kubectl context to "kind-d11-lab"
+kubeconfig:    server: https://127.0.0.1:9545
+kubeconfig-internal:    server: https://d11-lab-control-plane:6443
+node/d11-lab-control-plane condition met
+```
+
+</Expected>
+
+`export KUBECONFIG=…` làm kind ghi thông tin kết nối vào thư mục lab thay vì `~/.kube/config`; mọi terminal mới dùng cho bài này phải chạy lại dòng đó. Có hai file vì có hai nơi gọi API server: `kubectl` chạy trên máy, đi qua `127.0.0.1:9545`; còn provider `kubernetes` chạy **trong container** của hàm `tofu`, nơi `127.0.0.1` là chính container đó. `kind get kubeconfig --internal` cho địa chỉ theo tên container của node, và `docker network connect` nối node vào mạng `d11-tools` để tên đó phân giải được. Ngoài đời không có vòng này: provider trỏ thẳng tới API server của cụm, xác thực bằng token của pipeline.
+
+### 1. Hạ tầng ban đầu
+
+<Terminal where="mac" title="~/masteva-d10/k8s/shop">
+
+```bash
+mkdir -p ~/masteva-d10/k8s/shop && cd ~/masteva-d10/k8s/shop
+cat > versions.tf <<'EOF'
+terraform {
+  required_version = ">= 1.9"
+
+  required_providers {
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 3.3"
+    }
+  }
+}
+
+provider "kubernetes" {
+  config_path = "${path.module}/../kubeconfig-internal"
+}
+EOF
+cat > main.tf <<'EOF'
+resource "kubernetes_namespace_v1" "shop" {
+  metadata {
+    name = "shop"
+  }
+}
+
+resource "kubernetes_config_map_v1" "web" {
+  metadata {
+    name      = "web-config"
+    namespace = kubernetes_namespace_v1.shop.metadata[0].name
+  }
+
+  data = {
+    GREETING = "Xin chào từ IaC"
+  }
+}
+
+resource "kubernetes_deployment_v1" "web" {
+  metadata {
+    name      = "web"
+    namespace = kubernetes_namespace_v1.shop.metadata[0].name
+    labels    = { app = "web" }
+  }
+
+  spec {
+    replicas = 2
+
+    selector {
+      match_labels = { app = "web" }
+    }
+
+    template {
+      metadata {
+        labels = { app = "web" }
+      }
+
+      spec {
+        container {
+          name  = "nginx"
+          image = "nginx:1.30.5-alpine"
+
+          env_from {
+            config_map_ref {
+              name = kubernetes_config_map_v1.web.metadata[0].name
+            }
+          }
+        }
+      }
+    }
+  }
+
+  lifecycle {
+    ignore_changes = []
+  }
+}
+EOF
+tofu init -no-color | grep -E '^- Installed|successfully'
+tofu apply -no-color -auto-approve | grep -E 'Creation complete|^Apply'
+kubectl -n shop get deploy,cm
+tofu plan -no-color | grep -E '^No changes|^Plan:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+- Installed hashicorp/kubernetes v3.3.0 (signed, key ID 0C0AF313E5FD9F80)
+OpenTofu has been successfully initialized!
+kubernetes_namespace_v1.shop: Creation complete after 0s [id=shop]
+kubernetes_config_map_v1.web: Creation complete after 0s [id=shop/web-config]
+kubernetes_deployment_v1.web: Creation complete after 15s [id=shop/web]
+Apply complete! Resources: 3 added, 0 changed, 0 destroyed.
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   2/2     2            2           16s
+
+NAME                         DATA   AGE
+configmap/kube-root-ca.crt   1      16s
+configmap/web-config         1      16s
+No changes. Your infrastructure matches the configuration.
+```
+
+</Expected>
+
+Ba resource: một namespace, một ConfigMap, một Deployment hai bản sao đọc biến môi trường từ ConfigMap. Trong Deployment, `template` là khuôn của pod (chạy container nào, image nào) và `selector` cho Deployment biết pod nào là của nó: nó tìm pod mang nhãn `app = web`, đúng nhãn mà `template` gắn cho pod. `env_from` nạp mọi khoá của ConfigMap thành biến môi trường của container. `apply` chờ tới khi các pod sẵn sàng rồi mới báo xong (lần đầu mất vài chục giây vì node phải kéo image). `ignore_changes = []` chưa bỏ qua gì; bước 4 sẽ điền. ConfigMap `kube-root-ca.crt` do Kubernetes tự tạo trong mọi namespace, không thuộc mã của bạn.
+
+### 2. Sửa tay, rồi xem plan
+
+Hai giờ sáng, hệ thống quá tải. Người trực tăng số bản sao, sửa một giá trị cấu hình, gắn một nhãn, và tạo thêm một ConfigMap cờ tính năng, tất cả bằng `kubectl`:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n shop scale deploy/web --replicas=4
+kubectl -n shop patch cm web-config --type merge -p '{"data":{"GREETING":"sửa tay lúc 2 giờ sáng","DEBUG":"true"}}'
+kubectl -n shop label deploy/web owner=team-a
+kubectl -n shop create configmap feature-flags --from-literal=NEW_CHECKOUT=on --from-literal=DARK_MODE=off
+tofu plan -no-color | grep -E '^  # |^ +[~+-] |^Plan:'
+```
+
+</Terminal>
+
+<Predict question="Bốn thay đổi tay. Plan sẽ nhắc tới mấy cái, và đề xuất làm gì?">
+
+```text
+deployment.apps/web scaled
+configmap/web-config patched
+deployment.apps/web labeled
+configmap/feature-flags created
+  ~ update in-place (current -> planned)
+  # kubernetes_config_map_v1.web will be updated in-place
+  ~ resource "kubernetes_config_map_v1" "web" {
+      ~ data        = {
+          - "DEBUG"    = "true" -> null
+          ~ "GREETING" = "sửa tay lúc 2 giờ sáng" -> "Xin chào từ IaC"
+  # kubernetes_deployment_v1.web will be updated in-place
+  ~ resource "kubernetes_deployment_v1" "web" {
+      ~ metadata {
+          ~ labels           = {
+              - "owner" = "team-a" -> null
+      ~ spec {
+          ~ replicas                  = "4" -> "2"
+Plan: 0 to add, 2 to change, 0 to destroy.
+```
+
+Plan thấy **ba** trong bốn thay đổi, vì chúng nằm trên hai resource có trong state, và đề xuất kéo cả ba về: xoá khoá `DEBUG`, trả `GREETING` về giá trị trong mã, gỡ nhãn `owner`, giảm bản sao từ 4 xuống 2. Chạy `apply` lúc này, vì bất kỳ lý do gì, là cắt nửa số pod giữa lúc quá tải. ConfigMap `feature-flags` không xuất hiện ở đâu: nó không có trong state nên công cụ không hỏi về nó.
+
+</Predict>
+
+Dùng exit code để máy phát hiện thay cho người:
+
+<Terminal where="mac">
+
+```bash
+tofu plan -detailed-exitcode > /dev/null; echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+exit=2
+```
+
+</Expected>
+
+`2` nghĩa là plan chạy được và có khác biệt. Một job định kỳ chạy đúng lệnh này trên nhánh chính và báo vào kênh trực khi nhận `2` là bộ phát hiện drift tối thiểu; một bộ phát hiện tự động cùng loại là thứ tìm ra nguyên nhân trong sự cố của callout.
+
+<Check id="d10.4.lab-drift">Tạo được drift bằng tay, đọc được plan đề xuất kéo về những gì, chỉ ra được thay đổi nào plan không thấy, và phát hiện được drift bằng exit code.</Check>
+
+### 3. `-refresh-only`: xem bên ngoài đã đổi gì
+
+<Terminal where="mac">
+
+```bash
+tofu plan -no-color -refresh-only | grep -E '^  # |replicas|GREETING|DEBUG|owner|^This is a refresh-only'
+tofu apply -no-color -refresh-only -auto-approve | grep -E '^Apply'
+tofu state show -no-color kubernetes_deployment_v1.web | grep -E 'replicas|owner'
+tofu plan -no-color | grep -E '^Plan:'
+```
+
+</Terminal>
+
+<Predict question="Sau apply -refresh-only, state đã ghi replicas = 4. Plan thường còn đòi thay đổi không?">
+
+```text
+  # kubernetes_config_map_v1.web has changed
+          + "DEBUG"    = "true"
+          ~ "GREETING" = "Xin chào từ IaC" -> "sửa tay lúc 2 giờ sáng"
+  # kubernetes_deployment_v1.web has changed
+              + "owner" = "team-a"
+          ~ replicas                  = "2" -> "4"
+This is a refresh-only plan, so OpenTofu will not take any actions to undo
+Apply complete! Resources: 0 added, 0 changed, 0 destroyed.
+            "owner" = "team-a"
+        replicas                  = "4"
+Plan: 0 to add, 2 to change, 0 to destroy.
+```
+
+Còn nguyên. Chiều mũi tên của `-refresh-only` ngược với plan thường: nó liệt kê điều bên ngoài đã làm (`2 -> 4`, thêm `DEBUG`, thêm `owner`) và không đề xuất hành động nào. `apply -refresh-only` chép các giá trị đó vào state, không đụng tới cụm (`0 changed`). Nhưng mã vẫn ghi `replicas = 2`, nên plan thường vẫn đòi sửa hai resource. Refresh làm state khớp thực tế; nó không làm **mã** khớp thực tế. Drift chỉ hết khi bạn chọn một trong ba cách ở bước sau.
+
+</Predict>
+
+<Check id="d10.4.lab-refresh-only">Dùng được `plan -refresh-only` để xem thay đổi bên ngoài, và chứng minh được rằng nó không xử lý drift.</Check>
+
+### 4. Ba quyết định cho ba thay đổi
+
+Sau sự cố, đội xem lại từng thay đổi tay. Số bản sao 4 là đúng, **nhận vào mã**. `GREETING`, `DEBUG` và nhãn `owner` là thử nghiệm vội, **kéo về**.
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/replicas = 2/replicas = 4/' main.tf
+tofu plan -no-color | grep -E '^  # |^ +[~+-] |^Plan:'
+tofu apply -no-color -auto-approve | grep -E '^Apply'
+kubectl -n shop get cm web-config -o jsonpath='{.data}{"\n"}'
+kubectl -n shop get deploy web -o jsonpath='{.spec.replicas} {.metadata.labels}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  ~ update in-place (current -> planned)
+  # kubernetes_config_map_v1.web will be updated in-place
+  ~ resource "kubernetes_config_map_v1" "web" {
+      ~ data        = {
+          - "DEBUG"    = "true" -> null
+          ~ "GREETING" = "sửa tay lúc 2 giờ sáng" -> "Xin chào từ IaC"
+  # kubernetes_deployment_v1.web will be updated in-place
+  ~ resource "kubernetes_deployment_v1" "web" {
+      ~ metadata {
+          ~ labels           = {
+              - "owner" = "team-a" -> null
+Plan: 0 to add, 2 to change, 0 to destroy.
+Apply complete! Resources: 0 added, 2 changed, 0 destroyed.
+{"GREETING":"Xin chào từ IaC"}
+4 {"app":"web"}
+```
+
+</Expected>
+
+Sửa mã thành 4 làm dòng `replicas` biến khỏi plan: mã và thực tế đã khớp ở điểm đó mà không cần đụng tới cụm. Phần còn lại bị kéo về khi apply. Thay đổi mã này cần đi qua commit và review như mọi thay đổi khác; "nhận vào mã" là ghi lại quyết định, không phải hợp thức hoá mọi sửa tay.
+
+Tuần sau, đội gắn autoscaler cho Deployment này: từ nay số bản sao do autoscaler quyết định, và mã không nên giành lại. Đó là lúc dùng `ignore_changes`:
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/ignore_changes = \[\]/ignore_changes = [spec[0].replicas]/' main.tf
+kubectl -n shop scale deploy/web --replicas=3
+tofu plan -no-color | grep -E '^No changes|^Plan:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web scaled
+No changes. Your infrastructure matches the configuration.
+```
+
+</Expected>
+
+Mã ghi 4, cụm đang chạy 3 (lệnh `scale` đóng vai autoscaler), plan không còn ý kiến. `ignore_changes` nói "thuộc tính này có chủ khác": công cụ đặt giá trị một lần lúc tạo, sau đó thôi so sánh. Cái giá: từ giờ sửa `replicas` trong mã cũng không có tác dụng. Chỉ bỏ qua đúng thuộc tính có chủ khác; `ignore_changes = all` tắt luôn khả năng phát hiện drift của resource đó.
+
+<Check id="d10.4.lab-decide">Xử lý được một drift bằng cả ba cách: nhận vào mã, kéo về, và `ignore_changes` cho thuộc tính do hệ thống khác quản.</Check>
+
+### 5. Import một ConfigMap tạo tay
+
+`feature-flags` vẫn đang chạy ngoài mã. Đưa nó vào quản lý: khai báo khối `import`, rồi để công cụ sinh khối `resource`.
+
+<Terminal where="mac" title="~/masteva-d10/k8s/shop/imports.tf">
+
+```bash
+cat > imports.tf <<'EOF'
+import {
+  to = kubernetes_config_map_v1.flags
+  id = "shop/feature-flags"
+}
+EOF
+tofu plan -no-color -generate-config-out=generated.tf 2>&1 | grep -E '^Plan:|^Error:'
+cat generated.tf
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Error: metadata.0.generate_name a lowercase RFC 1123 label must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character (e.g. 'my-name',  or '123-abc', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?')
+# __generated__ by OpenTofu
+# Please review these resources and move them into your main configuration files.
+
+# __generated__ by OpenTofu
+resource "kubernetes_config_map_v1" "flags" {
+  binary_data = {}
+  data = {
+    DARK_MODE    = "off"
+    NEW_CHECKOUT = "on"
+  }
+  immutable = false
+  metadata {
+    annotations   = {}
+    generate_name = ""
+    labels        = {}
+    name          = "feature-flags"
+    namespace     = "shop"
+  }
+}
+```
+
+</Expected>
+
+Công cụ đọc ConfigMap thật và viết ra `generated.tf`: đúng hai khoá dữ liệu bạn tạo tay. Nhưng nó cũng chép mọi thuộc tính mà provider trả về, kể cả `generate_name = ""`, một chuỗi rỗng không hợp lệ theo chính quy tắc kiểm tra của provider, nên plan báo lỗi ngay sau khi sinh file. Đây là hành vi thường gặp, không phải lỗi của bạn: bản sinh ra là bản nháp. (Terraform 1.16.5 ghi dòng đó là `generate_name = null` nên bản nháp của nó qua được kiểm tra ngay; các bước dưới chạy như nhau với cả hai.) Bỏ dòng thừa rồi plan lại:
+
+<Terminal where="mac">
+
+```bash
+perl -ni -e 'print unless /generate_name/' generated.tf
+tofu plan -no-color | grep -E '^  # |^Plan:'
+tofu apply -no-color -auto-approve | grep -E '^Apply'
+tofu state list
+tofu plan -no-color | grep -E '^No changes|^Plan:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  # kubernetes_config_map_v1.flags will be imported
+  # (imported from "shop/feature-flags")
+Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.
+Apply complete! Resources: 1 imported, 0 added, 0 changed, 0 destroyed.
+kubernetes_config_map_v1.flags
+kubernetes_config_map_v1.web
+kubernetes_deployment_v1.web
+kubernetes_namespace_v1.shop
+No changes. Your infrastructure matches the configuration.
+```
+
+</Expected>
+
+`1 to import, 0 to add, 0 to change, 0 to destroy` là con số cần thấy: tài nguyên vào state mà không bị sửa. Sau `apply`, `state list` có thêm `kubernetes_config_map_v1.flags` và plan sạch. Khối `import` đã xong việc; có thể xoá, hoặc để lại làm dấu vết. Trong một repo thật, bạn sẽ dọn tiếp `generated.tf` (bỏ các dòng mặc định như `annotations = {}`, `binary_data = {}`, `immutable = false`), chuyển nội dung sang file chính và thay `namespace = "shop"` bằng tham chiếu tới resource namespace.
+
+Với resource phức tạp hơn, phần dọn dẹp nặng hơn nhiều. Khi viết bài, thử import một Deployment do `kubectl create deployment` tạo: bản nháp dài 84 dòng và báo 5 lỗi kiểm tra; sau khi viết lại gọn, plan vẫn còn hai dòng `~` (`enable_service_links` và `automount_service_account_token` từ `false` sang `true`), tức apply sẽ sửa pod template và khởi động lại các pod. Mỗi dòng `~` còn lại sau import là một quyết định, không phải nhiễu để bỏ qua.
+
+<Check id="d10.4.lab-import">Import được một tài nguyên tạo tay bằng khối `import` và `-generate-config-out`, sửa được bản nháp cho qua kiểm tra, và đạt được plan `1 to import, 0 to change`.</Check>
+
+### 6. Đổi tên resource: `moved`
+
+Tên `kubernetes_config_map_v1.web` dễ lẫn với Deployment `web`. Đổi thành `web_config`, sửa cả chỗ tham chiếu:
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's/"kubernetes_config_map_v1" "web"/"kubernetes_config_map_v1" "web_config"/; s/kubernetes_config_map_v1\.web\./kubernetes_config_map_v1.web_config./' main.tf
+tofu plan -no-color | grep -E '^  # |^Plan:'
+```
+
+</Terminal>
+
+<Predict question="Chỉ đổi tên trong mã, không đổi một thuộc tính nào của ConfigMap. Plan nói gì?">
+
+```text
+  # kubernetes_config_map_v1.web will be destroyed
+  # (because kubernetes_config_map_v1.web is not in configuration)
+  # kubernetes_config_map_v1.web_config will be created
+Plan: 1 to add, 0 to change, 1 to destroy.
+```
+
+Xoá `web` (vì "không còn trong cấu hình") và tạo `web_config`. Với công cụ, đây là hai resource khác nhau. Apply plan này sẽ xoá ConfigMap mà các pod đang đọc rồi tạo lại nó; trong khoảng giữa, pod nào khởi động lại sẽ lỗi vì thiếu ConfigMap. Với một database, kết quả là mất dữ liệu vì một lần đổi tên biến.
+
+</Predict>
+
+Nói cho công cụ biết đây là cùng một tài nguyên:
+
+<Terminal where="mac" title="~/masteva-d10/k8s/shop/refactor.tf">
+
+```bash
+cat > refactor.tf <<'EOF'
+moved {
+  from = kubernetes_config_map_v1.web
+  to   = kubernetes_config_map_v1.web_config
+}
+EOF
+tofu plan -no-color | grep -E '^  # |^Plan:'
+tofu apply -no-color -auto-approve | grep -E '^Apply'
+tofu state list
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  # kubernetes_config_map_v1.web has moved to kubernetes_config_map_v1.web_config
+Plan: 0 to add, 0 to change, 0 to destroy.
+Apply complete! Resources: 0 added, 0 changed, 0 destroyed.
+kubernetes_config_map_v1.flags
+kubernetes_config_map_v1.web_config
+kubernetes_deployment_v1.web
+kubernetes_namespace_v1.shop
+```
+
+</Expected>
+
+`has moved to`, và không có gì được tạo hay xoá. Apply chỉ đổi địa chỉ trong state. Khối `moved` nằm trong mã nên đồng nghiệp và các môi trường khác nhận cùng phép đổi tên khi họ apply; với `tofu state mv`, mỗi người phải tự nhớ chạy lệnh đúng thứ tự.
+
+<Check id="d10.4.lab-moved">Tái hiện được việc đổi tên resource dẫn tới plan xoá và tạo lại, rồi sửa bằng khối `moved` để plan không còn hành động nào.</Check>
+
+### 7. Thôi quản lý mà không xoá: `removed`
+
+Đội frontend nhận quản `feature-flags` bằng công cụ của họ. Mã của bạn phải nhả nó ra. Cách tự nhiên nhất là xoá khối resource:
+
+<Callout kind="danger">
+
+Lệnh `rm` dưới xoá hai file `generated.tf` và `imports.tf` trong thư mục lab. Lệnh `apply` ở cuối khối chỉ chạy **sau** khi đã thêm khối `removed`; nếu apply ngay sau `rm`, ConfigMap `feature-flags` sẽ bị xoá khỏi cụm.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+rm generated.tf imports.tf
+tofu plan -no-color | grep -E '^  # |^Plan:'
+cat >> refactor.tf <<'EOF'
+
+removed {
+  from = kubernetes_config_map_v1.flags
+
+  lifecycle {
+    destroy = false
+  }
+}
+EOF
+tofu plan -no-color | grep -E '^  # |^Plan:'
+tofu apply -no-color -auto-approve | grep -E '^Apply'
+tofu state list
+kubectl -n shop get cm feature-flags
+```
+
+</Terminal>
+
+<Predict question="Xoá khối resource khỏi mã thì plan đầu tiên đề xuất gì? Sau khi thêm khối removed thì sao?">
+
+```text
+  # kubernetes_config_map_v1.flags will be destroyed
+  # (because kubernetes_config_map_v1.flags is not in configuration)
+Plan: 0 to add, 0 to change, 1 to destroy.
+  # kubernetes_config_map_v1.flags will be removed from the OpenTofu state but will not be destroyed
+Plan: 0 to add, 0 to change, 0 to destroy, 1 to forget.
+Apply complete! Resources: 0 added, 0 changed, 0 destroyed, 1 forgotten.
+kubernetes_config_map_v1.web_config
+kubernetes_deployment_v1.web
+kubernetes_namespace_v1.shop
+NAME            DATA   AGE
+feature-flags   2      34s
+```
+
+Plan đầu: **xoá** ConfigMap, kèm lý do "không còn trong cấu hình". Đúng nguyên tắc của D11.1: gỡ khỏi mã là xoá. Plan thứ hai, sau khi thêm `removed` với `destroy = false`: resource "sẽ bị gỡ khỏi state nhưng không bị xoá", và dòng tổng kết có thêm `1 to forget`. Sau apply, state còn ba địa chỉ, và ConfigMap vẫn nằm trên cụm cho đội mới tiếp quản. Terraform diễn đạt khác: dòng tổng kết không có mục `to forget`, thay vào đó là dòng `will no longer be managed by Terraform, but will not be destroyed` và một cảnh báo liệt kê các object sắp thôi được quản.
+
+</Predict>
+
+<Check id="d10.4.lab-removed">Gỡ được một resource khỏi mã và state bằng khối `removed` mà tài nguyên thật vẫn còn, và phân biệt được với việc chỉ xoá khối resource.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`dial tcp: lookup d11-lab-control-plane … no such host`:** node chưa được nối vào mạng `d11-tools`, hoặc cụm đã bị tạo lại. Chạy lại `docker network connect d11-tools d11-lab-control-plane`.
+- **`The connection to the server localhost:8080 was refused`** từ `kubectl`: terminal chưa có `export KUBECONFIG=~/masteva-d10/k8s/kubeconfig`.
+- **`Error: Cannot import non-existent remote object`:** `id` trong khối `import` sai. Với resource có namespace, định dạng là `<namespace>/<tên>`; kiểm bằng `kubectl -n shop get cm`.
+- **`Error: Resource already managed by OpenTofu`:** địa chỉ trong `to` đã có trong state; xoá khối `import` đã chạy xong, hoặc đổi địa chỉ.
+- **`generated.tf` đã tồn tại** khi chạy lại `-generate-config-out`: công cụ không ghi đè file có sẵn. Xoá file cũ hoặc đổi tên file đích.
+- **`apply` đứng lâu ở `kubernetes_deployment_v1.web: Still creating…`:** node đang kéo image, hoặc pod không lên được. Xem `kubectl -n shop get pods` và `kubectl -n shop describe pod`.
+- **`Error: Moved object still exists`:** khối `moved` có `from` trỏ tới một resource vẫn còn trong mã. Bạn chưa đổi tên khối resource, hoặc gõ ngược `from` và `to`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá mọi resource mà mã đang quản (namespace `shop` và mọi thứ bên trong, kể cả ConfigMap `feature-flags` vì nó nằm trong namespace đó), rồi xoá hẳn cụm kind `d11-lab`. File `.tf` trong `k8s/shop` được giữ lại: D11.5 dùng chúng để chạy công cụ quét. Lệnh `rm -rf` cuối chỉ dành cho khi bạn không học tiếp D11.5.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-d10/k8s/shop && export KUBECONFIG=~/masteva-d10/k8s/kubeconfig
+tofu destroy -no-color -auto-approve | grep -E '^Destroy'
+kind delete cluster --name d11-lab
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Destroy complete! Resources: 3 destroyed.
+Deleting cluster "d11-lab" ...
+Deleted nodes: ["d11-lab-control-plane"]
+```
+
+</Expected>
+
+<Terminal where="mac" title="Chỉ khi không học tiếp D11.5">
+
+```bash
+cd ~/masteva-d10 && rm -rf k8s
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Kubernetes đã tự hội tụ về trạng thái mong muốn. Vậy drift giữa Terraform và Kubernetes khác gì?">
+
+Controller của Kubernetes hội tụ **bên trong** cụm: Deployment ghi 4 bản sao thì cụm giữ 4 pod. Nhưng chính con số 4 trong object Deployment là "trạng thái mong muốn" của cụm, và ai có quyền `kubectl` đều sửa được nó. Drift của bài này nằm một tầng cao hơn: giữa mã trong Git và object trong cụm. Công cụ như Terraform chỉ so khi bạn chạy nó; giữa hai lần chạy, drift tồn tại mà không ai biết. GitOps (chặng D13) đặt một controller trong cụm so liên tục và tự kéo về, tức biến "plan theo lịch" thành vòng lặp vài phút. Cả hai cách vẫn cần cùng một quyết định mà bước 4 đã làm: thuộc tính nào thuộc về mã, thuộc tính nào thuộc về hệ thống khác.
+
+</Reveal>
+
+<Reveal title="Sự cố CircleCI: vì sao một hệ thống gần như 100% IaC vẫn mất 80 phút để thấy một thay đổi tay?">
+
+Postmortem nêu hai lý do. Một: người điều tra tin vào giả định "mọi thay đổi đều qua pipeline", thấy pipeline không có gì nên loại WAF ra; họ cũng vừa xử lý xong một sự cố khác và mất thời gian kiểm xem hai việc có liên quan không. Hai: bộ phát hiện drift tự động chỉ ra đúng thay đổi, nhưng theo postmortem là gần 80 phút sau khi thay đổi xảy ra. Phần sau là suy luận của bài, postmortem không nói bộ phát hiện đó chạy theo chu kỳ nào: giả định chỉ an toàn khi nó được **ép** bằng quyền (không ai sửa tay được) chứ không chỉ bằng quy ước; và với một bộ phát hiện chạy theo lịch, khoảng thời gian tối đa một drift tồn tại mà không ai biết đúng bằng chu kỳ của nó. Với thành phần đứng trước toàn bộ lưu lượng như WAF, DNS, load balancer, chu kỳ đó nên tính bằng phút, và nhật ký thay đổi của nền tảng (CloudTrail trên AWS) nên nằm trong danh sách kiểm đầu tiên khi triệu chứng rộng mà pipeline không ghi nhận gì.
+
+</Reveal>
+
+<Reveal title="Import cả một hệ thống có sẵn: bắt đầu từ đâu?">
+
+Không import tất cả một lượt. Chọn một lát cắt nhỏ, độc lập và ít rủi ro (một bucket, một nhóm DNS record), import, đưa plan về `0 to change`, commit, rồi mới sang lát tiếp theo. Với mỗi lát: viết khối `import`, sinh bản nháp, dọn về đúng những thuộc tính đội muốn quản, đọc từng dòng `~` còn lại và quyết định sửa mã hay chấp nhận thay đổi. Để tài nguyên chứa dữ liệu (database, volume) sau cùng, khi đội đã quen với hành vi của provider, và đặt `prevent_destroy` cho chúng ngay trong cùng commit import. Trong lúc import dở dang, plan của phần đã import phải luôn sạch: một plan "bẩn sẵn" làm người ta quen bỏ qua khác biệt, và drift thật sẽ lẫn vào đó.
+
+</Reveal>
+
+<Reveal title="Khi nào `state mv` và `state rm` vẫn là lựa chọn đúng?">
+
+Khi thay đổi chỉ áp cho **một** state và không nên nằm lại trong mã: sửa một state hỏng sau sự cố, chuyển resource giữa hai state khác nhau (khối `moved` chỉ làm việc trong một state), gỡ một bản ghi mồ côi mà tài nguyên thật đã bị xoá tay. Trước khi chạy, `tofu state pull` ra một bản sao (D11.3), và sau khi chạy, `plan` phải cho kết quả bạn dự đoán trước. Việc gì lặp lại ở mọi môi trường, hoặc ảnh hưởng tới người dùng module của bạn, thì thuộc về khối khai báo.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nên nhờ AI dọn một bản `generated.tf` dài (bỏ giá trị mặc định, thay hằng số bằng tham chiếu), viết khối `moved` cho một đợt đổi tên nhiều resource, hoặc giải thích vì sao một dòng `~` còn lại sau import. AI hay sai ở: bịa định dạng `id` cho import (mỗi loại resource một kiểu; tra tài liệu provider, mục "Import"), đề xuất `ignore_changes = all` để "làm sạch plan", coi `-refresh-only` là cách sửa drift, và dùng `state mv` ở chỗ nên dùng `moved`. Kiểm bằng con số: sau import, plan phải là `N to import, 0 to change`; sau đổi tên, `0 to add, 0 to destroy`. Còn số khác thì chưa xong.
+
+</Callout>
+
+<Callout kind="link">
+
+D11.5 kiểm thử module và đưa việc đọc plan vào review, gồm cả kiểm tra tự động cho `destroy` và `replace`. D11.3 có đường khôi phục khi một thao tác trên state đi sai. K1.1, K1.2 dạy Deployment và ConfigMap; chặng K5 gắn autoscaler thật vào Deployment. Chặng D13 dùng GitOps để phát hiện và sửa drift liên tục trong cụm; chặng D15 siết quyền để sửa tay không còn là đường mặc định.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d10.4.mastery-drift">Đứng trước một plan có thay đổi mà bạn không viết, xác định được đó là drift và chọn được cách xử lý phù hợp cho từng thuộc tính: kéo về, nhận vào mã, hay bỏ qua có chủ đích.</Check>
+
+<Check id="d10.4.mastery-import">Đưa được một tài nguyên tạo tay vào quản lý bằng khối `import` sao cho plan sau đó không sửa gì trên tài nguyên.</Check>
+
+<Check id="d10.4.mastery-refactor">Đổi tên hoặc gỡ một resource khỏi mã mà không tạo ra hành động xoá ngoài ý muốn, và giải thích được vì sao khối khai báo tốt hơn lệnh sửa state.</Check>
+
+</Mastery>

@@ -1,0 +1,852 @@
+---
+title: "TLS trên production: ACME, xoay chứng chỉ, cipher và CA nội bộ"
+description: Dựng một CA nội bộ bằng step-ca với root cất ngoại tuyến, cho certbot xin và gia hạn chứng chỉ qua ACME rồi thay chứng chỉ trên Nginx dưới tải mà không rớt request, siết phiên bản TLS và cipher theo khuyến nghị của Mozilla, bật HSTS, xem OCSP stapling còn lại gì, và cho hai service xác thực nhau bằng mTLS với chứng chỉ một giờ.
+id: d21.4
+step: d21
+prerequisites: [d21.1, d2.3]
+topics: [d21.tls-production, d21.pki-noi-bo]
+status: verified
+verified:
+  date: 2026-10-11
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    step-ca: 0.30.2
+    step-cli: 0.31.0
+    certbot: 4.0.0
+    nginx: 1.28.3
+    openssl: 3.5.5
+    sslscan: 2.1.5
+    curl: 8.18.0
+---
+
+<Goal>
+
+D2.3 ký chứng chỉ bằng tay với `openssl`. Trên production không ai làm tay: chứng chỉ có hạn vài chục ngày, và một lần quên gia hạn là một sự cố. Bài này tự động hoá toàn bộ vòng đời chứng chỉ và dựng một CA nội bộ đúng nghĩa. Học xong, bạn giải thích được:
+
+- ACME chứng minh bạn sở hữu tên miền bằng cách nào, và vì sao chứng chỉ 45 ngày khiến tự động hoá thành bắt buộc.
+- Vì sao có hệ thống gia hạn thành công mà vẫn sập vì chứng chỉ hết hạn, và một dòng `deploy-hook` sửa chuyện đó thế nào.
+- Vì sao `ssl_stapling on` giờ chỉ còn in ra một dòng cảnh báo với chứng chỉ Let's Encrypt.
+- Chọn `ssl_protocols` và `ssl_ciphers` theo đâu, và vì sao HSTS là header dễ bật khó gỡ.
+- Vì sao root của CA nội bộ nằm ngoại tuyến, vì sao chứng chỉ nội bộ nên sống vài giờ, và mTLS chứng minh được gì, không chứng minh được gì.
+
+</Goal>
+
+<Knowledge>
+
+### ACME: xin chứng chỉ không cần người
+
+**ACME** (RFC 8555) là giao thức để một phần mềm (client) xin chứng chỉ từ CA mà không có người tham gia. Phần khó nhất của việc cấp chứng chỉ là CA phải chắc rằng người xin **kiểm soát** tên miền. ACME giải bằng một **challenge**:
+
+```text
+ certbot (ACME client)                        CA (Let's Encrypt, step-ca)                  web server
+   │ 1. tạo khoá tài khoản, đăng ký ─────────────► │                                            │
+   │ 2. "tôi muốn chứng chỉ cho www.lab.internal"─► │                                            │
+   │ ◄──── 3. "đặt token X ở đường dẫn sau" ─────── │                                            │
+   │ 4. ghi file /.well-known/acme-challenge/X ───────────────────────────────────────────────► │
+   │ 5. "xong, kiểm đi" ──────────────────────────► │ 6. GET http://www.lab.internal/.well-known/acme-challenge/X
+   │                                                │ ─────────────────────────────────────────► │
+   │                                                │ ◄──────────────── nội dung khớp token ──── │
+   │ 7. gửi CSR (khoá riêng không rời máy) ───────► │                                            │
+   │ ◄──── 8. chứng chỉ lá kèm intermediate ─────── │                                            │
+```
+
+| Challenge | CA kiểm gì | Cần gì | Giới hạn |
+|---|---|---|---|
+| `HTTP-01` | Một file ở port 80 của tên miền | Port 80 mở cho CA | Không cấp được wildcard; mỗi máy sau load balancer phải trả được file |
+| `DNS-01` | Một bản ghi TXT `_acme-challenge.<tên>` | API của nhà cung cấp DNS | Khoá API DNS là thứ rất nhạy cảm. Cấp được wildcard, không cần mở port |
+| `TLS-ALPN-01` | Một chứng chỉ đặc biệt ở port 443 | Web server hoặc proxy hỗ trợ | Ít công cụ hỗ trợ hơn |
+
+Vì sao phải tự động: hạn chứng chỉ công khai đang ngắn dần. D2.3 đã nêu lộ trình 47 ngày của CA/Browser Forum. Let's Encrypt [công bố](https://letsencrypt.org/2025/12/02/from-90-to-45) sẽ giảm hạn từ 90 xuống 45 ngày vào năm 2028, và từ 13/05/2026 profile `tlsserver` của họ đã cấp chứng chỉ 45 ngày. Gia hạn bằng tay mỗi sáu tuần cho vài chục tên miền không phải là một quy trình, đó là một sự cố đang chờ ngày.
+
+Client hay gặp: **certbot** (bài này), acme.sh, Caddy (ACME có sẵn trong web server, D2.5), cert-manager trong Kubernetes (K6). Let's Encrypt có giới hạn số chứng chỉ mỗi tuần cho một tên miền, nên khi thử nghiệm hãy dùng môi trường staging của họ hoặc một CA ACME cục bộ như bài này.
+
+<Check id="d21.4.acme">Kể được các bước của một lượt xin chứng chỉ qua ACME, chọn được loại challenge cho ba tình huống (một web server, wildcard, nhiều máy sau load balancer), và nói được vì sao hạn chứng chỉ ngắn dần.</Check>
+
+### Xoay chứng chỉ không gián đoạn
+
+Gia hạn có hai nửa, và sự cố thường nằm ở nửa sau:
+
+1. **Lấy chứng chỉ mới về đĩa.** Client chạy định kỳ (gói `certbot` của Ubuntu cài sẵn một systemd timer chạy hai lần mỗi ngày) và gia hạn khi chứng chỉ gần hết hạn.
+2. **Cho server dùng chứng chỉ mới.** Nginx đọc file chứng chỉ **lúc khởi động và lúc reload**, rồi giữ trong bộ nhớ. File trên đĩa mới tinh không có nghĩa gì nếu không ai reload.
+
+Kịch bản kinh điển: certbot gia hạn đều đặn, thư mục `live/` luôn có chứng chỉ mới, nhưng không có **deploy hook**; Nginx vẫn phục vụ chứng chỉ nạp từ lần khởi động cách đó ba tháng, và một đêm nó hết hạn. Hook phải là `reload`, không phải `restart` (D9.1 đã đo khác biệt). Ba thói quen đi kèm:
+
+- **Khoá mới cho mỗi chứng chỉ mới.** certbot làm vậy mặc định. Dùng lại khoá cũ thì khoá lộ một lần là lộ mãi.
+- **Giám sát hạn từ bên ngoài**, trên chứng chỉ server thật sự trả về, không phải trên file: `openssl s_client ... | openssl x509 -checkend` (D2.3), hoặc metric `probe_ssl_earliest_cert_expiry` của blackbox exporter (D12). Báo động khi còn dưới một phần ba hạn.
+- **Nhiều máy sau load balancer:** hoặc kết thúc TLS ở một tầng duy nhất, hoặc dùng `DNS-01` để mỗi máy tự xin, hoặc một nơi xin rồi phân phối bằng công cụ quản lý cấu hình (D8). Đừng chép tay.
+
+<Callout kind="production">
+
+Ngày 29/02/2020, Let's Encrypt phát hiện một lỗi trong đoạn code kiểm bản ghi CAA của chính họ. Theo [thông báo sự cố](https://community.letsencrypt.org/t/2020-02-29-caa-rechecking-bug/114591), quy định của ngành buộc họ thu hồi những chứng chỉ cấp không đúng chuẩn: khoảng 3 triệu chứng chỉ, tức 2,6% số đang hoạt động, với hạn chót là 03:00 UTC ngày 05/03/2020. Theo thông báo, hơn 1,7 triệu chứng chỉ bị ảnh hưởng đã được chủ nhân thay trong chưa đầy 48 giờ, và số đó bị thu hồi đúng hạn; với phần còn lại, Let's Encrypt quyết định chưa thu hồi ngay để không làm hỏng hàng loạt trang web. Bài học cho người vận hành, theo cách đọc của bài này: lịch gia hạn không hoàn toàn do bạn quyết định. CA có thể yêu cầu bạn thay chứng chỉ trong vài ngày, thậm chí vài chục giờ, vì lỗi của họ, và chỉ hệ thống gia hạn tự động, có hook reload, mới biến chuyện đó thành không có gì đáng kể.
+
+</Callout>
+
+<Check id="d21.4.rotation">Giải thích được vì sao chứng chỉ mới trên đĩa chưa có tác dụng cho tới khi server reload, kể được vai trò của deploy hook, và nêu được cách giám sát hạn chứng chỉ từ bên ngoài.</Check>
+
+### OCSP, phiên bản TLS, cipher và HSTS
+
+**OCSP** là giao thức để client hỏi CA "chứng chỉ này còn hiệu lực không". **OCSP stapling** để server tự hỏi trước và kẹp câu trả lời vào bắt tay TLS, đỡ cho client một lượt hỏi và che cho CA khỏi biết ai đang truy cập trang nào. Năm 2026, với chứng chỉ công khai phổ biến nhất, phần này đã thành lịch sử: Let's Encrypt [tắt hẳn dịch vụ OCSP ngày 06/08/2025](https://letsencrypt.org/2025/08/06/ocsp-service-has-reached-end-of-life/) và chỉ còn công bố thu hồi qua CRL; chứng chỉ của họ không còn chứa địa chỉ OCSP. Trình duyệt lớn kiểm thu hồi bằng danh sách gộp tải sẵn, không hỏi từng chứng chỉ. Hệ quả thực tế: `ssl_stapling on` với chứng chỉ không có địa chỉ OCSP không làm gì ngoài in cảnh báo (bước 4), và bộ khuyến nghị của Mozilla (guidelines 6.0) vẫn còn bật mục OCSP stapling. Với CA thương mại còn chạy OCSP thì stapling vẫn có tác dụng.
+
+**Phiên bản và cipher.** Đừng tự nghĩ danh sách cipher; lấy từ [Mozilla SSL Configuration Generator](https://ssl-config.mozilla.org/), nơi có ba mức:
+
+| Mức | Phiên bản TLS | Dùng khi |
+|---|---|---|
+| Modern | Chỉ 1.3 | Client là trình duyệt và thư viện mới; API nội bộ |
+| Intermediate | 1.2 và 1.3, TLS 1.2 chỉ với cipher AEAD có forward secrecy | Mặc định nên chọn cho dịch vụ công khai |
+| Old | Từ 1.0 | Chỉ khi buộc phải phục vụ client rất cũ |
+
+Nginx 1.28 đã mặc định `ssl_protocols TLSv1.2 TLSv1.3`, nhưng `ssl_ciphers` mặc định còn rộng hơn mức Intermediate (bước 4 đếm cho bạn). TLS 1.3 chỉ có vài bộ cipher, đều tốt, nên không cần chọn.
+
+**HSTS** (HTTP Strict Transport Security, RFC 6797) là header `Strict-Transport-Security: max-age=<giây>`. Trình duyệt đã thấy nó sẽ **tự đổi** mọi `http://` của tên miền đó thành `https://` trong `max-age` giây và không cho người dùng bấm bỏ qua lỗi chứng chỉ. Nó đóng lỗ hổng ở lần chuyển hướng `301` đầu tiên, vốn đi qua HTTP không mã hoá. Cái giá: trong `max-age`, bạn **không quay lại HTTP được**, và chứng chỉ hỏng là người dùng bị chặn hẳn. Bật theo nấc: 300 giây, rồi một tuần, rồi hai năm (mức Mozilla khuyên). `includeSubDomains` kéo theo mọi tên miền con, kể cả những cái chưa có HTTPS; `preload` đưa tên miền vào danh sách cài cứng trong trình duyệt và gỡ ra mất hàng tháng.
+
+<Check id="d21.4.tls-config">Nói được tình trạng của OCSP stapling với chứng chỉ Let's Encrypt hiện nay, chọn được mức Modern hay Intermediate cho một dịch vụ, và giải thích được vì sao HSTS nên bật từ `max-age` nhỏ.</Check>
+
+### PKI nội bộ
+
+CA công khai chỉ cấp cho tên miền công khai. Service nội bộ (`orders.internal`, tên pod, tên một job) cần một **PKI nội bộ**: CA của riêng tổ chức, mà mọi máy trong tổ chức được cấu hình để tin.
+
+| | CA công khai | CA nội bộ |
+|---|---|---|
+| Ai tin | Mọi trình duyệt, hệ điều hành | Chỉ máy đã cài root của bạn (D2.3: trust store của hệ thống, JVM có trust store riêng) |
+| Cấp cho | Tên miền công khai | Bất kỳ tên nào bạn cho phép, kể cả danh tính của service |
+| Hạn chứng chỉ | 45–90 ngày | Tuỳ bạn: vài giờ tới vài ngày |
+| Chứng chỉ client (mTLS) | Hầu như không | Mục đích chính |
+
+Cấu trúc ba tầng giống D2.3, nhưng do một **CA server** vận hành thay cho các lệnh `openssl`:
+
+```text
+ Root CA            khoá NGOẠI TUYẾN (két, HSM). Chỉ dùng để ký intermediate, vài năm một lần.
+   │ ký
+ Intermediate CA    khoá nằm trên CA server đang chạy. Lộ thì thay intermediate, root vẫn nguyên.
+   │ ký, qua các provisioner
+ Chứng chỉ lá       hạn ngắn, tự gia hạn. Mỗi service một danh tính.
+```
+
+Một **provisioner** là một cửa để xin chứng chỉ, kèm cách chứng minh danh tính: ACME (chứng minh kiểm soát tên), JWK (có mật khẩu của provisioner), OIDC (đăng nhập SSO, cho người), danh tính máy của cloud hay ServiceAccount của Kubernetes (cho workload).
+
+**Hạn ngắn thay cho thu hồi.** D2.3 đã nói thu hồi không đáng tin vì client hiếm khi kiểm. PKI nội bộ đi tới cùng ý đó: chứng chỉ sống 24 giờ hoặc ngắn hơn, service tự gia hạn khi được khoảng hai phần ba hạn, và "thu hồi" nghĩa là **CA từ chối gia hạn**. Chứng chỉ bị lộ tự hết giá trị sau vài giờ mà không cần ai phân phối danh sách thu hồi.
+
+**mTLS** (D2.3 đã nêu khái niệm) là server cũng đòi client xuất trình chứng chỉ. Cần tách hai câu hỏi:
+
+- **Xác thực:** chứng chỉ này có do CA của ta cấp và còn hạn không. TLS trả lời.
+- **Phân quyền:** danh tính trong chứng chỉ (`CN=payments`) có được gọi API này không. TLS **không** trả lời; bạn phải viết luật. Bật mTLS mà không có luật phân quyền nghĩa là mọi service có chứng chỉ đều gọi được mọi thứ.
+
+Đi sâu hơn là việc của D15 (workload identity, SPIFFE) và K11 (service mesh làm mTLS tự động cho mọi pod).
+
+<Check id="d21.4.pki">Vẽ được ba tầng của một PKI nội bộ và nói được khoá nào nằm ở đâu; giải thích được provisioner, vì sao hạn ngắn thay được thu hồi, và phân biệt được xác thực với phân quyền trong mTLS.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [RFC 8555: Automatic Certificate Management Environment (ACME)](https://www.rfc-editor.org/rfc/rfc8555): mục 7 về tài khoản, order và finalize; mục 8 về các challenge.
+- [Let's Encrypt: Challenge Types](https://letsencrypt.org/docs/challenge-types/): ưu nhược của HTTP-01, DNS-01, TLS-ALPN-01, viết bởi chính CA.
+- [Certbot User Guide](https://eff-certbot.readthedocs.io/en/stable/using.html): các plugin (`webroot`, `nginx`, DNS), `renew`, và các loại hook.
+- [Mozilla: Security/Server Side TLS](https://wiki.mozilla.org/Security/Server_Side_TLS): lý do đằng sau ba mức Modern, Intermediate, Old; kèm [công cụ sinh cấu hình](https://ssl-config.mozilla.org/).
+- [Let's Encrypt: 2020.02.29 CAA Rechecking Bug](https://community.letsencrypt.org/t/2020-02-29-caa-rechecking-bug/114591): thông báo sự cố và các bản cập nhật; nguồn của callout trong bài.
+- [step-ca: Production considerations](https://smallstep.com/docs/step-ca/certificate-authority-server-production/): cất khoá root, HSM, hạn chứng chỉ, sao lưu; đọc trước khi chạy CA nội bộ thật.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** VM Lima (2 CPU, 2 GiB) có `~/masteva-d21/topo.sh` của D9.1. Bài không cần thư mục `pki` của D2.3: CA của bài này tự tạo root và intermediate. Lab chạy step-ca, một Nginx và certbot, tốn khoảng 150 MB; máy 8 GB không cần thu gọn.
+
+`certbot`, `nginx`, `sslscan` có trong kho của Ubuntu. `step` (CLI) và `step-ca` (CA server) thì không, nên tải gói `.deb` từ trang phát hành của Smallstep rồi cài bằng `apt`:
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update && sudo apt-get install -y nginx certbot sslscan curl openssl
+sudo systemctl disable --now nginx
+ARCH=$(dpkg --print-architecture)
+mkdir -p /tmp/d21-dl && cd /tmp/d21-dl
+curl -fsSLO "https://dl.smallstep.com/gh-release/cli/gh-release-header/v0.31.0/step-cli_0.31.0-1_${ARCH}.deb"
+curl -fsSLO "https://dl.smallstep.com/gh-release/certificates/gh-release-header/v0.30.2/step-ca_0.30.2-1_${ARCH}.deb"
+sudo apt-get install -y ./step-cli_0.31.0-1_${ARCH}.deb ./step-ca_0.30.2-1_${ARCH}.deb
+step version | head -1; step-ca version | head -1; certbot --version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Smallstep CLI/0.31.0 (linux/arm64)
+Smallstep CA/0.30.2 (linux/arm64)
+certbot 4.0.0
+```
+
+</Expected>
+
+Gói tải ngoài kho thì không được `apt` kiểm chữ ký. Smallstep công bố `checksums.txt` kèm chữ ký cho mỗi bản phát hành; trên máy thật hãy đối chiếu trước khi cài (D14 dạy chuỗi cung ứng phần mềm). Trên máy Intel, dòng phiên bản in `linux/amd64`.
+
+Dựng mạng và đặt tên. Lab không chạy DNS, nên ba tên được ghi vào `/etc/hosts` của VM, kèm một nhãn để dọn dẹp sau:
+
+<Terminal where="vm">
+
+```bash
+sudo ~/masteva-d21/topo.sh up
+mkdir -p ~/masteva-d21/tls/sites && cd ~/masteva-d21/tls
+printf '%s\n' '10.9.0.1 ca.lab.internal # masteva-d21' \
+  '10.9.0.11 www.lab.internal internal.lab.internal # masteva-d21' | sudo tee -a /etc/hosts >/dev/null
+getent hosts ca.lab.internal www.lab.internal
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10.9.0.1        ca.lab.internal
+10.9.0.11       www.lab.internal internal.lab.internal
+```
+
+</Expected>
+
+```text
+ VM 10.9.0.1                                   lb1 10.9.0.11
+   step-ca  https://ca.lab.internal:9443         Nginx :80   www.lab.internal (challenge ACME, chuyển hướng)
+   certbot, curl (client)                              :443  www.lab.internal (chứng chỉ từ ACME)
+                                                       :8443 internal.lab.internal (mTLS)
+```
+
+Các hàm và biến của bài. `STEPPATH` đặt mọi thứ của `step` vào thư mục lab thay vì `~/.step`:
+
+<Terminal where="vm" title="~/masteva-d21/tls/tls.sh">
+
+```bash
+cat > ~/masteva-d21/tls/tls.sh <<'EOF'
+# Hàm của lab D9.4. Nạp bằng: . ~/masteva-d21/tls/tls.sh
+T=$HOME/masteva-d21/tls
+export STEPPATH=$T/step
+ROOT=$STEPPATH/certs/root_ca.crt
+ngx() { sudo ip netns exec lb1 nginx -c "$T/nginx.conf" "$@"; }
+cb() {    # certbot dùng thư mục của lab và CA ACME cục bộ
+  REQUESTS_CA_BUNDLE=$ROOT certbot --config-dir "$T/certbot/config" --work-dir "$T/certbot/work" \
+    --logs-dir "$T/certbot/logs" --server https://ca.lab.internal:9443/acme/acme/directory "$@"
+}
+served() {   # served [port]: serial và hạn của chứng chỉ mà server đang trả
+  echo | openssl s_client -connect "10.9.0.11:${1:-443}" -servername www.lab.internal 2>/dev/null |
+    openssl x509 -noout -serial -enddate | tr '\n' ' '; echo
+}
+scan() {     # phiên bản TLS được bật và số cipher được chấp nhận ở mỗi phiên bản
+  sslscan --no-colour --sni=www.lab.internal 10.9.0.11:443 | awk '
+    $1 ~ /^(SSLv|TLSv)/ && ($2 == "enabled" || $2 == "disabled") { print $1, $2 }
+    $1 == "Accepted" || $1 == "Preferred" { n[$2]++ }
+    END { for (v in n) print "so cipher " v ": " n[v] }'
+}
+issue() {    # issue <tên> [tuỳ chọn]: xin chứng chỉ <tên>.crt và <tên>.key từ provisioner admin
+  step ca certificate "$1" "$T/$1.crt" "$T/$1.key" --provisioner admin \
+    --provisioner-password-file "$T/ca-password.txt" "${@:2}" >/dev/null 2>&1 &&
+    step certificate inspect "$T/$1.crt" --short | sed -n '2p;5,6p'
+}
+EOF
+. ~/masteva-d21/tls/tls.sh
+```
+
+</Terminal>
+
+### 1. Một CA nội bộ, root cất ngoại tuyến
+
+`step ca init` tạo root, intermediate và file cấu hình trong một lệnh. Mật khẩu mã hoá các khoá được sinh ngẫu nhiên vào một file chỉ bạn đọc được:
+
+<Terminal where="vm">
+
+```bash
+( umask 077; openssl rand -base64 24 > ca-password.txt )
+step ca init --deployment-type standalone --name "Masteva Lab" --dns ca.lab.internal \
+  --address 10.9.0.1:9443 --provisioner admin --password-file ca-password.txt --acme >/dev/null 2>&1
+find step -type f | sort
+step certificate inspect step/certs/intermediate_ca.crt --short
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+step/certs/intermediate_ca.crt
+step/certs/root_ca.crt
+step/config/ca.json
+step/config/defaults.json
+step/secrets/intermediate_ca_key
+step/secrets/root_ca_key
+X.509v3 Intermediate CA Certificate (ECDSA P-256) [Serial: 9127...3406]
+  Subject:     Masteva Lab Intermediate CA
+  Issuer:      Masteva Lab Root CA
+  Valid from:  2026-10-11T03:18:05Z
+          to:  2036-10-08T03:18:05Z
+```
+
+</Expected>
+
+Cấu trúc y như D2.3 dựng bằng tay: root tự ký, intermediate do root ký. `--provisioner admin` tạo một provisioner kiểu JWK (xin chứng chỉ bằng mật khẩu), `--acme` thêm một provisioner ACME. Khoá riêng của root giờ không còn việc gì để làm cho tới lần ký intermediate kế tiếp. Lấy nó ra khỏi CA server rồi mới chạy CA:
+
+<Terminal where="vm">
+
+```bash
+mkdir -p offline && mv step/secrets/root_ca_key offline/
+grep -E '"(root|crt|key)":' step/config/ca.json | head -3 | sed "s#$HOME#~#"
+step-ca step/config/ca.json --password-file ca-password.txt > ca.log 2>&1 &
+sleep 2; grep -o 'Serving HTTPS.*' ca.log
+curl -s --cacert "$ROOT" https://ca.lab.internal:9443/health
+step ca provisioner list | grep -E '"(type|name)"' | tr -d ' ,' | paste -d' ' - -
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+	"root": "~/masteva-d21/tls/step/certs/root_ca.crt",
+	"crt": "~/masteva-d21/tls/step/certs/intermediate_ca.crt",
+	"key": "~/masteva-d21/tls/step/secrets/intermediate_ca_key",
+Serving HTTPS on 10.9.0.1:9443 ...
+{"status":"ok"}
+"type":"JWK" "name":"admin"
+"type":"ACME" "name":"acme"
+```
+
+</Expected>
+
+CA khởi động và hoạt động bình thường khi không có khoá root: cấu hình của nó chỉ trỏ tới **chứng chỉ** root (công khai) và **khoá** intermediate. Trong lab, "ngoại tuyến" là một thư mục bên cạnh; ngoài đời đó là một thiết bị không nối mạng hoặc HSM, và CA server chạy như một service systemd với khoá intermediate cũng nằm trong HSM hoặc KMS nếu được. `curl` phải có `--cacert` vì chưa máy nào tin root này: việc phân phối root tới trust store của mọi máy (D2.3 bước 7, hoặc `step certificate install`) là một phần của dựng PKI.
+
+<Check id="d21.4.lab-ca">Dựng được một CA bằng `step ca init`, chỉ ra được file nào là khoá của root và của intermediate, và chứng minh được CA vẫn cấp chứng chỉ khi khoá root đã được lấy đi.</Check>
+
+### 2. Xin chứng chỉ qua ACME bằng certbot
+
+Nginx cần trả được file challenge ở port 80. Thư mục chứa file đó đặt ở `/srv` vì worker của Nginx không đọc được thư mục home (D9.1). Cấu hình chính chỉ `include` các file trong `sites/`, để mỗi bước thêm một file:
+
+<Terminal where="vm" title="~/masteva-d21/tls/nginx.conf">
+
+```bash
+sudo install -d -o "$(id -un)" -g "$(id -gn)" /srv/masteva-d21/acme
+cat > nginx.conf <<'EOF'
+user www-data;
+worker_processes 1;
+pid LAB/tls/nginx.pid;
+error_log LAB/tls/error.log warn;
+events { worker_connections 1024; }
+http {
+  access_log off;
+  include LAB/tls/sites/*.conf;
+}
+EOF
+cat > sites/www-http.conf <<'EOF'
+server {
+  listen 10.9.0.11:80;
+  server_name www.lab.internal;
+  location /.well-known/acme-challenge/ { root /srv/masteva-d21/acme; }
+  location / { return 301 https://$host$request_uri; }
+}
+EOF
+sed -i "s#LAB#$HOME/masteva-d21#g" nginx.conf
+ngx -t 2>&1 | tail -1 | cut -d' ' -f5-; ngx
+cb certonly --non-interactive --register-unsafely-without-email \
+  --webroot -w /srv/masteva-d21/acme -d www.lab.internal 2>&1 | grep -E 'Successfully|expires'
+ls certbot/config/live/www.lab.internal/ | tr '\n' ' '; echo
+openssl x509 -in certbot/config/live/www.lab.internal/cert.pem -noout -issuer -dates -ext subjectAltName
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+test is successful
+Successfully received certificate.
+This certificate expires on 2026-10-12.
+README cert.pem chain.pem fullchain.pem privkey.pem 
+issuer=O=Masteva Lab, CN=Masteva Lab Intermediate CA
+notBefore=Oct 11 03:17:07 2026 GMT
+notAfter=Oct 12 03:18:07 2026 GMT
+X509v3 Subject Alternative Name: critical
+    DNS:www.lab.internal
+```
+
+</Expected>
+
+Đúng sơ đồ ở phần Kiến thức: certbot đăng ký tài khoản với CA, ghi token vào `/srv/masteva-d21/acme/.well-known/acme-challenge/`, step-ca gọi `http://www.lab.internal/...` qua Nginx để kiểm, rồi ký. Vài điểm đáng chú ý:
+
+- Chứng chỉ có hạn **24 giờ**, mặc định của step-ca. `notBefore` lùi một phút so với lúc cấp để dung sai đồng hồ lệch giữa các máy. `fullchain.pem` là lá kèm intermediate, thứ Nginx cần (D2.3 bước 5 cho thấy điều gì xảy ra khi thiếu intermediate).
+- `cb` là certbot trỏ vào CA của lab. Với Let's Encrypt, bỏ `--server` (mặc định là Let's Encrypt), thêm địa chỉ email thật thay cho `--register-unsafely-without-email` và `--agree-tos` sau khi đã đọc điều khoản của họ; CA của lab không có điều khoản nào để đồng ý.
+- `--webroot` chỉ ghi file, không đụng tới cấu hình Nginx. Plugin `--nginx` tự sửa cấu hình giúp bạn, tiện cho máy đơn lẻ nhưng khó kiểm soát khi cấu hình do công cụ khác quản lý.
+
+Giờ thêm virtual host HTTPS dùng chứng chỉ vừa nhận:
+
+<Terminal where="vm">
+
+```bash
+cat > sites/www-https.conf <<'EOF'
+server {
+  listen 10.9.0.11:443 ssl;
+  http2 on;
+  server_name www.lab.internal;
+  ssl_certificate     LAB/tls/certbot/config/live/www.lab.internal/fullchain.pem;
+  ssl_certificate_key LAB/tls/certbot/config/live/www.lab.internal/privkey.pem;
+  include LAB/tls/tls-params.conf;
+  location / { return 200 "xin chao qua TLS\n"; }
+}
+EOF
+sed -i "s#LAB#$HOME/masteva-d21#g" sites/www-https.conf
+touch tls-params.conf
+ngx -t 2>&1 | tail -1 | cut -d' ' -f5-; ngx -s reload 2>/dev/null; sleep 1
+curl -s --cacert "$ROOT" https://www.lab.internal/
+served
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+test is successful
+xin chao qua TLS
+serial=489E80F2E672EC43092FE15252138921 notAfter=Oct 12 03:18:07 2026 GMT 
+```
+
+</Expected>
+
+`tls-params.conf` còn rỗng; bước 4 điền vào. `served` in serial và hạn của chứng chỉ mà server **đang trả**, thứ duy nhất đáng tin khi kiểm việc xoay chứng chỉ. Serial và ngày giờ trên máy bạn sẽ khác.
+
+<Check id="d21.4.lab-acme">Xin được chứng chỉ từ một CA ACME bằng certbot với challenge HTTP-01 qua webroot, và cấu hình được Nginx dùng `fullchain.pem`, `privkey.pem` trong thư mục `live/`.</Check>
+
+### 3. Gia hạn và thay chứng chỉ dưới tải
+
+Hook triển khai là một script nhỏ reload Nginx. certbot ghi nhớ hook này trong cấu hình gia hạn của chứng chỉ, các lần sau tự dùng lại:
+
+<Terminal where="vm">
+
+```bash
+cat > reload-nginx.sh <<EOF
+#!/bin/sh
+# Deploy hook: chạy sau mỗi lần certbot nhận chứng chỉ mới
+exec sudo ip netns exec lb1 nginx -c $HOME/masteva-d21/tls/nginx.conf -s reload 2>/dev/null
+EOF
+chmod +x reload-nginx.sh
+( for i in $(seq 60); do
+    curl -s --cacert "$ROOT" -o /dev/null -w '%{http_code}\n' https://www.lab.internal/; sleep 0.05
+  done | sort | uniq -c ) & p=$!
+sleep 0.5
+cb renew --force-renewal --no-random-sleep-on-renew --deploy-hook "$PWD/reload-nginx.sh" 2>&1 | grep -E 'Renewing|succeeded'
+wait $p
+served
+ls certbot/config/archive/www.lab.internal/ | tr '\n' ' '; echo
+grep renew_hook certbot/config/renewal/www.lab.internal.conf | sed "s#$HOME#~#"
+```
+
+</Terminal>
+
+<Predict question="Trong lúc 60 request đang chạy, certbot lấy chứng chỉ mới và Nginx reload. Có request nào lỗi không? Serial của chứng chỉ server trả có đổi không?">
+
+```text
+Renewing an existing certificate for www.lab.internal
+Congratulations, all renewals succeeded: 
+     60 200
+serial=3820E6EA0AD6E3FBAAF691A6462C3AED notAfter=Oct 12 03:18:12 2026 GMT 
+cert1.pem cert2.pem chain1.pem chain2.pem fullchain1.pem fullchain2.pem privkey1.pem privkey2.pem 
+renew_hook = ~/masteva-d21/tls/reload-nginx.sh
+```
+
+Không request nào lỗi, và serial đã đổi. certbot ghi bộ file thứ hai (`cert2.pem`, `privkey2.pem`: khoá cũng mới) vào `archive/` rồi trỏ các symlink trong `live/` sang đó; hook reload Nginx, worker mới đọc chứng chỉ mới, worker cũ phục vụ nốt kết nối đang dở bằng chứng chỉ cũ (D9.1). Đường dẫn trong cấu hình Nginx không đổi, đó là lý do phải trỏ vào `live/` chứ không phải `archive/`.
+
+</Predict>
+
+Ba chi tiết của lệnh `renew`:
+
+- `--no-random-sleep-on-renew`: khi không chạy từ terminal, `certbot renew` tự ngủ một khoảng ngẫu nhiên tới 8 phút trước khi làm việc, để hàng triệu máy chạy cron cùng giờ không dội vào CA cùng lúc. Bài tắt nó để khỏi chờ; trên máy thật cứ để nguyên.
+- `--force-renewal`: gia hạn ngay bất kể chứng chỉ còn bao lâu, để kết quả của lab không phụ thuộc phiên bản certbot. Gói certbot 4.0.0 của Ubuntu 26.04 coi chứng chỉ còn dưới 30 ngày là tới hạn, nên chứng chỉ 24 giờ của lab đằng nào cũng luôn "tới hạn"; certbot từ 4.1 (bản hiện hành của dự án là 5.x) còn hỏi thêm ARI của CA để chọn thời điểm. Trên production **đừng** dùng cờ này trong cron: mỗi lần chạy sẽ xin một chứng chỉ mới và chạm giới hạn của CA. Với chứng chỉ hạn rất ngắn, hãy chạy `certbot renew` đủ dày (vài giờ một lần) hoặc dùng công cụ tính theo tỉ lệ hạn như `step ca renew --daemon` ở bước 6.
+
+Thử bỏ quên hook, kịch bản của phần Kiến thức:
+
+<Terminal where="vm">
+
+```bash
+sed -i '/^renew_hook/d' certbot/config/renewal/www.lab.internal.conf
+cb renew --force-renewal --no-random-sleep-on-renew 2>&1 | grep -E 'succeeded'
+openssl x509 -in certbot/config/live/www.lab.internal/cert.pem -noout -serial
+served
+./reload-nginx.sh; sleep 1; served
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Congratulations, all renewals succeeded: 
+serial=DED838EAEA85785FDE17476F9C10D096
+serial=3820E6EA0AD6E3FBAAF691A6462C3AED notAfter=Oct 12 03:18:12 2026 GMT 
+serial=DED838EAEA85785FDE17476F9C10D096 notAfter=Oct 12 03:18:15 2026 GMT 
+```
+
+</Expected>
+
+Gia hạn "thành công", file trên đĩa mang serial mới, nhưng server vẫn trả chứng chỉ cũ cho tới khi có người reload. Giám sát file trên đĩa sẽ báo mọi thứ ổn cho tới phút chứng chỉ trong bộ nhớ hết hạn.
+
+<Check id="d21.4.lab-rotate">Gia hạn được chứng chỉ bằng `certbot renew` với deploy hook trong lúc có traffic mà không request nào lỗi, và tái hiện được tình huống thiếu hook: file mới, server vẫn trả chứng chỉ cũ.</Check>
+
+### 4. Phiên bản TLS, cipher, HSTS và OCSP
+
+Xem Nginx đang chấp nhận gì khi chưa cấu hình:
+
+<Terminal where="vm">
+
+```bash
+scan
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+SSLv2 disabled
+SSLv3 disabled
+TLSv1.0 disabled
+TLSv1.1 disabled
+TLSv1.2 enabled
+TLSv1.3 enabled
+so cipher TLSv1.2: 13
+so cipher TLSv1.3: 3
+```
+
+</Expected>
+
+Phiên bản đã ổn, nhưng TLS 1.2 nhận 13 bộ cipher, trong đó có các bộ dùng CBC mà mức Intermediate của Mozilla đã loại. Điền `tls-params.conf` theo mức Intermediate, thêm HSTS với `max-age` nhỏ, và thử cả `ssl_stapling`:
+
+<Terminal where="vm" title="~/masteva-d21/tls/tls-params.conf">
+
+```bash
+cat > tls-params.conf <<'EOF'
+# Mức Intermediate của Mozilla (guidelines 6.0)
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ecdh_curve X25519MLKEM768:X25519:prime256v1:secp384r1;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers off;
+ssl_session_timeout 1d;
+ssl_session_cache shared:TLS:10m;
+ssl_stapling on;
+add_header Strict-Transport-Security "max-age=300" always;
+EOF
+ngx -t 2>&1 | grep -o '"ssl_stapling" ignored[^"]*' | head -1
+ngx -s reload 2>/dev/null; sleep 1
+scan | grep cipher
+echo | openssl s_client -connect 10.9.0.11:443 -servername www.lab.internal -groups X25519MLKEM768 2>/dev/null | grep -i 'group'
+echo | openssl s_client -connect 10.9.0.11:443 -servername www.lab.internal -status 2>/dev/null | grep 'OCSP response'
+curl -sI --cacert "$ROOT" https://www.lab.internal/ | grep -i strict
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+"ssl_stapling" ignored, no OCSP responder URL in the certificate 
+so cipher TLSv1.2: 3
+so cipher TLSv1.3: 3
+Negotiated TLS1.3 group: X25519MLKEM768
+OCSP response: no response sent
+strict-transport-security: max-age=300
+```
+
+</Expected>
+
+- TLS 1.2 còn 3 bộ cipher: ba bộ `ECDHE-ECDSA` trong danh sách (chứng chỉ của lab dùng khoá ECDSA nên các bộ `ECDHE-RSA` không áp dụng). `ssl_ecdh_curve` mở đầu bằng `X25519MLKEM768`, nhóm trao đổi khoá lai kháng lượng tử mà guidelines 6.0 đưa lên đầu; nếu bạn ghi danh sách này mà bỏ sót nó, client chỉ chào nhóm đó sẽ không bắt tay được.
+- Client chỉ chào nhóm `X25519MLKEM768` (cờ `-groups`) bắt tay được, và đó là nhóm được chọn: trao đổi khoá lai kháng lượng tử đã chạy với Nginx 1.28 và OpenSSL 3.5 của Ubuntu 26.04.
+- `ssl_stapling` bị bỏ qua: chứng chỉ của step-ca không có địa chỉ OCSP, giống chứng chỉ Let's Encrypt từ 2025. Client hỏi stapling thì nhận `no response sent`. Dòng cấu hình vô hại nhưng vô dụng; gỡ đi để log khỏi có cảnh báo mỗi lần reload.
+
+HSTS thì cần một client biết nhớ. curl làm được với `--hsts <file>`:
+
+<Terminal where="vm">
+
+```bash
+sed -i '/ssl_stapling/d' tls-params.conf; ngx -s reload 2>/dev/null
+H=/tmp/d21-hsts.txt; rm -f $H
+curl -s --cacert "$ROOT" -o /dev/null -w '%{url_effective} %{http_code}\n' http://www.lab.internal/
+curl -s --cacert "$ROOT" --hsts $H -o /dev/null https://www.lab.internal/
+grep -v '^#' $H | cut -d' ' -f1
+curl -s --cacert "$ROOT" --hsts $H -o /dev/null -w '%{url_effective} %{http_code}\n' http://www.lab.internal/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+http://www.lab.internal/ 301
+www.lab.internal
+https://www.lab.internal/ 200
+```
+
+</Expected>
+
+Lần đầu, `http://` nhận `301` qua kết nối không mã hoá: đây là khoảnh khắc kẻ đứng giữa có thể chen vào. Sau một lần thấy header HSTS, client ghi nhớ tên miền, và lần sau gõ `http://` nó **tự đổi** thành `https://` trước khi gửi bất cứ thứ gì ra mạng (`url_effective` là `https`, không còn `301`). Trình duyệt làm đúng như vậy, và trong 300 giây đó nó sẽ không nói HTTP với tên miền này dù server có muốn.
+
+Cuối cùng là mức Modern và cái giá của nó:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/^ssl_protocols .*/ssl_protocols TLSv1.3;/' tls-params.conf; ngx -s reload 2>/dev/null; sleep 1
+scan | grep -E 'TLSv1.[23] '
+curl -sS --cacert "$ROOT" --tls-max 1.2 -o /dev/null https://www.lab.internal/
+sed -i 's/^ssl_protocols .*/ssl_protocols TLSv1.2 TLSv1.3;/' tls-params.conf; ngx -s reload 2>/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+TLSv1.2 disabled
+TLSv1.3 enabled
+curl: (35) TLS connect error: error:0A00042E:SSL routines::tlsv1 alert protocol version
+```
+
+</Expected>
+
+Client chỉ nói được tới TLS 1.2 bị từ chối ngay ở bắt tay. Trước khi lên Modern cho một dịch vụ công khai, đếm trong access log xem còn bao nhiêu request đi TLS 1.2 (thêm `$ssl_protocol` vào `log_format`). Dòng cuối trả cấu hình về Intermediate.
+
+<Check id="d21.4.lab-tls-config">Áp được mức Intermediate của Mozilla cho Nginx và kiểm bằng `sslscan`; chứng minh được tác dụng của HSTS bằng `curl --hsts`; chỉ ra được vì sao `ssl_stapling` không có tác dụng với chứng chỉ không có địa chỉ OCSP.</Check>
+
+### 5. mTLS giữa hai service
+
+Dựng một service nội bộ ở port 8443 chỉ nhận client có chứng chỉ do CA của ta cấp, và chỉ cho `payments` gọi. Ba chứng chỉ hạn một giờ, xin qua provisioner `admin`: một cho server, hai cho hai client.
+
+<Terminal where="vm">
+
+```bash
+issue internal.lab.internal --not-after 1h
+issue payments --not-after 1h
+issue reports --not-after 1h
+openssl x509 -in payments.crt -noout -ext extendedKeyUsage
+cat > sites/internal-mtls.conf <<'EOF'
+server {
+  listen 10.9.0.11:8443 ssl;
+  server_name internal.lab.internal;
+  ssl_certificate     LAB/tls/internal.lab.internal.crt;
+  ssl_certificate_key LAB/tls/internal.lab.internal.key;
+  ssl_protocols TLSv1.3;
+
+  ssl_client_certificate LAB/tls/step/certs/root_ca.crt;   # CA mà server tin để kiểm client
+  ssl_verify_client on;
+  ssl_verify_depth 2;
+
+  location / {
+    if ($ssl_client_s_dn != "CN=payments") { return 403 "khong co quyen: $ssl_client_s_dn\n"; }
+    return 200 "xin chao $ssl_client_s_dn\n";
+  }
+}
+EOF
+sed -i "s#LAB#$HOME/masteva-d21#g" sites/internal-mtls.conf
+ngx -t 2>&1 | tail -1 | cut -d' ' -f5-; ngx -s reload 2>/dev/null; sleep 1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  Subject:     internal.lab.internal
+  Valid from:  2026-10-11T03:17:21Z
+          to:  2026-10-11T04:18:21Z
+  Subject:     payments
+  Valid from:  2026-10-11T03:17:21Z
+          to:  2026-10-11T04:18:21Z
+  Subject:     reports
+  Valid from:  2026-10-11T03:17:21Z
+          to:  2026-10-11T04:18:21Z
+X509v3 Extended Key Usage: 
+    TLS Web Server Authentication, TLS Web Client Authentication
+test is successful
+```
+
+</Expected>
+
+Chứng chỉ step-ca cấp có cả hai mục đích `serverAuth` và `clientAuth`, nên cùng một chứng chỉ dùng được ở cả hai vai. File `.crt` đã gồm lá và intermediate. Thử bốn kiểu client; kiểu cuối tự ký một chứng chỉ mang đúng tên `payments`:
+
+<Terminal where="vm">
+
+```bash
+U=https://internal.lab.internal:8443/
+curl -s --cacert "$ROOT" $U | grep -o '<title>.*</title>'
+curl -s --cacert "$ROOT" --cert payments.crt --key payments.key $U
+curl -s --cacert "$ROOT" --cert reports.crt --key reports.key $U
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -keyout fake.key -out fake.crt -subj "/CN=payments" 2>/dev/null
+curl -s --cacert "$ROOT" --cert fake.crt --key fake.key $U | grep -o '<title>.*</title>'
+```
+
+</Terminal>
+
+<Predict question="Bốn client: không chứng chỉ; payments; reports; chứng chỉ tự ký mang tên payments. Mỗi cái nhận gì?">
+
+```text
+<title>400 No required SSL certificate was sent</title>
+xin chao CN=payments
+khong co quyen: CN=reports
+<title>400 The SSL certificate error</title>
+```
+
+- Không chứng chỉ: `400`, bị chặn ở tầng TLS.
+- `payments`: qua cả xác thực lẫn phân quyền.
+- `reports`: chứng chỉ **hợp lệ**, do đúng CA cấp, nên qua xác thực; bị `403` vì luật `if` chỉ cho `payments`. Bỏ dòng `if` đó thì `reports` vào được: mTLS trơn chỉ trả lời "có phải người nhà không", không trả lời "người này được làm gì".
+- Chứng chỉ tự ký tên `payments`: `400`. Tên trong chứng chỉ ai cũng viết được; thứ không giả được là chữ ký của CA.
+
+</Predict>
+
+Trong hệ thống thật, Nginx thường chuyển danh tính đã kiểm cho ứng dụng qua header (`proxy_set_header X-Client-DN $ssl_client_s_dn`), và ứng dụng chỉ tin header đó khi request chắc chắn đi qua proxy này, cùng nguyên tắc với `X-Forwarded-For` ở D2.5.
+
+<Check id="d21.4.lab-mtls">Cấu hình được Nginx đòi chứng chỉ client từ CA nội bộ, và chứng minh được bằng bốn kiểu client rằng xác thực (chữ ký của CA) và phân quyền (luật theo danh tính) là hai tầng riêng.</Check>
+
+### 6. Gia hạn bằng chính chứng chỉ, và thu hồi
+
+Chứng chỉ một giờ thì phải tự gia hạn được. `step ca renew` dùng **chính chứng chỉ đang có** để xác thực với CA (mTLS), không cần mật khẩu provisioner:
+
+<Terminal where="vm">
+
+```bash
+ser() { openssl x509 -in "$1" -noout -serial -enddate | tr '\n' ' '; echo; }
+ser payments.crt
+step ca renew payments.crt payments.key --force 2>&1 | tail -1
+ser payments.crt
+curl -s --cacert "$ROOT" --cert payments.crt --key payments.key $U
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+serial=8BFB60EE0FCD764840DFEDC914CA512E notAfter=Oct 11 04:18:21 2026 GMT 
+Your certificate has been saved in payments.crt.
+serial=F8839645964455A9AB2481C6E0F3C56D notAfter=Oct 11 04:18:22 2026 GMT 
+xin chao CN=payments
+```
+
+</Expected>
+
+Serial mới, hạn mới (một giờ tính từ lúc gia hạn; ở đây chỉ nhích một giây vì vừa xin xong đã gia hạn), cùng danh tính. Trên production, `step ca renew --daemon --exec "<lệnh reload>"` chạy thường trực bên cạnh service: nó gia hạn khi chứng chỉ được khoảng hai phần ba hạn rồi chạy lệnh reload. Giờ giả sử khoá của `payments` bị lộ. Thu hồi chứng chỉ:
+
+<Terminal where="vm">
+
+```bash
+step ca revoke --cert payments.crt --key payments.key 2>&1 | grep -o 'has been revoked'
+curl -s --cacert "$ROOT" --cert payments.crt --key payments.key $U
+step ca renew payments.crt payments.key --force 2>&1 | head -1
+```
+
+</Terminal>
+
+<Predict question="Chứng chỉ đã bị thu hồi ở CA. Service nội bộ còn nhận nó không? CA còn cho gia hạn không?">
+
+```text
+has been revoked
+xin chao CN=payments
+The request lacked necessary authorization to be completed. Please see the certificate authority logs for more info.
+```
+
+Service **vẫn nhận** chứng chỉ đã thu hồi: Nginx kiểm chữ ký và hạn, không hỏi CA. Muốn nó từ chối ngay thì phải phân phối danh sách thu hồi tới mọi server (`ssl_crl`) và giữ danh sách đó luôn mới, đúng phần việc khó mà cả hệ sinh thái web đã vật lộn nhiều năm. Điều thu hồi làm được ngay là chặn **gia hạn**: CA từ chối. Kẻ có khoá dùng được chứng chỉ thêm tối đa một giờ, rồi hết. Với chứng chỉ hạn một năm, cũng thao tác đó để lại lỗ hổng một năm. Đó là toàn bộ lý lẽ của chứng chỉ ngắn hạn.
+
+</Predict>
+
+<Check id="d21.4.lab-renew-revoke">Gia hạn được một chứng chỉ bằng `step ca renew`, và chứng minh được sau khi thu hồi thì server vẫn nhận chứng chỉ cho tới khi hết hạn còn CA từ chối gia hạn.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `cb: command not found`, `$ROOT` rỗng: terminal mới chưa nạp hàm. Chạy `. ~/masteva-d21/tls/tls.sh` rồi `cd ~/masteva-d21/tls`.
+- `curl: (7) Failed to connect to ca.lab.internal port 9443`: step-ca không chạy. Xem `tail ca.log`; chạy lại lệnh `step-ca ... &` ở bước 1. `bind: address already in use` trong log nghĩa là một step-ca cũ còn sống: `pkill step-ca`.
+- certbot báo `unauthorized` hoặc `Connection refused` ở challenge: step-ca không lấy được file qua port 80. Kiểm `curl -i http://www.lab.internal/.well-known/acme-challenge/x` phải ra `404` của Nginx (không phải lỗi kết nối), và `/etc/hosts` có dòng của `www.lab.internal`.
+- certbot báo `SSLError ... CERTIFICATE_VERIFY_FAILED`: thiếu `REQUESTS_CA_BUNDLE`, tức bạn gọi `certbot` thay vì `cb`.
+- `Another instance of Certbot is already running`: một lần chạy trước còn treo (thường do quên `--no-random-sleep-on-renew`). `pkill certbot` rồi chạy lại.
+- `nginx: [emerg] cannot load certificate ".../live/www.lab.internal/fullchain.pem"`: chưa xin được chứng chỉ ở bước 2 mà đã thêm `www-https.conf`.
+- `curl: (60) SSL certificate problem`: thiếu `--cacert "$ROOT"`, hoặc bạn đã dựng lại CA (root mới) mà Nginx còn giữ chứng chỉ của CA cũ.
+- `step ca certificate` báo `error validating token` hay hỏi mật khẩu: sai đường dẫn `ca-password.txt` (hàm `issue` dùng đường dẫn tuyệt đối trong `tls/`).
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới dừng step-ca và Nginx của lab, xoá mạng lab, xoá thư mục `/srv/masteva-d21`, các file tạm trong `/tmp` và **xoá hai dòng có nhãn `# masteva-d21` khỏi `/etc/hosts`** của VM. Thư mục `~/masteva-d21/tls` (kể cả khoá của CA lab) được giữ lại; xoá nó nếu bạn không định xem lại. Gói `step-cli`, `step-ca` vẫn còn cài: gỡ bằng `sudo apt-get remove step-cli step-ca` nếu muốn.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn dẹp">
+
+```bash
+pkill step-ca
+sudo ~/masteva-d21/topo.sh down
+sudo rm -rf /srv/masteva-d21 /tmp/d21-dl /tmp/d21-hsts.txt
+sudo sed -i '/# masteva-d21$/d' /etc/hosts
+sleep 1; grep -c 'lab.internal' /etc/hosts; pgrep -c 'step-ca|nginx'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+0
+```
+
+</Expected>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nhiều máy sau một load balancer thì xin và phân phối chứng chỉ thế nào?">
+
+`HTTP-01` gặp khó: CA gọi vào tên miền, load balancer chuyển request challenge tới một máy bất kỳ, mà token chỉ nằm trên máy đang xin. Bốn cách xử lý. Kết thúc TLS ở **tầng load balancer** (hai HAProxy của D9.3) và chỉ tầng đó cần chứng chỉ; hai máy vẫn phải chia sẻ chứng chỉ, thường bằng cách một máy xin rồi đồng bộ qua công cụ quản lý cấu hình hoặc kho bí mật. Chuyển mọi request `/.well-known/acme-challenge/` về **một** máy chuyên xin chứng chỉ. Dùng **`DNS-01`**: không phụ thuộc đường đi của HTTP, mỗi máy tự xin được, và là cách duy nhất cho wildcard; đổi lại khoá API DNS phải được giới hạn quyền thật chặt, tốt nhất là uỷ quyền riêng vùng `_acme-challenge` sang một DNS phụ. Hoặc dùng proxy có kho chứng chỉ dùng chung như Caddy với storage chung. Trong Kubernetes, cert-manager làm việc này và lưu chứng chỉ vào Secret (K6).
+
+</Reveal>
+
+<Reveal title="Khi nào gia hạn, và ARI là gì?">
+
+Quy ước lâu nay là gia hạn khi còn một phần ba hạn: chứng chỉ 90 ngày gia hạn ở ngày 60, còn 30 ngày để phát hiện và sửa nếu gia hạn hỏng. Hạn ngắn lại thì khoảng đệm đó co theo: chứng chỉ 45 ngày chỉ còn 15 ngày, chứng chỉ 6 ngày chỉ còn 2 ngày, nên client phải chạy thường xuyên hơn và giám sát phải nhạy hơn. **ARI** (ACME Renewal Information, RFC 9773) cho CA chủ động nói với client "hãy gia hạn chứng chỉ này trong khoảng thời gian sau". Bình thường CA dùng nó để rải đều tải; khi có sự cố như vụ năm 2020 trong callout, CA dời khoảng đó về "ngay bây giờ" và mọi client hỗ trợ ARI tự thay chứng chỉ trước khi bị thu hồi. Cả hai đầu phải hỗ trợ: certbot có ARI từ bản 4.1 (gói 4.0.0 của Ubuntu 26.04 thì chưa), còn thư mục ACME của step-ca 0.30 trong lab không quảng bá `renewalInfo`, nên lab này không thử được ARI. Kiểm client và CA của bạn có hỗ trợ ARI không là việc đáng làm khi chọn công cụ.
+
+</Reveal>
+
+<Reveal title="Root ngoại tuyến ngoài đời trông ra sao, và intermediate hết hạn thì làm gì?">
+
+Khoá root được sinh trong một buổi có kịch bản và người chứng kiến (key ceremony), trên máy không nối mạng hoặc trong HSM, rồi cất ở nơi cần nhiều người cùng mở. Nó chỉ được lấy ra để ký intermediate mới hoặc ký danh sách thu hồi của intermediate. Intermediate nên có hạn ngắn hơn root nhiều (vài năm so với mười, hai mươi năm), và phải được thay **trước** khi hết hạn một khoảng dài hơn hạn của chứng chỉ lá dài nhất: lá không thể sống lâu hơn intermediate ký nó. Vì server gửi intermediate kèm lá trong bắt tay, đổi intermediate không đòi cập nhật trust store của client; đổi root thì có, trên mọi máy, nên phải phân phối root mới song song với root cũ hàng tháng trước khi chuyển. Lộ khoá intermediate của một CA nội bộ là sự cố nghiêm trọng nhưng xử lý được: ký intermediate mới bằng root, cấp lại mọi lá (tự động, nếu hạn ngắn), và nếu client có kiểm thì công bố thu hồi intermediate cũ.
+
+</Reveal>
+
+<Reveal title="Kết thúc mTLS ở proxy hay trong ứng dụng?">
+
+Ở proxy (Nginx như bài này, sidecar của service mesh) thì ứng dụng không phải biết gì về chứng chỉ: không code TLS, không tự gia hạn, đổi CA không cần deploy lại. Đổi lại, đoạn từ proxy tới ứng dụng phải được coi là tin cậy (cùng máy hoặc cùng pod, qua localhost hay Unix socket), và danh tính client phải được chuyển tiếp một cách không giả mạo được. Trong ứng dụng (ví dụ Spring Boot với SSL bundle) thì danh tính đi tới tận code và không có đoạn hở, nhưng mỗi service phải lo nạp lại chứng chỉ khi gia hạn, và mỗi ngôn ngữ làm một kiểu. Với vài service, proxy là đủ. Với hàng trăm service, đây chính là bài toán service mesh giải: mỗi pod một sidecar hoặc một tầng proxy dùng chung trên node, danh tính theo SPIFFE (D15), chứng chỉ vài giờ cấp tự động (K11).
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết cấu hình TLS cho Nginx hay HAProxy theo mức của Mozilla, viết deploy hook, hoặc giải thích một lỗi bắt tay. AI hay đưa danh sách cipher chép từ bài cũ (có `ECDHE-RSA-AES256-SHA384`, `DHE` với tham số yếu, thậm chí `TLSv1.1`), hay bật `ssl_stapling` và `ssl_stapling_verify` cho chứng chỉ Let's Encrypt như thể OCSP còn chạy, hay đặt ngay `max-age=63072000; includeSubDomains; preload` cho HSTS, hay viết cron `certbot renew` không có hook, và hay cho `ssl_verify_client optional` mà quên kiểm `$ssl_client_verify`. Kiểm lại bằng `sslscan` hoặc `openssl s_client`, đối chiếu với công cụ của Mozilla, chạy `certbot renew --dry-run`, và làm đúng phép thử của bước 3: so serial trên đĩa với serial server đang trả.
+
+</Callout>
+
+<Callout kind="link">
+
+D2.3 dạy chuỗi chứng chỉ, SNI, trust store và các lỗi TLS; D2.5 đặt Nginx kết thúc TLS. D9.1 giải thích vì sao reload không rớt kết nối. D9.3 đặt VIP trước tầng kết thúc TLS. D8 phân phối chứng chỉ và cấu hình ra nhiều máy. K6 dùng cert-manager, một client ACME chạy trong cụm, và K4 xoay chứng chỉ của chính cụm Kubernetes. D15 đi tiếp từ mTLS tới workload identity, SPIFFE và quản lý bí mật; K11 là service mesh làm mTLS tự động. D12 giám sát hạn chứng chỉ; D17 có quy trình khi chứng chỉ hết hạn giữa đêm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d21.4.mastery-automate">Tự dựng được cho một web server vòng đời chứng chỉ tự động: xin qua ACME, gia hạn có deploy hook reload (và nêu được cách chạy việc gia hạn định kỳ), và một phép kiểm từ bên ngoài so chứng chỉ server trả với chứng chỉ trên đĩa.</Check>
+
+<Check id="d21.4.mastery-harden">Rà được cấu hình TLS của một dịch vụ bằng `sslscan` hoặc `openssl s_client`, đối chiếu với mức Mozilla phù hợp, và lập được lộ trình bật HSTS mà không tự khoá mình.</Check>
+
+<Check id="d21.4.mastery-pki">Thiết kế được một PKI nội bộ nhỏ: root ở đâu, intermediate ở đâu, provisioner nào cho người và cho service, hạn chứng chỉ bao lâu, service gia hạn bằng gì, và điều gì xảy ra khi một khoá bị lộ.</Check>
+
+</Mastery>

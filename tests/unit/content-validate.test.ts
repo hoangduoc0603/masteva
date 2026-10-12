@@ -8,6 +8,7 @@ import {
   validateInternalLinks,
   validateLessonStructure,
   validateLock,
+  validateShellComments,
   validateTranslation,
 } from '@/lib/content/validate';
 import { parseLessonFileName } from '@/lib/content/repo';
@@ -134,5 +135,39 @@ describe('validateCodeRefs', () => {
 
   it('does not match inside longer tokens', () => {
     expect(validateCodeRefs('J2EE, JDK 25, MD5, SB30x', steps)).toEqual([]);
+  });
+});
+
+describe('validateShellComments', () => {
+  const fence = '```';
+  const term = (where: string, code: string) => `<Terminal where="${where}">\n\n${fence}bash\n${code}\n${fence}\n\n</Terminal>`;
+
+  it('reports a trailing comment in a mac terminal block with its line number', () => {
+    expect(validateShellComments(`Dòng đầu.\n\n${term('mac', 'echo a\nsleep 5   # chờ kube-proxy')}`)).toEqual([
+      'dòng 7: chú thích "#" trong <Terminal where="mac"> làm hỏng lệnh trên zsh của macOS; đưa lời giải thích ra văn bản',
+    ]);
+  });
+
+  it('reports a comment-only line and a comment after a function brace', () => {
+    expect(validateShellComments(term('mac', '# chờ CA nạp cấu hình\ndem() {  # đếm\n  echo x\n}'))).toHaveLength(2);
+  });
+
+  it('ignores heredoc bodies, quoted text and non-comment hashes', () => {
+    const code = [
+      "cat > a.yaml <<'EOF'",
+      'port: 80   # cổng của Service',
+      'EOF',
+      `echo 'a # b' "c # d"`,
+      'echo $# ${#x} a#b',
+      'cat <<-END',
+      '  # trong heredoc',
+      'END',
+    ].join('\n');
+    expect(validateShellComments(term('mac', code))).toEqual([]);
+  });
+
+  it('checks only mac terminal blocks and only fenced code', () => {
+    expect(validateShellComments(term('vm', 'sleep 5   # bash hiểu chú thích'))).toEqual([]);
+    expect(validateShellComments(`# Tiêu đề\n\n${fence}bash\nls   # ngoài Terminal\n${fence}`)).toEqual([]);
   });
 });

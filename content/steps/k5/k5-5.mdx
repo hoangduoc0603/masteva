@@ -1,0 +1,903 @@
+---
+title: ResourceQuota, LimitRange và multi-tenancy
+description: Chặn một namespace ăn hết cụm bằng ResourceQuota và LimitRange, dựng mô hình mỗi đội một namespace với năm lớp rào rồi tự tay thử phá từng lớp, chạy một cụm ảo vCluster cho đội cần quyền cấp cụm, và biết ranh giới nào của tenant mềm không vá được.
+id: k5.5
+step: k5
+prerequisites: [k5.4]
+topics: [k5.quota-limitrange, k5.multi-tenancy]
+status: verified
+verified:
+  date: 2026-10-12
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    vcluster: 0.37.2 (cụm ảo chạy Kubernetes 1.36.0)
+    curl-image: curlimages/curl 8.22.0
+    yq: 4.54.1
+---
+
+<Goal>
+
+Bốn bài trước coi cả cụm là của một đội. Cụm thật thường của nhiều đội, và điều đầu tiên xảy ra là một đội dùng hết phần của đội khác. Bài này dựng các hàng rào cho việc dùng chung, rồi thử phá chúng. Học xong, bạn giải thích được:
+
+- Vì sao `kubectl create deployment` báo thành công mà không pod nào xuất hiện, sau khi namespace có quota.
+- Vì sao một LimitRange chỉ khai `max` lại gắn CPU limit cho mọi pod.
+- Năm lớp làm nên một "tenant" bằng namespace, và lớp nào chính tenant gỡ được.
+- Cụm ảo cho tenant thêm được gì, và host vẫn nắm cái gì.
+- Những thứ tenant mềm luôn dùng chung, và dấu hiệu nào nói đã tới lúc tách cụm.
+
+</Goal>
+
+<Knowledge>
+
+### ResourceQuota: trần của một namespace
+
+Request quyết định pod được xếp vào đâu (K1.2, K5.1). Không có gì ngăn một namespace tạo pod xin hết request của cả cụm, hoặc tạo mười nghìn ConfigMap làm phình etcd. **ResourceQuota** là trần tổng cho một namespace, do API server kiểm **lúc tạo object**.
+
+| Nhóm | Ví dụ khoá trong `spec.hard` | Chặn điều gì |
+|---|---|---|
+| Tính toán | `requests.cpu`, `requests.memory`, `limits.cpu`, `limits.memory` | Tổng request, limit của mọi pod đang chạy trong namespace |
+| Lưu trữ | `requests.storage`, `persistentvolumeclaims` | Tổng dung lượng và số PVC |
+| Số object | `pods`, `services.nodeports`, `services.loadbalancers`, `count/deployments.apps`, `count/secrets` | Số lượng từng loại object |
+
+Hai hành vi cần biết trước khi bật quota trên một namespace đang có người dùng:
+
+- **Có quota cho một tài nguyên tính toán thì mọi pod phải khai tài nguyên đó.** Namespace có quota `requests.cpu` sẽ từ chối pod không khai request CPU. Bật quota mà không có mặc định là làm gãy mọi manifest chưa khai `resources`.
+- **Lỗi xuất hiện ở pod, không ở Deployment.** Quota kiểm lúc tạo pod. Deployment và ReplicaSet tạo được bình thường; ReplicaSet tạo pod thì bị từ chối, và lỗi nằm trong event của ReplicaSet. Người chạy `kubectl apply` không thấy lỗi nào.
+
+Quota đếm **request, không đếm mức dùng thật**, và không giữ chỗ: tổng quota của các namespace có thể lớn hơn cả cụm. Nó là giới hạn chi tiêu, không phải cam kết có hàng.
+
+Quota còn khoanh được theo **scope**. Hay dùng nhất là theo PriorityClass: quota có `scopeSelector` chọn class `cao` chỉ đếm pod dùng class đó, nên giới hạn được một namespace chạy bao nhiêu pod priority cao. Giới hạn đó chỉ có ở **namespace có quota**: namespace không có quota nào cho class `cao` vẫn tạo pod dùng nó, như bước 2 của lab cho thấy. Muốn mặc định là cấm thì phải cấu hình `limitedResources` cho plugin admission ResourceQuota của API server, hoặc dùng chính sách admission; cả hai thuộc K8.
+
+### LimitRange: mặc định và giới hạn cho từng container
+
+Quota là trần của cả namespace. **LimitRange** làm việc ở mức từng container, cũng lúc tạo pod:
+
+| Trường | Tác dụng |
+|---|---|
+| `defaultRequest` | Container không khai request thì được điền số này |
+| `default` | Container không khai limit thì được điền số này |
+| `min`, `max` | Request và limit phải nằm trong khoảng; ngoài khoảng thì pod bị từ chối |
+| `maxLimitRequestRatio` | Limit không được gấp request quá số lần này; chặn overcommit quá tay |
+
+Hai thứ đi thành cặp: LimitRange điền mặc định để pod qua được cửa quota, quota giữ tổng. Ba điều dễ vấp:
+
+- LimitRange chỉ áp cho **pod tạo sau** khi nó tồn tại. Pod đang chạy không đổi.
+- Số được điền là **mặc định của namespace**, không phải số đúng cho ứng dụng. Workload quan trọng vẫn phải tự khai; K5.3 đã cho thấy HPA phụ thuộc request thế nào.
+- **Khai `max` mà không khai `default` thì `default` bằng `max`.** Một LimitRange chỉ có `max: {cpu: "1"}` sẽ gắn CPU limit 1 cho mọi container không tự khai limit; nếu LimitRange cũng không có `defaultRequest` thì request CPU được điền theo limit, tức mỗi container giữ chỗ trọn 1 CPU. Khi soạn bài, thử một bản có `max.cpu` thì đúng điều đó xảy ra, và nó trái lời khuyên của K1.2 là cân nhắc kỹ trước khi đặt CPU limit.
+
+<Check id="k5.5.quota-limitrange">Kể được ba nhóm khoá của ResourceQuota, hai hành vi gây bất ngờ khi bật quota, và việc LimitRange làm cho từng container.</Check>
+
+### Multi-tenancy: mỗi đội một namespace
+
+**Tenant** là một bên dùng chung cụm: một đội trong công ty, hoặc một khách hàng. Kubernetes không có object nào tên là tenant; bạn ghép nó từ những thứ đã học. Mô hình phổ biến nhất là **namespace-as-a-service**: mỗi tenant một hoặc vài namespace, mỗi namespace có đủ năm lớp:
+
+| Lớp | Công cụ | Chặn điều gì | Dạy ở |
+|---|---|---|---|
+| Quyền trên API | RoleBinding trong namespace | Đọc, sửa object của tenant khác | K2.3 |
+| Tài nguyên | ResourceQuota, LimitRange | Dùng hết phần của tenant khác | Bài này |
+| Mạng | NetworkPolicy chặn mặc định | Gọi sang pod của tenant khác | K2.4 |
+| Đặc quyền của pod | Pod Security Admission | Pod chạy root, `privileged`, mount đĩa của node rồi thoát ra node | K2.4 dạy từng trường; K8 dạy cơ chế |
+| Node (tuỳ chọn) | Taint và label riêng cho tenant | Chung kernel với tenant khác | K5.1 |
+
+Pod Security Admission bật bằng một label trên namespace: `pod-security.kubernetes.io/enforce: restricted` làm API server từ chối mọi pod không đạt mức `restricted`, tức đúng bộ SecurityContext mà K2.4 đã viết tay.
+
+Năm lớp này tạo ra **tenant mềm**: đủ cho các đội tin nhau trong một tổ chức, nơi mối lo là nhầm lẫn và tranh tài nguyên. Chúng không đổi được việc mọi tenant dùng chung những thứ sau:
+
+| Dùng chung | Hệ quả | Giảm nhẹ được bằng |
+|---|---|---|
+| API server và etcd | Một tenant gọi API quá nhiều hoặc tạo quá nhiều object làm chậm API của mọi người | Quota số object; API Priority and Fairness |
+| Kernel của node | Lỗ hổng thoát container ảnh hưởng mọi pod trên node; tranh I/O đĩa, băng thông, bộ đệm, những thứ request không mô tả (noisy neighbor) | Node riêng cho tenant; runtime sandbox |
+| Tài nguyên cấp cụm: CRD, webhook, PriorityClass, StorageClass | Tenant không tự cài operator được; hai đội cần hai phiên bản của một CRD thì chỉ một đội được | Cụm ảo |
+| DNS, gateway, CNI của cụm | Một thành phần hỏng là mọi tenant hỏng | Tách cụm |
+
+<Callout kind="production">
+
+Ngày 11/12/2024, mọi dịch vụ của OpenAI gián đoạn hơn bốn giờ. Theo [postmortem của họ](https://status.openai.com/incidents/ctrsv3lwd797), nguyên nhân là một dịch vụ telemetry mới được triển khai lên toàn bộ các cụm Kubernetes. Cấu hình của nó vô tình khiến **mọi node** trong mỗi cụm thực hiện những lời gọi Kubernetes API tốn kém, có chi phí tăng theo kích thước cụm. Hàng nghìn node cùng gọi một lúc làm API server quá tải, và control plane của phần lớn các cụm lớn sập. Pod đang chạy thì vẫn chạy, nhưng DNS trong cụm cần control plane, nên khi cache DNS hết hạn các service không tìm thấy nhau nữa. Khó nhất là khâu sửa: muốn gỡ dịch vụ gây lỗi phải gọi được chính API server đang quá tải. Trước khi triển khai, họ đã kiểm CPU và bộ nhớ của dịch vụ mới trên mọi cụm, nhưng không đánh giá tải nó gây lên API server.
+
+Đây là sự cố của một tổ chức với workload của chính mình. Phần suy ra của bài: trên cụm nhiều tenant, bất kỳ workload nào được quyền gọi API cũng có thể làm điều tương tự với mọi tenant khác, và quota CPU, bộ nhớ hay NetworkPolicy không nhìn thấy loại tải này. API server là tài nguyên dùng chung mà năm lớp ở trên không chia được.
+
+</Callout>
+
+<Check id="k5.5.tenant-layers">Kể được năm lớp của một tenant bằng namespace, công cụ của từng lớp, và bốn thứ mà mọi tenant mềm vẫn dùng chung.</Check>
+
+### Capsule, vCluster, hay tách cụm
+
+Tự ghép năm lớp bằng script thì chạy được với vài đội. Tới vài chục đội, hai vấn đề lộ ra: tenant không tự tạo được namespace (đó là quyền cấp cụm), và không gì ngăn tenant gỡ rào trong namespace của chính họ. Có hai hướng công cụ, và một hướng không phải công cụ:
+
+| | Capsule | vCluster | Mỗi tenant một cụm |
+|---|---|---|---|
+| Ý tưởng | Một CRD `Tenant` gom nhiều namespace; operator áp và giữ chính sách | Mỗi tenant một **control plane ảo** (API server riêng) chạy thành pod trên cụm chủ | Cụm thật riêng |
+| Tenant tự tạo namespace | Được, trong hạn mức của Tenant | Được: tenant là admin của cụm ảo | Được |
+| Tenant tự cài CRD, operator | Không | Được, chỉ trong cụm ảo | Được |
+| Phiên bản Kubernetes riêng | Không | Được (API server riêng) | Được |
+| Dùng chung node và kernel | Có | Có, ở chế độ mặc định | Không |
+| Dùng chung API server của cụm chủ | Có, mọi lời gọi của tenant | Một phần: chỉ thành phần đồng bộ của cụm ảo gọi cụm chủ | Không |
+| Chi phí mỗi tenant | Gần như không | Một pod control plane (lab: khoảng 480 MiB RAM) | Cả một control plane, cộng công vận hành |
+
+**Capsule** (dự án CNCF) giữ nguyên mô hình namespace và thêm phần còn thiếu: quota tính trên cả nhóm namespace của tenant, tự sao NetworkPolicy và LimitRange vào namespace mới, dựng lại nếu bị xoá, giới hạn registry và StorageClass được dùng, và một proxy để tenant chỉ `kubectl get namespaces` thấy namespace của mình.
+
+**vCluster** đi hướng khác: cho tenant một API server riêng. Pod tenant tạo trong cụm ảo được **đồng bộ** xuống một namespace của cụm chủ để chạy thật trên node chủ. Tenant có đủ quyền cấp cụm mà không chạm được vào cụm chủ; người vận hành cụm chủ vẫn đặt quota, NetworkPolicy và Pod Security lên namespace chứa cụm ảo.
+
+Dấu hiệu nên **tách cụm thật**: tenant là khách hàng bên ngoài hoặc chạy code không tin được; có yêu cầu tuân thủ đòi tách vật lý; một tenant đủ lớn để một mình làm nghẽn API server; hoặc một sự cố cấp cụm là quá đắt nếu tất cả cùng dính. Cái giá là vận hành nhiều cụm, và đó là chủ đề của K10.
+
+<Check id="k5.5.capsule-vcluster">So sánh được Capsule, vCluster và tách cụm theo thứ tenant tự làm được và thứ vẫn dùng chung, và nêu được các dấu hiệu cần tách cụm.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Resource Quotas](https://kubernetes.io/docs/concepts/policy/resource-quotas/): danh sách khoá, quota theo scope, và mục "Limit Priority Class consumption by default" về `limitedResources`.
+- [Multi-tenancy | Kubernetes](https://kubernetes.io/docs/concepts/security/multi-tenancy/): cô lập control plane và data plane, hai mô hình "namespace per tenant" và "virtual control plane per tenant".
+- [Capsule Documentation](https://projectcapsule.dev/docs/): mô hình Tenant gom nhiều namespace và các chính sách operator giữ hộ.
+- [vCluster: Architecture](https://www.vcluster.com/docs/vcluster/introduction/architecture): control plane ảo, thành phần đồng bộ và các kiểu worker node.
+- [OpenAI: API, ChatGPT & Sora Facing Issues (postmortem 11/12/2024)](https://status.openai.com/incidents/ctrsv3lwd797): sự cố control plane quá tải dùng trong callout production.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k5-lab` của K5.1 (nếu đã xoá, làm lại bước 1 của bài đó) và `helm`. kindnet, plugin mạng mặc định của kind, thực thi NetworkPolicy như K2.4 đã dùng.
+
+**Profile máy.** Các bước 1 tới 5 chỉ thêm vài pod nhỏ. Bước 6 chạy một control plane ảo dùng khoảng 480 MiB RAM; cả cụm lên khoảng 2,4 tới 2,6 GiB. Máy 8 GB: đặt Docker 4 GB và không chạy gì khác; nếu vẫn chật, đọc bước 6 mà không chạy.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k5/kubeconfig
+export HELM_REPOSITORY_CONFIG=~/masteva-k5/helm/repositories.yaml HELM_REPOSITORY_CACHE=~/masteva-k5/helm/cache
+mkdir -p ~/masteva-k5/k5-5 && cd ~/masteva-k5/k5-5
+```
+
+</Terminal>
+
+### 1. Quota làm pod "biến mất"
+
+Tạo một namespace thử có quota, rồi triển khai một Deployment bình thường, không khai `resources`.
+
+<Terminal where="mac" title="~/masteva-k5/k5-5/quota.yaml">
+
+```bash
+kubectl create namespace k5-quota
+cat > quota.yaml <<'EOF'
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tran
+  namespace: k5-quota
+spec:
+  hard:
+    requests.cpu: "2"          # tổng request CPU của mọi pod trong namespace
+    requests.memory: 2Gi
+    limits.memory: 2Gi
+    pods: "10"
+    services.nodeports: "0"    # không cho mở NodePort
+EOF
+kubectl apply -f quota.yaml
+kubectl -n k5-quota create deployment web --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 \
+  --replicas=2 -- /agnhost netexec --http-port=8080
+sleep 5
+kubectl -n k5-quota get deploy,pods
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k5-quota created
+resourcequota/tran created
+deployment.apps/web created
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   0/2     0            0           6s
+```
+
+</Expected>
+
+`deployment.apps/web created`, không một dòng lỗi, và không có pod nào. Lỗi nằm ở tầng dưới:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k5-quota events --types=Warning | tail -1 | cut -c1-260
+kubectl -n k5-quota get deploy web -o yaml \
+  | yq '.status.conditions[] | select(.type == "ReplicaFailure") | .message'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+3s          Warning   FailedCreate   ReplicaSet/web-6fb755dd8f   (combined from similar events): Error creating: pods "web-6fb755dd8f-lpmtf" is forbidden: failed quota: tran: must specify limits.memory for: agnhost; requests.cpu for: agnhost; requests.memory f
+pods "web-6fb755dd8f-4zs7v" is forbidden: failed quota: tran: must specify limits.memory for: agnhost; requests.cpu for: agnhost; requests.memory for: agnhost
+```
+
+</Expected>
+
+Event thuộc về **ReplicaSet**, và Deployment có thêm điều kiện `ReplicaFailure`. Thông báo nói đúng ba thứ quota đang đếm mà pod không khai. Khi một Deployment đứng ở `0/N` mà không có pod `Pending`, chỗ đầu tiên cần xem là event của ReplicaSet.
+
+<Check id="k5.5.lab-quota-reject">Tái hiện được Deployment tạo thành công nhưng không có pod vì quota, và tìm được lý do ở event của ReplicaSet cùng điều kiện `ReplicaFailure`.</Check>
+
+### 2. LimitRange điền mặc định, quota giữ tổng
+
+Thêm LimitRange cho namespace, rồi cho Deployment tạo lại pod:
+
+<Terminal where="mac" title="~/masteva-k5/k5-5/limitrange.yaml">
+
+```bash
+cat > limitrange.yaml <<'EOF'
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: mac-dinh
+  namespace: k5-quota
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 100m, memory: 128Mi }   # container không khai request thì nhận số này
+      default: { memory: 256Mi }                     # container không khai limit thì nhận số này
+      max: { memory: 1Gi }                           # một container không được xin quá chừng này
+EOF
+kubectl apply -f limitrange.yaml
+kubectl -n k5-quota rollout restart deploy/web
+kubectl -n k5-quota rollout status deploy/web --timeout=120s | tail -1
+kubectl -n k5-quota get pods -o yaml | yq '.items[0] | {
+  "resources": .spec.containers[0].resources,
+  "qos": .status.qosClass,
+  "ai-dien": .metadata.annotations."kubernetes.io/limit-ranger"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+limitrange/mac-dinh created
+deployment.apps/web restarted
+deployment "web" successfully rolled out
+resources:
+  limits:
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+qos: Burstable
+ai-dien: 'LimitRanger plugin set: cpu, memory request for container agnhost; memory limit for container agnhost'
+```
+
+</Expected>
+
+Manifest của Deployment không đổi một chữ; pod được điền `resources` lúc tạo, và annotation `limit-ranger` ghi lại ai đã điền. Lệnh `rollout restart` là cần thiết: ReplicaSet thử tạo pod lại theo nhịp thưa dần, restart buộc nó thử ngay.
+
+LimitRange này cố ý không có `max.cpu`. Khi soạn bài, một bản có thêm `max: {cpu: "1"}` đã gắn `limits.cpu: 1` cho pod (request vẫn 100m nhờ `defaultRequest`), đúng cái bẫy "thiếu `default` thì lấy `max`" ở phần Kiến thức.
+
+Trước khi thử vượt rào, xem quota theo scope làm được gì. Tạo một PriorityClass thử, rồi một quota chỉ đếm pod dùng class đó, với trần 0:
+
+<Terminal where="mac" title="~/masteva-k5/k5-5/quota-priority.yaml">
+
+```bash
+kubectl create priorityclass cao-thu --value=1000 --preemption-policy=Never
+cat > quota-priority.yaml <<'EOF'
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: khong-cao-thu
+  namespace: k5-quota
+spec:
+  hard:
+    pods: "0"
+  scopeSelector:
+    matchExpressions:
+      - { scopeName: PriorityClass, operator: In, values: [cao-thu] }
+EOF
+kubectl apply -f quota-priority.yaml
+kubectl -n k5-quota run uu-tien --image=registry.k8s.io/pause:3.10.1 --overrides='{"spec":{"priorityClassName":"cao-thu"}}'
+kubectl -n k5 run uu-tien --image=registry.k8s.io/pause:3.10.1 --overrides='{"spec":{"priorityClassName":"cao-thu"}}'
+kubectl -n k5 get pod uu-tien -o custom-columns=NAME:.metadata.name,PRIORITY:.spec.priority
+kubectl -n k5 delete pod uu-tien
+kubectl delete priorityclass cao-thu
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+priorityclass.scheduling.k8s.io/cao-thu created
+resourcequota/khong-cao-thu created
+Error from server (Forbidden): pods "uu-tien" is forbidden: exceeded quota: khong-cao-thu, requested: pods=1, used: pods=0, limited: pods=0
+pod/uu-tien created
+NAME      PRIORITY
+uu-tien   1000
+pod "uu-tien" deleted from k5 namespace
+priorityclass.scheduling.k8s.io "cao-thu" deleted
+```
+
+</Expected>
+
+Trong `k5-quota`, pod dùng class `cao-thu` bị từ chối vì quota theo scope có trần 0. Trong namespace `k5`, nơi không có quota nào, cùng pod đó được tạo với priority 1000. Quota theo scope là hạn mức cho namespace được cấp, không phải danh sách cho phép: muốn namespace "không được cấp" bị cấm thì cần cấu hình admission như phần Kiến thức đã nói.
+
+Giờ thử ba cách vượt rào.
+
+<Callout kind="danger">
+
+Lệnh cuối của khối dưới xoá namespace `k5-quota` cùng mọi thứ trong đó. Xoá namespace không hoàn tác được; trước khi chạy, kiểm `kubectl config current-context` in ra `kind-k5-lab`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k5-quota scale deploy/web --replicas=12 && sleep 8
+kubectl -n k5-quota get deploy web
+kubectl -n k5-quota describe quota tran | sed -n '4,$p'
+kubectl -n k5-quota events --types=Warning | tail -1 | cut -c-270 | sed 's/.*Error creating: //'
+kubectl -n k5-quota run to --image=registry.k8s.io/pause:3.10.1 --overrides='{"spec":{"containers":[
+  {"name":"to","image":"registry.k8s.io/pause:3.10.1","resources":{"limits":{"memory":"2Gi"}}}]}}'
+kubectl -n k5-quota expose deploy web --type=NodePort --port=80 --target-port=8080
+kubectl delete namespace k5-quota
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web scaled
+NAME   READY   UP-TO-DATE   AVAILABLE   AGE
+web    8/12    8            8           17s
+--------            ----  ----
+limits.memory       2Gi   2Gi
+pods                8     10
+requests.cpu        800m  2
+requests.memory     1Gi   2Gi
+services.nodeports  0     0
+pods "web-84bbdcdbdd-h9qmb" is forbidden: exceeded quota: tran, requested: limits.memory=256Mi, used: limits.memory=2Gi, limited: limits.memory=2Gi
+Error from server (Forbidden): pods "to" is forbidden: maximum memory usage per Container is 1Gi, but limit is 2Gi
+Error from server (Forbidden): services "web" is forbidden: exceeded quota: tran, requested: services.nodeports=1, used: services.nodeports=0, limited: services.nodeports=0
+namespace "k5-quota" deleted
+```
+
+</Expected>
+
+- Tăng lên 12 thì dừng ở **8**: mỗi pod nhận limit bộ nhớ 256 MiB, 8 pod là đúng 2 GiB, khoá `limits.memory` cạn trước. Thông báo ghi đủ ba số: xin thêm, đang dùng, trần. `describe quota` là nơi xem namespace còn bao nhiêu.
+- Pod `to` bị **LimitRange** chặn vì vượt `max` của một container, dù quota vẫn có thể còn chỗ.
+- Service NodePort bị **quota số object** chặn: trần là 0.
+
+Hai lệnh cuối báo lỗi ngay cho người gõ, vì họ tạo thẳng pod và Service. Chỉ đường đi qua Deployment mới im lặng.
+
+<Check id="k5.5.lab-limitrange">Dùng được LimitRange để pod không khai `resources` qua được quota, chỉ ra được số nào do LimitRange điền, và tái hiện được ba lần bị từ chối: vượt quota, vượt `max`, và quota số object.</Check>
+
+### 3. Một tenant bằng namespace: năm lớp trong một file
+
+File mẫu dưới gom đủ năm lớp cho một tenant; `TENANT` được thay bằng tên đội khi áp. Quyền được cấp cho **nhóm** mang tên đội, qua ClusterRole `edit` có sẵn (K2.3).
+
+<Terminal where="mac" title="~/masteva-k5/k5-5/tenant.yaml">
+
+```bash
+cat > tenant.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: TENANT
+  labels:
+    tenant: TENANT
+    pod-security.kubernetes.io/enforce: restricted   # lớp đặc quyền của pod
+---
+apiVersion: v1
+kind: ResourceQuota                                  # lớp tài nguyên: trần của namespace
+metadata: { name: tenant, namespace: TENANT }
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 2Gi
+    limits.memory: 2Gi
+    pods: "10"
+    services.nodeports: "0"
+    services.loadbalancers: "0"
+---
+apiVersion: v1
+kind: LimitRange                                     # lớp tài nguyên: mặc định cho từng container
+metadata: { name: tenant, namespace: TENANT }
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 100m, memory: 128Mi }
+      default: { memory: 256Mi }
+      max: { memory: 1Gi }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy                                  # lớp mạng: chỉ nói chuyện trong namespace, cộng DNS
+metadata: { name: chi-trong-tenant, namespace: TENANT }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding                                    # lớp quyền: nhóm TENANT được edit trong namespace này
+metadata: { name: tenant-edit, namespace: TENANT }
+subjects:
+  - { kind: Group, name: TENANT, apiGroup: rbac.authorization.k8s.io }
+roleRef:
+  { kind: ClusterRole, name: edit, apiGroup: rbac.authorization.k8s.io }
+EOF
+for t in team-a team-b; do sed "s/TENANT/$t/g" tenant.yaml | kubectl apply -f -; done
+```
+
+</Terminal>
+
+Từ đây bạn đóng vai hai người dùng: An thuộc nhóm `team-a`, Bình thuộc nhóm `team-b`. K2.3 đã dùng `--as` để mượn danh tính; hai hàm shell dưới bọc việc đó lại. (Dùng hàm chứ không dùng biến: zsh, shell mặc định của macOS, không tách một biến chứa nhiều cờ thành nhiều tham số.)
+
+Ứng dụng của mỗi đội phải đạt mức `restricted`, nên manifest có đủ bộ SecurityContext của K2.4:
+
+<Terminal where="mac" title="~/masteva-k5/k5-5/app.yaml">
+
+```bash
+an()   { kubectl --as=an   --as-group=team-a "$@"; }
+binh() { kubectl --as=binh --as-group=team-b "$@"; }
+cat > app.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: app
+          image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+          args: ["netexec", "--http-port=8080"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web }
+spec:
+  selector: { app: web }
+  ports:
+    - { port: 80, targetPort: 8080 }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: client }
+spec:
+  terminationGracePeriodSeconds: 0
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 100
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: curl
+      image: curlimages/curl:8.22.0
+      command: ["sleep", "infinity"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+EOF
+an   -n team-a apply -f app.yaml
+binh -n team-b apply -f app.yaml
+kubectl -n team-a wait --for=condition=Ready pod --all --timeout=180s | tail -1
+kubectl -n team-b wait --for=condition=Ready pod --all --timeout=180s | tail -1
+an -n team-a get pods -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CPU:.spec.containers[0].resources.requests.cpu'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web created
+service/web created
+pod/client created
+deployment.apps/web created
+service/web created
+pod/client created
+pod/web-7d96cd69c4-v6smd condition met
+pod/web-7d96cd69c4-psgjz condition met
+NAME                   STATUS    CPU
+client                 Running   100m
+web-7d96cd69c4-25hzd   Running   100m
+web-7d96cd69c4-v6smd   Running   100m
+```
+
+</Expected>
+
+An triển khai được ứng dụng vào namespace của đội mình mà không cần quyền nào ở cấp cụm, và pod tự nhận request mặc định. Đó là nửa "dùng được" của một tenant. Nửa còn lại là những thứ An **không** làm được.
+
+<Check id="k5.5.lab-tenant">Dựng được hai tenant từ một file mẫu năm lớp, và triển khai được ứng dụng đạt mức `restricted` bằng danh tính của một thành viên tenant.</Check>
+
+### 4. Thử phá từng lớp
+
+Một hàng rào chưa ai thử trèo thì chưa chắc là hàng rào. Mỗi lệnh dưới là một phép thử âm: nó **phải thất bại**.
+
+<Terminal where="mac">
+
+```bash
+an -n team-b get pods 2>&1 | cut -c1-140
+an -n team-b get secrets 2>&1 | cut -c1-140
+an get nodes 2>&1 | cut -c1-140
+an get namespaces 2>&1 | cut -c1-140
+an -n team-a patch resourcequota tenant --type=merge -p '{"spec":{"hard":{"pods":"100"}}}' 2>&1 | cut -c1-140
+an -n team-a run root --image=registry.k8s.io/pause:3.10.1 --privileged 2>&1 | cut -c1-140
+an -n team-a expose deploy web --name=ra-ngoai --type=NodePort --port=80 2>&1 | cut -c1-140
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Error from server (Forbidden): pods is forbidden: User "an" cannot list resource "pods" in API group "" in the namespace "team-b"
+Error from server (Forbidden): secrets is forbidden: User "an" cannot list resource "secrets" in API group "" in the namespace "team-b"
+Error from server (Forbidden): nodes is forbidden: User "an" cannot list resource "nodes" in API group "" at the cluster scope
+Error from server (Forbidden): namespaces is forbidden: User "an" cannot list resource "namespaces" in API group "" at the cluster scope
+Error from server (Forbidden): resourcequotas "tenant" is forbidden: User "an" cannot patch resource "resourcequotas" in API group "" in the
+Error from server (Forbidden): pods "root" is forbidden: violates PodSecurity "restricted:latest": privileged (container "root" must not set
+Error from server (Forbidden): services "ra-ngoai" is forbidden: exceeded quota: tenant, requested: services.nodeports=1, used: services.nod
+```
+
+</Expected>
+
+Bảy lần bị từ chối, ba lớp khác nhau: bốn dòng đầu và dòng thứ năm (sửa quota) là RBAC (role `edit` không có quyền gì ngoài namespace, và không được sửa ResourceQuota của chính mình); dòng thứ sáu là Pod Security Admission; dòng cuối là quota. Dòng thứ tư đáng để ý: An không liệt kê được namespace, **kể cả namespace của mình**. Đúng về bảo mật, phiền về trải nghiệm; đây là chỗ proxy của Capsule vá.
+
+Lớp mạng thử bằng traffic thật, từ pod `client` của `team-a`:
+
+<Terminal where="mac" title="~/masteva-k5/k5-5/goi.sh">
+
+```bash
+cat > goi.sh <<'EOF'
+#!/bin/sh
+# Từ pod client của team-a, gọi lần lượt các URL; in mã HTTP và exit code của curl
+for url in "$@"; do
+  code=$(kubectl -n team-a exec client -- curl -sk -m 3 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+  printf '%-42s http=%s exit=%s\n' "$url" "$code" "$?"
+done
+EOF
+chmod +x goi.sh
+./goi.sh http://web.team-a/hostname http://web.team-b/hostname https://kubernetes.default.svc/version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+http://web.team-a/hostname                 http=200 exit=0
+http://web.team-b/hostname                 http=000 exit=28
+https://kubernetes.default.svc/version     http=000 exit=28
+```
+
+</Expected>
+
+Trong namespace thì gọi được. Sang `team-b` và ra API server thì hết thời gian chờ (`exit=28`, như ở K2.4). DNS vẫn phân giải được cả ba tên, vì policy mở riêng cổng 53.
+
+<Check id="k5.5.lab-negative">Chạy được ít nhất tám phép thử âm trên một tenant (quyền, quota, Pod Security, mạng) và nói được mỗi phép thử bị lớp nào chặn.</Check>
+
+### 5. Lớp mà tenant tự gỡ được
+
+<Predict question="An có quyền `edit` trong `team-a`. NetworkPolicy `chi-trong-tenant` nằm trong `team-a`. An xoá nó được không, và sau đó chuyện gì đổi?">
+
+Được. ClusterRole `edit` có quyền ghi NetworkPolicy, vì với một đội tự quản namespace, đó là công cụ của chính họ. Xoá xong, pod của `team-a` hết bị chặn chiều ra: gọi được API server và mọi thứ không tự bảo vệ. `team-b` vẫn an toàn với traffic từ `team-a`, nhưng là nhờ policy **của `team-b`** chặn chiều vào. Hàng rào do tenant giữ chìa thì chỉ chống được nhầm lẫn, không chống được chủ ý.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+an -n team-a auth can-i delete networkpolicies
+an -n team-a auth can-i update limitranges
+an -n team-a delete networkpolicy chi-trong-tenant
+until ./goi.sh https://kubernetes.default.svc/version | grep -q 'http=200'; do sleep 1; done
+for i in 1 2 3; do ./goi.sh http://web.team-b/hostname; sleep 1; done
+./goi.sh https://kubernetes.default.svc/version
+sed "s/TENANT/team-a/g" tenant.yaml | kubectl apply -f - | grep -v unchanged
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+yes
+no
+networkpolicy.networking.k8s.io "chi-trong-tenant" deleted from team-a namespace
+http://web.team-b/hostname                 http=000 exit=28
+http://web.team-b/hostname                 http=000 exit=28
+http://web.team-b/hostname                 http=000 exit=28
+https://kubernetes.default.svc/version     http=200 exit=0
+networkpolicy.networking.k8s.io/chi-trong-tenant created
+```
+
+</Expected>
+
+Role `edit` không cho sửa ResourceQuota hay LimitRange, nhưng cho xoá NetworkPolicy. Vòng `until` chờ tới khi thay đổi có hiệu lực: như K2.4 đã ghi, CNI cần khoảng một giây để áp một thay đổi policy. Sau khi xoá, đường ra API server mở (`200`), còn ba lần gọi sang `team-b` cách nhau một giây đều bị chặn. Bài gọi ba lần vì policy không được áp tức thì: một người duyệt bài từng thấy một lần gọi lọt sang `team-b` khi chạy bước này chỉ vài giây sau lúc tạo tenant, còn 30 lần gọi thử lại khi soạn bài đều bị chặn. Nếu bạn gặp một dòng `http=200` ở đây, gọi lại `./goi.sh` sau vài giây trước khi kết luận. Dòng cuối là người vận hành áp lại file mẫu để dựng lại policy; làm tay thì không bền. Ba cách đóng lỗ này, từ nhẹ tới nặng:
+
+| Cách | Làm gì | Giới hạn |
+|---|---|---|
+| Role riêng thay cho `edit` | Bỏ quyền ghi NetworkPolicy | Đội mất luôn quyền tự viết policy chi tiết hơn cho service của mình |
+| Chính sách admission (K8) | Cấm xoá hoặc sửa policy mang một label nhất định, trừ người vận hành | Thêm một lớp phải bảo trì |
+| Capsule, hoặc policy mạng cấp cụm của CNI (K6) | Operator tự dựng lại object bị xoá; policy cấp cụm thì tenant không chạm tới được | Thêm một thành phần vào cụm |
+
+<Check id="k5.5.lab-hole">Chứng minh được một thành viên tenant gỡ được NetworkPolicy của chính namespace mình, đo được điều gì thay đổi sau đó, và nêu được ba cách đóng lỗ hổng.</Check>
+
+### 6. Cụm ảo cho đội cần quyền cấp cụm
+
+Giả sử `team-c` cần tự cài CRD và tự tạo namespace. Thay vì cấp quyền cấp cụm trên cụm chủ, cấp cho họ một cụm ảo. Chart của vCluster tự tạo ResourceQuota và LimitRange trên namespace chủ khi bật `policies`; ở đây trần là 8 pod. LimitRange mặc định của chart có `default` cho cả CPU (1 CPU), bộ nhớ (512 MiB) và ephemeral-storage, nên pod của tenant không tự khai limit sẽ nhận `limits.cpu: 1` trên cụm chủ; chỉnh ở `policies.limitRange.default` nếu bạn theo cách không đặt CPU limit của K1.2.
+
+<Terminal where="mac" title="~/masteva-k5/k5-5/vcluster-values.yaml">
+
+```bash
+cat > vcluster-values.yaml <<'EOF'
+telemetry:
+  enabled: false                     # không gửi số liệu sử dụng về nhà phát hành
+exportKubeConfig:
+  server: https://localhost:9581     # địa chỉ ghi trong kubeconfig của cụm ảo
+policies:
+  resourceQuota:
+    enabled: true                    # vCluster tạo ResourceQuota và LimitRange trên namespace chủ
+    quota:
+      requests.cpu: 2
+      requests.memory: 2Gi
+      count/pods: 8
+EOF
+helm install team-c vcluster --repo https://charts.loft.sh --version 0.37.2 \
+  -n team-c --create-namespace -f vcluster-values.yaml | grep -E '^(NAME|STATUS):'
+kubectl -n team-c rollout status statefulset/team-c --timeout=600s | tail -1
+until kubectl -n team-c get secret vc-team-c >/dev/null 2>&1; do sleep 5; done
+kubectl -n team-c get secret vc-team-c -o jsonpath='{.data.config}' | base64 -d > vc-team-c.kubeconfig
+kubectl -n team-c get pods,quota -o name
+```
+
+</Terminal>
+
+Lần đầu mất một hai phút để kéo image.
+
+<Expected>
+
+```text
+NAME: team-c
+STATUS: deployed
+partitioned roll out complete: 1 new pods have been updated...
+pod/coredns-df8c87f55-9krp6-x-kube-system-x-team-c
+pod/team-c-0
+resourcequota/vc-team-c
+```
+
+</Expected>
+
+Trên cụm chủ, cả cụm ảo là một pod `team-c-0` (API server, controller manager và kho dữ liệu SQLite trong một pod), cộng một pod CoreDNS của riêng nó. Secret `vc-team-c` chứa kubeconfig quản trị của cụm ảo, và lệnh trên đã chép nó ra file. API server ảo chỉ nghe trong cụm, nên mở **terminal thứ hai** để nối cổng 9581 trên máy tới nó, và để terminal đó chạy:
+
+<Terminal where="mac" title="Terminal 2: giữ chạy tới hết bài">
+
+```bash
+export KUBECONFIG=~/masteva-k5/kubeconfig
+kubectl -n team-c port-forward svc/team-c 9581:443
+```
+
+</Terminal>
+
+Quay lại terminal đầu. Hàm `vc` là `kubectl` nói chuyện với cụm ảo:
+
+<Terminal where="mac">
+
+```bash
+vc() { kubectl --kubeconfig ~/masteva-k5/k5-5/vc-team-c.kubeconfig "$@"; }
+vc version | tail -1
+vc auth can-i '*' '*' --all-namespaces
+vc get namespaces
+vc create namespace shop
+vc -n shop create deployment web --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 \
+  --replicas=2 -- /agnhost netexec --http-port=8080
+vc -n shop rollout status deploy/web --timeout=180s | tail -1
+echo "--- cụm chủ thấy gì:"
+kubectl -n team-c get pods -o name
+kubectl get namespaces -o name | grep -c shop
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Server Version: v1.36.0
+yes
+NAME              STATUS   AGE
+default           Active   18s
+kube-node-lease   Active   18s
+kube-public       Active   18s
+kube-system       Active   18s
+namespace/shop created
+deployment.apps/web created
+deployment "web" successfully rolled out
+--- cụm chủ thấy gì:
+pod/coredns-df8c87f55-9krp6-x-kube-system-x-team-c
+pod/team-c-0
+pod/web-7b98f99775-btfvg-x-shop-x-team-c
+pod/web-7b98f99775-hwq9f-x-shop-x-team-c
+0
+```
+
+</Expected>
+
+Đọc từ hai phía:
+
+- **Phía tenant:** một cụm Kubernetes 1.36 (cụm chủ là 1.37), quyền admin toàn phần, bốn namespace quen thuộc của một cụm mới. Tạo namespace `shop` không cần hỏi ai.
+- **Phía chủ:** không có namespace `shop` nào. Hai pod `web` xuất hiện trong namespace `team-c` với tên dạng `<pod>-x-<namespace ảo>-x-<cụm ảo>`. Thành phần đồng bộ của vCluster đã chép chúng xuống để scheduler và kubelet của cụm chủ chạy chúng. Deployment, ReplicaSet, namespace `shop` chỉ tồn tại trong kho dữ liệu của cụm ảo.
+
+Hai phép thử cuối: tài nguyên cấp cụm, và quota.
+
+<Terminal where="mac" title="~/masteva-k5/k5-5/crd.yaml">
+
+```bash
+cat > crd.yaml <<'EOF'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.lab.masteva.test
+spec:
+  group: lab.masteva.test
+  scope: Namespaced
+  names: { plural: widgets, singular: widget, kind: Widget }
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+EOF
+vc apply -f crd.yaml
+echo "cụm ảo: $(vc get crd -o name | grep -c widgets) CRD widgets; cụm chủ: $(kubectl get crd -o name | grep -c widgets)"
+vc -n shop scale deploy/web --replicas=10 && sleep 15
+vc -n shop get deploy web
+kubectl -n team-c get quota vc-team-c -o jsonpath='{.status.used.count/pods}/{.status.hard.count/pods} pod trên cụm chủ{"\n"}'
+vc -n shop events --types=Warning | tail -1 | cut -c1-250
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+customresourcedefinition.apiextensions.k8s.io/widgets.lab.masteva.test created
+cụm ảo: 1 CRD widgets; cụm chủ: 0
+deployment.apps/web scaled
+NAME   READY   UP-TO-DATE   AVAILABLE   AGE
+web    6/10    10           6           17s
+8/8 pod trên cụm chủ
+14s (x2 over 14s)   Warning   SyncError   Pod/web-7b98f99775-hgmjc   Error syncing to host cluster: create object: pods "web-7b98f99775-hgmjc" is forbidden: exceeded quota: vc-team-c, requested: count/pods=1, used: count/pods=8, limited: count/pods=8
+```
+
+</Expected>
+
+Tenant cài CRD trong cụm của mình; cụm chủ không hề biết. Đó là thứ mô hình namespace không cho được. Còn quota của cụm chủ thì **vẫn có hiệu lực**: tenant là admin trong cụm ảo và tạo được 10 pod ở đó, nhưng chỉ 6 pod xuống được cụm chủ (trần 8, trừ pod control plane và CoreDNS), số còn lại `Pending` với event `SyncError` chép nguyên lỗi quota. Quyền admin của tenant dừng ở biên cụm ảo; tài nguyên thật do namespace chủ quyết định.
+
+Thứ không đổi: pod của `team-c` chạy trên cùng node, cùng kernel với `team-a` và `team-b`. Cụm ảo tách **control plane**, không tách data plane.
+
+<Check id="k5.5.lab-vcluster">Chạy được một cụm ảo, chỉ ra pod của nó trên cụm chủ, chứng minh được CRD của tenant không lộ ra cụm chủ, và quota của cụm chủ vẫn chặn được tenant.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Deployment `0/N`, không có pod | Quota hoặc Pod Security từ chối pod | `kubectl events --types=Warning`; điều kiện `ReplicaFailure` của Deployment |
+| `must specify requests.cpu…` | Namespace có quota mà thiếu LimitRange, pod không khai `resources` | `kubectl get limitrange -n <ns>` |
+| `violates PodSecurity "restricted:latest"` | Pod thiếu SecurityContext của mức `restricted` | Thông báo liệt kê từng trường thiếu; so với `app.yaml` |
+| Pod `client` không Ready, event có `non-numeric user` | Image khai user bằng tên, `runAsNonRoot` không kiểm được | Thêm `runAsUser` là số (K2.4) |
+| `User "an --as-group=…" cannot…` | Dùng biến chứa nhiều cờ trong zsh | Dùng hàm `an()` như bước 3 |
+| `vc` báo `connection refused` | Terminal 2 chưa chạy `port-forward`, hoặc đã ngắt | Chạy lại lệnh ở Terminal 2 |
+| Pod trong cụm ảo `Pending`, event `SyncError` | Quota hoặc policy của namespace chủ từ chối | `kubectl -n team-c describe quota` trên cụm chủ |
+
+### Dọn dẹp
+
+Đây là bài cuối của K5. Dừng `port-forward` ở Terminal 2 bằng Ctrl+C, rồi gỡ ba tenant.
+
+<Callout kind="danger">
+
+Khối đầu gỡ cụm ảo và xoá ba namespace `team-a`, `team-b`, `team-c` cùng mọi thứ trong đó; với `team-c`, đó là toàn bộ cụm ảo và dữ liệu của nó. Khối thứ hai xoá cả cụm `k5-lab` và thư mục `~/masteva-k5` cùng mọi file lab của năm bài K5; chỉ chạy khối đó khi không cần xem lại gì nữa. Trước khi chạy, kiểm `kubectl config current-context` in ra `kind-k5-lab`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+helm uninstall team-c -n team-c
+kubectl delete namespace team-a team-b team-c
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Xoá cụm và thư mục lab">
+
+```bash
+kind delete cluster --name k5-lab
+rm -rf ~/masteva-k5
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao quota CPU và bộ nhớ không chặn được noisy neighbor?">
+
+Vì request và limit chỉ mô tả hai thứ: thời gian CPU và bộ nhớ. Hai pod của hai tenant trên cùng một node còn chung nhau đĩa, băng thông mạng, bộ đệm trang của kernel, bảng conntrack (D2.4), số file đang mở, và bộ nhớ đệm của chính CPU. Một pod ghi log dồn dập làm đầy đĩa của node, và kubelet evict pod của tenant khác (K1.2). Một pod mở hàng trăm nghìn kết nối làm đầy conntrack, và kết nối mới của mọi pod trên node bị rớt. Không quota nào đếm những thứ đó. Giảm nhẹ được bằng `ephemeral-storage` trong request và quota, và bằng node riêng cho tenant ồn (taint và label của K5.1); muốn hết hẳn thì tenant phải có máy riêng.
+
+</Reveal>
+
+<Reveal title="API Priority and Fairness bảo vệ API server thế nào, và tới đâu?">
+
+API server không xử lý request theo thứ tự tới. Mỗi request được xếp vào một **priority level** qua các `FlowSchema` (theo người gọi, loại tài nguyên, namespace), mỗi level có phần năng lực riêng và hàng đợi riêng, và trong một level các **flow** được chia lượt công bằng. Nhờ đó một controller của tenant gọi `LIST` liên tục chỉ làm đầy hàng đợi của flow mình; kubelet và scheduler ở level khác vẫn được phục vụ. Cấu hình mặc định đã tách thành phần hệ thống khỏi workload.
+
+Giới hạn: nó chia theo **số request đang xử lý**, không theo chi phí thật của từng request, và mặc định mọi ServiceAccount của workload rơi vào cùng vài level. Tenant cần được tách thì phải viết FlowSchema riêng. Và nó không cứu được etcd khỏi việc bị lấp bởi hàng triệu object; phần đó là việc của quota số object.
+
+</Reveal>
+
+<Reveal title="Tenant trong cụm ảo có thoát ra cụm chủ được không?">
+
+Qua API thì không: kubeconfig của tenant chỉ trỏ tới API server ảo, và tenant không có danh tính nào trên cụm chủ. Qua **pod** thì tuỳ người vận hành. Pod của tenant chạy thật trên node chủ; nếu namespace chủ không ép Pod Security, tenant tạo một pod `privileged` mount đĩa của node và từ đó đọc được mọi thứ trên node, kể cả của tenant khác. Vì thế namespace chứa cụm ảo vẫn cần đủ các lớp ở bước 3: quota, Pod Security, NetworkPolicy (có mở đường cho thành phần đồng bộ gọi API server của cụm chủ). vCluster thêm quyền cho tenant; nó không bớt việc cho người giữ cụm chủ. Với tenant không tin được, vCluster có chế độ cho cụm ảo dùng node riêng, lúc đó chỉ còn chung control plane chủ.
+
+</Reveal>
+
+<Reveal title="Tổng quota của các namespace nên bằng bao nhiêu phần của cụm?">
+
+Tuỳ bạn coi quota là gì. Tổng bằng 100% năng lực cụm nghĩa là mỗi đội chắc chắn có phần của mình, và cụm thường xuyên rảnh vì không đội nào dùng hết. Tổng 150 tới 200% là overcommit có chủ ý: các đội hiếm khi cùng lên đỉnh, cụm được dùng tốt hơn, và khi họ cùng lên thì có pod `Pending`. Lúc đó thứ quyết định ai được chạy là PriorityClass (K5.2), còn cluster autoscaler (K5.4) quyết định cụm có nở ra không. Điều quan trọng là quyết định có chủ ý và đo được: so tổng quota, tổng request thật và năng lực cụm theo thời gian. D18 bàn kế hoạch dung lượng.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI dựng nhanh bộ manifest cho một tenant và nên nhờ nó phần lặp lại. Chỗ hay sai: (1) tạo ResourceQuota mà quên LimitRange, làm gãy mọi Deployment không khai `resources`; (2) LimitRange có `max.cpu` mà không có `default.cpu`, vô tình gắn CPU limit cho cả namespace; (3) cấp `admin` hoặc `cluster-admin` cho tenant "cho tiện"; (4) viết NetworkPolicy chặn mặc định mà quên DNS; (5) khẳng định namespace là ranh giới bảo mật đủ cho khách hàng bên ngoài. Kiểm bằng phép thử âm như bước 4: với mỗi lớp, viết một lệnh phải thất bại, chạy bằng danh tính của tenant, và giữ bộ lệnh đó làm test chạy lại mỗi khi sửa file mẫu.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.2 dạy request, limit và QoS, thứ quota và LimitRange điều khiển. K2.3 dạy RBAC và `--as`; K2.4 dạy SecurityContext và NetworkPolicy, hai trong năm lớp. K5.1 cho node riêng bằng taint; K5.2 cho PriorityClass, thứ nên được giới hạn bằng quota. K6 có policy mạng cấp cụm; K8 dạy Pod Security Admission và chính sách admission để khoá những gì tenant không được gỡ; K9 dạy CRD và operator, thứ tenant muốn tự cài; K10 là bước tiếp khi phải tách cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k5.5.mastery-quota">Đặt được ResourceQuota và LimitRange cho một namespace đang có workload mà không làm gãy workload đó, và chẩn đoán được một Deployment không có pod vì quota.</Check>
+
+<Check id="k5.5.mastery-tenant">Viết được file mẫu năm lớp cho một tenant và một bộ phép thử âm chứng minh từng lớp có hiệu lực, kể cả lớp tenant tự gỡ được.</Check>
+
+<Check id="k5.5.mastery-choice">Với một yêu cầu cụ thể (các đội nội bộ, đội cần CRD riêng, khách hàng bên ngoài), chọn được giữa namespace, Capsule, vCluster và tách cụm, và nói được thứ gì vẫn dùng chung ở lựa chọn đó.</Check>
+
+</Mastery>
