@@ -1,0 +1,924 @@
+---
+title: "Rook và Ceph: một kho object, ba giao diện"
+description: Hiểu Ceph từ RADOS lên (MON, OSD, pool, placement group, CRUSH, failure domain, size và min_size), dựng một cụm bằng Rook trên bốn đĩa ảo, cấp volume khối và file dùng chung, rồi dừng OSD, thêm OSD, hạ ngưỡng đầy để đọc đúng từng trạng thái mà một cụm thật sẽ đi qua.
+id: k7.3
+step: k7
+prerequisites: [k7.2]
+topics: [k7.rook-ceph]
+status: verified
+verified:
+  date: 2026-10-13
+  os: Ubuntu 26.04 LTS (một VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    k3s: v1.36.5+k3s1
+    rook: 1.21.0
+    ceph: 20.2.4 (Tentacle)
+    ceph-csi: 3.18.1
+    ceph-csi-operator: 1.1.0
+    kubectl: 1.37.1
+    jq: 1.8.2
+---
+
+<Goal>
+
+K7.2 kết thúc ở chỗ Longhorn hết hợp: cần volume lớn hơn một đĩa, cần file dùng chung và object storage ở quy mô lớn. Câu trả lời quen thuộc trên hạ tầng tự quản là **Ceph**, và trên Kubernetes thì Ceph được dựng bằng **Rook**. Ceph nhiều khái niệm hơn hẳn Longhorn; bài này đi từ nền lên rồi cho bạn làm hỏng một cụm thật. Học xong, bạn giải thích được:
+
+- Vì sao client của Ceph không hỏi ai "dữ liệu nằm ở đâu" mà tự tính ra, và MON, OSD, MGR mỗi thứ giữ vai gì.
+- Vì sao cụm vừa dựng xong đã có PG không hoạt động, và failure domain liên quan gì.
+- Vì sao mất một OSD thì ứng dụng không hay biết, mất hai thì mọi lệnh ghi đứng yên mà không báo lỗi.
+- `down` khác `out` thế nào, `noout` dùng khi nào, và vì sao cụm `full` là sự cố nặng hơn mất đĩa.
+- Cụm lab một node **không** chứng minh được những gì, và production cần phần cứng cỡ nào.
+
+</Goal>
+
+<Knowledge>
+
+### RADOS: một kho object, và các daemon giữ nó
+
+Lõi của Ceph là **RADOS**: một kho lưu **object** (một tên, một khối byte, vài thuộc tính) trải trên rất nhiều đĩa. Mọi thứ Ceph cho bạn đều là một lớp mỏng phía trên kho đó:
+
+```text
+   RBD: đĩa khối            CephFS: filesystem dùng chung      RGW: object storage kiểu S3
+   image cắt thành các      file cắt thành object;             mỗi object S3 thành một
+   object 4 MiB             cây thư mục do MDS giữ             hoặc nhiều object RADOS
+        |                          |                                  |
+        +--------------------------+----------------------------------+
+                                   |
+                     RADOS: pool -> placement group -> OSD
+```
+
+| Daemon | Số lượng | Việc |
+|---|---|---|
+| **MON** (monitor) | Số lẻ: 3 hoặc 5 | Giữ **cluster map**: danh sách MON, OSD nào sống, pool, luật CRUSH (mục sau). Các MON biểu quyết theo đa số (quorum). Không nằm trên đường dữ liệu |
+| **OSD** | Mỗi đĩa một daemon | Lưu object trên đĩa (BlueStore, ghi thẳng lên thiết bị thô), tự nhân bản sang OSD khác, tự phục hồi, và theo dõi nhịp tim của nhau |
+| **MGR** (manager) | 2 (một chạy, một chờ) | Số liệu, tự chỉnh số PG (mục sau) và cân lại dữ liệu giữa các OSD, dashboard. Mất nó cụm vẫn đọc ghi được |
+| **MDS** | Từ 1, chỉ khi dùng CephFS | Giữ cây thư mục và quyền của CephFS |
+| **RGW** | Từ 1, chỉ khi dùng S3 | Cổng HTTP dịch API S3 thành thao tác RADOS |
+
+Điểm khác mọi hệ có "máy chủ metadata": **không ai giữ bảng tra object nào nằm đâu**. Client lấy cluster map từ MON một lần, rồi tự **tính** ra OSD giữ object bằng thuật toán CRUSH (mục sau) và nói chuyện thẳng với OSD đó. MON chỉ phát bản đồ mới khi cụm đổi. Nhờ vậy Ceph lớn tới hàng nghìn OSD mà không có nút cổ chai, và cũng vì vậy cluster map là thứ cả cụm cùng tin: nó sai thì mọi nơi cùng sai.
+
+<Check id="k7.3.rados-daemon">Nói được RADOS là gì và ba giao diện dựng trên nó thế nào, MON, OSD, MGR, MDS, RGW mỗi thứ làm gì, daemon nào nằm trên đường dữ liệu, và vì sao client không cần hỏi vị trí của từng object.</Check>
+
+### Từ tên object tới ba cái đĩa: pool, PG, CRUSH
+
+```text
+ object "rbd_data.1216eebf1cde.0000000000000020" trong pool rbd-lab
+     | hash(tên object) mod pg_num của pool
+     v
+ placement group 2.0                (2 là mã pool; pool này có 32 PG)
+     | CRUSH(luật của pool, cluster map)
+     v
+ [osd.2, osd.1, osd.0]              OSD đầu là primary: nhận lệnh ghi, chép sang hai OSD kia,
+                                    đủ cả ba mới trả lời client
+```
+
+- **Pool** là một không gian tên có chính sách riêng: nhân bản mấy bản (`size`), còn ít nhất mấy bản thì mới phục vụ (`min_size`), đặt theo luật CRUSH nào.
+- **Placement group (PG)** là đơn vị Ceph quản lý thay cho từng object: hàng triệu object được gom vào vài chục tới vài nghìn PG, và Ceph theo dõi, nhân bản, phục hồi theo PG. Mọi trạng thái bạn đọc trong `ceph status` là trạng thái của PG. Số PG do autoscaler của MGR tự chỉnh.
+- **CRUSH** xếp OSD thành cây (`root` → `host` → `osd`, cụm lớn có thêm `rack`, `datacenter`) và mỗi pool có một **luật** nói các bản sao phải nằm tách nhau ở tầng nào. Tầng đó là **failure domain**. Mặc định là `host`: ba bản ở ba máy khác nhau, mất trọn một máy vẫn còn hai bản.
+
+`size` và `min_size` quyết định cụm làm gì khi thiếu bản. Với cặp chuẩn `size: 3`, `min_size: 2`:
+
+| Số bản còn sống của một PG | Trạng thái PG | Đọc ghi |
+|---|---|---|
+| 3 | `active+clean` | Bình thường |
+| 2 | `active+undersized+degraded` | Bình thường; cụm tìm cách dựng lại bản thứ ba |
+| 1 | `undersized+degraded+peered` (không còn `active`) | **Đứng yên**, không lỗi, không timeout, tới khi đủ 2 bản |
+| 0 | `stale`, `down` | Không |
+
+Dòng thứ ba là lựa chọn có chủ đích: thà dừng còn hơn nhận ghi vào đúng một bản, vì bản đó mất nốt thì những gì vừa ghi không còn ở đâu khác. Cùng một lý lẽ với replication đồng bộ của PostgreSQL ở K7.4.
+
+<Check id="k7.3.pool-pg-crush">Kể được đường đi từ tên object tới danh sách OSD, pool và PG là gì, failure domain của một luật CRUSH quyết định điều gì, và với `size: 3`, `min_size: 2` thì còn 2 bản và còn 1 bản khác nhau thế nào.</Check>
+
+### Rook: operator dịch CR thành một cụm Ceph
+
+Tự dựng Ceph là dựng MON, tạo khoá, chuẩn bị từng đĩa, và làm lại khi nâng cấp. **Rook** là operator (mô hình ở K7.4; K9 dạy viết) làm các việc đó từ vài custom resource. Rook **không nằm trên đường dữ liệu**: nó dựng và canh các daemon Ceph, còn pod của bạn nói chuyện thẳng với OSD qua driver CSI.
+
+| Bạn khai | Rook tạo ra |
+|---|---|
+| `CephCluster` | Deployment cho từng MON, MGR, OSD; Job `osd-prepare` biến đĩa trống thành OSD |
+| `CephBlockPool` | Một pool và một luật CRUSH theo `failureDomain` |
+| `CephFilesystem` | Hai loại pool (metadata, data) và các MDS |
+| `CephObjectStore` | Các pool của RGW và Deployment RGW; bucket xin qua `ObjectBucketClaim` |
+| Toolbox (một Deployment) | Một pod có sẵn lệnh `ceph`, `rbd`, `rados` và khoá admin |
+
+Driver CSI (dự án ceph-csi) đi kèm theo đúng mô hình K7.1. Với RBD, node plugin **map** image thành thiết bị `/dev/rbdN` bằng module `rbd` của kernel rồi mount; với CephFS, kernel mount thẳng filesystem. Đường dữ liệu là kernel của node tới OSD.
+
+<Check id="k7.3.rook-crd">Kể được bốn CRD chính của Rook và thứ mỗi cái tạo ra, toolbox dùng để làm gì, và Rook có nằm trên đường dữ liệu hay không.</Check>
+
+### Mất OSD, cụm gần đầy, mất MON
+
+**OSD có hai cặp trạng thái độc lập.** `up`/`down`: daemon có trả lời không. `in`/`out`: CRUSH có tính nó khi xếp dữ liệu không.
+
+```text
+ OSD chết      -> down ngay (dừng sạch), hoặc sau khoảng 20 giây (các OSD khác báo mất nhịp tim)
+                  PG có bản trên nó: active+undersized+degraded. Vẫn đọc ghi. CHƯA chép gì đi đâu.
+ 600 giây sau  -> MON đánh dấu out (mon_osd_down_out_interval)
+                  CRUSH tính lại: bản thiếu được dựng trên OSD khác = backfill. Xong thì active+clean.
+ OSD quay lại trước đó -> chỉ chép phần đã đổi trong lúc vắng = recovery, nhanh hơn nhiều.
+```
+
+Khoảng chờ 600 giây tồn tại vì backfill đắt: chép lại toàn bộ dữ liệu của một đĩa qua mạng. Bảo trì có kế hoạch (thay RAM, khởi động lại node) thì đặt cờ `noout` trước, để Ceph không bắt đầu một đợt backfill vô ích; nhớ gỡ cờ sau đó. Backfill cần hai thứ: **chỗ trống** trên các OSD còn lại, và **một nơi hợp luật** để đặt bản sao. Cụm có đúng ba host với `size: 3` theo host thì mất một host là không còn nơi nào hợp luật: cụm ở lại `degraded` tới khi host về.
+
+**Đầy đĩa có ba ngưỡng**, tính trên **từng OSD**, không phải trung bình cả cụm:
+
+| Ngưỡng | Mặc định | Chuyện xảy ra |
+|---|---|---|
+| `nearfull` | 85% | `HEALTH_WARN`. Chưa chặn gì |
+| `backfillfull` | 90% | OSD đó từ chối nhận backfill: cụm mất khả năng tự chữa |
+| `full` | 95% | `HEALTH_ERR`. Mọi lệnh ghi vào pool có dữ liệu trên OSD đó **đứng yên** |
+
+`full` nặng hơn mất đĩa vì nó chặn luôn lối ra: với RADOS, xoá dữ liệu cũng là một thao tác ghi, và backfill sang chỗ khác cũng cần chỗ. Và nó hay đến cùng một sự cố khác: cụm đang 80% mất một node, Ceph tự chữa bằng cách dồn dữ liệu của node đó sang các node còn lại, và chính việc tự chữa đẩy chúng qua ngưỡng. Tài liệu Ceph cho một lối thoát tạm là nâng nhẹ `full` (`ceph osd set-full-ratio`) để có chỗ mà xoá hoặc thêm OSD; lối thoát thật là không bao giờ để cụm tới đó.
+
+**MON và quorum.** Cluster map chỉ đổi khi quá nửa số MON đồng ý: 3 MON chịu mất 1, 5 MON chịu mất 2. Mất quorum thì bản đồ đóng băng: lệnh `ceph` treo, client mới không vào được, không OSD nào được đánh dấu `down` hay `out`. I/O đang chạy trên bản đồ cũ vẫn tiếp tục một lúc, tới khi có gì đó cần bản đồ mới.
+
+<Callout kind="production">
+
+Sáng 20/02/2020, cụm Ceph block storage của CERN, nơi chứa đĩa của các máy ảo OpenStack, ngừng phục vụ. Theo [báo cáo sự cố](https://twiki.cern.ch/twiki/bin/view/LCG/CERNProdIncident200220) và [bản phân tích kỹ thuật](https://codimd.web.cern.ch/p/HJGnq3HVI) của họ: lúc 10:11 cụm phát hiện 25% OSD `down`, khoảng 350 trong 1.300 OSD cùng crash khi một bản cập nhật **osdmap** (phần cluster map mô tả các OSD) tới nơi, và I/O của các volume dừng. Các OSD đó không khởi động lại được: chúng crash tiếp khi đọc osdmap đã lưu trên đĩa của mình, với lỗi sai mã CRC. Để phục hồi, họ lấy một bản osdmap tốt từ nơi khác và ghi đè lên từng OSD hỏng bằng `ceph-objectstore-tool`, lặp lại cho mọi OSD và vài bản đồ hỏng; dịch vụ trở lại theo từng phần, vào khoảng 17:30 và 19:00. Hệ thống gửi job batch, một phần AFS, GitLab và nhiều dịch vụ khác ngừng theo, vì đều đặt đĩa trên cụm đó. Nguyên nhân gốc mất một tuần mới tìm ra: thư viện nén LZ4 bản cũ hơn 1.8.2 (CentOS 7 kèm bản 1.7.5) nén sai khi dữ liệu nằm trong bộ đệm phân mảnh, làm hỏng 4 bit của osdmap. Họ tắt nén LZ4, và cấu hình lại các máy quản trị để không phụ thuộc vào lưu trữ ngoài.
+
+Điều rút ra cho bài này (của bài): thiết kế "ai cũng tự tính từ một bản đồ chung" cho Ceph khả năng mở rộng, và cũng cho nó một điểm hỏng chung: một bản đồ lỗi lan tới hàng trăm OSD cùng lúc, không failure domain nào chặn được. Hai việc nên chép: biết trước những dịch vụ nào chết theo cụm lưu trữ, và giữ công cụ cứu hộ (máy quản trị, runbook, toolbox) ở nơi **không** nằm trên chính cụm đó.
+
+</Callout>
+
+<Check id="k7.3.su-co">Phân biệt được `down` với `out` và recovery với backfill, nói được `noout` dùng khi nào, ba ngưỡng đầy làm gì và vì sao `full` nặng hơn mất đĩa, và mất quorum MON thì cái gì dừng, cái gì còn chạy.</Check>
+
+### Phần cứng thật, và những gì lab không chứng minh được
+
+| | Lab của bài | Production (tài liệu Ceph và Rook) |
+|---|---|---|
+| Node | 1 | Từ 3: `cluster.yaml` mẫu của Rook đòi 3 MON trên ba node khác nhau |
+| RAM mỗi OSD | `osd_memory_target` hạ xuống 896 MiB | Mặc định 4 GiB; dưới 2 GiB không được khuyến nghị. RAM máy nên lớn hơn số OSD × `osd_memory_target` × 2 |
+| Mạng | Trong một máy | Từ 10 Gb/s: chép 1 TiB mất ba giờ trên 1 Gb/s, hai mươi phút trên 10 Gb/s |
+| Đĩa OSD | File 6 GiB trên Mac | Thiết bị thô nguyên chiếc; khuyến nghị từ 1 TiB, dưới 100 GiB coi như không hiệu quả |
+| MON | 1, không có quorum để mất | 3 hoặc 5, trên SSD |
+| Failure domain | `osd` | `host` trở lên |
+
+Cụm một node dạy được cơ chế: PG, `size`, `min_size`, `down`, `out`, backfill, ngưỡng đầy. Nó **không** chứng minh được ba điều: dữ liệu sống sót khi mất một máy (mọi OSD ở chung một máy), quorum MON, và thời gian phục hồi thật qua mạng với dữ liệu thật. Đừng mang con số giây của lab đi lập kế hoạch.
+
+<Check id="k7.3.phan-cung">Nêu được yêu cầu tối thiểu của một cụm Ceph production về số node, RAM mỗi OSD, mạng và MON, và ba điều một cụm lab một node không chứng minh được.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Architecture | Ceph Documentation](https://docs.ceph.com/en/tentacle/architecture/): RADOS, cluster map, CRUSH, cách client tính vị trí object và cách OSD tự nhân bản; nền của cả bài.
+- [Health checks | Ceph Documentation](https://docs.ceph.com/en/tentacle/rados/operations/health-checks/): tra mã cảnh báo (`OSD_DOWN`, `OSD_NEARFULL`, `OSD_FULL`, `PG_AVAILABILITY`, `PG_DEGRADED`…), trạng thái PG đi kèm và cách xử lý từng cái.
+- [Hardware Recommendations | Ceph Documentation](https://docs.ceph.com/en/tentacle/start/hardware-recommendations/): RAM cho OSD, MON, MDS; mạng; cỡ đĩa.
+- [Quickstart | Rook Ceph Documentation](https://rook.io/docs/rook/v1.21/Getting-Started/quickstart/): các manifest mẫu của Rook 1.21 và khác biệt giữa `cluster.yaml` (production) với `cluster-test.yaml`.
+- [Ceph Block Store incident, CERN, 20/02/2020](https://twiki.cern.ch/twiki/bin/view/LCG/CERNProdIncident200220): nguồn của callout; bản kỹ thuật chi tiết ở [đây](https://codimd.web.cern.ch/p/HJGnq3HVI).
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cần Lima (D0.1) cùng `kubectl`, `jq`, `curl` trên máy (D0.2). Lab dựng **một** VM chạy k3s như K7.2, gắn bốn đĩa trống 6 GiB: ba cái thành OSD ngay, cái thứ tư để dành cho bước 6. Bài cài k3s theo đúng cách của K7.2 (bản 1.36.5; Rook 1.21 hỗ trợ Kubernetes 1.32 tới 1.37).
+
+**Profile máy.** Một VM 4 CPU, 4 GiB RAM, đĩa 30 GiB và bốn đĩa phụ 6 GiB (file thưa trên Mac). Cuối bài, `free -m` trong VM báo dùng 2.100 tới 2.500 MiB qua các lượt: theo RSS của `ps` trong VM, k3s 650 tới 750 MiB, MGR khoảng 215 MiB, mỗi OSD 100 tới 310 MiB tuỳ lúc đo (tăng theo lượng I/O đã qua), phần còn lại là MON, MDS, CSI và operator. Lần đầu VM kéo khoảng 1,5 GB image (đã nén). Chưa thử trên máy 8 GB: VM chỉ dùng 2,1 tới 2,5 GiB nên nhiều khả năng làm được nếu tắt Docker Desktop và mọi VM khác; cũng chưa thử với VM nhỏ hơn 4 GiB, nên máy không dành nổi 4 GiB thì đọc theo. Dừng hai VM của K7.2 trước khi bắt đầu.
+
+Đĩa phụ của Lima hiện ra trong VM là `/dev/vdb` tới `/dev/vde`, đúng thứ Rook cần: thiết bị thô, không partition, không filesystem. Chúng nhỏ hơn rất xa mức tối thiểu của một OSD thật, nên BlueStore tốn phần lớn chỗ cho metadata; đừng đọc các con số dung lượng của lab như của production.
+
+<Callout kind="danger">
+
+Bài này cố ý dừng OSD, làm cụm ngừng nhận ghi và đổi ngưỡng đầy của Ceph. Rook biến **mọi đĩa bạn khai** thành OSD và xoá sạch nó: chỉ chạy trong VM `k7-ceph`, không bao giờ trên máy có đĩa chứa dữ liệu. Trước mỗi bước, `kubectl config current-context` phải in ra `k7-ceph`.
+
+</Callout>
+
+### 1. Một máy, bốn đĩa trống, và k3s
+
+<Terminal where="mac" title="~/masteva-k7s/k7-3/k7-ceph-node.sh">
+
+```bash
+mkdir -p ~/masteva-k7s/k7-3 && cd ~/masteva-k7s/k7-3
+for i in 1 2 3 4; do limactl disk create k7-ceph-$i --size 6GiB --format raw >> lima.log 2>&1; done
+limactl start --name k7-ceph --cpus 4 --memory 4 --disk 30 --plain --network lima:user-v2 \
+  --port-forward 9661:6443,static=true \
+  --set '.additionalDisks=[{"name":"k7-ceph-1","format":false},{"name":"k7-ceph-2","format":false},{"name":"k7-ceph-3","format":false},{"name":"k7-ceph-4","format":false}]' \
+  --tty=false template:ubuntu-26.04 >> lima.log 2>&1
+cat > k7-ceph-node.sh <<'EOF'
+#!/usr/bin/env bash
+# k7-ceph-node.sh: biến máy này thành cụm k3s một node, sẵn sàng cho Rook và Ceph (chạy bằng root)
+set -euo pipefail
+K3S_VERSION=v1.36.5+k3s1
+INSTALL_SHA256=46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad
+
+# 1. Module kernel: rbd để node map image RBD thành thiết bị khối, ceph để mount CephFS
+printf 'rbd\nceph\n' > /etc/modules-load.d/ceph.conf
+modprobe rbd
+modprobe ceph
+
+# 2. Đĩa cho OSD phải TRỐNG: không partition, không filesystem. Có gì trên đó thì dừng, không tự xoá
+for d in vdb vdc vdd vde; do
+  if [ -n "$(lsblk -no FSTYPE /dev/$d)" ] || [ "$(lsblk -no NAME /dev/$d | wc -l)" != 1 ]; then
+    echo "/dev/$d không trống: Rook sẽ bỏ qua nó. Dừng." >&2; exit 1
+  fi
+done
+
+# 3. k3s: script cài lấy từ đúng tag, so sha256 trước khi chạy (như K7.2)
+curl -fsSL "https://raw.githubusercontent.com/k3s-io/k3s/${K3S_VERSION/+/%2B}/install.sh" -o /tmp/k3s-install.sh
+echo "$INSTALL_SHA256  /tmp/k3s-install.sh" | sha256sum -c - > /dev/null \
+  || { echo "sha256 của install.sh không khớp. Dừng." >&2; exit 1; }
+INSTALL_K3S_VERSION=$K3S_VERSION sh /tmp/k3s-install.sh server --node-name k7-ceph \
+  --node-ip "$(hostname -I | awk '{print $1}')" \
+  --disable traefik --disable servicelb --disable metrics-server --disable local-storage > /dev/null
+echo "k7-ceph: $(k3s --version | head -1), kernel $(uname -r), đĩa trống: $(lsblk -dno NAME,SIZE /dev/vd[b-e] | tr -s ' \n' ' ')"
+EOF
+limactl shell k7-ceph sudo bash -s < k7-ceph-node.sh 2>&1 | tail -1
+limactl shell k7-ceph sudo cat /etc/rancher/k3s/k3s.yaml | sed 's/127.0.0.1:6443/127.0.0.1:9661/' > kubeconfig
+chmod 600 kubeconfig
+export KUBECONFIG=~/masteva-k7s/k7-3/kubeconfig
+kubectl config rename-context default k7-ceph > /dev/null
+until kubectl get node k7-ceph > /dev/null 2>&1; do sleep 2; done
+kubectl wait --for=condition=Ready node/k7-ceph --timeout=120s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k7-ceph: k3s version v1.36.5+k3s1 (3dd98cc5), kernel 7.0.0-28-generic, đĩa trống: vdb 6G vdc 6G vdd 6G vde 6G
+node/k7-ceph condition met
+```
+
+</Expected>
+
+Cổng API server của VM ra `127.0.0.1:9661` trên Mac (K7.2 dùng 9660). **Mọi terminal dùng cho bài này phải chạy `export KUBECONFIG=~/masteva-k7s/k7-3/kubeconfig` trước, và cả bài làm trong một terminal.** Ceph không cần gói nào trên node ngoài hai module kernel; mọi daemon chạy trong container.
+
+### 2. Rook dựng cụm, và PG đầu tiên không hoạt động
+
+Rook phát hành dưới dạng manifest theo tag (và chart Helm). Bốn file: CRD, quyền, operator của driver CSI, operator của Rook. `cluster.yaml` dưới viết theo `cluster-test.yaml` của Rook và khác ở mấy chỗ: khai đích danh ba đĩa thay vì dùng mọi đĩa tìm thấy, ghim bản Ceph, tắt dashboard, hạ `osd_memory_target` còn 896 MiB (mẫu để 1 GiB), không bật `managePodBudgets`, và để `osd_pool_default_size` ở mặc định 3 (mẫu đặt 1 vì nó tính cả trường hợp chỉ có một OSD).
+
+<Terminal where="mac" title="~/masteva-k7s/k7-3/cluster.yaml">
+
+```bash
+ROOK=https://raw.githubusercontent.com/rook/rook/v1.21.0/deploy/examples
+kubectl create -f $ROOK/crds.yaml -f $ROOK/common.yaml -f $ROOK/csi-operator.yaml > rook-install.log 2>&1
+kubectl create -f $ROOK/operator.yaml >> rook-install.log 2>&1
+kubectl -n rook-ceph rollout status deploy/rook-ceph-operator --timeout=600s | tail -1
+cat > cluster.yaml <<'EOF'
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata: { name: lab, namespace: rook-ceph }
+spec:
+  dataDirHostPath: /var/lib/rook
+  cephVersion: { image: "quay.io/ceph/ceph:v20.2.4" }
+  mon: { count: 1, allowMultiplePerNode: true }
+  mgr: { count: 1, allowMultiplePerNode: true }
+  dashboard: { enabled: false }
+  crashCollector: { disable: true }
+  storage:
+    useAllNodes: false
+    useAllDevices: false
+    nodes:
+      - name: k7-ceph
+        devices: [{ name: vdb }, { name: vdc }, { name: vdd }]
+  cephConfig:
+    global: { osd_memory_target: "939524096" }
+  healthCheck:
+    muteHealthWarning:
+      AUTH_INSECURE_KEYS_ALLOWED: { policy: mute }
+      AUTH_INSECURE_KEYS_CREATABLE: { policy: mute }
+EOF
+kubectl apply -f cluster.yaml -f $ROOK/toolbox.yaml > /dev/null
+until [ "$(kubectl -n rook-ceph get cephcluster lab -o jsonpath='{.status.phase}')" = Ready ]; do sleep 5; done
+kubectl -n rook-ceph rollout status deploy/rook-ceph-tools --timeout=300s | tail -1
+tools() { kubectl -n rook-ceph exec deploy/rook-ceph-tools -- "$@"; }
+ceph() { tools ceph "$@"; }
+clean() { until ceph pg stat | grep -qE '^[0-9]+ pgs: [0-9]+ active\+clean;'; do sleep 2; done; }
+until ceph osd stat 2> /dev/null | grep -q '3 osds: 3 up'; do sleep 3; done
+until ceph pg stat 2> /dev/null | grep -q 'undersized+peered'; do sleep 3; done
+kubectl -n rook-ceph wait deploy -l app=rook-ceph-osd --for=condition=Available --timeout=300s > /dev/null
+kubectl -n rook-ceph get deploy -o custom-columns='DEPLOYMENT:.metadata.name,READY:.status.readyReplicas'
+ceph status 2> /dev/null | sed -n '/services:/,$p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "rook-ceph-operator" successfully rolled out
+deployment "rook-ceph-tools" successfully rolled out
+DEPLOYMENT                                 READY
+ceph-csi-controller-manager                1
+rook-ceph-exporter-k7-ceph                 1
+rook-ceph-mgr-a                            1
+rook-ceph-mon-a                            1
+rook-ceph-operator                         1
+rook-ceph-osd-0                            1
+rook-ceph-osd-1                            1
+rook-ceph-osd-2                            1
+rook-ceph-tools                            1
+rook-ceph.cephfs.csi.ceph.com-ctrlplugin   1
+rook-ceph.rbd.csi.ceph.com-ctrlplugin      1
+  services:
+    mon: 1 daemons, quorum a (age 54s) [leader: a]
+    mgr: a(active, since 26s)
+    osd: 3 osds: 3 up (since 12s), 3 in (since 22s)
+
+  data:
+    pools:   1 pools, 1 pgs
+    objects: 0 objects, 0 B
+    usage:   79 MiB used, 18 GiB / 18 GiB avail
+    pgs:     100.000% pgs not active
+             1 undersized+peered
+```
+
+</Expected>
+
+Cả khối mất ba tới năm phút, phần lớn là kéo image (Ceph và Rook mỗi cái hơn 500 MB); khi image đã có sẵn, từ `apply` tới lúc ba OSD `up` chỉ khoảng một phút rưỡi. Đọc từng phần:
+
+- Mỗi daemon Ceph là một Deployment: `mon-a`, `mgr-a`, ba `osd-N` (mỗi đĩa một cái). Hai `ctrlplugin` là nửa controller của hai driver CSI (RBD và CephFS); nửa node là DaemonSet.
+- `cephConfig` hạ `osd_memory_target` xuống 896 MiB cho vừa VM. `muteHealthWarning` tắt hai cảnh báo mới của Ceph 20.2 về loại khoá `aes` cũ còn được phép dùng, như `cluster-test.yaml` làm với nhóm cảnh báo này; trên production đó là việc phải lên kế hoạch chuyển khoá, không phải tắt đi.
+- Ba hàm `tools`, `ceph`, `clean` chạy lệnh trong pod toolbox; `clean` chờ tới khi mọi PG `active+clean`.
+
+Và dòng cuối: cụm vừa dựng xong đã có **100% PG không hoạt động**. Pool `.mgr` (MGR tự tạo để lưu dữ liệu của nó) có đúng một PG ở trạng thái `undersized+peered`, dòng thứ ba của bảng ở phần Kiến thức.
+
+<Predict question="Ba OSD đều `up` và `in`, pool `.mgr` có `size: 3`. Vì sao PG của nó chỉ có một bản?">
+
+Vì luật CRUSH mặc định tách các bản theo **host**, và cụm chỉ có một host. CRUSH đặt được bản thứ nhất, rồi không tìm ra host thứ hai, thứ ba. Một bản là dưới `min_size: 2`, nên PG không được phép `active`. Ba OSD khoẻ không giúp gì: chúng chung một failure domain. Trên cụm thật, đây là hình ảnh của "ba bản nhưng cả ba ở chung một rack".
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+ceph osd tree
+ceph osd pool ls detail | grep -oE "'[^']+' replicated size [0-9]+ min_size [0-9]+ crush_rule [0-9]+"
+ceph osd crush rule dump replicated_rule | jq -c '.steps[1]'
+ceph osd crush rule create-replicated theo-osd default osd
+ceph osd pool set .mgr crush_rule theo-osd
+clean
+ceph pg stat | cut -d';' -f1
+until ceph health | grep -q HEALTH_OK; do sleep 5; done
+ceph health
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ID  CLASS  WEIGHT   TYPE NAME         STATUS  REWEIGHT  PRI-AFF
+-1         0.01767  root default
+-3         0.01767      host k7-ceph
+ 0    hdd  0.00589          osd.0         up   1.00000  1.00000
+ 1    hdd  0.00589          osd.1         up   1.00000  1.00000
+ 2    hdd  0.00589          osd.2         up   1.00000  1.00000
+'.mgr' replicated size 3 min_size 2 crush_rule 0
+{"op":"chooseleaf_firstn","num":0,"type":"host"}
+set pool 1 crush_rule to theo-osd
+1 pgs: 1 active+clean
+HEALTH_OK (muted: AUTH_INSECURE_KEYS_ALLOWED AUTH_INSECURE_KEYS_CREATABLE)
+```
+
+</Expected>
+
+`ceph osd tree` là cây CRUSH: một `root`, một `host`, ba `osd`. Luật `replicated_rule` chọn lá theo `host`. Luật mới `theo-osd` tách bản theo `osd`; đổi pool sang luật đó là PG có đủ ba bản trên ba OSD và `active+clean` sau vài giây.
+
+Lab phải hạ failure domain xuống `osd` vì chỉ có một máy, và trả giá đúng bằng thứ failure domain sinh ra để bảo vệ: mất máy này là mất cả ba bản. Mọi pool của các bước sau khai `failureDomain: osd` vì cùng lý do; trên cụm thật, để mặc định `host`.
+
+<Check id="k7.3.lab-failure-domain">Dựng được một cụm Ceph bằng Rook, đọc được `ceph status` và `ceph osd tree`, giải thích được vì sao PG của pool `.mgr` không hoạt động trên cụm một host, và sửa được bằng một luật CRUSH có failure domain `osd`.</Check>
+
+### 3. RBD: một ổ đĩa, và nó nằm ở đâu
+
+Một file cho cả chuỗi: pool `rbd-lab` (ba bản), StorageClass trỏ vào pool đó, một PVC và ứng dụng ghi `ticks` của K7.2. Các tham số `csi.storage.k8s.io/…-secret-…` chỉ cho driver biết lấy khoá Ceph ở Secret nào; Rook đã tạo sẵn các Secret đó.
+
+<Terminal where="mac" title="~/masteva-k7s/k7-3/rbd.yaml">
+
+```bash
+kubectl create namespace k7
+kubectl config set-context --current --namespace k7 > /dev/null
+cat > rbd.yaml <<'EOF'
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata: { name: rbd-lab, namespace: rook-ceph }
+spec:
+  failureDomain: osd
+  replicated: { size: 3 }
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: ceph-rbd }
+provisioner: rook-ceph.rbd.csi.ceph.com
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  clusterID: rook-ceph
+  pool: rbd-lab
+  imageFormat: "2"
+  imageFeatures: layering
+  csi.storage.k8s.io/fstype: ext4
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-publish-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/controller-publish-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: data }
+spec:
+  storageClassName: ceph-rbd
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: app }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: app } }
+  template:
+    metadata: { labels: { app: app } }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: busybox:1.38.0
+          command: ["sh", "-c", "while true; do date +%s >> /data/ticks; sync; sleep 0.2; done"]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: data } }
+EOF
+gap() { kubectl exec deploy/app -- awk -v n=$1 'NR>=n && p && $1-p>m {m=$1-p} NR>=n {p=$1} END {print "ngừng ghi dài nhất: " m+0 " giây"}' /data/ticks; }
+kubectl apply -f rbd.yaml > /dev/null
+kubectl rollout status deploy/app --timeout=600s | tail -1
+ceph osd pool set rbd-lab pg_num 32 > /dev/null 2>&1
+until [ "$(ceph osd pool get rbd-lab pgp_num -f json | jq .pgp_num)" = 32 ]; do sleep 2; done
+until [ "$(ceph pg ls-by-pool rbd-lab -f json | jq '[.pg_stats[].acting] | unique | length')" -gt 1 ]; do sleep 2; done
+clean
+kubectl exec deploy/app -- dd if=/dev/urandom of=/data/blob bs=1M count=300 conv=fsync 2>&1 | tail -1
+IMG=$(tools rbd ls rbd-lab)
+tools rbd info rbd-lab/$IMG | grep -E 'size|order'
+limactl shell k7-ceph sh -c 'echo "/dev/rbd0 = $(cat /sys/bus/rbd/devices/0/pool)/$(cat /sys/bus/rbd/devices/0/name)"' | sed -E 's/csi-vol-[0-9a-f-]+/csi-vol-…/'
+echo "số object của image: $(tools rados -p rbd-lab ls | grep -c rbd_data)"
+OBJ=$(tools rados -p rbd-lab ls | grep rbd_data | sort | head -1)
+ceph osd map rbd-lab $OBJ | sed -E 's/rbd_data\.[0-9a-f]+/rbd_data.…/; s/osdmap e[0-9]+ //'
+ceph pg ls-by-pool rbd-lab -f json | jq -r '.pg_stats[] | .acting | map(tostring) | join(",")' | sort | uniq -c
+until [ "$(ceph df -f json | jq '.pools[] | select(.name == "rbd-lab") | .stats.stored')" -gt 300000000 ]; do sleep 2; done
+ceph df | sed -n '/POOLS/,$p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k7 created
+deployment "app" successfully rolled out
+314572800 bytes (300.0MB) copied, 1.299918 seconds, 230.8MB/s
+	size 2 GiB in 512 objects
+	order 22 (4 MiB objects)
+/dev/rbd0 = rbd-lab/csi-vol-…
+số object của image: 84
+pool 'rbd-lab' (2) object 'rbd_data.….0000000000000000' -> pg 2.f991c50e (2.e) -> up ([2,0,1], p2) acting ([2,0,1], p2)
+   8 0,1,2
+   4 0,2,1
+   8 1,0,2
+   3 1,2,0
+   4 2,0,1
+   5 2,1,0
+--- POOLS ---
+POOL     ID  PGS   STORED  OBJECTS     USED  %USED  MAX AVAIL
+.mgr      1    1  449 KiB        2  1.3 MiB      0    5.4 GiB
+rbd-lab   2   32  302 MiB       90  906 MiB   5.20    5.4 GiB
+```
+
+</Expected>
+
+Đi theo sơ đồ ở phần Kiến thức, lần này bằng số thật:
+
+- PVC 2 GiB là một **image** RBD, về lý thuyết gồm 512 object 4 MiB. Trên node nó hiện ra là `/dev/rbd0`, do module `rbd` của kernel map; kernel tự khai thiết bị đó ứng với pool và image nào trong `/sys/bus/rbd`.
+- Chỉ những object đã được ghi mới tồn tại: 84 object `rbd_data.…` cho 300 MiB dữ liệu cùng metadata của ext4, không phải 512. RBD cũng cấp phát mỏng như Longhorn.
+- `ceph osd map` làm đúng phép tính của client: tên object → PG `2.e` → ba OSD, `p2` (tức `osd.2`) là primary. Không có bảng tra nào được hỏi. Tên, mã PG và thứ tự OSD trên máy bạn sẽ khác.
+- 32 PG của pool, mỗi PG một bộ ba OSD theo thứ tự riêng (cột đầu là số PG có thứ tự đó): vai primary được rải ra cả ba OSD, nên tải đọc ghi cũng được chia ra.
+- `ceph df`: 302 MiB dữ liệu (`STORED`) chiếm 906 MiB thật (`USED`) vì ba bản. `MAX AVAIL` 5,4 GiB là số còn ghi thêm được **sau** khi chia ba và trừ ngưỡng đầy, không phải 18 GiB.
+
+Lệnh `ceph osd pool set … pg_num 32` chỉ để lab không phải chờ: pool mới bắt đầu với một PG, và autoscaler của MGR tự đưa nó lên 32 sau vài phút. Hai vòng `until` kế đó chờ `pgp_num` (số PG được dùng khi **xếp chỗ**) theo kịp và chờ thống kê của MGR cập nhật; thiếu chúng, lệnh in phân bố PG sẽ cho thấy cả 32 PG còn nằm chung một bộ ba OSD.
+
+<Check id="k7.3.lab-rbd">Cấp được một volume RBD qua StorageClass, chỉ ra được image, thiết bị `/dev/rbd0` trên node, object của image, phép ánh xạ object tới PG tới OSD, và đọc được `STORED`, `USED`, `MAX AVAIL` trong `ceph df`.</Check>
+
+### 4. CephFS: một filesystem cho nhiều pod
+
+Volume RBD là một đĩa khối, chỉ một node mount được. Cần `ReadWriteMany` thì dùng CephFS: `CephFilesystem` tạo hai pool và một MDS; mỗi PVC là một thư mục con (subvolume) trong filesystem đó. PVC chỉ được tạo **sau khi** filesystem báo `Ready`: một lượt chạy thử tạo cả hai cùng lúc, driver trả lỗi `volume not found`, provisioner coi đó là lỗi không nên thử lại ngay, và PVC đứng ở `Pending` hơn sáu phút cho tới khi được xoá và tạo lại.
+
+<Terminal where="mac" title="~/masteva-k7s/k7-3/cephfs.yaml, chung.yaml">
+
+```bash
+cat > cephfs.yaml <<'EOF'
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystem
+metadata: { name: fs-lab, namespace: rook-ceph }
+spec:
+  metadataPool: { failureDomain: osd, replicated: { size: 3 } }
+  dataPools:
+    - { name: data, failureDomain: osd, replicated: { size: 3 } }
+  metadataServer: { activeCount: 1, activeStandby: false }
+---
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystemSubVolumeGroup
+metadata: { name: fs-lab-csi, namespace: rook-ceph }
+spec: { name: csi, filesystemName: fs-lab, pinning: { distributed: 1 } }
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: ceph-fs }
+provisioner: rook-ceph.cephfs.csi.ceph.com
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  clusterID: rook-ceph
+  fsName: fs-lab
+  pool: fs-lab-data
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-publish-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/controller-publish-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+EOF
+cat > chung.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: chung }
+spec:
+  storageClassName: ceph-fs
+  accessModes: ["ReadWriteMany"]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: chung }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: chung } }
+  template:
+    metadata: { labels: { app: chung } }
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: c
+          image: busybox:1.38.0
+          command: ["sleep", "infinity"]
+          volumeMounts: [{ name: v, mountPath: /chung }]
+      volumes:
+        - { name: v, persistentVolumeClaim: { claimName: chung } }
+EOF
+kubectl apply -f cephfs.yaml > /dev/null
+until [ "$(kubectl -n rook-ceph get cephfilesystem fs-lab -o jsonpath='{.status.phase}')" = Ready ]; do sleep 3; done
+until [ "$(kubectl -n rook-ceph get cephfilesystemsubvolumegroup fs-lab-csi -o jsonpath='{.status.phase}')" = Ready ]; do sleep 3; done
+kubectl apply -f chung.yaml > /dev/null
+kubectl rollout status deploy/chung --timeout=600s | tail -1
+clean
+P1=$(kubectl get pods -l app=chung -o jsonpath='{.items[0].metadata.name}')
+P2=$(kubectl get pods -l app=chung -o jsonpath='{.items[1].metadata.name}')
+kubectl exec $P1 -- sh -c 'echo "ghi từ pod thứ nhất" > /chung/a'
+kubectl exec $P2 -- cat /chung/a
+kubectl exec $P2 -- sh -c 'mount | grep " /chung " | grep -oE "type [a-z0-9]+"'
+ceph fs ls
+ceph osd pool ls | tr '\n' ' '; echo
+kubectl -n rook-ceph get deploy -o name | grep mds
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "chung" successfully rolled out
+ghi từ pod thứ nhất
+type ceph
+name: fs-lab, metadata pool: fs-lab-metadata, data pools: [fs-lab-data ]
+.mgr rbd-lab fs-lab-metadata fs-lab-data
+deployment.apps/rook-ceph-mds-fs-lab-a
+```
+
+</Expected>
+
+Hai pod cùng mount một PVC và thấy cùng một file; kiểu mount là `ceph`, client CephFS của kernel, không qua NFS. So với RWX của Longhorn ở K7.2: không có một NFS server đứng giữa, client đọc ghi dữ liệu thẳng với các OSD và chỉ hỏi MDS về metadata. Cùng một cụm, cùng ba OSD, giờ phục vụ cả đĩa khối lẫn filesystem.
+
+Giới hạn của lab: hai pod nằm chung node, nên nó không chứng minh được RWX **giữa các node**. `activeStandby: false` cũng là thu gọn: production chạy thêm MDS dự phòng, vì MDS chết thì mọi thao tác trên filesystem dừng tới khi có MDS khác thay.
+
+<Check id="k7.3.lab-cephfs">Tạo được một CephFilesystem cùng StorageClass của nó, cho hai pod dùng chung một PVC RWX, và chỉ ra được pool, MDS và kiểu mount của CephFS.</Check>
+
+### 5. Dừng một OSD, rồi hai: `min_size` chặn ghi
+
+Đóng vai bảo trì có kế hoạch: đặt `noout`, rồi dừng `osd.2` bằng cách hạ Deployment của nó về 0. **Lệnh `kubectl scale` dưới đây dừng một daemon lưu trữ đang giữ dữ liệu: chỉ chạy trên `k7-ceph`.**
+
+<Terminal where="mac">
+
+```bash
+N=$(kubectl exec deploy/app -- sh -c 'wc -l < /data/ticks')
+ceph osd set noout
+kubectl -n rook-ceph scale deploy rook-ceph-osd-2 --replicas=0 > /dev/null
+for i in $(seq 1 90); do ceph pg stat | cut -d';' -f1 | grep -qE 'clean|stale|peering|unknown' || break; sleep 2; done
+ceph osd tree | grep 'osd\.' | awk '{print $4, $5}'
+ceph pg stat | cut -d';' -f1
+ceph health detail | grep -E '^\[' | cut -c1-110
+gap $N
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+noout is set
+osd.0 up
+osd.1 up
+osd.2 down
+81 pgs: 30 active+undersized, 51 active+undersized+degraded
+[WRN] OSDMAP_FLAGS: noout flag(s) set
+[WRN] OSD_DOWN: 1 osds down
+[WRN] PG_DEGRADED: Degraded data redundancy: 132/396 objects degraded (33.333%), 51 pgs degraded
+ngừng ghi dài nhất: 1 giây
+```
+
+</Expected>
+
+Vòng `for` chờ (tối đa ba phút) tới khi không PG nào còn `clean`, `stale` hay `peering`: sau khi OSD dừng, các PG đổi trạng thái dần trong chừng mười lăm giây, đọc sớm sẽ thấy con số lưng chừng. Mọi PG còn `active`: hai bản trên ba, đúng dòng thứ hai của bảng. `undersized` là PG thiếu bản; `degraded` là trong PG đó có object thiếu bản, nên PG chưa chứa object nào thì chỉ `undersized`. Một phần ba số object đang thiếu một bản, và ứng dụng không hay biết: khoảng dừng dài nhất vẫn là một, hai giây của nhịp ghi bình thường. OSD dừng sạch nên được đánh dấu `down` ngay; chết đột ngột thì phải chờ các OSD khác báo mất nhịp tim (`osd_heartbeat_grace`, mặc định 20 giây; bài không thử trường hợp này). Số PG và số object trên máy bạn có thể khác: autoscaler tăng dần số PG của hai pool CephFS trong vài phút đầu, nên tổng số PG là 35, 81 hay 97 tuỳ lúc chạy.
+
+Giờ sự cố chồng lên bảo trì: thêm `osd.1` chết. **Lệnh `kubectl scale` đầu khối dưới làm cả cụm ngừng đọc ghi cho tới khi OSD được bật lại: chỉ chạy trên `k7-ceph`.**
+
+<Predict question="Còn một OSD sống, giữ đủ một bản của mọi object. Ứng dụng đọc được không, ghi được không, có nhận lỗi không?">
+
+Không đọc được, không ghi được, và không nhận lỗi nào: mọi thao tác treo. Một bản là dưới `min_size: 2`, nên mọi PG rời trạng thái `active`. Client của Ceph không coi đó là lỗi; nó giữ yêu cầu và chờ PG hoạt động lại, bao lâu cũng chờ. Phía ứng dụng là tiến trình đứng ở một lệnh `write` hay `read` không trả về, pod vẫn `Running`. Vì thế khối lệnh dưới không `exec` vào pod ứng dụng trong lúc cụm đang chặn: chính lệnh `exec` đó cũng sẽ treo.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+N=$(kubectl exec deploy/app -- sh -c 'wc -l < /data/ticks')
+kubectl -n rook-ceph scale deploy rook-ceph-osd-1 --replicas=0 > /dev/null
+for i in $(seq 1 90); do ceph pg stat | cut -d';' -f1 | grep -q active || break; sleep 2; done
+ceph pg stat | cut -d';' -f1
+for i in $(seq 1 60); do ceph health | grep -q inactive && break; sleep 5; done
+ceph health detail | grep -E '^\[' | cut -c1-70
+kubectl get pods -l app=app -o custom-columns='POD-PHASE:.status.phase' --no-headers
+kubectl -n rook-ceph scale deploy rook-ceph-osd-1 rook-ceph-osd-2 --replicas=1 > /dev/null
+clean
+ceph osd unset noout
+gap $N
+until ceph health | grep -q HEALTH_OK; do sleep 5; done
+ceph health
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+81 pgs: 29 undersized+peered, 52 undersized+degraded+peered
+[WRN] OSDMAP_FLAGS: noout flag(s) set
+[WRN] OSD_DOWN: 2 osds down
+[WRN] PG_AVAILABILITY: Reduced data availability: 26 pgs inactive
+[WRN] PG_DEGRADED: Degraded data redundancy: 264/396 objects degraded
+Running
+noout is unset
+ngừng ghi dài nhất: 14 giây
+HEALTH_OK (muted: AUTH_INSECURE_KEYS_ALLOWED AUTH_INSECURE_KEYS_CREATABLE)
+```
+
+</Expected>
+
+Chữ `active` biến mất khỏi mọi PG, và `PG_AVAILABILITY` là cảnh báo cần nhớ mặt: **dữ liệu không truy cập được**, khác hẳn `PG_DEGRADED` (dữ liệu thiếu bản nhưng vẫn phục vụ). Pod ứng dụng vẫn `Running`. Thời gian ngừng ghi bằng đúng quãng cụm ở dưới `min_size`: 13 tới 19 giây ở phần lớn các lượt, 76 giây ở hai lượt cảnh báo `PG_AVAILABILITY` hiện chậm, và hơn năm phút ở lượt soạn bài để nguyên hai OSD dừng. Ở các lượt chờ lâu, danh sách có thêm `MDS_SLOW_METADATA_IO` (MDS của CephFS cũng là một client đang bị chặn) và có PG ở trạng thái `unknown` (vừa được autoscaler tách ra, chưa OSD nào kịp báo). Con số `pgs inactive` tăng dần theo thời gian PG bị kẹt, nên lúc mới xuất hiện nó nhỏ hơn tổng số PG.
+
+Khi hai OSD quay lại, chúng chỉ nhận phần dữ liệu đã đổi trong lúc vắng (recovery), nên cụm sạch lại sau vài chục giây. Nhờ `noout`, suốt thời gian đó không có đợt backfill nào bắt đầu. Cờ đã được gỡ: quên gỡ `noout` là để cụm không bao giờ tự chữa.
+
+<Check id="k7.3.lab-osd-min-size">Dừng được một OSD và đọc được trạng thái `active+undersized+degraded` trong khi ứng dụng vẫn ghi; dừng OSD thứ hai để thấy PG mất `active` và ứng dụng treo không lỗi; phân biệt được `PG_DEGRADED` với `PG_AVAILABILITY`, và dùng được `noout`.</Check>
+
+### 6. Thêm một OSD, rồi mất hẳn một OSD: backfill
+
+Thêm dung lượng trong Rook là thêm một dòng vào `CephCluster`: khai nốt đĩa `vde`.
+
+<Terminal where="mac">
+
+```bash
+T0=$(date +%s)
+kubectl -n rook-ceph patch cephcluster lab --type json -p '[{"op":"add","path":"/spec/storage/nodes/0/devices/-","value":{"name":"vde"}}]' > /dev/null
+until ceph osd stat | grep -q '4 osds: 4 up'; do sleep 3; done
+echo "osd.3 vào cụm sau $(( $(date +%s) - T0 )) giây"
+until [ "$(ceph osd df -f json | jq '.nodes[] | select(.id == 3) | .pgs')" -gt 0 ]; do sleep 2; done
+clean
+osds() { ceph osd df -f json | jq -r '.nodes[] | "osd.\(.id): \(.status), \(.pgs) PG, dùng \(.kb_used/1024|floor) MiB"'; }
+osds
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+osd.3 vào cụm sau 43 giây
+osd.0: up, 56 PG, dùng 330 MiB
+osd.1: up, 69 PG, dùng 336 MiB
+osd.2: up, 53 PG, dùng 203 MiB
+osd.3: up, 65 PG, dùng 288 MiB
+```
+
+</Expected>
+
+Operator chạy lại Job `osd-prepare`, thấy đĩa mới và dựng `osd.3`. CRUSH tính lại ngay: 65 trong 243 bản (81 PG, mỗi PG ba bản), khoảng một phần tư, được chuyển sang OSD mới, và Ceph tự chép chúng sang (backfill) trong lúc cụm vẫn phục vụ. Không ai phải "cân lại" bằng tay. Trên cụm thật, thêm OSD là một đợt backfill hàng giờ tranh I/O với ứng dụng, nên được làm từng đợt nhỏ. Số PG và dung lượng mỗi OSD trên máy bạn sẽ khác.
+
+Giờ cho `osd.3` chết hẳn. Không có `noout`, MON sẽ đánh dấu nó `out` sau 600 giây; lab làm việc đó bằng tay để khỏi chờ mười phút. Dòng `ceph pg stat` đầu tiên được đọc ngay khi có PG `degraded`, nên có thể còn lẫn `peering`, `stale` hay `active+clean` trong vài giây đầu. **Hai lệnh dưới dừng một OSD rồi loại nó khỏi cụm.**
+
+<Terminal where="mac">
+
+```bash
+kubectl -n rook-ceph scale deploy rook-ceph-osd-3 --replicas=0 > /dev/null
+until ceph pg stat | grep -q degraded; do sleep 2; done
+ceph pg stat | cut -d';' -f1
+T0=$(date +%s)
+ceph osd out 3
+clean
+echo "sạch lại sau $(( $(date +%s) - T0 )) giây kể từ lúc out"
+osds
+ceph status | grep 'osd:' | sed -E 's/ \(since [^)]*\)//g'
+ceph health
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+81 pgs: 29 active+undersized, 36 active+undersized+degraded, 16 active+clean
+marked out osd.3.
+sạch lại sau 11 giây kể từ lúc out
+osd.0: up, 81 PG, dùng 371 MiB
+osd.1: up, 81 PG, dùng 372 MiB
+osd.2: up, 81 PG, dùng 372 MiB
+osd.3: down, 0 PG, dùng 0 MiB
+    osd: 4 osds: 3 up, 3 in
+HEALTH_OK (muted: AUTH_INSECURE_KEYS_ALLOWED AUTH_INSECURE_KEYS_CREATABLE)
+```
+
+</Expected>
+
+So với bước 5: ở đó OSD `down` nhưng vẫn `in`, và cụm chỉ **chờ**. Ở đây OSD `out`: CRUSH bỏ nó khỏi phép tính, mọi PG từng có bản trên `osd.3` được dựng lại bản đó trên ba OSD còn lại, và cụm về `HEALTH_OK` với đủ ba bản cho mọi object, dù một đĩa đã mất hẳn. Đây là khả năng tự chữa mà Longhorn chỉ có khi còn node trống. Điều kiện của nó là hai thứ đã nói: ba OSD còn lại vẫn thoả luật CRUSH, và còn đủ chỗ.
+
+`osd.3` vẫn nằm trong cây CRUSH ở trạng thái `down`, `out`. Gỡ hẳn một OSD khỏi cụm Rook là một quy trình riêng (xoá khỏi `CephCluster`, purge OSD, xoá Deployment) mô tả ở trang "Ceph OSD Management" của Rook; bài không chạy phần đó.
+
+<Check id="k7.3.lab-backfill">Thêm được một OSD bằng cách sửa `CephCluster` và thấy dữ liệu tự dàn sang; làm mất hẳn một OSD, đánh dấu `out` và theo dõi backfill tới `active+clean`; giải thích được vì sao `down` thì cụm chờ còn `out` thì cụm chữa.</Check>
+
+### 7. Cụm đầy
+
+Ghi cho đầy thật ba đĩa 6 GiB thì lâu và không dạy thêm gì, nên lab làm ngược lại: **hạ ngưỡng** xuống dưới mức đang dùng. Cơ chế Ceph chạy y hệt. **Khối lệnh dưới làm cả cụm ngừng nhận ghi trong nửa phút.**
+
+<Terminal where="mac">
+
+```bash
+ceph osd dump | grep ratio
+ceph osd df -f json | jq -r '.nodes[] | select(.status == "up") | "osd.\(.id): đã dùng \(.utilization * 10 | round / 10)%"'
+N=$(kubectl exec deploy/app -- sh -c 'wc -l < /data/ticks')
+ceph osd set-nearfull-ratio 0.01 > /dev/null 2>&1
+until ceph health | grep -q '3 nearfull osd'; do sleep 2; done
+ceph health | cut -d';' -f1-2
+ceph osd set-backfillfull-ratio 0.02 > /dev/null 2>&1
+ceph osd set-full-ratio 0.03 > /dev/null 2>&1
+until ceph health | grep -q '3 full osd(s)'; do sleep 2; done
+ceph health | cut -d';' -f1-2
+ceph df -f json | jq -r '.pools[] | "\(.name): còn ghi được \(.stats.max_avail) byte"'
+sleep 20
+ceph osd set-full-ratio 0.95 > /dev/null 2>&1
+ceph osd set-backfillfull-ratio 0.90 > /dev/null 2>&1
+ceph osd set-nearfull-ratio 0.85 > /dev/null 2>&1
+until ceph health | grep -q HEALTH_OK; do sleep 2; done
+gap $N
+limactl shell k7-ceph free -m | sed -n 2p
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+full_ratio 0.95
+backfillfull_ratio 0.9
+nearfull_ratio 0.85
+osd.0: đã dùng 6%
+osd.1: đã dùng 6.1%
+osd.2: đã dùng 6.1%
+HEALTH_WARN 3 nearfull osd(s); 4 pool(s) nearfull
+HEALTH_ERR 3 full osd(s); 4 pool(s) full
+.mgr: còn ghi được 0 byte
+rbd-lab: còn ghi được 0 byte
+fs-lab-metadata: còn ghi được 0 byte
+fs-lab-data: còn ghi được 0 byte
+ngừng ghi dài nhất: 29 giây
+Mem:            3895        2146         154           4        1788        1748
+```
+
+</Expected>
+
+Ba ngưỡng mặc định, rồi mức dùng thật của từng OSD: khoảng 6%. Hạ `nearfull` xuống 1% thì cụm chỉ cảnh báo, và mọi thứ vẫn chạy. Hạ `full` xuống 3% thì cụm thành `HEALTH_ERR`, mọi pool báo `full`, số byte còn ghi được (`MAX AVAIL` của `ceph df`) về 0, và ứng dụng đứng yên cho tới khi ngưỡng được trả lại. Giống `min_size`, không có lỗi nào trả về cho ứng dụng. Ở hai trong bốn lượt chạy, kernel của node còn ghi `libceph: pool 2 is full or reached quota` vào `dmesg`; hai lượt kia thì không, nên đừng coi `dmesg` trống là cụm không đầy. Lệnh `sleep 20` chỉ để khoảng dừng đủ dài mà đo. Dòng cuối là số đo RAM cho phần profile máy.
+
+Việc vừa làm ở cuối khối, nâng ngưỡng `full`, cũng chính là lối thoát tạm mà tài liệu Ceph ghi cho một cụm đầy thật: nâng nhẹ để có lại quyền ghi, dùng quyền đó để xoá bớt hoặc thêm OSD, rồi trả ngưỡng về chỗ cũ. Lối thoát thật là cảnh báo từ `nearfull` và kế hoạch dung lượng tính cả tình huống mất một failure domain (phần Đào sâu).
+
+<Check id="k7.3.lab-full">Đọc được ba ngưỡng đầy và mức dùng của từng OSD, tái hiện được `nearfull` rồi `full` bằng cách hạ ngưỡng, chỉ ra được dấu vết của `full` trong `ceph health` và `ceph df`, và giải thích được vì sao nâng ngưỡng chỉ là lối thoát tạm.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `CephCluster` đứng ở `Progressing`, không có pod `rook-ceph-osd-N` | Đĩa không trống, hoặc sai tên node, tên đĩa trong `storage.nodes` | `kubectl -n rook-ceph logs -l app=rook-ceph-osd-prepare --tail=30`; `lsblk -f` trong VM |
+| Pod `rook-ceph-mon-a` `Pending` hoặc khởi động lại liên tục | VM thiếu RAM, hoặc `/var/lib/rook` còn dữ liệu của một cụm cũ | `kubectl -n rook-ceph describe pod -l app=rook-ceph-mon`; dựng lại VM |
+| `ceph status` có PG `undersized+peered` ngay sau khi tạo pool | Pool dùng luật CRUSH theo `host` trên cụm một host | `ceph osd pool ls detail`; đổi `crush_rule` như bước 2, hoặc khai `failureDomain: osd` |
+| PVC RBD `Pending`, event nhắc `rook-csi-rbd-provisioner` | Sai tên pool, sai `clusterID`, hoặc `CephBlockPool` chưa `Ready` | `kubectl -n rook-ceph get cephblockpool`; `kubectl describe pvc` |
+| PVC CephFS `Pending`, event `Volume provisioning failed with infeasible error … volume not found` | PVC được tạo trước khi `CephFilesystem` sẵn sàng; provisioner lùi lâu giữa các lần thử | Chờ filesystem `Ready`, xoá PVC rồi tạo lại |
+| Lệnh `ceph` treo nhiều phút rồi báo `timed out` | MON không chạy (với cụm thật: mất quorum) | `ceph --connect-timeout 10 status` để khỏi chờ lâu; `kubectl -n rook-ceph get pods -l app=rook-ceph-mon` |
+| Pod dùng volume Ceph `Running` nhưng treo khi đọc ghi | PG không `active` (dưới `min_size`), hoặc cụm `full` | `ceph health detail`; `sudo dmesg` trên node, tìm dòng `libceph` |
+| `HEALTH_WARN … noout flag(s) set` kéo dài | Quên gỡ cờ sau bảo trì | `ceph osd unset noout` |
+
+### Dọn dẹp
+
+Dừng VM là đủ để trả RAM; `limactl start k7-ceph` đưa cụm trở lại. Đã thử: khoảng một phút rưỡi sau khi VM bật, cụm về `HEALTH_OK`; operator bật lại cả Deployment `rook-ceph-osd-3` (OSD đó `up` nhưng vẫn `out`), và pod `app` qua trạng thái `Unknown` rồi tự chạy lại.
+
+<Terminal where="mac" title="Dừng VM, giữ lại để xem tiếp">
+
+```bash
+limactl stop k7-ceph
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Khối dưới xoá hẳn VM, bốn đĩa phụ cùng mọi dữ liệu Ceph trên đó, và thư mục lab của bài. Gõ đúng tên: `limactl delete` không hỏi lại.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn lab của bài này">
+
+```bash
+limactl delete k7-ceph
+limactl disk delete k7-ceph-1 k7-ceph-2 k7-ceph-3 k7-ceph-4
+rm -rf ~/masteva-k7s/k7-3
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Cụm đang dùng 80% dung lượng trên bốn node bằng nhau. Mất một node thì sao?">
+
+Tính nhẩm trước khi tin vào "Ceph tự chữa". Dữ liệu của node chết phải được dựng lại trên ba node còn lại, nên mỗi node đó sẽ chứa 80% × 4/3 ≈ 107% dung lượng của mình. Không thể: các OSD chạm `backfillfull` (90%) thì từ chối nhận thêm và việc tự chữa dừng giữa chừng; những OSD đầy hơn mức trung bình có thể chạm `full` (95%) trước, và cụm ngừng nhận ghi. Sự cố mất một node thành sự cố mất quyền ghi. Quy tắc rút ra: mức dùng an toàn là mức mà sau khi mất **một failure domain**, phần còn lại vẫn dưới `nearfull`. Với N node bằng nhau: dùng không quá 85% × (N − 1)/N, tức khoảng 64% cho bốn node, 57% cho ba node (và ba node với `size: 3` theo host thì không tự chữa được dù còn chỗ). Con số 85% "còn rộng" của một cụm nhỏ thực ra đã quá muộn. Đây là phép tính của bài, không chạy trong lab.
+
+</Reveal>
+
+<Reveal title="Mất MON duy nhất của cụm lab thì chuyện gì xảy ra?">
+
+Đã thử khi soạn bài: hạ Deployment `rook-ceph-mon-a` về 0 trong khoảng 50 giây. Lệnh `ceph status` trong toolbox treo rồi báo `timed out`: không còn ai trả lời về trạng thái cụm. Nhưng ứng dụng ghi `ticks` trên volume RBD **không hề khựng** (khoảng dừng dài nhất vẫn 1 giây): OSD và client tiếp tục làm việc với bản đồ đang có. Bật MON lại, cụm về `HEALTH_OK`. Đừng đọc kết quả này là "mất MON không sao". Trong lúc không có MON, không gì đổi được bản đồ: một OSD chết lúc đó sẽ không được đánh dấu `down`, client mới không kết nối được, và các khoá xác thực hết hạn dần. Với ba MON thật, mất hai cái cho đúng tình trạng này, và đây là điều lab một MON không dạy được: quorum sống sót thế nào khi mất **một phần** số MON.
+
+</Reveal>
+
+<Reveal title="RGW: object storage trên cùng cụm">
+
+RGW là một cổng HTTP nói giao thức S3 và lưu object vào RADOS. Trong Rook: khai một `CephObjectStore`, operator tạo các pool và Deployment RGW; ứng dụng xin bucket bằng `ObjectBucketClaim` (một kiểu PVC cho bucket) và nhận về một ConfigMap chứa địa chỉ, tên bucket, cùng một Secret chứa cặp khoá. Bài không đưa RGW vào các bước lab, nhưng đã chạy thử khi soạn bài trên chính cụm này. Hai điều ghi lại. Rook tạo cho object store **tám pool** (index, data, log, meta…): số PG của cụm tăng vọt, một lý do RGW hợp với cụm lớn. Và `curl` ký SigV4 (như ở K7.2) ghi và đọc được object qua bucket của một `ObjectBucketClaim`; cả VM lúc đó dùng khoảng 2.500 MiB RAM. Như mọi pool khác của lab, hai pool khai trong `CephObjectStore` phải có `failureDomain: osd`.
+
+</Reveal>
+
+<Reveal title="Vì sao không đặt `min_size: 1` để cụm khỏi chặn ghi?">
+
+Vì nó đổi một lần ngừng lấy một lần mất dữ liệu. Với `min_size: 1`, khi chỉ còn một OSD giữ một PG, cụm vẫn nhận ghi vào đúng bản đó. Nếu OSD ấy chết trước khi các bản khác kịp quay lại và chép phần mới, những gì vừa ghi không còn ở đâu; tệ hơn, các OSD quay lại mang dữ liệu **cũ** và cụm không tự biết bản nào đúng. `min_size: 2` trên `size: 3` bảo đảm mọi lệnh ghi đã thành công đều nằm trên ít nhất hai đĩa. Pool `size: 2` thì kẹt giữa hai lựa chọn tồi: `min_size: 2` nghĩa là mất một OSD là ngừng ghi, `min_size: 1` là chấp nhận rủi ro trên; vì thế ba bản là mức chuẩn cho dữ liệu quan trọng, và erasure coding là cách tiết kiệm chỗ khi ba bản quá đắt (bài không dạy phần này).
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** giải thích một dòng `ceph health detail` hay một trạng thái PG lạ, viết `CephBlockPool`, `CephFilesystem` và StorageClass theo mẫu của đúng bản Rook, tính dung lượng dùng được từ số OSD, `size` và ngưỡng đầy.
+
+**AI hay sai ở đâu:** dùng manifest của bản Rook cũ (driver CSI từng do operator Rook tự cài; từ các bản gần đây là operator ceph-csi riêng và CRD `Driver`); khuyên `size: 2` hay `min_size: 1` "cho tiết kiệm"; khuyên `ceph osd set-full-ratio 0.99` như một cách sửa lâu dài; gợi ý `ceph osd lost`, `ceph osd force-create-pg` hay xoá PG để "gỡ kẹt" mà không nói đó là lệnh chấp nhận mất dữ liệu; bỏ qua failure domain khi tính số node; đưa ra con số RAM và mạng của lab cho production; và coi `HEALTH_OK` là đủ mà không nhìn mức đầy của từng OSD.
+
+**Cách kiểm tra:** mọi lệnh Ceph làm thay đổi dữ liệu hoặc bản đồ, tra trang Health checks của đúng bản đang chạy trước khi gõ. `kubectl apply --dry-run=server` bắt trường sai của CRD Rook. Mọi lời khẳng định về sự cố, làm lại bước 5 tới 7 trên cụm thử và nhìn `ceph status` cùng một ứng dụng ghi liên tục.
+
+</Callout>
+
+<Callout kind="link">
+
+K7.1 là nền: CSI, StorageClass, snapshot (driver RBD và CephFS đều có snapshot và clone qua đúng các object đó). K7.2 dạy Longhorn và bảng so sánh hai hệ. K7.4 dùng mô hình operator và nói về RPO, RTO, replication đồng bộ; K9 là chặng viết operator. K4 là chặng dựng cụm nhiều máy, điều kiện để có failure domain `host` thật. K5.2 dạy PodDisruptionBudget và `drain`: bật `disruptionManagement.managePodBudgets` trong `CephCluster` thì Rook tự quản PDB cho OSD, MON, MDS để một lần `drain` không lấy đi quá nhiều (lab không bật). D1.3 dạy đĩa và thiết bị khối. D12 là chặng theo dõi: Ceph xuất metric cho Prometheus qua MGR. D18 là chặng dung lượng, hiệu năng và quá tải, nơi phép tính 85% × (N − 1)/N thuộc về; D21 là chặng giới hạn blast radius, bài học của sự cố CERN. D20 là chặng sao lưu và DR: nhân bản trong cụm Ceph không thay được backup ra ngoài cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k7.3.mastery-doc-trang-thai">Nhìn `ceph status`, `ceph osd tree` và `ceph df` của một cụm đang mất OSD, dưới `min_size` hoặc `full`, nói được cụm đang thiếu bản hay không truy cập được, OSD nào `down` hay `out`, còn ghi thêm được bao nhiêu, ứng dụng đang chịu ảnh hưởng gì, và việc nên làm trước tiên.</Check>
+
+<Check id="k7.3.mastery-thiet-ke">Phác được một cụm Ceph cho production trên Rook: số node, số MON, failure domain, `size` và `min_size`, RAM và mạng, và giải thích được từng lựa chọn bằng một sự cố nó chống lại.</Check>
+
+</Mastery>

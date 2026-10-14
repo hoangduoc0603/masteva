@@ -1,0 +1,599 @@
+---
+title: "MetalLB: Service LoadBalancer trên bare metal, và Rancher"
+description: Cho Service kiểu LoadBalancer một địa chỉ IP thật trên cụm tự dựng bằng MetalLB chế độ L2, nhìn gói ARP quyết định node nào nhận traffic, giữ IP của client bằng externalTrafficPolicy, chuyển việc quảng bá sang node khác và thấy giới hạn của một IP tầng 2; kèm chế độ BGP ở mức khái niệm và chỗ đứng của Rancher.
+id: d13.6
+step: d13
+prerequisites: [d13.3, d21.3]
+topics: [d13.metallb, d13.rancher]
+status: verified
+verified:
+  date: 2026-10-13
+  os: Ubuntu 26.04 LTS (hai VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    kubernetes: 1.37.1
+    metallb: 0.16.1
+    flannel: 0.28.10
+    iputils-arping: "20250605"
+    tcpdump: 4.99.6
+    agnhost: "2.66.1"
+---
+
+<Goal>
+
+Trên cloud, `type: LoadBalancer` cho bạn một địa chỉ IP trong vài giây. Trên cụm tự dựng, Service đó nằm ở `<pending>` mãi mãi. Học xong bài này, bạn giải thích được:
+
+- Ai cấp IP cho Service `LoadBalancer`, và vì sao cụm kubeadm không có "ai" đó.
+- MetalLB chế độ L2 đưa traffic của một IP tới cụm bằng gói ARP nào, và vì sao tại mỗi thời điểm chỉ **một** node nhận traffic của IP ấy.
+- Vì sao `curl` từ chính một node của cụm không chứng minh được gì về load balancer.
+- `externalTrafficPolicy: Local` đổi gì ở IP nguồn mà ứng dụng thấy, và giá của nó.
+- Khi nào L2 là đủ, khi nào cần BGP, và Rancher giải quyết việc gì.
+
+</Goal>
+
+<Knowledge>
+
+### Service `LoadBalancer` cần một người đứng sau
+
+K2.1 đã dạy ba kiểu Service. `ClusterIP` và `NodePort` do kube-proxy tự lo trong cụm. `LoadBalancer` thì khác: nó là một **lời yêu cầu** gửi ra ngoài cụm, "hãy cấp cho Service này một địa chỉ mà bên ngoài gọi được, và đưa traffic của địa chỉ đó tới các node".
+
+| Môi trường | Ai nhận lời yêu cầu | Làm gì |
+|---|---|---|
+| Cloud (EKS, GKE, AKS) | `cloud-controller-manager` của nhà cung cấp | Gọi API của cloud, tạo một load balancer được quản lý (D10) |
+| kind trong lab (K2.1) | `cloud-provider-kind` | Chạy một container proxy làm load balancer giả |
+| Cụm kubeadm trên máy thật | **Không ai** | Service ở `EXTERNAL-IP: <pending>` mãi |
+
+**MetalLB** lấp chỗ trống đó bằng hai thành phần:
+
+```text
+ controller (Deployment)   thấy Service LoadBalancer chưa có IP
+                           → lấy một địa chỉ từ IPAddressPool, ghi vào status của Service
+ speaker (DaemonSet,       thấy Service đã có IP
+          hostNetwork)     → làm cho mạng bên ngoài biết "IP này ở đây": bằng ARP (chế độ L2) hoặc BGP
+```
+
+Hai việc tách bạch: **cấp** địa chỉ và **quảng bá** địa chỉ. Một Service có `EXTERNAL-IP` đẹp đẽ mà không ai quảng bá thì bên ngoài vẫn không tới được; lab cho bạn gặp đúng trường hợp đó.
+
+Sau khi gói tới được một node, phần còn lại là chuyện K2.1 đã dạy: kube-proxy trên node đó có luật cho IP của Service và chia kết nối cho các pod. MetalLB không đụng vào gói dữ liệu; nó chỉ lo việc "IP này nằm ở node nào".
+
+<Check id="d13.6.ai-cap-ip">Giải thích được vì sao Service `LoadBalancer` ở `<pending>` trên cụm kubeadm, và phân biệt được hai việc của MetalLB: cấp địa chỉ và quảng bá địa chỉ.</Check>
+
+### Chế độ L2: một node trả lời ARP
+
+Nhắc lại nền của D9.3 và D2.1. Trong một mạng LAN, máy muốn gửi gói tới một IP phải hỏi "IP này ở địa chỉ MAC nào" bằng giao thức **ARP**, và máy giữ IP đó trả lời. Một **VIP** là địa chỉ không thuộc hẳn về máy nào: máy đang giữ nó trả lời ARP cho nó, và khi đổi chủ thì máy mới phát **gratuitous ARP**, một gói ARP không ai hỏi, để cả mạng cập nhật. Chế độ L2 của MetalLB là đúng ý tưởng đó, áp cho từng IP của Service:
+
+```text
+ client cùng mạng LAN                                 cụm
+   │ "ai có 192.168.104.200?"  (ARP request, broadcast)
+   │ ───────────────────────────────────────────────►  speaker trên node được chọn trả lời:
+   │ ◄───────────────────────────────────────────────  "200 ở MAC của tôi" (MAC card mạng của node)
+   │ gói TCP tới MAC đó ────────────────────────────►  node nhận gói có đích 192.168.104.200
+   │                                                    kube-proxy DNAT sang một pod (có thể ở node khác)
+```
+
+- **Không node nào gắn IP đó lên card mạng.** Speaker chỉ trả lời ARP thay cho nó; `ip addr` trên node không thấy địa chỉ này.
+- **Mỗi IP một node.** Các speaker biết nhau qua một giao thức thành viên (memberlist, cổng 7946) và cùng tính ra một thứ tự ứng viên cho từng IP; node đứng đầu danh sách quảng bá. Tài liệu MetalLB nói thẳng: mọi traffic của một IP đi vào một node, rồi kube-proxy mới chia cho các pod, nên "theo nghĩa đó, layer 2 không cài đặt một load balancer". Đó là **failover**, không phải cân bằng tải giữa các node.
+- **Node quảng bá chết** thì các speaker còn lại phát hiện qua memberlist, node kế tiếp trong danh sách tiếp quản và phát gratuitous ARP. Theo tài liệu, với client xử lý gratuitous ARP đúng thì việc này mất vài giây; client giữ bảng ARP cũ thì mất liên lạc tới khi bảng của nó hết hạn.
+- **Node control plane mặc định không quảng bá.** kubeadm gắn cho chúng label `node.kubernetes.io/exclude-from-external-load-balancers` (bạn đã thấy ở output `mark-control-plane` của K4.1), và MetalLB tôn trọng label đó.
+
+Hai giới hạn tài liệu MetalLB nêu cho chế độ này: **nghẽn ở một node** (băng thông vào của một IP bằng băng thông của một máy) và **failover có thể chậm**. So với Keepalived: MetalLB không dùng VRRP nên không có `virtual_router_id` để quản, cấu hình ít hơn; đổi lại nó không phối hợp được với thiết bị nói VRRP. Cả hai đều cần các node nằm chung một mạng tầng 2 với client hoặc router, nên cả hai đều không dùng được trong VPC của cloud (D9.3).
+
+<Check id="d13.6.l2">Kể được chuyện gì xảy ra từ gói ARP của client tới pod trong chế độ L2, vì sao mỗi IP chỉ có một node nhận traffic, node nào không được chọn mặc định, và hai giới hạn của chế độ này.</Check>
+
+### `externalTrafficPolicy`: IP của client và đường đi của gói
+
+Gói vào node A có thể được kube-proxy chuyển cho pod ở node B. Để gói trả lời quay về đúng đường, node A đổi IP nguồn thành địa chỉ của chính nó (SNAT). Ứng dụng vì thế **không thấy IP thật của client**. Trường `externalTrafficPolicy` của Service chọn giữa hai cách:
+
+| | `Cluster` (mặc định) | `Local` |
+|---|---|---|
+| Node nhận gói chuyển cho | Bất kỳ pod nào của Service, ở mọi node | Chỉ pod **trên chính node đó** |
+| IP nguồn ứng dụng thấy | Địa chỉ của node (đã SNAT) | IP thật của client |
+| Chia tải | Đều giữa các pod | Chỉ các pod trên node đang nhận traffic |
+| Với MetalLB L2 | Node nào quảng bá cũng được | Chỉ node **có pod sẵn sàng** mới được quảng bá |
+| Dùng khi | Không cần IP client | Cần IP client cho log, giới hạn tốc độ, luật chặn (D9.1) |
+
+Với L2 và `Local`, mọi request rơi vào các pod trên một node. Muốn vừa giữ IP client vừa chia tải thật giữa các node thì cần BGP, hoặc đặt một lớp proxy hiểu PROXY protocol hay `X-Forwarded-For` ở trước (D9.2), hoặc Gateway (K2.2).
+
+<Check id="d13.6.etp">So sánh được `externalTrafficPolicy: Cluster` với `Local` theo IP nguồn, đường đi của gói và cách chia tải, và nói được hệ quả của `Local` khi dùng với MetalLB L2.</Check>
+
+### Chế độ BGP: router chia tải
+
+Ở chế độ BGP, mỗi node mở một phiên BGP tới router của mạng và quảng bá "muốn tới IP này thì đi qua tôi". Router thấy nhiều đường tương đương tới cùng một IP và chia traffic cho chúng (ECMP): đây mới là cân bằng tải giữa các node, và băng thông vào cộng dồn theo số node.
+
+| | L2 | BGP |
+|---|---|---|
+| Cần gì ở mạng | Chung một mạng tầng 2 | Router nói BGP và bật multipath; đội mạng cấp số AS |
+| Số node nhận traffic của một IP | Một | Nhiều (ECMP) |
+| Một node chết | Đổi node, vài giây | Router bỏ đường đó; các kết nối đang mở có thể bị băm lại sang node khác và đứt |
+| Hợp với | Lab, cụm nhỏ, lưu lượng vào vừa phải | Datacenter có router phù hợp, lưu lượng lớn |
+
+Giới hạn tài liệu MetalLB nêu cho BGP: router chia theo phép băm không trạng thái trên từng kết nối, nên khi tập node thay đổi, kết nối đang mở bị băm lại "gần như ngẫu nhiên" và nên coi như đứt một lần. Cách giảm họ liệt kê gồm bật kiểu ECMP ổn định trên router, đổi tập node vào giờ thấp điểm, và đặt một lớp ingress ở sau. Từ bản 0.16, phần BGP của MetalLB mặc định chạy trên FRR-K8s (một bộ định tuyến FRR chạy trên mỗi node); chế độ FRR cũ đã bị đánh dấu sẽ gỡ. Lab không dựng BGP vì cần một router; D2 và K6 có nền để bạn tự thử với FRR trong một VM.
+
+Dù chế độ nào, **dải địa chỉ** là thứ bạn phải xin đội mạng: một dải trong đúng subnet của node (với L2), nằm ngoài vùng DHCP cấp phát, không ai khác dùng. Hai máy cùng trả lời ARP cho một IP là kiểu sự cố khó truy bậc nhất của mạng LAN (D9.3 đã cho thấy triệu chứng).
+
+<Callout kind="production">
+
+**Tình huống minh hoạ** (bài không tìm được postmortem công khai nào về MetalLB để dẫn; các con số dưới đây là giả định). Một đội chạy cụm bare metal với MetalLB L2 và một IP cho gateway của cả hệ thống. Ngày thường mọi thứ ổn. Ngày khuyến mãi, lưu lượng vào gấp bốn, và node đang quảng bá IP chạm trần card mạng 10 Gbit trong khi sáu node còn lại gần như rảnh: thêm node không giúp gì, vì mọi gói vẫn vào qua một máy. Tuần sau họ vá node đó và khởi động lại không báo trước; IP chuyển sang node khác trong vài giây, nhưng hệ thống của một đối tác gọi qua một tường lửa cũ thì mất kết nối thêm vài phút, tới khi bảng ARP của tường lửa hết hạn.
+
+Cả hai chuyện đều là hai giới hạn mà [tài liệu MetalLB](https://metallb.io/concepts/layer2/) viết ra từ đầu: nghẽn ở một node và failover phụ thuộc vào việc client xử lý gratuitous ARP. Tài liệu cũng cho lời khuyên cho lần chuyển có kế hoạch: giữ node cũ chạy thêm vài phút sau khi chuyển, để nó tiếp tục chuyển tiếp traffic của những client còn giữ bảng ARP cũ. Bước 5 của lab cho bạn thấy đúng hiện tượng đó.
+
+</Callout>
+
+<Check id="d13.6.bgp">So sánh được chế độ L2 với BGP theo yêu cầu về mạng, số node nhận traffic và hành vi khi một node chết; nói được dải địa chỉ cho MetalLB phải thoả những điều kiện gì.</Check>
+
+### Rancher: khi có nhiều cụm (tuỳ chọn)
+
+Chặng này dạy bạn vận hành **một** cụm bằng tay. Tổ chức có mười cụm ở ba nơi gặp một loại việc khác: ai được vào cụm nào, cụm nào đang ở phiên bản nào, dựng cụm thứ mười một sao cho giống mười cụm trước. **Rancher** (của SUSE, mã nguồn mở, bản 2.15 vào tháng 10/2026) là một lớp quản lý cho loại việc đó. Theo tài liệu của nó, Rancher cho: xác thực và phân quyền tập trung cho mọi cụm nó quản, dựng cụm mới trên máy có sẵn và nâng cấp chúng, nhận quản các cụm đã có (kể cả EKS, GKE, AKS), một danh mục ứng dụng dạng Helm chart, triển khai từ Git bằng Fleet, và giám sát.
+
+| Rancher làm thay | Rancher **không** làm thay |
+|---|---|
+| Giao diện và API chung cho nhiều cụm | Hiểu biết của chặng này: khi node `NotReady` bạn vẫn đọc `journalctl` (K4.7) |
+| Đăng nhập một nơi (LDAP, OIDC), RBAC xuyên cụm | Sao lưu và khôi phục của từng cụm vẫn phải được thiết kế và diễn tập (K4.5) |
+| Dựng và nâng cấp cụm bằng bản phân phối của SUSE (RKE2, K3s) | Mạng vật lý, dải IP, load balancer trước API server |
+| Xem workload, log, shell vào pod qua trình duyệt | Chính nó: Rancher chạy **trên một cụm Kubernetes** mà bạn phải dựng, sao lưu, nâng cấp |
+
+Đáng dùng khi: nhiều cụm, nhiều đội, cần một cửa quản trị và kiểm toán chung, và chấp nhận đi theo hệ sinh thái của SUSE. Chưa đáng khi: một hai cụm do một đội nhỏ vận hành, nơi GitOps (D13) và `kubectl` là đủ, và thêm Rancher là thêm một hệ thống trọng yếu phải trực. Trước khi chọn, đọc ma trận hỗ trợ của bản Rancher định dùng (nó chỉ hỗ trợ một khoảng phiên bản Kubernetes) và điều khoản hỗ trợ thương mại. K10 dạy quản nhiều cụm bằng Cluster API, cách tiếp cận không gắn với một nhà cung cấp. Bài không cài Rancher.
+
+<Check id="d13.6.rancher">Nói được Rancher giải quyết loại việc gì, những việc nó không làm thay, và nêu được hai điều kiện khiến nó đáng dùng cùng một lý do để chưa dùng.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [MetalLB in layer 2 mode](https://metallb.io/concepts/layer2/): cách hoạt động, hai giới hạn và phần so với Keepalived.
+- [MetalLB in BGP mode](https://metallb.io/concepts/bgp/): ECMP, hành vi khi tập node đổi và các cách giảm thiểu.
+- [MetalLB: Usage](https://metallb.io/usage/): xin một IP cụ thể, `externalTrafficPolicy` với từng chế độ, dùng chung IP.
+- [Service: type LoadBalancer](https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer): định nghĩa của Kubernetes, `loadBalancerClass` và `externalTrafficPolicy`.
+- [Rancher: Overview](https://ranchermanager.docs.rancher.com/getting-started/overview): Rancher là gì và làm được gì, theo chính tài liệu của nó.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cụm của K4.5: `k4-cp1` và `k4-w1` ở 1.37.1, ứng dụng `web` hai bản sao, mỗi node một bản. Mở một terminal vào mỗi VM.
+
+**Profile máy.** Như K4.1 (hai VM, mỗi VM 2 CPU và 2 GiB); MetalLB thêm khoảng 100 MB. Máy 8 GB làm được.
+
+**Giới hạn của lab.** Một phép thử failover đầy đủ cần ba máy: hai node để chuyển qua lại và một máy khách đứng ngoài quan sát liên tục. Lab chỉ có hai VM, nên "máy khách" là một network namespace gắn thẳng vào mạng LAN của VM (bước 3), và bước 5 quan sát việc đổi node bằng gói ARP thay vì đo số request rớt. Bài nói rõ ở từng chỗ.
+
+Cài `arping` trên cả hai máy, và kiểm trạng thái ban đầu:
+
+<Terminal where="mac">
+
+```bash
+for v in k4-cp1 k4-w1; do limactl shell $v sudo sh -c 'apt-get install -y -qq iputils-arping tcpdump > /dev/null 2>&1; arping -V | head -1'; done
+limactl shell k4-cp1 kubectl get pods -l app=web -o wide --no-headers | cut -c1-80
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+arping from iputils 20250605
+arping from iputils 20250605
+web-5c94dc48c-57nmv   1/1   Running   1     39m   10.244.0.26   lima-k4-cp1
+web-5c94dc48c-6v9qj   1/1   Running   0     23m   10.244.1.25   lima-k4-w1
+```
+
+</Expected>
+
+### 1. Service `LoadBalancer` không ai nhận
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl expose deployment web --name=web-lb --type=LoadBalancer --port=80 --target-port=8080
+sleep 5; kubectl get service web-lb
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+service/web-lb exposed
+NAME     TYPE           CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE
+web-lb   LoadBalancer   10.103.138.168   <pending>     80:32470/TCP   5s
+```
+
+</Expected>
+
+`<pending>` không phải lỗi mà là một lời yêu cầu chưa ai đáp. Service vẫn dùng được như một `NodePort` (cổng `32470` ở đây; trên máy bạn sẽ khác), vì `LoadBalancer` bao gồm `NodePort`.
+
+### 2. Cài MetalLB, cấp một dải địa chỉ
+
+Dải địa chỉ phải nằm trong subnet của node và không ai khác dùng. Mạng `user-v2` của Lima là `192.168.104.0/24`, cấp địa chỉ cho VM từ đầu dải; bài lấy `192.168.104.200` tới `192.168.104.210`.
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.16.1/config/manifests/metallb-native.yaml > /dev/null
+kubectl -n metallb-system rollout status deploy/controller --timeout=180s | tail -1
+kubectl -n metallb-system rollout status ds/speaker --timeout=180s | tail -1
+mkdir -p ~/k4 && cat > ~/k4/metallb-lab.yaml <<'EOF'
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: lab
+  namespace: metallb-system
+spec:
+  addresses:
+  - 192.168.104.200-192.168.104.210
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: lab
+  namespace: metallb-system
+spec:
+  ipAddressPools: [lab]
+EOF
+until kubectl apply -f ~/k4/metallb-lab.yaml > /dev/null 2>&1; do sleep 3; done
+kubectl apply -f ~/k4/metallb-lab.yaml
+sleep 5; kubectl get service web-lb
+kubectl get events --field-selector involvedObject.name=web-lb -o custom-columns=REASON:.reason,FROM:.source.component,MESSAGE:.message
+kubectl -n metallb-system get servicel2statuses -o custom-columns=NODE:.status.node,SERVICE:.status.serviceName
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "controller" successfully rolled out
+daemon set "speaker" successfully rolled out
+ipaddresspool.metallb.io/lab unchanged
+l2advertisement.metallb.io/lab unchanged
+NAME     TYPE           CLUSTER-IP       EXTERNAL-IP       PORT(S)        AGE
+web-lb   LoadBalancer   10.103.138.168   192.168.104.200   80:32470/TCP   24s
+REASON         FROM                 MESSAGE
+IPAllocated    metallb-controller   Assigned IP ["192.168.104.200"]
+nodeAssigned   metallb-speaker      announcing from node "lima-k4-w1" with protocol "layer2"
+NODE         SERVICE
+lima-k4-w1   web-lb
+```
+
+</Expected>
+
+Vòng `until` thử lại vì MetalLB kiểm object của nó bằng một admission webhook, và webhook cần thêm vài giây sau khi pod controller báo sẵn sàng; apply sớm hơn sẽ gặp `failed calling webhook`. Lệnh apply thứ hai chỉ để in kết quả.
+
+Hai event là hai việc của hai thành phần: controller cấp `192.168.104.200`, speaker báo node nào quảng bá. `IPAddressPool` một mình chưa đủ; `L2Advertisement` mới là lời cho phép quảng bá dải đó bằng ARP. Node được chọn là `k4-w1`, node duy nhất đủ điều kiện: `k4-cp1` mang label loại trừ của kubeadm.
+
+Hỏi mạng xem ai giữ địa chỉ đó. `arping` gửi một ARP request thật ra card mạng:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+sudo arping -I eth0 -c 2 192.168.104.200 | grep -o "reply from.*\]"
+ping -c 1 -W 1 lima-k4-w1.internal > /dev/null; ip neigh show "$(getent hosts lima-k4-w1.internal | awk '{print $1}')" | awk '{print "MAC cua k4-w1:", toupper($5)}'
+kubectl get nodes -l node.kubernetes.io/exclude-from-external-load-balancers -o name
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+reply from 192.168.104.200 [52:55:55:FA:45:59]
+reply from 192.168.104.200 [52:55:55:FA:45:59]
+MAC cua k4-w1: 52:55:55:FA:45:59
+node/lima-k4-cp1
+```
+
+</Expected>
+
+Người trả lời cho `192.168.104.200` có đúng địa chỉ MAC của card mạng `k4-w1`. Không có gì khác xảy ra ở tầng mạng: không địa chỉ nào được gắn thêm, không giao thức nào mới. Địa chỉ MAC trên máy bạn sẽ khác.
+
+<Check id="d13.6.lab-install">Cài được MetalLB, khai được `IPAddressPool` và `L2Advertisement`, chỉ ra được qua event thành phần nào cấp IP và node nào quảng bá, và xác nhận được bằng `arping` rằng MAC trả lời là của node đó.</Check>
+
+### 3. Một máy khách thật
+
+`curl http://192.168.104.200` từ chính `k4-cp1` sẽ thành công, nhưng không chứng minh được gì: kube-proxy trên mọi node đã có luật cho địa chỉ này và bắt gói ngay tại chỗ, gói không hề ra dây. Cần một máy **ngoài cụm** trên cùng mạng LAN. Lab tạo nó bằng một network namespace (D1.5) có card `macvlan`: một loại card ảo của Linux, có địa chỉ MAC riêng, cắm thẳng vào mạng của `eth0`. Gói của nó ra dây mà không đi qua các luật mạng của node, nên với cụm nó là một máy lạ trên cùng LAN.
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+sudo ip netns add khach
+sudo ip link add mv0 link eth0 type macvlan mode bridge
+sudo ip link set mv0 netns khach
+sudo ip -n khach addr add 192.168.104.50/24 dev mv0
+sudo ip -n khach link set mv0 up
+for i in 1 2 3 4; do sudo ip netns exec khach curl -s -m 2 http://192.168.104.200/hostname; echo; done
+sudo ip netns exec khach ip neigh show 192.168.104.200
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web-5c94dc48c-6v9qj
+web-5c94dc48c-57nmv
+web-5c94dc48c-6v9qj
+web-5c94dc48c-6v9qj
+192.168.104.200 dev mv0 lladdr 52:55:55:fa:45:59 REACHABLE
+```
+
+</Expected>
+
+Máy khách `192.168.104.50` hỏi ARP, được `k4-w1` trả lời, gửi gói tới đó, và kube-proxy trên `k4-w1` chia cho cả hai pod (một pod nằm ở `k4-cp1`, đi qua đường hầm Flannel). Một giới hạn của `macvlan`: card ảo không nói chuyện được với chính máy chứa nó, nên máy khách này chỉ dùng được khi node quảng bá **không phải** `k4-cp1`.
+
+Giờ tách "cấp địa chỉ" khỏi "quảng bá địa chỉ".
+
+<Callout kind="danger">
+
+Lệnh đầu của khối dưới xoá `L2Advertisement`, tức cố ý làm Service mất liên lạc với bên ngoài cho tới khi bạn tạo lại nó ở khối kế tiếp. Chỉ chạy trên cụm lab.
+
+</Callout>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl -n metallb-system delete l2advertisement lab
+sleep 3; sudo ip netns exec khach ip neigh flush all
+kubectl get service web-lb --no-headers | awk '{print "EXTERNAL-IP:", $4}'
+sudo ip netns exec khach curl -s -m 2 -o /dev/null -w "may khach: %{http_code}\n" http://192.168.104.200/hostname
+curl -s -m 2 -o /dev/null -w "tu node k4-cp1: %{http_code}\n" http://192.168.104.200/hostname
+```
+
+</Terminal>
+
+<Predict question="L2Advertisement đã bị xoá, IPAddressPool còn nguyên. Service còn EXTERNAL-IP không? Máy khách và node, ai còn gọi được?">
+
+```text
+l2advertisement.metallb.io "lab" deleted from metallb-system namespace
+EXTERNAL-IP: 192.168.104.200
+may khach: 000
+tu node k4-cp1: 200
+```
+
+Service vẫn có địa chỉ: việc cấp phát thuộc controller và không đổi. Nhưng không còn speaker nào trả lời ARP, nên máy khách không tìm ra ai giữ `192.168.104.200` (`000` là mã của `curl` khi không kết nối được). Node thì vẫn gọi được, vì gói của nó chưa bao giờ đi qua ARP. Một phép thử "từ node gọi được mà" sẽ báo xanh cho một dịch vụ mà cả thế giới bên ngoài không tới được.
+
+</Predict>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl apply -f ~/k4/metallb-lab.yaml
+sleep 3; sudo ip netns exec khach curl -s -m 2 -o /dev/null -w "may khach: %{http_code}\n" http://192.168.104.200/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ipaddresspool.metallb.io/lab unchanged
+l2advertisement.metallb.io/lab created
+may khach: 200
+```
+
+</Expected>
+
+<Check id="d13.6.lab-client">Dựng được một máy khách ngoài cụm bằng network namespace và `macvlan`, giải thích được vì sao phép thử từ node không có giá trị, và chứng minh được Service có IP mà không được quảng bá thì bên ngoài không tới được.</Check>
+
+### 4. Ứng dụng thấy IP của ai
+
+`agnhost netexec` có đường dẫn `/clientip` trả về địa chỉ nguồn mà nó thấy:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do sudo ip netns exec khach curl -s -m 2 http://192.168.104.200/clientip | cut -d: -f1; done | sort | uniq -c
+kubectl patch service web-lb -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+sleep 3
+sudo ip netns exec khach curl -s -m 2 http://192.168.104.200/clientip; echo
+for i in 1 2 3 4; do sudo ip netns exec khach curl -s -m 2 http://192.168.104.200/hostname; echo; done | sort | uniq -c
+kubectl get pods -l app=web -o wide --no-headers | awk '{print $1, $7}'
+```
+
+</Terminal>
+
+<Predict question="Máy khách có địa chỉ 192.168.104.50. Với chính sách mặc định, ứng dụng thấy địa chỉ nào? Đổi sang Local thì sao, và pod nào trả lời?">
+
+```text
+      2 10.244.1.0
+      6 10.244.1.1
+service/web-lb patched
+192.168.104.50:57540
+      4 web-5bd7cbd797-lm45m
+web-5bd7cbd797-chnhf lima-k4-cp1
+web-5bd7cbd797-lm45m lima-k4-w1
+```
+
+Với `Cluster`, ứng dụng không lần nào thấy `192.168.104.50`. Nó thấy một địa chỉ của chính node `k4-w1` trên mạng pod, sau khi node SNAT gói: `10.244.1.1` (địa chỉ của bridge `cni0`) khi pod trả lời nằm ngay trên `k4-w1`, và `10.244.1.0` (địa chỉ của đầu `flannel.1`) khi request được chuyển sang pod ở `k4-cp1`. Với `Local`, ứng dụng thấy đúng `192.168.104.50`, và cả bốn request rơi vào pod duy nhất nằm trên `k4-w1`, node đang quảng bá. Pod ở `k4-cp1` không nhận gì. Tỉ lệ giữa hai địa chỉ ở phần đầu là ngẫu nhiên, và cổng nguồn trên máy bạn sẽ khác.
+
+</Predict>
+
+Đó là cái giá của `Local` với L2: giữ được IP client, mất chia tải giữa các node. Bài giữ `Local` cho bước sau.
+
+<Check id="d13.6.lab-etp">Chứng minh được bằng `/clientip` rằng `externalTrafficPolicy: Cluster` che IP của client còn `Local` thì giữ, và chỉ ra được với `Local` chỉ pod trên node quảng bá nhận request.</Check>
+
+### 5. Đổi node quảng bá
+
+Cho `k4-cp1` đủ điều kiện quảng bá bằng cách gỡ label loại trừ:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl label node lima-k4-cp1 node.kubernetes.io/exclude-from-external-load-balancers-
+sleep 5
+kubectl -n metallb-system get servicel2statuses -o custom-columns=NODE:.status.node,SERVICE:.status.serviceName
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-w1">
+
+```bash
+sudo arping -I eth0 -c 1 192.168.104.200 | grep -o "reply from.*\]"
+ip -br link show eth0 | awk '{print "MAC cua chinh k4-w1:", toupper($3)}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-cp1 unlabeled
+NODE          SERVICE
+lima-k4-cp1   web-lb
+reply from 192.168.104.200 [52:55:55:AC:18:2B]
+MAC cua chinh k4-w1: 52:55:55:FA:45:59
+```
+
+</Expected>
+
+Vừa có hai ứng viên, việc quảng bá chuyển sang `k4-cp1` mà không ai ra lệnh: với mỗi IP, các speaker xếp thứ tự ứng viên bằng một phép băm trên tên node và địa chỉ, và ở đây `k4-cp1` đứng trước. Bạn không chọn được node cho từng IP (trừ khi giới hạn danh sách ứng viên bằng `nodeSelectors` của `L2Advertisement`), và thêm một node vào cụm có thể làm IP đổi chủ. Hỏi ARP từ `k4-w1` giờ nhận MAC của `k4-cp1`.
+
+Giờ chuyển ngược lại và nhìn việc đó trên dây. Ở terminal của `k4-w1`, bắt các gói ARP về địa chỉ này trong 15 giây:
+
+<Terminal where="vm" title="k4-w1 (terminal 2)">
+
+```bash
+sudo timeout 15 tcpdump -ni eth0 -ttt 'arp and arp host 192.168.104.200' 2> /dev/null | cut -c1-110
+```
+
+</Terminal>
+
+Trong lúc lệnh trên đang chạy, ở terminal của `k4-cp1` gắn lại label loại trừ, cách rút một node khỏi vai trò load balancer trước khi bảo trì nó:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl label node lima-k4-cp1 node.kubernetes.io/exclude-from-external-load-balancers=
+sleep 6
+kubectl -n metallb-system get servicel2statuses -o custom-columns=NODE:.status.node,SERVICE:.status.serviceName
+sudo ip netns exec khach curl -s -m 2 http://192.168.104.200/hostname; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-cp1 labeled
+NODE         SERVICE
+lima-k4-w1   web-lb
+web-5c94dc48c-6v9qj
+```
+
+</Expected>
+
+Terminal của `k4-w1` in ra:
+
+```text
+ 00:00:00.000000 ARP, Request who-has 192.168.104.200 (ff:ff:ff:ff:ff:ff) tell 192.168.104.200, length 46
+ 00:00:00.000193 ARP, Reply 192.168.104.200 is-at 52:55:55:fa:45:59, length 46
+ 00:00:01.104524 ARP, Request who-has 192.168.104.200 (ff:ff:ff:ff:ff:ff) tell 192.168.104.200, length 46
+ 00:00:00.000127 ARP, Reply 192.168.104.200 is-at 52:55:55:fa:45:59, length 46
+ 00:00:01.096426 ARP, Request who-has 192.168.104.200 (ff:ff:ff:ff:ff:ff) tell 192.168.104.200, length 46
+ 00:00:00.000085 ARP, Reply 192.168.104.200 is-at 52:55:55:fa:45:59, length 46
+ …
+```
+
+Đây là gratuitous ARP của D9.3, do speaker trên `k4-w1` phát ngay khi nó nhận vai: một request "ai có `.200`, hãy báo cho `.200`" và một reply "`.200` ở MAC của tôi", gửi tới mọi máy trong mạng, lặp lại khoảng mỗi giây, năm lần. Máy khách cập nhật bảng ARP và request kế tiếp tới `k4-w1`. Trong một lượt chạy khác của bài, giữa cặp gói đầu còn có thêm một reply mang MAC của `k4-cp1`, 20 mili giây sau gói của `k4-w1`: trong khoảnh khắc đó hai máy cùng nhận là chủ. Thời gian in ở đầu dòng là khoảng cách với gói trước; trên máy bạn sẽ khác chút ít.
+
+Phần lab **không** đo được với hai VM: node quảng bá chết đột ngột. Khi đó không có lời "tôi nghỉ"; các speaker còn lại phải tự phát hiện qua memberlist rồi mới tiếp quản, và tài liệu MetalLB cho con số "vài giây" với client xử lý gratuitous ARP đúng. Nếu máy bạn đủ RAM cho một VM thứ ba làm máy khách, hãy tắt hẳn node đang quảng bá và đo bằng `probe.sh` của K4.3; bài chưa chạy phép thử này.
+
+<Check id="d13.6.lab-move">Chuyển được việc quảng bá một IP giữa hai node bằng label loại trừ, bắt được gratuitous ARP của node mới bằng `tcpdump`, và nói được vì sao không chọn trước được node quảng bá cho từng IP.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `EXTERNAL-IP` vẫn `<pending>` sau khi có pool: `kubectl describe service web-lb` xem event; hay gặp là dải địa chỉ viết sai hoặc pool đã hết địa chỉ.
+- Có `EXTERNAL-IP` nhưng `arping` không ai trả lời: thiếu `L2Advertisement`, hoặc không node nào đủ điều kiện (mọi node đều mang label loại trừ; với `Local`, không node nào có pod sẵn sàng). `kubectl -n metallb-system get servicel2statuses` trống là dấu hiệu.
+- `RTNETLINK answers: File exists` khi tạo `mv0`: namespace `khach` đã có từ lần trước; bỏ qua ba lệnh tạo.
+- Máy khách `curl` trả `000` dù node quảng bá là `k4-w1`: `sudo ip netns exec khach ip neigh flush all` để xoá bảng ARP cũ rồi thử lại.
+- Ở bước 5, sau khi gỡ label mà node quảng bá vẫn là `k4-w1`: trên cụm của bạn phép băm xếp `k4-w1` trước. Phần còn lại của bước vẫn làm được nếu bạn đổi vai hai máy: gắn label loại trừ cho `k4-w1` và bắt gói trên `k4-cp1`.
+- `tcpdump` không in gì: lệnh gắn label chạy sau khi 15 giây đã hết. Chạy lại `tcpdump`, rồi gỡ và gắn lại label.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh dưới xoá Service `web-lb`, gỡ MetalLB khỏi cụm và xoá network namespace `khach`. Ứng dụng `web` và cụm được giữ cho K4.7.
+
+</Callout>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl delete service web-lb
+kubectl delete -f https://raw.githubusercontent.com/metallb/metallb/v0.16.1/config/manifests/metallb-native.yaml > /dev/null 2>&1
+sudo ip netns delete khach
+kubectl get nodes -l node.kubernetes.io/exclude-from-external-load-balancers -o name
+kubectl get namespace metallb-system 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+service "web-lb" deleted from default namespace
+node/lima-k4-cp1
+Error from server (NotFound): namespaces "metallb-system" not found
+```
+
+</Expected>
+
+Cuối buổi học: `limactl stop k4-w1` rồi `limactl stop k4-cp1` trên Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="MetalLB hay kube-vip hay Cilium? Chúng trùng việc nhau không?">
+
+Trùng một phần. kube-vip làm được hai việc: giữ VIP cho API server của control plane (việc K4.2 làm bằng Keepalived và HAProxy) và quảng bá IP cho Service `LoadBalancer`, cũng bằng ARP hoặc BGP. Cilium (K6) có sẵn cấp phát IP cho LoadBalancer, quảng bá L2 và BGP, nên cụm đã dùng Cilium thường không cài thêm MetalLB. MetalLB chỉ làm một việc và chạy được với mọi CNI. Điều cần tránh là để **hai** thứ cùng quảng bá một dải địa chỉ: mỗi Service nên chỉ có một bên chịu trách nhiệm, và trường `loadBalancerClass` của Service tồn tại để chỉ định bên đó khi cụm có nhiều hơn một.
+
+</Reveal>
+
+<Reveal title="Cụm chỉ có một IP công khai. Chạy mười service thế nào?">
+
+Không cấp mười IP. Một IP cho một gateway L7, và gateway định tuyến theo tên miền và đường dẫn tới mười Service kiểu `ClusterIP` phía sau (K2.2 đã dạy Gateway API). MetalLB cấp và quảng bá IP cho Service của gateway; mọi thứ khác là HTTP. Service không phải HTTP (database, MQTT) mới cần IP hoặc cổng riêng; MetalLB cho phép vài Service dùng chung một IP trên các cổng khác nhau bằng annotation chia sẻ địa chỉ. Đây cũng là cách đỡ giới hạn "một node gánh hết": thứ đi qua node đó là lưu lượng của gateway, và gateway là thứ bạn đo và mở rộng có chủ đích.
+
+</Reveal>
+
+<Reveal title="Vì sao IP của Service không ping được?">
+
+Vì không máy nào thật sự giữ địa chỉ đó. Speaker trả lời ARP, nên gói tới được node; nhưng luật của kube-proxy chỉ khớp đúng giao thức và cổng của Service (TCP 80 ở lab). Gói ICMP tới `192.168.104.200` không khớp luật nào, và node không có địa chỉ đó trên card mạng nào để tự trả lời. Kết quả tuỳ chế độ của kube-proxy và phiên bản: có nơi im lặng, có nơi trả lời từ chối. Vì vậy đừng giám sát một Service bằng ping; hãy gọi đúng cổng của nó, từ ngoài cụm.
+
+</Reveal>
+
+<Reveal title="Rút một node đang quảng bá để bảo trì thì làm theo thứ tự nào?">
+
+Kết hợp bước 5 với quy trình drain của K4.4. Trước hết gắn label loại trừ để IP chuyển sang node khác một cách chủ động (bạn chọn thời điểm, có gratuitous ARP ngay). Chờ vài phút với node cũ **vẫn chạy**: tài liệu MetalLB khuyên vậy để node cũ tiếp tục chuyển tiếp cho những client còn giữ bảng ARP cũ. Lab cho thấy điều này làm được vì kube-proxy trên node cũ vẫn giữ luật cho IP đó. Sau đó mới `drain`, vá, khởi động lại, `uncordon`, và gỡ label. Với `externalTrafficPolicy: Local`, thêm một việc: bảo đảm node sắp nhận vai có pod sẵn sàng của Service, nếu không IP sẽ không có ai quảng bá.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết `IPAddressPool`, `L2Advertisement` hay cấu hình BGP từ sơ đồ mạng bạn mô tả, hoặc giải thích một dòng log của speaker. AI hay đưa cấu hình kiểu cũ dùng ConfigMap `config` (MetalLB bỏ từ 0.13, nay dùng CRD), quên `L2Advertisement` (pool có mà không ai quảng bá), bảo bật `strictARP` của kube-proxy trong mọi trường hợp (chỉ cần ở chế độ IPVS), và gọi chế độ L2 là "cân bằng tải" giữa các node. Nó cũng hay kiểm bằng `curl` từ một node. Kiểm lại bằng `arping` và một lần gọi từ máy thật sự nằm ngoài cụm, và đối chiếu dải IP với đội mạng trước khi apply.
+
+</Callout>
+
+<Callout kind="link">
+
+D2.1 dạy ARP và bảng neighbor; D9.3 dạy VIP, gratuitous ARP và split-brain, nền của chế độ L2; D9.2 dạy PROXY protocol, cách khác để giữ IP client. K2.1 dạy Service và kube-proxy; K2.2 dạy Gateway API, thứ thường đứng sau IP mà MetalLB cấp. K4.2 dùng cùng kỹ thuật VIP cho API server. K4.4 dạy drain, bước đi kèm khi rút node quảng bá. K6 dạy Cilium, nơi có sẵn chức năng tương đương và BGP. D10 là load balancer của cloud. K10 quản nhiều cụm bằng Cluster API, hướng thay cho Rancher.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d13.6.mastery-setup">Trên một cụm tự dựng, cấp được IP cho một Service `LoadBalancer` bằng MetalLB L2 với một dải địa chỉ hợp lệ, và chứng minh được từ một máy ngoài cụm rằng nó tới được, kèm node nào đang nhận traffic.</Check>
+
+<Check id="d13.6.mastery-choose">Với một yêu cầu cho trước (cần IP client hay không, lưu lượng vào bao nhiêu, mạng có router BGP hay không), chọn được L2 hay BGP, `Cluster` hay `Local`, và nêu được giới hạn của lựa chọn đó.</Check>
+
+<Check id="d13.6.mastery-ops">Lập được quy trình bảo trì một node đang quảng bá IP sao cho client ít bị ảnh hưởng nhất, và giải thích được từng bước bằng ARP.</Check>
+
+</Mastery>

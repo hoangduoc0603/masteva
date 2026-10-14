@@ -1,0 +1,989 @@
+---
+title: "Longhorn: lưu trữ khối phân tán trên đĩa của node"
+description: Dựng Longhorn trên cụm hai node, đi theo một lệnh ghi từ pod qua iSCSI tới hai replica, tắt nguồn đột ngột từng node để đo degraded, rebuild và pod kẹt, sao lưu ra object storage rồi khôi phục sau khi mất volume, mở rộng volume và đọc sổ sách chỗ trống của Longhorn.
+id: k7.2
+step: k7
+prerequisites: [k7.1, d13.1]
+topics: [k7.longhorn]
+status: verified
+verified:
+  date: 2026-10-13
+  os: Ubuntu 26.04 LTS (hai VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    k3s: v1.36.5+k3s1
+    containerd: 2.3.4-k3s1.36
+    longhorn: 1.13.0
+    open-iscsi: 2.1.11
+    external-snapshotter: 8.6.0 (CRD, snapshot-controller)
+    rustfs: 1.0.1
+    kubectl: 1.37.1
+    helm: 4.3.0
+    jq: 1.8.2
+---
+
+<Goal>
+
+K7.1 dạy đường đi của một PVC bằng một driver mẫu giữ dữ liệu trên một node duy nhất. Bài này thay nó bằng **Longhorn**, hệ lưu trữ khối giữ nhiều bản sao của mỗi volume trên đĩa của chính các node, rồi làm hỏng nó theo những cách production sẽ làm. Học xong, bạn giải thích được:
+
+- Vì sao mất một node mà ứng dụng chỉ ngừng ghi chừng chín giây, và chín giây đó đến từ đâu.
+- Vì sao node chạy pod chết thì pod thay thế kẹt ở `ContainerCreating` dù dữ liệu còn nguyên ở node khác, và Longhorn gỡ việc đó thế nào.
+- Vì sao xoá volume là mất mọi snapshot, còn bản backup ngoài cụm thì khôi phục được.
+- Vì sao một PVC `Bound` mà pod không gắn được đĩa, và over-provisioning trả giá thế nào khi đĩa đầy thật.
+- Khi nào Longhorn là đủ, khi nào cần tới Ceph (K7.3).
+
+</Goal>
+
+<Knowledge>
+
+### Mỗi volume một bộ điều khiển riêng
+
+Longhorn là dự án CNCF (mức Incubating), giấy phép Apache 2.0. Ý tưởng của nó khác hầu hết hệ lưu trữ phân tán: không có một "cụm lưu trữ" chung chứa mọi dữ liệu. **Mỗi volume** là một hệ nhỏ độc lập gồm một **engine** và vài **replica**:
+
+```text
+        Pod (node A) ghi vào /data
+              |
+     /dev/longhorn/pvc-...        = /dev/sdX, một đĩa iSCSI trong kernel của node A
+              | iSCSI qua TCP, tới tgtd trong pod instance-manager của node A
+        +-----v------+
+        |   ENGINE   |   một tiến trình cho MỖI volume, luôn nằm ở node có pod
+        +--+------+--+
+    TCP    |      |    TCP: mỗi lệnh ghi được gửi tới MỌI replica đang khoẻ
+     +-----v--+ +-v------+
+     | REPLICA| | REPLICA|   mỗi bản một tiến trình, trong instance-manager của node giữ nó
+     | node A | | node B |
+     +---+----+ +---+----+
+         |          |
+   /var/lib/longhorn/replicas/pvc-...-<mã>/     các file thưa: volume-head-NNN.img, volume-snap-*.img
+```
+
+Replica là **bản đầy đủ** của volume, nằm trọn trong một thư mục trên **một** đĩa của một node, dưới dạng file thưa (sparse file: chỉ chiếm chỗ cho phần đã ghi). Engine nhân bản **đồng bộ**: một lệnh ghi chỉ xong khi mọi replica đang khoẻ đã nhận. Còn một replica khoẻ là volume còn dùng được.
+
+| Thành phần | Chạy ở | Việc |
+|---|---|---|
+| `longhorn-manager` | DaemonSet, mỗi node một pod | Control plane: phục vụ API, điều khiển các object `Volume`, `Engine`, `Replica`, `Node` (đều là CRD) |
+| `longhorn-global-manager` | Deployment, mặc định 3 bản, một bản làm leader (có từ 1.13) | Các controller nhìn cả cụm: theo dõi pod và PV, trong đó có việc xử lý pod trên node chết |
+| `instance-manager` | Mỗi node một pod | Chứa tiến trình engine và replica của **mọi** volume trên node, cùng `tgtd` (đầu phát iSCSI). Pod này chết là mọi engine và replica trên node chết theo |
+| `longhorn-csi-plugin`, `csi-attacher`, `csi-provisioner`, `csi-resizer`, `csi-snapshotter` | DaemonSet và các Deployment | Hai nửa của một driver CSI, đúng mô hình K7.1 |
+| `share-manager-<volume>` | Một pod cho mỗi volume RWX | NFS server chia sẻ volume đó |
+
+So với driver mẫu của K7.1: PV của Longhorn **không có `nodeAffinity`**. Volume gắn được vào bất kỳ node nào, vì engine sẽ được dựng ở node đó và nối tới các replica qua mạng.
+
+<Check id="k7.2.kien-truc">Vẽ được engine và các replica của một volume Longhorn, nói được mỗi thứ chạy trong pod nào ở node nào, replica lưu dữ liệu ở đâu, và vì sao PV của Longhorn không gắn với một node.</Check>
+
+### Đường dữ liệu: V1 dùng iSCSI, V2 dùng SPDK
+
+Longhorn có hai **data engine**. Chọn theo StorageClass (`dataEngine`), mặc định là V1.
+
+| | V1 (mặc định, bài này dùng) | V2 |
+|---|---|---|
+| Engine và replica | Tiến trình Linux thường | SPDK (`spdk_tgt`), xử lý I/O trong user space |
+| Đĩa hiện ra trên node qua | iSCSI: node cần `open-iscsi`, module `iscsi_tcp` | NVMe/TCP: module `nvme-tcp`, `vfio_pci`, `uio_pci_generic` |
+| Replica nằm trên | Filesystem ext4 hoặc XFS của node | Đĩa khối thô; tài liệu khuyên NVMe |
+| Node phải dành riêng | Không gì đặc biệt | 2 GiB hugepage và ít nhất một lõi CPU cho mỗi instance-manager; kernel 6.7 trở lên |
+
+V2 (GA từ Longhorn 1.12.0; tài liệu khuyên mỗi cụm chỉ bật một engine) nhanh hơn rõ rệt trên NVMe và đắt hơn rõ rệt về tài nguyên: hai VM 2 GiB của lab không đủ riêng phần hugepage. Mọi con số và hành vi trong bài là của V1.
+
+Vì dữ liệu đi qua kernel của node, **mỗi node** phải được chuẩn bị trước khi cài Longhorn:
+
+- `open-iscsi` đã cài và `iscsid` chạy được. Tài liệu 1.13 cảnh báo riêng bản **2.1.12** làm hỏng việc gắn volume; dùng 2.1.11 trở xuống hoặc 2.1.13 trở lên. Ubuntu 26.04 có sẵn 2.1.11.
+- NFS client (`nfs-common` trên Ubuntu) nếu dùng volume RWX.
+- Đĩa chứa replica format ext4 hoặc XFS.
+- `multipathd` không được nhận đĩa của Longhorn. Daemon này gộp nhiều đường tới cùng một đĩa SAN; trên distro mà nó nhận mọi đĩa `sd*`, nó chiếm luôn đĩa iSCSI của Longhorn và pod báo `already mounted or mount point busy`. Cách sửa trong tài liệu Longhorn là thêm `devnode "^sd[a-z0-9]+"` vào mục `blacklist` của `/etc/multipath.conf`. Trên Ubuntu 26.04 của lab, `multipathd` chạy sẵn với `find_multipaths "on"` (chỉ nhận đĩa có từ hai đường) và không đụng tới volume nào.
+
+Công cụ `longhornctl check preflight` của Longhorn kiểm các điều kiện này trên cả cụm; bài cài tay để thấy từng thứ.
+
+<Check id="k7.2.duong-du-lieu">Kể được một lệnh ghi đi qua những gì từ pod tới file trên đĩa của hai node với data engine V1, V2 khác V1 ở đâu và đòi thêm gì, và những thứ phải có trên mỗi node trước khi cài Longhorn.</Check>
+
+### Replica đặt ở đâu, và sổ sách chỗ trống
+
+Số replica khai ở StorageClass (`numberOfReplicas`, mặc định 3). Longhorn rải chúng theo ba tầng chống trùng (anti-affinity):
+
+| Tầng | Setting | Mặc định | Nghĩa |
+|---|---|---|---|
+| Node | `replica-soft-anti-affinity` | `false` (cứng) | Hai replica của một volume không bao giờ chung node. Thiếu node thì volume chạy thiếu replica |
+| Zone | `replica-zone-soft-anti-affinity` | `true` (mềm) | Cố rải khác zone (label `topology.kubernetes.io/zone` của node), không được thì vẫn xếp chung zone |
+| Đĩa | `replica-disk-soft-anti-affinity` | `true` (mềm) | Tương tự, giữa các đĩa của một node |
+
+Volume khai 1 GiB không chiếm ngay 1 GiB: replica là file thưa (thin provisioning). Longhorn vì thế giữ **sổ sách** riêng cho mỗi đĩa, tách khỏi dung lượng thật:
+
+```text
+ Storage Maximum     dung lượng filesystem của đĩa
+ Storage Reserved    phần không bao giờ cấp cho replica (đĩa mặc định: 30% lúc tạo)
+ Storage Scheduled   tổng dung lượng DANH NGHĨA của các replica đã xếp vào đĩa
+ Storage Available   chỗ trống THẬT của filesystem
+
+ Được xếp thêm một replica cỡ S khi cả hai điều sau đúng:
+   Scheduled + S  <=  (Maximum - Reserved) x storage-over-provisioning-percentage   (mặc định 100%)
+   Available - (dữ liệu thật replica mang theo)  >  Maximum x storage-minimal-available-percentage   (mặc định 25%)
+```
+
+Tăng over-provisioning lên 200% là cho phép hứa gấp đôi chỗ mình có, với giả định các volume không cùng đầy. Giả định đó sai thì đĩa đầy thật; phần Đào sâu kể lại một lần như thế. Hai điều thin provisioning không tự làm: volume **không tự co** khi bạn xoá file (Longhorn làm việc ở tầng khối nên không biết khối nào đã bỏ; phải chạy trim), và snapshot giữ lại mọi khối cũ nên một replica có thể chiếm **nhiều hơn** dung lượng danh nghĩa.
+
+<Check id="k7.2.replica-va-cho-trong">Kể được ba tầng anti-affinity của replica cùng mặc định của chúng, và tính được một đĩa còn nhận thêm replica cỡ nào từ Maximum, Reserved, Scheduled và tỉ lệ over-provisioning.</Check>
+
+### Khi một node chết
+
+Hai trường hợp khác hẳn nhau, tuỳ node đó giữ gì của volume:
+
+```text
+ (A) Node chết CHỈ giữ một replica (pod và engine ở node khác)
+     0s     node mất. Engine chờ replica đó trả lời.
+     ~8s    hết engine-replica-timeout (mặc định 8 giây): engine loại replica, ghi tiếp trên bản còn lại.
+            Trong khoảng này mọi lệnh ghi của ứng dụng đứng yên.
+     sau đó volume ở trạng thái degraded: chạy được, thiếu bản sao.
+     node về trong replica-replenishment-wait-interval (mặc định 600 giây):
+            Longhorn dùng lại dữ liệu của replica cũ, chỉ chép phần khác biệt.
+     quá hạn mà còn node khác đủ chỗ: dựng replica mới từ đầu ở đó.
+
+ (B) Node chết giữ cả pod lẫn engine
+     volume mất engine: không ai đọc ghi được, dù replica ở node khác còn nguyên.
+     Kubernetes: ~50s node NotReady -> hết tolerationSeconds (mặc định 300 giây) pod bị đánh dấu xoá
+                 -> pod thay thế được tạo ở node khác -> kẹt ContainerCreating:
+                    volume RWO còn một VolumeAttachment trỏ vào node chết (K7.1).
+     Kẹt tới khi: node sống lại, có người xoá cưỡng bức pod cũ, node nhận taint out-of-service (K7.1),
+                  hoặc Longhorn được phép tự làm việc đó.
+```
+
+"Longhorn tự làm" là setting `node-down-pod-deletion-policy`. Mặc định `do-nothing`. Đặt `delete-deployment-pod`, `delete-statefulset-pod` hoặc `delete-both-statefulset-and-deployment-pod` thì khi node `NotReady` và pod đã bị đánh dấu xoá, global manager xoá VolumeAttachment cũ rồi xoá cưỡng bức pod; volume được gắn sang node mới với các replica còn lại. Cái giá: bạn tin vào phán đoán "node đã chết" chỉ dựa trên `NotReady`. Lý do Kubernetes không tự làm việc này nằm ở phần Đào sâu của K7.1.
+
+**Rebuild có giá.** Dựng lại một replica là chép dữ liệu qua mạng trong lúc volume vẫn phục vụ, và trước khi chép Longhorn tự chụp một snapshot hệ thống. Nhiều volume cùng rebuild sẽ tranh mạng và đĩa với ứng dụng; `concurrent-replica-rebuild-per-node-limit` (mặc định 5) chặn số lượng rebuild cùng lúc trên một node.
+
+<Callout kind="production">
+
+Rạng sáng 21/04/2011, một thay đổi cấu hình mạng trong một Availability Zone của AWS US East chuyển nhầm lưu lượng của mạng chính sang mạng dự phòng dung lượng thấp. Theo [bản tường trình của AWS](https://aws.amazon.com/message/65648/), rất nhiều node EBS (dịch vụ đĩa khối, cũng nhân bản mỗi volume ra nhiều node) cùng lúc mất liên lạc với replica của mình. Khi mạng được trả lại, các node đó đồng loạt đi tìm chỗ trống trong cụm để dựng replica mới. Chỗ trống của cụm cạn rất nhanh, và nhiều node rơi vào vòng lặp tìm chỗ không dứt; AWS gọi đó là "re-mirroring storm". Khoảng 13% volume trong zone bị "stuck": không đọc ghi được, vì EBS chặn truy cập volume trong lúc chưa xác định được bản ghi chính mới. Một lỗi race condition hiếm gặp trong code node EBS, bình thường gần như không xuất hiện, bị cơn bão kích hoạt liên tục và làm thêm node sập. Lời gọi tạo volume có timeout dài dồn ứ lại, làm control plane của EBS cạn thread và ảnh hưởng cả các zone khác. Để phục hồi, họ phải chở thêm máy chủ tới lắp vào cụm, vì thiết kế không dùng lại node hỏng chừng nào dữ liệu trên đó chưa được nhân bản xong. Hơn một ngày sau, phần lớn volume mới trở lại; cuối cùng 0,07% volume trong zone không khôi phục được ở trạng thái nhất quán. Ba lớp bảo vệ họ cam kết thêm: giữ nhiều dung lượng dự phòng hơn cho các đợt phục hồi lớn; sửa logic thử lại để lùi (back off) mạnh hơn và ưu tiên nối lại với replica cũ thay vì đi tìm node mới; và sửa lỗi race condition.
+
+Điều rút ra cho bài này (của bài): hai lớp đầu có mặt trong Longhorn. `replica-replenishment-wait-interval` là "chờ replica cũ quay lại trước khi dựng bản mới", và `concurrent-replica-rebuild-per-node-limit` là cái phanh của cơn bão. Còn dung lượng dự phòng là việc của bạn: rebuild cần **chỗ trống ở node khác**. Cụm ba node chạy ba replica thì mất một node là không còn nơi nào để dựng lại, và over-provisioning ăn đúng vào khoản dự phòng đó.
+
+</Callout>
+
+<Check id="k7.2.node-chet">Kể được chuyện gì xảy ra với lệnh ghi và với volume khi node chết chỉ giữ replica và khi node chết giữ cả pod, hai khoảng thời gian 8 giây và 600 giây là gì, và `node-down-pod-deletion-policy` đổi điều gì lấy điều gì.</Check>
+
+### Snapshot trong cụm, backup ngoài cụm
+
+**Snapshot** của Longhorn là một tầng trong mỗi replica. Chụp snapshot không chép dữ liệu: file `volume-head` đang ghi được đóng lại thành `volume-snap-<tên>.img`, và một `volume-head` trống mới nhận các lệnh ghi tiếp theo. Đọc một khối là tìm từ tầng mới nhất ngược về tầng cũ. Hệ quả: snapshot nằm **trong thư mục replica**, trên chính các đĩa giữ volume. Mất volume là mất snapshot, đúng điều K7.1 đã nói về mọi loại snapshot.
+
+**Backup** là thứ khác hẳn: Longhorn lấy một snapshot, cắt thành các khối (mặc định 2 MiB), nén rồi đẩy ra **backup target** ngoài cụm: object storage tương thích S3, hoặc NFS. Lần backup sau chỉ đẩy các khối đã đổi. Khôi phục luôn tạo **volume mới** từ bản backup. Một cụm Longhorn khác trỏ vào cùng backup target sẽ thấy và khôi phục được các bản đó; Longhorn còn có **DR volume**, một volume dự phòng ở cụm thứ hai tự cập nhật theo backup mới.
+
+Qua CSI, cả hai dùng chung object VolumeSnapshot của K7.1; khác nhau ở tham số `type` của VolumeSnapshotClass:
+
+| `parameters.type` | VolumeSnapshot tạo ra | Sống sót khi mất volume |
+|---|---|---|
+| `snap` | Một snapshot trong các replica | Không |
+| `bak` | Một snapshot, rồi một bản backup trên backup target | Có |
+
+RPO (lượng dữ liệu mất tối đa, K7.4 định nghĩa) của một volume bằng khoảng cách giữa hai lần backup. Longhorn có `RecurringJob` để đặt lịch snapshot và backup; bài không chạy phần lịch. Cả snapshot lẫn backup đều chỉ nhất quán mức crash-consistent: Longhorn chạy `sync` trước khi chụp, không biết gì về ứng dụng. Với database, K7.4 vẫn là câu trả lời.
+
+**RWX.** Longhorn là lưu trữ khối, một volume chỉ có một engine. `ReadWriteMany` được làm bằng cách gắn volume vào một pod `share-manager` chạy NFS server (NFSv4.1), các node mount qua một Service. Khi soạn bài, một PVC RWX của Longhorn được hai pod ở hai node mount cùng lúc, kiểu mount là `nfs4 (vers=4.1)` tới ClusterIP của Service đó. Cần biết cái giá: mọi I/O đi qua một NFS server duy nhất, và khi pod đó chết, client treo hoặc nhận lỗi sau timeout (mount ở lượt thử có tuỳ chọn `softerr`) cho tới khi nó được dựng lại.
+
+<Check id="k7.2.snapshot-backup">Giải thích được snapshot của Longhorn nằm ở đâu và vì sao chụp gần như tức thì, backup khác snapshot thế nào, `type: snap` và `type: bak` cho ra gì, và RWX của Longhorn được làm bằng gì.</Check>
+
+### Khi nào Longhorn là đủ
+
+| | Longhorn | Ceph (K7.3) |
+|---|---|---|
+| Mô hình | Mỗi volume một engine và N bản đầy đủ, mỗi bản nằm trọn trên một đĩa | Dữ liệu cắt thành object, rải khắp mọi đĩa của cụm |
+| Giao diện | Khối; RWX qua một NFS server cho mỗi volume | Khối, file dùng chung, object S3, trên cùng một cụm |
+| Volume lớn nhất | Không vượt được một đĩa (V1) | Lớn hơn bất kỳ đĩa nào |
+| Tối thiểu khuyến nghị | 3 node, mỗi node 4 vCPU và 4 GiB | Nhiều hơn hẳn: xem K7.3 |
+| Vận hành | Ít khái niệm; đọc được gần hết bằng `kubectl` | Nhiều khái niệm; cần người hiểu Ceph |
+
+Longhorn hợp với cụm nhỏ và vừa, edge, on-prem không có đội lưu trữ riêng, nơi cần PVC có nhân bản mà không muốn nuôi thêm một hệ thống lớn. Nó hết hợp khi bạn cần object storage hoặc file dùng chung ở quy mô lớn, cần volume lớn hơn một đĩa, hoặc khi số volume và dung lượng lớn tới mức mỗi lần mất node là một đợt rebuild hàng trăm volume. Về hiệu năng, mỗi lệnh ghi đi qua iSCSI, một tiến trình user space và một vòng mạng tới mọi replica: đo bằng tải thật trên phần cứng thật trước khi đặt database lên, đừng tin con số của người khác. Với ứng dụng **tự nhân bản** như cụm CloudNativePG của K7.4, tài liệu Longhorn khuyên StorageClass có `numberOfReplicas: "1"` và `dataLocality: strict-local` (bản duy nhất nằm ngay node chạy pod): ba instance trên ba volume ba replica là chín bản của cùng một dữ liệu và hai lần trả giá cho nhân bản đồng bộ.
+
+<Check id="k7.2.chon-longhorn">Nêu được ba khác biệt giữa Longhorn và Ceph về mô hình dữ liệu, giao diện và giới hạn, và hai dấu hiệu cho thấy một hệ thống đã vượt quá chỗ Longhorn hợp.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Architecture and Concepts | Longhorn 1.13](https://longhorn.io/docs/1.13.0/concepts/): engine, replica, instance manager, cách snapshot xếp tầng và cách replica được dựng lại; đọc mục 2.3 và 3.
+- [Quick Installation | Longhorn 1.13](https://longhorn.io/docs/1.13.0/deploy/install/): yêu cầu của node cho V1 và V2, cảnh báo về open-iscsi 2.1.12, và `longhornctl check preflight`.
+- [Node Failure Handling with Longhorn](https://longhorn.io/docs/1.13.0/high-availability/node-failure/): dòng thời gian khi node chết và khi node sống lại, cùng chính sách xoá pod.
+- [Best Practices | Longhorn 1.13](https://longhorn.io/docs/1.13.0/best-practices/): phần cứng tối thiểu, đĩa riêng, over-provisioning, các setting nên đổi cho production.
+- [Summary of the Amazon EC2 and Amazon RDS Service Disruption in the US East Region](https://aws.amazon.com/message/65648/): nguồn của callout; đọc đoạn mô tả re-mirroring và phần các thay đổi sau sự cố.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cần Lima (D0.1) cùng `kubectl`, `helm`, `jq`, `curl` trên máy (D0.2). Lab dựng hai VM Ubuntu 26.04 theo cách của K4.1 (mạng `user-v2`, chế độ `--plain`), mỗi VM thêm một đĩa 8 GiB dành riêng cho Longhorn, và chạy **k3s** thay cho kubeadm.
+
+Vì sao k3s: control plane của nó gói trong một tiến trình và dùng ít RAM hơn cụm kubeadm của K4.1 vài trăm MiB, phần đó nhường cho Longhorn. K3s với CNI Flannel cũng có trong bảng tổ hợp đã kiểm của tài liệu Longhorn 1.13. Bài dùng k3s **1.36** dù 1.37 đã có: danh sách Kubernetes đã kiểm với Longhorn 1.13.0 dừng ở 1.36. Đối chiếu bảng tương thích của hệ lưu trữ trước khi nâng Kubernetes là thói quen nên có.
+
+**Profile máy.** Hai VM, mỗi VM 2 CPU, 2 GiB RAM, đĩa 20 GiB và một đĩa phụ 8 GiB (file thưa trên Mac, chỉ lớn theo dữ liệu thật). Cuối bài, `free -m` trong từng VM (`limactl shell k7-n1 free -m`) cho thấy `k7-n1` dùng khoảng 1.200 MiB và `k7-n2` 720 tới 760 MiB. Lần đầu mỗi node kéo khoảng 1 GB image (đã nén). Máy 8 GB làm được nếu tắt Docker Desktop và mọi VM khác; đừng hạ VM xuống dưới 2 GiB. Tài liệu Longhorn khuyên production tối thiểu 3 node, mỗi node 4 vCPU và 4 GiB; lab hai node chỉ đủ cho volume 2 replica.
+
+Đĩa phụ của Lima là một file trên Mac, hiện ra trong VM như `/dev/vdb`. Nó cho bạn thứ quan trọng nhất của một đĩa riêng: Longhorn đầy thì hệ điều hành của node không đầy theo. Nó không cho bạn hiệu năng hay kiểu hỏng của đĩa thật.
+
+<Callout kind="danger">
+
+Bài này cố ý tắt nguồn đột ngột máy ảo và xoá volume có dữ liệu. Mọi lệnh chỉ dành cho hai VM `k7-n1`, `k7-n2` và cụm `k7-lab` của lab. Trước mỗi bước, `kubectl config current-context` phải in ra `k7-lab`.
+
+</Callout>
+
+### 1. Hai máy, mỗi máy một đĩa riêng, và cụm k3s
+
+Khác K4.1 ở hai chỗ. `--set '.additionalDisks=…'` gắn thêm đĩa vừa tạo, để nguyên chưa format. `--port-forward 9660:6443,static=true` đưa cổng API server của `k7-n1` ra `127.0.0.1:9660` trên Mac: chuyển tiếp cổng tĩnh vẫn chạy ở chế độ `--plain`, nhờ đó `kubectl` và `helm` chạy thẳng trên Mac.
+
+Script `k7-node.sh` làm ba việc trên mỗi máy, theo đúng danh sách ở phần Kiến thức: cài thứ Longhorn cần, format và mount đĩa riêng vào `/var/lib/longhorn` (đường dẫn mặc định của Longhorn, ghi vào `/etc/fstab` để sống qua khởi động lại), rồi cài k3s. Script cài của k3s được lấy từ đúng tag và so sha256 trước khi chạy bằng root; chính nó lại kiểm sha256 của binary nó tải về. Giá trị sha256 dùng chung cho arm64 và amd64 vì đó là một file script; bài chỉ chạy trên arm64.
+
+<Terminal where="mac" title="~/masteva-k7s/k7-2/k7-node.sh">
+
+```bash
+limactl --version
+mkdir -p ~/masteva-k7s/k7-2 && cd ~/masteva-k7s/k7-2
+limactl disk create k7-n1-lh --size 8GiB --format raw > lima.log 2>&1
+limactl disk create k7-n2-lh --size 8GiB --format raw >> lima.log 2>&1
+limactl start --name k7-n1 --cpus 2 --memory 2 --disk 20 --plain --network lima:user-v2 \
+  --port-forward 9660:6443,static=true \
+  --set '.additionalDisks=[{"name":"k7-n1-lh","format":false}]' \
+  --tty=false template:ubuntu-26.04 >> lima.log 2>&1
+limactl start --name k7-n2 --cpus 2 --memory 2 --disk 20 --plain --network lima:user-v2 \
+  --set '.additionalDisks=[{"name":"k7-n2-lh","format":false}]' \
+  --tty=false template:ubuntu-26.04 >> lima.log 2>&1
+limactl shell k7-n1 lsblk -d -o NAME,SIZE,TYPE
+limactl shell k7-n1 ping -c 1 lima-k7-n2.internal | sed -n 2p
+cat > k7-node.sh <<'EOF'
+#!/usr/bin/env bash
+# k7-node.sh server | k7-node.sh agent <IP server> <token>   (chạy bằng root)
+set -euo pipefail
+ROLE=${1:?thiếu vai: server hoặc agent}
+K3S_VERSION=v1.36.5+k3s1
+INSTALL_SHA256=46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUPPRESS=1
+
+# 1. Thứ Longhorn cần trên MỖI node: iscsiadm và iscsid (đường dữ liệu V1), NFS client (volume RWX)
+apt-get update -qq
+apt-get install -y -qq open-iscsi nfs-common > /dev/null
+echo iscsi_tcp > /etc/modules-load.d/longhorn.conf
+modprobe iscsi_tcp
+systemctl enable --now iscsid > /dev/null 2>&1
+# 2. Đĩa riêng cho Longhorn: format ext4, mount cố định vào đường dẫn mặc định của Longhorn
+if ! findmnt /var/lib/longhorn > /dev/null; then
+  mkfs.ext4 -q -L longhorn /dev/vdb
+  mkdir -p /var/lib/longhorn
+  echo 'LABEL=longhorn /var/lib/longhorn ext4 defaults 0 2' >> /etc/fstab
+  mount /var/lib/longhorn
+fi
+# 3. k3s: script cài lấy từ đúng tag, so sha256 trước khi chạy
+curl -fsSL "https://raw.githubusercontent.com/k3s-io/k3s/${K3S_VERSION/+/%2B}/install.sh" -o /tmp/k3s-install.sh
+echo "$INSTALL_SHA256  /tmp/k3s-install.sh" | sha256sum -c - > /dev/null \
+  || { echo "sha256 của install.sh không khớp. Dừng." >&2; exit 1; }
+NAME=$(hostname | sed 's/^lima-//')
+IP=$(hostname -I | awk '{print $1}')
+if [ "$ROLE" = server ]; then
+  INSTALL_K3S_VERSION=$K3S_VERSION sh /tmp/k3s-install.sh server --node-name "$NAME" --node-ip "$IP" \
+    --disable traefik --disable servicelb --disable metrics-server > /dev/null
+else
+  INSTALL_K3S_VERSION=$K3S_VERSION K3S_URL="https://${2:?thiếu IP server}:6443" K3S_TOKEN=${3:?thiếu token} \
+    sh /tmp/k3s-install.sh agent --node-name "$NAME" --node-ip "$IP" > /dev/null
+fi
+echo "$NAME: $(k3s --version | head -1), open-iscsi $(dpkg-query -W -f='${Version}' open-iscsi), $(findmnt -no SOURCE,SIZE /var/lib/longhorn)"
+EOF
+limactl shell k7-n1 sudo bash -s server < k7-node.sh 2>&1 | tail -1
+N1=$(limactl shell k7-n1 hostname -I | awk '{print $1}')
+TOKEN=$(limactl shell k7-n1 sudo cat /var/lib/rancher/k3s/server/node-token)
+limactl shell k7-n2 sudo bash -s agent $N1 $TOKEN < k7-node.sh 2>&1 | tail -1
+limactl shell k7-n1 sudo cat /etc/rancher/k3s/k3s.yaml | sed 's/127.0.0.1:6443/127.0.0.1:9660/' > kubeconfig
+chmod 600 kubeconfig
+export KUBECONFIG=~/masteva-k7s/k7-2/kubeconfig
+kubectl config rename-context default k7-lab > /dev/null
+kubectl wait --for=condition=Ready node --all --timeout=120s > /dev/null
+kubectl get nodes
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+limactl version 2.2.0
+NAME  SIZE TYPE
+vda    20G disk
+vdb     8G disk
+vdc   176K disk
+64 bytes from 192.168.104.7: icmp_seq=1 ttl=64 time=0.271 ms
+k7-n1: k3s version v1.36.5+k3s1 (3dd98cc5), open-iscsi 2.1.11-3ubuntu3.1, /dev/vdb  7.8G
+k7-n2: k3s version v1.36.5+k3s1 (3dd98cc5), open-iscsi 2.1.11-3ubuntu3.1, /dev/vdb  7.8G
+NAME    STATUS   ROLES           AGE   VERSION
+k7-n1   Ready    control-plane   57s   v1.36.5+k3s1
+k7-n2   Ready    <none>          3s    v1.36.5+k3s1
+```
+
+</Expected>
+
+`vdb` là đĩa 8 GiB còn trống (`vdc` là đĩa cấu hình của Lima); địa chỉ trên máy bạn có thể khác, và lệnh `limactl` nào lỗi thì đọc `lima.log`. Kubeconfig nằm trong thư mục lab và trỏ vào cổng 9660. **Mọi terminal dùng cho bài này phải chạy `export KUBECONFIG=~/masteva-k7s/k7-2/kubeconfig` trước, và cả bài làm trong một terminal**, vì các bước sau dùng biến và hàm khai ở bước trước.
+
+### 2. Cài Longhorn bằng Helm
+
+Chart mặc định dành cho cụm từ ba node: ba bản cho mỗi sidecar CSI và cho global manager. File values dưới thu gọn cho hai node 2 GiB nhưng giữ **hai bản** cho `csi-attacher` và global manager, mỗi node một bản: hai thành phần này phải còn sống khi một node chết thì volume mới chuyển được sang node kia (bước 5). `defaultClass: false` để Longhorn không tranh vai StorageClass mặc định với `local-path` có sẵn của k3s.
+
+Chart được tải về, so sha256 với giá trị ghi trong index của kho chart chính thức `https://charts.longhorn.io`, rồi cài từ file; `helm repo add` như K3.1 cho cùng kết quả. Ba hàm `disks`, `vol`, `replicas` in sổ sách đĩa, trạng thái volume và các replica; các bước sau gọi lại.
+
+<Terminal where="mac" title="~/masteva-k7s/k7-2/longhorn-values.yaml">
+
+```bash
+cat > longhorn-values.yaml <<'EOF'
+# Thu gọn cho cụm lab 2 node x 2 GiB. Production để mặc định: 3 bản mỗi thành phần.
+csi: { attacherReplicaCount: 2, provisionerReplicaCount: 1, resizerReplicaCount: 1, snapshotterReplicaCount: 1 }
+longhornUI: { replicas: 1 }
+longhornGlobalManager: { replicas: 2 }
+persistence: { defaultClass: false, defaultClassReplicaCount: 2 }
+EOF
+curl -sLO https://github.com/longhorn/charts/releases/download/longhorn-1.13.0/longhorn-1.13.0.tgz
+echo "e57f010d2a8bcf0da5b8b03ffecf49c5bc35ddc2663588ce8f22b7567b6133ed  longhorn-1.13.0.tgz" | shasum -a 256 -c - \
+  && helm install longhorn ./longhorn-1.13.0.tgz --namespace longhorn-system --create-namespace \
+       -f longhorn-values.yaml --wait --timeout 15m 2>&1 | grep -E '^STATUS|Error'
+until kubectl -n longhorn-system get ds longhorn-csi-plugin > /dev/null 2>&1; do sleep 2; done
+kubectl -n longhorn-system rollout status ds/longhorn-csi-plugin --timeout=600s | tail -1
+until [ "$(kubectl -n longhorn-system get deploy csi-attacher -o jsonpath='{.status.readyReplicas}')" = 2 ]; do sleep 2; done
+kubectl -n longhorn-system get pods --no-headers -o custom-columns='POD:.metadata.name,NODE:.spec.nodeName' \
+  | sed -E 's/-[a-z0-9]{8,10}-[a-z0-9]{5} / /; s/-[a-z0-9]{5} / /; s/(instance-manager)-[a-z0-9]+/\1/' \
+  | sort | awk '{a[$1] = a[$1] " " $2} END {for (k in a) print k ":" a[k]}' | sort
+disks() { kubectl -n longhorn-system get nodes.longhorn.io -o json | jq -r '.items[] | .metadata.name as $n | (.spec.disks[] | .storageReserved) as $r | .status.diskStatus[] | "\($n): maximum \(.storageMaximum/1048576|floor) MiB, reserved \($r/1048576|floor), scheduled \(.storageScheduled/1048576|floor), available \(.storageAvailable/1048576|floor)"'; }
+vol() { kubectl -n longhorn-system get volumes.longhorn.io -o custom-columns='STATE:.status.state,ROBUSTNESS:.status.robustness,SIZE:.spec.size,NODE:.status.currentNodeID'; }
+replicas() { kubectl -n longhorn-system get replicas.longhorn.io -o json | jq -r '.items[] | "\(.metadata.name | sub(".*-r-"; "r-"))  \(.spec.nodeID)  failedAt=\(.spec.failedAt)"'; }
+disks
+kubectl -n longhorn-system get settings.longhorn.io node-down-pod-deletion-policy storage-over-provisioning-percentage \
+  replica-replenishment-wait-interval -o custom-columns='SETTING:.metadata.name,VALUE:.value'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+longhorn-1.13.0.tgz: OK
+STATUS: deployed
+daemon set "longhorn-csi-plugin" successfully rolled out
+csi-attacher: k7-n1 k7-n2
+csi-provisioner: k7-n1
+…
+instance-manager: k7-n1 k7-n2
+longhorn-global-manager: k7-n1 k7-n2
+longhorn-manager: k7-n1 k7-n2
+k7-n1: maximum 7963 MiB, reserved 2389, scheduled 0, available 7900
+k7-n2: maximum 7963 MiB, reserved 2389, scheduled 0, available 7900
+SETTING                                VALUE
+node-down-pod-deletion-policy          do-nothing
+storage-over-provisioning-percentage   100
+replica-replenishment-wait-interval    600
+```
+
+</Expected>
+
+Lần đầu mất ba tới năm phút, phần lớn là kéo image. Các lệnh `sed`, `awk` chỉ cắt hậu tố ngẫu nhiên của tên pod và gom theo thành phần; output ở trên đã lược bớt (đủ là 11 dòng). Đối chiếu với bảng ở phần Kiến thức: mỗi node có `longhorn-manager`, `instance-manager`, `longhorn-csi-plugin` và `engine-image`; `csi-attacher` và `longhorn-global-manager` mỗi node một bản; các pod một bản nằm ở node nào tuỳ scheduler. Longhorn tự nhận `/var/lib/longhorn` làm đĩa mặc định của mỗi node và giữ lại 30%. Theo công thức ở phần Kiến thức, mỗi đĩa nhận được tổng cộng 7963 − 2389 = 5574 MiB replica danh nghĩa. Node, đĩa, volume và cả setting của Longhorn đều là object đọc và sửa được bằng `kubectl`; Longhorn cũng có giao diện web (Service `longhorn-frontend`), bài không dùng.
+
+<Check id="k7.2.lab-cai-dat">Chuẩn bị được node cho Longhorn bằng script, cài Longhorn bằng Helm với values thu gọn, chỉ ra được pod nào là thành phần nào, và đọc được sổ sách đĩa của từng node.</Check>
+
+### 3. Một volume hai replica, và đường dữ liệu của nó
+
+Tài liệu Longhorn khuyên không sửa StorageClass `longhorn` có sẵn mà tạo class riêng. `lh-2` khai hai replica; khối lệnh tạo PVC, xem trạng thái lúc chưa ai dùng, rồi mới chạy ứng dụng.
+
+Ứng dụng là một Deployment ghi mỗi 0,2 giây một dòng thời gian (giây Unix) vào `/data/ticks` rồi `sync`. Khoảng trống giữa hai dòng liên tiếp là thời gian nó không ghi được; hàm `gap` tìm khoảng dài nhất kể từ dòng thứ N, hàm `healthy` chờ volume đủ replica. Hai `tolerations` rút thời gian Kubernetes chờ trước khi đuổi pod khỏi node chết từ 300 giây (K5.1) xuống 30 giây, để bước 5 không phải đợi năm phút. `kubectl cordon` (K5.2) ép pod vào `k7-n1`.
+
+<Terminal where="mac" title="~/masteva-k7s/k7-2/volume.yaml, app.yaml">
+
+```bash
+kubectl create namespace k7
+kubectl config set-context --current --namespace k7 > /dev/null
+cat > volume.yaml <<'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: lh-2 }
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters: { numberOfReplicas: "2", fsType: ext4 }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: data }
+spec:
+  storageClassName: lh-2
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 1Gi } }
+EOF
+kubectl apply -f volume.yaml > /dev/null
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/data --timeout=120s > /dev/null
+vol
+kubectl -n longhorn-system get replicas.longhorn.io -o custom-columns='REPLICA-NODE:.spec.nodeID,STATE:.status.currentState'
+echo "nodeAffinity của PV: [$(kubectl get pv -o jsonpath='{.items[0].spec.nodeAffinity}')]"
+cat > app.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: app }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: app } }
+  template:
+    metadata: { labels: { app: app } }
+    spec:
+      terminationGracePeriodSeconds: 5
+      tolerations:
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 30 }
+        - { key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 30 }
+      containers:
+        - name: app
+          image: busybox:1.38.0
+          command: ["sh", "-c", "while true; do date +%s >> /data/ticks; sync; sleep 0.2; done"]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: data } }
+EOF
+gap() { kubectl exec deploy/app -- awk -v n=$1 'NR>=n && p && $1-p>m {m=$1-p} NR>=n {p=$1} END {print "ngừng ghi dài nhất: " m+0 " giây"}' /data/ticks; }
+healthy() { until [ "$(kubectl -n longhorn-system get volumes.longhorn.io -o jsonpath='{.items[0].status.robustness}')" = healthy ]; do sleep 2; done; }
+kubectl cordon k7-n2 > /dev/null
+kubectl apply -f app.yaml > /dev/null
+kubectl rollout status deploy/app --timeout=300s | tail -1
+kubectl uncordon k7-n2 > /dev/null
+healthy
+vol
+kubectl -n longhorn-system get engines.longhorn.io -o custom-columns='ENGINE-NODE:.spec.nodeID,STATE:.status.currentState'
+limactl shell k7-n1 lsblk -o NAME,SIZE,TYPE,TRAN | grep -E 'NAME|iscsi'
+limactl shell k7-n1 sudo iscsiadm -m session | cut -d' ' -f1-3
+kubectl -n longhorn-system get pods -l longhorn.io/component=instance-manager -o custom-columns='INSTANCE-MANAGER-NODE:.spec.nodeName,IP:.status.podIP'
+limactl shell k7-n1 sudo sh -c 'ls -s --block-size=M /var/lib/longhorn/replicas/*/ | grep img$'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k7 created
+STATE      ROBUSTNESS   SIZE         NODE
+detached   unknown      1073741824
+REPLICA-NODE   STATE
+k7-n1          stopped
+k7-n2          stopped
+nodeAffinity của PV: []
+deployment "app" successfully rolled out
+STATE      ROBUSTNESS   SIZE         NODE
+attached   healthy      1073741824   k7-n1
+ENGINE-NODE   STATE
+k7-n1         running
+NAME     SIZE TYPE TRAN
+sda        1G disk iscsi
+tcp: [1] 10.42.0.8:3260,1
+INSTANCE-MANAGER-NODE   IP
+k7-n1                   10.42.0.8
+k7-n2                   10.42.1.7
+40 volume-head-000.img
+```
+
+</Expected>
+
+Đối chiếu với sơ đồ đầu bài, từ trên xuống:
+
+- Trước khi có pod: PVC `Bound` ngay, phía Longhorn có một object `Volume` và hai `Replica`, mỗi node một cái, nhưng chưa gì chạy (`detached`, `stopped`). PV không có `nodeAffinity`.
+- Có pod: volume `attached` ở `k7-n1`, nơi pod chạy, và engine cũng ở đó.
+- Node `k7-n1` có thêm đĩa `sda` 1 GiB với `TRAN` là `iscsi`. Phiên iSCSI nối tới cổng 3260 của **pod instance-manager trên chính node đó**: đầu phát iSCSI (`tgtd`) nằm trong pod, đầu nhận là kernel của node.
+- File `volume-head-000.img` của replica có kích thước danh nghĩa 1 GiB nhưng mới chiếm 40 MiB trên đĩa (cột đầu, tính bằng MiB; 40 tới 48 qua các lượt): file thưa.
+
+<Check id="k7.2.lab-volume">Tạo được StorageClass và volume hai replica, chỉ ra được object Volume, Engine, Replica của Longhorn, đĩa iSCSI trên node có pod, phiên iSCSI tới instance-manager, và file của replica trên đĩa.</Check>
+
+### 4. Tắt nguồn đột ngột node chỉ giữ một replica
+
+Ghi 300 MiB để replica có dữ liệu đáng kể, ghi lại sha256 của nó, rồi tắt nguồn đột ngột `k7-n2`. **`limactl stop --force` cắt máy ảo như rút điện, không tiến trình nào kịp dọn dẹp: chỉ dùng với VM của lab, và gõ đúng tên `k7-n2`.**
+
+<Predict question="Volume có hai replica, node giữ một replica biến mất đột ngột. Ứng dụng ở node kia có nhận lỗi ghi không, và ngừng ghi bao lâu?">
+
+Không có lỗi nào, nhưng nó đứng yên chừng tám tới chín giây. Engine gửi mỗi lệnh ghi tới cả hai replica và chờ cả hai. Replica ở node chết không trả lời, cũng không báo lỗi, nên engine chờ hết `engine-replica-timeout` (8 giây) rồi mới loại nó và ghi tiếp trên bản còn lại. Trường hợp xấu chính là máy biến mất không một lời: một replica chết "sạch", kết nối TCP được đóng hẳn hoi, thì engine biết ngay.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl exec deploy/app -- dd if=/dev/urandom of=/data/blob bs=1M count=300 conv=fsync 2>&1 | tail -1
+kubectl exec deploy/app -- sha256sum /data/blob > blob.sha256
+N=$(kubectl exec deploy/app -- sh -c 'wc -l < /data/ticks')
+T0=$(date +%s)
+limactl stop --force k7-n2 >> lima.log 2>&1
+until [ "$(kubectl -n longhorn-system get volumes.longhorn.io -o jsonpath='{.items[0].status.robustness}')" = degraded ]; do sleep 2; done
+echo "Longhorn báo degraded sau $(( $(date +%s) - T0 )) giây"
+vol
+replicas
+gap $N
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+314572800 bytes (300.0MB) copied, 1.853519 seconds, 161.9MB/s
+Longhorn báo degraded sau 54 giây
+STATE      ROBUSTNESS   SIZE         NODE
+attached   degraded     1073741824   k7-n1
+r-325ee843  k7-n1  failedAt=
+r-d0de0108  k7-n2  failedAt=2026-10-13T09:26:14Z
+ngừng ghi dài nhất: 8 giây
+```
+
+</Expected>
+
+Hai con số, hai tầng khác nhau. **Ứng dụng** ngừng ghi 8 giây ở lượt này, 9 giây ở ba lượt khác (đồng hồ của phép đo chỉ chính xác tới giây), ngay sau khi node mất: đó là engine tự xử lý trên đường dữ liệu, không hỏi ai. **Sổ sách** của Longhorn chậm hơn nhiều: object Volume chuyển sang `degraded` sau 54 giây ở lượt này, 35 và 63 giây ở các lượt khác. Cảnh báo dựa trên `robustness` vì vậy đến sau sự cố nửa phút tới một phút; nó cho biết bạn đang chạy thiếu bản sao, không cho biết lúc nào ứng dụng khựng. Mã và giờ của replica trên máy bạn sẽ khác. Volume `degraded` vẫn đọc ghi bình thường, trên **một** bản duy nhất: mất nốt node còn lại lúc này là mất dữ liệu. Giờ bật lại máy.
+
+<Terminal where="mac">
+
+```bash
+T0=$(date +%s)
+limactl start k7-n2 >> lima.log 2>&1
+healthy
+echo "healthy sau $(( $(date +%s) - T0 )) giây kể từ lúc bật máy"
+replicas
+limactl shell k7-n2 sudo sh -c 'ls -s --block-size=M /var/lib/longhorn/replicas/*/ | grep img$' | sed -E 's/snap-[0-9a-f-]+/snap-…/'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+healthy sau 64 giây kể từ lúc bật máy
+r-325ee843  k7-n1  failedAt=
+r-d0de0108  k7-n2  failedAt=
+  0 volume-head-001.img
+348 volume-snap-….img
+```
+
+</Expected>
+
+Khoảng một phút sau khi máy bật, volume `healthy` lại; phần lớn thời gian đó là máy khởi động và k3s đưa pod instance-manager lên, phần chép dữ liệu chỉ vài giây. Hai điều đáng nhìn:
+
+- Replica ở `k7-n2` **giữ nguyên tên** `r-d0de0108`. Node quay lại trong hạn 600 giây của `replica-replenishment-wait-interval`, nên Longhorn dùng lại dữ liệu cũ và chỉ chép phần đã đổi. Đây chính là "nối lại với replica cũ" trong callout về EBS.
+- Thư mục replica có thêm một `volume-snap-…`: snapshot hệ thống Longhorn tự chụp trước khi rebuild. Nó sẽ được gộp đi sau; cho tới lúc đó nó chiếm chỗ thật.
+
+Con số một phút này không đại diện cho production. Rebuild từ đầu (node mất hẳn, hoặc về sau hạn 600 giây) là chép toàn bộ dữ liệu đã dùng qua mạng: 500 GiB trên mạng 1 Gb/s (khoảng 110 MiB mỗi giây) mất hơn một giờ, và suốt giờ đó volume chỉ có một bản.
+
+<Check id="k7.2.lab-degraded-rebuild">Tắt nguồn đột ngột được node giữ một replica, đo được thời gian ứng dụng ngừng ghi và thời điểm Longhorn báo degraded, giải thích được vì sao hai con số khác nhau, và chỉ ra được replica cũ được dùng lại khi node về.</Check>
+
+### 5. Node chạy pod chết
+
+Chuyển pod sang `k7-n2` rồi tắt nguồn đột ngột node đó. Lần này node chết mang theo cả engine. **Khối dưới lại chạy `limactl stop --force k7-n2`: gõ đúng tên VM của lab.**
+
+<Terminal where="mac">
+
+```bash
+kubectl cordon k7-n1 > /dev/null
+kubectl rollout restart deploy/app > /dev/null
+kubectl rollout status deploy/app --timeout=300s | tail -1
+kubectl uncordon k7-n1 > /dev/null
+healthy
+vol
+N=$(kubectl exec deploy/app -- sh -c 'wc -l < /data/ticks')
+T0=$(date +%s)
+limactl stop --force k7-n2 >> lima.log 2>&1
+until kubectl get pods -l app=app --field-selector spec.nodeName=k7-n1 -o name | grep -q .; do sleep 2; done
+NEW=$(kubectl get pods -l app=app --field-selector spec.nodeName=k7-n1 -o jsonpath='{.items[0].metadata.name}')
+until kubectl get events --field-selector involvedObject.name=$NEW,reason=FailedAttachVolume -o name | grep -q .; do sleep 2; done
+echo "pod thay thế kẹt sau $(( $(date +%s) - T0 )) giây"
+kubectl get pods -o custom-columns='POD:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,DELETING-SINCE:.metadata.deletionTimestamp'
+kubectl get events --field-selector involvedObject.name=$NEW,reason=FailedAttachVolume -o jsonpath='{.items[0].message}{"\n"}' | sed 's/pvc-[0-9a-f-]*/pvc-…/'
+kubectl get volumeattachment -o custom-columns='ATTACHED-TO:.spec.nodeName,ATTACHED:.status.attached'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "app" successfully rolled out
+STATE      ROBUSTNESS   SIZE         NODE
+attached   healthy      1073741824   k7-n2
+pod thay thế kẹt sau 85 giây
+POD                    NODE    PHASE     DELETING-SINCE
+app-6bdc88596c-hlctr   k7-n2   Running   2026-10-13T09:29:13Z
+app-6bdc88596c-nnsm8   k7-n1   Pending   <none>
+Waiting for detach for volume "pvc-…" Volume is already used by pod(s) app-6bdc88596c-hlctr
+ATTACHED-TO   ATTACHED
+k7-n2         true
+```
+
+</Expected>
+
+Dòng `vol` đầu tiên là điều sơ đồ đã nói: pod sang `k7-n2` thì volume và engine sang theo, không cần chép gì vì ở đó có sẵn một replica. Sau khi node chết: khoảng 50 giây thì node `NotReady`, thêm 30 giây toleration thì pod cũ bị đánh dấu xoá và pod mới ra đời ở `k7-n1` (kẹt sau 75 tới 85 giây qua các lượt; hai dòng pod có thể in theo thứ tự ngược lại). Rồi mọi thứ dừng. Thông báo `Waiting for detach…` là cách Kubernetes từ 1.36 diễn đạt; tới 1.35, cùng event này mở đầu bằng `Multi-Attach error`, cái tên K7.1 dùng. Pod cũ vẫn hiện `Running` kèm một thời điểm xoá: không còn kubelet nào để xác nhận nó đã dừng. VolumeAttachment vẫn nói volume đang gắn ở `k7-n2`. Dữ liệu thì nằm ngay trên `k7-n1`, trong replica còn lại, nhưng không ai được phép dùng. Khi soạn bài, để nguyên trạng thái này mười phút, pod vẫn kẹt.
+
+Giờ cho phép Longhorn xử lý pod của Deployment trên node chết.
+
+<Terminal where="mac">
+
+```bash
+T1=$(date +%s)
+kubectl -n longhorn-system patch settings.longhorn.io node-down-pod-deletion-policy --type merge -p '{"value":"delete-deployment-pod"}'
+kubectl wait --for=condition=Ready pod/$NEW --timeout=600s > /dev/null
+echo "pod mới chạy sau $(( $(date +%s) - T1 )) giây kể từ lúc đổi chính sách, $(( $(date +%s) - T0 )) giây kể từ lúc node chết"
+kubectl -n longhorn-system get volumes.longhorn.io -o custom-columns='STATE:.status.state,NODE:.status.currentNodeID'
+kubectl exec deploy/app -- sha256sum /data/blob | diff - blob.sha256 && echo "blob còn nguyên"
+gap $N
+until [ "$(kubectl get pods -l app=app -o name | wc -l | tr -d ' ')" = 1 ]; do sleep 2; done
+kubectl get pods -o custom-columns='POD:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase'
+for p in $(kubectl -n longhorn-system get pods -l app=longhorn-global-manager -o name); do
+  kubectl -n longhorn-system logs $p --since=10m 2> /dev/null
+done | grep -oE '(deleted volume attachment|Forcefully deleted pod)' | sort -u
+limactl start k7-n2 >> lima.log 2>&1
+healthy
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+setting.longhorn.io/node-down-pod-deletion-policy patched
+pod mới chạy sau 67 giây kể từ lúc đổi chính sách, 152 giây kể từ lúc node chết
+STATE      NODE
+attached   k7-n1
+blob còn nguyên
+ngừng ghi dài nhất: 152 giây
+POD                    NODE    PHASE
+app-6bdc88596c-nnsm8   k7-n1   Running
+Forcefully deleted pod
+deleted volume attachment
+```
+
+</Expected>
+
+Log của global manager kể đúng hai việc: xoá VolumeAttachment của pod trên node chết, rồi (khoảng nửa phút sau) xoá cưỡng bức pod đó; vòng `until` chờ tới khi pod cũ biến mất. Volume được gắn vào `k7-n1` với replica còn lại, và ứng dụng thấy lại đủ dữ liệu. Từ lúc đổi chính sách tới lúc pod chạy là 67 giây ở lượt này, 40 và 75 giây ở các lượt khác; tổng thời gian ngừng ghi hai tới hai phút rưỡi, trong đó có phần bạn đứng nhìn. Đặt chính sách từ trước thì chuỗi này tự chạy. Setting này giữ nguyên tới hết bài.
+
+Lý do values ở bước 2 giữ hai bản `csi-attacher` và global manager nằm ở đây. Lượt thử đầu khi soạn bài chỉ để một bản mỗi thứ, và cả hai tình cờ nằm trên node bị tắt: Longhorn không làm gì cho tới khi Kubernetes dựng lại chúng ở node kia, hơn năm phút sau. Thu gọn control plane của hệ lưu trữ xuống một bản là biến nó thành điểm lỗi đơn.
+
+<Check id="k7.2.lab-node-pod-chet">Tái hiện được pod thay thế kẹt vì volume RWO còn gắn với node chết, đọc được lý do từ event và VolumeAttachment, gỡ được bằng `node-down-pod-deletion-policy`, và kiểm được dữ liệu còn nguyên sau khi chuyển node.</Check>
+
+### 6. Snapshot, backup, và mất volume
+
+Cần ba thứ. CRD snapshot cùng snapshot-controller là phần dùng chung của cụm (K7.1), k3s không kèm sẵn; bản 8.6.0 khớp với sidecar `csi-snapshotter` của Longhorn 1.13. Kế đến là một kho S3: lab dùng RustFS như K7.4, ở đây chỉ là **một pod giữ dữ liệu trong đĩa tạm của nó**, đủ cho một buổi lab. Cuối cùng là **backup target** của Longhorn trỏ vào bucket đó. Production đặt kho backup ở một dịch vụ S3 **ngoài cụm**, và không gõ khoá truy cập trên dòng lệnh.
+
+<Terminal where="mac">
+
+```bash
+SNAP=https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0
+for f in volumesnapshotclasses volumesnapshotcontents volumesnapshots; do
+  kubectl apply -f $SNAP/client/config/crd/snapshot.storage.k8s.io_$f.yaml > /dev/null
+done
+kubectl apply -f $SNAP/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml > /dev/null
+curl -sL $SNAP/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml \
+  | sed 's/snapshot-controller:v8.5.0/snapshot-controller:v8.6.0/' | kubectl apply -f - > /dev/null
+kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=300s | tail -1
+kubectl run rustfs --image=rustfs/rustfs:1.0.1 --port=9000 --expose \
+  --env=RUSTFS_ACCESS_KEY=masteva --env=RUSTFS_SECRET_KEY=masteva-secret > /dev/null
+kubectl wait --for=condition=Ready pod/rustfs --timeout=300s > /dev/null
+S3=$(kubectl get svc rustfs -o jsonpath='{.spec.clusterIP}')
+limactl shell k7-n1 curl -s -o /dev/null -w 'tạo bucket: HTTP %{http_code}\n' --retry 5 --retry-connrefused \
+  --aws-sigv4 "aws:amz:us-east-1:s3" --user masteva:masteva-secret -X PUT http://$S3:9000/longhorn-backup
+kubectl -n longhorn-system create secret generic s3-backup --from-literal=AWS_ACCESS_KEY_ID=masteva \
+  --from-literal=AWS_SECRET_ACCESS_KEY=masteva-secret --from-literal=AWS_ENDPOINTS=http://rustfs.k7.svc:9000 > /dev/null
+kubectl -n longhorn-system patch backuptargets.longhorn.io default --type merge \
+  -p '{"spec":{"backupTargetURL":"s3://longhorn-backup@us-east-1/","credentialSecret":"s3-backup"}}' > /dev/null
+until [ "$(kubectl -n longhorn-system get backuptargets.longhorn.io default -o jsonpath='{.status.available}')" = true ]; do sleep 2; done
+kubectl -n longhorn-system get backuptargets.longhorn.io -o custom-columns='NAME:.metadata.name,URL:.spec.backupTargetURL,AVAILABLE:.status.available'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "snapshot-controller" successfully rolled out
+tạo bucket: HTTP 200
+NAME      URL                               AVAILABLE
+default   s3://longhorn-backup@us-east-1/   true
+```
+
+</Expected>
+
+Bucket được tạo bằng một lời gọi `PUT` ký theo chuẩn SigV4 của S3, gửi bằng `curl` từ node (node tới được ClusterIP của Service). Backup target là một object `BackupTarget`; Secret của nó dùng tên biến của AWS, và `AWS_ENDPOINTS` là thứ trỏ Longhorn sang một S3 không phải của AWS. Giờ ghi ba "đơn hàng" rồi chụp **cả hai loại** cùng lúc.
+
+<Terminal where="mac" title="~/masteva-k7s/k7-2/snap.yaml">
+
+```bash
+cat > snap.yaml <<'EOF'
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata: { name: lh-snap }
+driver: driver.longhorn.io
+deletionPolicy: Delete
+parameters: { type: snap }
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata: { name: lh-backup }
+driver: driver.longhorn.io
+deletionPolicy: Delete
+parameters: { type: bak }
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata: { name: data-snap }
+spec: { volumeSnapshotClassName: lh-snap, source: { persistentVolumeClaimName: data } }
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata: { name: data-bak }
+spec: { volumeSnapshotClassName: lh-backup, source: { persistentVolumeClaimName: data } }
+EOF
+kubectl exec deploy/app -- sh -c 'for i in 1001 1002 1003; do echo "don $i" >> /data/orders.txt; done; sync'
+T0=$(date +%s)
+kubectl apply -f snap.yaml > /dev/null
+kubectl wait --for=jsonpath='{.status.readyToUse}'=true volumesnapshot/data-snap volumesnapshot/data-bak --timeout=600s > /dev/null
+echo "cả hai sẵn sàng sau $(( $(date +%s) - T0 )) giây"
+kubectl get volumesnapshotcontent -o custom-columns='SNAPSHOT:.spec.volumeSnapshotRef.name,HANDLE:.status.snapshotHandle' | sed -E 's/pvc-[0-9a-f-]*/pvc-…/; s/(backup|snapshot)-[0-9a-f-]+/\1-…/'
+echo "file snapshot trong replica trên k7-n1: $(limactl shell k7-n1 sudo sh -c 'ls /var/lib/longhorn/replicas/*/' | grep -c 'volume-snap-snapshot-.*img$')"
+kubectl exec rustfs -- du -sh /data/longhorn-backup/backupstore
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cả hai sẵn sàng sau 12 giây
+SNAPSHOT    HANDLE
+data-bak    bak://pvc-…/backup-…
+data-snap   snap://pvc-…/snapshot-…
+file snapshot trong replica trên k7-n1: 2
+304M	/data/longhorn-backup/backupstore
+```
+
+</Expected>
+
+Hai `HANDLE` nói hai thứ nằm ở đâu (hai dòng có thể in theo thứ tự ngược lại). `snap://` là một snapshot của volume: trong thư mục replica trên node có hai file `volume-snap-snapshot-…img`, một cho `data-snap`, một do `data-bak` tạo ra làm nguồn cho bản backup. `bak://` là bản backup: khoảng 300 MiB khối dữ liệu đã nằm trong bucket, ngoài Longhorn.
+
+Giờ là sự cố: ai đó xoá Deployment và PVC. StorageClass có `reclaimPolicy: Delete`, nên volume Longhorn bị xoá theo.
+
+<Predict question="Hai object VolumeSnapshot `data-snap` và `data-bak` vẫn còn và vẫn báo `READYTOUSE: true`. Tạo PVC mới từ mỗi cái: cái nào ra dữ liệu?">
+
+Chỉ `data-bak`. Snapshot loại `snap` sống trong các replica của volume; volume bị xoá thì các file `volume-snap-…` đi theo, và object VolumeSnapshot còn lại chỉ là cái vỏ trỏ vào hư không: Kubernetes không biết điều đó nên vẫn báo sẵn sàng. Bản backup nằm trong bucket, không liên quan gì tới số phận của volume.
+
+</Predict>
+
+**Hai lệnh `kubectl delete` đầu khối dưới xoá ứng dụng và toàn bộ dữ liệu của volume `data`. Dòng đầu tiên in ra phải là `k7-lab`.**
+
+<Terminal where="mac" title="~/masteva-k7s/k7-2/restore.yaml">
+
+```bash
+kubectl config current-context
+kubectl delete deploy app > /dev/null
+kubectl delete pvc data > /dev/null
+until [ -z "$(kubectl -n longhorn-system get volumes.longhorn.io -o name)" ]; do sleep 2; done
+echo "thư mục replica còn lại trên k7-n1: $(limactl shell k7-n1 sudo ls /var/lib/longhorn/replicas/ | wc -l | tr -d ' ')"
+kubectl get volumesnapshot -o custom-columns='NAME:.metadata.name,READYTOUSE:.status.readyToUse'
+cat > restore.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: data-tu-backup }
+spec:
+  storageClassName: lh-2
+  dataSource: { name: data-bak, kind: VolumeSnapshot, apiGroup: snapshot.storage.k8s.io }
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 1Gi } }
+EOF
+kubectl apply -f restore.yaml > /dev/null
+sed 's/data-tu-backup/data-tu-snap/; s/data-bak/data-snap/' restore.yaml | kubectl apply -f - > /dev/null
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/data-tu-backup --timeout=300s > /dev/null
+until kubectl get events --field-selector involvedObject.name=data-tu-snap,reason=ProvisioningFailed -o name | grep -q .; do sleep 2; done
+kubectl get pvc data-tu-snap data-tu-backup -o custom-columns='PVC:.metadata.name,STATUS:.status.phase'
+kubectl get events --field-selector involvedObject.name=data-tu-snap,reason=ProvisioningFailed -o jsonpath='{.items[0].message}{"\n"}' | grep -oE 'failed to verify data source: [^],]*' | sed 's/pvc-[0-9a-f-]*/pvc-…/'
+kubectl delete pvc data-tu-snap > /dev/null
+sed 's/claimName: data /claimName: data-tu-backup /' app.yaml | kubectl apply -f - > /dev/null
+kubectl rollout status deploy/app --timeout=600s | tail -1
+kubectl exec deploy/app -- cat /data/orders.txt
+kubectl exec deploy/app -- sha256sum /data/blob | diff - blob.sha256 && echo "blob còn nguyên"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k7-lab
+thư mục replica còn lại trên k7-n1: 0
+NAME        READYTOUSE
+data-bak    true
+data-snap   true
+PVC              STATUS
+data-tu-snap     Pending
+data-tu-backup   Bound
+failed to verify data source: volume.longhorn.io "pvc-…" not found
+deployment "app" successfully rolled out
+don 1001
+don 1002
+don 1003
+blob còn nguyên
+```
+
+</Expected>
+
+Thư mục replica trên node trống: volume, hai replica và mọi snapshot đã đi. `data-tu-snap` đứng ở `Pending` với lý do nói thẳng volume nguồn không còn. `data-tu-backup` là một volume **mới**, Longhorn kéo các khối từ bucket về cả hai replica, và ứng dụng thấy lại ba đơn hàng cùng file 300 MiB đúng từng byte. Khi volume gốc còn, tạo PVC từ `data-snap` chạy được như ở K7.1 (đã thử khi soạn bài): snapshot cứu bạn khỏi lỗi **bên trong** volume, backup cứu bạn khi mất **cả** volume. Thứ khôi phục được là trạng thái lúc backup. Mọi thứ ghi sau đó đã mất: đó là RPO của lịch backup bạn chọn.
+
+<Check id="k7.2.lab-backup-restore">Cấu hình được backup target S3 cho Longhorn, tạo được snapshot và backup qua VolumeSnapshot, chỉ ra được mỗi thứ nằm ở đâu, sau khi volume bị xoá thì khôi phục được dữ liệu từ backup thành volume mới, và nói được RPO của cách làm đó cùng lý do snapshot không thay được nó.</Check>
+
+### 7. Mở rộng volume, và PVC `Bound` mà không có chỗ
+
+Mở rộng trước. K7.1 đã dạy hai bước của việc này và gặp một driver chỉ đổi sổ sách; Longhorn nới đĩa thật, trong lúc volume đang dùng. Ngay sau đó, xin thêm một volume 8 GiB, trong khi mỗi đĩa chỉ còn hứa thêm được 5574 − 2048 = 3526 MiB. **Hai lệnh `kubectl delete` cuối khối xoá pod và PVC `big` vừa tạo.**
+
+<Terminal where="mac" title="~/masteva-k7s/k7-2/big.yaml">
+
+```bash
+kubectl exec deploy/app -- df -h /data | tail -1
+kubectl patch pvc data-tu-backup --type merge -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}' > /dev/null
+kubectl wait --for=jsonpath='{.status.capacity.storage}'=2Gi pvc/data-tu-backup --timeout=300s > /dev/null
+kubectl exec deploy/app -- df -h /data | tail -1
+limactl shell $(kubectl get pod -l app=app -o jsonpath='{.items[0].spec.nodeName}') lsblk -o NAME,SIZE,TRAN | grep iscsi
+disks
+cat > big.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: big }
+spec:
+  storageClassName: lh-2
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 8Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: big }
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: big
+      image: busybox:1.38.0
+      command: ["sleep", "infinity"]
+      volumeMounts: [{ name: v, mountPath: /v }]
+  volumes:
+    - { name: v, persistentVolumeClaim: { claimName: big } }
+EOF
+kubectl apply -f big.yaml > /dev/null
+until kubectl get events --field-selector involvedObject.name=big,reason=FailedAttachVolume -o name | grep -q .; do sleep 2; done
+kubectl get pvc big -o custom-columns='PVC:.metadata.name,STATUS:.status.phase,CAPACITY:.status.capacity.storage'
+kubectl get pod big -o custom-columns='POD:.metadata.name,PHASE:.status.phase'
+vol
+kubectl -n longhorn-system get volumes.longhorn.io -o json | jq -r '.items[] | select(.spec.size == "8589934592") | .status.conditions[] | select(.type == "Scheduled") | "Scheduled=\(.status): \(.message)"'
+kubectl delete pod big --now > /dev/null
+kubectl delete pvc big > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+                        973.4M    300.0M    657.4M  31% /data
+                          1.9G    300.0M      1.6G  15% /data
+sda        2G iscsi
+k7-n1: maximum 7963 MiB, reserved 2389, scheduled 2048, available 7500
+k7-n2: maximum 7963 MiB, reserved 2389, scheduled 2048, available 7500
+PVC   STATUS   CAPACITY
+big   Bound    8Gi
+POD   PHASE
+big   Pending
+STATE      ROBUSTNESS   SIZE         NODE
+detached   faulted      8589934592
+attached   healthy      2147483648   k7-n1
+Scheduled=False: precheck new replica failed: insufficient storage
+```
+
+</Expected>
+
+Phần mở rộng: `df` trong pod nhảy từ 973 MiB lên 1,9 GiB, đĩa iSCSI trên node thành 2 GiB, ứng dụng không khởi động lại. Lệnh `wait` mất khoảng một phút vì bước nới filesystem chờ lượt đồng bộ của kubelet, đúng như K7.1. Sổ sách ghi mỗi đĩa đã hứa 2048 MiB, trong khi chỗ thật mới dùng vài trăm MiB.
+
+Phần volume 8 GiB: PVC `Bound`, có PV, và Kubernetes coi như xong. Phía Longhorn, volume 8 GiB (dòng có `SIZE` 8589934592) `faulted`: không replica nào được xếp, và condition `Scheduled` nói lý do. Pod kẹt ở `ContainerCreating` với `FailedAttachVolume`. Với Longhorn, **PVC `Bound` không có nghĩa là có chỗ**; câu trả lời nằm ở object Volume.
+
+Cách "sửa" nhanh mà nhiều người chọn là tăng `storage-over-provisioning-percentage`; phần Đào sâu kể điều xảy ra khi làm vậy rồi ghi đầy thật. Ở đây khối lệnh chỉ bỏ volume vừa xin (hai lệnh `kubectl delete` cuối).
+
+<Check id="k7.2.lab-mo-rong-cho-trong">Mở rộng được một volume Longhorn đang dùng và thấy `df` đổi; tái hiện được PVC `Bound` mà volume không xếp được replica, đọc được lý do từ object Volume và tính lại được bằng sổ sách đĩa.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `kubectl` báo `connection refused` tới `127.0.0.1:9660` | VM `k7-n1` chưa chạy, hoặc terminal chưa `export KUBECONFIG` | `limactl list`; `echo $KUBECONFIG` |
+| Khối cài Longhorn in `longhorn-1.13.0.tgz: FAILED` rồi đứng yên | Mã băm không khớp nên `helm install` không chạy, và vòng `until` chờ một DaemonSet không bao giờ có | Ctrl+C; tải lại chart và so lại mã băm với index của `https://charts.longhorn.io` |
+| Pod `longhorn-manager` `CrashLoopBackOff`, log nhắc `iscsiadm` | Node thiếu `open-iscsi` | `limactl shell k7-n1 which iscsiadm`; chạy lại `k7-node.sh` |
+| PVC `Bound`, pod `FailedAttachVolume … not ready for workloads` | Longhorn không xếp được replica | `vol`; condition `Scheduled` của object Volume; `disks` |
+| Volume đứng mãi ở `degraded` dù node đã về | Node hoặc đĩa không nhận replica, hoặc hết chỗ theo sổ sách | `kubectl -n longhorn-system get nodes.longhorn.io`; `disks` |
+| `kubectl patch settings.longhorn.io` báo `failed calling webhook … context deadline exceeded` | Vừa mất một node, webhook của Longhorn còn trỏ vào pod trên node đó | Chờ node chuyển `NotReady` (chừng một phút) rồi chạy lại |
+| Backup target `AVAILABLE: false` | Sai `AWS_ENDPOINTS`, sai khoá, chưa tạo bucket | `kubectl -n longhorn-system get backuptargets.longhorn.io default -o jsonpath='{.status.conditions}'` |
+
+### Dọn dẹp
+
+K7.3 dùng VM khác, không dùng lại gì của bài này. Dừng hai VM là đủ để trả RAM (`limactl stop` và `start` chỉ nhận một tên mỗi lần). Bật lại bằng `limactl start k7-n1` rồi `limactl start k7-n2` đã được thử khi soạn bài: volume lên ở trạng thái `faulted` vì cả hai replica cùng tắt, Longhorn tự chọn lại replica dùng được (setting `auto-salvage`, event `AutoSalvaged`) và tạo lại pod, khoảng hai phút rưỡi sau volume `healthy` với đủ dữ liệu. Kho backup thì không sống sót: pod RustFS của lab giữ dữ liệu trong đĩa tạm của container, nên bucket mất và backup target báo `AVAILABLE: false`; thêm một lý do kho backup thật không nằm trong cụm.
+
+<Terminal where="mac" title="Dừng VM, giữ lại để xem tiếp">
+
+```bash
+limactl stop k7-n2
+limactl stop k7-n1
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Khối dưới xoá hẳn hai VM, hai đĩa phụ cùng mọi dữ liệu trên đó, và thư mục lab của bài. Gõ đúng tên: `limactl delete` không hỏi lại. Chỉ chạy khi không học lại bài này.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn lab của bài này">
+
+```bash
+limactl delete k7-n1 k7-n2
+limactl disk delete k7-n1-lh k7-n2-lh
+rm -rf ~/masteva-k7s/k7-2
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Bật `node-down-pod-deletion-policy` cho mọi cụm có phải là mặc định đúng không?">
+
+Nó đổi một sự cố chắc chắn (ứng dụng kẹt tới khi có người can thiệp) lấy một rủi ro hiếm hơn. Longhorn coi node là chết khi Kubernetes báo `NotReady`. Nếu node chỉ mất mạng tới control plane, pod cũ có thể vẫn đang chạy; Longhorn gắn volume sang node khác, và thứ pod cũ ghi thêm vào replica trên node của nó sẽ không có mặt trong volume mới. K7.1 đã nói đây là lý do Kubernetes chọn chờ; bài không thử tình huống mất mạng. Cách dùng hợp lý: bật cho workload mà ngừng lâu đắt hơn rủi ro đó, chọn `delete-deployment-pod` hay cả StatefulSet tuỳ loại workload, và nhớ ba điều lab đã cho thấy. Một: nó chỉ chạy sau khi pod bị đánh dấu xoá, tức sau `tolerationSeconds` (mặc định 5 phút). Hai: nó cần global manager và `csi-attacher` còn sống ở node khác. Ba: trong chừng một phút đầu sau khi node chết, chính việc đổi setting có thể thất bại vì webhook của Longhorn còn trỏ vào node đó (lượt thử đầu khi soạn bài gặp lỗi `failed calling webhook "validator.longhorn.io"`); chính sách phải được đặt **trước** sự cố.
+
+</Reveal>
+
+<Reveal title="Tăng over-provisioning lên 200% để volume 8 GiB ở bước 7 chạy được, rồi ghi đầy nó. Chuyện gì xảy ra?">
+
+Đã làm đúng như vậy khi soạn bài, trên chính cụm lab. Với 200%, volume `big` được xếp replica và pod chạy; sổ sách ghi mỗi đĩa 7.963 MiB đã hứa 10.240 MiB. Ghi tới khoảng 7,4 tới 7,8 GiB (tuỳ lượt) thì `dd` dừng với `Input/output error`, và `df` trên **cả hai** node báo đĩa Longhorn 100%: hai node có đĩa giống nhau, giữ replica giống nhau, nên đầy cùng lúc và nhân bản không cứu được gì. Nạn nhân thứ hai là volume 2 GiB của ứng dụng, mới dùng 400 MiB: replica của nó nằm chung filesystem, không xin thêm được khối nào, lệnh ghi kế tiếp nhận lỗi I/O và ext4 trong volume tự chuyển sang chỉ đọc (`touch` báo `Read-only file system`). Trong lúc đó mọi pod vẫn `Running`, và `robustness` không phản ánh chuyện này: `big` vẫn `healthy` dù filesystem của nó đã chỉ đọc; volume của ứng dụng có lượt vẫn `healthy`, có lượt thành `degraded` vì một replica bị loại khi ghi lỗi (event `Detected replica … in error`). Xoá `big` trả lại chỗ ngay, nhưng volume của ứng dụng **vẫn** chỉ đọc cho tới khi pod được khởi động lại để mount lại; dữ liệu cũ còn nguyên, và ứng dụng ngừng ghi 93 giây ở lượt đó, bằng đúng thời gian có người nhận ra và xử lý. Thí nghiệm này chỉ an toàn vì Longhorn nằm trên đĩa riêng: trên đĩa hệ điều hành, nó làm sập cả node. Tài liệu Longhorn khuyên để 100% khi dùng chung đĩa hệ điều hành, và chỉ tăng khi bạn đã **đo** được các volume trung bình dùng bao nhiêu phần trăm dung lượng đã xin.
+
+</Reveal>
+
+<Reveal title="Longhorn có thể vẫn báo `healthy` trong lúc ứng dụng không ghi được. Vậy nên cảnh báo trên cái gì?">
+
+Trên nhiều tầng, vì mỗi tầng mù một kiểu. `robustness` của volume cho biết số replica, đến chậm nửa phút tới một phút sau sự cố (bước 4) và không thấy filesystem chỉ đọc (câu hỏi trên). Chỗ trống thật của đĩa (`storageAvailable` trong object Node của Longhorn, hoặc metric đĩa của node theo phương pháp USE ở D12.3) báo trước khi đầy. Phía ứng dụng, một liveness probe có **ghi thử** vào volume sẽ khởi động lại pod khi filesystem thành chỉ đọc, và việc mount lại tự xảy ra; tài liệu Longhorn khuyên đúng điều này cho volume ext4. Longhorn có xuất metric cho Prometheus (D12.2); bài không cài phần đó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết StorageClass theo bảng tham số của Longhorn, giải thích một condition của object Volume hay một dòng log của `longhorn-manager`, viết `RecurringJob` cho lịch backup, viết câu `jq` đọc sổ sách đĩa.
+
+**AI hay sai ở đâu:** dùng tên setting và giá trị của bản cũ (backup target từng là một setting, nay là object `BackupTarget`; global manager chỉ có từ 1.13); dùng MinIO cho kho backup; nói V2 còn là bản thử nghiệm; coi snapshot của Longhorn là backup; khuyên tăng over-provisioning để "hết lỗi insufficient storage"; khuyên xoá cưỡng bức pod hoặc xoá VolumeAttachment bằng tay mà không hỏi node đã thật sự tắt chưa; đặt ba replica Longhorn dưới một database đã tự nhân bản; và trả lời "Longhorn chịu được mất node" mà không nói tới tám, chín giây, tới pod kẹt, tới chỗ trống cho rebuild.
+
+**Cách kiểm tra:** `kubectl -n longhorn-system get settings.longhorn.io` cho tên setting đúng của bản đang chạy; `kubectl apply --dry-run=server` bắt trường sai. Với mọi lời khẳng định về sự cố, làm lại bước 4 và 5 trên cụm thử và đo bằng một ứng dụng ghi liên tục. Với mọi cấu hình backup, khôi phục thử như bước 6.
+
+</Callout>
+
+<Callout kind="link">
+
+K7.1 là nền: CSI, StorageClass, VolumeSnapshot, vì sao snapshot không phải backup, và node chết với volume RWO. K7.3 dạy Rook và Ceph, lựa chọn khi Longhorn không còn đủ. K7.4 chạy PostgreSQL bằng operator và định nghĩa RPO, RTO. K4.1 dạy cách dựng VM và cụm bằng tay; K4 cũng là nơi dạy nâng cấp cụm, việc phải đối chiếu với bảng tương thích của Longhorn. K5.1 dạy taint, toleration và dòng thời gian khi node chết; K5.2 dạy `cordon` và `drain` (Longhorn chặn `drain` node giữ replica khoẻ cuối cùng của một volume). D1.3 dạy đĩa, filesystem và LVM, thứ nằm dưới `/var/lib/longhorn`. D12 là chặng theo dõi và cảnh báo. D20 là chặng sao lưu và khôi phục sau thảm hoạ, nơi backup của Longhorn là một mảnh của kế hoạch chung.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k7.2.mastery-chan-doan">Với một volume Longhorn đang `degraded`, `faulted`, hoặc một pod kẹt vì volume, xác định được nguyên nhân từ object Volume, Replica, Node của Longhorn và event của Kubernetes, và nói được ứng dụng đang chịu ảnh hưởng gì.</Check>
+
+<Check id="k7.2.mastery-thiet-ke">Với một cụm cụ thể, quyết định được số replica, chính sách khi node chết và dung lượng dự phòng cho rebuild, nêu được cái giá của từng lựa chọn, và nói được khi nào nên chuyển sang Ceph.</Check>
+
+</Mastery>

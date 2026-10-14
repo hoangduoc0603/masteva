@@ -1,0 +1,770 @@
+---
+title: Kiểm soát egress
+description: Chặn mặc định mọi kết nối đi ra của một namespace mà DNS vẫn chạy, mở lại theo tên miền bằng CiliumNetworkPolicy, gặp và sửa hai cái bẫy của policy theo tên (hai tên chung một IP, search domain), siết tới method và đường dẫn HTTP, xem gói bị chặn bằng Hubble, và cho traffic ra ngoài mang một IP nguồn cố định qua egress gateway.
+id: k6.3
+step: k6
+prerequisites: [k6.1, k2.4]
+topics: [k6.egress]
+status: verified
+verified:
+  date: 2026-10-13
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop, kernel 7.0.12-linuxkit)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    cilium: 1.20.2
+    hubble: 1.20.2
+    coredns: 1.14.6
+    yq: 4.54.1
+---
+
+<Goal>
+
+K2.4 chặn được traffic **vào** pod, và dừng ở một câu thừa nhận: pod vẫn hỏi được DNS và policy chuẩn không lọc được theo tên miền. Bài này làm nốt chiều **đi ra**. Học xong, bạn giải thích được:
+
+- Vì sao NetworkPolicy chuẩn không khoá nổi lời gọi tới một API bên ngoài có IP đổi liên tục.
+- Vì sao policy "chỉ được gọi `api.ext.test`" vẫn để lọt một tên miền khác, và phải xuống tầng nào mới chặn được.
+- Vì sao vừa siết danh sách tên được phép hỏi DNS thì mọi lời gọi đều hỏng, kể cả tới tên nằm trong danh sách.
+- Vì sao đối tác thấy request của bạn đến từ ba IP khác nhau, và làm sao để họ chỉ thấy một.
+- Một kết nối đi ra bị bỏ: nhìn ở đâu để biết đích, lý do và tên miền pod đã hỏi.
+
+</Goal>
+
+<Knowledge>
+
+### Vì sao phải kiểm soát chiều đi ra
+
+Mặc định một pod gọi được mọi địa chỉ nó định tuyến tới: pod khác, API server, mạng nội bộ của công ty, Internet, và địa chỉ metadata của cloud. Ba lý do khiến "mặc định mở" không chấp nhận được trên production:
+
+| Lý do | Không kiểm soát thì |
+|---|---|
+| Giới hạn thiệt hại khi một pod bị chiếm | Kẻ tấn công tải công cụ về, nối tới máy chủ điều khiển, đẩy dữ liệu ra, dò mạng nội bộ |
+| Biết service nào nói chuyện với ai | Không trả lời được câu hỏi của kiểm toán "hệ thống thanh toán gọi ra những đâu" |
+| Đối tác chỉ nhận request từ IP đã đăng ký | Request ra ngoài mang IP của node bất kỳ đang chạy pod |
+
+<Callout kind="production">
+
+Báo cáo [SCARLETEEL](https://sysdig.com/blog/cloud-breach-terraform-data-theft/) của Sysdig (02/2023) thuật lại một vụ xâm nhập ở môi trường của khách hàng. Kẻ tấn công khai thác một service công khai chạy trong cụm Kubernetes tự quản trên AWS và vào được pod. Từ trong pod, hai việc đầu tiên được ghi nhận là: tải về và chạy một cryptominer, và gọi thẳng dịch vụ metadata của máy (IMDS v1) để lấy thông tin xác thực tạm thời của IAM role gắn với node. Role đó bị cấp thừa quyền đọc, nên chúng liệt kê được tài nguyên AWS, tải mã nguồn độc quyền từ các Lambda function, đọc hơn 1 TB dữ liệu trong S3, tìm thấy thêm khoá trong một file state của Terraform và thử lan sang tài khoản AWS thứ hai. Báo cáo khuyến nghị vá service công khai, dùng IMDS v2 và IAM role theo service account, siết quyền đọc, và cất file state cẩn thận.
+
+Phần suy ra của bài này, không có trong báo cáo: cả hai việc đầu tiên đều là kết nối **đi ra** từ pod, một cái tới Internet, một cái tới địa chỉ `169.254.169.254`. Một namespace chặn egress mặc định và chỉ mở những đích ứng dụng cần sẽ làm cả hai thất bại ngay tại pod, bất kể lỗ hổng của service là gì. Nó không thay cho việc vá và siết IAM; nó là lớp còn đứng khi các lớp kia đã thủng.
+
+</Callout>
+
+<Check id="k6.3.vi-sao-egress">Nêu được ba lý do phải kiểm soát egress, và với mỗi lý do, một hậu quả cụ thể khi để mặc định.</Check>
+
+### NetworkPolicy chuẩn thiếu gì
+
+K2.4 đã viết policy egress chuẩn: chọn đích bằng `podSelector`, `namespaceSelector`, hoặc `ipBlock`. Với đích **ngoài cụm**, chỉ còn `ipBlock`, tức một dải IP. Điều đó không khớp với cách dịch vụ bên ngoài tồn tại: API của đối tác nằm sau CDN, IP đổi theo giờ và dùng chung với hàng nghìn tên miền khác.
+
+| Nhu cầu | NetworkPolicy chuẩn | CiliumNetworkPolicy |
+|---|---|---|
+| Đích là pod trong cụm | `podSelector`, `namespaceSelector` | `toEndpoints` (theo label, kể cả label của namespace) |
+| Đích ngoài cụm theo IP | `ipBlock` | `toCIDR`, `toCIDRSet` |
+| Đích ngoài cụm theo **tên miền** | Không có | `toFQDNs` |
+| Lọc theo method, đường dẫn, header HTTP | Không có | `toPorts.rules.http` |
+| Lọc tên được phép hỏi DNS | Không có | `toPorts.rules.dns` |
+| Một policy cho cả cụm | Không có, policy thuộc một namespace | `CiliumClusterwideNetworkPolicy` |
+
+Hai loại policy cộng dồn với nhau theo cùng quy tắc K2.4 đã dạy: pod được ít nhất một policy chọn theo chiều egress thì chiều đó chuyển sang chặn hết, chỉ mở những gì các policy liệt kê.
+
+<Check id="k6.3.networkpolicy-thieu-gi">Giải thích được vì sao `ipBlock` không đủ cho đích ngoài cụm, và kể được ba thứ CiliumNetworkPolicy thêm vào cho egress.</Check>
+
+### Policy theo tên miền chạy thế nào: DNS proxy
+
+Kernel chỉ thấy IP, không thấy tên miền. Cilium nối hai thứ đó bằng cách **đứng giữa truy vấn DNS** của pod:
+
+```text
+ pod app                    Cilium trên node                         CoreDNS
+   │ (1) hỏi api.ext.test ──► DNS proxy: tên này có được hỏi không?
+   │                           (rules.dns) ── được ──────────────────► trả lời 172.20.0.5
+   │ ◄── (2) trả lời ───────── ghi vào bảng: api.ext.test → 172.20.0.5
+   │                           gán cho IP đó identity "fqdn:api.ext.test"
+   │ (3) connect(172.20.0.5:8080)
+   │ ─────────────────────────► policy: identity này có trong toFQDNs không? ── có ──► cho đi
+```
+
+Từ sơ đồ suy ra bốn điều, và lab cho bạn gặp cả bốn:
+
+- **Phải có rule DNS thì mới học được tên.** Phần `rules.dns` trong policy cho phép DNS là thứ bật proxy. Thiếu nó, `toFQDNs` không bao giờ khớp gì.
+- **Thực thi vẫn là theo IP.** Policy nói "tên", data plane cho qua "IP mà tên đó trỏ tới". Tên khác trỏ cùng IP (cùng CDN, cùng load balancer) được hưởng theo. Bước 3 tái hiện.
+- **`*` không vượt qua dấu chấm.** `*.ext.test` khớp `api.ext.test`, không khớp `a.b.ext.test`. Muốn mọi cấp phải viết `**.ext.test`. Cộng với search domain của pod (K2.1), đây là cái bẫy ở bước 5.
+- **Proxy thấy mọi câu hỏi DNS.** Hubble in ra pod đã hỏi tên gì và nhận IP nào: nguyên liệu tốt nhất để viết danh sách cho phép, và để phát hiện pod hỏi một tên lạ.
+
+<Check id="k6.3.dns-proxy">Kể được ba bước từ truy vấn DNS tới lúc kết nối được cho qua, và giải thích được vì sao policy theo tên miền vẫn để lọt một tên khác dùng chung IP.</Check>
+
+### Tầng 7 và cái giá của nó
+
+Khi rule có `rules.http`, Cilium chuyển kết nối của cổng đó qua proxy Envoy trên node (pod `cilium-envoy` ở K6.1). Proxy đọc từng request và so method, đường dẫn, header `Host`. Hai khác biệt so với tầng 3–4 cần nhớ khi gỡ lỗi:
+
+- Request bị từ chối nhận **`403 Access denied`** từ proxy, không phải timeout. Kết nối TCP vẫn mở được.
+- Mọi request đi qua thêm một proxy: thêm độ trễ và một thành phần có thể hỏng. Chỉ bật cho những đích cần.
+
+Với HTTPS, proxy không đọc được method và đường dẫn nếu không giải mã. Khi đó mức kiểm soát thực tế dừng ở tên miền và cổng, hoặc bạn đặt một egress proxy có chủ đích (Envoy của D9.6, Squid) mà ứng dụng gọi qua.
+
+<Check id="k6.3.l7">Nói được request bị rule HTTP từ chối trông khác gì so với gói bị policy tầng 3–4 bỏ, và hai cái giá của việc lọc ở tầng 7.</Check>
+
+### IP nguồn của traffic đi ra, và egress gateway
+
+IP của pod chỉ có nghĩa trong cụm. Gói đi ra ngoài được đổi địa chỉ nguồn thành IP của **node đang chạy pod** (SNAT, D2.4). Pod được xếp lại sang node khác thì bên ngoài thấy IP khác. Đối tác chỉ mở firewall cho vài IP đã đăng ký sẽ chặn bạn một cách ngẫu nhiên.
+
+```text
+ Mặc định                                   Egress gateway
+ pod trên worker   ─► nguồn = IP worker      pod trên worker  ─┐
+ pod trên worker2  ─► nguồn = IP worker2     pod trên worker2 ─┼─► node gateway ─► nguồn = IP egress cố định
+ pod trên worker3  ─► nguồn = IP worker3     pod trên worker3 ─┘   (SNAT tại đây)
+```
+
+**Egress gateway** của Cilium là một policy (`CiliumEgressGatewayPolicy`): chọn pod nguồn theo label, chọn đích theo CIDR, chọn node làm gateway và IP dùng để SNAT. Gói khớp policy được bọc gửi sang node gateway rồi mới ra ngoài. Theo tài liệu Cilium:
+
+- Cần bật thay kube-proxy (K6.1) và masquerade bằng eBPF.
+- IP egress phải được gán sẵn trên một card mạng của node gateway; Cilium không tự gán. Trên cloud nghĩa là thêm network interface hoặc IP phụ cho máy đó.
+- Nhiều node cùng khớp thì node đứng đầu theo thứ tự tên được chọn; **không node nào khớp thì traffic bị bỏ**.
+- Pod vừa khởi động có một khoảng trễ trước khi policy áp vào: trong lúc đó traffic có thể ra ngoài bằng IP của node.
+
+Các cách khác cho cùng nhu cầu: NAT gateway của cloud cho cả subnet (D10), một nhóm node riêng có IP cố định chỉ chạy các workload cần ra ngoài (taint ở K5.1), hoặc egress proxy ở tầng 7.
+
+<Check id="k6.3.egress-gateway">Giải thích được vì sao IP nguồn của traffic đi ra thay đổi theo node, egress gateway đổi điều đó thế nào, và ba điều kiện để nó chạy.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Layer 3 Policies | Cilium](https://docs.cilium.io/en/stable/security/policy/layer3/): mục "DNS based" về `toFQDNs`, quy tắc của `matchPattern` và tiền tố `**.`.
+- [Layer 7 Policies | Cilium](https://docs.cilium.io/en/stable/security/policy/layer7/): rule HTTP và rule DNS, kèm ví dụ ghép với `toFQDNs`.
+- [Egress Gateway | Cilium](https://docs.cilium.io/en/stable/network/egress-gateway/egress-gateway/): điều kiện bật, cấu trúc policy và các mục không tương thích.
+- [Network Policies | Kubernetes](https://kubernetes.io/docs/concepts/services-networking/network-policies/): mục "What you can't do with network policies" liệt kê giới hạn của policy chuẩn.
+- [SCARLETEEL: Operation leveraging Terraform, Kubernetes, and AWS for data theft | Sysdig](https://sysdig.com/blog/cloud-breach-terraform-data-theft/): sự cố trong callout, từng bước của chuỗi tấn công.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Cụm `k6-lab` của K6.1 đang chạy với Cilium thay kube-proxy và Hubble Relay; có `~/masteva-k6/hubble.sh` và `cilium-values.yaml` của K6.1. Bài không dùng gì của K6.2. Nếu đã xoá cụm, làm lại bước 1, 2, 3, 5 và 6 của K6.1.
+- `yq`, `curl` trên máy. Bài chạy thêm hai container nhỏ ngoài cụm (`k6-ext-api`, `k6-ext-khac`) trong mạng Docker `kind`.
+- **Profile máy:** các pod của bài rất nhẹ; hai lượt chạy liền cả chặng đo được ba node dùng tổng cộng 3,6 và 3,9 GiB RAM ở cuối bài (cụm còn Envoy Gateway và cert-manager của K6.2), cộng hai container ngoài cụm vài chục MiB. Docker Desktop nên có từ 6 GB. Máy 8 GB: cụm một worker như ghi chú ở K6.1; bước 6 khi đó phải đặt label gateway và IP egress lên chính `k6-lab-worker` (bài chưa chạy cấu hình một worker này).
+- Bước 1 và bước 2 gọi `example.com` để có một đích trên Internet; máy không có mạng thì dòng đó cho kết quả khác, các dòng còn lại không đổi.
+- Egress gateway ở bước 6 đã chạy được trên kind trong Docker Desktop. IP, tên pod và identity trong output của bạn sẽ khác.
+
+### 1. Hai dịch vụ "bên ngoài" và một pod để thử
+
+Hai container `agnhost` chạy ngoài cụm đóng vai API của đối tác (`api.ext.test`) và một đích không liên quan (`khac.ext.test`). Chúng nằm trong mạng Docker của kind nên pod gọi tới được, nhưng với cụm thì chúng là "thế giới bên ngoài". CoreDNS được thêm một zone nhỏ để các tên đó phân giải được; tên thứ ba, `cung-ip.ext.test`, cố ý trỏ **cùng IP** với `api`.
+
+<Callout kind="danger">
+
+Khối dưới sửa Corefile và khởi động lại CoreDNS của **cả cụm**, không riêng namespace nào. Trên cụm lab việc này vô hại; trên cụm thật, một Corefile sai cú pháp là mất DNS toàn cụm. Kiểm `kubectl config current-context` in ra `kind-k6-lab`.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k6/ext-zone.corefile">
+
+```bash
+cd ~/masteva-k6
+export KUBECONFIG=~/masteva-k6/kubeconfig
+docker run -d --name k6-ext-api --network kind registry.k8s.io/e2e-test-images/agnhost:2.66.1 netexec --http-port=8080 > /dev/null
+docker run -d --name k6-ext-khac --network kind registry.k8s.io/e2e-test-images/agnhost:2.66.1 netexec --http-port=8080 > /dev/null
+API_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' k6-ext-api)
+KHAC_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' k6-ext-khac)
+cat > ext-zone.corefile <<EOF
+ext.test:53 {
+    hosts {
+        $API_IP api.ext.test cung-ip.ext.test
+        $KHAC_IP khac.ext.test
+    }
+}
+EOF
+cat ext-zone.corefile
+kubectl -n kube-system get configmap coredns -o yaml \
+  | yq '.data.Corefile += load_str("ext-zone.corefile")' | kubectl replace -f -
+kubectl -n kube-system rollout restart deployment/coredns
+kubectl -n kube-system rollout status deployment/coredns --timeout=120s | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ext.test:53 {
+    hosts {
+        172.20.0.5 api.ext.test cung-ip.ext.test
+        172.20.0.6 khac.ext.test
+    }
+}
+configmap/coredns replaced
+deployment.apps/coredns restarted
+deployment "coredns" successfully rolled out
+```
+
+</Expected>
+
+Pod `app` trong namespace `k6-egress` là "ứng dụng" cần gọi ra ngoài; nó được ghim vào `k6-lab-worker` để bước 6 so được IP nguồn. Script `thu-egress.sh` gọi lần lượt các URL từ pod đó và in mã HTTP cùng exit code của `curl` (`28` là hết giờ, `6` là không phân giải được tên).
+
+<Terminal where="mac" title="~/masteva-k6/thu-egress.sh">
+
+```bash
+kubectl create namespace k6-egress
+kubectl -n k6-egress run app --image=curlimages/curl:8.22.0 --labels=app=app \
+  --overrides='{"spec":{"nodeName":"k6-lab-worker"}}' -- sleep infinity
+kubectl -n k6-egress wait --for=condition=Ready pod/app --timeout=120s
+cat > thu-egress.sh <<'EOF'
+#!/bin/sh
+# Gọi từng URL từ pod app trong k6-egress; in mã HTTP và exit code của curl
+for url in "$@"; do
+  code=$(kubectl -n k6-egress exec app -- curl -s -m 3 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+  printf '%-40s http=%s exit=%s\n' "$url" "$code" "$?"
+done
+EOF
+chmod +x thu-egress.sh
+./thu-egress.sh http://api.ext.test:8080/hostname http://khac.ext.test:8080/hostname \
+  http://cung-ip.ext.test:8080/hostname http://echo.k6-demo/hostname http://example.com/
+kubectl -n k6-egress exec app -- curl -s api.ext.test:8080/clientip; echo
+kubectl get nodes -o 'custom-columns=NODE:.metadata.name,IP:.status.addresses[0].address'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k6-egress created
+pod/app created
+pod/app condition met
+http://api.ext.test:8080/hostname        http=200 exit=0
+http://khac.ext.test:8080/hostname       http=200 exit=0
+http://cung-ip.ext.test:8080/hostname    http=200 exit=0
+http://echo.k6-demo/hostname             http=200 exit=0
+http://example.com/                      http=200 exit=0
+172.20.0.3:37970
+NODE                   IP
+k6-lab-control-plane   172.20.0.2
+k6-lab-worker          172.20.0.3
+k6-lab-worker2         172.20.0.4
+```
+
+</Expected>
+
+Điểm xuất phát: pod gọi được mọi nơi, kể cả Internet và Service của namespace khác. Đường dẫn `/clientip` của `agnhost` trả về địa chỉ nguồn nó nhìn thấy: `172.20.0.3`, IP của node `k6-lab-worker`, không phải IP của pod. Giữ con số này cho bước 6.
+
+<Check id="k6.3.lab-chuan-bi">Dựng được hai đích ngoài cụm có tên phân giải được từ pod, và chỉ ra được IP nguồn mà đích nhìn thấy là IP của node.</Check>
+
+### 2. Chặn mặc định, giữ lại DNS
+
+Một `CiliumNetworkPolicy` chọn mọi pod của namespace (`endpointSelector: {}`) và chỉ mở đúng một thứ: DNS tới CoreDNS. Phần `rules.dns` vừa cho phép truy vấn, vừa là thứ bật DNS proxy.
+
+<Callout kind="danger">
+
+Khối dưới chặn **mọi** kết nối đi ra của mọi pod trong namespace `k6-egress`, trừ DNS. Trên một namespace thật đang chạy, áp thẳng policy này là gây sự cố; xem câu hỏi đầu của phần Đào sâu về cách làm từng bước.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k6/cnp-default-deny.yaml">
+
+```bash
+cat > cnp-default-deny.yaml <<'EOF'
+# Mọi pod trong k6-egress: egress chỉ còn DNS tới CoreDNS; mọi thứ khác bị chặn
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: egress-mac-dinh, namespace: k6-egress}
+spec:
+  endpointSelector: {}
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+          rules:
+            dns:
+              - matchPattern: "*"      # cho hỏi mọi tên; bước 5 siết lại
+EOF
+kubectl apply -f cnp-default-deny.yaml
+sleep 3
+kubectl -n k6-egress get ciliumnetworkpolicy
+./thu-egress.sh http://api.ext.test:8080/hostname http://khac.ext.test:8080/hostname \
+  http://echo.k6-demo/hostname http://example.com/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ciliumnetworkpolicy.cilium.io/egress-mac-dinh created
+NAME              AGE   VALID
+egress-mac-dinh   3s    True
+http://api.ext.test:8080/hostname        http=000 exit=28
+http://khac.ext.test:8080/hostname       http=000 exit=28
+http://echo.k6-demo/hostname             http=000 exit=28
+http://example.com/                      http=000 exit=28
+```
+
+</Expected>
+
+Mọi đích đều hết giờ ở bước kết nối (`exit=28`), không phải ở bước phân giải tên: DNS vẫn chạy. Cột `VALID` cho biết Cilium đã nhận policy; khác với NetworkPolicy chuẩn, một `CiliumNetworkPolicy` viết sai cấu trúc sẽ hiện `False` kèm lý do. `sleep 3` là vì agent trên node cần khoảng một giây để áp policy. Hubble cho thấy pod vừa cố đi đâu, và, nhờ DNS proxy, vừa hỏi tên gì:
+
+<Terminal where="mac">
+
+```bash
+./hubble.sh observe --namespace k6-egress --verdict DROPPED --type drop --since 60s \
+  | cut -d' ' -f4- | sed 's/app:[0-9]* /app /; s/k6-egress\///' | sort | uniq -c
+./hubble.sh observe --namespace k6-egress --protocol dns --since 60s \
+  | grep 'dns-response' | grep -v -e AAAA -e Non-Existent | cut -d' ' -f8- | sed 's/(ID:[0-9]*) //' | sort -u
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   3 app (ID:19129) <> 104.20.23.154:80 (world) Policy denied DROPPED (TCP Flags: SYN)
+   3 app (ID:19129) <> 172.20.0.5:8080 (world) Policy denied DROPPED (TCP Flags: SYN)
+   3 app (ID:19129) <> 172.20.0.6:8080 (world) Policy denied DROPPED (TCP Flags: SYN)
+   3 app (ID:19129) <> 172.66.147.243:80 (world) Policy denied DROPPED (TCP Flags: SYN)
+   3 app (ID:19129) <> k6-demo/echo-85cc55b84f-xbxhf:8080 (ID:55794) Policy denied DROPPED (TCP Flags: SYN)
+dns-response proxy FORWARDED (DNS Answer "10.96.145.3" TTL: 30 (Proxy echo.k6-demo.svc.cluster.local. A))
+dns-response proxy FORWARDED (DNS Answer "104.20.23.154,172.66.147.243" TTL: 30 (Proxy example.com. A))
+dns-response proxy FORWARDED (DNS Answer "172.20.0.5" TTL: 3600 (Proxy api.ext.test. A))
+dns-response proxy FORWARDED (DNS Answer "172.20.0.6" TTL: 3600 (Proxy khac.ext.test. A))
+```
+
+</Expected>
+
+Nửa trên: các đích bị bỏ, mỗi đích ba gói `SYN` (lần đầu và hai lần gửi lại); `example.com` có hai IP nên chiếm hai dòng, và IP của nó ở chỗ bạn có thể khác. Đích ngoài cụm mang identity `world`; đích trong cụm hiện tên pod. Nửa dưới: từng câu trả lời DNS mà proxy đã cho qua, kèm tên và IP (lệnh đã lọc bớt các câu trả lời "không tồn tại" do search domain sinh ra). Ghép hai nửa lại là có bản đồ "pod này muốn nói chuyện với những ai", thứ bạn cần trước khi viết danh sách cho phép cho một ứng dụng không ai còn nhớ nó gọi đi đâu.
+
+<Check id="k6.3.lab-default-deny">Áp được chặn egress mặc định cho một namespace mà DNS vẫn chạy, và dùng Hubble liệt kê được các đích bị chặn cùng các tên miền pod đã hỏi.</Check>
+
+### 3. Mở theo tên miền, và cái bẫy chung IP
+
+Yêu cầu: `app` được gọi `api.ext.test` cổng 8080, không gì khác. Policy thứ hai cộng thêm vào policy mặc định:
+
+<Terminal where="mac" title="~/masteva-k6/cnp-fqdn.yaml">
+
+```bash
+cat > cnp-fqdn.yaml <<'EOF'
+# Pod app được gọi api.ext.test cổng 8080, theo TÊN
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata: {name: app-goi-api, namespace: k6-egress}
+spec:
+  endpointSelector:
+    matchLabels: {app: app}
+  egress:
+    - toFQDNs:
+        - matchName: api.ext.test
+      toPorts:
+        - ports:
+            - {port: "8080", protocol: TCP}
+EOF
+kubectl apply -f cnp-fqdn.yaml
+sleep 3
+./thu-egress.sh http://api.ext.test:8080/hostname http://khac.ext.test:8080/hostname http://example.com/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ciliumnetworkpolicy.cilium.io/app-goi-api created
+http://api.ext.test:8080/hostname        http=200 exit=0
+http://khac.ext.test:8080/hostname       http=000 exit=28
+http://example.com/                      http=000 exit=28
+```
+
+</Expected>
+
+Đúng yêu cầu: `api` qua, hai đích kia bị chặn, và trong policy không có địa chỉ IP nào. Đối tác đổi IP thì lần phân giải kế tiếp của pod tự cập nhật.
+
+<Predict question="`cung-ip.ext.test` không có trong policy, nhưng trỏ cùng IP với `api.ext.test`. Gọi nó có được không? Còn gọi thẳng `http://<IP của api>:8080` thì sao?">
+
+Cả hai đều được. Policy viết theo tên, nhưng thứ data plane cho qua là IP `172.20.0.5`, vì IP đó đã được gán identity `fqdn:api.ext.test` khi pod phân giải `api`. Từ đó mọi kết nối tới IP ấy cổng 8080 đều hợp lệ, dù pod tới đó bằng tên nào hay không dùng tên nào. Với một đối tác nằm sau CDN, "cùng IP" nghĩa là hàng nghìn tên miền của người khác.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+./thu-egress.sh http://cung-ip.ext.test:8080/hostname "http://$API_IP:8080/hostname"
+CIL=$(kubectl -n kube-system get pod -l k8s-app=cilium --field-selector spec.nodeName=k6-lab-worker -o name)
+kubectl -n kube-system exec $CIL -c cilium-agent -- cilium-dbg fqdn cache list | grep -E 'FQDN|ext.test' | cut -c12-110
+kubectl -n kube-system exec $CIL -c cilium-agent -- cilium-dbg identity list | grep 'fqdn:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+http://cung-ip.ext.test:8080/hostname    http=200 exit=0
+http://172.20.0.5:8080/hostname          http=200 exit=0
+Source   FQDN                              TTL    ExpirationTime             IPs                   
+lookup   cung-ip.ext.test.                 3600   2026-10-13T04:11:10.753Z   172.20.0.5            
+lookup   api.ext.test.                     3600   2026-10-13T04:11:04.346Z   172.20.0.5            
+lookup   khac.ext.test.                    3600   2026-10-13T04:11:04.425Z   172.20.0.6            
+16777217   fqdn:api.ext.test
+```
+
+</Expected>
+
+Bảng `fqdn cache` là thứ DNS proxy học được: tên nào, IP nào, còn hiệu lực tới bao giờ. Một identity `fqdn:api.ext.test` được tạo cho IP `172.20.0.5`, và policy thực chất là "được gọi identity đó". `toFQDNs` vì vậy là công cụ để **không phải bảo trì danh sách IP**, không phải bức tường giữa các tên miền chung hạ tầng. Muốn phân biệt hai tên trên cùng một IP, phải nhìn vào bên trong kết nối.
+
+<Check id="k6.3.lab-fqdn">Viết được policy egress theo tên miền, chứng minh được một tên khác trỏ cùng IP vẫn lọt, và đọc được bảng `fqdn cache` để giải thích.</Check>
+
+### 4. Siết tới tầng 7
+
+Thêm `rules.http` vào đúng rule vừa viết: chỉ `GET`, chỉ hai đường dẫn, và header `Host` phải đúng tên. Ba trường này là biểu thức chính quy.
+
+<Terminal where="mac" title="~/masteva-k6/cnp-fqdn.yaml">
+
+```bash
+cat >> cnp-fqdn.yaml <<'EOF'
+          rules:
+            http:
+              - method: GET
+                path: "/(hostname|clientip)"
+                host: "api\\.ext\\.test(:8080)?"
+EOF
+kubectl apply -f cnp-fqdn.yaml
+sleep 4
+./thu-egress.sh http://api.ext.test:8080/hostname http://api.ext.test:8080/healthz http://cung-ip.ext.test:8080/hostname
+kubectl -n k6-egress exec app -- curl -s -m 3 -i -X POST api.ext.test:8080/hostname | grep -E '^HTTP|^server|denied'
+sleep 2
+./hubble.sh observe --namespace k6-egress --type l7 --protocol http --since 20s \
+  | grep http-request | cut -d' ' -f8- | sed 's/(ID:[0-9]*) //'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ciliumnetworkpolicy.cilium.io/app-goi-api configured
+http://api.ext.test:8080/hostname        http=200 exit=0
+http://api.ext.test:8080/healthz         http=403 exit=0
+http://cung-ip.ext.test:8080/hostname    http=403 exit=0
+HTTP/1.1 403 Forbidden
+server: envoy
+Access denied
+http-request FORWARDED (HTTP/1.1 GET http://api.ext.test:8080/hostname)
+http-request DROPPED (HTTP/1.1 GET http://api.ext.test:8080/healthz)
+http-request DROPPED (HTTP/1.1 GET http://cung-ip.ext.test:8080/hostname)
+http-request DROPPED (HTTP/1.1 POST http://api.ext.test:8080/hostname)
+```
+
+</Expected>
+
+`cung-ip.ext.test` giờ bị chặn: cùng IP, nhưng header `Host` không khớp. Đường dẫn ngoài danh sách và method `POST` cũng vậy. Mã lỗi đã đổi: không còn `exit=28` mà là **`403` do Envoy trả** (`server: envoy`), vì kết nối TCP được chấp nhận rồi proxy mới từ chối từng request. Hubble ghi từng request với đủ method và URL: một nhật ký truy cập cho traffic đi ra mà ứng dụng không phải làm gì.
+
+<Check id="k6.3.lab-l7">Thêm được rule HTTP vào policy egress, phân biệt được `403` của proxy với timeout của policy tầng 3–4, và xem được từng request bị từ chối trong Hubble.</Check>
+
+### 5. Siết DNS, và cái bẫy search domain
+
+Kết nối đã bị khoá, nhưng DNS thì chưa: `matchPattern: "*"` cho pod hỏi mọi tên. K2.4 đã chỉ ra hệ quả: dữ liệu có thể đi ra ngoài trong chính câu hỏi DNS (`<dữ liệu>.kẻ-tấn-công.com`), vì CoreDNS chuyển tiếp câu hỏi đó ra Internet. Siết danh sách tên được hỏi về hai nhóm pod thật sự cần: tên trong cụm và tên dưới `ext.test`. Bản đầu tiên viết theo trực giác:
+
+<Terminal where="mac">
+
+```bash
+yq '.spec.egress[0].toPorts[0].rules.dns = [{"matchPattern": "*.cluster.local"}, {"matchPattern": "*.ext.test"}]' \
+  cnp-default-deny.yaml > cnp-default-deny-dns.yaml
+yq -o json -I 0 '.spec.egress[0].toPorts[0].rules.dns' cnp-default-deny-dns.yaml
+kubectl apply -f cnp-default-deny-dns.yaml
+sleep 3
+kubectl -n k6-egress exec app -- curl -sS -m 3 -o /dev/null http://api.ext.test:8080/hostname
+sleep 2
+./hubble.sh observe --namespace k6-egress --protocol dns --verdict DROPPED --since 15s \
+  | grep -v AAAA | cut -d' ' -f8- | sed 's/(ID:[0-9]*) //' | sort -u
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"matchPattern":"*.cluster.local"},{"matchPattern":"*.ext.test"}]
+ciliumnetworkpolicy.cilium.io/egress-mac-dinh configured
+curl: (28) Resolving timed out after 3001 milliseconds
+command terminated with exit code 28
+dns-request proxy DROPPED (DNS Query api.ext.test.k6-egress.svc.cluster.local. A)
+```
+
+</Expected>
+
+Lời gọi tới `api.ext.test`, cái tên nằm ngay trong danh sách, giờ hỏng, và lần này hỏng ở bước **phân giải tên** (`Resolving timed out`), không phải bước kết nối như ở bước 2. Hubble chỉ ra thủ phạm: pod không hỏi `api.ext.test` trước. Vì `ndots:5` (K2.1), resolver ghép search domain trước và hỏi `api.ext.test.k6-egress.svc.cluster.local.`; tên đó có năm nhãn trước `cluster.local`, mà `*` của Cilium không vượt qua dấu chấm, nên `*.cluster.local` không khớp. Proxy từ chối câu hỏi đó, resolver trong image này (Alpine, musl) không đi tiếp tới tên thật, và `curl` hết giờ. Image dùng thư viện C khác có thể xử lý câu từ chối khác đi; đừng dựa vào điều đó. Sửa bằng tiền tố `**.`, khớp mọi cấp:
+
+<Terminal where="mac" title="~/masteva-k6/cnp-default-deny-dns.yaml">
+
+```bash
+yq -i '.spec.egress[0].toPorts[0].rules.dns[0].matchPattern = "**.cluster.local"' cnp-default-deny-dns.yaml
+yq -o json -I 0 '.spec.egress[0].toPorts[0].rules.dns' cnp-default-deny-dns.yaml
+kubectl apply -f cnp-default-deny-dns.yaml
+sleep 3
+./thu-egress.sh http://api.ext.test:8080/hostname
+kubectl -n k6-egress exec app -- nslookup -type=a du-lieu-mat.example.com 2>&1 | grep -E 'REFUSED|Address: [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"matchPattern":"**.cluster.local"},{"matchPattern":"*.ext.test"}]
+ciliumnetworkpolicy.cilium.io/egress-mac-dinh configured
+http://api.ext.test:8080/hostname        http=200 exit=0
+** server can't find du-lieu-mat.example.com: REFUSED
+```
+
+</Expected>
+
+`api` chạy lại, còn một tên ngoài danh sách nhận `REFUSED` ngay tại node: câu hỏi không bao giờ tới CoreDNS, càng không ra tới Internet. Đường rò qua DNS đã hẹp lại còn các tên bạn cho phép. Hai điều rút ra: mọi danh sách tên DNS cho pod phải tính cả search domain; và sau mỗi lần siết, thử bằng chính cách ứng dụng phân giải tên (`curl`, không phải `nslookup`, vốn không dùng search domain theo cùng cách). Cilium còn cho đổi câu trả lời cho tên bị cấm từ `REFUSED` sang `NXDOMAIN` (giá trị Helm `dnsProxy.dnsRejectResponseCode: nameError`), để resolver coi như tên không tồn tại và đi tiếp sang search domain kế; bài chưa chạy cấu hình đó.
+
+<Check id="k6.3.lab-dns">Giới hạn được các tên miền pod được hỏi DNS, tái hiện được lỗi do search domain khi dùng `*`, tìm ra nó bằng Hubble và sửa bằng `**.`.</Check>
+
+### 6. Egress gateway: một IP nguồn cố định
+
+Đối tác `api.ext.test` chỉ nhận request từ một IP đã đăng ký. Bật egress gateway trong Cilium: thêm hai giá trị vào file values của K6.1 rồi khởi động lại agent và operator, đúng như tài liệu Cilium hướng dẫn.
+
+<Callout kind="danger">
+
+Khối dưới khởi động lại agent Cilium trên mọi node và đổi cách masquerade từ iptables sang eBPF. Kết nối giữa các pod đang mở vẫn sống vì chương trình eBPF nằm lại trong kernel, nhưng kết nối đi ra ngoài đang mở có thể đứt, và trong vài chục giây policy mới không được áp. Trên cụm thật, làm việc này theo từng node trong giờ bảo trì. Kiểm `kubectl config current-context` in ra `kind-k6-lab`.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k6/cilium-values.yaml">
+
+```bash
+kubectl config current-context
+cat >> cilium-values.yaml <<'EOF'
+egressGateway:
+  enabled: true                        # cho phép CiliumEgressGatewayPolicy
+bpf:
+  masquerade: true                     # SNAT bằng eBPF; egress gateway cần
+  hostLegacyRouting: true              # giữ gói của pod đi qua netfilter của node (callout cuối bước)
+EOF
+helm upgrade cilium oci://quay.io/cilium/charts/cilium --version 1.20.2 \
+  -n kube-system -f cilium-values.yaml | grep '^STATUS:'
+kubectl -n kube-system rollout restart daemonset/cilium deployment/cilium-operator
+kubectl -n kube-system rollout status daemonset/cilium --timeout=300s | tail -1
+kubectl -n kube-system rollout status deployment/cilium-operator --timeout=120s | tail -1
+kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status | awk '/^Routing/ {print} /^Masquerading/ {print $1, $2}'
+until ./thu-egress.sh http://api.ext.test:8080/hostname | grep -q 'http=200'; do sleep 2; done
+kubectl -n k6-demo exec client -- getent hosts example.com > /dev/null && echo "pod vẫn phân giải được tên ngoài cụm"
+kubectl -n k6-egress exec app -- curl -s api.ext.test:8080/clientip; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k6-lab
+STATUS: deployed
+daemonset.apps/cilium restarted
+deployment.apps/cilium-operator restarted
+daemon set "cilium" successfully rolled out
+deployment "cilium-operator" successfully rolled out
+Routing:                 Network: Tunnel [vxlan]   Host: Legacy
+Masquerading: BPF
+pod vẫn phân giải được tên ngoài cụm
+172.20.0.3:38638
+```
+
+</Expected>
+
+Masquerade giờ là `BPF` (K6.1 đã thấy nó là `IPTables`), còn `Host: Legacy` cho biết gói vẫn đi qua netfilter của node (callout cuối bước giải thích vì sao phải giữ như vậy); policy của các bước trước vẫn nguyên, và IP nguồn vẫn là IP của node `worker`. Chọn `k6-lab-worker2` làm gateway, gán cho nó một IP phụ trong mạng Docker của kind (hai số đầu lấy theo mạng đó, đuôi `.250.1` để không trùng ai), rồi viết policy:
+
+<Terminal where="mac" title="~/masteva-k6/egress-gw.yaml">
+
+```bash
+GW_IP=$(echo $API_IP | cut -d. -f1-2).250.1
+kubectl label node k6-lab-worker2 egress-gw=true
+docker exec k6-lab-worker2 ip addr add $GW_IP/16 dev eth0
+cat > egress-gw.yaml <<EOF
+apiVersion: cilium.io/v2
+kind: CiliumEgressGatewayPolicy
+metadata: {name: app-ra-ngoai}          # tài nguyên cấp cụm, không có namespace
+spec:
+  selectors:
+    - podSelector:
+        matchLabels:
+          io.kubernetes.pod.namespace: k6-egress
+          app: app
+  destinationCIDRs: ["$API_IP/32"]       # chỉ traffic tới đối tác mới đi qua gateway
+  egressGateway:
+    nodeSelector:
+      matchLabels: {egress-gw: "true"}
+    egressIP: $GW_IP                     # phải có sẵn trên một card mạng của node gateway
+EOF
+kubectl apply -f egress-gw.yaml
+until kubectl -n k6-egress exec app -- curl -s -m 3 api.ext.test:8080/clientip 2>/dev/null | grep -q "$GW_IP"; do sleep 2; done
+kubectl -n k6-egress exec app -- curl -s api.ext.test:8080/clientip; echo
+kubectl -n kube-system exec $(kubectl -n kube-system get pod -l k8s-app=cilium --field-selector spec.nodeName=k6-lab-worker -o name) \
+  -c cilium-agent -- cilium-dbg bpf egress list
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k6-lab-worker2 labeled
+ciliumegressgatewaypolicy.cilium.io/app-ra-ngoai created
+172.20.250.1:38662
+Source IP      Destination CIDR   Egress IP   Gateway IP   Egress Ifindex
+10.244.1.105   172.20.0.5/32      0.0.0.0     172.20.0.4   0
+```
+
+</Expected>
+
+Đối tác giờ thấy `172.20.250.1`, không phải IP của node đang chạy pod. Bảng `bpf egress` trên node `worker` (nơi pod chạy) ghi: gói từ pod `10.244.1.105` tới `172.20.0.5` được gửi sang gateway `172.20.0.4`, tức `worker2`; việc đổi địa chỉ nguồn diễn ra ở đó. Policy tầng 7 của bước 4 vẫn áp cho chính traffic này. Dù `app` được xếp lại sang node nào, đối tác vẫn thấy một IP.
+
+Cái giá: mọi traffic tới đối tác giờ phụ thuộc vào **một** node. Gỡ label `egress-gw` khỏi `worker2` để xem chuyện gì xảy ra khi node gateway biến mất mà không có node khác khớp; khối dưới làm gián đoạn lời gọi của pod `app` trong vài giây rồi gắn label lại.
+
+<Terminal where="mac">
+
+```bash
+kubectl label node k6-lab-worker2 egress-gw-
+sleep 3
+kubectl -n k6-egress exec app -- curl -sS -m 3 -o /dev/null api.ext.test:8080/clientip
+sleep 2
+./hubble.sh observe --from-pod k6-egress/app --verdict DROPPED --since 10s | grep -o 'No egress gateway found DROPPED' | sort | uniq -c
+kubectl -n kube-system exec $(kubectl -n kube-system get pod -l k8s-app=cilium --field-selector spec.nodeName=k6-lab-worker -o name) \
+  -c cilium-agent -- cilium-dbg bpf egress list
+kubectl label node k6-lab-worker2 egress-gw=true
+until kubectl -n k6-egress exec app -- curl -s -m 3 api.ext.test:8080/clientip 2>/dev/null | grep -q "$GW_IP"; do sleep 2; done
+kubectl -n k6-egress exec app -- curl -s api.ext.test:8080/clientip; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k6-lab-worker2 unlabeled
+curl: (28) Operation timed out after 3002 milliseconds with 0 bytes received
+command terminated with exit code 28
+   6 No egress gateway found DROPPED
+Source IP      Destination CIDR   Egress IP   Gateway IP   Egress Ifindex
+10.244.1.105   172.20.0.5/32      0.0.0.0     Not Found    0
+node/k6-lab-worker2 labeled
+172.20.250.1:56116
+```
+
+</Expected>
+
+Traffic **không** quay về đường cũ: nó bị bỏ, đúng như tài liệu viết. Hubble gọi tên lý do (`No egress gateway found`), bảng `bpf egress` ghi `Not Found` ở cột gateway, và gắn lại label thì đường ra hồi lại. Trên production, đặt label gateway trên ít nhất hai node và theo dõi chúng như theo dõi một load balancer.
+
+<Callout kind="pitfall">
+
+Dòng `bpf.hostLegacyRouting: true` trong file values là để tránh một cái bẫy đã gặp khi soạn bài này. Bật `bpf.masquerade` trên cụm đã thay kube-proxy thì Cilium tự bật thêm **BPF host routing**: gói của pod được chương trình eBPF chuyển thẳng giữa các card mạng, bỏ qua netfilter của node (dòng `Routing` trong `cilium-dbg status` khi đó ghi `Host: BPF`). Nhanh hơn, nhưng mọi thứ dựa vào luật iptables trên node thôi nhận được gói của pod. Trên kind, thứ đó là DNS: mỗi node có luật `DNAT` đưa truy vấn tới máy chủ DNS nhúng của Docker (`docker exec k6-lab-worker iptables-save -t nat | grep DOCKER_OUTPUT`), và khi chưa có dòng `hostLegacyRouting`, pod mất khả năng phân giải tên ngoài Internet, log CoreDNS báo `i/o timeout`. Với `hostLegacyRouting: true`, gói vẫn đi qua netfilter như cũ (`Host: Legacy`) trong khi masquerade và egress gateway chạy bằng eBPF. Bài học chung: đổi data plane sang eBPF thì phải kiểm lại mọi thứ từng dựa vào iptables trên node.
+
+</Callout>
+
+<Check id="k6.3.lab-egress-gateway">Bật được egress gateway, gán được IP egress cho node gateway, và chứng minh được đích bên ngoài thấy IP đó thay cho IP của node chạy pod.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `kubectl get ciliumnetworkpolicy` hiện `VALID False` | Policy sai cấu trúc hoặc sai giá trị (ví dụ biểu thức chính quy hỏng) | `kubectl -n k6-egress describe ciliumnetworkpolicy <tên>`, đọc phần `Status` |
+| `toFQDNs` đã viết mà đích vẫn timeout | Policy DNS thiếu `rules.dns` nên proxy không học được tên; hoặc pod dùng IP có sẵn mà chưa từng phân giải tên | `cilium-dbg fqdn cache list` không có tên đó |
+| Mọi lời gọi theo tên hỏng sau khi siết `rules.dns` | Search domain: tên được ghép với `*.svc.cluster.local` trước và bị từ chối | `./hubble.sh observe --protocol dns --verdict DROPPED` |
+| Nhận `403 Access denied` thay vì kết quả | Rule HTTP không khớp method, đường dẫn hoặc `Host` (nhớ cổng trong `Host`) | `./hubble.sh observe --type l7 --protocol http` in đúng URL bị từ chối |
+| `/clientip` vẫn in IP của node sau khi áp egress gateway | Chưa bật `egressGateway` và `bpf.masquerade`, chưa khởi động lại agent; label node sai; `destinationCIDRs` không chứa IP đích | `cilium-dbg bpf egress list` trên node chạy pod: không có dòng nào |
+| Áp egress gateway xong thì đích timeout | IP egress chưa được gán trên node gateway, hoặc không node nào mang label. Gán IP **sau** khi tạo policy thì Cilium không tự nhận: theo tài liệu, phải `kubectl apply` lại policy để nó chọn lại | `docker exec k6-lab-worker2 ip -br addr show eth0`; `kubectl get nodes -l egress-gw=true` |
+| `docker run` báo tên `k6-ext-api` đã tồn tại | Container còn lại từ lần làm trước | `docker ps -a --filter name=k6-ext`; chạy khối dọn dẹp rồi làm lại bước 1 |
+
+### Dọn dẹp
+
+K6.4 và K6.5 dùng lại cụm, Cilium và CoreDNS, không dùng namespace `k6-egress`, hai container ngoài cụm hay zone `ext.test`. Cấu hình egress gateway của Cilium (`egressGateway`, `bpf.masquerade`, `bpf.hostLegacyRouting`) được giữ nguyên: không có policy nào thì nó không làm gì.
+
+<Callout kind="danger">
+
+Khối đầu xoá policy egress gateway, namespace `k6-egress` cùng mọi thứ trong đó, hai container `k6-ext-api` và `k6-ext-khac` (chỉ đúng hai tên này), IP phụ trên `worker2`, và gỡ zone `ext.test` khỏi CoreDNS (CoreDNS của cả cụm khởi động lại). Khối thứ hai xoá cả cụm và thư mục lab; chỉ chạy khi không học tiếp K6.4. Kiểm `kubectl config current-context` in ra `kind-k6-lab` trước.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K6.4">
+
+```bash
+kubectl config current-context
+kubectl delete -f egress-gw.yaml
+kubectl delete namespace k6-egress
+kubectl label node k6-lab-worker2 egress-gw-
+docker exec k6-lab-worker2 sh -c 'ip -o -4 addr show eth0 | grep -o "[0-9.]*\.250\.1/16" | xargs -r -I{} ip addr del {} dev eth0'
+docker rm -f k6-ext-api k6-ext-khac
+kubectl -n kube-system get configmap coredns -o yaml \
+  | yq '.data.Corefile |= sub("ext\.test:53 \{[^}]*\}\n\}\n", "")' | kubectl replace -f -
+kubectl -n kube-system rollout restart deployment/coredns
+kubectl -n kube-system rollout status deployment/coredns --timeout=120s | tail -1
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k6-lab
+rm -rf ~/masteva-k6
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Áp chặn mặc định cho một namespace đang chạy production mà không làm sập nó, bằng cách nào?">
+
+Đừng bắt đầu bằng chặn. Bước 2 cho thấy Hubble ghi được cả đích lẫn tên miền pod hỏi; trên một namespace chưa có policy, cùng các lệnh `hubble observe` đó (bỏ `--verdict DROPPED`) cho bạn danh sách đích thật trong vài ngày, gồm cả những thứ không ai nhớ: job chạy cuối tháng, lời gọi tới dịch vụ đo lường. Cilium còn có chế độ audit cho policy (`policyAuditMode`), trong đó gói lẽ ra bị bỏ chỉ được ghi lại với verdict `AUDIT` thay vì bị bỏ; bài chưa chạy chế độ này. Trình tự an toàn: quan sát, viết policy cho phép từ dữ liệu quan sát, áp ở chế độ audit hoặc ở môi trường staging, xem còn gì bị ghi nhận, rồi mới chặn thật. Và luôn giữ sẵn lệnh gỡ policy: lỗi do policy luôn có dạng timeout, và người trực ít khi nghĩ tới policy đầu tiên.
+
+</Reveal>
+
+<Reveal title="Pod giữ một kết nối lâu tới api.ext.test. Đối tác đổi IP, bản ghi DNS hết hạn. Chuyện gì xảy ra?">
+
+Bảng `fqdn cache` ở bước 3 có cột TTL: mỗi ánh xạ tên sang IP chỉ có hiệu lực trong thời gian DNS trả về (Cilium có giá trị `dnsProxy.minTtl` để nâng TTL quá ngắn lên một mức tối thiểu). Khi hết hạn và pod không hỏi lại, IP cũ rời khỏi danh sách cho phép. Kết nối đang mở tới IP cũ không bị cắt ngay, nhưng kết nối **mới** tới IP đó sẽ bị chặn cho tới khi pod phân giải lại tên. Ứng dụng nào tự cache kết quả DNS lâu hơn TTL sẽ tiếp tục gọi IP mà policy không còn cho phép, và lỗi hiện ra như timeout ngẫu nhiên vài giờ sau một lần đối tác đổi IP. Hai cách phòng: ứng dụng tôn trọng TTL của DNS, và cảnh báo trên số gói bị bỏ theo policy của từng namespace.
+
+</Reveal>
+
+<Reveal title="Vì sao policy egress nên chặn riêng địa chỉ metadata của cloud?">
+
+Vì nó là một đích "nội bộ" mà mọi pod tới được và trả về thông tin xác thực của node. Sự cố trong callout đi đúng đường đó. Với chặn mặc định như bước 2, `169.254.169.254` đã bị chặn cùng mọi thứ khác; nguy cơ nằm ở lúc bạn mở rộng policy: một rule `toCIDR: 0.0.0.0/0` "cho ra Internet" vô tình mở luôn địa chỉ link-local này. Cilium cho viết ngoại lệ bằng `toCIDRSet` với `except`, và một `CiliumClusterwideNetworkPolicy` cấm đích đó cho mọi namespace là lớp nên có trên cụm chạy ở cloud. Bài không chạy phép thử này vì cụm lab không có dịch vụ metadata. Phía cloud, IMDS v2 và giới hạn số chặng của gói trả lời là lớp tương ứng (D10).
+
+</Reveal>
+
+<Reveal title="Egress gateway, NAT gateway của cloud, egress proxy: chọn cái nào?">
+
+Ba thứ giải ba bài toán gần nhau. NAT gateway của cloud cho **mọi** thứ trong subnet một IP nguồn cố định: đơn giản nhất, không phân biệt được pod nào với pod nào, tính tiền theo lưu lượng. Egress gateway của CNI chọn theo label của pod: đội thanh toán ra bằng IP A, phần còn lại ra đường thường; đổi lại bạn vận hành các node gateway và IP của chúng. Egress proxy (Envoy, Squid) làm việc ở tầng 7: lọc và ghi log theo URL, giữ thông tin xác thực với đối tác ở một chỗ, nhưng ứng dụng phải được cấu hình để gọi qua nó. Nhiều hệ thống dùng hai lớp: policy theo tên miền của bài này để giới hạn pod nào được ra đâu, cộng NAT gateway hoặc egress gateway để bên ngoài thấy IP ổn định.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết `CiliumNetworkPolicy` đúng cú pháp khá thường xuyên, và sai ở đúng những chỗ lab vừa cho bạn gặp: viết `toFQDNs` mà quên rule DNS có `rules.dns`, nên policy không bao giờ khớp; dùng `*.cluster.local` cho tên trong cụm; coi `toFQDNs` là ranh giới tuyệt đối giữa các tên miền; quên rằng `host` và `path` là biểu thức chính quy nên không escape dấu chấm. Với egress gateway, nó hay bỏ qua việc IP egress phải có sẵn trên node. Đừng duyệt bằng mắt. Mỗi policy AI viết phải đi kèm ba phép thử chạy thật: một đích được phép, một đích phải bị chặn, và một lệnh `hubble observe --verdict DROPPED` để xem cái bị chặn có đúng là cái bạn định chặn.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.4 dạy NetworkPolicy chuẩn và chặn egress cơ bản; K2.1 dạy `ndots` và search domain, nguồn gốc cái bẫy ở bước 5. K6.1 dựng Cilium, Hubble và bật thay kube-proxy mà egress gateway cần. K6.5 đi sâu CoreDNS, thứ mọi policy theo tên miền dựa vào. K5.1 dạy taint để dành riêng node làm gateway. K8 siết phần còn lại của pod: admission, seccomp, phát hiện hành vi lúc chạy. D10 dạy NAT gateway, IMDS và IAM phía cloud; D9.6 dạy Envoy nếu bạn cần một egress proxy tầng 7. K11 thêm mTLS và phân quyền giữa các service trong cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k6.3.mastery-policy">Tự viết được bộ policy egress cho một namespace: chặn mặc định, DNS giới hạn theo tên có tính search domain, một đích ngoài cụm theo tên miền, và kiểm bằng cả đích được phép lẫn đích bị chặn.</Check>
+
+<Check id="k6.3.mastery-gioi-han">Nói được policy theo tên miền **không** bảo đảm điều gì (tên chung IP, HTTPS không đọc được đường dẫn, ứng dụng cache DNS quá TTL), và lớp nào bù cho từng điểm.</Check>
+
+<Check id="k6.3.mastery-ip-nguon">Với yêu cầu "đối tác chỉ nhận request từ một IP", chọn được giữa egress gateway, NAT gateway và egress proxy, và nêu được điểm hỏng đơn lẻ của phương án đã chọn.</Check>
+
+</Mastery>

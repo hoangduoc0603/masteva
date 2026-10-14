@@ -1,0 +1,991 @@
+---
+title: "Operator quản lý database: CloudNativePG"
+description: Vì sao StatefulSet chưa đủ để chạy PostgreSQL, operator thêm vào những gì, và tự tay làm trọn vòng với CloudNativePG, từ dựng cụm ba instance, đo failover và switchover, tới sao lưu liên tục ra object storage và khôi phục về một thời điểm trước khi xoá nhầm dữ liệu.
+id: k7.4
+step: k7
+prerequisites: [k7.1, d11.4]
+topics: [k7.operator-database]
+status: verified
+verified:
+  date: 2026-10-13
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    cloudnative-pg: 1.30.1 (operator và plugin kubectl cnpg)
+    plugin-barman-cloud: 0.15.1
+    cert-manager: 1.21.2
+    postgresql: 18.6 (image ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie)
+    rustfs: 1.0.1
+---
+
+<Goal>
+
+K1.4 kết thúc phần StatefulSet bằng một câu: nó không biết gì về database. Bài này lấp chỗ trống đó bằng một **operator**, và dùng nó như người vận hành dùng: làm hỏng, đo, sao lưu, khôi phục. Học xong, bạn giải thích được:
+
+- Ba pod PostgreSQL trong một StatefulSet còn thiếu những gì để thành một database chịu được lỗi.
+- Trong vài chục giây sau khi primary biến mất, ai làm gì theo thứ tự nào, và switchover có kế hoạch khác ở chỗ nào.
+- Vì sao bật replication đồng bộ có thể làm mọi lệnh ghi đứng yên.
+- Vì sao khôi phục về một thời điểm cần cả base backup lẫn WAL, và vì sao kết quả là một cụm mới.
+- Khi nào không nên tự chạy database trong cụm.
+
+</Goal>
+
+<Knowledge>
+
+### StatefulSet cho bạn cái gì, và thiếu cái gì
+
+K1.4 đã dạy bốn bảo đảm của StatefulSet: tên ổn định, địa chỉ ổn định, ổ đĩa riêng, thứ tự. Đó là cái nền. Một database có nhân bản cần thêm cả một danh sách việc mà StatefulSet, vốn không biết ứng dụng bên trong là gì, không làm được:
+
+| Việc | Với StatefulSet trần | Ai phải làm |
+|---|---|---|
+| Dựng replication | Ba pod là ba database rời nhau | Chép dữ liệu từ primary (`pg_basebackup`), cấu hình streaming |
+| Biết ai là primary | Mọi pod như nhau; Service trỏ tới cả ba | Một nơi ghi nhận vai trò, một Service chỉ trỏ tới primary |
+| Failover | Pod chết được tạo lại **đúng chỗ cũ**; không ai promote replica | Phát hiện, chọn replica theo kịp nhất, promote, trỏ lại client |
+| Chặn hai primary (fencing) | Không có khái niệm | Bảo đảm primary cũ đã dừng trước khi có primary mới |
+| Sao lưu | Không | Base backup định kỳ, lưu WAL liên tục, khôi phục theo thời điểm |
+| Nâng cấp | Rollout từ số lớn xuống, bất kể vai | Replica trước, primary sau cùng, có switchover |
+| Nới đĩa | `volumeClaimTemplates` không sửa được (K7.1) | Sửa từng PVC |
+
+Không có operator, cột "ai phải làm" là script, runbook và một người trực. Operator sinh ra để lấp đúng cột đó.
+
+### Operator: kiến thức vận hành viết thành controller
+
+**Operator** là một controller (K1.1: vòng so sánh trạng thái mong muốn với thực tế) cho một loại object do chính nó định nghĩa bằng **CRD** (custom resource definition, cách thêm một `kind` mới vào API). Bạn khai "tôi muốn một cụm PostgreSQL ba instance, sao lưu vào bucket này"; operator làm mọi việc ở cột phải của bảng trên, và làm lại mỗi khi thực tế lệch khỏi lời khai. K9 dạy viết operator; bài này chỉ dùng.
+
+Bài dùng **CloudNativePG** (CNPG), operator PostgreSQL thuộc CNCF, giấy phép Apache 2.0. Vài quyết định thiết kế của nó cần biết trước khi nhìn vào cụm:
+
+```text
+   kubectl apply  Cluster "pg" (instances: 3)
+        |
+        v
+  +---------------------------+        tạo và giữ đúng:
+  | operator                  |
+  | cnpg-controller-manager   | ---->  Pod pg-1, pg-2, pg-3    (KHÔNG có StatefulSet)
+  | (namespace cnpg-system)   |        PVC pg-1, pg-2, pg-3    (mỗi instance một PVC)
+  +---------------------------+        Service pg-rw, pg-ro, pg-r
+        ^                              Secret (mật khẩu app, chứng chỉ TLS)
+        | trạng thái                   PodDisruptionBudget, Lease "pg"
+        |
+  trong MỖI pod: instance manager (PID 1) -> khởi động, theo dõi, promote, tắt postgres
+```
+
+- **Không dùng StatefulSet.** Operator tự tạo từng pod và từng PVC. Lý do: primary và replica là hai loại pod khác nhau, thứ tự thao tác phụ thuộc **vai trò** chứ không phụ thuộc số thứ tự, và operator cần tự quyết khi nào bỏ một PVC hỏng để dựng lại instance từ primary.
+- **Instance manager.** Trong mỗi pod, tiến trình số 1 không phải `postgres` mà là một chương trình của CNPG. Nó khởi động và tắt PostgreSQL đúng cách, trả lời probe, và thực hiện lệnh promote của operator.
+- **Không dùng chung đĩa (shared-nothing).** Mỗi instance có PVC riêng, nên đặt mỗi instance trên một node khác nhau và dùng đĩa cục bộ của node. Tính sẵn sàng đến từ replication của PostgreSQL, không đến từ hệ lưu trữ.
+
+Ba Service, khác nhau ở selector:
+
+| Service | Trỏ tới | Dùng cho |
+|---|---|---|
+| `<cụm>-rw` | Chỉ primary | Ghi, và đọc cần thấy ngay điều vừa ghi |
+| `<cụm>-ro` | Chỉ replica | Đọc chịu được trễ vài mili giây tới vài giây |
+| `<cụm>-r` | Mọi instance | Đọc không quan tâm vai |
+
+Khi primary đổi, operator đổi label của pod và Service `-rw` trỏ sang pod mới. Ứng dụng chỉ cần một điều: **tự kết nối lại** khi kết nối cũ đứt.
+
+<Check id="k7.4.operator-mo-hinh">Kể được ít nhất năm việc một database có nhân bản cần mà StatefulSet không làm, operator là gì, CloudNativePG tạo những object nào cho một Cluster và vì sao không dùng StatefulSet, và ba Service `-rw`, `-ro`, `-r` khác nhau thế nào.</Check>
+
+### Replication: bất đồng bộ, đồng bộ, và cái giá
+
+PostgreSQL ghi mọi thay đổi vào **WAL** (write-ahead log, nhật ký ghi trước) rồi mới sửa file dữ liệu. Replica nhận dòng WAL đó qua mạng (**streaming replication**) và phát lại. Câu hỏi là: primary có chờ replica không?
+
+| | Bất đồng bộ (mặc định) | Đồng bộ, `required` (mặc định khi bật) | Đồng bộ, `preferred` |
+|---|---|---|---|
+| `COMMIT` trả về khi | Primary đã ghi WAL xuống đĩa | Thêm ít nhất N standby đã nhận WAL | Như `required` nếu đủ standby; thiếu thì không chờ |
+| Primary chết đột ngột | Có thể mất vài giao dịch cuối chưa kịp gửi đi | Giao dịch đã báo thành công có ở ít nhất một standby | Có thể mất, nếu lúc đó đang thiếu standby |
+| Mọi standby hỏng | Ghi bình thường | **Ghi đứng yên** | Ghi bình thường |
+
+Hai con số của mọi cuộc bàn về database: **RPO** (recovery point objective) là mất tối đa bao nhiêu dữ liệu; **RTO** (recovery time objective) là ngừng tối đa bao lâu. Đồng bộ đẩy RPO của một lần failover về 0 (trừ một khe hở nói ở phần Đào sâu) và trả bằng độ trễ của mỗi lệnh ghi cùng rủi ro ghi đứng yên. Trong CNPG khai ở `.spec.postgresql.synchronous` với `method: any`, `number: 1` (một standby bất kỳ trong số còn lại). Bước 5 của lab cho thấy cột giữa.
+
+<Check id="k7.4.replication">Giải thích được bất đồng bộ và đồng bộ khác nhau ở thời điểm `COMMIT` trả về, mỗi kiểu mất gì khi primary chết và khi mọi standby hỏng, và RPO, RTO là gì.</Check>
+
+### Failover và switchover
+
+**Failover** là phản ứng khi primary hỏng ngoài ý muốn. **Switchover** là đổi primary có chủ đích, khi primary cũ còn khoẻ.
+
+```text
+ FAILOVER
+  (1) Phát hiện   readiness của pod primary thất bại; operator thấy ở vòng reconcile kế.
+                  Node chết hẳn: phải chờ Kubernetes đánh dấu node Unknown, khoảng 50 tới 55 giây
+  (2) Dừng cũ     operator đặt targetPrimary = "pending": primary cũ (nếu còn) phải tắt,
+                  các replica ngừng nhận WAL
+  (3) Chọn mới    operator chọn replica theo kịp nhất. Replica đó phải lấy được Lease
+                  mang tên cụm rồi mới được promote. Primary cũ tắt sạch thì nhả lease ngay;
+                  chết đột ngột thì replica chờ lease hết hạn (mặc định 15 giây)
+  (4) Promote     replica thành primary; operator đổi label, Service -rw trỏ sang pod mới
+  (5) Primary cũ, khi quay lại, thấy mình không còn là primary và nối vào làm replica
+
+ SWITCHOVER   bỏ bước (1): primary cũ CHECKPOINT, tắt nhanh, đẩy hết WAL, nhả lease;
+              replica được chọn đã có đủ dữ liệu, promote ngay
+```
+
+Hai cơ chế **thu hẹp** khả năng hai primary cùng nhận ghi (split-brain, D9.3 đã gặp với VIP); không cái nào đóng kín hẳn:
+
+- **Lease:** chỉ instance giữ lease mới được promote. Release notes 1.30 nói rõ nó là cổng cho việc promote, không phải hàng rào: nó không dừng được một primary cũ còn đang chạy.
+- **Kiểm tra cô lập:** primary không tới được API server lẫn các instance khác sẽ tự báo liveness thất bại, và kubelet khởi động lại container. Lần tắt đó là "smart shutdown": không nhận kết nối mới, nhưng phiên đang mở vẫn commit được tới hết `smartShutdownTimeout` (mặc định 180 giây). Hệ thống không chịu được khoảng đó thì đặt `smartShutdownTimeout: 0`.
+
+**Fencing** là công cụ của người vận hành: đánh dấu một instance là "không được chạy". PostgreSQL trong pod đó bị tắt, pod và đĩa giữ nguyên để điều tra.
+
+Failover luôn có gián đoạn ghi, switchover cũng vậy. Bài học thực dụng: bảo trì thì dùng switchover, **không xoá pod primary** (switchover cho primary cũ đẩy hết WAL trước khi nhường, nên không giao dịch nào bị bỏ lại); và đo RTO của chính cụm mình, đừng tin con số trong tài liệu.
+
+<Callout kind="production">
+
+Chiều 10/10/2017, API và Dashboard của GoCardless ngừng 1 giờ 50 phút. Theo [bài tường thuật của họ](https://gocardless.com/blog/incident-review-api-and-dashboard-outage-on-10th-october/), PostgreSQL chạy trên cụm ba node (primary, một replica đồng bộ, một bất đồng bộ), và phần mềm Pacemaker lo việc đưa replica lên khi primary hỏng, một việc bình thường mất 1 tới 2 phút. Hôm đó mảng đĩa của primary hỏng, nhưng tự động hoá không promote được replica nào. Đội vận hành mất khoảng một giờ thử nhiều cách; mỗi lần họ sửa cấu hình để replica đồng bộ thành primary, Pacemaker lại đưa nó về cấu hình cũ. Cuối cùng họ đặt cụm vào chế độ bảo trì, tự tay cấu hình replica đồng bộ thành primary và trỏ ứng dụng thẳng vào địa chỉ của nó.
+
+Điều tra sau đó cho thấy phải đủ ba điều kiện cùng lúc: một thiết lập "dính" tài nguyên của Pacemaker, một luật cấm địa chỉ ảo dùng cho backup nằm chung node với primary (địa chỉ đó lúc ấy đang ở đúng replica đồng bộ), và một tiến trình con của PostgreSQL trên replica đồng bộ crash gần như cùng lúc với sự cố đĩa. Bỏ một trong ba, cụm failover bình thường. Hai điều họ tự rút ra: có những lỗi cấu hình chỉ lộ ra khi **tiêm lỗi** có chủ đích; và "tự động hoá bào mòn hiểu biết": sau hai năm tự động hoá xử lý tốt mọi lần hỏng, kỹ năng thao tác tay của đội đã mai một, và runbook lâu không dùng thì gần như chắc chắn đã cũ.
+
+Điều rút ra cho bài này (của bài): operator là tự động hoá cùng loại. Nó làm đúng trong các trường hợp đã được nghĩ tới, và đội vận hành vẫn phải biết promote bằng tay, biết đọc trạng thái cụm, và tập những việc đó định kỳ. Lab dưới là một buổi tập như thế.
+
+</Callout>
+
+<Check id="k7.4.failover-switchover">Kể được các bước của một lần failover và chỗ switchover khác đi, Lease và kiểm tra cô lập làm được gì và để hở điều gì, và fencing dùng khi nào.</Check>
+
+### Sao lưu liên tục và khôi phục theo thời điểm
+
+K7.1 kết luận snapshot không phải backup. Với PostgreSQL, backup đúng nghĩa gồm hai thứ **nằm ngoài cụm**:
+
+- **Base backup:** bản chép toàn bộ file dữ liệu tại một thời điểm, lấy được khi database đang chạy.
+- **WAL archive:** mọi file WAL kể từ base backup, được đẩy đi ngay khi mỗi file đầy, hoặc sau tối đa 5 phút (`archive_timeout` mà CNPG đặt sẵn). Con số 5 phút đó là RPO khi mất **cả cụm**.
+
+```text
+   base backup B1            base backup B2
+        |------ WAL ------------|------ WAL ------------------> hiện tại
+                                          ^ T: ngay trước lệnh xoá nhầm
+
+ Khôi phục về T (PITR) = chép B2 (bản gần nhất xong TRƯỚC T)
+                         + phát lại WAL từ B2 tới đúng T rồi dừng
+                       -> thành một cụm MỚI; cụm gốc không bị đụng tới
+```
+
+Có WAL mà không có base backup thì không khôi phục được gì. Có base backup mà thiếu một đoạn WAL thì chỉ khôi phục được tới chỗ đứt. Và khôi phục luôn ra **cụm mới**: bạn kiểm tra dữ liệu ở đó, rồi quyết định chuyển ứng dụng sang hay chỉ chép phần đã mất về.
+
+Từ bản 1.26, CNPG chuyển phần sao lưu ra **plugin**. Cách cấu hình `barmanObjectStore` nằm thẳng trong Cluster vẫn chạy nhưng đã deprecated, và release notes 1.30 ghi nó sẽ bị gỡ ở 1.31; cách hiện hành là **plugin Barman Cloud**: một Deployment trong namespace của operator, một CRD `ObjectStore` mô tả bucket, và một sidecar được chèn vào mỗi pod instance để đẩy WAL. Image PostgreSQL loại `system` (kèm sẵn Barman) cũng deprecated theo; dùng `minimal` hoặc `standard`.
+
+Một backup chưa từng được khôi phục thử thì chưa phải backup. Bước 7 của lab là lần thử bằng tay; kiểm tra khôi phục tự động là một chủ đề của D19, diễn tập khôi phục là của D20.
+
+<Check id="k7.4.backup-pitr">Giải thích được base backup và WAL archive mỗi thứ dùng để làm gì, RPO khi mất cả cụm đến từ đâu, PITR ghép hai thứ đó thế nào, và vì sao khôi phục tạo ra cụm mới.</Check>
+
+### Nâng cấp, và câu hỏi có nên tự chạy database không
+
+**Nâng cấp minor** (18.5 lên 18.6: vá lỗi, không đổi định dạng lưu trữ) là đổi `imageName` của Cluster. Operator làm **rolling update**: thay từng replica một, sau cùng mới tới primary, bằng khởi động lại tại chỗ hoặc switchover sang một replica đã mới (`primaryUpdateMethod`). Đặt `primaryUpdateStrategy: supervised` thì operator dừng trước bước primary và chờ bạn ra lệnh, để chọn giờ. Đổi một tham số cần khởi động lại, hay đổi `resources`, đi cùng con đường đó. **Nâng cấp major** (17 lên 18) đổi định dạng lưu trữ; CNPG có ba cách (dump rồi restore sang cụm mới, logical replication sang cụm mới, `pg_upgrade` tại chỗ có ngừng dịch vụ), cách nào cũng cần kế hoạch và thử trước, và không thuộc bài này.
+
+Operator làm cho việc chạy database trong cụm **khả thi**, không làm cho nó **miễn phí**. D19 có riêng một chủ đề cho câu hỏi đặt database ở đâu; các tiêu chí chính:
+
+| | Nghiêng về tự chạy bằng operator | Nghiêng về dịch vụ được quản lý |
+|---|---|---|
+| Hạ tầng | On-prem, bare metal, hoặc phải chạy giống nhau trên nhiều nơi | Đã ở hẳn trên một cloud |
+| Con người | Có người hiểu PostgreSQL và có lịch trực | Đội nhỏ, không ai chuyên database |
+| Yêu cầu | Cần extension, phiên bản, cấu hình hoặc độ trễ mà dịch vụ không đáp ứng | Nhu cầu chuẩn, chấp nhận giới hạn của nhà cung cấp |
+| Ai gánh sự cố | Bạn: đĩa đầy, replica trễ, khôi phục | Nhà cung cấp gánh phần hạ tầng; schema và truy vấn chậm vẫn là của bạn |
+| Chi phí | Trả bằng phần cứng và công vận hành, kể cả lịch trực | Trả theo cấu hình và dung lượng thuê; ít công vận hành hạ tầng |
+| Nơi đặt dữ liệu | Quy định buộc dữ liệu nằm ở nơi nhà cung cấp không có vùng phù hợp | Nhà cung cấp có vùng đáp ứng quy định (D10) |
+
+Operator tự động hoá thao tác. Nó không thay được việc hiểu PostgreSQL đang làm gì khi thao tác đó thất bại.
+
+<Check id="k7.4.nang-cap-va-lua-chon">Kể được thứ tự của một lần rolling update, và nêu được ba tiêu chí để chọn giữa tự chạy database bằng operator với dùng dịch vụ được quản lý.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [CloudNativePG 1.30](https://cloudnative-pg.io/docs/1.30/): tài liệu của đúng bản dùng trong bài; bắt đầu ở "Architecture", rồi "Automated failover" và "Replication"; phần "Custom Pod Controller" giải thích vì sao không dùng StatefulSet.
+- [Barman Cloud Plugin](https://cloudnative-pg.io/plugin-barman-cloud/docs/intro/): cài plugin, CRD ObjectStore, cấu hình cho từng loại object storage và phần xử lý sự cố.
+- [PostgreSQL: Continuous Archiving and Point-in-Time Recovery](https://www.postgresql.org/docs/18/continuous-archiving.html): cơ chế gốc mà mọi công cụ sao lưu PostgreSQL dựa vào; đọc mục 25.3.6 về timeline.
+- [Operator pattern | Kubernetes](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/): định nghĩa operator và quan hệ với CRD, controller.
+- [Incident review: API and Dashboard outage on 10 October 2017 (GoCardless)](https://gocardless.com/blog/incident-review-api-and-dashboard-outage-on-10th-october/): nguồn của callout; đáng đọc trọn phần điều tra.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k7-lab` của K7.1 (kind, 1 control plane và 3 worker). Nếu đã xoá cụm, chạy lại khối lệnh đầu tiên ở bước 1 của K7.1; bài này không cần driver CSI hay snapshot-controller, chỉ cần StorageClass `standard` có sẵn của kind. Cần thêm `curl`.
+
+**Profile máy.** Cuối bài, bốn node dùng khoảng 2,1 tới 2,2 GiB RAM của Docker (control plane 0,85 GiB, mỗi worker 0,35 tới 0,55 GiB) và chiếm 7 tới 9 GB đĩa của Docker; đĩa của Docker còn dưới 10 GB trống thì dọn trước khi bắt đầu. Lần đầu, mỗi worker phải kéo ba image (PostgreSQL khoảng 80 MB, sidecar của plugin khoảng 105 MB, operator khoảng 40 MB), nên bước 2 thường mất 5 tới 15 phút, mạng chậm thì lâu hơn. Máy 8 GB: đặt Docker 4 GB, dừng mọi VM và cụm khác.
+
+Ba thứ lab làm cho gọn mà production không làm: object storage nằm **trong cùng cụm và cùng namespace** với database (thật thì phải nằm ngoài cụm, nếu không backup chết chung với thứ nó bảo vệ); khoá truy cập gõ thẳng trên dòng lệnh; và mỗi instance chỉ được 256 MiB RAM.
+
+<Callout kind="danger">
+
+Bài này cố ý xoá pod primary, tắt PostgreSQL trên các replica và xoá dữ liệu trong một bảng. Mọi lệnh chỉ dành cho cụm lab. Trước khi bắt đầu, kiểm `kubectl config current-context` in ra `kind-k7-lab`.
+
+</Callout>
+
+### 1. Cài operator, plugin và object storage
+
+Operator trước. Manifest cài CRD, quyền và một Deployment vào namespace `cnpg-system`.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k7/kubeconfig
+mkdir -p ~/masteva-k7/k7-4 ~/masteva-k7/bin && cd ~/masteva-k7/k7-4
+kubectl config current-context
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.30/releases/cnpg-1.30.1.yaml > /dev/null
+kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=300s | tail -1
+kubectl get crd -o name | grep postgresql.cnpg.io | sed 's|.*/||; s|\.postgresql.*||' | tr '\n' ' '; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k7-lab
+deployment "cnpg-controller-manager" successfully rolled out
+backups clusterimagecatalogs clusters databaseroles databases failoverquorums imagecatalogs poolers publications scheduledbackups subscriptions 
+```
+
+</Expected>
+
+Mười một CRD, mỗi cái là một `kind` mới mà operator hiểu. Bài dùng `clusters` và `backups`.
+
+Kế đến là plugin `cnpg` cho `kubectl`: công cụ của người vận hành để xem trạng thái, switchover, fencing. Khối dưới tải bản dựng sẵn vào thư mục lab, **kiểm sha256** với file checksum của cùng bản phát hành, rồi thêm thư mục đó vào `PATH` của terminal này. Lệnh `shasum` phải in `OK`; không khớp thì `tar` không chạy. Bài chạy binary trên macOS arm64; với `darwin_x86_64`, `linux_x86_64` và `linux_arm64` mới kiểm tên file và checksum, chưa chạy binary.
+
+<Terminal where="mac">
+
+```bash
+V=1.30.1; OS=$(uname -s | tr A-Z a-z); ARCH=$(uname -m | sed 's/aarch64/arm64/')
+F=kubectl-cnpg_${V}_${OS}_${ARCH}.tar.gz
+curl -sLO https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v$V/$F
+curl -sL https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v$V/cnpg-$V-checksums.txt \
+  | grep " $F\$" | shasum -a 256 -c - \
+  && tar -xzf $F -C ~/masteva-k7/bin kubectl-cnpg
+export PATH=~/masteva-k7/bin:$PATH
+kubectl cnpg version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kubectl-cnpg_1.30.1_darwin_arm64.tar.gz: OK
+Build: {Version:1.30.1 Commit:2a35abb46 Date:2026-09-23}
+```
+
+</Expected>
+
+**Mọi terminal dùng cho bài này cần hai dòng:** `export KUBECONFIG=~/masteva-k7/kubeconfig` và `export PATH=~/masteva-k7/bin:$PATH`.
+
+Plugin Barman Cloud cần cert-manager để cấp chứng chỉ TLS cho kết nối giữa nó và operator, nên cài cert-manager trước. Plugin phải nằm cùng namespace với operator.
+
+<Terminal where="mac">
+
+```bash
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.2/cert-manager.yaml > /dev/null
+kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=300s > /dev/null
+kubectl apply -f https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/v0.15.1/manifest.yaml > /dev/null
+kubectl -n cnpg-system rollout status deploy/barman-cloud --timeout=300s | tail -1
+kubectl get crd -o name | grep barmancloud
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "barman-cloud" successfully rolled out
+customresourcedefinition.apiextensions.k8s.io/objectstores.barmancloud.cnpg.io
+```
+
+</Expected>
+
+Cuối cùng là nơi chứa backup. MinIO, lựa chọn quen thuộc cho S3 tự host, đã ngừng bản cộng đồng từ 2026; lab dùng **RustFS**, cũng là ví dụ trong tài liệu của plugin. Tạo namespace cho bài, một Secret giữ cặp khoá, và RustFS đọc khoá từ chính Secret đó.
+
+<Terminal where="mac" title="~/masteva-k7/k7-4/rustfs.yaml">
+
+```bash
+kubectl create namespace k7-db
+kubectl config set-context --current --namespace k7-db > /dev/null
+kubectl create secret generic s3-creds \
+  --from-literal=ACCESS_KEY_ID=masteva --from-literal=ACCESS_SECRET_KEY=masteva-secret
+cat > rustfs.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rustfs-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: rustfs }
+  template:
+    metadata:
+      labels: { app: rustfs }
+    spec:
+      containers:
+        - name: rustfs
+          image: rustfs/rustfs:1.0.1
+          env:
+            - name: RUSTFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: s3-creds, key: ACCESS_KEY_ID }
+            - name: RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: s3-creds, key: ACCESS_SECRET_KEY }
+          ports:
+            - containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rustfs-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs
+spec:
+  selector: { app: rustfs }
+  ports:
+    - port: 9000
+EOF
+kubectl apply -f rustfs.yaml > /dev/null
+kubectl rollout status deploy/rustfs --timeout=300s | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k7-db created
+secret/s3-creds created
+deployment "rustfs" successfully rolled out
+```
+
+</Expected>
+
+### 2. Dựng cụm ba instance và xem operator tạo gì
+
+Hai object: `ObjectStore` mô tả bucket, và `Cluster`. Phần `plugins` của Cluster bật lưu WAL liên tục ngay từ đầu.
+
+<Terminal where="mac" title="~/masteva-k7/k7-4/pg.yaml">
+
+```bash
+cat > pg.yaml <<'EOF'
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: s3-store
+spec:
+  configuration:
+    destinationPath: s3://pg-backups/
+    endpointURL: http://rustfs:9000
+    s3Credentials:
+      accessKeyId: { name: s3-creds, key: ACCESS_KEY_ID }
+      secretAccessKey: { name: s3-creds, key: ACCESS_SECRET_KEY }
+    wal:
+      compression: gzip
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie
+  storage:
+    storageClass: standard
+    size: 1Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: s3-store
+EOF
+kubectl apply -f pg.yaml
+kubectl wait --for=condition=Ready cluster/pg --timeout=1800s
+kubectl get cluster pg
+kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/podRole=instance -o custom-columns='POD:.metadata.name,ROLE:.metadata.labels.cnpg\.io/instanceRole,NODE:.spec.nodeName,OWNER:.metadata.ownerReferences[0].kind'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+objectstore.barmancloud.cnpg.io/s3-store created
+cluster.postgresql.cnpg.io/pg created
+cluster.postgresql.cnpg.io/pg condition met
+NAME   AGE     INSTANCES   READY   STATUS                     PRIMARY
+pg     4m51s   3           3       Cluster in healthy state   pg-1
+POD    ROLE      NODE             OWNER
+pg-1   primary   k7-lab-worker2   Cluster
+pg-2   replica   k7-lab-worker    Cluster
+pg-3   replica   k7-lab-worker3   Cluster
+```
+
+</Expected>
+
+Operator dựng lần lượt: một Job `initdb` tạo `pg-1`, rồi mỗi replica được một Job `join` chép dữ liệu từ primary. Lượt này mất gần 5 phút kể cả kéo image; một lượt khác, khi image đã có sẵn trên node, mất 2 phút. Label `cnpg.io/podRole=instance` lọc ra pod chạy PostgreSQL; thiếu nó, lệnh còn in cả pod của các Job vừa xong trong vài chục giây đầu. Ba pod nằm trên ba node (operator tự thêm anti-affinity), và chủ của mỗi pod là object `Cluster`, không phải ReplicaSet hay StatefulSet. Xem phần còn lại:
+
+<Terminal where="mac">
+
+```bash
+kubectl get statefulset
+kubectl get pvc -o custom-columns='PVC:.metadata.name,STATUS:.status.phase,CLASS:.spec.storageClassName'
+kubectl get svc -l cnpg.io/cluster=pg -o custom-columns='SERVICE:.metadata.name,SELECTOR:.spec.selector'
+kubectl get lease pg -o custom-columns='LEASE:.metadata.name,HOLDER:.spec.holderIdentity'
+until [ "$(kubectl get pdb pg -o jsonpath='{.status.disruptionsAllowed}')" = 1 ]; do sleep 1; done
+kubectl get pdb
+kubectl get secret -o name | grep pg-
+kubectl get pod pg-1 -o jsonpath='{.spec.initContainers[*].name} | {.spec.containers[*].name}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+No resources found in k7-db namespace.
+PVC           STATUS   CLASS
+pg-1          Bound    standard
+pg-2          Bound    standard
+pg-3          Bound    standard
+rustfs-data   Bound    standard
+SERVICE   SELECTOR
+pg-r      map[cnpg.io/cluster:pg cnpg.io/podRole:instance]
+pg-ro     map[cnpg.io/cluster:pg cnpg.io/instanceRole:replica]
+pg-rw     map[cnpg.io/cluster:pg cnpg.io/instanceRole:primary]
+LEASE   HOLDER
+pg      pg-1
+NAME         MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+pg           1               N/A               1                     4m52s
+pg-primary   1               N/A               0                     4m52s
+secret/pg-app
+secret/pg-ca
+secret/pg-replication
+secret/pg-server
+bootstrap-controller plugin-barman-cloud | postgres
+```
+
+</Expected>
+
+Đối chiếu với sơ đồ ở phần Kiến thức:
+
+- Không có StatefulSet. Mỗi instance một PVC, trên `standard` nên là đĩa cục bộ của node: đúng kiểu shared-nothing.
+- Ba Service khác nhau đúng một label trong selector. Failover là operator đổi label `cnpg.io/instanceRole` trên pod.
+- Lease `pg` đang do `pg-1` giữ.
+- Hai PodDisruptionBudget (K5.2): `pg-primary` không cho rút pod primary, nên `kubectl drain` node của primary sẽ chờ operator switchover xong trước. PDB `pg` có thể báo 0 trong vài giây đầu sau khi cụm vừa sẵn sàng; vòng `until` chờ nó lên 1.
+- Secret `pg-app` chứa tài khoản cho ứng dụng (user `app`, database `app`, mật khẩu sinh ngẫu nhiên, cả chuỗi kết nối dựng sẵn); ba Secret kia là chứng chỉ TLS mà operator tự cấp và tự gia hạn.
+- Pod có một container chính, `postgres`, và hai init container. `bootstrap-controller` chép instance manager vào pod. `plugin-barman-cloud` là sidecar kiểu K1.3 (init container có `restartPolicy: Always`, chạy suốt đời pod): nó sẽ đẩy WAL đi.
+
+<Check id="k7.4.lab-dung-cum">Dựng được một cụm PostgreSQL ba instance bằng một object `Cluster`, và chỉ ra được bằng lệnh: không có StatefulSet, mỗi instance một PVC, selector của ba Service, Lease và hai PDB.</Check>
+
+### 3. Ghi liên tục, rồi xoá pod primary
+
+Cần một "ứng dụng" để thấy gián đoạn. Deployment `writer` nối vào `pg-rw` bằng tài khoản trong Secret `pg-app`, mỗi vòng mở một kết nối mới, chèn một dòng vào bảng `ticks` rồi nghỉ 0,2 giây; lỗi thì in giờ ra log. Mỗi dòng tự ghi thời điểm và địa chỉ của instance đã nhận nó.
+
+Hàm `sql` chạy một câu SQL trên primary hiện tại của một cụm (mặc định `pg`) bằng `kubectl exec`. Khi làm việc tương tác, `kubectl cnpg psql pg` mở thẳng một phiên `psql`.
+
+<Terminal where="mac" title="~/masteva-k7/k7-4/writer.yaml">
+
+```bash
+sql() { kubectl exec "$(kubectl get cluster ${2:-pg} -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -Atc "$1"; }
+sql "create table ticks (id bigserial primary key, at timestamptz not null default clock_timestamp(), via inet not null default inet_server_addr()); alter table ticks owner to app"
+cat > writer.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writer
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: writer }
+  template:
+    metadata:
+      labels: { app: writer }
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: writer
+          image: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie
+          env:
+            - { name: PGHOST, value: pg-rw }
+            - { name: PGDATABASE, value: app }
+            - { name: PGCONNECT_TIMEOUT, value: "1" }
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef: { name: pg-app, key: username }
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: { name: pg-app, key: password }
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                psql -qAt -c "insert into ticks default values" > /dev/null 2>&1 \
+                  || echo "$(date -u +%T) ghi thất bại"
+                sleep 0.2
+              done
+EOF
+kubectl apply -f writer.yaml > /dev/null
+kubectl rollout status deploy/writer --timeout=120s > /dev/null
+until [ "$(sql 'select count(*) > 20 from ticks')" = t ]; do sleep 2; done
+sql "select count(*), count(distinct via) from ticks"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CREATE TABLE
+ALTER TABLE
+25|1
+```
+
+</Expected>
+
+Vài chục dòng, tất cả qua một địa chỉ: primary. Giờ xoá pod primary; biến `N` nhớ dòng cuối trước sự cố để phép đo chỉ tính từ đó. **Lệnh `kubectl delete pod` dưới đây làm database ngừng nhận ghi: chỉ chạy trên `kind-k7-lab`.** Khối này có thể mất tới 5 phút lúc máy bận, phần lớn là chờ primary cũ nối lại làm replica.
+
+<Predict question="Xoá pod primary. PVC của nó còn nguyên, và operator sẽ tạo lại pod ngay. Việc ghi có chỉ gián đoạn vài giây, bằng thời gian pod khởi động lại không?">
+
+Không, và lý do nằm ở thứ tự: operator không chờ pod cũ quay lại. Thấy primary không sẵn sàng là nó bắt đầu failover: buộc primary cũ dừng hẳn, chọn một replica, chờ replica đó lấy được lease, promote, rồi mới đổi Service. Mỗi bước vài giây tới chục giây. Pod cũ quay lại sau đó, với tư cách replica. Tổng thời gian không ghi được ở lab này từ nửa phút tới hơn một phút, dài hơn hẳn thời gian khởi động một pod.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+N=$(sql "select max(id) from ticks")
+P=$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')
+kubectl delete pod $P --wait=false
+until [ "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" != "$P" ]; do sleep 1; done
+kubectl wait --for=condition=Ready cluster/pg --timeout=600s > /dev/null
+kubectl get pods -l cnpg.io/cluster=pg -o custom-columns='POD:.metadata.name,ROLE:.metadata.labels.cnpg\.io/instanceRole,RESTARTS:.status.containerStatuses[0].restartCount'
+kubectl get events --field-selector involvedObject.kind=Cluster -o custom-columns='REASON:.reason,MESSAGE:.message' | grep -i failover
+sql "select 'ngừng ghi ' || date_trunc('second', max(at - prev)) from (select at, lag(at) over (order by id) prev from ticks where id >= $N) s"
+sql "select via, count(*) from ticks group by via order by min(id)"
+kubectl logs deploy/writer | head -2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "pg-1" deleted from k7-db namespace
+POD    ROLE      RESTARTS
+pg-1   replica   0
+pg-2   primary   0
+pg-3   replica   0
+FailingOver                   Current primary isn't healthy, initiating a failover from pg-1
+FailoverTarget                Failing over from pg-1 to pg-2
+ngừng ghi 00:01:11
+10.244.3.8|30
+10.244.1.12|73
+01:58:18 ghi thất bại
+01:58:19 ghi thất bại
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- `pg-2` (hoặc `pg-3` trên máy bạn) lên làm primary; `pg-1` được tạo lại và quay về làm replica.
+- **Ngừng ghi 1 phút 11 giây ở lượt này.** Con số dao động mạnh theo tải của máy: sáu lượt đo khi soạn bài cho 28 và 45 giây lúc máy rảnh; 71 tới 104 giây lúc máy đang chạy thêm một cụm kind khác. Ở các lượt chậm, phần lớn thời gian là chờ pod primary cũ tắt xong (theo tài liệu CNPG, lúc tắt nó cố đẩy nốt WAL đi), và mọi bước của operator đều đi qua API server: control plane chậm thì failover chậm theo. Đây là RTO của một lần primary bị xoá pod **trên cụm này**; cụm của bạn phải tự đo.
+- Bảng `ticks` có hai địa chỉ: các dòng trước sự cố vào primary cũ, các dòng sau vào primary mới. Ứng dụng không đổi cấu hình gì; nó chỉ kết nối lại vào `pg-rw`.
+- Log của `writer` là thứ người dùng thấy: lỗi bắt đầu ngay sau lệnh xoá và lặp lại suốt khoảng đó.
+
+Đây là xoá pod, trường hợp **dễ**: primary được tắt sạch và nhả lease ngay. Node chết hẳn thì chậm hơn nhiều, vì riêng việc Kubernetes nhận ra node đã chết mất khoảng 50 tới 55 giây (theo tài liệu CNPG, với Kubernetes từ 1.32); bài không thử trường hợp này.
+
+### 4. Switchover có kế hoạch
+
+Cùng phép đo, lần này đổi primary có chủ đích sang một replica bằng `kubectl cnpg promote`.
+
+<Terminal where="mac">
+
+```bash
+N=$(sql "select max(id) from ticks")
+T=$(kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[0].metadata.name}')
+kubectl cnpg promote pg $T 2>&1 | grep promoted
+until [ "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" = "$T" ]; do sleep 1; done
+kubectl wait --for=condition=Ready cluster/pg --timeout=600s > /dev/null
+kubectl get cluster pg -o custom-columns='CLUSTER:.metadata.name,PRIMARY:.status.currentPrimary,STATUS:.status.phase'
+sql "select 'ngừng ghi ' || date_trunc('second', max(at - prev)) from (select at, lag(at) over (order by id) prev from ticks where id >= $N) s"
+kubectl cnpg status pg | sed -n '/^Instances status/,/^$/p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Node pg-1 in cluster pg will be promoted
+CLUSTER   PRIMARY   STATUS
+pg        pg-1      Cluster in healthy state
+ngừng ghi 00:01:40
+Instances status
+Name  Current LSN  Replication role  Status  QoS        Manager Version  Node
+----  -----------  ----------------  ------  ---        ---------------  ----
+pg-1  0/8012098    Primary           OK      Burstable  1.30.1           k7-lab-worker2
+pg-3  0/8012218    Standby (async)   OK      Burstable  1.30.1           k7-lab-worker3
+pg-2  0/8012098    Standby (async)   OK      Burstable  1.30.1           k7-lab-worker
+```
+
+</Expected>
+
+1 phút 40 giây ở lượt này, lúc máy đang bận và đĩa gần đầy: lâu hơn cả lần failover ngay trước đó (1 phút 11). Ba lượt khác: 14 giây lúc máy rảnh; 25 và 47 giây lúc bận. Lúc máy rảnh, switchover ngắn hơn hẳn failover (14 so với 28 tới 45 giây) vì không có bước phát hiện; lúc máy bận, hai con số chồng lên nhau, vì cả hai cùng phải chờ primary cũ tắt xong và chờ API server. Lý do chọn switchover vì vậy không nằm ở tốc độ mà ở **an toàn dữ liệu và thế chủ động**: primary cũ `CHECKPOINT` và đẩy hết WAL trước khi nhường, còn bạn chọn được giờ và chọn được instance lên thay. PostgreSQL không có switchover "không gián đoạn": ứng dụng phải chịu được việc mất kết nối trong khoảng đó. Quy tắc vận hành rút ra: mọi việc bảo trì có kế hoạch trên primary đi qua `kubectl cnpg promote`, không qua `kubectl delete pod`; tài liệu CNPG khuyên đúng như vậy để tránh mất dữ liệu.
+
+`kubectl cnpg status` là lệnh xem tổng thể của người vận hành: bản đầy đủ có thêm trạng thái sao lưu và độ trễ từng replica; thêm `-v -v` thì có cả cấu hình PostgreSQL và chứng chỉ. Đoạn vừa in cho thấy vai trò mới của ba instance, hai standby đang ở chế độ `async`, và vị trí WAL (LSN) của chúng bằng nhau.
+
+<Check id="k7.4.lab-failover-switchover">Đo được thời gian ngừng ghi khi pod primary bị xoá và khi switchover bằng `kubectl cnpg promote`, chỉ ra được primary mới, event failover và việc primary cũ quay về làm replica, và giải thích được switchover khác failover ở đâu và vì sao nó vẫn có gián đoạn.</Check>
+
+### 5. Replication đồng bộ, và fencing
+
+Bật replication đồng bộ với một standby bất kỳ, rồi dùng fencing tắt PostgreSQL trên **cả hai** replica để xem cột giữa của bảng ở phần Kiến thức. **Lệnh `fencing on` dưới đây dừng PostgreSQL trên hai instance: chỉ chạy trên `kind-k7-lab`.**
+
+<Predict question="Replication đồng bộ `ANY 1` đang bật, hai replica bị tắt, primary vẫn khoẻ. Lệnh `insert` của `writer` sẽ báo lỗi, hay vẫn chạy?">
+
+Không cái nào: nó **đứng yên**. Primary nhận lệnh, ghi WAL của mình, rồi chờ một standby xác nhận trước khi trả `COMMIT`. Không có standby nào, nên nó chờ mãi; không có lỗi, không có timeout. Phía ứng dụng, đó là các kết nối treo dần cho tới khi pool cạn. Một database "còn sống" theo mọi probe mà không ghi được là kiểu sự cố khó nhận ra hơn một database chết hẳn.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl patch cluster pg --type merge -p '{"spec":{"postgresql":{"synchronous":{"method":"any","number":1}}}}'
+until [ -n "$(sql 'show synchronous_standby_names')" ]; do sleep 2; done
+sql "show synchronous_standby_names"
+sql "select application_name, sync_state from pg_stat_replication order by 1"
+N=$(sql "select max(id) from ticks")
+for r in $(kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[*].metadata.name}'); do
+  kubectl cnpg fencing on pg $r
+done
+sleep 20
+sql "select 'dòng cuối cách đây ' || date_trunc('second', now() - max(at)) from ticks"
+kubectl cnpg fencing off pg "*"
+until [ "$(sql "select now() - max(at) < interval '2 seconds' from ticks")" = t ]; do sleep 1; done
+sql "select 'ngừng ghi ' || date_trunc('second', max(at - prev)) from (select at, lag(at) over (order by id) prev from ticks where id >= $N) s"
+kubectl patch cluster pg --type merge -p '{"spec":{"postgresql":{"synchronous":null}}}'
+until [ "$(kubectl get cluster pg -o jsonpath='{.status.readyInstances}')" = 3 ]; do sleep 2; done
+kubectl wait --for=condition=Ready cluster/pg --timeout=300s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cluster.postgresql.cnpg.io/pg patched
+ANY 1 ("pg-2","pg-3","pg-1")
+pg-2|quorum
+pg-3|quorum
+pg-2 fenced
+pg-3 fenced
+dòng cuối cách đây 00:00:20
+* unfenced
+ngừng ghi 00:00:34
+cluster.postgresql.cnpg.io/pg patched
+cluster.postgresql.cnpg.io/pg condition met
+```
+
+</Expected>
+
+Đọc hai dòng đầu: `ANY 1 (…)` nghĩa là mỗi `COMMIT` chờ **một** standby bất kỳ trong danh sách. CNPG liệt kê tên mọi instance theo thứ tự instance khoẻ, instance không khoẻ, cuối cùng là chính primary; tên primary nằm đó không có tác dụng, vì PostgreSQL chỉ tính những standby đang nối vào. `sync_state` là `quorum` nghĩa là standby đó thuộc nhóm ứng viên: commit chờ một cái bất kỳ trong nhóm, không chờ đích danh nó.
+
+Lệnh `sleep 20` chỉ để có thời gian quan sát; vòng `until` sau đó chờ tới khi có dòng mới được ghi. Trong 20 giây đó primary vẫn chạy, vẫn trả lời câu `select`, nhưng không một dòng nào được ghi: mỗi `COMMIT` chờ một standby xác nhận, và không còn standby nào. Gỡ fencing xong, ghi chỉ chạy lại khi một replica đã khởi động PostgreSQL và nối lại vào primary: tổng cộng 34 giây ở lượt này, 50 giây ở một lượt khác. Với `dataDurability: required` (mặc định), mất hết standby nghĩa là mất khả năng ghi; đó là lựa chọn "thà dừng còn hơn mất dữ liệu", và phải là lựa chọn có chủ đích. Cụm ba instance với `number: 1` chịu được mất một standby; cụm hai instance thì không.
+
+Ba lệnh cuối tắt replication đồng bộ để các bước sau không phụ thuộc vào nó, rồi chờ cả ba instance sẵn sàng: hai replica vừa gỡ fence cần vài chục giây mới theo kịp, và bước 6 cần một standby khoẻ.
+
+<Check id="k7.4.lab-dong-bo">Bật được replication đồng bộ, đọc được `synchronous_standby_names` và `sync_state`, và tái hiện được việc ghi đứng yên khi mọi standby bị fence.</Check>
+
+### 6. Sao lưu: WAL liên tục và base backup
+
+WAL đã được đẩy đi từ lúc cụm khởi động, vì Cluster khai plugin ngay từ đầu. Xem trạng thái, rồi yêu cầu một base backup bằng object `Backup`.
+
+<Terminal where="mac" title="~/masteva-k7/k7-4/backup.yaml">
+
+```bash
+kubectl cnpg status pg | sed -n '/^Continuous Backup status/,/^$/p'
+cat > backup.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: pg-base-1
+spec:
+  cluster:
+    name: pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+EOF
+kubectl apply -f backup.yaml
+kubectl wait --for=jsonpath='{.status.phase}'=completed backup/pg-base-1 --timeout=300s > /dev/null
+kubectl get backup pg-base-1 -o custom-columns='BACKUP:.metadata.name,PHASE:.status.phase,TAKEN-ON:.status.instanceID.podName,ID:.status.backupId,BEGIN-WAL:.status.beginWal'
+kubectl exec deploy/rustfs -- sh -c 'cd /data/pg-backups/pg && ls -d base/*/* && ls wals/*/ | grep -c gz'
+kubectl cnpg status pg | grep 'First Point'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Continuous Backup status (Barman Cloud Plugin)
+ObjectStore / Server name:      s3-store/pg
+First Point of Recoverability:  -
+Last Successful Backup:         -
+Last Failed Backup:             -
+Working WAL archiving:          OK
+WALs waiting to be archived:    0
+Last Archived WAL:              000000020000000000000008.partial   @   2026-10-13T02:02:27.668069Z
+Last Failed WAL:                00000003.history                   @   2026-10-13T02:02:01.750196Z
+
+backup.postgresql.cnpg.io/pg-base-1 created
+BACKUP      PHASE       TAKEN-ON   ID                BEGIN-WAL
+pg-base-1   completed   pg-2       20261013T020408   000000030000000000000008
+base/20261013T020408/backup.info
+base/20261013T020408/data.tar
+13
+First Point of Recoverability:  2026-10-13 09:04:15 +07
+```
+
+</Expected>
+
+Trước khi có base backup, trạng thái nói thẳng: WAL được lưu đều (`Working WAL archiving: OK`) nhưng `First Point of Recoverability` là `-`: **chưa có cửa sổ khôi phục nào**. Ở một số lượt chạy, ba dòng đầu được in gọn thành một dòng `No recovery window information found in ObjectStore 's3-store' for server 'pg'`; hai dạng nói cùng một điều. WAL một mình không khôi phục được gì. Dòng `Last Failed WAL` ghi một lần đẩy file `.history` thất bại ngay lúc đổi primary ở bước 4; nó đã được đẩy lại (ở một lượt chạy khác dòng này là `-`), và điều cần nhìn là `Working WAL archiving` cùng số WAL đang chờ.
+
+Sau lệnh backup, bucket có hai nhánh: `base/<mã>/` chứa bản chép dữ liệu, `wals/` chứa các file WAL nén (13 file ở lượt này), và `First Point of Recoverability` đã có giá trị: mốc sớm nhất khôi phục về được (giờ in theo múi giờ máy bạn). Cột `TAKEN-ON` cho biết backup lấy ở đâu: mặc định operator ưu tiên một **standby** để không thêm tải cho primary, và chỉ lấy trên primary khi không có standby nào khoẻ (đó là lý do bước 5 chờ đủ ba instance). Backup chạy trong lúc `writer` vẫn ghi. Tám chữ số đầu của tên file WAL là **timeline**: mỗi lần promote ở bước 3 và 4 mở một timeline mới, nên nó đã là `00000003`. File `.partial` là đoạn WAL dở dang mà primary cũ kịp đẩy đi lúc bị thay.
+
+Trên production, thay object `Backup` làm tay bằng `ScheduledBackup` (lịch kiểu cron có thêm trường giây), và đặt `retentionPolicy` trong ObjectStore để backup cũ tự bị dọn.
+
+<Check id="k7.4.lab-backup">Kiểm được WAL đang được lưu liên tục, tạo được một base backup qua plugin, và chỉ ra được trong bucket đâu là base backup, đâu là WAL.</Check>
+
+### 7. Xoá nhầm dữ liệu, rồi khôi phục về trước thời điểm đó
+
+Tạo bảng `orders` với 500 đơn, ghi lại giờ của database vào `T0`, chờ 2 giây cho chắc `T0` nằm trước sự cố, rồi chạy câu lệnh mà ai cũng sợ: `delete` thiếu `where`. **Lệnh `delete from orders` xoá hết dữ liệu của bảng: chỉ chạy trên `kind-k7-lab`.**
+
+<Predict question="Lệnh `delete` chạy trên primary. Cụm có hai replica. Ngay sau đó, đọc bảng `orders` trên một replica thì còn bao nhiêu đơn?">
+
+Không còn đơn nào. Replication chép **mọi** thay đổi, kể cả thay đổi sai, và chép trong vài mili giây. Replica bảo vệ bạn khỏi mất máy, không bảo vệ khỏi lệnh sai. Snapshot hay backup hằng đêm thì cứu được tới đêm qua. Chỉ WAL archive cho quay về đúng `T0`.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+sql "create table orders (id int primary key, customer text, total int); alter table orders owner to app"
+sql "insert into orders select g, 'khach-' || g, g * 1000 from generate_series(1, 500) g"
+T0=$(sql "select now()")
+sleep 2
+sql "delete from orders"
+echo "T0 = $T0"
+sql "select count(*) from orders"
+kubectl exec "$(kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[0].metadata.name}')" -c postgres -- psql -U postgres app -Atc "select 'trên replica: ' || count(*) from orders"
+W=$(sql "select pg_walfile_name(pg_current_wal_lsn())")
+sql "select pg_switch_wal()" > /dev/null
+until [ "$(sql "select coalesce(last_archived_wal >= '$W', false) from pg_stat_archiver")" = t ]; do sleep 2; done
+echo "WAL $W đã nằm trong bucket"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CREATE TABLE
+ALTER TABLE
+INSERT 0 500
+DELETE 500
+T0 = 2026-10-13 02:04:31.719922+00
+0
+trên replica: 0
+WAL 000000030000000000000008 đã nằm trong bucket
+```
+
+</Expected>
+
+Dữ liệu đã mất trên primary lẫn replica.
+
+Mấy dòng cuối của khối lệnh làm một việc cần hiểu: PITR chỉ dùng được WAL **đã nằm trong bucket**. File WAL chứa lệnh `delete` còn đang ghi dở trên primary; `pg_switch_wal()` đóng nó lại để nó được đẩy đi ngay, thay vì chờ đầy hoặc chờ tới 5 phút. Trong sự cố thật, bạn thường phát hiện muộn hơn 5 phút nên WAL đã sang sẵn.
+
+Giờ khôi phục thành cụm mới `pg-pitr`, một instance cho nhẹ. `externalClusters` chỉ tới backup của cụm `pg` trong ObjectStore; `recoveryTarget.targetTime` là `T0`. Cụm mới không khai `plugins`, nên nó chưa tự sao lưu: đủ cho việc lấy lại dữ liệu. Nếu định dùng nó thay cụm cũ thì khai thêm `plugins`; WAL của nó sẽ vào một thư mục riêng theo tên cụm, và CNPG từ chối ghi vào thư mục đã có WAL của cụm khác (`Expected empty archive`).
+
+<Terminal where="mac" title="~/masteva-k7/k7-4/pitr.yaml">
+
+```bash
+cat > pitr.yaml <<EOF
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-pitr
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie
+  storage:
+    storageClass: standard
+    size: 1Gi
+  bootstrap:
+    recovery:
+      source: pg-goc
+      recoveryTarget:
+        targetTime: "$T0"
+  externalClusters:
+    - name: pg-goc
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters:
+          barmanObjectName: s3-store
+          serverName: pg
+EOF
+kubectl apply -f pitr.yaml
+kubectl wait --for=condition=Ready cluster/pg-pitr --timeout=600s > /dev/null
+kubectl get cluster -o custom-columns='CLUSTER:.metadata.name,INSTANCES:.status.instances,STATUS:.status.phase'
+sql "select count(*), sum(total) from orders" pg-pitr
+sql "select max(at) from ticks" pg-pitr
+sql "select count(*) from orders"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cluster.postgresql.cnpg.io/pg-pitr created
+CLUSTER   INSTANCES   STATUS
+pg        3           Cluster in healthy state
+pg-pitr   1           Cluster in healthy state
+500|125250000
+2026-10-13 02:04:31.561208+00
+0
+```
+
+</Expected>
+
+Cụm `pg-pitr` có đủ 500 đơn, và dòng `ticks` cuối cùng của nó dừng ngay trước `T0`: nó là database **tại thời điểm đó**. Cụm `pg` vẫn chạy, vẫn nhận ghi, và vẫn thiếu 500 đơn. Việc còn lại là quyết định của người, không phải của công cụ: chuyển ứng dụng sang cụm mới (mất mọi thứ ghi sau `T0`), hay chép phần bị mất về cụm đang chạy. Ở đây chỉ một bảng bị xoá, nên chép về:
+
+<Terminal where="mac">
+
+```bash
+kubectl exec pg-pitr-1 -c postgres -- pg_dump -U postgres --data-only -t orders app \
+  | kubectl exec -i "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -q -o /dev/null
+sql "select count(*), sum(total) from orders"
+sql "select count(*) > 0 from ticks where at > '$T0'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+500|125250000
+t
+```
+
+</Expected>
+
+Cụm gốc có lại 500 đơn và vẫn giữ mọi dòng `ticks` ghi sau `T0`. Thời gian từ lúc `apply` tới lúc cụm khôi phục sẵn sàng ở lab này là một phút lúc máy rảnh và bốn phút lúc máy bận, với database chỉ vài MB; với database thật, đó là thời gian chép base backup cộng phát lại WAL, có thể tính bằng giờ, và là con số chỉ biết được khi đã thử.
+
+<Check id="k7.4.lab-pitr">Khôi phục được database về một thời điểm trước lệnh xoá nhầm thành một cụm mới, kiểm được dữ liệu ở đó, đưa được phần đã mất về cụm đang chạy, và giải thích được vì sao phải chờ WAL được lưu rồi mới khôi phục.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Cluster đứng ở `Setting up primary`, pod `initdb` `ImagePullBackOff` hoặc `ContainerCreating` lâu | Đang kéo image, hoặc sai tag `imageName` | `kubectl describe pod -l cnpg.io/cluster=pg`; tag phải ghi rõ loại và bản Debian, ví dụ `18.6-minimal-trixie` |
+| Pod instance báo lỗi về plugin, Cluster không lên | Plugin Barman Cloud chưa chạy, hoặc khác namespace với operator | `kubectl -n cnpg-system get deploy barman-cloud`; `kubectl cnpg status pg` phần "Plugins status" |
+| `Working WAL archiving` không phải `OK`, số WAL đang chờ tăng dần | Sai `endpointURL`, sai khoá, object storage chưa chạy | `kubectl logs pg-1 -c plugin-barman-cloud`; `kubectl get objectstore s3-store -o yaml` |
+| WAL lỗi `x-amz-content-sha256` với một S3 tương thích | Kiểm tra checksum mới của boto3 không hợp storage đó | Đặt `AWS_REQUEST_CHECKSUM_CALCULATION` và `AWS_RESPONSE_CHECKSUM_VALIDATION` thành `when_required` trong `instanceSidecarConfiguration.env` của ObjectStore (tài liệu plugin, mục S3-compatible) |
+| Cụm khôi phục đứng ở job `full-recovery` lỗi | `targetTime` nằm sau WAL cuối đã lưu, hoặc trước base backup đầu tiên | `kubectl logs job/pg-pitr-1-full-recovery`; so `T0` với `kubectl cnpg status pg` |
+| `kubectl cnpg` báo `unknown command "cnpg"` | Terminal mới chưa có `PATH` | `export PATH=~/masteva-k7/bin:$PATH` |
+| Ghi đứng yên, không có lỗi | Replication đồng bộ `required` mà thiếu standby; hoặc instance đang bị fence | `sql "show synchronous_standby_names"`; `kubectl get cluster pg -o jsonpath='{.metadata.annotations}'` |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Khối lệnh dưới xoá cả cụm `k7-lab` (mọi database và backup trong đó) cùng thư mục lab. Đây là bài cuối dùng cụm này.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm và thư mục lab">
+
+```bash
+kind delete cluster --name k7-lab
+rm -rf ~/masteva-k7
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao tên instance được dùng lại (`pg-1` chết hẳn, instance mới vẫn tên `pg-1`)?">
+
+Khi soạn bài, thử xoá cả pod lẫn PVC của một replica: operator coi instance đó đã mất, tạo PVC mới và một Job `join` chép lại dữ liệu từ primary; 40 tới hơn 80 giây sau, tuỳ tải máy, cụm đủ ba instance. Instance mới mang **đúng tên cũ**. Đây là thay đổi của bản 1.30: số thứ tự instance lấy ô trống nhỏ nhất thay vì luôn tăng (các bản trước sẽ tạo `pg-4`, và nhiều tài liệu, kể cả câu trả lời của AI, còn mô tả hành vi cũ). Hệ quả thực dụng: đừng suy ra "instance nào là bản gốc" từ tên; hỏi `kubectl get cluster` hoặc label `cnpg.io/instanceRole`.
+
+Cũng từ thí nghiệm đó: đây là thứ StatefulSet không làm được. Nó sẽ tạo lại PVC trống cho đúng pod đó, và PostgreSQL trong pod khởi động với thư mục dữ liệu rỗng.
+
+</Reveal>
+
+<Reveal title="Đổi một tham số cần khởi động lại thì chuyện gì xảy ra với ứng dụng?">
+
+Khi soạn bài, thử đổi `shared_buffers` (tham số chỉ nhận giá trị mới khi PostgreSQL khởi động lại) trong `.spec.postgresql.parameters`. Operator làm đúng trình tự rolling update: thay lần lượt hai pod replica (mỗi cái khoảng 20 tới 40 giây, ứng dụng ghi không bị ảnh hưởng), rồi khởi động lại primary tại chỗ, gây khoảng 10 giây không ghi được. Tổng cộng chưa tới hai phút (một lượt đo, lúc máy rảnh). Nâng cấp minor bằng cách đổi `imageName` đi đúng con đường đó. Hai điều nên đặt cho production: `primaryUpdateStrategy: supervised` để bước đụng vào primary chờ bạn ra lệnh vào giờ thấp điểm, và cân nhắc `primaryUpdateMethod: switchover` khi image mới chưa có sẵn trên node của primary (khởi động lại tại chỗ phải chờ kéo image trong lúc không có primary).
+
+</Reveal>
+
+<Reveal title="Replication đồng bộ đã bật. Failover có còn mất dữ liệu được không?">
+
+Có một khe hở. Với `ANY 1` trên ba instance, mỗi giao dịch có ở primary và **một** standby, không nhất thiết cả hai. Nếu primary và đúng standby đó cùng mất (cùng rack, cùng một đợt mất mạng), standby còn lại có thể thiếu vài giao dịch đã báo thành công, và promote nó là mất chúng. CNPG có **failover quorum** cho đúng chuyện này: operator chỉ promote khi chứng minh được instance được chọn chứa mọi giao dịch đã commit đồng bộ; không chứng minh được thì không failover, và cụm chờ người. Một lần nữa là đổi tính sẵn sàng lấy an toàn dữ liệu. Phần này bài không chạy trong lab; cấu hình ở mục "Failover Quorum" của tài liệu CNPG.
+
+</Reveal>
+
+<Reveal title="Ứng dụng nên nối vào database thế nào để sống qua failover?">
+
+Ba việc, đều ở phía ứng dụng. (1) Nối vào tên Service (`pg-rw`), không nối vào tên pod hay IP. (2) Pool kết nối phải bỏ kết nối chết và mở cái mới: đặt thời gian sống tối đa cho kết nối và timeout khi lấy kết nối; SB12.2 làm việc này với HikariCP (pool kết nối mặc định của Spring Boot). (3) Lệnh ghi đang chạy dở lúc failover sẽ lỗi, và ứng dụng không biết nó đã commit hay chưa: thao tác quan trọng cần idempotent hoặc có khoá chống trùng để thử lại an toàn. Khi số kết nối lớn, đặt PgBouncer ở giữa; CNPG có CRD `Pooler` dựng sẵn việc đó, và D19 bàn tiếp về pooling cùng độ trễ replication.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết khung `Cluster`, `ScheduledBackup`, giải thích một đoạn log của instance manager hay một dòng trong `kubectl cnpg status`, viết câu SQL đo độ trễ replication.
+
+**AI hay sai ở đâu:** viết backup theo kiểu `spec.backup.barmanObjectStore` đã deprecated thay vì plugin và `ObjectStore`; dùng tag image đã bị gỡ như `postgresql:18` hoặc loại `system`; dùng MinIO và chart Bitnami trong ví dụ; nói instance thay thế sẽ có số thứ tự mới; gợi ý `kubectl delete pod` để "khởi động lại primary"; viết `targetTime` không có múi giờ (CNPG sẽ hiểu là UTC); coi replica là backup; đặt object storage của backup trong chính cụm production; và trả lời "RTO vài giây" mà không có phép đo nào.
+
+**Cách kiểm tra:** `kubectl apply --dry-run=server` bắt trường sai và giá trị bị webhook của operator từ chối. Với mọi cấu hình sao lưu, làm trọn vòng như bước 6 và 7 trên một cụm thử: chỉ một lần khôi phục thành công mới chứng minh backup dùng được. Với mọi con số về gián đoạn, đo bằng một `writer` như bước 3.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.4 là nền: StatefulSet và giới hạn của nó. K7.1 dạy PVC, StorageClass và vì sao snapshot không phải backup; K7.2 và K7.3 dạy Longhorn và Rook với Ceph, những hệ lưu trữ có thể đứng dưới PVC của database. K5.2 dạy PodDisruptionBudget và `drain`, thứ operator dựa vào khi bảo trì node. K9 là chặng viết operator. D9.3 đã gặp split-brain với Keepalived. D10 có chủ đề database được quản lý trên cloud và dữ liệu trong nước. D19 là chặng vận hành dữ liệu stateful: PostgreSQL HA với operator, pooling và độ trễ replication, kiểm tra khôi phục tự động, đặt database ở đâu. D20 là chặng sao lưu và DR: RPO, RTO, diễn tập khôi phục, sao lưu tài nguyên cụm. SB12.2 cấu hình pool kết nối phía ứng dụng.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k7.4.mastery-van-hanh">Trên một cụm CloudNativePG đang chạy, đọc được ai là primary, replica có theo kịp không và WAL có được lưu không; thực hiện được switchover, và giải thích được từng bước của một lần failover cùng con số gián đoạn đo được.</Check>
+
+<Check id="k7.4.mastery-khoi-phuc">Tự làm được trọn một lần khôi phục theo thời điểm, từ lúc phát hiện dữ liệu bị xoá tới lúc dữ liệu có lại trên cụm đang chạy, và nói được trước RPO, RTO của cách sao lưu đang dùng.</Check>
+
+<Check id="k7.4.mastery-lua-chon">Với một hệ thống cụ thể, lập luận được nên chạy PostgreSQL bằng operator trong cụm hay dùng dịch vụ được quản lý, nên bật replication đồng bộ hay không, và nêu được cái giá của mỗi lựa chọn.</Check>
+
+</Mastery>

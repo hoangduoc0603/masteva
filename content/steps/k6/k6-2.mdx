@@ -1,0 +1,998 @@
+---
+title: Gateway API nâng cao và cert-manager
+description: Dựng một Gateway dùng chung cho nhiều đội với allowedRoutes và ReferenceGrant, đặt timeout và retry rồi đo cái giá của retry, cho cert-manager cấp và tự gia hạn chứng chỉ của Gateway từ một CA nội bộ, tái hiện một lần gia hạn hỏng mà mọi chỉ báo vẫn xanh, và mã hoá chặng từ gateway tới backend bằng BackendTLSPolicy.
+id: k6.2
+step: k6
+prerequisites: [k6.1, k2.2, d21.4]
+topics: [k6.gateway-api-nang-cao, k6.cert-manager]
+status: verified
+verified:
+  date: 2026-10-13
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    cilium: 1.20.2
+    gateway-api: 1.6.3 (standard)
+    envoy-gateway: 1.9.2
+    cert-manager: 1.21.2
+    go-httpbin: 2.25.0
+    yq: 4.54.1
+    openssl: 3.6.2
+---
+
+<Goal>
+
+K2.2 dạy một Gateway và một HTTPRoute trong cùng namespace, chạy HTTP. Trên một nền tảng thật, Gateway là tài nguyên dùng chung: đội nền tảng giữ cổng và chứng chỉ, nhiều đội ứng dụng gắn route vào, và mọi thứ chạy HTTPS với chứng chỉ không ai gia hạn bằng tay. Học xong, bạn giải thích được:
+
+- Vì sao route của đội bạn viết đúng mà `Accepted=False`, hoặc trả `500` khi trỏ sang Service của đội khác, và ai phải đồng ý để nó chạy.
+- Vì sao bật retry ở gateway làm backend nhận gần gấp đôi số request.
+- Vì sao `kubectl get certificate` báo `READY=True` suốt một tháng trong khi lần gia hạn đã hỏng từ ngày đầu.
+- Vì sao trỏ route vào một backend HTTPS thì nhận `400`, thêm policy thì `503`, và mỗi lần sửa policy phải chờ khoảng 15 giây mới thấy kết quả.
+
+</Goal>
+
+<Knowledge>
+
+### Một Gateway, nhiều đội: hai lần "bên bị tham chiếu phải đồng ý"
+
+K2.2 đã nêu ba vai trò của Gateway API. Khi Gateway và route nằm ở các namespace khác nhau, có hai mũi tên vượt ranh giới namespace, và mỗi mũi tên cần bên đích cho phép:
+
+```text
+ namespace k6-gateway (đội nền tảng)        namespace k6-demo (đội A)          namespace k6-tools (đội B)
+ ┌──────────────────────────────┐          ┌─────────────────────┐            ┌──────────────────────┐
+ │ Gateway shared               │◄──(1)────│ HTTPRoute tools     │────(2)────►│ Service httpbin      │
+ │  listener http, https        │ parentRefs│  backendRefs        │            │                      │
+ │  allowedRoutes: namespace    │          └─────────────────────┘            │ ReferenceGrant:      │
+ │  có label shared-gateway=true│                                             │  từ HTTPRoute của    │
+ └──────────────────────────────┘                                             │  k6-demo tới httpbin │
+                                                                              └──────────────────────┘
+ (1) Gateway quyết định: allowedRoutes        (2) Chủ của Service quyết định: ReferenceGrant
+```
+
+| Mũi tên | Ai cho phép | Bằng gì | Khi chưa cho phép |
+|---|---|---|---|
+| Route gắn vào Gateway ở namespace khác | Chủ Gateway | `allowedRoutes.namespaces` trên từng listener: `Same` (mặc định), `All`, hoặc `Selector` theo label của namespace | Route `Accepted=False`, lý do `NotAllowedByListeners`; client nhận `404` |
+| Route trỏ tới Service ở namespace khác | Chủ Service | Một `ReferenceGrant` **đặt trong namespace của Service**, ghi rõ loại và namespace của bên được phép | Route `ResolvedRefs=False`, lý do `RefNotPermitted`; client nhận `500` |
+
+Cùng cơ chế `ReferenceGrant` dùng cho Gateway trỏ tới Secret chứng chỉ ở namespace khác. `Selector` theo label kéo theo một điều phải nhớ: ai gắn được label lên namespace thì tự mở được cửa vào Gateway, nên quyền sửa namespace phải thuộc đội nền tảng (K2.3), hoặc label do công cụ tạo namespace đặt.
+
+Route chọn listener bằng `parentRefs.sectionName`. Không ghi thì route gắn vào **mọi** listener cho phép nó, kể cả listener HTTP không mã hoá mà bạn tưởng chỉ dùng để chuyển hướng.
+
+<Check id="k6.2.gateway-dung-chung">Giải thích được `allowedRoutes` và `ReferenceGrant` bảo vệ ai trước ai, đặt ở namespace nào, và đọc được `NotAllowedByListeners` với `RefNotPermitted` trong status của route.</Check>
+
+### Timeout, retry và ranh giới giữa chuẩn với riêng
+
+K2.2 đã dùng trọng số, điều kiện header và các filter sửa request. Phần còn lại của việc điều phối traffic chia làm hai loại: thứ đã nằm trong API chuẩn, và thứ mỗi implementation làm theo cách riêng.
+
+| Nhu cầu | Ở đâu trong Gateway API 1.6 (kênh standard) | Ghi chú |
+|---|---|---|
+| Giới hạn thời gian | `rules[].timeouts.request` (cả request, gồm mọi lần thử lại) và `backendRequest` (một lần gọi backend) | Hết giờ thì gateway trả `504` |
+| Chuyển hướng, viết lại | Filter `RequestRedirect`, `URLRewrite` | HTTP sang HTTPS là một `RequestRedirect` |
+| Sao chép traffic | Filter `RequestMirror` | Thử bản mới bằng traffic thật, bỏ response |
+| Retry | **Chưa có** trong kênh standard | Envoy Gateway: `BackendTrafficPolicy` |
+| Giới hạn tốc độ, xác thực, circuit breaker | Không có | Policy riêng của implementation |
+| TLS tới backend | `BackendTLSPolicy` | Phần sau |
+| gRPC, TLS không giải mã, TCP, UDP | `GRPCRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute` | Cùng cách gắn vào Gateway như HTTPRoute |
+
+Thứ nằm ngoài chuẩn được gắn bằng **policy attachment**: một object riêng có `targetRefs` trỏ vào Gateway, route hoặc Service. Route của bạn vẫn là Gateway API thuần; đổi implementation thì chỉ viết lại các policy.
+
+Retry ở gateway có ba cái giá, và SB7.2 đã nêu cùng những cái giá đó cho retry trong code:
+
+- **Nhân tải.** Mỗi request hỏng sinh thêm request. Backend đang quá tải mà bị thử lại thì quá tải thêm; nếu client cũng retry, hai tầng nhân với nhau.
+- **Lặp tác dụng phụ.** Gateway không biết `POST /payments` có lặp lại an toàn không. Chỉ retry request idempotent, hoặc chỉ retry lỗi chắc chắn chưa tới ứng dụng (không kết nối được).
+- **Che lỗi.** Tỉ lệ lỗi client thấy giảm trong khi backend vẫn hỏng nửa số lần. Phải đo ở cả hai phía.
+
+<Check id="k6.2.timeout-retry-chuan">Phân biệt được tính năng nào viết trong HTTPRoute chuẩn, tính năng nào phải dùng policy riêng của implementation, và nêu được ba cái giá của retry ở gateway.</Check>
+
+### cert-manager: chứng chỉ là một object có vòng đời
+
+D9.4 đã dạy ACME, CA nội bộ và vì sao gia hạn phải tự động, với certbot trên một máy. Trong cụm, việc đó thuộc về **cert-manager**: một controller biến "tôi cần chứng chỉ cho tên X" thành một Secret luôn còn hạn.
+
+```text
+ Gateway shared                         cert-manager                               Envoy
+  annotation cluster-issuer: k6-ca
+  listener https: hostname, tên Secret
+        │ (1) gateway-shim (một controller trong cert-manager) đọc Gateway
+        ▼
+  Certificate app-k6-test-tls  ──(2)──► tạo khoá riêng mới + CertificateRequest (CSR)
+        ▲                                        │ (3) Issuer ký: CA nội bộ, ACME, Vault…
+        │                                        ▼
+        │ (5) tới renewalTime:           Secret app-k6-test-tls (tls.crt, tls.key) ──(4)──► Envoy nạp nóng,
+        └──── lặp lại từ (2) ◄───────────────────┘                                          không khởi động lại
+```
+
+| Object | Ai tạo | Ý nghĩa |
+|---|---|---|
+| `Issuer`, `ClusterIssuer` | Đội nền tảng | Nơi ký: `selfSigned`, `ca` (khoá CA trong một Secret), `acme` (Let's Encrypt hoặc CA ACME nội bộ như step-ca của D9.4), `vault` |
+| `Certificate` | Bạn, hoặc cert-manager tạo thay từ annotation trên Gateway | Điều mong muốn: tên miền, hạn, Secret đích |
+| `CertificateRequest` | cert-manager | Một lần xin cụ thể; mỗi lần gia hạn là một object mới |
+| `Order`, `Challenge` | cert-manager, chỉ với ACME | Từng bước của giao thức ACME |
+| Secret kiểu `kubernetes.io/tls` | cert-manager | Chứng chỉ và khoá mà Gateway dùng |
+
+Mặc định cert-manager gia hạn khi chứng chỉ đi được 2/3 hạn, hoặc trước hạn một khoảng `renewBefore`; mỗi lần gia hạn sinh khoá riêng mới. Envoy theo dõi Secret và nạp chứng chỉ mới không cần reload: vấn đề "gia hạn xong mà server vẫn dùng chứng chỉ cũ" của D9.4 không còn. Vấn đề còn lại là lần gia hạn **không thành**.
+
+Tài liệu cert-manager tách hai kiểu hỏng. **Chờ** (pending): issuer chưa sẵn sàng, challenge ACME chưa qua; cert-manager giữ nguyên `CertificateRequest` và tự chạy tiếp khi nguyên nhân hết. **Hỏng hẳn** (failed): CA từ chối, bị rate limit, request bị người duyệt từ chối; cert-manager đặt `Issuing=False` kèm `lastFailureTime` và chỉ thử lại sau một khoảng tăng dần từ 1 tới 32 giờ, muốn thử ngay phải tự kích.
+
+Cả hai kiểu có chung một bẫy: trong lúc gia hạn kẹt, chứng chỉ **cũ vẫn còn hạn**, nên `Certificate` vẫn `READY=True`, metric `certmanager_certificate_ready_status` vẫn bằng 1, trang web vẫn chạy. Không có gì đỏ cho tới ngày chứng chỉ hết hạn.
+
+<Callout kind="production">
+
+[Postmortem của MIT Open Learning](https://engineering.ol.mit.edu/runbooks_post_mortems/20260603_xpro_outage/) về sự cố ngày 03/06/2026: trang xPRO trả `503` khoảng một giờ vì chứng chỉ của origin trong cụm hết hạn. Chứng chỉ do cert-manager xin từ Let's Encrypt bằng `DNS-01` và có hạn 90 ngày. Theo dòng thời gian trong bài: ngày 04/05, cert-manager bước vào cửa sổ gia hạn 30 ngày và tạo `CertificateRequest`, `Order`, `Challenge` mới; challenge không bao giờ qua, vì cấu hình CDN (Fastly) của họ đã tạo một bản ghi `CNAME` ở đúng tên `_acme-challenge` mà cert-manager cần ghi bản ghi `TXT`. Let's Encrypt huỷ authorization, order thành cũ, và, theo dòng thời gian của bài viết, gần một tháng trôi qua tới ngày hết hạn mà lần gia hạn hỏng không được ai phát hiện (đây là điều bài này suy ra; nguồn không viết thành câu). Ngày 03/06 lúc 19:29 UTC chứng chỉ hết hạn; chín phút sau cảnh báo `503` mới kêu. Họ khôi phục bằng cách xoá và tạo lại các object của cert-manager, rồi sửa cấu hình để CDN không quản tên miền của origin nữa. Một việc cần làm họ ghi lại: cảnh báo sớm khi `CertificateRequest` hoặc `Order` hỏng, để lỗi được thấy trước ngày hết hạn.
+
+Phần suy ra của bài này: cảnh báo đúng không phải "chứng chỉ có `Ready` không", mà là "đã quá `renewalTime` bao lâu mà chưa có chứng chỉ mới" và "chứng chỉ server đang trả còn bao nhiêu ngày" (đo từ ngoài, D9.4). Bước 5 của lab tái hiện đúng trạng thái "mọi thứ xanh, gia hạn kẹt".
+
+</Callout>
+
+<Check id="k6.2.cert-manager-vong-doi">Kể được chuỗi từ annotation trên Gateway tới Secret mà Envoy dùng, phân biệt được lần gia hạn đang chờ với lần hỏng hẳn, và giải thích được vì sao `READY=True` không chứng minh việc gia hạn đang ổn.</Check>
+
+### TLS tới backend: BackendTLSPolicy
+
+Listener HTTPS kết thúc TLS ở gateway; từ gateway tới pod mặc định là HTTP thường. Khi chặng đó cũng phải mã hoá (quy định tuân thủ, mạng không tin được), backend phục vụ HTTPS và gateway cần biết hai điều: **phải nói TLS** với Service này, và **tin chứng chỉ nào**. `BackendTLSPolicy` (chuẩn, `v1`) khai cả hai: `targetRefs` trỏ vào Service, `validation` gồm CA để kiểm và `hostname` phải có trong chứng chỉ của backend. Không có policy, gateway gửi HTTP thường vào cổng HTTPS. Có policy mà CA hoặc hostname sai, bắt tay TLS hỏng và client nhận `503`.
+
+Đây là TLS một chiều: gateway kiểm backend. Hai chiều giữa mọi service (mTLS) là việc của service mesh ở K11.
+
+<Check id="k6.2.backend-tls-ly-thuyet">Nói được `BackendTLSPolicy` khai hai điều gì, gắn vào object nào, và client thấy gì khi thiếu policy hoặc policy sai.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Cross-Namespace routing | Gateway API](https://gateway-api.sigs.k8s.io/guides/multiple-ns/): mô hình Gateway dùng chung với `allowedRoutes`, kèm ví dụ đầy đủ.
+- [ReferenceGrant | Gateway API](https://gateway-api.sigs.k8s.io/reference/api-types/referencegrant/): cấu trúc `from`, `to` và những loại tham chiếu cần grant.
+- [Annotated Gateway resource | cert-manager](https://cert-manager.io/docs/usage/gateway/): cách bật hỗ trợ Gateway API và danh sách annotation.
+- [Frequently Asked Questions (FAQ) | cert-manager](https://cert-manager.io/docs/faq/): mục "What happens if issuance fails? Will it be retried?" về hai kiểu hỏng và khoảng chờ.
+- [MIT xPRO outage #7 | MIT Open Learning Platform Engineering](https://engineering.ol.mit.edu/runbooks_post_mortems/20260603_xpro_outage/): postmortem trong callout, có dòng thời gian từng bước.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Cụm `k6-lab` của K6.1 đang chạy với Cilium thay kube-proxy, và **dùng lại từ K6.1**: namespace `k6-demo` (Deployment `echo`, Service `echo`, pod `client`), cổng `9600` và `9601` trên máy nối vào NodePort 30080 và 30443, thư mục `~/masteva-k6`. Nếu đã xoá cụm, làm lại bước 1, 2, 3 và 5 của K6.1.
+- Helm 4.3, `yq`, `jq`, `curl`, `openssl` trên máy. Lệnh `openssl` trong bài chỉ dùng `s_client` và `x509`, chạy được với cả OpenSSL lẫn LibreSSL có sẵn của macOS.
+- **Profile máy:** thêm Envoy Gateway, một proxy và cert-manager; hai lượt chạy liền cả chặng đo được ba node dùng tổng cộng 3,2 và 3,6 GiB RAM ở cuối bài. Máy 8 GB: Docker Desktop 6 GB, cụm một worker như ghi chú ở K6.1.
+- **Vì sao Envoy Gateway:** Cilium có implementation Gateway API riêng, bật bằng một giá trị Helm. Bài dùng tiếp Envoy Gateway của K2.2 để bạn không phải học lại cách đọc status, và vì bước 3 cùng bước 6 đã được chạy thật với nó; bài chưa thử các bước đó với Gateway API của Cilium. Route và `BackendTLSPolicy` trong bài là API chuẩn; chỉ `EnvoyProxy` và `BackendTrafficPolicy` là riêng của Envoy Gateway.
+
+### 1. CRD kênh standard, Envoy Gateway và một Gateway dùng chung
+
+K2.2 để chart của Envoy Gateway cài luôn CRD kênh experimental và hẹn K6 làm cho đúng. Cách đúng: CRD của Gateway API là tài nguyên của cả cụm, cài riêng từ bản phát hành chính thức, kênh **standard**; CRD riêng của Envoy Gateway cài từ chart `gateway-crds-helm`; chart chính cài với `--skip-crds`.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k6
+export KUBECONFIG=~/masteva-k6/kubeconfig
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml | grep -c serverside-applied
+helm template eg-crds oci://docker.io/envoyproxy/gateway-crds-helm --version v1.9.2 \
+  --set crds.gatewayAPI.enabled=false --set crds.envoyGateway.enabled=true 2>/dev/null \
+  | kubectl apply --server-side -f - | grep -c serverside-applied
+helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.9.2 \
+  -n envoy-gateway-system --create-namespace --skip-crds --wait | grep -E '^(NAME|NAMESPACE|STATUS):'
+kubectl get crd -o json | jq -r '.items[] | select(.spec.group == "gateway.networking.k8s.io")
+  | .metadata.annotations | "\(.["gateway.networking.k8s.io/channel"]) \(.["gateway.networking.k8s.io/bundle-version"])"' | sort | uniq -c
+kubectl get crd -o name | grep -c gateway.networking.k8s.io
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+12
+8
+NAME: eg
+NAMESPACE: envoy-gateway-system
+STATUS: deployed
+  10 standard v1.6.3
+10
+```
+
+</Expected>
+
+Mười CRD của Gateway API, đều kênh standard, bản 1.6.3: ngoài `Gateway` và `HTTPRoute` còn có `ReferenceGrant`, `BackendTLSPolicy`, `GRPCRoute`, `TLSRoute`, `ListenerSet`, `TCPRoute`, `UDPRoute`. CRD của Envoy Gateway được đưa vào bằng `helm template | kubectl apply` thay cho `helm install`: bộ CRD đó lớn hơn 1 MiB, vượt giới hạn kích thước của Secret mà Helm dùng để lưu release, nên `helm install` chart này báo lỗi `Too long: may not be more than 1048576 bytes`.
+
+Gateway nằm trong namespace `k6-gateway` của đội nền tảng. Listener chỉ nhận route từ namespace mang label `shared-gateway: "true"`. Như K2.2, object `EnvoyProxy` đổi Service của proxy sang NodePort vì kind không cấp được `LoadBalancer`.
+
+<Terminal where="mac" title="~/masteva-k6/gateway.yaml và envoyproxy.yaml">
+
+```bash
+cat > envoyproxy.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: {name: k6-gateway}
+---
+# Riêng của Envoy Gateway: mở proxy bằng NodePort mà kind đã nối ra máy (30080 -> 9600)
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata: {name: nodeport, namespace: k6-gateway}
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
+        externalTrafficPolicy: Cluster
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              ports:
+                - {port: 80, nodePort: 30080}
+EOF
+cat > gateway.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {name: eg}
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: shared, namespace: k6-gateway}
+spec:
+  gatewayClassName: eg
+  infrastructure:
+    parametersRef: {group: gateway.envoyproxy.io, kind: EnvoyProxy, name: nodeport}
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels: {shared-gateway: "true"}
+EOF
+kubectl apply -f envoyproxy.yaml -f gateway.yaml
+kubectl -n k6-gateway wait --for=condition=Programmed gateway/shared --timeout=180s
+kubectl -n k6-gateway get gateway
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k6-gateway created
+envoyproxy.gateway.envoyproxy.io/nodeport created
+gatewayclass.gateway.networking.k8s.io/eg created
+gateway.gateway.networking.k8s.io/shared created
+gateway.gateway.networking.k8s.io/shared condition met
+NAME     CLASS   ADDRESS      PROGRAMMED   AGE
+shared   eg      172.20.0.2   True         13s
+```
+
+</Expected>
+
+`ADDRESS` là IP của một node vì proxy được mở bằng NodePort (status của Gateway ghi IP của cả ba node, `kubectl` chỉ in cái đầu); trên cụm không có kube-proxy này, NodePort 30080 do Cilium phục vụ, như bước 5 của K6.1.
+
+<Check id="k6.2.lab-gateway-chung">Cài được CRD Gateway API kênh standard tách khỏi chart của implementation, và dựng được một Gateway trong namespace riêng chỉ nhận route từ namespace có label.</Check>
+
+### 2. Hai lần xin phép: gắn vào Gateway và gọi sang namespace khác
+
+Đội A (`k6-demo`) viết route cho ứng dụng `echo`, trỏ `parentRefs` sang Gateway của đội nền tảng. Script `xem-route.sh` in status của một route, như ở K2.2.
+
+<Terminal where="mac" title="~/masteva-k6/route-echo.yaml">
+
+```bash
+cat > xem-route.sh <<'EOF'
+#!/bin/sh
+# In các điều kiện trong status của HTTPRoute $1 ở namespace k6-demo
+kubectl -n k6-demo get httproute "$1" -o yaml \
+  | yq '.status.parents[0].conditions[] | [.type, .status, .reason, .message] | join(" | ")'
+EOF
+chmod +x xem-route.sh
+cat > route-echo.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: echo, namespace: k6-demo}
+spec:
+  parentRefs:
+    - {name: shared, namespace: k6-gateway, sectionName: http}
+  hostnames: ["app.k6.test"]
+  rules:
+    - backendRefs:
+        - {name: echo, port: 80}
+EOF
+kubectl apply -f route-echo.yaml
+sleep 3; ./xem-route.sh echo
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: app.k6.test' localhost:9600/hostname
+kubectl label namespace k6-demo shared-gateway=true
+until curl -s -H 'Host: app.k6.test' localhost:9600/hostname | grep -q echo-; do sleep 1; done
+./xem-route.sh echo | cut -d'|' -f1-3
+curl -s -w ' %{http_code}\n' -H 'Host: app.k6.test' localhost:9600/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/echo created
+Accepted | False | NotAllowedByListeners | No listeners included by this parent ref allowed this attachment.
+ResolvedRefs | True | ResolvedRefs | Resolved all the Object references for the Route
+404
+namespace/k6-demo labeled
+Accepted | True | Accepted 
+ResolvedRefs | True | ResolvedRefs 
+echo-85cc55b84f-hhl55 200
+```
+
+</Expected>
+
+Route viết đúng, `apply` thành công, và không chạy: Gateway chưa cho namespace `k6-demo` gắn vào. Sau khi namespace có label, không ai phải sửa route; controller tự xét lại. Người gắn label là đội nền tảng, không phải đội A.
+
+Giờ đội A muốn đường dẫn `/tools` đi tới `httpbin`, một service của đội B ở namespace `k6-tools`. `go-httpbin` là server thử HTTP: `/delay/3` trả lời sau 3 giây, `/unstable` trả lỗi ngẫu nhiên; bước 3 dùng cả hai.
+
+<Terminal where="mac" title="~/masteva-k6/route-tools.yaml">
+
+```bash
+kubectl create namespace k6-tools
+kubectl -n k6-tools create deployment httpbin --image=ghcr.io/mccutchen/go-httpbin:2.25.0 --port=8080
+kubectl -n k6-tools expose deployment httpbin --port=80 --target-port=8080
+cat > route-tools.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: tools, namespace: k6-demo}
+spec:
+  parentRefs:
+    - {name: shared, namespace: k6-gateway, sectionName: http}
+  hostnames: ["app.k6.test"]
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /tools}
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path: {type: ReplacePrefixMatch, replacePrefixMatch: /}
+      backendRefs:
+        - {name: httpbin, namespace: k6-tools, port: 80}   # Service của namespace khác
+EOF
+kubectl apply -f route-tools.yaml
+kubectl -n k6-tools rollout status deployment/httpbin --timeout=180s | tail -1
+sleep 3; ./xem-route.sh tools
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: app.k6.test' localhost:9600/tools/status/200
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k6-tools created
+deployment.apps/httpbin created
+service/httpbin exposed
+httproute.gateway.networking.k8s.io/tools created
+deployment "httpbin" successfully rolled out
+Accepted | True | Accepted | Route is accepted
+ResolvedRefs | False | RefNotPermitted | Failed to process route rule 0 backendRef 0: Backend ref to Service k6-tools/httpbin not permitted by any ReferenceGrant.
+500
+```
+
+</Expected>
+
+Service tồn tại, cổng đúng, mà `ResolvedRefs=False`: không có rào này thì đội nào cũng tự đưa được traffic từ Internet vào Service của đội khác. Đội B mở cửa bằng một `ReferenceGrant` trong namespace của họ, hẹp tới từng loại object và từng tên:
+
+<Terminal where="mac" title="~/masteva-k6/grant-tools.yaml">
+
+```bash
+cat > grant-tools.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata: {name: cho-k6-demo, namespace: k6-tools}   # nằm ở namespace của Service
+spec:
+  from:
+    - {group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: k6-demo}
+  to:
+    - {group: "", kind: Service, name: httpbin}       # bỏ name thì mở mọi Service của namespace
+EOF
+kubectl apply -f grant-tools.yaml
+until [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: app.k6.test' localhost:9600/tools/status/200)" = 200 ]; do sleep 1; done
+./xem-route.sh tools | cut -d'|' -f1-3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+referencegrant.gateway.networking.k8s.io/cho-k6-demo created
+Accepted | True | Accepted 
+ResolvedRefs | True | ResolvedRefs 
+```
+
+</Expected>
+
+<Check id="k6.2.lab-cross-namespace">Tái hiện được `NotAllowedByListeners` và `RefNotPermitted`, và sửa được từng lỗi bằng đúng object của đúng bên: label trên namespace, `ReferenceGrant` trong namespace của Service.</Check>
+
+### 3. Timeout và retry
+
+`/tools/delay/3` mất 3 giây. Đặt trần 1 giây cho cả request bằng trường chuẩn `timeouts.request`:
+
+<Terminal where="mac">
+
+```bash
+curl -s -o /dev/null -w 'chưa có timeout: %{http_code} sau %{time_total}s\n' -H 'Host: app.k6.test' localhost:9600/tools/delay/3
+yq -i '.spec.rules[0].timeouts = {"request": "1s"}' route-tools.yaml
+kubectl apply -f route-tools.yaml
+until [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: app.k6.test' localhost:9600/tools/delay/3)" = 504 ]; do sleep 1; done
+curl -s -w '\n%{http_code} sau %{time_total}s\n' -H 'Host: app.k6.test' localhost:9600/tools/delay/3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+chưa có timeout: 200 sau 3.007422s
+httproute.gateway.networking.k8s.io/tools configured
+upstream request timeout
+504 sau 1.003859s
+```
+
+</Expected>
+
+Quá 1 giây, Envoy trả `504` và thôi chờ; request xong trước 1 giây không bị ảnh hưởng. Số giây của bạn sẽ lệch vài chục mili giây. Đây là mắt xích ngoài cùng của chuỗi timeout "ngắn dần từ ngoài vào trong" mà SB12.2 đã dạy cho phía ứng dụng.
+
+Giờ tới retry. `/tools/unstable?failure_rate=0.5` trả `500` cho khoảng một nửa số request. Hàm `goi100` gọi 100 lần và đếm mã trả về; hàm `dem` đếm số request `/unstable` mà `httpbin` thật sự nhận, lấy từ log của nó.
+
+<Predict question="Thêm policy retry tối đa 3 lần khi gặp 500. Trong 100 request, khoảng bao nhiêu cái client còn thấy 500? Backend nhận khoảng bao nhiêu request?">
+
+Client còn thấy khoảng 6 lỗi: một request chỉ hỏng khi cả 4 lần (1 lần đầu, 3 lần thử lại) đều hỏng, xác suất 0,5⁴ ≈ 6%. Backend nhận gần gấp đôi, khoảng 190 request: 100 lần đầu, cộng 50, cộng 25, cộng 12 lần thử lại. Tỉ lệ lỗi client thấy giảm từ 50% xuống 6%, còn backend vẫn hỏng một nửa và đang gánh gấp đôi tải.
+
+</Predict>
+
+<Terminal where="mac" title="~/masteva-k6/retry-tools.yaml">
+
+```bash
+goi100() { for i in $(seq 100); do curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: app.k6.test' 'localhost:9600/tools/unstable?failure_rate=0.5'; done | sort | uniq -c; }
+dem() { kubectl -n k6-tools logs deployment/httpbin --tail=-1 | grep -c 'uri="/unstable'; }
+T0=$(dem); goi100; echo "backend nhận: $(( $(dem) - T0 ))"
+cat > retry-tools.yaml <<'EOF'
+# Policy riêng của Envoy Gateway, gắn vào HTTPRoute tools
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata: {name: retry-tools, namespace: k6-demo}
+spec:
+  targetRefs:
+    - {group: gateway.networking.k8s.io, kind: HTTPRoute, name: tools}
+  retry:
+    numRetries: 3
+    perRetry:
+      backOff: {baseInterval: 50ms, maxInterval: 500ms}
+    retryOn:
+      triggers: ["connect-failure", "retriable-status-codes"]
+      httpStatusCodes: [500, 503]
+EOF
+kubectl apply -f retry-tools.yaml
+sleep 5
+echo "--- có retry"
+T0=$(dem); goi100; echo "backend nhận: $(( $(dem) - T0 ))"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  53 200
+  47 500
+backend nhận: 100
+backendtrafficpolicy.gateway.envoyproxy.io/retry-tools created
+--- có retry
+  92 200
+   8 500
+backend nhận: 187
+```
+
+</Expected>
+
+Đây là số của một lượt chạy; kết quả là ngẫu nhiên nên của bạn sẽ quanh quẩn 40–60 lỗi khi chưa retry, 2–12 lỗi và 175–210 request tới backend khi có retry (hai lượt chạy của bài cho 7 và 9 lỗi, 187 và 201 request). Điều cần nhìn là hai con số đi ngược chiều nhau: client thấy ít lỗi hơn hẳn, backend nhận gần gấp đôi. Với một backend chậm vì quá tải chứ không phải lỗi ngẫu nhiên, gấp đôi tải là thứ đẩy nó từ chậm sang sập. Vì vậy policy trên giới hạn số lần, có khoảng lùi giữa các lần, và trên production nên chỉ bật cho lỗi kết nối (`connect-failure`) với những route có tác dụng phụ.
+
+<Check id="k6.2.lab-timeout-retry">Đặt được timeout bằng trường chuẩn của HTTPRoute và retry bằng policy của Envoy Gateway, đo được tỉ lệ lỗi phía client cùng số request phía backend trước và sau khi bật retry.</Check>
+
+### 4. cert-manager và CA nội bộ cho Gateway
+
+Cài cert-manager từ chart chính thức, bật hỗ trợ Gateway API. CRD của Gateway API phải có **trước** khi cert-manager khởi động; bước 1 đã lo.
+
+<Terminal where="mac" title="~/masteva-k6/ca.yaml">
+
+```bash
+helm install cert-manager oci://quay.io/jetstack/charts/cert-manager --version v1.21.2 \
+  -n cert-manager --create-namespace --set crds.enabled=true --set config.gatewayAPI.enabled=true --wait \
+  | grep -E '^(NAME|NAMESPACE|STATUS):'
+cat > ca.yaml <<'EOF'
+# 1. Issuer tự ký: chỉ dùng một lần, để sinh ra root CA
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: selfsigned}
+spec:
+  selfSigned: {}
+---
+# 2. Root CA của lab: một Certificate có isCA, khoá nằm trong Secret k6-root-ca
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: k6-root-ca, namespace: cert-manager}
+spec:
+  isCA: true
+  commonName: Masteva K6 Lab Root CA
+  secretName: k6-root-ca
+  duration: 87600h
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: selfsigned, kind: ClusterIssuer}
+---
+# 3. Issuer cho mọi namespace: ký bằng khoá trong Secret k6-root-ca
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: k6-ca}
+spec:
+  ca:
+    secretName: k6-root-ca
+EOF
+kubectl apply -f ca.yaml
+kubectl wait --for=condition=Ready clusterissuer/k6-ca --timeout=60s
+kubectl -n cert-manager get secret k6-root-ca -o jsonpath='{.data.tls\.crt}' | base64 -d > ca.crt
+openssl x509 -in ca.crt -noout -enddate
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME: cert-manager
+NAMESPACE: cert-manager
+STATUS: deployed
+clusterissuer.cert-manager.io/selfsigned created
+certificate.cert-manager.io/k6-root-ca created
+clusterissuer.cert-manager.io/k6-ca created
+clusterissuer.cert-manager.io/k6-ca condition met
+notAfter=Oct 10 03:06:04 2036 GMT
+```
+
+</Expected>
+
+File `ca.crt` là chứng chỉ gốc của lab, thứ client cần để tin chứng chỉ do CA này cấp.
+
+<Callout kind="pitfall">
+
+CA này gọn cho lab và sai cho production ở một điểm D9.4 đã nhấn: **khoá của root nằm ngay trong cụm**, trong Secret `k6-root-ca`; ai đọc được Secret của namespace `cert-manager` thì ký được chứng chỉ cho mọi tên. Trên production, cert-manager chỉ nên giữ một **intermediate** do root ngoại tuyến ký, hoặc không giữ khoá CA nào: dùng issuer `acme` trỏ vào CA nội bộ như step-ca của D9.4 (khai `server` và `caBundle`, solver `http01.gatewayHTTPRoute`), hoặc issuer `vault`. Bài chưa chạy hai cấu hình đó; phần còn lại của lab, từ annotation tới gia hạn, không đổi theo loại issuer.
+
+</Callout>
+
+Thêm listener HTTPS vào Gateway. Hai file ở bước 1 được viết để chỉ phải nối thêm vào cuối: một cổng cho `EnvoyProxy`, một listener cho Gateway. Ba annotation bảo cert-manager cấp chứng chỉ từ `k6-ca`; hạn 1 giờ là mức thấp nhất cert-manager nhận (`renewBefore` thì tối thiểu 5 phút và phải nhỏ hơn hạn), và gia hạn trước 58 phút nghĩa là **hai phút là thấy một lần gia hạn**.
+
+<Terminal where="mac">
+
+```bash
+cat >> envoyproxy.yaml <<'EOF'
+                - {port: 443, nodePort: 30443}
+EOF
+cat >> gateway.yaml <<'EOF'
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: app.k6.test
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - {name: app-k6-test-tls}     # Secret chưa tồn tại: cert-manager sẽ tạo
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels: {shared-gateway: "true"}
+EOF
+kubectl -n k6-gateway annotate gateway shared cert-manager.io/cluster-issuer=k6-ca \
+  cert-manager.io/duration=1h cert-manager.io/renew-before=58m
+kubectl apply -f envoyproxy.yaml -f gateway.yaml | grep configured
+until kubectl -n k6-gateway get certificate app-k6-test-tls > /dev/null 2>&1; do sleep 1; done
+kubectl -n k6-gateway wait --for=condition=Ready certificate/app-k6-test-tls --timeout=120s
+kubectl -n k6-gateway get certificate,certificaterequest -o name
+kubectl -n k6-gateway get certificate app-k6-test-tls -o json | jq -c '.spec | {dnsNames, duration, renewBefore, secretName, issuer: .issuerRef.name}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+gateway.gateway.networking.k8s.io/shared annotated
+envoyproxy.gateway.envoyproxy.io/nodeport configured
+gateway.gateway.networking.k8s.io/shared configured
+certificate.cert-manager.io/app-k6-test-tls condition met
+certificate.cert-manager.io/app-k6-test-tls
+certificaterequest.cert-manager.io/app-k6-test-tls-1
+{"dnsNames":["app.k6.test"],"duration":"1h0m0s","renewBefore":"58m0s","secretName":"app-k6-test-tls","issuer":"k6-ca"}
+```
+
+</Expected>
+
+Bạn không viết `Certificate` nào. cert-manager đọc Gateway, lấy `hostname` của listener làm `dnsNames`, tên trong `certificateRefs` làm `secretName`, và tạo object ấy thay bạn. Chuyển ứng dụng sang listener HTTPS, còn listener HTTP chỉ giữ một việc là chuyển hướng:
+
+<Terminal where="mac" title="~/masteva-k6/route-echo.yaml">
+
+```bash
+cat > route-echo.yaml <<'EOF'
+# Ứng dụng: chỉ phục vụ trên listener https
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: echo, namespace: k6-demo}
+spec:
+  parentRefs:
+    - {name: shared, namespace: k6-gateway, sectionName: https}
+  hostnames: ["app.k6.test"]
+  rules:
+    - backendRefs:
+        - {name: echo, port: 80}
+---
+# Listener http: không có backend, chỉ chuyển hướng sang HTTPS
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: echo-redirect, namespace: k6-demo}
+spec:
+  parentRefs:
+    - {name: shared, namespace: k6-gateway, sectionName: http}
+  hostnames: ["app.k6.test"]
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            port: 9601          # lab: cổng HTTPS phía máy bạn; production bỏ dòng này (mặc định 443)
+            statusCode: 301
+EOF
+kubectl apply -f route-echo.yaml
+goi() { curl -s -m 5 -w ' %{http_code}\n' --cacert ca.crt --resolve app.k6.test:9601:127.0.0.1 "https://app.k6.test:9601$1"; }
+until goi /hostname | grep -q ' 200'; do sleep 1; done
+curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}\n' -H 'Host: app.k6.test' localhost:9600/hostname
+curl -sS -o /dev/null --resolve app.k6.test:9601:127.0.0.1 https://app.k6.test:9601/hostname 2>&1 | head -1
+goi /hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/echo configured
+httproute.gateway.networking.k8s.io/echo-redirect created
+301 -> https://app.k6.test:9601/hostname
+curl: (60) SSL certificate problem: unable to get local issuer certificate
+echo-85cc55b84f-bwmkw 200
+```
+
+</Expected>
+
+HTTP được chuyển hướng `301` sang HTTPS. Gọi HTTPS mà không đưa CA thì `curl` từ chối (mã 60), đúng như phải thế với một CA nội bộ; đưa `--cacert ca.crt` thì qua. `--resolve` thay cho DNS: tên `app.k6.test` cổng 9601 được trỏ về `127.0.0.1`. Hàm `goi` dùng tiếp ở các bước sau. Route `tools` vẫn nằm trên listener HTTP và vẫn chạy, vì đường dẫn `/tools` cụ thể hơn rule chuyển hướng; trên production nó cũng nên chuyển sang listener HTTPS.
+
+<Check id="k6.2.lab-cert-manager">Dựng được CA nội bộ bằng cert-manager, cho Gateway tự có chứng chỉ chỉ bằng annotation, gọi được HTTPS với `--cacert`, và chuyển hướng được HTTP sang HTTPS bằng một route.</Check>
+
+### 5. Gia hạn tự động, và gia hạn hỏng mà mọi thứ vẫn xanh
+
+Chứng chỉ hạn 1 giờ, gia hạn trước 58 phút: cứ hai phút cert-manager gia hạn một lần. Hàm `serial` hỏi chứng chỉ mà **Envoy đang thật sự trả** (không đọc Secret), còn một vòng lặp gọi HTTPS liên tục trong lúc chờ lần gia hạn kế tiếp. Vì vòng lặp chạy nền, terminal của bạn in thêm vài dòng `[1] …` của shell lúc nó bắt đầu và lúc bị `kill`.
+
+<Terminal where="mac">
+
+```bash
+serial() { echo | openssl s_client -connect 127.0.0.1:9601 -servername app.k6.test 2>/dev/null | openssl x509 -noout -serial -startdate | tr '\n' ' '; echo; }
+REV=$(kubectl -n k6-gateway get certificate app-k6-test-tls -o jsonpath='{.status.revision}')
+serial
+( while :; do goi /hostname | grep -o '[0-9]*$'; sleep 0.2; done > loop.txt ) &
+LOOP=$!
+kubectl -n k6-gateway wait --for=jsonpath='{.status.revision}'=$((REV+1)) certificate/app-k6-test-tls --timeout=200s
+sleep 5; kill $LOOP
+serial
+sort loop.txt | uniq -c
+kubectl -n k6-gateway get events --sort-by=.lastTimestamp -o custom-columns=MESSAGE:.message | grep 'private key' | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+serial=53301C0804C0A73887D5013D25F5BB6C4D6DBF87 notBefore=Oct 13 03:06:06 2026 GMT 
+certificate.cert-manager.io/app-k6-test-tls condition met
+serial=0F649AC017852605F3C4F58561B292C9D8907F22 notBefore=Oct 13 03:08:06 2026 GMT 
+ 553 200
+Stored new private key in temporary Secret resource "app-k6-test-tls-452mr"
+```
+
+</Expected>
+
+Số serial đổi, khoá riêng mới được sinh, và trong lúc đó mọi request đều `200` (số request của bạn tuỳ lúc bắt đầu chờ). Không ai reload gì: Envoy nhận chứng chỉ mới qua Secret. Đó là nửa dễ.
+
+Giờ làm hỏng issuer theo một cách rất thật: ai đó "dọn dẹp" và đổi `ClusterIssuer` sang một Secret không tồn tại.
+
+<Predict question="Issuer hỏng, và hai phút sau tới hạn gia hạn. `kubectl get certificate` sẽ báo READY là gì? Trang web còn chạy không?">
+
+`READY` vẫn `True` và trang web vẫn chạy, vì chứng chỉ hiện tại còn hạn gần một giờ. Lần gia hạn kẹt ở trạng thái chờ: `CertificateRequest` mới không được ký. Dấu hiệu duy nhất là điều kiện `Issuing=True` kéo dài, `renewalTime` đã ở quá khứ, và issuer `READY=False`. Nếu không ai nhìn những chỗ đó, người đầu tiên biết là người dùng, vào lúc chứng chỉ hết hạn.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl patch clusterissuer k6-ca --type merge -p '{"spec":{"ca":{"secretName":"k6-root-ca-moi"}}}'
+kubectl -n k6-gateway wait --for=condition=Issuing certificate/app-k6-test-tls --timeout=200s
+until kubectl -n k6-gateway get certificaterequest -o json | grep -q '"reason": "Pending"'; do sleep 1; done
+kubectl -n k6-gateway get certificate
+goi /hostname | grep -o '[0-9]*$'
+echo "--- nhìn kỹ hơn"
+kubectl get clusterissuer k6-ca -o 'custom-columns=NAME:.metadata.name,READY:.status.conditions[0].status,MESSAGE:.status.conditions[0].message'
+kubectl -n k6-gateway get certificate app-k6-test-tls -o json \
+  | jq -r '.status.conditions[] | select(.type == "Issuing") | "\(.type) | \(.status) | \(.message)"'
+kubectl -n k6-gateway get certificaterequest -o json \
+  | jq -r '.items[] | .metadata.name as $n | .status.conditions[] | select(.type == "Ready" and .status == "False") | "\($n): \(.reason), \(.message)"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+clusterissuer.cert-manager.io/k6-ca patched
+certificate.cert-manager.io/app-k6-test-tls condition met
+NAME              READY   SECRET            AGE
+app-k6-test-tls   True    app-k6-test-tls   4m1s
+200
+--- nhìn kỹ hơn
+NAME    READY   MESSAGE
+k6-ca   False   Error getting keypair for CA issuer: secrets "k6-root-ca-moi" not found
+Issuing | True | Renewing certificate as renewal was scheduled at 2026-10-13 03:10:06 +0000 UTC
+app-k6-test-tls-3: Pending, Referenced issuer does not have a Ready status condition
+```
+
+</Expected>
+
+Hai dòng đầu là thứ một người trực nhìn thấy: `READY True`, trang web `200`. Ba dòng cuối là sự thật: issuer hỏng, lần gia hạn bắt đầu từ `03:10:06` (giờ UTC) chưa xong, `CertificateRequest` mới nằm ở `Pending`. Trong lab, đồng hồ còn chưa đầy một giờ; với chứng chỉ 90 ngày của sự cố trong callout, trạng thái này kéo dài bốn tuần. Ba thứ nên có cảnh báo, theo thứ tự sớm dần: issuer không `Ready`; `Certificate` có `Issuing=True` quá vài chục phút (metric `certmanager_certificate_renewal_timestamp_seconds` đã ở quá khứ); và hạn của chứng chỉ server đang trả, đo từ bên ngoài.
+
+Sửa issuer. Vì lần gia hạn đang ở kiểu "chờ", cert-manager tự chạy tiếp; vòng `until` chờ tới khi điều kiện `Issuing` không còn `True`:
+
+<Terminal where="mac">
+
+```bash
+kubectl patch clusterissuer k6-ca --type merge -p '{"spec":{"ca":{"secretName":"k6-root-ca"}}}'
+until [ "$(kubectl -n k6-gateway get certificate app-k6-test-tls -o jsonpath='{.status.conditions[?(@.type=="Issuing")].status}')" != True ]; do sleep 1; done
+kubectl -n k6-gateway get certificate app-k6-test-tls -o jsonpath='revision={.status.revision}, cấp lúc {.status.notBefore}, gia hạn kế tiếp {.status.renewalTime}{"\n"}'
+kubectl -n k6-gateway annotate --overwrite gateway shared cert-manager.io/duration=24h cert-manager.io/renew-before=8h
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+clusterissuer.cert-manager.io/k6-ca patched
+revision=3, cấp lúc 2026-10-13T03:10:07Z, gia hạn kế tiếp 2026-10-13T03:12:07Z
+gateway.gateway.networking.k8s.io/shared annotated
+```
+
+</Expected>
+
+Nếu lần gia hạn đã **hỏng hẳn** thay vì chờ, sửa nguyên nhân chưa đủ: cert-manager chỉ thử lại sau khoảng lùi 1 tới 32 giờ. Khi đó phải tự kích, bằng lệnh `cmctl renew` hoặc, như đội trong callout đã làm, xoá `Certificate` để nó được tạo lại. Lab không tái hiện nhánh này. Dòng cuối đưa hạn chứng chỉ về 24 giờ để cụm không gia hạn hai phút một lần trong các bài sau.
+
+<Check id="k6.2.lab-gia-han">Quan sát được một lần gia hạn tự động không rớt request, tái hiện được lần gia hạn kẹt trong khi `READY=True`, và chỉ ra được ba chỗ cho thấy sự thật: issuer, điều kiện `Issuing`, `CertificateRequest`.</Check>
+
+### 6. TLS tới backend với BackendTLSPolicy
+
+Một backend phục vụ HTTPS: `agnhost` với chứng chỉ do chính CA nội bộ cấp cho tên `echo-tls.k6-demo.svc`. Lần này bạn tự viết `Certificate`, vì không có Gateway nào để cert-manager đọc.
+
+<Terminal where="mac" title="~/masteva-k6/echo-tls.yaml">
+
+```bash
+cat > echo-tls.yaml <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: echo-tls, namespace: k6-demo}
+spec:
+  secretName: echo-tls
+  dnsNames: ["echo-tls.k6-demo.svc"]
+  duration: 24h
+  issuerRef: {name: k6-ca, kind: ClusterIssuer}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: echo-tls, namespace: k6-demo}
+spec:
+  selector:
+    matchLabels: {app: echo-tls}
+  template:
+    metadata:
+      labels: {app: echo-tls}
+    spec:
+      containers:
+        - name: echo
+          image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+          args: ["netexec", "--http-port=8443", "--tls-cert-file=/tls/tls.crt", "--tls-private-key-file=/tls/tls.key"]
+          ports: [{name: https, containerPort: 8443}]
+          volumeMounts: [{name: tls, mountPath: /tls, readOnly: true}]
+      volumes: [{name: tls, secret: {secretName: echo-tls}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo-tls, namespace: k6-demo}
+spec:
+  selector: {app: echo-tls}
+  ports:
+    - {name: https, port: 443, targetPort: https}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: echo-tls, namespace: k6-demo}
+spec:
+  parentRefs:
+    - {name: shared, namespace: k6-gateway, sectionName: https}
+  hostnames: ["app.k6.test"]
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /secure}
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path: {type: ReplacePrefixMatch, replacePrefixMatch: /}
+      backendRefs:
+        - {name: echo-tls, port: 443}
+EOF
+kubectl apply -f echo-tls.yaml
+kubectl -n k6-demo rollout status deployment/echo-tls --timeout=180s | tail -1
+until goi /secure/hostname | grep -q ' 400'; do sleep 1; done
+goi /secure/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+certificate.cert-manager.io/echo-tls created
+deployment.apps/echo-tls created
+service/echo-tls created
+httproute.gateway.networking.k8s.io/echo-tls created
+deployment "echo-tls" successfully rolled out
+Client sent an HTTP request to an HTTPS server.
+ 400
+```
+
+</Expected>
+
+Route đúng, status của nó cũng `True` cả hai điều kiện, nhưng Envoy không biết cổng 443 của Service nói TLS, nên gửi HTTP thường và chính backend trả `400`. Thêm `BackendTLSPolicy`, cố ý viết **sai `hostname`** trước để thấy phép kiểm có thật:
+
+<Terminal where="mac" title="~/masteva-k6/backend-tls.yaml">
+
+```bash
+kubectl -n k6-demo create configmap k6-ca --from-file=ca.crt=ca.crt
+cat > backend-tls.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {name: echo-tls, namespace: k6-demo}
+spec:
+  targetRefs:
+    - {group: "", kind: Service, name: echo-tls}
+  validation:
+    caCertificateRefs:
+      - {group: "", kind: ConfigMap, name: k6-ca}   # CA dùng để kiểm chứng chỉ của backend
+    hostname: echo-tls.k6-demo.svc                   # tên phải có trong chứng chỉ của backend
+EOF
+sed 's/hostname: echo-tls.k6-demo.svc/hostname: khac.k6-demo.svc    /' backend-tls.yaml | kubectl apply -f -
+T0=$(date +%s); until goi /secure/hostname | grep -q ' 503'; do sleep 1; done; echo "policy sai có hiệu lực sau $(( $(date +%s) - T0 )) giây"
+goi /secure/hostname
+kubectl -n k6-demo logs deployment/echo-tls --tail=20 | grep -o 'TLS handshake error.*' | sed 's/from [0-9.]*:[0-9]*/from <envoy>/' | tail -1
+kubectl apply -f backend-tls.yaml
+T0=$(date +%s); until goi /secure/hostname | grep -q ' 200'; do sleep 1; done; echo "policy đúng có hiệu lực sau $(( $(date +%s) - T0 )) giây"
+goi /secure/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/k6-ca created
+backendtlspolicy.gateway.networking.k8s.io/echo-tls created
+policy sai có hiệu lực sau 0 giây
+upstream connect error or disconnect/reset before headers. reset reason: remote connection failure 503
+TLS handshake error from <envoy>: remote error: tls: unknown certificate
+backendtlspolicy.gateway.networking.k8s.io/echo-tls configured
+policy đúng có hiệu lực sau 15 giây
+echo-tls-666cc8c8c5-sfn4m 200
+```
+
+</Expected>
+
+Với `hostname` sai, Envoy bắt tay TLS, thấy chứng chỉ của backend không mang tên nó được dặn phải kiểm, và bỏ kết nối: client nhận `503`, log của backend ghi phía bên kia từ chối chứng chỉ. Sửa `hostname` thì chạy. Hai dòng "có hiệu lực sau … giây" là điều cần nhớ khi vận hành. Policy vừa **tạo** có tác dụng gần như ngay (0 giây ở lượt này), còn **mỗi lần sửa** một policy đang có mất khoảng 15 giây, theo cả hai chiều (bài đo thêm chiều đúng thành sai: 16 giây). Envoy Gateway đẩy cấu hình mới ngay, nhưng trong Envoy, cụm backend vừa bị sửa phải qua một giai đoạn "làm nóng" (warming) trước khi thay bản cũ, và ở đây giai đoạn đó chỉ kết thúc khi hết thời gian chờ mặc định 15 giây; trong lúc chờ, cấu hình cũ vẫn phục vụ. Hệ quả: một policy vừa sửa thành sai vẫn trả `200` thêm 15 giây rồi mới `503`. Đừng kết luận một thay đổi TLS tới backend là ổn từ một lệnh `curl` chạy ngay sau `apply`; chờ 20 giây rồi thử.
+
+ConfigMap `k6-ca` được tạo tay từ `ca.crt`. Khi nhiều namespace cần cùng một CA, công cụ `trust-manager` của dự án cert-manager phân phối bundle đó tự động; bài không cài nó.
+
+<Check id="k6.2.lab-backend-tls">Tái hiện được `400` khi route trỏ vào backend HTTPS mà thiếu policy, `503` khi policy kiểm sai tên, và `200` khi `BackendTLSPolicy` có đúng CA cùng hostname. Đo được mỗi lần đổi policy mất khoảng 15 giây mới có hiệu lực.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Gateway `PROGRAMMED=False`, lý do `AddressNotAssigned` | Service của proxy không tạo được. Hay gặp: `EnvoyProxy` vá một cổng mà Gateway chưa có listener (ví dụ thêm dòng 443 trước khi có listener HTTPS) | `kubectl -n envoy-gateway-system logs deployment/envoy-gateway \| grep -o 'is invalid.*'`; sửa xong mà không tự hồi thì `rollout restart deployment/envoy-gateway` |
+| Không có `Certificate` nào sau khi thêm annotation | cert-manager chưa bật Gateway API, hoặc khởi động trước khi có CRD Gateway API; listener thiếu `hostname` hay `tls.certificateRefs` | `kubectl -n cert-manager logs deployment/cert-manager \| grep -i gateway`; `rollout restart deployment/cert-manager` |
+| Lệnh `curl` HTTPS không có `--cacert` vẫn thành công | Máy bạn có file `~/.curlrc` chứa `-k` hoặc `insecure`, tắt kiểm chứng chỉ cho mọi lệnh `curl` | `cat ~/.curlrc`; chạy `curl -q …` để bỏ qua file đó |
+| `/secure` vẫn trả kết quả cũ ngay sau khi sửa policy | Cấu hình mới của Envoy cần khoảng 15 giây mới thay bản cũ; nếu quá lâu hơn thế thì ConfigMap CA không khớp CA đã ký chứng chỉ backend | Chờ 20 giây rồi thử lại; `kubectl -n k6-demo get backendtlspolicy echo-tls -o yaml`, xem `status` |
+
+### Dọn dẹp
+
+K6.4 dùng lại Gateway `shared`, route `echo` và cert-manager. Gỡ những thứ chỉ phục vụ bài này: backend TLS, `httpbin` và các route, policy của chúng.
+
+<Callout kind="danger">
+
+Khối đầu xoá namespace `k6-tools` cùng mọi thứ trong đó và các object thử của bài trong `k6-demo`. Khối thứ hai xoá cả cụm và thư mục lab; chỉ chạy khi không học tiếp K6.3. Kiểm `kubectl config current-context` in ra `kind-k6-lab` trước.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K6.3">
+
+```bash
+kubectl config current-context
+kubectl delete -f backend-tls.yaml -f echo-tls.yaml -f retry-tools.yaml -f route-tools.yaml
+kubectl -n k6-demo delete configmap k6-ca
+kubectl delete namespace k6-tools
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k6-lab
+rm -rf ~/masteva-k6
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đội ứng dụng muốn tự thêm tên miền và chứng chỉ mà không được sửa Gateway. Làm thế nào?">
+
+Trong lab, listener HTTPS nằm trong object Gateway của đội nền tảng: thêm một tên miền là sửa Gateway, tức phải qua đội nền tảng. Gateway API 1.6 có `ListenerSet` ở kênh standard cho đúng nhu cầu này: một object nằm trong namespace của đội ứng dụng, khai thêm listener (tên miền, cổng, Secret chứng chỉ) và gắn vào một Gateway có sẵn; Gateway quyết định namespace nào được gắn `ListenerSet`, giống `allowedRoutes`. Tài liệu cert-manager ghi nó hỗ trợ annotation trên `ListenerSet` từ bản 1.20, phải bật thêm bằng cấu hình riêng. Bài chưa chạy cấu hình này. Khi chưa dùng `ListenerSet`, hai cách phổ biến là một listener wildcard (`*.apps.example.com`) với một chứng chỉ wildcard cấp bằng `DNS-01`, hoặc để việc thêm listener đi qua pull request vào repo của đội nền tảng.
+
+</Reveal>
+
+<Reveal title="timeouts.request và backendRequest khác nhau thế nào khi có retry?">
+
+`request` là thời gian tối đa gateway dành cho cả request của client, tính từ lúc nhận tới lúc trả xong, gồm mọi lần thử lại. `backendRequest` là trần cho **một** lần gọi backend. Với `request: 3s`, `backendRequest: 1s` và retry 3 lần, một backend treo sẽ bị bỏ sau 1 giây, thử lại, và client nhận `504` muộn nhất ở giây thứ 3 dù chưa dùng hết số lần thử. Đặc tả yêu cầu `backendRequest` không lớn hơn `request`. Bước 3 chỉ đặt `request`, nên với policy retry đang bật, một lần gọi `/delay/3` hết sạch ngân sách ở lần thử đầu và không lần thử lại nào kịp chạy. Quy tắc đặt: `request` nhỏ hơn timeout của client phía trước, `backendRequest` lớn hơn p99 của backend một khoảng vừa phải, và tích (số lần thử × `backendRequest`) không vượt `request`.
+
+</Reveal>
+
+<Reveal title="Vì sao phải khai hostname trong BackendTLSPolicy khi đã có CA?">
+
+Vì CA chỉ trả lời "chứng chỉ này có do ta cấp không", không trả lời "đây có đúng là service tôi định gọi không". CA nội bộ của lab cấp chứng chỉ cho mọi namespace. Nếu gateway chỉ kiểm CA, một pod bất kỳ có chứng chỉ hợp lệ cho tên `khac.k6-demo.svc` mà chen được vào sau Service `echo-tls` (sửa selector, hoặc chiếm label) sẽ được gateway tin. Kiểm `hostname` buộc chứng chỉ phải mang đúng tên của backend này; D9.4 đã tách hai câu hỏi xác thực và phân quyền theo cùng cách. Envoy gateway kết nối tới IP của pod chứ không tới tên, nên không có tên nào để kiểm ngầm: bạn phải nói ra.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết HTTPRoute và manifest cert-manager nhanh. Chỗ hay sai ở phần nâng cao: đặt `ReferenceGrant` trong namespace của route thay vì namespace của Service; viết `retry` thẳng vào HTTPRoute như thể đã là trường chuẩn; dùng `apiVersion` cũ (`v1beta1` cho `ReferenceGrant`, `v1alpha3` cho `BackendTLSPolicy`), hoặc annotation của Ingress (`kubernetes.io/tls-acme`) cho Gateway; quên bật `config.gatewayAPI.enabled` rồi đi tìm lỗi ở issuer; và khi được hỏi "làm sao biết chứng chỉ ổn" thì trả lời `kubectl get certificate` có `READY=True`. Kiểm lại: `kubectl apply --dry-run=server` bắt sai schema; `xem-route.sh` cho biết route có thật sự được nhận; còn với chứng chỉ, hỏi thẳng server bằng `openssl s_client` và xem `Issuing`, `renewalTime` của `Certificate`.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.2 là nền: ba vai trò, HTTPRoute, status. D9.4 dạy ACME, CA ba tầng và step-ca mà issuer của bài này nên trỏ tới trên production; D2.3 là nền về chứng chỉ. SB7.2 dạy retry trong code và SB12.2 dạy chuỗi timeout phía ứng dụng. K6.4 cho external-dns đọc `hostnames` của các route trên Gateway này để tạo bản ghi DNS. D12.4 là nơi đặt các cảnh báo về hạn chứng chỉ. K8 siết quyền đọc Secret và quyền gắn label lên namespace. K11 đưa mTLS tới mọi service, D13 dùng trọng số của HTTPRoute cho canary tự động.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k6.2.mastery-gateway">Thiết kế được một Gateway dùng chung: namespace nào giữ Gateway, đội ứng dụng gắn route bằng gì, gọi sang Service của đội khác cần ai đồng ý, và tính năng nào phải viết bằng policy riêng của implementation.</Check>
+
+<Check id="k6.2.mastery-cert">Tự dựng được chuỗi issuer, Gateway có annotation, listener HTTPS; và với một chứng chỉ bất kỳ trong cụm, nói được nó hết hạn khi nào, lần gia hạn tới là bao giờ (`status.renewalTime`), lần gia hạn gần nhất có thành công không.</Check>
+
+<Check id="k6.2.mastery-canh-bao">Nêu được ba tín hiệu cần cảnh báo để một lần gia hạn hỏng được phát hiện trước ngày chứng chỉ hết hạn, và vì sao `READY=True` không nằm trong số đó.</Check>
+
+</Mastery>

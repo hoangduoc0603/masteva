@@ -1,0 +1,596 @@
+---
+title: external-dns
+description: Chạy một máy chủ DNS có thẩm quyền trong lab, cho external-dns tự tạo bản ghi từ HTTPRoute qua RFC 2136, đọc bản ghi TXT đánh dấu quyền sở hữu, so policy upsert-only với sync bằng một route bị xoá, và tái hiện cảnh hai cụm trùng owner id xoá bản ghi của nhau.
+id: k6.4
+step: k6
+prerequisites: [k6.2, d2.2]
+topics: [k6.external-dns]
+status: verified
+verified:
+  date: 2026-10-13
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    external-dns: 0.23.0 (chart 1.23.0)
+    bind: 9.20.29
+    envoy-gateway: 1.9.2
+    gateway-api: 1.6.3 (standard)
+    yq: 4.54.1
+---
+
+<Goal>
+
+K6.2 kết thúc với một Gateway phục vụ `app.k6.test`, nhưng bạn phải tự bảo `curl` tên đó nằm ở đâu bằng `--resolve`. Trên hệ thống thật, mỗi route mới cần một bản ghi DNS, và làm tay thì bản ghi luôn chậm hơn hoặc sai so với cụm. Bài này để cụm tự viết DNS. Học xong, bạn giải thích được:
+
+- Vì sao một bản ghi `TXT` lạ nằm cạnh mỗi bản ghi `A` mà external-dns tạo, và xoá nó đi thì chuyện gì xảy ra.
+- Vì sao route đã xoá từ tháng trước mà tên miền vẫn phân giải được, và đổi một giá trị cấu hình thì nó biến mất.
+- Vì sao hai cụm cùng quản một zone có thể xoá sạch bản ghi của nhau trong một phút.
+- Vì sao một object hỏng của một đội có thể chặn việc cập nhật DNS của mọi đội.
+
+</Goal>
+
+<Knowledge>
+
+### external-dns làm gì
+
+**external-dns** là một controller chạy trong cụm, lặp đi lặp lại một vòng ba bước:
+
+```text
+        nguồn (source)                         external-dns                          nhà cung cấp DNS (provider)
+ HTTPRoute: hostnames app.k6.test     (1) đọc nguồn ──► danh sách MONG MUỐN
+ Gateway shared: địa chỉ 172.20.0.4       app.k6.test A 172.20.0.4
+ Service LoadBalancer, Ingress…       (2) đọc zone  ──► danh sách HIỆN CÓ  ◄───── AXFR (chép cả zone) / API liệt kê bản ghi
+                                      (3) so hai danh sách, lập kế hoạch:
+                                          tạo / sửa / xoá ──────────────────────► RFC 2136 UPDATE, API của cloud
+                                      lặp lại sau mỗi --interval (mặc định 1 phút)
+```
+
+- **Nguồn** là object Kubernetes mang tên miền: `hostnames` của HTTPRoute (địa chỉ lấy từ Gateway mà route gắn vào), Service kiểu `LoadBalancer` có annotation `external-dns.alpha.kubernetes.io/hostname`, Ingress.
+- **Provider** là nơi giữ zone: Route 53, Cloud DNS, Cloudflare, hoặc, như bài này, một máy chủ DNS tự vận hành nhận cập nhật động theo **RFC 2136** (BIND, Knot, Windows DNS). Giao thức đó cho phép gửi lệnh thêm, xoá bản ghi tới máy chủ có thẩm quyền, ký bằng một khoá chung gọi là **TSIG**.
+
+Nó không phải máy chủ DNS và không trả lời truy vấn nào. Nó chỉ giữ cho zone khớp với cụm. Hệ quả: external-dns hỏng thì tên miền đang có vẫn phân giải bình thường; thứ dừng lại là **thay đổi**.
+
+<Check id="k6.4.external-dns-vong-lap">Kể được ba bước của một vòng đồng bộ, phân biệt được nguồn với provider, và nói được external-dns hỏng thì cái gì dừng, cái gì không.</Check>
+
+### Ai sở hữu bản ghi: TXT registry
+
+Một zone hiếm khi chỉ thuộc về một cụm. Trong đó có bản ghi tạo tay từ nhiều năm trước, bản ghi của cụm khác, của hệ thống khác. Nếu external-dns coi mọi bản ghi không có nguồn là rác cần dọn, lần chạy đầu tiên sẽ xoá sạch zone. Vì vậy nó chỉ đụng tới bản ghi **nó đã tạo**, và ghi nhớ điều đó ngay trong zone bằng một bản ghi `TXT` đi kèm:
+
+```text
+ app.k6.test.     A     172.20.0.4
+ a-app.k6.test.   TXT   "heritage=external-dns,external-dns/owner=k6-lab,external-dns/resource=httproute/k6-demo/echo"
+                         └─ do external-dns tạo   └─ của instance nào        └─ sinh ra từ object nào
+```
+
+`owner` lấy từ cấu hình `txtOwnerId`. Quy tắc: bản ghi không có `TXT` đi kèm, hoặc `TXT` mang owner khác, thì external-dns **không sửa, không xoá**. Từ đó có hai lỗi cấu hình đối xứng nhau:
+
+| Lỗi | Hậu quả |
+|---|---|
+| Hai cụm dùng **cùng** `txtOwnerId` trên một zone | Mỗi cụm coi bản ghi của cụm kia là của mình mà không còn nguồn, và (với policy `sync`) xoá chúng |
+| Đổi `txtOwnerId` của một cụm đang chạy | Mọi bản ghi cũ thành "của người khác": không được cập nhật khi IP đổi, không được dọn khi route bị xoá |
+
+<Check id="k6.4.txt-registry">Giải thích được bản ghi `TXT` đi kèm dùng để làm gì, external-dns xử lý thế nào với bản ghi không có nó, và hậu quả của việc trùng hoặc đổi `txtOwnerId`.</Check>
+
+### Policy: được làm gì với bản ghi của mình
+
+| `policy` | Tạo | Sửa | Xoá khi nguồn mất | Dùng khi |
+|---|---|---|---|---|
+| `upsert-only` | Có | Có | **Không** | Mới đưa vào dùng; zone quan trọng; chấp nhận dọn rác bằng tay |
+| `sync` | Có | Có | Có | Zone hoặc zone con dành riêng cho cụm, owner id đã chắc chắn duy nhất |
+| `create-only` | Có | Không | Không | Chỉ muốn điền bản ghi còn thiếu |
+
+Ở bản 0.23, cả chart Helm lẫn chương trình đều buộc bạn chọn `policy` một cách tường minh (thiếu `--policy` thì chương trình không khởi động). Các bản cũ, ví dụ 0.18, mặc định `sync`, nên hướng dẫn cũ thường không ghi cờ này. `upsert-only` an toàn hơn và để lại rác: route đã xoá vẫn còn bản ghi, trỏ tới một địa chỉ mà mai kia có thể thuộc về thứ khác. `sync` giữ zone sạch và biến mọi lỗi cấu hình thành lệnh xoá.
+
+Ba hàng rào nên có cùng lúc với `sync`:
+
+- **`domainFilters`** giới hạn external-dns trong đúng zone hoặc zone con của nó. Tốt nhất mỗi cụm một zone con được uỷ quyền riêng (`cum-a.example.com`); khi đó lỗi của một cụm không chạm được vào tên của cụm khác.
+- **Quyền của khoá** khớp với phạm vi đó: khoá TSIG hay IAM role chỉ sửa được zone ấy. Khoá DNS là thứ rất nhạy cảm (D9.4): ai sửa được DNS thì xin được chứng chỉ cho tên miền của bạn.
+- **Cảnh báo khi đồng bộ lỗi.** external-dns áp cả kế hoạch thay đổi theo lô; một thay đổi bị provider từ chối có thể chặn cả lô.
+
+<Callout kind="production">
+
+[Báo cáo sự cố ngày 22/01/2022](https://runbooks.cloud-platform.service.justice.gov.uk/incidents/2022-01-22-some-dns-records-deleted.html) của nhóm Cloud Platform, Bộ Tư pháp Anh: một số bản ghi DNS của nền tảng Kubernetes dùng chung bị xoá vào cuối tuần. Hai trang production không truy cập được, ba trang production khác gặp lỗi nhỏ (không truy cập được trên các tên miền chỉ nhân viên của bộ dùng), và 46 trang không phải production không truy cập được trên các tên miền như vậy; thời gian sửa là 2 giờ 2 phút. Phần đáng chú ý nằm ở mục khắc phục: external-dns **đã cố tạo lại** các bản ghi, nhưng mọi lần ghi đều lỗi vì một Ingress không liên quan thiếu annotation `external-dns.alpha.kubernetes.io/aws-weight`; chỉ khi có người thêm annotation đó bằng tay thì DNS mới hồi lại. Các việc cần làm họ ghi ra gồm nâng mức ưu tiên của cảnh báo `ErrorsInExternalDNS`, viết runbook cho cảnh báo đó, và xem lại liệu chức năng `sync` có đủ cho việc dọn DNS.
+
+Phần suy ra của bài này: trên một nền tảng nhiều đội, external-dns là điểm dùng chung. Một object sai của một đội đủ làm việc đồng bộ của mọi đội đứng lại, và vì tên miền cũ vẫn chạy nên không ai thấy cho tới khi cần một thay đổi. Cảnh báo cần có là "external-dns báo lỗi" và "đã bao lâu chưa đồng bộ thành công"; bước 4 chỉ ra hai metric đó.
+
+</Callout>
+
+<Check id="k6.4.policy">So sánh được `upsert-only` với `sync` ở việc xoá bản ghi, và kể được ba hàng rào nên có khi bật `sync`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [external-dns](https://kubernetes-sigs.github.io/external-dns/latest/): trang tổng quan, danh sách nguồn và provider.
+- [RFC2136 provider | external-dns](https://kubernetes-sigs.github.io/external-dns/latest/docs/tutorials/rfc2136/): cấu hình với BIND và TSIG, các cờ `--rfc2136-*`.
+- [TXT | external-dns](https://kubernetes-sigs.github.io/external-dns/latest/docs/registry/txt/): định dạng bản ghi sở hữu, `txt-prefix`, và cách đổi owner an toàn.
+- [Gateway API Route Sources | external-dns](https://kubernetes-sigs.github.io/external-dns/latest/docs/sources/gateway-api/): tên miền và địa chỉ được lấy từ route và Gateway thế nào.
+- [RFC 2136: Dynamic Updates in the Domain Name System](https://www.rfc-editor.org/rfc/rfc2136): giao thức cập nhật động; đọc mục 2 và 3 để hiểu một gói UPDATE.
+- [Incident on 2022-01-22: some DNS records got deleted at the weekend | Cloud Platform Runbooks](https://runbooks.cloud-platform.service.justice.gov.uk/incidents/2022-01-22-some-dns-records-deleted.html): sự cố trong callout.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Cụm `k6-lab` sau K6.2: Gateway `shared` trong `k6-gateway` có listener `http` và `https` cho `app.k6.test`, route `echo` và `echo-redirect` trong `k6-demo`, file `~/masteva-k6/ca.crt`. Nếu chưa làm K6.2, làm bước 1, 2 và 4 của bài đó.
+- `dig`, `curl`, `yq`, `openssl` trên máy (macOS có sẵn `dig`). Cổng `9605` trên máy còn trống.
+- **Profile máy:** thêm một pod external-dns (khoảng 16 MiB) và một container BIND ngoài cụm (khoảng 34 MiB); hai lượt chạy liền cả chặng đo được ba node của cụm dùng tổng cộng 3,3 và 3,9 GiB RAM ở cuối bài. Không cần thu gọn gì thêm so với K6.2.
+- Bài không dùng tài khoản cloud nào. Máy chủ DNS là một container BIND; với Route 53 hay Cloudflare chỉ khác phần `provider` và cách cấp khoá.
+
+### 1. Một máy chủ DNS có thẩm quyền cho zone `k6.test`
+
+BIND chạy trong container `k6-dns`, cùng mạng Docker với các node của kind để pod gọi tới được. Image chính thức của ISC chỉ có bản `amd64`; trên máy Apple Silicon, Docker Desktop chạy nó qua giả lập, đủ nhanh cho lab (cờ `--platform` nói rõ điều đó thay vì để Docker cảnh báo). Máy Linux `arm64` không có giả lập thì phải cài `qemu-user-static` (binfmt) trước, hoặc dùng một image BIND khác có bản `arm64`; bài chưa chạy hai cách đó. Tag `9.20` là tag trôi, nên lệnh ghim thêm digest của bản 9.20.29 đã kiểm. File cấu hình khai một zone và một khoá TSIG; chỉ ai ký bằng khoá đó mới cập nhật được zone. Khoá được sinh ngẫu nhiên, chỉ có giá trị trong lab.
+
+<Terminal where="mac" title="~/masteva-k6/bind/named.conf">
+
+```bash
+cd ~/masteva-k6
+export KUBECONFIG=~/masteva-k6/kubeconfig
+mkdir -p bind
+TSIG=$(openssl rand -base64 32)
+cat > bind/named.conf <<EOF
+options {
+    directory "/var/cache/bind";
+    listen-on { any; };
+    listen-on-v6 { none; };
+    recursion no;                          // máy chủ có thẩm quyền, không phân giải hộ
+    allow-query { any; };
+    dnssec-validation no;
+};
+key "externaldns" {
+    algorithm hmac-sha256;
+    secret "$TSIG";
+};
+zone "k6.test" {
+    type primary;
+    file "/var/lib/bind/k6.test.zone";
+    allow-update { key "externaldns"; };   // RFC 2136: chỉ ai có khoá mới sửa được zone
+    allow-transfer { key "externaldns"; }; // và mới liệt kê được toàn bộ zone (AXFR)
+};
+EOF
+cat > bind/k6.test.zone <<'EOF'
+$TTL 60
+@   IN SOA ns.k6.test. admin.k6.test. ( 1 3600 600 86400 60 )
+    IN NS  ns.k6.test.
+ns  IN A   127.0.0.1
+EOF
+docker run -d --name k6-dns --platform linux/amd64 --network kind -p 127.0.0.1:9605:53/udp -p 127.0.0.1:9605:53/tcp \
+  -v ~/masteva-k6/bind/named.conf:/etc/bind/named.conf:ro \
+  -v ~/masteva-k6/bind/k6.test.zone:/var/lib/bind/k6.test.zone \
+  internetsystemsconsortium/bind9:9.20@sha256:071465f88068854d0ceadd9b985fb1acae4071e80754e545cd811fde57541ad0 > /dev/null
+until dig @127.0.0.1 -p 9605 k6.test SOA +short | grep -q admin; do sleep 1; done
+DNS_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' k6-dns)
+echo "BIND: $(docker exec k6-dns named -v | cut -d' ' -f1-2), IP trong mạng kind: $DNS_IP"
+dig @127.0.0.1 -p 9605 k6.test SOA +short
+dig @127.0.0.1 -p 9605 app.k6.test A +noall +comments | grep -o 'status: [A-Z]*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+BIND: BIND 9.20.29, IP trong mạng kind: 172.20.0.5
+ns.k6.test. admin.k6.test. 1 3600 600 86400 60
+status: NXDOMAIN
+```
+
+</Expected>
+
+Zone tồn tại, và `app.k6.test` chưa có: `NXDOMAIN`. Cổng `9605` trên máy nối vào cổng 53 của container để bạn hỏi bằng `dig`; external-dns thì gọi thẳng `$DNS_IP:53` trong mạng Docker. IP của bạn sẽ khác.
+
+<Check id="k6.4.lab-bind">Chạy được một máy chủ DNS có thẩm quyền cho zone lab, có khoá TSIG cho cập nhật động, và hỏi được nó bằng `dig`.</Check>
+
+### 2. Cài external-dns và xem bản ghi đầu tiên tự xuất hiện
+
+Chart của external-dns chỉ phát hành qua kho Helm kiểu cũ và file đính kèm bản phát hành trên GitHub, không có bản OCI như Cilium hay cert-manager. Bài tải file `.tgz` về thư mục lab, kiểm mã băm rồi cài từ file: cách cài này tất định và ghim đúng phiên bản. Mã băm lấy từ trường `digest` trong `index.yaml` của kho chart chính thức; lệnh `helm install` nối sau `shasum … &&` nên **không chạy nếu mã băm sai** (trên Linux thay `shasum -a 256` bằng `sha256sum`). Khoá TSIG đi vào cụm dưới dạng Secret và tới external-dns qua biến môi trường, không nằm trong file values.
+
+<Terminal where="mac" title="~/masteva-k6/external-dns-values.yaml">
+
+```bash
+curl -sLO https://github.com/kubernetes-sigs/external-dns/releases/download/external-dns-helm-chart-1.23.0/external-dns-1.23.0.tgz
+echo "6d149b9b04db1dc9e46b3693a4eca4ac90d6bba5e3b2a0fdd067ce3f7bfbc31e  external-dns-1.23.0.tgz" > chart.sha256
+kubectl create namespace external-dns
+kubectl -n external-dns create secret generic k6-dns-tsig --from-literal=secret="$TSIG"
+cat > external-dns-values.yaml <<EOF
+provider:
+  name: rfc2136
+sources: [gateway-httproute]
+domainFilters: [k6.test]              # không đụng tới zone nào khác
+policy: upsert-only                   # tạo và sửa, không xoá; bước 4 đổi sang sync
+registry: txt
+txtOwnerId: k6-lab                    # tên của instance này trong bản ghi TXT sở hữu
+interval: 10s                         # lab: đồng bộ mỗi 10 giây (mặc định 1 phút)
+env:
+  - name: EXTERNAL_DNS_RFC2136_TSIG_SECRET
+    valueFrom:
+      secretKeyRef: {name: k6-dns-tsig, key: secret}
+extraArgs:
+  - --rfc2136-host=$DNS_IP
+  - --rfc2136-port=53
+  - --rfc2136-zone=k6.test
+  - --rfc2136-tsig-keyname=externaldns
+  - --rfc2136-tsig-secret-alg=hmac-sha256
+  - --rfc2136-axfr
+  - --rfc2136-min-ttl=60s
+EOF
+shasum -a 256 -c chart.sha256 && helm install external-dns ./external-dns-1.23.0.tgz -n external-dns -f external-dns-values.yaml --wait \
+  | grep -E '^(NAME|NAMESPACE|STATUS):'
+until dig @127.0.0.1 -p 9605 app.k6.test A +short | grep -q .; do sleep 2; done
+kubectl -n external-dns logs deployment/external-dns | grep -E 'Configured|Adding RR' | sed 's/.*msg="//; s/"$//' | cut -c1-110
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/external-dns created
+secret/k6-dns-tsig created
+external-dns-1.23.0.tgz: OK
+NAME: external-dns
+NAMESPACE: external-dns
+STATUS: deployed
+Configured RFC2136 with zones '[k6.test]' and nameservers '[172.20.0.5]'
+Adding RR: app.k6.test 60 A 172.20.0.2
+Adding RR: app.k6.test 60 A 172.20.0.3
+Adding RR: app.k6.test 60 A 172.20.0.4
+Adding RR: a-app.k6.test 60 TXT \"heritage=external-dns,external-dns/owner=k6-lab,external-dns/resource=httpro
+```
+
+</Expected>
+
+Không ai tạo bản ghi nào. external-dns thấy hai HTTPRoute của K6.2 mang `hostnames: ["app.k6.test"]`, lấy địa chỉ từ status của Gateway `shared` (ba IP của ba node, vì proxy được mở bằng NodePort), và gửi bốn lệnh thêm tới BIND: ba bản ghi `A` và một bản ghi `TXT` sở hữu. Hàm `d` dưới đây hỏi BIND cho gọn; rồi một container ngoài cụm dùng BIND làm DNS gọi ứng dụng **bằng tên**, không `--resolve`, không header `Host`:
+
+<Terminal where="mac">
+
+```bash
+d() { dig @127.0.0.1 -p 9605 +noall +answer "$@" | awk '{$3=""; print}' | sort; }
+d app.k6.test A
+d a-app.k6.test TXT
+docker run --rm --network kind --dns $DNS_IP -v ~/masteva-k6/ca.crt:/ca.crt:ro curlimages/curl:8.22.0 \
+  -s --cacert /ca.crt -w ' %{http_code}\n' https://app.k6.test:30443/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+app.k6.test. 60  A 172.20.0.2
+app.k6.test. 60  A 172.20.0.3
+app.k6.test. 60  A 172.20.0.4
+a-app.k6.test. 60  TXT "heritage=external-dns,external-dns/owner=k6-lab,external-dns/resource=httproute/k6-demo/echo"
+echo-85cc55b84f-hhl55 200
+```
+
+</Expected>
+
+Chuỗi của ba bài đã khép lại: tên miền do external-dns viết, trỏ tới Gateway của K6.2, chứng chỉ do cert-manager cấp cho đúng tên đó, request tới pod `echo`. Cổng `30443` là NodePort của listener HTTPS; trên cloud, bản ghi sẽ trỏ tới địa chỉ của load balancer và cổng là 443.
+
+Bản ghi `TXT` có tên `a-app.k6.test`: tiền tố `a-` cho biết nó đi kèm bản ghi kiểu `A`. Trường `resource` chỉ ghi một trong hai route cùng mang tên miền này; ở lượt của bạn có thể là `echo-redirect`.
+
+<Check id="k6.4.lab-ban-ghi-dau">Cài được external-dns với provider RFC 2136, thấy bản ghi `A` và `TXT` tự xuất hiện từ một HTTPRoute có sẵn, và gọi được ứng dụng bằng tên qua máy chủ DNS đó.</Check>
+
+### 3. Route mới, bản ghi tạo tay, và `upsert-only`
+
+Thêm một route cho tên miền mới, và, như trên mọi zone thật, một bản ghi do người tạo tay từ trước (`legacy.k6.test`), gửi bằng `nsupdate` với cùng khoá TSIG.
+
+<Terminal where="mac" title="~/masteva-k6/route-shop.yaml">
+
+```bash
+cat > route-shop.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: shop, namespace: k6-demo}
+spec:
+  parentRefs:
+    - {name: shared, namespace: k6-gateway, sectionName: http}
+  hostnames: ["shop.k6.test"]
+  rules:
+    - backendRefs:
+        - {name: echo, port: 80}
+EOF
+kubectl apply -f route-shop.yaml
+cat > capnhat-dns.sh <<'EOF'
+#!/bin/sh
+# Gửi các lệnh nsupdate đọc từ stdin tới BIND của lab, ký bằng khoá TSIG trong named.conf
+KEY=$(grep secret ~/masteva-k6/bind/named.conf | cut -d'"' -f2)
+{ echo "server 127.0.0.1"; echo "zone k6.test"; cat; echo "send"; } \
+  | docker exec -i k6-dns nsupdate -y "hmac-sha256:externaldns:$KEY"
+EOF
+chmod +x capnhat-dns.sh
+echo "update add legacy.k6.test 300 A 10.0.0.99" | ./capnhat-dns.sh
+until d shop.k6.test A | grep -q .; do sleep 2; done
+d shop.k6.test A | head -1; d a-shop.k6.test TXT; d legacy.k6.test A
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/shop created
+shop.k6.test. 60  A 172.20.0.2
+a-shop.k6.test. 60  TXT "heritage=external-dns,external-dns/owner=k6-lab,external-dns/resource=httproute/k6-demo/shop"
+legacy.k6.test. 300  A 10.0.0.99
+```
+
+</Expected>
+
+Trong vòng một lượt đồng bộ, `shop.k6.test` có bản ghi kèm `TXT` sở hữu. `legacy.k6.test` không có `TXT` nào đi kèm: với external-dns, đó là bản ghi của người khác.
+
+<Predict question="Đội ứng dụng xoá HTTPRoute `shop`. Policy đang là `upsert-only`. Hai mươi giây sau, `shop.k6.test` còn phân giải được không?">
+
+Còn, và sẽ còn mãi. `upsert-only` không bao giờ xoá. Bản ghi vẫn trỏ về Gateway, nơi không còn route nào cho tên đó, nên người dùng nhận `404` thay vì lỗi DNS. Trên cloud tệ hơn: nếu địa chỉ cũ được cấp lại cho người khác, tên miền của bạn trỏ sang hệ thống của họ.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k6-demo delete httproute shop
+sleep 25
+d shop.k6.test A | head -1
+kubectl -n external-dns logs deployment/external-dns --since=15s | sed 's/.*msg="//; s/"$//' | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io "shop" deleted from k6-demo namespace
+shop.k6.test. 60  A 172.20.0.2
+   1 All records are already up to date
+```
+
+</Expected>
+
+Hai lượt đồng bộ đã qua (`sleep 25` với `interval: 10s`), external-dns báo "đã khớp", và bản ghi mồ côi vẫn nằm đó. Số dòng log của bạn có thể là 1 hoặc 2 tuỳ thời điểm.
+
+<Check id="k6.4.lab-upsert-only">Chứng minh được với `upsert-only`, bản ghi của một route đã xoá vẫn tồn tại, và nêu được rủi ro của bản ghi mồ côi.</Check>
+
+### 4. `sync`, và ranh giới của quyền sở hữu
+
+Đổi policy sang `sync` bằng một dòng trong file values:
+
+<Callout kind="danger">
+
+Khối dưới cho external-dns quyền **xoá**: ngay lượt đồng bộ đầu tiên nó xoá bốn bản ghi của route `shop` đã mất. Trên một zone thật, đọc trước danh sách bản ghi `TXT` mang owner của bạn để biết `sync` sẽ dọn những gì. Chỉ chạy với zone `k6.test` của lab.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+yq -i '.policy = "sync"' external-dns-values.yaml
+helm upgrade external-dns ./external-dns-1.23.0.tgz -n external-dns -f external-dns-values.yaml --wait | grep '^STATUS:'
+kubectl -n external-dns rollout status deployment/external-dns --timeout=120s | tail -1
+until [ -z "$(d shop.k6.test A)" ]; do sleep 2; done
+kubectl -n external-dns logs deployment/external-dns | grep 'Removing RR' | sed 's/.*msg="//; s/"$//' | cut -c1-70
+echo "shop: $(d shop.k6.test A | wc -l | tr -d ' ') bản ghi"
+d legacy.k6.test A; d app.k6.test A | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+STATUS: deployed
+deployment "external-dns" successfully rolled out
+Removing RR: shop.k6.test 60 A 172.20.0.2
+Removing RR: shop.k6.test 60 A 172.20.0.3
+Removing RR: shop.k6.test 60 A 172.20.0.4
+Removing RR: a-shop.k6.test 0 TXT heritage=external-dns,external-dns/o
+shop: 0 bản ghi
+legacy.k6.test. 300  A 10.0.0.99
+app.k6.test. 60  A 172.20.0.2
+```
+
+</Expected>
+
+Ngay lượt đầu, `sync` dọn bản ghi mồ côi cùng `TXT` của nó. `legacy.k6.test` còn nguyên vì không mang dấu sở hữu; `app.k6.test` còn nguyên vì nguồn của nó còn. Đây là `sync` khi mọi thứ cấu hình đúng.
+
+Giờ tới trường hợp cấu hình sai. Giả sử zone này còn được hai cụm khác dùng: cụm B được cài bằng cách chép file values của bạn nên **cũng mang `txtOwnerId: k6-lab`**, cụm C có owner riêng. Không cần dựng thêm cụm: bản ghi mà external-dns của chúng sẽ tạo ra được viết thẳng vào zone bằng `nsupdate`.
+
+<Callout kind="danger">
+
+Khối dưới cố ý để external-dns **xoá** một bản ghi vừa tạo, để thấy cơ chế. Trên một zone thật, đây chính là cách hai cụm trùng owner id xoá bản ghi production của nhau. Chỉ chạy với zone `k6.test` của lab.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+./capnhat-dns.sh <<'EOF'
+update add cum-b.k6.test 60 A 10.0.0.50
+update add a-cum-b.k6.test 60 TXT "heritage=external-dns,external-dns/owner=k6-lab,external-dns/resource=httproute/shop/web"
+update add cum-c.k6.test 60 A 10.0.0.60
+update add a-cum-c.k6.test 60 TXT "heritage=external-dns,external-dns/owner=cum-c,external-dns/resource=httproute/shop/web"
+EOF
+d cum-b.k6.test A; d cum-c.k6.test A
+until [ -z "$(d cum-b.k6.test A)" ]; do sleep 2; done
+echo "--- sau một lượt đồng bộ"
+echo "cum-b: $(d cum-b.k6.test A | wc -l | tr -d ' ') bản ghi"; d cum-c.k6.test A
+kubectl -n external-dns logs deployment/external-dns --since=30s | grep 'Removing RR.*cum-' | sed 's/.*msg="//; s/"$//' | cut -c1-45
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cum-b.k6.test. 60  A 10.0.0.50
+cum-c.k6.test. 60  A 10.0.0.60
+--- sau một lượt đồng bộ
+cum-b: 0 bản ghi
+cum-c.k6.test. 60  A 10.0.0.60
+Removing RR: cum-b.k6.test 60 A 10.0.0.50
+Removing RR: a-cum-b.k6.test 0 TXT heritage=e
+```
+
+</Expected>
+
+Bản ghi của "cụm B" biến mất trong vòng mười giây. external-dns của bạn đọc `TXT`, thấy `owner=k6-lab`, kết luận "của tôi", không tìm thấy nguồn nào trong cụm, và xoá. Trong thực tế cụm B cũng làm đúng như vậy với bản ghi của bạn, và hai bên tạo lại rồi xoá của nhau mỗi phút. Bản ghi của cụm C, owner khác, không bị đụng tới. `txtOwnerId` phải duy nhất cho từng instance; đặt nó theo tên cụm, và đừng để nó nằm trong phần values dùng chung. Bỏ trống cũng không an toàn: giá trị mặc định của `--txt-owner-id` là chuỗi `default`, nên hai cụm cùng bỏ trống là hai cụm trùng owner.
+
+Lỗi đối xứng với nó là **đổi** owner id của một cụm đang chạy, ví dụ khi đổi tên cụm. Tạo lại route `shop`, chờ bản ghi, đổi `txtOwnerId` thành `cum-moi` (kèm log mức `debug` để thấy lý do), rồi xoá route:
+
+<Terminal where="mac" title="~/masteva-k6/external-dns-owner-moi.yaml">
+
+```bash
+kubectl apply -f route-shop.yaml
+until d shop.k6.test A | grep -q .; do sleep 2; done
+yq '.txtOwnerId = "cum-moi" | .logLevel = "debug"' external-dns-values.yaml > external-dns-owner-moi.yaml
+helm upgrade external-dns ./external-dns-1.23.0.tgz -n external-dns -f external-dns-owner-moi.yaml --wait | grep '^STATUS:'
+kubectl -n external-dns rollout status deployment/external-dns --timeout=120s | tail -1
+kubectl -n k6-demo delete httproute shop
+sleep 25
+d shop.k6.test A | head -1
+kubectl -n external-dns logs deployment/external-dns --since=12s | grep 'Skipping endpoint shop' | sed 's/.*msg="//; s/"$//; s/\\//g' | sort -u
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/shop created
+STATUS: deployed
+deployment "external-dns" successfully rolled out
+httproute.gateway.networking.k8s.io "shop" deleted from k6-demo namespace
+shop.k6.test. 60  A 172.20.0.2
+Skipping endpoint shop.k6.test 60 IN A  172.20.0.2;172.20.0.3;172.20.0.4 [] because owner id does not match (found: "k6-lab", required: "cum-moi")
+```
+
+</Expected>
+
+Policy vẫn là `sync`, route đã xoá, và bản ghi không được dọn: với instance mang tên mới, mọi bản ghi cũ là "của người khác". Cũng vì thế chúng sẽ không được cập nhật khi địa chỉ của Gateway đổi. Dòng log chỉ hiện ở mức `debug`; ở mức mặc định external-dns im lặng bỏ qua. Muốn đổi owner id thật, tài liệu của external-dns có quy trình chuyển quyền sở hữu; đừng chỉ sửa giá trị rồi triển khai.
+
+Cuối cùng, hai metric cần có cảnh báo. external-dns mở chúng ở cổng 7979:
+
+<Terminal where="mac">
+
+```bash
+( kubectl -n external-dns port-forward deployment/external-dns 9611:7979 > /dev/null 2>&1 & )
+until curl -s -o /dev/null localhost:9611/metrics; do sleep 1; done
+curl -s localhost:9611/metrics | grep -E '^external_dns_(registry_errors_total|source_errors_total|controller_last_sync_timestamp_seconds) '
+pkill -f 'port-forward deployment/external-dns'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+external_dns_controller_last_sync_timestamp_seconds 1.7918613227757583e+09
+external_dns_registry_errors_total 0
+external_dns_source_errors_total 0
+```
+
+</Expected>
+
+`last_sync_timestamp` là lúc lượt đồng bộ gần nhất **thành công**; cảnh báo khi nó cũ hơn vài lần `interval`. Hai bộ đếm lỗi tăng khi external-dns không đọc được nguồn hoặc không ghi được vào provider. Sự cố trong callout là đúng trường hợp các con số này lẽ ra phải gọi người dậy.
+
+<Check id="k6.4.lab-sync">Chuyển được sang `sync` và thấy bản ghi mồ côi được dọn, chứng minh được bản ghi không có `TXT` sở hữu hoặc mang owner khác không bị đụng tới, và tái hiện được hai lỗi owner id: trùng thì bản ghi bị xoá, đổi thì bản ghi bị bỏ mặc.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Không bản ghi nào xuất hiện | Tên miền nằm ngoài `domainFilters`; Gateway chưa có địa chỉ; route chưa `Accepted` | `kubectl -n external-dns logs deployment/external-dns --tail=20`; `kubectl -n k6-gateway get gateway` |
+| Log báo `NOTAUTH` hoặc `BADKEY`, `BADSIG` | Sai tên khoá, sai thuật toán, hoặc Secret không khớp `named.conf` (chạy lại bước 1 sẽ sinh khoá mới) | So `--rfc2136-tsig-keyname` với `key "…"` trong `named.conf`; tạo lại Secret `k6-dns-tsig` |
+| Log báo lỗi AXFR, `REFUSED` | BIND không cho khoá đó chuyển zone | `allow-transfer` trong `named.conf` |
+| `dig` ở cổng 9605 không trả lời | Container `k6-dns` dừng vì `named.conf` sai cú pháp | `docker logs k6-dns \| tail -5` |
+| Bản ghi không đổi khi IP của Gateway đổi | `TXT` sở hữu mang owner khác hoặc đã bị xoá: external-dns coi bản ghi là của người khác | `d a-<tên>.k6.test TXT` |
+| `shasum` báo `FAILED` (và `helm install` không chạy) | File chart tải lỗi hoặc không phải bản 1.23.0 | Tải lại; so với trường `digest` trong `index.yaml` của kho chart |
+| `helm` báo `no cached repo found` | Máy có repo Helm đã `repo add` nhưng chưa từng `repo update`; Helm đọc bộ nhớ đệm đó cả khi cài từ URL | Cài từ file `.tgz` như bài làm, hoặc chạy `helm repo update` |
+
+### Dọn dẹp
+
+K6.5 dùng lại cụm và CoreDNS, không dùng external-dns hay BIND. Gỡ cả hai; giữ Gateway và cert-manager nếu bạn còn muốn thử thêm.
+
+<Callout kind="danger">
+
+Khối đầu gỡ external-dns, xoá namespace của nó và xoá container `k6-dns` cùng toàn bộ zone `k6.test` bên trong (chỉ đúng container tên `k6-dns`). Khối thứ hai xoá cả cụm và thư mục lab; chỉ chạy khi không học tiếp K6.5. Kiểm `kubectl config current-context` in ra `kind-k6-lab` trước.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K6.5">
+
+```bash
+kubectl config current-context
+helm uninstall external-dns -n external-dns
+kubectl delete namespace external-dns
+docker rm -f k6-dns
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k6-lab
+rm -rf ~/masteva-k6
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đổi địa chỉ của Gateway rồi rollout: người dùng có bị gián đoạn vì DNS không?">
+
+Có thể, và độ dài gián đoạn do ba đồng hồ cộng lại quyết định. Một: external-dns chỉ thấy địa chỉ mới ở lượt đồng bộ kế tiếp (`interval`, mặc định 1 phút). Hai: TTL của bản ghi; lab đặt tối thiểu 60 giây bằng `--rfc2136-min-ttl`, nghĩa là resolver nào đã hỏi sẽ giữ địa chỉ cũ thêm tới một phút. Ba: cache phía client và các resolver trung gian, không phải lúc nào cũng tôn trọng TTL (D2.2). Vì vậy đổi địa chỉ điểm vào không bao giờ là "tắt cái cũ, bật cái mới": giữ địa chỉ cũ phục vụ song song ít nhất bằng tổng ba khoảng đó. Hạ TTL xuống rất thấp để "đổi nhanh" có cái giá riêng: mọi request mới phải hỏi DNS thường xuyên hơn, và máy chủ DNS thành điểm nóng. Địa chỉ ổn định ở tầng dưới (một load balancer hoặc VIP không đổi, D9.3) tốt hơn TTL thấp.
+
+</Reveal>
+
+<Reveal title="Gỡ external-dns khỏi cụm, hoặc xoá cả cụm, thì các bản ghi nó đã tạo ra sao?">
+
+Ở lại nguyên trong zone, cùng các bản ghi `TXT` sở hữu. external-dns không dọn gì khi tắt: nó chỉ hành động trong vòng đồng bộ, và một tiến trình đã dừng thì không còn vòng nào. Chạy `helm uninstall` ở phần Dọn dẹp rồi hỏi lại `d app.k6.test A` trước khi xoá container BIND sẽ thấy ba bản ghi `A` vẫn đó. Hệ quả khi bỏ một cụm: phải dọn bản ghi của nó như một bước riêng, nếu không zone giữ mãi những tên trỏ vào địa chỉ đã trả lại cho nhà cung cấp. Hai cách dọn: trước khi gỡ, xoá hết nguồn (route, Service) trong lúc external-dns còn chạy với `sync` và chờ nó xoá; hoặc lọc trong zone mọi bản ghi `TXT` mang `owner` của cụm đó rồi xoá chúng cùng bản ghi đi kèm. Đây cũng là lý do owner id nên đặt theo tên cụm: nó là thứ duy nhất cho biết bản ghi nào thuộc về cụm đã mất.
+
+</Reveal>
+
+<Reveal title="Cần cả tên miền công khai lẫn tên miền nội bộ cho cùng một cụm thì cài thế nào?">
+
+Chạy **hai** instance external-dns, mỗi instance một zone và một bộ khoá: một cái trỏ vào zone công khai, một cái vào zone nội bộ (split-horizon DNS, D2.2). Mỗi instance cần `txtOwnerId` riêng, `domainFilters` riêng, và một cách chọn nguồn riêng để chúng không cùng nhận một route: lọc theo label của Gateway hoặc theo annotation trên object. Bài chưa chạy cấu hình hai instance. Điều lab đã cho thấy và áp dụng nguyên ở đây: hai instance trên **cùng** một zone mà trùng owner id là công thức xoá bản ghi của nhau.
+
+</Reveal>
+
+<Reveal title="Vì sao không cho external-dns quyền trên cả zone example.com của công ty?">
+
+Vì phạm vi quyền chính là phạm vi thiệt hại. Khoá DNS của external-dns nằm trong một Secret của cụm; ai đọc được Secret đó, hoặc chiếm được pod external-dns, sẽ sửa được mọi bản ghi mà khoá cho phép. Sửa được bản ghi `A` của `www` là chuyển hướng được người dùng; sửa được `_acme-challenge` là xin được chứng chỉ hợp lệ cho tên miền (D9.4, và sự cố ở K6.2 cho thấy bản ghi đó quan trọng thế nào). Cách làm chuẩn: uỷ quyền một zone con cho mỗi cụm (`cum-a.k8s.example.com`), khoá chỉ có quyền trên zone con ấy, còn các tên "đẹp" trong zone chính là bản ghi `CNAME` do người tạo có kiểm soát, trỏ vào tên trong zone con. Lỗi cấu hình, kể cả lỗi owner id ở bước 4, khi đó chỉ chạm được vào bản ghi của chính cụm.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết values cho chart external-dns khá ổn với Route 53 và hay sai với các provider ít gặp: tên cờ `--rfc2136-*` cũ (bài này gặp `--rfc2136-tsig-axfr` đã bị thay bằng `--rfc2136-axfr`), bỏ quên `--rfc2136-zone`, hoặc đặt khoá TSIG thẳng vào `extraArgs`, nơi nó hiện ra trong `kubectl describe pod`. Nó cũng hay đề xuất `policy: sync` ngay từ đầu mà không hỏi zone có dùng chung không, và dùng một `txtOwnerId` cố định trong ví dụ để bạn chép sang mọi cụm. Kiểm lại: chạy lần đầu với `upsert-only`, đọc dòng `Adding RR` trong log xem nó định tạo gì; trước khi bật `sync`, liệt kê mọi bản ghi `TXT` có `heritage=external-dns` trong zone và xem có owner nào trùng với mình không.
+
+</Callout>
+
+<Callout kind="link">
+
+K6.2 dựng Gateway, route và chứng chỉ mà bài này đặt tên miền lên. D2.2 là nền về DNS: zone, bản ghi, TTL, máy chủ có thẩm quyền và resolver. D9.4 giải thích vì sao quyền sửa DNS tương đương quyền xin chứng chỉ. K6.5 lo phía còn lại của DNS: pod trong cụm phân giải tên thế nào khi cụm lớn. D10 dạy Route 53 và IAM role cho external-dns trên AWS; D12.4 là nơi đặt cảnh báo cho hai metric ở bước 4. D13 đưa file values của external-dns vào GitOps, nơi `txtOwnerId` phải là giá trị riêng của từng cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k6.4.mastery-cai-dat">Tự cài được external-dns cho một zone: chọn nguồn, giới hạn `domainFilters`, cấp khoá qua Secret, và kiểm bằng `dig` rằng bản ghi của một route mới xuất hiện kèm `TXT` sở hữu.</Check>
+
+<Check id="k6.4.mastery-policy">Với một zone cụ thể (dùng chung hay dành riêng, có bản ghi tạo tay hay không), chọn được `upsert-only` hay `sync` và nêu được điều phải kiểm trước khi bật `sync`.</Check>
+
+<Check id="k6.4.mastery-su-co">Gặp tình huống "bản ghi không được cập nhật" hoặc "bản ghi tự biến mất", lần được qua log, bản ghi `TXT` và metric của external-dns để chỉ ra nguyên nhân.</Check>
+
+</Mastery>

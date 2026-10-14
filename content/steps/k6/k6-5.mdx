@@ -1,0 +1,570 @@
+---
+title: CoreDNS ở quy mô
+description: Đo một lần phân giải tên trong pod sinh bao nhiêu truy vấn tới CoreDNS và bao nhiêu được trả từ cache, chỉnh cache và negative cache rồi đo lại, đặt NodeLocal DNSCache lên cụm Cilium bằng local redirect policy và xem tải của CoreDNS giảm còn bao nhiêu, và cho số bản CoreDNS tự tăng theo số node.
+id: k6.5
+step: k6
+prerequisites: [k6.1, k2.1]
+topics: [k6.coredns-quy-mo]
+status: verified
+verified:
+  date: 2026-10-13
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop, kernel 7.0.12-linuxkit)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    cilium: 1.20.2
+    coredns: 1.14.6
+    k8s-dns-node-cache: 1.26.5
+    cluster-proportional-autoscaler: 1.10.3
+    yq: 4.54.1
+---
+
+<Goal>
+
+K2.1 đã đếm: một lời gọi tới tên bên ngoài sinh tám truy vấn DNS. Trên cụm vài node, không ai để ý. Trên cụm vài trăm node, DNS là dịch vụ dùng chung mà mọi request đều chạm vào, và là thứ hay sập dây chuyền nhất. Học xong, bạn giải thích được:
+
+- Vì sao một service bị lỗi ở đâu đó có thể làm sập DNS của cả cụm, và từ đó làm sập mọi service khác.
+- Trong 400 truy vấn CoreDNS nhận, bao nhiêu cái nó tự trả lời được từ cache, và hai dòng cấu hình quyết định con số đó.
+- Vì sao cài NodeLocal DNSCache theo hướng dẫn chuẩn lên cụm Cilium thay kube-proxy thì không có tác dụng, và cách làm đúng.
+- Vì sao cụm tăng từ 10 lên 200 node mà vẫn chạy hai pod CoreDNS, và ai nên là người tăng nó.
+
+</Goal>
+
+<Knowledge>
+
+### DNS của cụm là một điểm dùng chung
+
+Mọi pod của mọi đội hỏi cùng một Service `kube-dns`, đứng trước vài pod CoreDNS. Ba tính chất biến nó thành nơi sự cố lan rộng:
+
+- **Khuếch đại.** `ndots:5` nhân mỗi lần phân giải tên ngoài lên tám truy vấn (K2.1). Ứng dụng không cache DNS và không giữ kết nối thì mỗi request ra ngoài là tám truy vấn.
+- **Tải tăng đúng lúc có sự cố.** Một service chậm làm client retry; retry mở kết nối mới; kết nối mới hỏi DNS. Tải DNS tăng theo lỗi, không theo traffic bình thường.
+- **Mọi thứ phụ thuộc vào nó.** DNS chết thì service lành cũng không tìm thấy nhau, và hệ thống giám sát cũng không gửi được cảnh báo.
+
+<Callout kind="production">
+
+[Postmortem của Zalando](https://github.com/zalando-incubator/kubernetes-on-aws/blob/dev/docs/postmortems/jan-2019-dns-outage.md) về ngày 07/01/2019: các trang sản phẩm của cửa hàng trả lỗi cho khách hơn một giờ. Chuỗi sự kiện theo bài viết: lời gọi từ tầng tổng hợp dữ liệu tới **một** service phía sau, không quan trọng lắm, bắt đầu hết giờ; client retry, tạo một đợt tăng request; đợt đó kéo theo một đợt tăng truy vấn DNS tương ứng; bộ nhớ của các pod CoreDNS tăng vọt, vượt limit `100Mi`, và tất cả bị OOM-kill cùng lúc. Chúng khởi động lại vào đúng dòng tải ấy và lại bị giết: DNS của cả cụm mất hoàn toàn. Giám sát nội bộ của cụm cũng mất theo vì nó cần gọi dịch vụ bên ngoài để gửi cảnh báo, nên kỹ sư trực được gọi muộn; người đó nâng limit bộ nhớ từ `100Mi` lên `2000Mi` và cụm hồi lại.
+
+Các yếu tố góp phần họ liệt kê: ứng dụng Node.js dùng cách phân giải mặc định, không cache DNS; cấu hình DNS mặc định của Kubernetes với `ndots:5`, sinh 10 truy vấn cho mỗi tên ngoài cụm trong môi trường của họ; pool kết nối HTTP có tuổi thọ ngắn nên liên tục mở kết nối mới; và limit bộ nhớ của CoreDNS đặt theo mức dùng lúc bình thường. Bài học họ rút ra: một ứng dụng không được phép làm sập DNS của mọi ứng dụng khác; phạm vi ảnh hưởng nên bị giới hạn trong một node, lý tưởng là một pod. Việc cần làm đầu tiên của họ là chạy DNS cache trên từng node.
+
+</Callout>
+
+<Check id="k6.5.dns-diem-chung">Giải thích được ba tính chất khiến DNS của cụm dễ sập dây chuyền, và kể lại được chuỗi sự kiện từ một service chậm tới mất DNS toàn cụm.</Check>
+
+### Bốn chỗ giảm tải, từ pod vào trong
+
+```text
+ pod ──(1) ít truy vấn hơn──► [cache trên node] ──(2)──► Service kube-dns ──► CoreDNS ──(3) cache──► máy chủ DNS phía trên
+                               NodeLocal DNSCache                              (4) đủ số bản, đủ bộ nhớ
+```
+
+| Chỗ | Làm gì | Ai làm | Đánh đổi |
+|---|---|---|---|
+| (1) Trong pod | Hạ `ndots`, dùng tên có dấu chấm cuối, giữ kết nối, cache DNS trong ứng dụng (K2.1) | Đội ứng dụng, từng service một | Hiệu quả nhất, nhưng không ép được mọi đội |
+| (2) Trên node | **NodeLocal DNSCache**: một cache DNS trên mỗi node, trả lời ngay tại chỗ | Đội nền tảng, một lần | Thêm một DaemonSet phải vận hành |
+| (3) Trong CoreDNS | Plugin `cache`: giữ câu trả lời, kể cả câu trả lời "không tồn tại" | Đội nền tảng | Câu trả lời cũ tới hết TTL |
+| (4) Sức chứa của CoreDNS | Số bản theo cỡ cụm, trải trên nhiều node, limit bộ nhớ theo đỉnh tải | Đội nền tảng | Tốn tài nguyên khi rảnh |
+
+**Cache và negative cache.** Plugin `cache` của CoreDNS giữ hai loại câu trả lời: `success` (có bản ghi) và `denial` (`NXDOMAIN` hoặc không có dữ liệu). Loại thứ hai gọi là **negative cache**, và quan trọng hơn vẻ ngoài của nó: sáu trong tám truy vấn do `ndots:5` sinh ra là `NXDOMAIN`. Mỗi loại có số mục tối đa và TTL tối đa riêng. TTL dài thì đỡ tải và chậm thấy thay đổi: một Service vừa tạo có thể bị trả `NXDOMAIN` thêm vài giây vì câu trả lời "không tồn tại" lúc trước còn trong cache.
+
+**NodeLocal DNSCache.** Bản chuẩn là một DaemonSet dùng mạng của node, nghe ở một địa chỉ link-local, cài luật iptables để truy vấn gửi tới IP của `kube-dns` rơi vào nó. Lợi ích, theo tài liệu Kubernetes: pod hỏi cache ngay trên node, không qua DNAT và conntrack; cache nói chuyện với CoreDNS bằng TCP; có negative cache riêng; và có metric theo từng node. Nó cũng chính là "phạm vi ảnh hưởng trong một node" mà sự cố ở trên đòi hỏi.
+
+Trên cụm Cilium thay kube-proxy, bản chuẩn **không chạy**: truy vấn tới ClusterIP của `kube-dns` được socket LB đổi địa chỉ ngay trong pod (K6.1), không bao giờ đi qua luật iptables của node. Cilium có cơ chế riêng cho đúng việc này, **local redirect policy**: "gói gửi tới Service X thì giao cho pod mang label Y nằm trên cùng node".
+
+<Check id="k6.5.bon-cho-giam-tai">Kể được bốn chỗ giảm tải DNS và ai làm ở từng chỗ, giải thích được negative cache là gì, và vì sao NodeLocal DNSCache bản chuẩn không có tác dụng trên cụm Cilium thay kube-proxy.</Check>
+
+### Mất gói UDP và độ trễ 5 giây
+
+K2.1 đã kể lỗi kinh điển: resolver gửi câu hỏi `A` và `AAAA` gần như cùng lúc từ một socket UDP; trên cụm dùng kube-proxy, hai gói cùng đi qua luật DNAT, chạy đua lúc ghi vào bảng conntrack, và một gói bị rơi. UDP không có gửi lại ở tầng giao vận, nên resolver chờ hết timeout mặc định 5 giây rồi mới hỏi lại.
+
+| Cách xử lý | Tác dụng | Giới hạn |
+|---|---|---|
+| Kernel hiện hành | Ba cuộc đua đã biết đều đã được vá: hai cái ở kernel 4.19 và 5.0, cái cuối bằng một bản vá năm 2020 | Node chạy kernel cũ hơn vẫn dính |
+| `options single-request-reopen` trong `dnsConfig` | Resolver gửi `A` và `AAAA` từ hai socket khác nhau | Chỉ glibc hiểu; musl (Alpine) bỏ qua |
+| `options use-vc` (DNS qua TCP) | Không còn cuộc đua của UDP | Chỉ glibc; thêm chi phí bắt tay |
+| NodeLocal DNSCache | Pod tới cache không qua DNAT; cache tới CoreDNS bằng TCP | Thêm một thành phần |
+| Data plane không dùng DNAT của netfilter cho Service | Trên cụm lab, truy vấn từ pod được socket LB đổi địa chỉ lúc gửi (K6.1), không đi qua bước DNAT ấy | Phụ thuộc CNI |
+
+Dấu hiệu nhận biết không đổi dù nguyên nhân là gì: độ trễ p99 của một service có bậc thang ở đúng 5 giây. Thấy bậc thang đó, nghi DNS trước ứng dụng. Bài không tái hiện cuộc đua này: nó cần kube-proxy và kernel cũ.
+
+<Check id="k6.5.udp-conntrack">Giải thích được vì sao mất một gói UDP của DNS thành 5 giây chờ, và chọn được cách xử lý cho image dùng glibc, image dùng musl, và cho cả cụm.</Check>
+
+### Sức chứa của CoreDNS
+
+Deployment `coredns` do kubeadm (và kind) tạo ra có 2 bản, cố định, bất kể cụm 3 node hay 300 node. Ba việc phải làm khi cụm lớn lên:
+
+- **Số bản theo cỡ cụm.** `cluster-proportional-autoscaler` là một controller nhỏ đặt số bản theo công thức `max(ceil(số core / coresPerReplica), ceil(số node / nodesPerReplica))`. Nó không nhìn tải: nó giữ một mức nền hợp lý. Tải tăng đột biến là việc của HPA (K5.3) hoặc, tốt hơn, của cache trên node.
+- **Trải các bản ra.** Hai pod CoreDNS trên cùng một node thì node đó chết là mất DNS. Dùng anti-affinity hoặc topology spread (K5.2), và một PodDisruptionBudget để drain không rút hết cùng lúc.
+- **Bộ nhớ theo đỉnh, không theo lúc rảnh.** Bộ nhớ của CoreDNS tăng theo số truy vấn đang xử lý và kích thước cache. Limit đặt sát mức bình thường là công thức của sự cố trong callout: pod bị giết đúng lúc tải cao, khởi động lại vào chính dòng tải đó.
+
+<Check id="k6.5.suc-chua">Viết được công thức của cluster-proportional-autoscaler, nói được nó khác HPA ở đâu, và nêu được hai việc về xếp chỗ cùng một việc về bộ nhớ cần làm cho CoreDNS.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Using NodeLocal DNSCache in Kubernetes Clusters | Kubernetes](https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/): kiến trúc bản chuẩn, lợi ích và các metric.
+- [Local Redirect Policy | Cilium](https://docs.cilium.io/en/stable/network/kubernetes/local-redirect-policy/): mục "Node-local DNS cache", cách cài trên cụm Cilium.
+- [cache | CoreDNS](https://coredns.io/plugins/cache/): mọi tham số của plugin: `success`, `denial`, `prefetch`, `serve_stale`.
+- [Autoscale the DNS Service in a Cluster | Kubernetes](https://kubernetes.io/docs/tasks/administer-cluster/dns-horizontal-autoscaling/): manifest và các tham số của cluster-proportional-autoscaler.
+- [Total DNS outage in Kubernetes cluster | Zalando](https://github.com/zalando-incubator/kubernetes-on-aws/blob/dev/docs/postmortems/jan-2019-dns-outage.md): postmortem trong callout.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Cụm `k6-lab` của K6.1 đang chạy với Cilium thay kube-proxy và Hubble; có `~/masteva-k6/hubble.sh`, `cilium-values.yaml`, và namespace `k6-demo` với Service `echo`.
+- `yq`, `curl` trên máy. Bài cần Internet để phân giải `example.com`.
+- **Profile máy:** thêm ba pod `node-local-dns` (mỗi pod khoảng 10 MiB) và một pod autoscaler; hai lượt chạy liền cả chặng đo được ba node dùng tổng cộng 3,2 và 4,4 GiB RAM ở cuối bài (cụm còn Envoy Gateway và cert-manager của K6.2). Docker Desktop nên có từ 6 GB. Máy 8 GB: cụm một worker như ghi chú ở K6.1; bước 4 khi đó cho 2 bản CoreDNS thay vì 3.
+- Mọi con số đếm truy vấn trong bài lấy từ metric của CoreDNS. Chúng tất định với cùng image và cùng lệnh, nhưng có thể lệch vài đơn vị vì các pod khác trong cụm cũng hỏi DNS trong lúc đo.
+
+### 1. Đo: CoreDNS nhận gì, trả từ đâu
+
+Pod `tai` là nơi sinh truy vấn. Hai script: `dem-dns.sh` cộng một metric trên mọi pod CoreDNS (đọc qua API server, không cần port-forward); `do-dns.sh` phân giải một tên 50 lần rồi in ba hiệu số: truy vấn CoreDNS nhận, số trả từ cache, số phải hỏi máy chủ phía trên.
+
+<Terminal where="mac" title="~/masteva-k6/dem-dns.sh và do-dns.sh">
+
+```bash
+cd ~/masteva-k6
+export KUBECONFIG=~/masteva-k6/kubeconfig
+kubectl create namespace k6-dns
+kubectl -n k6-dns run tai --image=curlimages/curl:8.22.0 \
+  --overrides='{"spec":{"nodeName":"k6-lab-worker"}}' -- sleep infinity
+kubectl -n k6-dns wait --for=condition=Ready pod/tai --timeout=120s
+cat > dem-dns.sh <<'EOF'
+#!/bin/sh
+# Cộng một nhóm metric trên mọi pod CoreDNS. $1: biểu thức grep chọn dòng metric
+for p in $(kubectl -n kube-system get pods -l k8s-app=kube-dns -o name | cut -d/ -f2); do
+  kubectl get --raw "/api/v1/namespaces/kube-system/pods/$p:9153/proxy/metrics" 2>/dev/null
+done | grep -E "$1" | awk '{s += $NF} END {printf "%d\n", s}'
+EOF
+cat > do-dns.sh <<'EOF'
+#!/bin/sh
+# Phân giải tên $1 50 lần từ pod tai; in số truy vấn CoreDNS nhận, số trả từ cache, số phải hỏi ra ngoài
+R0=$(./dem-dns.sh '^coredns_dns_requests_total'); H0=$(./dem-dns.sh '^coredns_cache_hits_total')
+F0=$(./dem-dns.sh '^coredns_proxy_request_duration_seconds_count')
+kubectl -n k6-dns exec tai -- sh -c "for i in \$(seq 50); do getent ahosts $1 > /dev/null; done"
+R1=$(./dem-dns.sh '^coredns_dns_requests_total'); H1=$(./dem-dns.sh '^coredns_cache_hits_total')
+F1=$(./dem-dns.sh '^coredns_proxy_request_duration_seconds_count')
+printf '%-32s CoreDNS nhận %4d | trả từ cache %4d | hỏi ra ngoài %3d\n' "$1" $((R1-R0)) $((H1-H0)) $((F1-F0))
+EOF
+chmod +x dem-dns.sh do-dns.sh
+./do-dns.sh example.com
+./do-dns.sh example.com.
+./do-dns.sh echo.k6-demo.svc.cluster.local.
+kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' | grep -A3 'cache'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k6-dns created
+pod/tai created
+pod/tai condition met
+example.com                      CoreDNS nhận  400 | trả từ cache   96 | hỏi ra ngoài   4
+example.com.                     CoreDNS nhận  100 | trả từ cache  100 | hỏi ra ngoài   0
+echo.k6-demo.svc.cluster.local.  CoreDNS nhận  100 | trả từ cache    0 | hỏi ra ngoài   0
+    cache 30 {
+       disable success cluster.local
+       disable denial cluster.local
+    }
+```
+
+</Expected>
+
+Đọc từng dòng:
+
+- `example.com`, 50 lần: **400** truy vấn, tám cái mỗi lần: `getent ahosts` gọi `getaddrinfo` như phần lớn ứng dụng, hỏi `A` và `AAAA` cho từng tên trong bốn tên mà `ndots:5` sinh ra (K2.1). Chỉ 96 được trả từ cache, và 4 phải hỏi ra ngoài (hai kiểu bản ghi, mỗi pod CoreDNS hỏi một lần rồi nhớ 30 giây). Còn lại 300 truy vấn là các tên ghép với search domain, kiểu `example.com.k6-dns.svc.cluster.local`: CoreDNS phải tự tra và trả `NXDOMAIN` từng cái một.
+- `example.com.` có dấu chấm cuối: 100 truy vấn, tất cả từ cache.
+- Tên trong cụm, viết đủ và có dấu chấm cuối: 100 truy vấn (`A` và `AAAA` cho mỗi lần gọi), **không cái nào** từ cache.
+
+Script dùng `getent ahosts` chứ không phải `getent hosts`: lệnh `hosts` của Alpine phân giải theo cách riêng (lần lượt từng họ địa chỉ) và cho số truy vấn khác với một ứng dụng thật.
+
+Lý do nằm ở bốn dòng cấu hình cuối: Corefile mặc định mà kubeadm tạo (kind dùng nguyên) **tắt cache cho `cluster.local`**, cả câu trả lời có lẫn không. Mỗi truy vấn tên trong cụm, và mỗi `NXDOMAIN` do search domain sinh ra, đều được tra lại từ đầu. Mặc định đó chọn "luôn trả lời đúng trạng thái mới nhất" thay cho "đỡ việc cho CoreDNS".
+
+<Check id="k6.5.lab-do">Đo được bằng metric số truy vấn CoreDNS nhận, số trả từ cache và số hỏi ra ngoài cho một tên ngoài cụm và một tên trong cụm, và chỉ ra được cấu hình cache hiện tại trong Corefile.</Check>
+
+### 2. Chỉnh cache và negative cache, rồi đo lại
+
+Thay khối `cache` bằng bản áp cho mọi tên, khai riêng hai loại: câu trả lời có bản ghi giữ tối đa 30 giây, câu trả lời "không tồn tại" giữ tối đa 10 giây; mỗi loại tối đa 9.984 mục. Vòng `until` sau khi khởi động lại chờ các pod CoreDNS cũ biến mất hẳn, để phép đo chỉ tính hai pod mới.
+
+<Predict question="Sau khi bật cache cho mọi tên, 50 lần phân giải `example.com` vẫn sinh 400 truy vấn tới CoreDNS. Bao nhiêu cái được trả từ cache?">
+
+Gần hết, khoảng 384. Mỗi pod CoreDNS chỉ phải trả lời thật 8 kiểu câu hỏi một lần (bốn tên, mỗi tên hai kiểu bản ghi), rồi 10 tới 30 giây sau đó mọi câu hỏi giống hệt đều lấy từ cache; cụm có hai pod CoreDNS nên là 16 lần tra thật. Thứ thay đổi nhiều nhất là sáu câu `NXDOMAIN`: negative cache biến chúng từ việc phải làm thành việc đã làm.
+
+</Predict>
+
+<Callout kind="danger">
+
+Khối dưới sửa Corefile và khởi động lại CoreDNS của **cả cụm**. Trên cụm thật, một Corefile sai cú pháp là mất DNS toàn cụm: thử trước ở cụm phụ, và giữ bản cũ để quay lại. Kiểm `kubectl config current-context` in ra `kind-k6-lab`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n kube-system get configmap coredns -o yaml \
+  | yq '.data.Corefile |= sub("cache 30 \{[^}]*\}", "cache {\n       success 9984 30\n       denial 9984 10\n    }")' \
+  | kubectl replace -f -
+kubectl -n kube-system rollout restart deployment/coredns
+kubectl -n kube-system rollout status deployment/coredns --timeout=120s | tail -1
+until [ "$(kubectl -n kube-system get pods -l k8s-app=kube-dns --no-headers | wc -l)" -eq 2 ]; do sleep 2; done
+kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' | grep -A3 'cache'
+./do-dns.sh example.com
+./do-dns.sh echo.k6-demo.svc.cluster.local.
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/coredns replaced
+deployment.apps/coredns restarted
+deployment "coredns" successfully rolled out
+    cache {
+       success 9984 30
+       denial 9984 10
+    }
+example.com                      CoreDNS nhận  400 | trả từ cache  384 | hỏi ra ngoài   4
+echo.k6-demo.svc.cluster.local.  CoreDNS nhận  100 | trả từ cache   96 | hỏi ra ngoài   0
+```
+
+</Expected>
+
+Cùng số truy vấn tới, nhưng phần phải tra thật giảm từ 304 xuống 16 với tên ngoài, và từ 100 xuống 4 với tên trong cụm. Ở lượt chạy của bạn các con số có thể lệch vài đơn vị, do pod khác trong cụm hỏi DNS trong lúc đo. CoreDNS giờ rẻ hơn nhiều cho mỗi truy vấn; nhưng 400 gói vẫn đi từ pod, qua mạng, tới CoreDNS. Và cái giá của cache là thật: một Service vừa tạo có thể còn bị trả `NXDOMAIN` tới 10 giây nếu ai đó vừa hỏi tên ấy trước khi nó tồn tại; một Service headless đổi pod thì client thấy danh sách cũ tới 30 giây. Đó là thứ mặc định của kubeadm tránh. Bật cache cho tên trong cụm là một đánh đổi bạn chủ động chọn khi tải DNS đủ lớn, không phải một cấu hình "đúng hơn".
+
+<Check id="k6.5.lab-cache">Sửa được khối `cache` của CoreDNS, đo được tỉ lệ trả từ cache trước và sau, và nêu được hai tình huống cache làm client thấy dữ liệu cũ.</Check>
+
+### 3. NodeLocal DNSCache trên cụm Cilium
+
+Bật local redirect policy trong Cilium (một giá trị Helm, rồi khởi động lại agent và operator như tài liệu yêu cầu), sau đó cài `node-local-dns` từ manifest mà dự án Cilium phát hành kèm bản 1.20.2: nó khác bản chuẩn của Kubernetes ở chỗ pod **không** dùng mạng của node và không cài luật iptables.
+
+<Callout kind="danger">
+
+Khối dưới khởi động lại agent Cilium trên mọi node. Kết nối giữa các pod đang mở vẫn sống, nhưng trong vài chục giây policy mới không được áp; trên cụm thật làm theo từng node. Kiểm `kubectl config current-context` in ra `kind-k6-lab`.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k6/node-local-dns.yaml">
+
+```bash
+kubectl config current-context
+cat >> cilium-values.yaml <<'EOF'
+localRedirectPolicies:
+  enabled: true                        # cho phép CiliumLocalRedirectPolicy
+EOF
+helm upgrade cilium oci://quay.io/cilium/charts/cilium --version 1.20.2 \
+  -n kube-system -f cilium-values.yaml | grep '^STATUS:'
+kubectl -n kube-system rollout restart daemonset/cilium deployment/cilium-operator
+kubectl -n kube-system rollout status daemonset/cilium --timeout=300s | tail -1
+kubectl -n kube-system rollout status deployment/cilium-operator --timeout=120s | tail -1
+KUBEDNS=$(kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}')
+BASE=https://raw.githubusercontent.com/cilium/cilium/v1.20.2/examples/kubernetes-local-redirect
+curl -sL $BASE/node-local-dns.yaml | sed "s/__PILLAR__DNS__SERVER__/$KUBEDNS/g" > node-local-dns.yaml
+curl -sL $BASE/node-local-dns-lrp.yaml > node-local-dns-lrp.yaml
+grep -E 'image:|hostNetwork' node-local-dns.yaml
+kubectl apply -f node-local-dns.yaml | tail -1
+kubectl -n kube-system rollout status daemonset/node-local-dns --timeout=180s | tail -1
+kubectl -n kube-system get pods -l k8s-app=node-local-dns -o wide --no-headers | awk '{print $1, $3, $6, $7}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k6-lab
+STATUS: deployed
+daemonset.apps/cilium restarted
+deployment.apps/cilium-operator restarted
+daemon set "cilium" successfully rolled out
+deployment "cilium-operator" successfully rolled out
+        image: registry.k8s.io/dns/k8s-dns-node-cache:1.26.5
+daemonset.apps/node-local-dns created
+daemon set "node-local-dns" successfully rolled out
+node-local-dns-672w7 Running 10.244.1.43 k6-lab-worker
+node-local-dns-8hqnw Running 10.244.2.241 k6-lab-worker2
+node-local-dns-s26dv Running 10.244.0.215 k6-lab-control-plane
+```
+
+</Expected>
+
+Mỗi node một pod cache, mang IP pod bình thường (không có dòng `hostNetwork` nào trong manifest). Lúc này chưa có gì thay đổi: pod vẫn hỏi `kube-dns` và vẫn tới CoreDNS. Thứ nối hai bên là policy sau:
+
+<Terminal where="mac" title="~/masteva-k6/node-local-dns-lrp.yaml">
+
+```bash
+cat node-local-dns-lrp.yaml
+kubectl apply -f node-local-dns-lrp.yaml
+sleep 5
+kubectl -n k6-dns exec tai -- grep nameserver /etc/resolv.conf
+./do-dns.sh example.com
+./do-dns.sh echo.k6-demo.svc.cluster.local.
+./hubble.sh observe --from-pod k6-dns/tai --port 53 --last 1 | cut -d' ' -f4- | sed 's/(ID:[0-9]*) //g'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+apiVersion: "cilium.io/v2"
+kind: CiliumLocalRedirectPolicy
+metadata:
+  name: "nodelocaldns"
+  namespace: kube-system
+spec:
+  redirectFrontend:
+    serviceMatcher:
+      serviceName: kube-dns
+      namespace: kube-system
+  redirectBackend:
+    localEndpointSelector:
+      matchLabels:
+        k8s-app: node-local-dns
+    toPorts:
+      - port: "53"
+        name: dns
+        protocol: UDP
+      - port: "53"
+        name: dns-tcp
+        protocol: TCP
+ciliumlocalredirectpolicy.cilium.io/nodelocaldns created
+nameserver 10.96.0.10
+example.com                      CoreDNS nhận    6 | trả từ cache    0 | hỏi ra ngoài   0
+echo.k6-demo.svc.cluster.local.  CoreDNS nhận    2 | trả từ cache    1 | hỏi ra ngoài   0
+k6-dns/tai:45966 -> kube-system/node-local-dns-672w7:53 to-endpoint FORWARDED (UDP)
+```
+
+</Expected>
+
+Policy đọc đúng như một câu: gói gửi tới Service `kube-dns` thì giao cho pod `node-local-dns` **trên cùng node**. Pod `tai` không biết gì: `resolv.conf` của nó vẫn ghi `10.96.0.10`. Nhưng Hubble cho thấy truy vấn tới thẳng pod cache trên `k6-lab-worker`, và CoreDNS chỉ còn nhận **6** truy vấn thay cho 400, **2** thay cho 100: cache trên node hỏi CoreDNS một lần cho mỗi kiểu câu hỏi rồi tự trả lời phần còn lại. Tên ngoài cụm thậm chí không tới CoreDNS: cấu hình của `node-local-dns` chuyển chúng thẳng tới máy chủ DNS của node.
+
+Một cache trên node là một thứ nữa có thể chết. Thử điều tệ nhất: node `worker` không còn pod cache nào (`sleep 12` trong khối dưới để các flow cũ trôi khỏi cửa sổ 10 giây của lệnh `hubble`). Mọi node được gắn label `dns-cache=on` trừ `worker`, rồi một `nodeSelector` tạm thời đẩy DaemonSet khỏi node đó:
+
+<Callout kind="danger">
+
+Khối dưới gỡ pod cache DNS khỏi node `k6-lab-worker` trong khoảng nửa phút. Trên cụm thật, đừng thử trên node đang chạy workload mà chưa biết chắc cơ chế dự phòng hoạt động.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl label node --all dns-cache=on > /dev/null && kubectl label node k6-lab-worker dns-cache-
+kubectl -n kube-system patch daemonset node-local-dns --type merge \
+  -p '{"spec":{"template":{"spec":{"nodeSelector":{"dns-cache":"on"}}}}}'
+kubectl -n kube-system rollout status daemonset/node-local-dns --timeout=120s | tail -1
+until [ "$(kubectl -n kube-system get pods -l k8s-app=node-local-dns --field-selector spec.nodeName=k6-lab-worker --no-headers 2>/dev/null | wc -l)" -eq 0 ]; do sleep 2; done
+sleep 12
+kubectl -n k6-dns exec tai -- getent hosts echo.k6-demo.svc.cluster.local | awk '{print $1, $2}'
+sleep 2
+./hubble.sh observe --from-pod k6-dns/tai --port 53 --since 10s | grep -oE 'kube-system/(coredns|node-local-dns)' | sort -u
+kubectl -n kube-system patch daemonset node-local-dns --type json \
+  -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector/dns-cache"}]'
+kubectl label node --all dns-cache-
+kubectl -n kube-system rollout status daemonset/node-local-dns --timeout=120s | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k6-lab-worker unlabeled
+daemonset.apps/node-local-dns patched
+daemon set "node-local-dns" successfully rolled out
+10.96.145.3 echo.k6-demo.svc.cluster.local
+kube-system/coredns
+daemonset.apps/node-local-dns patched
+node/k6-lab-control-plane unlabeled
+label "dns-cache" not found.
+node/k6-lab-worker not labeled
+node/k6-lab-worker2 unlabeled
+daemon set "node-local-dns" successfully rolled out
+```
+
+</Expected>
+
+Tên vẫn phân giải được, và Hubble cho thấy truy vấn đã quay về CoreDNS: khi node không có pod cache nào khớp, Cilium giao gói cho backend thường của Service. Đây là khác biệt đáng giá so với bản chuẩn dùng iptables, nơi cache trên node chết đồng nghĩa mọi pod của node đó mất DNS cho tới khi nó sống lại. Hai lệnh cuối trả DaemonSet về mọi node.
+
+<Check id="k6.5.lab-nodelocal">Cài được NodeLocal DNSCache trên cụm Cilium bằng local redirect policy, đo được số truy vấn tới CoreDNS trước và sau, và chứng minh được DNS vẫn chạy khi một node mất pod cache.</Check>
+
+### 4. Số bản CoreDNS theo cỡ cụm
+
+Manifest của `cluster-proportional-autoscaler` lấy từ trang tài liệu Kubernetes; ba lệnh `sed` điền Deployment đích, đổi sang bản 1.10.3, và đặt `nodesPerReplica` bằng 1 để cụm ba node thấy được thay đổi (mặc định là 16).
+
+<Terminal where="mac" title="~/masteva-k6/dns-autoscaler.yaml">
+
+```bash
+kubectl -n kube-system get deployment coredns --no-headers | awk '{print "trước:", $2, "bản"}'
+curl -sL https://raw.githubusercontent.com/kubernetes/website/snapshot-initial-v1.37/content/en/examples/admin/dns/dns-horizontal-autoscaler.yaml \
+  | sed -e 's|<SCALE_TARGET>|deployment/coredns|' \
+        -e 's|cluster-proportional-autoscaler:[0-9.]*|cluster-proportional-autoscaler:v1.10.3|' \
+        -e 's|"nodesPerReplica":16|"nodesPerReplica":1|' > dns-autoscaler.yaml
+grep -E 'image:|--target|--default-params' dns-autoscaler.yaml | sed 's/^ *//'
+kubectl apply -f dns-autoscaler.yaml | tail -1
+kubectl -n kube-system rollout status deployment/kube-dns-autoscaler --timeout=120s | tail -1
+until [ "$(kubectl -n kube-system get deployment coredns -o jsonpath='{.status.readyReplicas}')" = 3 ]; do sleep 2; done
+kubectl -n kube-system logs deployment/kube-dns-autoscaler | grep -E 'Cluster status|updating' | cut -d']' -f2- | tail -2
+kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide --no-headers | awk '{print $1, $7}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trước: 2/2 bản
+image: registry.k8s.io/cpa/cluster-proportional-autoscaler:v1.10.3
+- --target=deployment/coredns
+- --default-params={"linear":{"coresPerReplica":256,"nodesPerReplica":1,"preventSinglePointFailure":true,"includeUnschedulableNodes":true}}
+deployment.apps/kube-dns-autoscaler created
+deployment "kube-dns-autoscaler" successfully rolled out
+ Cluster status: SchedulableNodes[3], TotalNodes[3], SchedulableCores[18], TotalCores[18]
+ Replicas are not as expected : updating deployment/coredns from 2 to 3
+coredns-6f99b46bb-6m25c k6-lab-worker
+coredns-6f99b46bb-9zhgs k6-lab-control-plane
+coredns-6f99b46bb-xzl2g k6-lab-worker2
+```
+
+</Expected>
+
+Autoscaler đếm 3 node và 18 core (mỗi node kind thấy toàn bộ 6 core của Docker), tính `max(ceil(18/256), ceil(3/1)) = 3`, và sửa `replicas` của Deployment. Ba pod nằm trên ba node; trên cụm của bạn, kiểm cột cuối, vì Deployment `coredns` của kubeadm chỉ **ưu tiên** trải pod chứ không bắt buộc. Tham số nằm trong một ConfigMap do autoscaler tạo; sửa nó là đổi công thức mà không phải khởi động lại gì:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n kube-system get configmap kube-dns-autoscaler -o jsonpath='{.data.linear}'; echo
+kubectl -n kube-system patch configmap kube-dns-autoscaler --type merge \
+  -p '{"data":{"linear":"{\"coresPerReplica\":256,\"nodesPerReplica\":2,\"min\":2,\"preventSinglePointFailure\":true}"}}'
+until [ "$(kubectl -n kube-system get deployment coredns -o jsonpath='{.spec.replicas}')" = 2 ]; do sleep 2; done
+echo "sau khi đặt nodesPerReplica=2: $(kubectl -n kube-system get deployment coredns -o jsonpath='{.spec.replicas}') bản"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"coresPerReplica":256,"includeUnschedulableNodes":true,"nodesPerReplica":1,"preventSinglePointFailure":true}
+configmap/kube-dns-autoscaler patched
+sau khi đặt nodesPerReplica=2: 2 bản
+```
+
+</Expected>
+
+`ceil(3/2) = 2`. Trên cụm thật, `nodesPerReplica` 16 và `coresPerReplica` 256 là điểm xuất phát của tài liệu Kubernetes; đã có cache trên node thì CoreDNS chịu tải nhẹ hơn nhiều và con số có thể lớn hơn. `preventSinglePointFailure` giữ tối thiểu 2 bản khi cụm có từ hai node. Từ lúc này, đừng đặt `replicas` của `coredns` bằng tay hay trong GitOps: autoscaler sẽ ghi đè, hai bên giằng co nhau.
+
+<Check id="k6.5.lab-autoscale">Cài được cluster-proportional-autoscaler cho CoreDNS, giải thích được số bản nó chọn bằng công thức, và đổi được tham số qua ConfigMap.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `do-dns.sh` treo rồi báo `exit code 2` | Pod không phân giải được tên ngoài: mất Internet, hoặc Cilium đang ở BPF host routing (xem callout cuối bước 6 của K6.3) | `kubectl -n kube-system logs -l k8s-app=kube-dns --tail=3` báo `i/o timeout`; `cilium-dbg status` phải ghi `Host: Legacy` |
+| Cột "hỏi ra ngoài" luôn bằng 0 dù vừa khởi động lại CoreDNS | Metric đổi tên theo phiên bản CoreDNS | Liệt kê metric: `kubectl get --raw /api/v1/namespaces/kube-system/pods/<pod coredns>:9153/proxy/metrics \| grep -E 'forward\|proxy'` |
+| Sau bước 3, CoreDNS vẫn nhận 400 truy vấn | Chưa bật `localRedirectPolicies` hoặc chưa khởi động lại agent; policy tạo sai namespace | `kubectl -n kube-system get ciliumlocalredirectpolicy`; `cilium-dbg status` |
+| Pod `node-local-dns` `CrashLoopBackOff` | Quên thay `__PILLAR__DNS__SERVER__` | `grep PILLAR__DNS__SERVER node-local-dns.yaml` phải không in gì |
+| Sửa Corefile xong CoreDNS `CrashLoopBackOff` | Biểu thức `yq` làm hỏng cú pháp Corefile | `kubectl -n kube-system logs deployment/coredns --tail=5`; so với khối `cache` trong bài |
+| `coredns` cứ quay về số bản cũ sau khi `kubectl scale` | Autoscaler đang quản | Sửa ConfigMap `kube-dns-autoscaler`, không sửa Deployment |
+
+### Dọn dẹp
+
+Đây là bài cuối của chặng K6. Khối đầu trả cụm về trạng thái của K6.1 để bạn dùng tiếp cho việc khác; khối thứ hai xoá hết.
+
+<Callout kind="danger">
+
+Khối đầu gỡ autoscaler, NodeLocal DNSCache cùng policy của nó, namespace `k6-dns`, trả Corefile về bản của kind, và khởi động lại agent Cilium với cấu hình cũ. Khối thứ hai xoá cả cụm `k6-lab`, mọi thứ các bài K6.1 tới K6.5 đã tạo trong đó, và thư mục lab. Kiểm `kubectl config current-context` in ra `kind-k6-lab` trước.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm">
+
+```bash
+kubectl config current-context
+kubectl delete -f dns-autoscaler.yaml
+kubectl -n kube-system delete configmap kube-dns-autoscaler
+kubectl -n kube-system scale deployment coredns --replicas=2
+kubectl delete -f node-local-dns-lrp.yaml -f node-local-dns.yaml
+kubectl delete namespace k6-dns
+kubectl -n kube-system get configmap coredns -o yaml \
+  | yq '.data.Corefile |= sub("cache \{[^}]*\}", "cache 30 {\n       disable success cluster.local\n       disable denial cluster.local\n    }")' \
+  | kubectl replace -f -
+yq -i 'del(.localRedirectPolicies)' cilium-values.yaml
+helm upgrade cilium oci://quay.io/cilium/charts/cilium --version 1.20.2 \
+  -n kube-system -f cilium-values.yaml | grep '^STATUS:'
+kubectl -n kube-system rollout restart daemonset/cilium deployment/cilium-operator deployment/coredns
+kubectl -n kube-system rollout status daemonset/cilium --timeout=300s | tail -1
+kubectl -n kube-system rollout status deployment/coredns --timeout=120s | tail -1
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Xoá cụm và thư mục lab">
+
+```bash
+kind delete cluster --name k6-lab
+rm -rf ~/masteva-k6
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đã có NodeLocal DNSCache thì còn cần hạ ndots trong ứng dụng không?">
+
+Vẫn nên, cho những service gọi ra ngoài nhiều. Bước 3 cho thấy cache trên node chặn gần hết truy vấn trước khi chúng tới CoreDNS, nhưng pod vẫn gửi đủ tám truy vấn cho mỗi tên ngoài và chờ đủ tám câu trả lời, lần lượt theo search domain. Cache làm mỗi câu trả lời nhanh và rẻ; nó không bỏ được số vòng. Với một service mở kết nối mới cho từng request, đó là độ trễ cộng thêm vào mỗi request. Hai lớp bổ sung cho nhau: nền tảng đặt cache trên node để một ứng dụng viết ẩu không kéo sập ai khác (đúng bài học của sự cố trong callout), còn từng đội tự giảm số truy vấn của mình bằng `ndots` thấp hơn, tên có dấu chấm cuối và connection pool (K2.1, SB12.2).
+
+</Reveal>
+
+<Reveal title="Vì sao node-local-dns nói chuyện với CoreDNS bằng TCP?">
+
+Manifest ở bước 3 có `force_tcp` trong các khối `forward` tới CoreDNS. Giữa pod và cache trên node là một chặng trong cùng node, gần như không mất gói. Chặng từ cache tới CoreDNS thì đi qua mạng giữa các node, nơi gói UDP có thể rơi; rơi một gói UDP là chờ hết timeout, còn TCP tự gửi lại sau vài chục mili giây. Dùng TCP cho chặng dài và UDP cho chặng ngắn vì vậy lấy được cái tốt của cả hai: pod vẫn hỏi bằng UDP như cũ, không phải sửa gì, mà phần dễ mất gói đã có cơ chế gửi lại. TCP cũng cho phép giữ kết nối lâu giữa cache và CoreDNS, nên chi phí bắt tay không lặp lại cho từng truy vấn.
+
+</Reveal>
+
+<Reveal title="Đặt limit bộ nhớ cho CoreDNS bao nhiêu thì đủ?">
+
+Không có con số chung; có cách tìm. CoreDNS của cụm lab có request `70Mi` và limit `170Mi`, giá trị kubeadm đặt sẵn. Bộ nhớ thật phụ thuộc số Service và pod (plugin `kubernetes` giữ tất cả trong bộ nhớ), kích thước cache (bước 2 cho phép gần 20.000 mục), và số truy vấn đang xử lý cùng lúc. Sự cố trong callout cho thấy thành phần thứ ba là thứ nguy hiểm nhất: limit `100Mi` đủ cho mọi ngày thường và thiếu đúng vào phút cần nhất. Cách làm: đo bộ nhớ ở đỉnh tải thật hoặc dưới một bài thử tải DNS, đặt limit cao hơn đỉnh đó vài lần, và cảnh báo khi mức dùng vượt một nửa limit. Bộ nhớ của CoreDNS rẻ so với cái giá của việc mất DNS toàn cụm; đây là chỗ nên dư.
+
+</Reveal>
+
+<Reveal title="Cảnh báo nào cho DNS của cụm, và đặt ở đâu?">
+
+Bốn tín hiệu, đều có sẵn từ metric của CoreDNS và `node-local-dns`: tỉ lệ câu trả lời `SERVFAIL` (`coredns_dns_responses_total` theo `rcode`), độ trễ xử lý ở p99 (`coredns_dns_request_duration_seconds`), bộ nhớ của pod so với limit, và số lần pod CoreDNS khởi động lại. Thêm một phép thử từ ngoài nhìn vào: một pod định kỳ phân giải một tên trong cụm và một tên ngoài, đo thời gian. Điều quan trọng nhất nằm ở chỗ đặt: sự cố trong callout kéo dài hơn vì hệ thống cảnh báo chạy trong chính cụm đang mất DNS. Đường gửi cảnh báo cho DNS không được phụ thuộc DNS của cụm: Alertmanager trỏ tới địa chỉ IP, hoặc một hệ thống giám sát ngoài cụm kiểm cụm từ bên ngoài (D12.4).
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI đưa lời khuyên về DNS trong Kubernetes theo số đông, mà số đông là cụm dùng kube-proxy. Hay gặp: bảo cài NodeLocal DNSCache bằng manifest chuẩn và đổi `--cluster-dns` của kubelet mà không hỏi CNI là gì (trên cụm Cilium thay kube-proxy, bước 3 cho thấy phải dùng local redirect policy); khuyên `single-request-reopen` cho image Alpine, nơi musl bỏ qua tuỳ chọn đó; đề xuất HPA theo CPU cho CoreDNS như giải pháp cho mọi thứ; và sửa Corefile bằng `kubectl edit` trên cụm do công cụ quản lý, nơi lần nâng cấp sau ghi đè mất. Kiểm lại bằng số đo: mọi thay đổi về DNS phải đi kèm phép đo trước và sau như `do-dns.sh`, và một lần `hubble observe --port 53` để thấy truy vấn thật sự đi tới đâu.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.1 dạy Service `kube-dns`, tên DNS của Service, `ndots` và search domain; D2.2 là nền về resolver và cache DNS. K6.1 giải thích socket LB, lý do bản chuẩn của NodeLocal DNSCache không chạy trên cụm này. K6.3 dùng DNS proxy của Cilium để viết policy theo tên miền, một lớp nữa đứng giữa pod và CoreDNS; K6.4 lo chiều ngược lại, bản ghi DNS cho người bên ngoài. K5.2 dạy topology spread và PodDisruptionBudget cho CoreDNS; K5.3 dạy HPA. D12.3 và D12.4 biến các metric của bài thành dashboard và cảnh báo. SB12.2 dạy connection pool phía ứng dụng, thứ giảm truy vấn DNS hiệu quả nhất.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k6.5.mastery-do">Với một cụm bất kỳ, đo được DNS đang chịu tải thế nào: số truy vấn CoreDNS nhận, tỉ lệ trả từ cache, số phải hỏi ra ngoài, và chỉ ra được phần nào do `ndots` sinh ra.</Check>
+
+<Check id="k6.5.mastery-thiet-ke">Thiết kế được DNS cho một cụm lớn: cache trên node cài theo đúng data plane của cụm, cấu hình cache của CoreDNS, số bản theo cỡ cụm, trải pod và limit bộ nhớ, kèm cái giá của từng lựa chọn.</Check>
+
+<Check id="k6.5.mastery-su-co">Gặp độ trễ có bậc thang 5 giây hoặc lỗi phân giải tên hàng loạt, nêu được vì sao nghi DNS trước, các cách xử lý cho image dùng glibc, image dùng musl và cho cả cụm, và metric hay lệnh dùng để xem truy vấn đi tới đâu.</Check>
+
+</Mastery>

@@ -1,0 +1,998 @@
+---
+title: CNI, eBPF và Cilium; kube-proxy và data plane của Service
+description: Dựng cụm kind không có CNI để thấy pod kẹt ở đâu, cài Cilium bằng Helm và xem nó nối một pod vào mạng thế nào, so luật của kube-proxy ở chế độ iptables và nftables với bản đồ eBPF khi cụm có 1.000 Service, cho Cilium thay hẳn kube-proxy, rồi dùng Hubble tìm nguyên nhân của một lời gọi hết giờ.
+id: k6.1
+step: k6
+prerequisites: [k2.1, k2.4]
+topics: [k6.cni-cilium, k6.kube-proxy-dataplane]
+status: verified
+verified:
+  date: 2026-10-13
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop, kernel 7.0.12-linuxkit)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    cilium: 1.20.2
+    hubble: 1.20.2
+---
+
+<Goal>
+
+K2.1 coi mạng pod là thứ có sẵn và dừng ở "kube-proxy viết luật". Bài này mở hai lớp đó ra: ai nối pod vào mạng, và gói tin tới một Service được đổi địa chỉ ở đâu. Học xong, bạn giải thích được:
+
+- Vì sao cụm vừa dựng xong mà mọi node `NotReady` và CoreDNS đứng ở `Pending`.
+- Vì sao cụm có vài nghìn Service thì kết nối mới chậm dần với kube-proxy `iptables`, còn `nftables` và eBPF thì không.
+- Vì sao pod gọi Service chín lần mà bộ đếm trên luật của kube-proxy vẫn bằng 0.
+- Vì sao một NodePort vẫn trả lời khi node không có tiến trình nào lắng nghe và không có luật iptables nào cho cổng đó.
+- Một lời gọi `curl` hết giờ: gói bị bỏ ở đâu, bởi ai, vì lý do gì.
+
+</Goal>
+
+<Knowledge>
+
+### CNI: ba việc kubelet không tự làm
+
+Kubernetes đặt ra yêu cầu cho mạng pod (mỗi pod một IP, pod ở node nào cũng gọi thẳng được pod ở node khác, không NAT) nhưng không tự làm. Nó giao cho một **CNI plugin** (Container Network Interface). CNI là một chuẩn rất nhỏ: một file cấu hình trong `/etc/cni/net.d/` và một file thực thi trong `/opt/cni/bin/` mà container runtime gọi mỗi khi tạo hoặc xoá pod.
+
+```text
+ (1) kubelet nhận pod mới  ──CRI──►  containerd tạo network namespace rỗng cho pod
+ (2) containerd đọc /etc/cni/net.d/05-cilium.conflist, chạy /opt/cni/bin/cilium-cni với lệnh ADD
+ (3) plugin làm ba việc:
+       a. tạo cặp veth: một đầu là eth0 trong pod, một đầu (lxc…) nằm ở node
+       b. IPAM: lấy một IP còn trống trong dải của node, gán cho eth0
+       c. đặt route trong pod và trên node để gói đi được hai chiều
+ (4) plugin trả IP về cho containerd ──► kubelet ghi vào status.podIP
+ (5) agent của CNI trên mỗi node (DaemonSet) lo phần còn lại:
+       đưa gói sang node khác (overlay hoặc route thẳng), thực thi NetworkPolicy
+```
+
+Chưa có file cấu hình CNI thì runtime báo `NetworkReady=false`, kubelet đặt node ở `NotReady`, và scheduler không xếp pod thường nào lên đó. Pod dùng mạng của node (`hostNetwork: true`: etcd, API server, kube-proxy) không cần CNI nên vẫn chạy. Bước 1 của lab cho thấy đúng trạng thái này.
+
+Ba việc ở bước (3) và (5) là chỗ các CNI khác nhau:
+
+| Việc | Các cách làm | Đánh đổi |
+|---|---|---|
+| Cấp IP (**IPAM**) | Mỗi node một dải `podCIDR` do Kubernetes chia (lab này); CNI tự chia từ một pool chung; lấy IP thật của mạng cloud (AWS VPC CNI) | IP của mạng cloud thì các dịch vụ khác gọi thẳng được pod, nhưng dễ cạn dải (K5.4) |
+| Đưa gói giữa các node | **Overlay**: bọc gói của pod trong một gói UDP giữa hai node (VXLAN, Geneve). **Native routing**: mạng bên dưới biết đường tới từng dải pod (route tĩnh, BGP, hoặc mạng cloud) | Overlay chạy trên mọi mạng nhưng tốn khoảng 50 byte mỗi gói và khó soi bằng công cụ mạng thường. Native nhanh hơn nhưng cần mạng bên dưới phối hợp |
+| NetworkPolicy | iptables hoặc nftables; eBPF; không làm | CNI không thực thi policy thì policy nằm đó vô tác dụng (K2.4) |
+
+| CNI | Data plane | Policy | Ghi chú |
+|---|---|---|---|
+| kindnet | Route thẳng giữa các node của kind | Có (K2.4) | Chỉ dùng cho lab |
+| Flannel | Overlay VXLAN | Không | Đơn giản nhất; cần thêm một CNI khác nếu muốn policy |
+| Calico | Route thẳng bằng BGP hoặc overlay; iptables hoặc eBPF | Có, kèm policy riêng | Phổ biến trên máy chủ riêng |
+| Cilium | eBPF; overlay hoặc route thẳng | Có, kèm policy theo tên miền và tầng 7 (K6.3) | Thay được kube-proxy; có Hubble để quan sát |
+
+<Check id="k6.1.cni-ba-viec">Kể được chuỗi kubelet → runtime → CNI plugin khi một pod được tạo, ba việc plugin làm, và vì sao cụm chưa có CNI thì node `NotReady` nhưng etcd và API server vẫn chạy.</Check>
+
+### eBPF và cách Cilium dùng nó
+
+**eBPF** là cơ chế cho phép nạp một chương trình nhỏ vào kernel đang chạy và gắn nó vào một **điểm móc** (hook): lúc gói tin vào card mạng, lúc một tiến trình gọi `connect()`. Kernel kiểm chương trình trước khi nhận (không vòng lặp vô hạn, không đọc bộ nhớ lung tung), rồi chạy nó ngay trong kernel, không chuyển gói lên tiến trình nào. Chương trình và tiến trình bên ngoài chia sẻ dữ liệu qua **map**: bảng băm nằm trong kernel.
+
+Cilium thay cho chuỗi luật iptables bằng vài chương trình eBPF và một bộ map:
+
+| Điểm móc | Chương trình | Làm gì |
+|---|---|---|
+| `tc` (lớp điều khiển lưu lượng của kernel, nơi gắn được chương trình vào từng card mạng) trên đầu veth của từng pod | `cil_from_container` | Mọi gói rời pod đi qua đây trước khi chạm vào mạng của node: tra policy, đổi địa chỉ Service, chọn đường |
+| `tc` trên card mạng của node và card overlay | `cil_from_netdev`, `cil_from_overlay` | Gói từ ngoài vào: NodePort, gói từ node khác |
+| cgroup, lúc `connect()` | socket LB | Đổi địa chỉ Service thành địa chỉ pod ngay khi mở socket (phần sau) |
+
+Điểm khác thứ hai là **identity**. Cilium không viết policy theo IP. Mỗi tập label của pod được gán một số (identity); map `ipcache` ghi IP nào mang identity nào; policy là "identity A được gọi identity B cổng 8080". Pod bị thay, IP đổi, policy không phải viết lại: chỉ một dòng trong `ipcache` đổi.
+
+<Check id="k6.1.ebpf-identity">Giải thích được eBPF chạy ở đâu, map dùng để làm gì, Cilium gắn chương trình vào những điểm nào, và identity khác IP ở chỗ nào khi viết policy.</Check>
+
+### Data plane của Service: bốn cách làm cùng một việc
+
+K2.1 đã cho thấy ClusterIP là IP ảo và kube-proxy viết luật DNAT để biến nó thành IP pod. "Viết luật" có bốn cách hiện thực, cùng kết quả, khác nhau ở cách kernel **tìm** Service trong vài nghìn cái:
+
+```text
+ Gói tới 10.96.17.35:80. Kernel tìm Service thế nào?
+
+ iptables          KUBE-SERVICES: luật 1? không. luật 2? không. … luật 1.000? khớp   O(n)
+ nftables          một luật duy nhất: tra (IP, giao thức, cổng) trong một map (verdict map)  O(1)
+ IPVS              bảng băm của IPVS                                                   O(1)
+ eBPF (Cilium)     tra bảng băm trong map, ngay tại veth của pod hoặc lúc connect()    O(1)
+```
+
+| | `iptables` | `nftables` | `ipvs` | eBPF (Cilium) |
+|---|---|---|---|---|
+| Ai viết | kube-proxy | kube-proxy | kube-proxy | agent của Cilium |
+| Tìm Service | Duyệt tuần tự chain `KUBE-SERVICES` | Một lần tra map | Bảng băm | Bảng băm |
+| Cập nhật khi endpoint đổi | Nạp lại qua `iptables-restore`, cỡ tỉ lệ với tổng số Service | Chỉ gửi phần thay đổi | Chỉ phần thay đổi | Chỉ phần thay đổi |
+| Theo dõi kết nối | conntrack của netfilter | conntrack của netfilter | Bảng kết nối của IPVS | Map riêng của Cilium |
+| Tình trạng ở Kubernetes 1.37 | Mặc định | Ổn định từ 1.33, cần kernel 5.13 trở lên | Deprecated từ 1.35 | Không thuộc Kubernetes |
+
+Con số từ [bài đo của nhóm phát triển kube-proxy](https://kubernetes.io/blog/2025/02/28/nftables-kube-proxy/): ở cụm 5.000 và 10.000 Service, độ trễ gói đầu ở mức trung vị của `nftables` xấp xỉ mức tốt nhất của `iptables`; ở cụm 30.000 Service, trường hợp xấu nhất của `nftables` còn nhanh hơn trường hợp tốt nhất của `iptables`. Chỉ **gói đầu** của một kết nối chịu chi phí này; các gói sau đi theo conntrack. Service có nhiều kết nối ngắn (không keep-alive) chịu nặng nhất.
+
+Vì sao `iptables` vẫn là mặc định: tương thích. Chế độ `nftables` cố ý khác vài hành vi cũ, ví dụ NodePort không còn trả lời trên `127.0.0.1` của node, và công cụ nào đọc thẳng luật của kube-proxy sẽ phải sửa.
+
+<Callout kind="production">
+
+Một ca gỡ lỗi có nguồn, không phải một lần sập hệ thống: bài [kube-proxy Subtleties: Debugging an Intermittent Connection Reset](https://kubernetes.io/blog/2019/03/29/kube-proxy-subtleties-debugging-an-intermittent-connection-reset/) của một kỹ sư Google kể lại một báo cáo từ người dùng: pod tải file lớn qua một Service ClusterIP thỉnh thoảng bị ngắt kết nối. Chạy một client thì không thấy, chạy nhiều client song song mới tái hiện được, và cùng tải đó chạy trên VM không có Kubernetes thì không lỗi. Nguyên nhân nằm ở chỗ ba hệ con gặp nhau. conntrack không nhận ra một gói trả về (bảng đầy, hoặc gói nằm ngoài cửa sổ TCP) và đánh dấu nó `INVALID`. Không có luật iptables nào bỏ gói `INVALID`, nên gói được chuyển tiếp tới pod client **mà không được đổi địa chỉ nguồn về IP của Service**. Client thấy một gói từ IP pod lạ, trả lời bằng `RST`; gói `RST` này là một gói pod-tới-pod hợp lệ nên tới được server, và server đóng kết nối. Bài nêu hai cách xử lý: cho conntrack dễ dãi hơn với gói ngoài cửa sổ, hoặc thêm luật bỏ gói `INVALID`; bản sửa có trong kube-proxy từ 1.15.
+
+Phần suy ra của bài này: khi một lời gọi qua Service hỏng mà gọi thẳng IP pod thì không, lớp cần nghi là data plane của Service và bảng theo dõi kết nối, không phải ứng dụng. Mỗi data plane có bảng riêng và kiểu hỏng riêng; với Cilium, bảng đó là map eBPF, xem bằng `cilium-dbg bpf ct list global`, không phải lệnh `conntrack`.
+
+</Callout>
+
+<Check id="k6.1.dataplane-bon-cach">So sánh được `iptables`, `nftables`, `ipvs` và eBPF ở cách tìm Service và cách cập nhật luật, và nói được gói nào của một kết nối chịu chi phí tìm kiếm.</Check>
+
+### Cilium thay kube-proxy
+
+Mặc định (`kubeProxyReplacement: false`) Cilium đã tự đổi địa chỉ ClusterIP cho gói đi ra từ pod, tại veth, trước khi gói tới được luật của kube-proxy. kube-proxy khi đó chỉ còn phục vụ gói xuất phát từ chính node và gói từ ngoài vào NodePort. Bật `kubeProxyReplacement: true` thì Cilium nhận nốt hai phần đó và kube-proxy gỡ đi được:
+
+```text
+ kube-proxy (iptables/nftables)             Cilium thay kube-proxy
+ ------------------------------             ----------------------------------
+ pod gọi connect(10.96.17.35:80)            pod gọi connect(10.96.17.35:80)
+   gói mang đích là IP ảo                     chương trình eBPF ở cgroup đổi đích
+   → rời pod → netfilter của node             thành 10.244.1.113:8080 NGAY LÚC connect()
+   → DNAT sang 10.244.1.113:8080              → gói rời pod đã mang IP pod thật
+   → conntrack nhớ để đổi ngược gói về        → không còn bước DNAT cho từng gói
+```
+
+Cơ chế bên phải gọi là **socket LB**: đổi địa chỉ một lần ở tầng socket thay vì đổi từng gói. NodePort và traffic từ ngoài vào không có socket nào để móc, nên được xử lý ở `tc` trên card mạng của node.
+
+Ba điều phải biết trước khi bật trên cụm thật:
+
+- **Agent phải tự tìm được API server.** Bình thường agent gọi `10.96.0.1`, một ClusterIP do kube-proxy phục vụ. Không còn kube-proxy thì phải khai `k8sServiceHost` và `k8sServicePort` trỏ thẳng vào API server (hoặc load balancer đứng trước nó).
+- **Chuyển đổi làm đứt kết nối đang mở.** Tài liệu Cilium cảnh báo: bảng NAT của kube-proxy và của Cilium không biết về nhau, nên đổi qua lại trên cụm đang phục vụ thì kết nối hiện có sẽ hỏng. Cách an toàn là bật trên node mới rồi chuyển workload sang (K5.2 đã dạy drain).
+- **Công cụ dựa vào iptables sẽ không thấy gì.** Bộ đếm của luật `KUBE-SVC-*`, lệnh `conntrack -L`, script đọc `iptables-save` đều trả kết quả rỗng cho traffic của Service. Bước 5 của lab cho thấy một NodePort trả lời mà `ss` và `iptables-save` không có dấu vết nào.
+
+<Check id="k6.1.kube-proxy-replacement">Giải thích được socket LB đổi địa chỉ ở đâu so với DNAT của kube-proxy, vì sao phải khai `k8sServiceHost`, và hai rủi ro khi chuyển một cụm đang chạy.</Check>
+
+### Hubble: nhật ký luồng từ chính data plane
+
+Chương trình eBPF của Cilium quyết định số phận từng gói, nên nó cũng là nơi ghi lại quyết định đó chính xác nhất. **Hubble** thu các sự kiện ấy thành **flow**: ai gọi ai (theo tên pod và identity, không chỉ IP), cổng nào, và **verdict**: `FORWARDED`, `DROPPED` kèm lý do, hay `TRACED`.
+
+| Thành phần | Chạy ở đâu | Việc |
+|---|---|---|
+| Hubble server | Trong agent Cilium trên mỗi node | Giữ các flow gần nhất của node đó trong một bộ đệm vòng (mặc định 4.095 flow) |
+| Hubble Relay | Một Deployment | Hỏi mọi node và gộp kết quả, để một lệnh thấy cả cụm |
+| `hubble` CLI, Hubble UI | Máy bạn hoặc trong cụm | Lọc và hiển thị |
+
+Hubble không thay `tcpdump`: nó không giữ nội dung gói, và bộ đệm vòng nghĩa là flow cũ bị ghi đè sau vài phút trên node bận. Thứ nó làm tốt hơn `tcpdump` là trả lời ngay câu hỏi "gói có bị bỏ không, ở node nào, vì policy hay vì lý do khác", vốn rất khó thấy khi gói bị bỏ im lặng (K2.4).
+
+<Check id="k6.1.hubble-la-gi">Nói được flow của Hubble chứa gì, Relay để làm gì, và hai giới hạn khiến Hubble không thay được `tcpdump`.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Network Plugins | Kubernetes](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/): kubelet và runtime tìm, gọi CNI plugin thế nào.
+- [Virtual IPs and Service Proxies | Kubernetes](https://kubernetes.io/docs/reference/networking/virtual-ips/): ba chế độ của kube-proxy, mục "Migrating from iptables mode to nftables" liệt kê các hành vi khác nhau.
+- [NFTables mode for kube-proxy | Kubernetes Blog](https://kubernetes.io/blog/2025/02/28/nftables-kube-proxy/): vì sao `iptables` chậm theo số Service, kèm số đo ở 5.000 tới 30.000 Service.
+- [Kubernetes Without kube-proxy | Cilium](https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/): cách bật thay kube-proxy, socket LB và mục "Limitations".
+- [kube-proxy Subtleties: Debugging an Intermittent Connection Reset | Kubernetes Blog](https://kubernetes.io/blog/2019/03/29/kube-proxy-subtleties-debugging-an-intermittent-connection-reset/): ca gỡ lỗi trong callout, có sơ đồ từng gói.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Đã làm K2 và K3.1: có Docker, kind 0.33, kubectl 1.37, Helm 4.3, `jq` trên máy (cài ở D0).
+- **Profile máy:** cụm gồm 1 control plane và 2 worker chạy Cilium; cuối bài `docker stats` báo ba node dùng tổng cộng khoảng 3,1 GiB RAM (control plane 1,5 GiB, mỗi worker khoảng 0,85 GiB; phần lớn do bước 4 với 1.000 Service để lại). Máy 16 GB chạy được cùng trình duyệt. Máy 8 GB: đặt Docker Desktop ở 6 GB, bỏ dòng `- role: worker` thứ hai trong file cấu hình cụm và tắt mọi cụm kind, VM Lima khác. Bài chưa chạy cấu hình một worker; khi đó phải bỏ tên `k6-lab-worker2` khỏi vòng lặp dọn bảng nftables ở bước 5.
+- Cổng `9600` và `9601` trên máy còn trống.
+- Lệnh chạy trên macOS với Docker Desktop: chương trình eBPF chạy trên kernel của VM Docker. Chưa chạy thử trên Linux; ở đó node kind dùng thẳng kernel của máy bạn và Cilium cần kernel 5.10 trở lên. Tên pod, IP và identity trong output của bạn sẽ khác.
+
+Cụm này dùng suốt chặng K6 (năm bài). Giữ nó tới hết K6.5.
+
+### 1. Cụm không có CNI
+
+`disableDefaultCNI: true` bảo kind đừng cài kindnet. kubectl dùng file cấu hình riêng trong thư mục lab để không đụng tới `~/.kube/config`; **mỗi terminal mới phải chạy lại dòng `export`**.
+
+<Terminal where="mac" title="~/masteva-k6/kind-k6.yaml">
+
+```bash
+mkdir -p ~/masteva-k6 && cd ~/masteva-k6
+export KUBECONFIG=~/masteva-k6/kubeconfig
+cat > kind-k6.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k6-lab
+networking:
+  disableDefaultCNI: true      # không cài kindnet: cụm chưa có CNI
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080   # NodePort ở bước 5, HTTP của Gateway ở K6.2
+        hostPort: 9600
+        listenAddress: 127.0.0.1
+      - containerPort: 30443   # HTTPS của Gateway ở K6.2
+        hostPort: 9601
+        listenAddress: 127.0.0.1
+  - role: worker
+  - role: worker
+EOF
+kind create cluster --config kind-k6.yaml
+kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=120s | tail -1
+kubectl -n kube-system wait --for=condition=Ready pod -l tier=control-plane --timeout=120s > /dev/null
+kubectl get nodes
+kubectl get pods -A -o wide | grep -v -E 'apiserver|controller-manager|scheduler' | awk '{print $2, $3, $4, $8}' | column -t
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+daemon set "kube-proxy" successfully rolled out
+NAME                   STATUS     ROLES           AGE   VERSION
+k6-lab-control-plane   NotReady   control-plane   20s   v1.37.0
+k6-lab-worker          NotReady   <none>          6s    v1.37.0
+k6-lab-worker2         NotReady   <none>          5s    v1.37.0
+NAME                                     READY  STATUS   NODE
+coredns-559f6c778d-4ggbr                 0/1    Pending  <none>
+coredns-559f6c778d-cd6nj                 0/1    Pending  <none>
+etcd-k6-lab-control-plane                1/1    Running  k6-lab-control-plane
+kube-proxy-288sg                         1/1    Running  k6-lab-worker
+kube-proxy-q9sn9                         1/1    Running  k6-lab-control-plane
+kube-proxy-s4fvs                         1/1    Running  k6-lab-worker2
+local-path-provisioner-75f7fc7dc5-hf8b5  0/1    Pending  <none>
+```
+
+</Expected>
+
+Cụm "chạy" nhưng không dùng được: ba node `NotReady`. Các pod `Running` đều là pod dùng mạng của node. CoreDNS và `local-path-provisioner` cần IP pod nên đứng ở `Pending`, cột `NODE` trống: scheduler chưa xếp chúng lên đâu cả. Hỏi node lý do:
+
+<Terminal where="mac">
+
+```bash
+kubectl get node k6-lab-worker -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}{"\n"}' \
+  | grep -o 'NetworkReady=false.*not initialized'
+kubectl get node k6-lab-worker -o jsonpath='{.spec.taints[*].key}{"\n"}{.spec.podCIDR}{"\n"}'
+docker exec k6-lab-worker sh -c 'echo "số file trong /etc/cni/net.d: $(ls /etc/cni/net.d | wc -l)"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NetworkReady=false reason:NetworkPluginNotReady message:Network plugin returns error: cni plugin not initialized
+node.kubernetes.io/not-ready
+10.244.1.0/24
+số file trong /etc/cni/net.d: 0
+```
+
+</Expected>
+
+Đúng chuỗi ở phần Kiến thức: thư mục `/etc/cni/net.d` trống, runtime báo `cni plugin not initialized`, kubelet đặt node `NotReady` kèm taint `node.kubernetes.io/not-ready`, và pod thường không chịu taint đó nên không được xếp. Kubernetes đã chia sẵn dải `10.244.1.0/24` cho node này (`podCIDR`), nhưng chưa ai dùng nó.
+
+<Check id="k6.1.lab-khong-cni">Dựng được cụm kind không có CNI và chỉ ra được từ `kubectl` và từ thư mục `/etc/cni/net.d` vì sao node `NotReady`, pod nào vẫn chạy, pod nào kẹt.</Check>
+
+### 2. Cài Cilium bằng Helm
+
+Chart chính thức nằm trên OCI registry `quay.io/cilium/charts`. Ba giá trị đủ cho lần cài đầu; kube-proxy vẫn giữ nguyên, bước 5 mới thay.
+
+<Terminal where="mac" title="~/masteva-k6/cilium-values.yaml">
+
+```bash
+cat > cilium-values.yaml <<'EOF'
+ipam:
+  mode: kubernetes              # dùng dải podCIDR Kubernetes đã chia cho từng node
+operator:
+  replicas: 1                   # lab: một bản operator là đủ
+kubeProxyReplacement: false     # bước 5 mới bật
+EOF
+helm install cilium oci://quay.io/cilium/charts/cilium --version 1.20.2 \
+  -n kube-system -f cilium-values.yaml | grep -E '^(NAME|NAMESPACE|STATUS):'
+kubectl -n kube-system rollout status daemonset/cilium --timeout=600s | tail -1
+kubectl wait --for=condition=Ready nodes --all --timeout=120s
+kubectl -n kube-system rollout status deployment/coredns --timeout=120s | tail -1
+kubectl -n kube-system get daemonset,deployment -o name | grep cilium
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME: cilium
+NAMESPACE: kube-system
+STATUS: deployed
+daemon set "cilium" successfully rolled out
+node/k6-lab-control-plane condition met
+node/k6-lab-worker condition met
+node/k6-lab-worker2 condition met
+deployment "coredns" successfully rolled out
+daemonset.apps/cilium
+daemonset.apps/cilium-envoy
+deployment.apps/cilium-operator
+```
+
+</Expected>
+
+Lần đầu mất khoảng hai phút, phần lớn để kéo image. Ba thành phần: `cilium` là agent trên mỗi node (nạp chương trình eBPF, làm IPAM, thực thi policy); `cilium-envoy` là proxy tầng 7 trên mỗi node, chỉ dùng khi có policy HTTP (K6.3); `cilium-operator` lo việc cấp cụm. Node chuyển `Ready` và CoreDNS được xếp ngay sau đó. Xem agent để lại gì trên node và tự báo cáo thế nào:
+
+<Terminal where="mac">
+
+```bash
+docker exec k6-lab-worker sh -c 'ls /etc/cni/net.d /opt/cni/bin | grep cilium; grep type /etc/cni/net.d/05-cilium.conflist'
+kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status \
+  | grep -E '^(KubeProxyReplacement|Cilium|IPAM|Routing|Masquerading|Hubble):' | cut -c1-110
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+05-cilium.conflist
+cilium-cni
+       "type": "cilium-cni",
+KubeProxyReplacement:    False   
+Cilium:                  Ok   1.20.2 (v1.20.2-e0dc92bd)
+IPAM:                    IPv4: 2/254 allocated from 10.244.2.0/24, 
+Routing:                 Network: Tunnel [vxlan]   Host: Legacy
+Masquerading:            IPTables [IPv4: Enabled, IPv6: Disabled]
+Hubble:                  Ok              Current/Max Flows: 31/4095 (0.76%), Flows/s: 0.90   Metrics: Disabled
+```
+
+</Expected>
+
+Agent đã chép file thực thi `cilium-cni` và viết file cấu hình: đó là toàn bộ "giao diện CNI". Dòng `IPAM` cho thấy agent cấp IP từ đúng dải `podCIDR` của node (lệnh `exec ds/cilium` rơi vào một node bất kỳ, nên dải in ra là của node đó); dòng `Routing` cho thấy gói giữa các node đi bằng overlay VXLAN, mặc định của chart.
+
+<Check id="k6.1.lab-cai-cilium">Cài được Cilium bằng Helm, thấy node chuyển `Ready`, và đọc được từ `cilium-dbg status` chế độ IPAM, kiểu định tuyến và trạng thái thay kube-proxy.</Check>
+
+### 3. CNI đã làm gì cho một pod
+
+Triển khai ứng dụng mẫu của K2.1 (`agnhost netexec`, `/hostname` trả tên pod) và một pod `client`. `client` được ghim vào node `k6-lab-worker` bằng `nodeName` để biết chắc phải soi node nào.
+
+<Terminal where="mac" title="~/masteva-k6/echo.yaml">
+
+```bash
+cat > echo.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: {name: k6-demo}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: echo, namespace: k6-demo}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: echo}
+  template:
+    metadata:
+      labels: {app: echo}
+    spec:
+      containers:
+        - name: echo
+          image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+          args: ["netexec", "--http-port=8080"]
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo, namespace: k6-demo}
+spec:
+  selector: {app: echo}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: client, namespace: k6-demo, labels: {app: client}}
+spec:
+  nodeName: k6-lab-worker     # ghim vào một node để biết soi veth ở đâu
+  containers:
+    - {name: curl, image: "curlimages/curl:8.22.0", command: ["sleep", "infinity"]}
+EOF
+kubectl apply -f echo.yaml > /dev/null
+kubectl -n k6-demo rollout status deployment/echo --timeout=180s | tail -1
+kubectl -n k6-demo wait --for=condition=Ready pod/client --timeout=120s
+kubectl -n k6-demo get pods -o wide | awk '{print $1, $6, $7}' | column -t
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "echo" successfully rolled out
+pod/client condition met
+NAME                   IP            NODE
+client                 10.244.1.78   k6-lab-worker
+echo-85cc55b84f-bwmkw  10.244.2.163  k6-lab-worker2
+echo-85cc55b84f-hhl55  10.244.2.159  k6-lab-worker2
+echo-85cc55b84f-xbxhf  10.244.1.125  k6-lab-worker
+```
+
+</Expected>
+
+IP của pod nằm trong dải của node chứa nó: `10.244.1.x` trên `worker`, `10.244.2.x` trên `worker2`. Pod `echo` rơi vào node nào là do scheduler; của bạn có thể chia khác. Giờ lần theo ba việc của plugin, từ trong pod ra ngoài node:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k6-demo exec client -- sh -c 'ip addr show eth0 | grep -E "eth0|inet "; ip route; echo "iflink=$(cat /sys/class/net/eth0/iflink)"'
+IDX=$(kubectl -n k6-demo exec client -- cat /sys/class/net/eth0/iflink)
+docker exec k6-lab-worker sh -c "ip -o link | grep '^$IDX:' | cut -d' ' -f1-2; ip -br addr show cilium_host; ip route | grep cilium_host"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+23: eth0@if24: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 65520 qdisc noqueue state UP 
+    inet 10.244.1.78/32 scope global eth0
+default via 10.244.1.61 dev eth0 
+10.244.1.61 dev eth0 scope link 
+iflink=24
+24: lxce2757681e3ac@if23:
+cilium_host@cilium_net UP             10.244.1.61/32 fe80::f4b2:bfff:fe17:a109/64 
+10.244.0.0/24 via 10.244.1.61 dev cilium_host proto kernel src 10.244.1.61 mtu 65470 
+10.244.1.0/24 via 10.244.1.61 dev cilium_host proto kernel src 10.244.1.61 
+10.244.1.61 dev cilium_host proto kernel scope link 
+10.244.2.0/24 via 10.244.1.61 dev cilium_host proto kernel src 10.244.1.61 mtu 65470 
+```
+
+</Expected>
+
+- **veth.** `eth0@if24` trong pod và `lxce2757681e3ac@if23` trên node là hai đầu của một cặp: số sau `@if` của bên này là số thứ tự card của bên kia.
+- **IPAM.** Pod nhận `10.244.1.78/32`: một địa chỉ đơn, không có mạng con. Pod không "cùng mạng" với ai, kể cả pod cùng node.
+- **Route.** Trong pod chỉ có một đường: mọi thứ đi qua `10.244.1.61`, địa chỉ của card `cilium_host` trên node. Trên node, dải pod của các node khác (`10.244.0.0/24`, `10.244.2.0/24`) có MTU 65470, nhỏ hơn 50 byte so với 65520 của `eth0`: đó là phần đầu gói VXLAN chiếm chỗ.
+
+Phần còn lại là của agent: chương trình eBPF trên đầu veth, và map cho biết IP nào ở node nào.
+
+<Terminal where="mac">
+
+```bash
+CIL=$(kubectl -n kube-system get pod -l k8s-app=cilium --field-selector spec.nodeName=k6-lab-worker -o name)
+kubectl -n kube-system exec $CIL -c cilium-agent -- bpftool net show | grep -E 'lxc[0-9a-f]{6}|cilium_vxlan|eth0'
+PODS=$(kubectl -n k6-demo get pods -o jsonpath='{.items[*].status.podIP}' | tr ' ' '|')
+kubectl -n kube-system exec $CIL -c cilium-agent -- cilium-dbg bpf ipcache list | grep -E "^($PODS)/32" | sort
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+eth0(11) tcx/ingress cil_from_netdev prog_id 48649 link_id 686 
+cilium_vxlan(14) tcx/ingress cil_from_overlay prog_id 48420 link_id 663 
+cilium_vxlan(14) tcx/egress cil_to_overlay prog_id 48421 link_id 664 
+lxc7c3e7cc3d00a(16) tcx/ingress cil_from_container prog_id 48518 link_id 677 
+lxc3c20f50bf5e8(18) tcx/ingress cil_from_container prog_id 48535 link_id 678 
+lxcd6965915b90d(20) tcx/ingress cil_from_container prog_id 48570 link_id 679 
+lxce2757681e3ac(24) tcx/ingress cil_from_container prog_id 48575 link_id 690 
+lxc8a19117164e5(26) tcx/ingress cil_from_container prog_id 48589 link_id 689 
+10.244.1.125/32     identity=63093 encryptkey=0 tunnelendpoint=0.0.0.0 flags=<none>         
+10.244.1.78/32      identity=24837 encryptkey=0 tunnelendpoint=0.0.0.0 flags=<none>         
+10.244.2.159/32     identity=63093 encryptkey=0 tunnelendpoint=172.20.0.4 flags=hastunnel   
+10.244.2.163/32     identity=63093 encryptkey=0 tunnelendpoint=172.20.0.4 flags=hastunnel   
+```
+
+</Expected>
+
+Mỗi `lxc…` (veth của từng pod đang chạy trên node này, trong đó có `client`) có một chương trình `cil_from_container`: mọi gói rời pod phải qua nó. Trong map `ipcache`, ba pod `echo` chung một identity (`63093`) vì chung label, còn `client` có identity riêng. Cũng map đó cho biết đường đi: hai pod `echo` trên `worker2` có `tunnelendpoint=172.20.0.4`, IP của node đó trong mạng Docker, tức gói tới pod ấy được bọc VXLAN gửi sang `172.20.0.4`; pod cùng node thì `0.0.0.0`, giao thẳng.
+
+<Check id="k6.1.lab-veth-ipam">Lần được từ `eth0` trong pod ra đầu veth trên node, đọc được địa chỉ `/32` và route của pod, và chỉ ra được chương trình eBPF gắn trên veth cùng dòng `ipcache` của một pod ở node khác.</Check>
+
+### 4. Một Service, ba data plane
+
+kube-proxy của cụm đang ở chế độ `iptables` và đã viết luật cho Service `echo` (K2.1 đã đọc từng dòng). Thêm `-c` để `iptables-save` in bộ đếm `[số gói:số byte]` của từng luật.
+
+<Predict question="Pod `client` gọi Service `echo` chín lần. Bộ đếm trên luật `KUBE-SERVICES` của `echo` tăng lên bao nhiêu?">
+
+Không tăng: vẫn `[0:0]`. Chương trình `cil_from_container` trên veth của `client` đã đổi địa chỉ đích từ ClusterIP sang IP pod trước khi gói tới netfilter của node, nên luật của kube-proxy không bao giờ thấy gói nào gửi tới ClusterIP. Gói xuất phát từ chính node thì không đi qua veth nào, và vẫn do kube-proxy xử lý.
+
+</Predict>
+
+Hàm `dem` trong khối dưới in bộ đếm của luật đó trên node `worker`.
+
+<Terminal where="mac">
+
+```bash
+IP=$(kubectl -n k6-demo get service echo -o jsonpath='{.spec.clusterIP}')
+dem() { docker exec k6-lab-worker iptables-save -t nat -c | grep "KUBE-SERVICES -d $IP/32" | cut -d' ' -f1; }
+echo "trước: $(dem)"
+kubectl -n k6-demo exec client -- sh -c 'for i in $(seq 9); do curl -s echo/hostname; echo; done | sort | uniq -c'
+echo "sau 9 lần gọi từ pod: $(dem)"
+for i in 1 2 3; do docker exec k6-lab-worker curl -s $IP/hostname; echo; done
+echo "sau 3 lần gọi từ node: $(dem)"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trước: [0:0]
+      3 echo-85cc55b84f-bwmkw
+      6 echo-85cc55b84f-xbxhf
+sau 9 lần gọi từ pod: [0:0]
+echo-85cc55b84f-xbxhf
+echo-85cc55b84f-hhl55
+echo-85cc55b84f-hhl55
+sau 3 lần gọi từ node: [3:180]
+```
+
+</Expected>
+
+Chín lời gọi từ pod thành công mà luật của kube-proxy không đếm được gói nào; ba lời gọi từ node thì đếm đủ ba (mỗi kết nối một gói SYN 60 byte; các gói sau đi theo conntrack). Trên cụm có Cilium, ngay cả khi chưa "thay kube-proxy", đường đi của traffic giữa các pod đã không qua kube-proxy nữa.
+
+Giờ cho cụm 1.000 Service, cùng trỏ vào ba pod `echo`, để thấy data plane lớn lên thế nào. EndpointSlice controller tạo slice có giới hạn tốc độ, nên vòng `until` chờ khoảng hai phút; `sleep 15` sau đó chờ kube-proxy ghi xong luật.
+
+<Terminal where="mac" title="~/masteva-k6/tao-services.sh">
+
+```bash
+cat > tao-services.sh <<'EOF'
+#!/bin/sh
+# In manifest của $1 Service, cùng trỏ vào ba pod echo
+for i in $(seq 1 "$1"); do
+  printf -- '---\napiVersion: v1\nkind: Service\nmetadata: {name: svc-%04d, namespace: k6-demo, labels: {lab: scale}}\nspec:\n  selector: {app: echo}\n  ports: [{port: 80, targetPort: 8080}]\n' "$i"
+done
+EOF
+docker exec k6-lab-worker sh -c 'echo "trước: $(iptables-save -t nat | wc -l) dòng nat, $(iptables -t nat -S KUBE-SERVICES | wc -l) dòng KUBE-SERVICES"'
+sh tao-services.sh 1000 > many-services.yaml
+kubectl create -f many-services.yaml | tail -1
+until [ "$(kubectl -n k6-demo get endpointslices --no-headers | wc -l)" -ge 1001 ]; do sleep 5; done
+sleep 15
+docker exec k6-lab-worker sh -c 'echo "sau:   $(iptables-save -t nat | wc -l) dòng nat, $(iptables -t nat -S KUBE-SERVICES | wc -l) dòng KUBE-SERVICES"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trước: 104 dòng nat, 8 dòng KUBE-SERVICES
+service/svc-1000 created
+sau:   15104 dòng nat, 1008 dòng KUBE-SERVICES
+```
+
+</Expected>
+
+Mỗi Service ba endpoint thêm khoảng 15 dòng vào bảng `nat`, và đúng một dòng vào chain `KUBE-SERVICES`. Chain đó được duyệt từ trên xuống: gói đầu của một kết nối tới Service nằm ở dòng 1.000 phải so qua 999 luật trước nó. Thứ tự trong chain không theo tên hay thời điểm tạo, nên bạn không chọn được Service nào nằm đầu. Đổi kube-proxy sang `nftables` bằng một dòng trong ConfigMap rồi khởi động lại DaemonSet:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n kube-system get configmap kube-proxy -o yaml \
+  | sed 's/mode: iptables/mode: nftables/' | kubectl replace -f -
+kubectl -n kube-system rollout restart daemonset/kube-proxy
+kubectl -n kube-system rollout status daemonset/kube-proxy --timeout=120s | tail -1
+until docker exec k6-lab-worker nft list map ip kube-proxy service-ips 2>/dev/null | grep -q "$IP . tcp . 80"; do sleep 2; done
+docker exec k6-lab-worker sh -c 'echo "luật KUBE-SVC còn lại trong iptables: $(iptables-save -t nat | grep -c KUBE-SVC)"'
+docker exec k6-lab-worker nft list chain ip kube-proxy services | grep vmap
+docker exec k6-lab-worker sh -c "echo \"phần tử trong map service-ips: \$(nft list map ip kube-proxy service-ips | grep -c ' : goto')\""
+docker exec k6-lab-worker nft list map ip kube-proxy service-ips | grep "$IP . tcp . 80" | sed 's/^[[:space:]]*//; s/,$//'
+docker exec k6-lab-worker nft list table ip kube-proxy | grep -A1 'k6-demo/echo/tcp/http {' | tail -1 | sed 's/^[[:space:]]*//'
+docker exec k6-lab-worker curl -s $IP/hostname; echo
+echo "--- cùng Service đó trong map của Cilium"
+kubectl -n kube-system exec $CIL -c cilium-agent -- cilium-dbg service list | grep -A2 "$IP:80/TCP"
+kubectl -n kube-system exec $CIL -c cilium-agent -- cilium-dbg service list | grep -c ClusterIP
+kubectl -n kube-system exec $CIL -c cilium-agent -- cilium-dbg status --verbose | grep -E 'IPv4 service +[0-9]'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/kube-proxy replaced
+daemonset.apps/kube-proxy restarted
+daemon set "kube-proxy" successfully rolled out
+luật KUBE-SVC còn lại trong iptables: 0
+		ip daddr . meta l4proto . th dport vmap @service-ips
+		ip daddr @nodeport-ips meta l4proto . th dport vmap @service-nodeports
+phần tử trong map service-ips: 1006
+10.96.145.3 . tcp . 80 : goto service-S2GZBIJ6-k6-demo/echo/tcp/http
+meta l4proto tcp dnat ip to numgen random mod 3 map { 0 : 10.244.1.125 . 8080, 1 : 10.244.2.159 . 8080, 2 : 10.244.2.163 . 8080 }
+echo-85cc55b84f-hhl55
+--- cùng Service đó trong map của Cilium
+6      10.96.145.3:80/TCP     ClusterIP      1 => 10.244.1.125:8080/TCP (active)   
+                                             2 => 10.244.2.159:8080/TCP (active)   
+                                             3 => 10.244.2.163:8080/TCP (active)   
+1006
+  IPv4 service                  65536
+```
+
+</Expected>
+
+kube-proxy khi khởi động ở chế độ mới tự xoá luật của chế độ cũ: không còn chain `KUBE-SVC` nào trong iptables. Thay cho 1.000 luật tuần tự là **một** luật `vmap @service-ips`: ghép (IP đích, giao thức, cổng) thành khoá, tra trong map, nhảy thẳng tới chain của Service. Chain của từng Service cũng gọn hơn: chọn ngẫu nhiên một trong ba pod bằng `numgen random mod 3` thay cho chuỗi xác suất 1/3, 1/2 của iptables.
+
+Ba dòng cuối là bản của Cilium: cùng một ánh xạ ClusterIP → ba pod, nằm trong một map eBPF kiểu bảng băm có sẵn chỗ cho 65.536 mục. 1.006 Service hay 60.000 Service thì một lần tra vẫn là một lần băm.
+
+<Check id="k6.1.lab-dataplane">Chứng minh được bằng bộ đếm rằng traffic từ pod không qua luật của kube-proxy khi có Cilium, và chỉ ra được cùng một Service dưới ba dạng: chain `iptables`, verdict map `nftables`, map eBPF.</Check>
+
+### 5. Cho Cilium thay kube-proxy
+
+Thêm ba dòng vào file values: bật thay thế, và chỉ cho agent địa chỉ thật của API server (tên container của node control plane, phân giải được trong mạng Docker của kind).
+
+<Callout kind="danger">
+
+Khối dưới khởi động lại agent Cilium trên mọi node và chuyển việc phục vụ Service từ kube-proxy sang Cilium. Tài liệu Cilium cảnh báo: đổi qua lại giữa hai data plane trên cụm đang phục vụ làm đứt các kết nối đang mở qua Service. Chỉ chạy trên cụm lab; kiểm `kubectl config current-context` in ra `kind-k6-lab`.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k6/cilium-values.yaml">
+
+```bash
+cat > cilium-values.yaml <<'EOF'
+ipam:
+  mode: kubernetes
+operator:
+  replicas: 1
+kubeProxyReplacement: true
+k8sServiceHost: k6-lab-control-plane   # agent gọi thẳng API server, không qua ClusterIP 10.96.0.1
+k8sServicePort: 6443
+EOF
+helm upgrade cilium oci://quay.io/cilium/charts/cilium --version 1.20.2 \
+  -n kube-system -f cilium-values.yaml | grep -E '^(STATUS|REVISION):'
+kubectl -n kube-system rollout status daemonset/cilium --timeout=300s | tail -1
+kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status --verbose \
+  | grep -A4 'KubeProxyReplacement Details' | cut -c1-60
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+STATUS: deployed
+REVISION: 2
+daemon set "cilium" successfully rolled out
+KubeProxyReplacement Details:
+  Status:               True
+  Socket LB:            Enabled
+  Socket LB Tracing:    Enabled
+  Socket LB Coverage:   Full
+```
+
+</Expected>
+
+Cilium giờ xử lý đủ mọi loại Service. kube-proxy vẫn đang chạy song song; gỡ nó, dọn luật nó để lại, và xoá luôn 1.000 Service thử của bước 4.
+
+<Callout kind="danger">
+
+Khối dưới xoá 1.000 Service thử (chọn theo label `lab=scale`, không đụng tới `echo`), DaemonSet `kube-proxy`, ConfigMap của nó và bảng nftables `kube-proxy` trên cả ba node. Trên cụm lab không có gì bị ảnh hưởng. Trên cụm đang phục vụ, việc đổi data plane tại chỗ làm đứt các kết nối đang mở qua Service (xem phần Kiến thức); đừng chép lệnh này sang cụm thật. Kiểm `kubectl config current-context` in ra `kind-k6-lab`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl -n k6-demo delete service -l lab=scale | tail -1
+kubectl -n kube-system delete daemonset kube-proxy
+kubectl -n kube-system delete configmap kube-proxy
+for n in k6-lab-control-plane k6-lab-worker k6-lab-worker2; do
+  docker exec $n sh -c 'nft delete table ip kube-proxy; nft delete table ip6 kube-proxy'
+done
+docker exec k6-lab-worker sh -c 'nft list tables | grep -c kube-proxy'
+kubectl -n k6-demo exec client -- sh -c 'for i in $(seq 6); do curl -s echo/hostname; echo; done | sort | uniq -c'
+docker exec k6-lab-worker curl -s $IP/hostname; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k6-lab
+service "svc-1000" deleted from k6-demo namespace
+daemonset.apps "kube-proxy" deleted from kube-system namespace
+configmap "kube-proxy" deleted from kube-system namespace
+0
+      2 echo-85cc55b84f-bwmkw
+      3 echo-85cc55b84f-hhl55
+      1 echo-85cc55b84f-xbxhf
+echo-85cc55b84f-xbxhf
+```
+
+</Expected>
+
+Không còn kube-proxy, không còn bảng `kube-proxy`, và Service vẫn chạy từ pod lẫn từ node. Xoá ConfigMap là để lần `kubeadm upgrade` sau không cài lại kube-proxy. Thử nốt loại Service khó nhất, NodePort, từ máy bạn qua cổng `9600` đã nối vào `30080` của control plane:
+
+<Terminal where="mac" title="~/masteva-k6/echo-np.yaml">
+
+```bash
+cat > echo-np.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata: {name: echo-np, namespace: k6-demo}
+spec:
+  type: NodePort
+  selector: {app: echo}
+  ports:
+    - {name: http, port: 80, targetPort: http, nodePort: 30080}
+EOF
+kubectl apply -f echo-np.yaml
+until curl -s -m 2 -o /dev/null localhost:9600/hostname; do sleep 1; done
+curl -s localhost:9600/hostname; echo
+docker exec k6-lab-control-plane sh -c 'echo "tiến trình nghe cổng 30080: $(ss -ltn | grep -c 30080); luật iptables nhắc 30080: $(iptables-save | grep -c 30080)"'
+kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg service list | grep -A2 ':30080/TCP' | cut -c1-90
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+service/echo-np created
+echo-85cc55b84f-xbxhf
+tiến trình nghe cổng 30080: 0; luật iptables nhắc 30080: 0
+1013   0.0.0.0:30080/TCP     NodePort       1 => 10.244.1.125:8080/TCP (active)   
+                                            2 => 10.244.2.159:8080/TCP (active)   
+                                            3 => 10.244.2.163:8080/TCP (active)   
+```
+
+</Expected>
+
+Request từ máy bạn tới được pod, trong khi trên node không có tiến trình nào nghe cổng 30080 và `iptables-save` không nhắc tới con số đó. Gói được chương trình `cil_from_netdev` trên `eth0` của node bắt và đổi đích ngay khi vừa vào. Đây là điều phải nhớ khi gỡ lỗi một cụm Cilium: `ss`, `iptables-save` và `conntrack` không còn là nơi có câu trả lời; `cilium-dbg service list` mới là.
+
+K6.2 dùng lại cổng 30080 cho Gateway, nên xoá Service thử này đi:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k6-demo delete service echo-np
+```
+
+</Terminal>
+
+<Check id="k6.1.lab-thay-kube-proxy">Bật được thay kube-proxy, gỡ kube-proxy cùng luật của nó, và chứng minh được ClusterIP lẫn NodePort vẫn chạy khi node không còn luật iptables nào cho Service.</Check>
+
+### 6. Hubble: nhìn luồng traffic
+
+Hubble server đã chạy sẵn trong mỗi agent. Bật thêm Relay để một lệnh thấy cả ba node:
+
+<Callout kind="danger">
+
+Khối dưới chạy `helm upgrade` lần nữa và khởi động lại agent Cilium trên mọi node. Trên cụm lab không ai bị ảnh hưởng; trên cụm thật, làm theo từng node.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k6/hubble.sh">
+
+```bash
+cat >> cilium-values.yaml <<'EOF'
+hubble:
+  relay:
+    enabled: true                      # gom flow từ mọi node về một điểm hỏi
+EOF
+helm upgrade cilium oci://quay.io/cilium/charts/cilium --version 1.20.2 \
+  -n kube-system -f cilium-values.yaml | grep -E '^(STATUS|REVISION):'
+kubectl -n kube-system rollout status deployment/hubble-relay --timeout=180s | tail -1
+kubectl -n kube-system rollout status daemonset/cilium --timeout=300s | tail -1
+cat > hubble.sh <<'EOF'
+#!/bin/sh
+# Chạy lệnh hubble có sẵn trong pod cilium, hỏi qua hubble-relay để thấy flow của mọi node
+RELAY=$(kubectl -n kube-system get service hubble-relay -o jsonpath='{.spec.clusterIP}')
+kubectl -n kube-system exec ds/cilium -c cilium-agent -- hubble --server "$RELAY:80" "$@"
+EOF
+chmod +x hubble.sh
+until ./hubble.sh status 2>/dev/null | grep -q 'Connected Nodes: 3/3'; do sleep 3; done
+./hubble.sh status | grep Connected
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+STATUS: deployed
+REVISION: 3
+deployment "hubble-relay" successfully rolled out
+daemon set "cilium" successfully rolled out
+Connected Nodes: 3/3
+```
+
+</Expected>
+
+Lệnh `hubble` thường được cài trên máy; để không phải cài thêm gì, `hubble.sh` dùng bản có sẵn trong image của agent và trỏ nó vào ClusterIP của Relay (pod agent dùng mạng của node nên không phân giải được tên Service). `Connected Nodes: 3/3` nghĩa là Relay đã nối tới Hubble của cả ba node. Gọi một request rồi xem Hubble ghi được gì; bộ lọc `grep -v` bỏ các gói chỉ có cờ `ACK` cho gọn:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k6-demo exec client -- curl -s -o /dev/null echo/hostname
+sleep 2
+./hubble.sh observe --from-pod k6-demo/client --since 10s --print-node-name \
+  | grep -v 'ACK)$' | cut -d' ' -f4- | sed 's/k6-demo\///g; s/kube-system\///'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[k6-lab-worker]: client:45704 (ID:24837) -> coredns-559f6c778d-4ggbr:53 (ID:3263) to-endpoint FORWARDED (UDP)
+[k6-lab-worker]: client:53542 (ID:24837) -> coredns-559f6c778d-cd6nj:53 (ID:3263) to-endpoint FORWARDED (UDP)
+[k6-lab-worker]: client (ID:24837) <> echo:80 (world) pre-xlate-fwd TRACED (TCP)
+[k6-lab-worker]: client:42616 (ID:24837) -> echo-85cc55b84f-hhl55:8080 (ID:63093) to-overlay FORWARDED (TCP Flags: SYN)
+[k6-lab-worker2]: client:42616 (ID:24837) -> echo-85cc55b84f-hhl55:8080 (ID:63093) to-endpoint FORWARDED (TCP Flags: SYN)
+[k6-lab-worker]: client:42616 (ID:24837) -> echo-85cc55b84f-hhl55:8080 (ID:63093) to-overlay FORWARDED (TCP Flags: ACK, PSH)
+[k6-lab-worker2]: client:42616 (ID:24837) -> echo-85cc55b84f-hhl55:8080 (ID:63093) to-endpoint FORWARDED (TCP Flags: ACK, PSH)
+[k6-lab-worker]: client:42616 (ID:24837) -> echo-85cc55b84f-hhl55:8080 (ID:63093) to-overlay FORWARDED (TCP Flags: ACK, FIN)
+[k6-lab-worker2]: client:42616 (ID:24837) -> echo-85cc55b84f-hhl55:8080 (ID:63093) to-endpoint FORWARDED (TCP Flags: ACK, FIN)
+```
+
+</Expected>
+
+Chín dòng kể trọn một lời gọi. Các dòng đến từ hai node nên không xếp đúng thứ tự thời gian; đọc theo nội dung:
+
+- Hai truy vấn DNS (`A` và `AAAA`) tới hai pod CoreDNS. Ở lượt này CoreDNS nằm cùng node với `client` nên mỗi truy vấn chỉ có một dòng `to-endpoint` (gói tới thẳng veth của pod đích).
+- `pre-xlate-fwd TRACED`: socket LB ở bước 5 đang làm việc. `client` gọi `echo:80`, và ngay lúc `connect()` đích được đổi.
+- Từ đó trở đi không còn ClusterIP: gói `SYN` mang thẳng đích là một pod `echo`, cổng 8080. Pod được chọn nằm ở `worker2` nên mỗi gói hiện hai lần: `to-overlay` trên `worker` (gói được bọc VXLAN gửi đi) và `to-endpoint` trên `worker2`. Nhờ Relay bạn thấy cả hai đầu. Pod đích và CoreDNS của bạn có thể nằm ở node khác, khi đó số dòng `to-overlay` thay đổi theo.
+
+<Check id="k6.1.lab-hubble">Bật được Hubble Relay, chạy được `hubble observe` cho một pod, và đọc được từ output: truy vấn DNS, chỗ socket LB đổi địa chỉ, và gói nào đi qua overlay.</Check>
+
+### 7. Gỡ một lỗi kết nối bằng Hubble
+
+Tình huống: ai đó thêm một NetworkPolicy "chỉ cho `client` gọi `echo`", và từ đó `client` gọi `echo` không được nữa. Policy viết cổng của Service thay cho cổng của pod (K2.4 đã nhắc quy tắc này; ở đây bạn nhìn thấy nó).
+
+<Callout kind="danger">
+
+Khối dưới áp một NetworkPolicy chặn mọi traffic vào ba pod `echo` trừ thứ nó cho phép. Chỉ ảnh hưởng namespace `k6-demo` của lab.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k6/np-sai-cong.yaml">
+
+```bash
+cat > np-sai-cong.yaml <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: echo-chi-client, namespace: k6-demo}
+spec:
+  podSelector:
+    matchLabels: {app: echo}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: client}
+      ports:
+        - {protocol: TCP, port: 80}     # SAI: 80 là cổng của Service, pod nghe ở 8080
+EOF
+kubectl apply -f np-sai-cong.yaml
+sleep 3
+kubectl -n k6-demo exec client -- curl -sS -m 3 -o /dev/null echo/hostname
+sleep 2
+./hubble.sh observe --pod k6-demo/client --since 10s --verdict DROPPED | cut -d' ' -f4- | sed 's/k6-demo\///g' | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+networkpolicy.networking.k8s.io/echo-chi-client created
+curl: (28) Connection timed out after 3001 milliseconds
+command terminated with exit code 28
+   3 client:38514 (ID:24837) <> echo-85cc55b84f-xbxhf:8080 (ID:63093) Policy denied DROPPED (TCP Flags: SYN)
+   3 client:38514 (ID:24837) <> echo-85cc55b84f-xbxhf:8080 (ID:63093) policy-verdict:none INGRESS DENIED (TCP Flags: SYN)
+```
+
+</Expected>
+
+`curl` **chờ hết 3 giây** rồi báo mã 28: gói bị bỏ im lặng, client gửi lại `SYN` (vì vậy mỗi dòng được đếm ba lần). Hubble nói đủ ba điều mà `curl` không nói được:
+
+- **Bị bỏ, không phải lạc:** verdict `DROPPED`, lý do `Policy denied`.
+- **Ở chiều nào:** `INGRESS DENIED`, tức policy ở phía pod đích từ chối, không phải egress của `client`.
+- **Với cổng nào:** `8080`. Policy cho phép `80`, gói tới nơi mang `8080` vì địa chỉ đã được đổi trước khi policy được xét.
+
+Sửa đúng một con số rồi thử lại:
+
+<Terminal where="mac">
+
+```bash
+sed -e 's/port: 80}.*/port: 8080}/' np-sai-cong.yaml | kubectl apply -f -
+sleep 3
+kubectl -n k6-demo exec client -- curl -s -m 3 -o /dev/null -w '%{http_code}\n' echo/hostname
+sleep 2
+./hubble.sh observe --pod k6-demo/client --type policy-verdict --verdict FORWARDED --last 1 | cut -d' ' -f4- | sed 's/k6-demo\///g'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+networkpolicy.networking.k8s.io/echo-chi-client configured
+200
+client:38440 (ID:24837) -> echo-85cc55b84f-bwmkw:8080 (ID:63093) policy-verdict:L3-L4 INGRESS ALLOWED (TCP Flags: SYN)
+```
+
+</Expected>
+
+`policy-verdict:L3-L4 INGRESS ALLOWED`: gói đầu của kết nối được một rule tầng 3–4 cho qua. Quy trình rút ra cho mọi lỗi kết nối trên cụm Cilium: nhìn mã lỗi của client (từ chối ngay hay hết giờ), rồi `hubble observe --pod <pod> --verdict DROPPED`; có dòng `DROPPED` thì đọc lý do, chiều và cổng; không có dòng nào và gói vẫn `FORWARDED` thì mạng không chặn, lỗi nằm ở đích (ví dụ Service ghi sai `targetPort`: Hubble cho thấy gói `SYN` tới một cổng không ai nghe và pod trả `RST`).
+
+<Check id="k6.1.lab-go-loi">Tìm được bằng Hubble một lời gọi bị NetworkPolicy bỏ, đọc được lý do, chiều và cổng trong dòng `DROPPED`, và sửa được policy.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Sau khi cài Cilium, node vẫn `NotReady` | Agent chưa chạy xong (đang kéo image) hoặc `CrashLoopBackOff` | `kubectl -n kube-system get pods -l k8s-app=cilium`; `kubectl -n kube-system logs ds/cilium -c cilium-agent --tail=20` |
+| Agent `CrashLoopBackOff` ngay sau bước 5, log báo không tới được API server | `k8sServiceHost` sai tên hoặc sai cổng | `kubectl -n kube-system get configmap cilium-config -o yaml`, xem `k8s-service-host`; tên phải là container node control plane |
+| `cilium-dbg status` có dòng `Modules Health: … Degraded(1)` | Trên kernel của Docker Desktop, module `socket-termination` báo kernel không hỗ trợ; không ảnh hưởng các bước của bài | `cilium-dbg status --verbose`, tìm `DEGRADED` |
+| `curl localhost:9600` không kết nối được ở bước 5 | Cụm tạo thiếu `extraPortMappings` | `docker port k6-lab-control-plane` phải có `30080/tcp -> 127.0.0.1:9600` |
+
+### Dọn dẹp
+
+Các bài K6.2 tới K6.5 dùng tiếp cụm này cùng Cilium, Hubble, namespace `k6-demo` (Deployment `echo`, Service `echo`, pod `client`) và các file trong `~/masteva-k6`. Chỉ gỡ NetworkPolicy của bước 7.
+
+<Callout kind="danger">
+
+Khối đầu xoá NetworkPolicy `echo-chi-client`. Khối thứ hai xoá cả cụm `k6-lab` và thư mục lab; chỉ chạy khi không học tiếp K6.2. Kiểm tên cụm trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K6.2">
+
+```bash
+kubectl -n k6-demo delete networkpolicy echo-chi-client
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k6-lab
+rm -rf ~/masteva-k6
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Sau khi thay kube-proxy, vì sao iptables-save trên node vẫn còn luật của Cilium?">
+
+Vì "thay kube-proxy" chỉ nói về Service. Dòng `Masquerading: IPTables` trong `cilium-dbg status` ở bước 2 cho thấy một việc khác vẫn dùng iptables: đổi địa chỉ nguồn của gói từ pod đi ra ngoài cụm thành IP của node (SNAT, D2.4). Chạy `docker exec k6-lab-worker iptables-save | grep -c CILIUM` sẽ thấy vài chục luật. Cilium làm được việc này bằng eBPF khi đặt `bpf.masquerade: true`; K6.3 bật nó vì egress gateway cần. Ngoài ra kubelet tự đặt vài chain `KUBE-FIREWALL`, `KUBE-KUBELET-CANARY` không liên quan tới kube-proxy. Bài học khi tiếp nhận một cụm: đừng kết luận "cụm này dùng eBPF hoàn toàn" hay "còn kube-proxy" từ một lệnh `grep`; hỏi `cilium-dbg status` từng dòng.
+
+</Reveal>
+
+<Reveal title="Overlay hay native routing: chọn theo gì?">
+
+Overlay (VXLAN, mặc định của chart) chạy trên mọi mạng: mạng bên dưới chỉ thấy gói UDP giữa các node. Cái giá là 50 byte mỗi gói (bước 3 đã thấy MTU 65470 so với 65520), một lượt bọc và mở gói, và công cụ mạng bên ngoài cụm (firewall, flow log của cloud) chỉ thấy IP node. Native routing (`routingMode: native`) gửi gói của pod nguyên dạng, nhanh hơn và soi được từ ngoài, nhưng mạng bên dưới phải biết đường tới từng dải pod: route tĩnh khi các node chung một mạng tầng 2 (`autoDirectNodeRoutes: true`), BGP với router của trung tâm dữ liệu, hoặc mạng cloud lo. Trên máy chủ riêng có đội mạng phối hợp thì native đáng làm; không chắc về mạng bên dưới thì overlay là lựa chọn an toàn. Một bẫy của overlay: MTU của đường đi nhỏ hơn MTU Cilium tính được (VPN, mạng lồng nhau) thì gói lớn bị rơi trong khi `ping` và request nhỏ vẫn chạy.
+
+</Reveal>
+
+<Reveal title="Cụm đang chạy kube-proxy iptables với 5.000 Service: nên đổi sang nftables hay sang Cilium?">
+
+Hai thay đổi khác cỡ nhau. Đổi `mode: nftables` là thay một dòng cấu hình của thành phần đang có: cùng mô hình (netfilter, conntrack), kube-proxy tự dọn luật cũ như bước 4, quay lại cũng bằng một dòng. Phải kiểm ba thứ trước: kernel của node từ 5.13, CNI và các công cụ khác có đọc thẳng luật `KUBE-*` không, và có ai dựa vào NodePort trên `127.0.0.1` không. Đổi sang Cilium thay kube-proxy là thay CNI: đổi cách cấp IP, cách thực thi policy, công cụ gỡ lỗi, và thường phải dựng node mới. Nếu vấn đề duy nhất là độ trễ của kết nối mới và thời gian đồng bộ luật, `nftables` giải quyết đúng chỗ với rủi ro thấp. Cilium đáng chọn khi bạn cần cả những thứ kube-proxy không có: policy theo tên miền và tầng 7 (K6.3), Hubble, hoặc đang dựng cụm mới. Đừng chọn `ipvs` cho cụm mới: chế độ này đã deprecated từ 1.35, theo tài liệu sẽ tắt mặc định ở 1.40 và gỡ ở 1.43.
+
+</Reveal>
+
+<Reveal title="Socket LB đổi địa chỉ một lần lúc connect(). Backend bị gỡ thì kết nối đang mở ra sao?">
+
+Sau `connect()`, socket của ứng dụng nối thẳng tới IP pod; data plane không còn đứng giữa từng gói để chuyển hướng. Tài liệu Cilium mô tả hai việc nó làm vì thế. Một: khi backend của một Service bị gỡ, Cilium **chủ động đóng** các socket đã được socket LB nối tới backend đó, để ứng dụng mở lại kết nối và được chia sang backend còn sống. Đây chính là module `socket-termination` mà bảng Gỡ lỗi ghi là kernel của Docker Desktop không hỗ trợ: trên cụm lab, kết nối giữ lâu tới một pod đã mất chỉ đứt khi hết timeout của chính nó. Hai: lúc một pod bị xoá, kubelet gửi `SIGTERM` cùng lúc endpoint chuyển sang `terminating`, nên ứng dụng có thể từ chối kết nối trước khi data plane kịp bỏ nó khỏi danh sách; tài liệu khuyên thêm `preStop` ngủ một đến vài giây, đúng trình tự tắt pod K1.3 đã dạy. Phía ứng dụng, hai lớp phòng không đổi dù data plane là gì: timeout cho từng request và giới hạn tuổi thọ kết nối (K2.1 đã nêu cho gRPC).
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết values cho chart Cilium và lệnh `hubble observe` khá tốt, nhưng hay sai ở chỗ phụ thuộc phiên bản: dùng `kubeProxyReplacement: strict` hay `partial` (đã bỏ, nay chỉ còn `true` và `false`), `tunnel: vxlan` (nay là `routingMode` và `tunnelProtocol`), gọi lệnh `cilium` trong pod agent (nay là `cilium-dbg`). Nó cũng hay quên `k8sServiceHost` khi bảo bạn gỡ kube-proxy, và khuyên gỡ lỗi Service bằng `iptables -L` hay `conntrack -L` trên cụm đã dùng eBPF. Kiểm lại: `helm show values oci://quay.io/cilium/charts/cilium --version <bản của bạn> | grep -n <khoá>` cho biết khoá có tồn tại không; `helm upgrade --dry-run=server` bắt lỗi schema; và sau mọi thay đổi data plane, một lệnh `curl` từ pod, một từ node và một `hubble observe --verdict DROPPED` là phép thử thật.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.1 là nền của bài: Service, EndpointSlice, luật iptables của kube-proxy. K2.4 dạy NetworkPolicy chuẩn mà bước 7 gỡ lỗi. K6.2 đặt Gateway API lên cụm này và cấp chứng chỉ bằng cert-manager. K6.3 dùng policy riêng của Cilium để kiểm soát egress theo tên miền và tầng 7, bật `bpf.masquerade` cho egress gateway, và dùng Hubble để xem gói bị chặn. K6.4 để external-dns viết bản ghi DNS cho các route; K6.5 gặp lại socket LB khi đặt cache DNS trên từng node. K4 dựng cụm bằng kubeadm, nơi bạn tự chọn CNI và có thể bỏ kube-proxy từ đầu. K11 đặt service mesh lên trên lớp mạng này. D2.4 là nền về NAT và conntrack.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k6.1.mastery-cni">Nhận một cụm có node `NotReady` vì mạng, lần được từ điều kiện của node tới thư mục cấu hình CNI và pod agent, và nói được CNI của cụm cấp IP và đưa gói giữa các node bằng cách nào.</Check>
+
+<Check id="k6.1.mastery-dataplane">Với một cụm bất kỳ, xác định được data plane nào đang phục vụ Service (`iptables`, `nftables` hay eBPF), xem được ánh xạ của một Service trong đúng công cụ của nó, và nêu được khi nào nên đổi.</Check>
+
+</Mastery>

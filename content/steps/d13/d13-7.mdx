@@ -1,0 +1,747 @@
+---
+title: Chẩn đoán sự cố trong cụm
+description: Tiêm năm lỗi vào một cụm kubeadm (runtime chết, kubelet không lên, static pod hỏng, CNI hỏng, DNS hỏng) rồi lần ra từng lỗi theo một thứ tự cố định, bằng kubectl khi API server còn và bằng crictl, journalctl khi nó không còn.
+id: d13.7
+step: d13
+prerequisites: [d13.5, d1.4]
+topics: [d13.chan-doan-su-co-cum]
+status: verified
+verified:
+  date: 2026-10-13
+  os: Ubuntu 26.04 LTS (hai VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    kubernetes: 1.37.1
+    containerd: 2.2.2
+    cri-tools: 1.36.0
+    flannel: 0.28.10
+    coredns: 1.14.6
+    busybox: 1.38.0
+---
+
+<Goal>
+
+K1 tới K3 dạy chẩn đoán một **pod** hỏng. Bài này chẩn đoán khi thứ hỏng là chính cụm: node, kubelet, runtime, control plane, mạng. Học xong, bạn làm được:
+
+- Đi từ "có gì đó không ổn" tới đúng máy và đúng tầng bằng một thứ tự kiểm cố định, thay vì thử ngẫu nhiên.
+- Đọc được lý do `NotReady` của node và phân biệt "kubelet chết" với "runtime chết" với "mạng chưa sẵn sàng".
+- Tìm nguyên nhân khi `kubectl` không còn dùng được, bằng `crictl` và `journalctl` trên node.
+- Tách lỗi DNS thành lỗi của pod, của Service `kube-dns`, của CoreDNS hay của DNS phía trên.
+
+</Goal>
+
+<Knowledge>
+
+### Bốn tầng, bốn bộ công cụ
+
+Một node là bốn tầng chồng lên nhau, và mỗi tầng chỉ quan sát được bằng công cụ **không phụ thuộc vào tầng đang hỏng**:
+
+```text
+ tầng                      hỏng thì thấy gì                    công cụ còn dùng được
+ ───────────────────────────────────────────────────────────────────────────────────────────
+ 4. object trong API       pod Pending, CrashLoopBackOff        kubectl get, describe, logs, events
+ 3. control plane          kubectl: connection refused,         trên máy control plane: crictl ps -a,
+    (static pod)           timeout                              crictl logs, /var/log/pods
+ 2. kubelet và runtime     node NotReady                        systemctl status, journalctl -u kubelet,
+                                                                journalctl -u containerd, crictl
+ 1. máy và hệ điều hành    node NotReady, không SSH được        ping, console của máy, dmesg (D1.4)
+```
+
+Quy tắc đi kèm: **đi từ trên xuống cho tới khi công cụ của tầng đó ngừng trả lời, rồi xuống một tầng.** `kubectl` còn trả lời thì hỏi nó trước, vì nó nhìn được cả cụm. `kubectl` im thì đừng ngồi thử lại: lên máy control plane với `crictl`. `crictl` cũng im thì xuống `systemctl` và `journalctl`.
+
+Thứ tự kiểm cho mọi sự cố:
+
+```text
+ 1. Phạm vi     kubectl get nodes;  kubectl get pods -A | grep -v Running
+                → một pod, một node, hay mọi thứ?
+ 2. Vừa đổi gì  kubectl get events -A --sort-by=.lastTimestamp | tail
+                → deploy, nâng cấp, sửa cấu hình trong một giờ qua
+ 3. Tới đúng máy và đúng tầng theo bảng trên
+ 4. Đọc thông báo lỗi nguyên văn trước khi sửa bất cứ thứ gì
+ 5. Sửa một thứ, kiểm lại bằng đúng lệnh đã cho thấy lỗi
+```
+
+Bước 4 nghe hiển nhiên nhưng là bước hay bị bỏ nhất lúc gấp. Và có một điều cấm: đừng xoá bằng chứng (khởi động lại máy, dựng lại cụm) trước khi đọc nó.
+
+<Callout kind="production">
+
+Ngày 04/12/2018, phòng lab trực tuyến NRE Labs ngừng hoạt động. [Bản tường thuật của người vận hành](https://oswalt.dev/2018/12/december-4-nre-labs-outage-post-mortem/) kể lại từng bước, kể cả những bước sai. Cụm dựng bằng kubeadm với một control plane. `kubectl` báo `connection refused`. Anh SSH vào máy, không thấy API server trong danh sách container, và theo phản xạ khởi động lại kubelet; cụm chạy lại, anh báo đã xong, rồi nó lại chết. `kubectl get pods` khi còn chạy được đã cho thấy pod etcd và API server có **183 lần khởi động lại**, điều mà anh viết là lẽ ra phải thấy nếu chịu đọc kỹ thay vì chỉ nhìn chữ `Running`. Thay vào đó anh xoá cả cụm bằng `terraform destroy` và dựng lại, mất khoảng 30 phút, và lỗi vẫn còn nguyên. Chỉ khi quay lại đọc log của các container đã thoát anh mới thấy etcd khởi động bình thường rồi nhận tín hiệu dừng sau khoảng một phút rưỡi tới hai phút, lần nào cũng vậy; log của kubelet ghi nó khởi động lại container etcd đã chết. Anh nghi kubelet và tìm trong manifest etcd do kubeadm sinh ra một liveness probe có `failureThreshold: 8` và `timeoutSeconds: 15`; anh tự nhân hai số ra hai phút, thấy khớp với nhịp khởi động lại, và coi đó là thủ phạm. Đó là suy luận của anh: bài viết không dẫn event hay log nào cho thấy probe thất bại, và khi anh chạy tay đúng lệnh của probe thì nó thành công. Anh bỏ hẳn probe khỏi manifest và cụm ổn; hai câu hỏi "vì sao probe bắt đầu hỏng" và "vì sao nó hỏng" anh để ngỏ. Trong các điều anh tự rút: giám sát, một trang báo bảo trì, tin vào việc kiểm những thứ cơ bản trước, và kiên nhẫn; anh tiếc vì đã vội "huỷ bằng chứng".
+
+Điều rút ra (của bài này): những gì anh tìm ra được đều nằm sẵn ở ba chỗ mà lab dưới đây dùng (cột `RESTARTS`, log của container đã thoát, log của kubelet), và dựng lại cụm từ cùng một bộ mã thì dựng lại luôn cả vấn đề.
+
+</Callout>
+
+<Check id="d13.7.tang">Kể được bốn tầng của một node, triệu chứng khi mỗi tầng hỏng và công cụ còn dùng được ở tầng đó; nói được thứ tự kiểm năm bước.</Check>
+
+### Node `NotReady`: ba nguyên nhân, ba dấu hiệu
+
+Kubelet báo về control plane theo hai đường: nó gia hạn một Lease trong namespace `kube-node-lease` khoảng 10 giây một lần (nhịp tim), và cập nhật `status` của node khi có thay đổi hoặc 5 phút một lần. `Ready` là một **condition** trong `status` đó. `kubectl describe node` in cả bảng condition, và cột `Reason`, `Message` đã nói gần hết:
+
+| Thấy gì trong condition `Ready` | Nghĩa là | Xuống máy xem gì |
+|---|---|---|
+| `Status: Unknown`, `NodeStatusUnknown`, "Kubelet stopped posting node status" | **Kubelet im lặng**: tiến trình chết, máy tắt, hoặc máy mất đường tới API server | `ping`, `systemctl status kubelet`, `journalctl -u kubelet` |
+| `Status: False`, "container runtime is down" | Kubelet sống và đang báo: **runtime không trả lời** | `systemctl status containerd`, `journalctl -u containerd` |
+| `Status: False`, "NetworkPluginNotReady … cni plugin not initialized" | Kubelet và runtime sống: **chưa có cấu hình CNI** | `/etc/cni/net.d`, pod của CNI trên node đó (K4.1 bước 4) |
+| Các condition `MemoryPressure`, `DiskPressure`, `PIDPressure` là `True` | Node cạn tài nguyên, kubelet đang rút pod | `free`, `df`, D1.4 |
+
+`Unknown` khác `False` ở chỗ: `False` là kubelet **nói** "tôi chưa sẵn sàng", `Unknown` là node controller **suy ra** vì quá lâu không nghe thấy kubelet. K4.4 đã cho thấy mốc thời gian: khoảng 40 tới 50 giây thì node bị đánh dấu, khoảng 6 phút thì pod bị dời đi.
+
+Một điều dễ quên: `NotReady` nói về **khả năng quản lý** node, không nói container trên đó đã dừng. Kubelet hay runtime chết thì container đang chạy vẫn chạy (tiến trình `containerd-shim` giữ chúng, không phải containerd), và vẫn nhận traffic cho tới khi endpoint bị gỡ.
+
+<Check id="d13.7.notready">Đọc được condition `Ready` của một node và phân biệt được ba trường hợp: kubelet im lặng, runtime chết, CNI chưa sẵn sàng; nói được vì sao node `NotReady` chưa có nghĩa ứng dụng trên đó đã dừng.</Check>
+
+### Khi `kubectl` không trả lời
+
+Thông báo của `kubectl` đã phân loại giúp bạn:
+
+| `kubectl` báo | Kết nối hỏng ở đâu | Nghi gì trước |
+|---|---|---|
+| `connection refused` | Tới được máy, không có gì nghe ở cổng 6443 | API server không chạy: static pod hỏng, kubelet của control plane chết |
+| `i/o timeout`, `no route to host` | Không tới được máy | Mạng, firewall, load balancer hay VIP trước API server (K4.2), máy tắt |
+| `TLS handshake timeout` | Có thứ nghe cổng nhưng không bắt tay nổi | API server đang khởi động hoặc quá tải |
+| `x509: certificate has expired` | Bắt tay TLS bị từ chối | Chứng chỉ hết hạn (K4.5) |
+| `Unauthorized`, `Forbidden` | API server sống và đã trả lời | Danh tính hoặc RBAC (K2.3), không phải sự cố của cụm |
+| `etcdserver: request timed out`, `leader changed` | API server sống, etcd phía sau không | etcd: đĩa chậm, mất quorum (K4.2) |
+
+Với hai dòng đầu, việc tiếp theo là lên máy control plane và nhìn bằng `crictl`, vì static pod không cần API server để tồn tại và cũng không cần nó để được quan sát:
+
+```text
+ sudo crictl ps -a --name kube-apiserver     có container không? Running hay Exited? ATTEMPT bao nhiêu?
+ sudo crictl logs <id>                       nó nói gì trước khi chết?
+ sudo journalctl -u kubelet --since -5min    kubelet có đọc được manifest không? có tạo được pod không?
+ ls /etc/kubernetes/manifests                file còn đó không, ai vừa sửa?
+```
+
+- **Không có container nào, kể cả đã thoát:** kubelet không tạo được pod. Hoặc kubelet chết, hoặc manifest sai cú pháp YAML (kubelet ghi lỗi vào journal và bỏ qua file).
+- **Container `Exited`, `ATTEMPT` tăng dần:** tiến trình khởi động rồi chết. Log của container có câu trả lời (K4.3 bước 2 là một ví dụ).
+- **Container `Running` mà vẫn không trả lời:** xem log của nó; thường nó đang chờ etcd.
+
+Log của container đã thoát không sống lâu: kubelet dọn container cũ, và log ở `/var/log/pods` mất theo pod. Đọc ngay, và chép ra chỗ khác nếu cần cho postmortem (D17).
+
+<Check id="d13.7.api-chet">Từ thông báo lỗi của `kubectl`, nói được kết nối hỏng ở chặng nào; kể được bốn lệnh trên máy control plane để tìm nguyên nhân khi API server không chạy, và mỗi kết quả của `crictl ps -a` gợi ý điều gì.</Check>
+
+### Pod không có mạng, tên không phân giải
+
+Pod kẹt ở `ContainerCreating` gần như luôn là một trong ba chuyện, và `kubectl describe pod` nói rõ là chuyện nào trong phần Events: chưa kéo xong image, chưa gắn được volume (K2.3, K7), hoặc `FailedCreatePodSandBox`. Sandbox là container `pause` cùng network namespace của pod; tạo sandbox là lúc runtime gọi plugin CNI. Lỗi ở đó là lỗi của CNI **trên đúng node ấy**, và thông báo thường chỉ thẳng vào file hay tiến trình thiếu.
+
+DNS trong cụm là một chuỗi bốn mắt xích (K2.1 đã dạy từng mắt):
+
+```text
+ pod ── /etc/resolv.conf: nameserver 10.96.0.10 ──► Service kube-dns ──► pod CoreDNS ──► DNS phía trên
+        (kubelet ghi)                                (kube-proxy, K2.1)   tên *.cluster.local   (resolv.conf của node)
+                                                                          tự trả lời
+```
+
+Một phép thử tách được nửa chuỗi: phân giải **một tên trong cụm** và **một tên ngoài cụm** từ cùng một pod.
+
+| Tên trong cụm | Tên ngoài cụm | Hỏng ở đâu |
+|---|---|---|
+| Được | Được | DNS không hỏng; xem lại ứng dụng, NetworkPolicy (K2.4) |
+| Được | Không | CoreDNS sống, **đường lên DNS phía trên** hỏng: cấu hình `forward`, DNS của node, firewall ra ngoài |
+| Không | Không | Trước CoreDNS: pod không tới được `10.96.0.10` (kube-proxy, CNI), Service `kube-dns` không có endpoint, hoặc CoreDNS chết |
+
+K6 đi sâu vào những kiểu hỏng DNS khó hơn (conntrack, `ndots`, tải); bài này dừng ở việc khoanh đúng mắt xích.
+
+<Check id="d13.7.mang-dns">Nói được ba nguyên nhân làm pod kẹt ở `ContainerCreating` và tìm chúng ở đâu; dùng được phép thử tên trong cụm và tên ngoài cụm để khoanh mắt xích DNS bị hỏng.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Troubleshooting Clusters](https://kubernetes.io/docs/tasks/debug/debug-cluster/): vị trí log của từng thành phần và các kiểu hỏng của cụm.
+- [Debugging Kubernetes nodes with crictl](https://kubernetes.io/docs/tasks/debug/debug-cluster/crictl/): `crictl pods`, `ps`, `images`, `exec`, `logs`.
+- [Debugging DNS Resolution](https://kubernetes.io/docs/tasks/administer-cluster/dns-debugging-resolution/): quy trình kiểm DNS từ pod tới CoreDNS.
+- [Troubleshooting kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/troubleshooting-kubeadm/): các lỗi hay gặp của cụm kubeadm.
+- [NRE Labs Outage Post-Mortem](https://oswalt.dev/2018/12/december-4-nre-labs-outage-post-mortem/): bài tường thuật dùng trong callout; đọc phần anh lần ra probe của etcd.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cụm của K4.5: `k4-cp1` và `k4-w1` ở 1.37.1, ứng dụng `web` hai bản sao (mỗi node một bản), control plane không còn taint. Mở một terminal vào mỗi VM và một terminal trên Mac.
+
+**Profile máy.** Như K4.1 (hai VM, mỗi VM 2 CPU và 2 GiB). Máy 8 GB làm được.
+
+Script tiêm lỗi nằm trên Mac và được đẩy vào máy cần hỏng. Nếu muốn tự chẩn đoán như gặp sự cố thật, **đừng đọc thân script**: chạy lệnh tiêm ở đầu mỗi bước, rồi thử tự tìm trước khi đọc tiếp.
+
+<Terminal where="mac" title="~/masteva-d13/pha.sh">
+
+```bash
+mkdir -p ~/masteva-d13 && cd ~/masteva-d13
+cat > pha.sh <<'EOF'
+#!/usr/bin/env bash
+# pha.sh <số>: tiêm một lỗi vào máy đang chạy script (chạy bằng root)
+set -euo pipefail
+case "${1:-}" in
+  1) systemctl stop containerd ;;
+  2) sed -i 's/^cgroupDriver: systemd/cgroupDriver: systemd\nmaxPods: "nhieu"/' /var/lib/kubelet/config.yaml
+     systemctl restart kubelet ;;
+  3) sed -i 's|--etcd-servers=https://127.0.0.1:2379|--etcd-servers=https://127.0.0.1:2389|' /etc/kubernetes/manifests/kube-apiserver.yaml ;;
+  4) rm -f /run/flannel/subnet.env ;;
+  5) export KUBECONFIG=/etc/kubernetes/admin.conf
+     kubectl -n kube-system get configmap coredns -o yaml | sed 's|forward . /etc/resolv.conf|forward . 192.0.2.53|' | kubectl apply -f - > /dev/null 2>&1
+     kubectl -n kube-system rollout restart deployment/coredns > /dev/null
+     kubectl -n kube-system rollout status deployment/coredns --timeout=120s > /dev/null
+     sleep 6 ;;
+  *) echo "dung: pha.sh 1..5" >&2; exit 1 ;;
+esac
+echo "da tiem loi $1 vao $(hostname)"
+EOF
+limactl shell k4-cp1 kubectl get nodes
+limactl shell k4-cp1 kubectl get pods -l app=web -o wide --no-headers | cut -c1-80
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME          STATUS   ROLES           AGE   VERSION
+lima-k4-cp1   Ready    control-plane   46m   v1.37.1
+lima-k4-w1    Ready    <none>          23m   v1.37.1
+web-5c94dc48c-57nmv   1/1   Running   1     20m     10.244.0.26   lima-k4-cp1
+web-5c94dc48c-6v9qj   1/1   Running   0     4m31s   10.244.1.25   lima-k4-w1
+```
+
+</Expected>
+
+Nếu `web` không đủ hai bản sao trên hai node: `kubectl rollout restart deploy/web` trên `k4-cp1`.
+
+### 1. Node `NotReady`, lần thứ nhất
+
+<Callout kind="danger">
+
+Năm lệnh `pha.sh` trong bài cố ý làm hỏng node hoặc control plane của cụm lab. Chỉ chạy với hai VM `k4-cp1`, `k4-w1`; mỗi bước đều có lệnh sửa ở cuối.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-w1 sudo bash -s 1 < pha.sh
+```
+
+</Terminal>
+
+Bước 1 của thứ tự kiểm: phạm vi. Lệnh `wait` chờ tới khi cụm nhận ra có chuyện (30 tới 50 giây):
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl wait --for=condition=Ready=false node/lima-k4-w1 --timeout=120s
+kubectl get nodes
+kubectl get node lima-k4-w1 -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{" | "}{.reason}{" | "}{.message}{"\n"}{end}'
+kubectl get pods -l app=web -o wide --no-headers | cut -c1-80
+curl -s -m 2 -o /dev/null -w "web qua k4-w1: %{http_code}\n" http://lima-k4-w1.internal:30080/hostname
+```
+
+</Terminal>
+
+<Predict question="Node k4-w1 đã NotReady. Pod web trên node đó đang ở trạng thái gì, và NodePort của k4-w1 còn trả lời không?">
+
+```text
+node/lima-k4-w1 condition met
+NAME          STATUS     ROLES           AGE   VERSION
+lima-k4-cp1   Ready      control-plane   46m   v1.37.1
+lima-k4-w1    NotReady   <none>          24m   v1.37.1
+False | KubeletNotReady | container runtime is down
+web-5c94dc48c-57nmv   1/1   Running   1     21m    10.244.0.26   lima-k4-cp1
+web-5c94dc48c-6v9qj   1/1   Running   0     5m6s   10.244.1.25   lima-k4-w1
+web qua k4-w1: 200
+```
+
+Pod vẫn `Running` và NodePort vẫn trả `200`. Condition đã nói nguyên nhân: `False` (kubelet còn sống và đang báo cáo) với lý do `container runtime is down`. Theo bảng ở phần Kiến thức, xuống máy xem containerd.
+
+</Predict>
+
+<Terminal where="vm" title="k4-w1">
+
+```bash
+systemctl is-active kubelet containerd
+sudo crictl ps 2>&1 | tail -1 | cut -c1-150
+sudo journalctl -u kubelet --since "-20s" --no-pager | grep -o 'dial unix /var/run/containerd/containerd.sock: connect: [a-z ]*' | sort | uniq -c | cut -c1-110
+ps -e -o comm= | grep -c containerd-shim
+pgrep -a agnhost | cut -d' ' -f2-
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+active
+inactive
+time="2026-10-13T04:32:56Z" level=error msg="validate service connection: validate CRI v1 runtime API for endpoint \"unix:///run/containerd/containerd.sock\": rpc error: co
+     92 dial unix /var/run/containerd/containerd.sock: connect: no such file or directory
+3
+/agnhost netexec --http-port=8080 --delay-shutdown=5
+```
+
+</Expected>
+
+Ba công cụ, ba mảnh của cùng một sự thật: `systemctl` nói containerd không chạy; `crictl` không nối được vào socket; kubelet ghi đi ghi lại rằng socket không tồn tại. Và hai dòng cuối giải thích vì sao ứng dụng còn sống: các tiến trình `containerd-shim` vẫn đó, và tiến trình `agnhost` của pod `web` vẫn chạy dưới một trong số chúng. Runtime chết thì node mất khả năng **tạo, dừng, kiểm tra** container; container đang chạy không bị ảnh hưởng. Số dòng log và số shim trên máy bạn sẽ khác.
+
+Nếu không ai sửa, sau khoảng 6 phút pod trên node này bị dời đi (K4.4). Sửa:
+
+<Terminal where="vm" title="k4-w1">
+
+```bash
+sudo systemctl start containerd
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl wait --for=condition=Ready node/lima-k4-w1 --timeout=120s
+```
+
+</Terminal>
+
+Trên hệ thống thật, câu hỏi kế tiếp là **vì sao** containerd dừng: `journalctl -u containerd` và `systemctl status containerd` cho biết nó bị dừng tay, crash, hay bị kernel giết vì hết bộ nhớ (D1.4).
+
+<Check id="d13.7.lab-runtime">Từ condition của node tìm ra được runtime chết, xác nhận được bằng `systemctl`, `crictl` và log của kubelet, và chứng minh được container đang chạy vẫn phục vụ khi containerd dừng.</Check>
+
+### 2. Node `NotReady`, lần thứ hai
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-w1 sudo bash -s 2 < pha.sh
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl wait --for=jsonpath='{.status.conditions[?(@.type=="Ready")].status}'=Unknown node/lima-k4-w1 --timeout=120s
+kubectl get node lima-k4-w1 -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{" | "}{.reason}{" | "}{.message}{"\n"}{end}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-w1 condition met
+Unknown | NodeStatusUnknown | Kubelet stopped posting node status.
+```
+
+</Expected>
+
+Cùng là `NotReady` trong `kubectl get nodes`, nhưng condition khác hẳn lần trước: `Unknown`, và lời nhắn do node controller viết, không phải kubelet. Kubelet im lặng. Máy còn sống không, kubelet còn chạy không?
+
+<Terminal where="vm" title="k4-w1">
+
+```bash
+systemctl is-active kubelet containerd
+systemctl status kubelet --no-pager | grep "Active:" | cut -c1-80
+sudo journalctl -u kubelet --since "-30s" --no-pager | grep -o '"command failed".*' | tail -1 | cut -c1-290
+sudo crictl ps | awk 'NR > 1 {print $(NF-4)}' | sort | tr '\n' ' '; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+activating
+active
+     Active: activating (auto-restart) (Result: exit-code) since Tue 2026-10-13 04:34:39 UTC; 4s ago
+"command failed" err="failed to load kubelet config file, path: /var/lib/kubelet/config.yaml, error: failed to load Kubelet config file /var/lib/kubelet/config.yaml, error failed to decode: json: cannot unmarshal string into Go struct field KubeletConfiguration.maxPods of type int32"
+kube-flannel kube-proxy web
+```
+
+</Expected>
+
+`activating (auto-restart)` là dấu hiệu của một dịch vụ chết ngay khi khởi động và được systemd chạy lại liên tục (D1.1). Log của kubelet nói chính xác file nào, trường nào: `maxPods` trong `/var/lib/kubelet/config.yaml` đang là một chuỗi. Dòng cuối: runtime vẫn khoẻ và container vẫn chạy, kể cả `web`.
+
+Sửa tay dòng sai là một cách. Cách tốt hơn là lấy lại cấu hình chuẩn của cụm: K4.1 đã nói file này sinh ra từ ConfigMap `kubelet-config`, và kubeadm có một pha chỉ để làm việc đó.
+
+<Terminal where="vm" title="k4-w1">
+
+```bash
+sudo kubeadm upgrade node phase kubelet-config 2>&1 | tail -1
+grep -c maxPods /var/lib/kubelet/config.yaml
+sudo systemctl restart kubelet
+sleep 3; systemctl is-active kubelet
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+0
+active
+```
+
+</Expected>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl wait --for=condition=Ready node/lima-k4-w1 --timeout=120s
+```
+
+</Terminal>
+
+Bài học phụ: cấu hình sửa tay trên một node bị ghi đè bởi đúng lệnh này ở lần nâng cấp kế tiếp. Muốn đổi cấu hình kubelet thì đổi ở ConfigMap, hoặc dùng cơ chế patch của kubeadm.
+
+<Check id="d13.7.lab-kubelet">Phân biệt được qua condition hai kiểu `NotReady` (kubelet báo `False` và kubelet im lặng), tìm được nguyên nhân kubelet không khởi động từ `systemctl status` và `journalctl`, và khôi phục được cấu hình kubelet từ ConfigMap của cụm.</Check>
+
+### 3. `kubectl` không trả lời
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-cp1 sudo bash -s 3 < pha.sh
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+sleep 45
+kubectl get nodes 2>&1 | grep -o -E "connection refused|TLS handshake timeout" | head -1
+curl -s -m 2 -o /dev/null -w "web qua k4-cp1: %{http_code}\n" http://lima-k4-cp1.internal:30080/hostname
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+connection refused
+web qua k4-cp1: 200
+```
+
+</Expected>
+
+`grep` chỉ giữ phần cốt lõi của thông báo lỗi. Tuỳ thời điểm, bạn có thể thấy `TLS handshake timeout` thay cho `connection refused`: API server đang ở giữa một lần khởi động lại. Ứng dụng vẫn phục vụ. Tầng 4 đã mất, xuống tầng 3 và 2 trên chính máy control plane:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+systemctl is-active kubelet containerd
+until sudo crictl ps -a -q --name kube-apiserver --state exited | grep -q .; do sleep 2; done
+sudo crictl ps -a --name kube-apiserver | awk 'NR > 1 {print $(NF-4), $(NF-5), "attempt=" $(NF-3)}'
+sudo crictl logs "$(sudo crictl ps -a -q --name kube-apiserver --state exited | head -1)" 2>&1 | grep -o 'dial tcp [0-9.:]*: connect: connection refused' | sort | uniq -c
+sudo crictl logs "$(sudo crictl ps -a -q --name kube-apiserver --state exited | head -1)" 2>&1 | grep -o '"command failed".*'
+sudo grep -n "etcd-servers" /etc/kubernetes/manifests/kube-apiserver.yaml
+sudo grep -n "listen-client-urls" /etc/kubernetes/manifests/etcd.yaml | cut -c1-80
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+active
+active
+kube-apiserver Exited attempt=0
+     18 dial tcp 127.0.0.1:2389: connect: connection refused
+"command failed" err="error creating storage factory: etcd grpc connection not ready: context deadline exceeded"
+24:    - --etcd-servers=https://127.0.0.1:2389
+23:    - --listen-client-urls=https://127.0.0.1:2379,https://192.168.104.1:2379
+```
+
+</Expected>
+
+kubelet và containerd đều khoẻ, nên vấn đề nằm ở chính static pod. Vòng `until` chờ tới khi có một container API server đã thoát. `crictl ps -a` cho thấy nó (`attempt` tăng dần mỗi lần kubelet chạy lại; tuỳ lúc, bạn thấy thêm một dòng `Running` của lần thử đang diễn ra). Log của container đã thoát nói hai điều: nó thử nối tới `127.0.0.1:2389` nhiều lần và bị từ chối, rồi bỏ cuộc vì không có etcd. Hai lệnh `grep` cuối đặt hai sự thật cạnh nhau: API server được bảo tìm etcd ở cổng `2389`, còn etcd nghe ở `2379`. Một chữ số sai trong manifest. Số lần thử và số dòng trong file trên máy bạn có thể khác.
+
+Sửa file; kubelet thấy manifest đổi và tạo lại pod:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+sudo sed -i 's|:2389|:2379|' /etc/kubernetes/manifests/kube-apiserver.yaml
+until kubectl get --raw /readyz > /dev/null 2>&1; do sleep 2; done
+kubectl get nodes
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME          STATUS   ROLES           AGE   VERSION
+lima-k4-cp1   Ready    control-plane   49m   v1.37.1
+lima-k4-w1    Ready    <none>          26m   v1.37.1
+```
+
+</Expected>
+
+Cụm lên lại sau 15 tới 30 giây. Đối chiếu với câu chuyện NRE Labs: người vận hành ở đó cũng đứng trước một API server "connection refused" trên cụm kubeadm một control plane, và mọi câu trả lời cũng nằm trong `ps -a` và log của container đã thoát.
+
+<Check id="d13.7.lab-static-pod">Khi `kubectl` báo `connection refused`, lên được máy control plane, dùng `crictl ps -a` và `crictl logs` tìm ra nguyên nhân static pod không chạy, sửa manifest và xác nhận cụm hồi phục.</Check>
+
+### 4. Pod mới không lên trên một node
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-w1 sudo bash -s 4 < pha.sh
+```
+
+</Terminal>
+
+Mọi thứ trông bình thường: node `Ready`, pod cũ chạy. Lỗi chỉ lộ khi có pod **mới** trên node đó:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl run thu --image=busybox:1.38.0 --overrides='{"spec":{"nodeName":"lima-k4-w1"}}' -- sleep 3600
+until kubectl get events --field-selector involvedObject.name=thu,type=Warning -o name | grep -q .; do sleep 2; done
+sleep 3; kubectl get nodes --no-headers | awk '{print $1, $2}'
+kubectl get pod thu -o wide --no-headers | cut -c1-80
+kubectl get events --field-selector involvedObject.name=thu,type=Warning -o jsonpath='{.items[-1].reason}{": "}{.items[-1].message}{"\n"}' | cut -c1-330
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/thu created
+lima-k4-cp1 Ready
+lima-k4-w1 Ready
+thu   0/1   ContainerCreating   0     4s    <none>   lima-k4-w1
+FailedCreatePodSandBox: Failed to create pod sandbox: rpc error: code = Unknown desc = failed to setup network for sandbox "7359ffee0b828cf1f64f390bc32198dcb11e6e484edb67c9c5df8786424a8953": plugin type="flannel" failed (add): failed to load flannel 'subnet.env' file: open /run/flannel/subnet.env: no such file or directory. Check the flannel pod log for this node.
+```
+
+</Expected>
+
+`FailedCreatePodSandBox` cùng `failed to setup network` là chữ ký của lỗi CNI, và thông báo chỉ thẳng vào file thiếu: `/run/flannel/subnet.env`, file mà K4.1 đã cho bạn xem. Node vẫn `Ready` vì file cấu hình CNI trong `/etc/cni/net.d` còn nguyên; kubelet chỉ kiểm sự có mặt của cấu hình, không kiểm plugin chạy được hay không. Đây là kiểu hỏng "node khoẻ, pod mới không lên, pod cũ không sao" mà dashboard node không cho thấy.
+
+Ai tạo ra file đó? Pod Flannel của node, lúc nó khởi động. Vậy cách sửa là cho pod ấy chạy lại:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl -n kube-flannel get pods --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName
+kubectl -n kube-flannel delete pod --field-selector spec.nodeName=lima-k4-w1
+kubectl wait --for=condition=Ready pod/thu --timeout=120s
+kubectl delete pod thu --now
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kube-flannel-ds-6rf9z   Running   lima-k4-cp1
+kube-flannel-ds-9p8mc   Running   lima-k4-w1
+pod "kube-flannel-ds-9p8mc" deleted from kube-flannel namespace
+pod/thu condition met
+pod "thu" deleted from default namespace
+```
+
+</Expected>
+
+Pod Flannel trên `k4-w1` vẫn `Running` suốt lúc lỗi: nó chỉ ghi `subnet.env` một lần khi khởi động và không biết file đã mất. DaemonSet tạo pod thay, pod mới ghi lại file, và kubelet (vốn đang thử lại tạo sandbox) thành công ở lần thử kế. `/run` là thư mục trong bộ nhớ, mất sau mỗi lần khởi động lại máy; trên thực tế file này biến mất khi có thứ dọn `/run`, hoặc khi pod Flannel chưa kịp chạy sau lúc máy lên. Lúc soạn bài, đúng thông báo này cũng hiện trong event của pod ở vài giây đầu sau khi một worker khởi động lại.
+
+<Check id="d13.7.lab-cni">Nhận ra được lỗi CNI từ event `FailedCreatePodSandBox` của một pod kẹt ở `ContainerCreating`, giải thích được vì sao node vẫn `Ready`, và sửa được bằng cách cho pod CNI của đúng node đó chạy lại.</Check>
+
+### 5. Tên không phân giải
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-cp1 sudo bash -s 5 < pha.sh
+```
+
+</Terminal>
+
+Lệnh tiêm chờ thêm 6 giây ở cuối: pod CoreDNS cũ còn trả lời khoảng 5 giây sau khi nhận lệnh dừng (`lameduck 5s` trong Corefile), và thử ngay trong lúc đó thì chưa thấy lỗi. Triệu chứng người dùng báo: "ứng dụng không gọi được API bên ngoài". Dựng một pod thử và làm phép thử hai tên:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl run dns --image=busybox:1.38.0 --restart=Never -- sleep 3600
+kubectl wait --for=condition=Ready pod/dns --timeout=120s
+kubectl exec dns -- cat /etc/resolv.conf
+kubectl exec dns -- nslookup -type=a web.default.svc.cluster.local > /dev/null 2>&1 && echo "ten trong cum: duoc" || echo "ten trong cum: KHONG"
+kubectl exec dns -- nslookup -type=a kubernetes.io > /dev/null 2>&1 && echo "ten ngoai cum: duoc" || echo "ten ngoai cum: KHONG"
+```
+
+</Terminal>
+
+<Predict question="Tên trong cụm phân giải được, tên ngoài cụm thì không. Mắt xích nào hỏng?">
+
+```text
+pod/dns created
+pod/dns condition met
+search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+ten trong cum: duoc
+ten ngoai cum: KHONG
+```
+
+Theo bảng ở phần Kiến thức: pod tới được `10.96.0.10`, Service `kube-dns` có endpoint, CoreDNS sống và trả lời được tên của cụm. Thứ hỏng nằm **sau** CoreDNS: đường nó hỏi tiếp lên DNS phía trên. Hai dòng `echo` dựa vào mã thoát của `nslookup`; bỏ phần `> /dev/null …` để đọc thông báo đầy đủ.
+
+</Predict>
+
+Xác nhận từng mắt xích, rồi đọc log và cấu hình của CoreDNS:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl -n kube-system get endpointslices -l k8s-app=kube-dns --no-headers | awk '{print $1, $4}'
+kubectl -n kube-system logs -l k8s-app=kube-dns --tail=50 | grep -o -E '>[0-9.]+:53: i/o timeout' | sort | uniq -c
+kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' | grep -A 2 forward
+grep nameserver /run/systemd/resolve/resolv.conf
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kube-dns-zxpcd 10.244.1.33,10.244.1.32
+      9 >192.0.2.53:53: i/o timeout
+    forward . 192.0.2.53 {
+       max_concurrent 1000
+    }
+nameserver 192.168.104.2
+```
+
+</Expected>
+
+Log của CoreDNS đầy những lần nó gửi truy vấn tới `192.0.2.53` cổng 53 rồi hết giờ chờ; Corefile xác nhận có người đã đặt địa chỉ đó vào `forward`. Dòng cuối là DNS thật của node: mặc định CoreDNS của kubeadm có `forward . /etc/resolv.conf`, tức dùng chính DNS của node nó chạy trên. Địa chỉ IP của pod CoreDNS và số dòng log trên máy bạn sẽ khác.
+
+Sửa ConfigMap về mặc định, chạy lại CoreDNS, rồi thử lại. Vòng `until` thử lại vì ngay sau khi CoreDNS được thay, vài truy vấn đầu của pod có thể còn rơi vào pod CoreDNS cũ:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl -n kube-system get configmap coredns -o yaml | sed 's|forward . 192.0.2.53|forward . /etc/resolv.conf|' | kubectl apply -f - 2>&1 | grep -v Warning
+kubectl -n kube-system rollout restart deployment/coredns
+kubectl -n kube-system rollout status deployment/coredns --timeout=120s | tail -1
+until kubectl exec dns -- nslookup -type=a kubernetes.io > /dev/null 2>&1; do sleep 2; done
+kubectl exec dns -- nslookup -type=a kubernetes.io 2>&1 | grep -c "^Address: "
+kubectl delete pod dns --now
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/coredns configured
+deployment.apps/coredns restarted
+deployment "coredns" successfully rolled out
+2
+pod "dns" deleted from default namespace
+```
+
+</Expected>
+
+Dòng `2` là số địa chỉ `kubernetes.io` trả về (có thể khác theo thời điểm, miễn lớn hơn 0); lab cần VM ra được Internet ở bước này.
+
+<Check id="d13.7.lab-dns">Dùng được phép thử tên trong cụm và tên ngoài cụm từ một pod để khoanh lỗi DNS, kiểm được endpoint của `kube-dns`, đọc được log và Corefile của CoreDNS để tìm nguyên nhân, và sửa được.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `pha.sh` in `dung: pha.sh 1..5`: thiếu số lỗi sau `-s`, ví dụ `sudo bash -s 2 < pha.sh`.
+- Ở bước 1, `kubectl wait --for=condition=Ready=false` hết giờ: containerd đã được chạy lại (bạn hoặc một lần tiêm trước). `limactl shell k4-w1 systemctl is-active containerd`.
+- Sau bước 1 hoặc 2, node `Ready` nhưng `web` chỉ còn một bản sao sẵn sàng: nếu bạn để lỗi quá khoảng 6 phút, pod trên node đã bị dời. `kubectl rollout restart deploy/web`.
+- Ở bước 3, API server không lên lại sau khi sửa: kubelet đang giãn thời gian thử lại (tối đa 5 phút). `sudo systemctl restart kubelet` trên `k4-cp1`.
+- Ở bước 3, `crictl logs` báo `ID cannot be empty`: đúng lúc đó không có container nào của API server (đang giữa hai lần thử). Chạy lại lệnh.
+- Ở bước 5, cả tên trong cụm cũng không phân giải được: CoreDNS chưa chạy xong sau lần tiêm. `kubectl -n kube-system get pods -l k8s-app=kube-dns`.
+- Muốn đưa mọi thứ về trạng thái tốt mà không nhớ đang ở bước nào: `sudo systemctl start containerd` và `sudo kubeadm upgrade node phase kubelet-config && sudo systemctl restart kubelet` trên `k4-w1`; lệnh `sed` của bước 3 trên `k4-cp1`; xoá pod Flannel của `k4-w1`; lệnh sửa ConfigMap của bước 5.
+
+</Callout>
+
+### Dọn dẹp
+
+Mỗi bước đã tự sửa lỗi của nó. Kiểm lần cuối rằng cụm sạch:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl get nodes
+kubectl get pods -A --no-headers | grep -v -E "Running|Completed|Terminating" | wc -l
+kubectl delete pod thu dns --ignore-not-found --now
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME          STATUS   ROLES           AGE   VERSION
+lima-k4-cp1   Ready    control-plane   51m   v1.37.1
+lima-k4-w1    Ready    <none>          28m   v1.37.1
+0
+```
+
+</Expected>
+
+Cuối buổi học: `limactl stop k4-w1` rồi `limactl stop k4-cp1` trên Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Node NotReady rồi Ready rồi lại NotReady, cứ vài phút một lần. Tìm ở đâu?">
+
+Node "chập chờn" thường là kubelet còn sống nhưng không kịp báo cáo. Ba hướng: (1) kubelet bận hoặc bị treo vì runtime chậm, tìm chữ `PLEG is not healthy` trong `journalctl -u kubelet`: kubelet định kỳ hỏi runtime danh sách container, runtime trả lời quá chậm thì kubelet tự báo `NotReady`; nguyên nhân phía sau thường là đĩa chậm hoặc quá nhiều container chết đi sống lại. (2) Node cạn tài nguyên: condition `MemoryPressure`, `DiskPressure`, và `dmesg` có `Out of memory: Killed process` (D1.4). (3) Đường mạng tới API server chập chờn: Lease của node (`kubectl -n kube-node-lease get lease <node> -o yaml`, trường `renewTime`) không được gia hạn đều. Đặt `renewTime` cạnh log của kubelet cùng thời điểm là biết kubelet không gửi, hay gửi mà không tới.
+
+</Reveal>
+
+<Reveal title="API server chết thì đọc event và log ở đâu?">
+
+Event nằm trong etcd, sau API server, nên không đọc được. Còn lại là những thứ nằm trên đĩa của node: `journalctl -u kubelet` (kubelet ghi lại mọi việc nó định báo lên, kể cả những event không gửi được), `/var/log/pods/<namespace>_<pod>_<uid>/<container>/<số lần chạy>.log` (log của mọi container, kể cả lần chạy trước), và `crictl logs`. Vì vậy hệ thống thu log (D12.5) phải lấy log từ **đĩa của node**, không phải qua API server, và phải gồm cả journal của kubelet và containerd: lúc cần nhất là lúc API server không còn.
+
+</Reveal>
+
+<Reveal title="Vì sao không khởi động lại máy cho nhanh?">
+
+Vì ba lẽ, và cả ba đều có trong các sự cố chặng này đã kể. Khởi động lại xoá bằng chứng: container đã thoát và log của nó, trạng thái trong `/run`, bộ đếm `RESTARTS`. Nó có thể biến sự cố nhẹ thành nặng: với chứng chỉ hết hạn (K4.5), các kết nối đang mở là thứ duy nhất còn giữ cụm chạy. Và nó không chữa nguyên nhân nằm trong cấu hình: manifest sai, file cấu hình kubelet sai, cờ không hợp lệ sẽ hỏng lại y như cũ, như ở NRE Labs. Khởi động lại là một lựa chọn hợp lý **sau khi** đã đọc log và có giả thuyết rằng trạng thái trong bộ nhớ là thứ hỏng; khi đó hãy khởi động lại đúng thứ đó (một dịch vụ, một pod), không phải cả máy.
+
+</Reveal>
+
+<Reveal title="Trên EKS, GKE tôi không SSH được vào control plane. Bài này còn dùng được gì?">
+
+Một nửa. Tầng 3 (static pod của control plane) là việc của nhà cung cấp; bạn chỉ thấy nó qua log control plane mà dịch vụ xuất ra (phải bật) và trang trạng thái của họ. Nhưng node vẫn là của bạn: kubelet, containerd, CNI, DNS hỏng y như bước 1, 2, 4, 5, và bạn vào node bằng SSH, bằng công cụ của cloud, hoặc bằng `kubectl debug node/<tên> -it --image=busybox`, lệnh tạo một pod đặc quyền gắn hệ thống file của node vào `/host` (dùng được khi kubelet và runtime của node đó còn sống). Thứ tự kiểm năm bước và bảng condition của node không đổi.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Dán cho AI nguyên văn một thông báo lỗi kèm ngữ cảnh (lệnh nào, trên máy nào, vừa thay đổi gì) và hỏi các nguyên nhân có thể, xếp theo khả năng; hoặc nhờ nó giải thích một đoạn log của kubelet. AI hay nhảy tới cách sửa phá huỷ: `kubeadm reset`, xoá `/var/lib/kubelet`, `kubectl delete pod --force --grace-period=0`, `systemctl restart` mọi thứ; và hay đoán nguyên nhân phổ biến nhất thay vì hỏi thêm bằng chứng. Nó cũng hay gợi ý `docker ps` trên node (node dùng containerd, lệnh đúng là `crictl ps`). Quy tắc khi làm cùng AI lúc có sự cố: nó đề xuất lệnh **đọc**, bạn chạy và đưa lại output; lệnh **ghi** chỉ chạy khi bạn hiểu nó sửa gì và lui thế nào.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.1 dạy systemd và journald; D1.4 dạy chẩn đoán máy (bộ nhớ, đĩa, `dmesg`); K1.1 dạy event và trạng thái pod; K2.1 dạy Service và DNS; K2.4 dạy NetworkPolicy, nghi phạm khác khi pod không gọi được nhau. K4.1 là nơi bạn dựng từng thứ bài này làm hỏng; K4.4 cho thấy hai mốc 40 tới 50 giây và 6 phút của node chết; K4.5 là kiểu hỏng "mọi thứ `Running` mà cụm bị khoá". K6 chẩn đoán mạng sâu hơn với Cilium và Hubble. D12 thu log và metric để lần sau khỏi phải SSH; D17 dạy điều phối sự cố và viết postmortem.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d13.7.mastery-method">Trước một cụm có triệu chứng lạ, áp được thứ tự kiểm năm bước và nói được ở mỗi bước mình đang loại trừ điều gì, thay vì thử các cách sửa.</Check>
+
+<Check id="d13.7.mastery-node">Với một node `NotReady` bất kỳ, xác định được trong vài phút nguyên nhân nằm ở máy, kubelet, runtime hay CNI, kèm bằng chứng từ condition và log.</Check>
+
+<Check id="d13.7.mastery-no-api">Khi API server không trả lời, tìm được nguyên nhân chỉ bằng công cụ trên node (`crictl`, `journalctl`, file manifest), sửa được, và giữ lại được bằng chứng cho postmortem.</Check>
+
+</Mastery>

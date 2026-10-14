@@ -1,0 +1,542 @@
+---
+title: "Vòng đời node: drain, vá, khởi động lại, thay node"
+description: Rút một node khỏi cụm đúng cách bằng cordon và drain, thấy PodDisruptionBudget chặn một lần drain, đo số request rớt khi tắt node không báo trước so với khi drain trước, rồi vá hệ điều hành, khởi động lại và thay một node trong lúc ứng dụng vẫn phục vụ.
+id: d13.4
+step: d13
+prerequisites: [d13.3]
+topics: [d13.vong-doi-node]
+status: verified
+verified:
+  date: 2026-10-13
+  os: Ubuntu 26.04 LTS (hai VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    kubernetes: 1.37.1
+    kubeadm: 1.37.1
+    containerd: 2.2.2
+    flannel: 0.28.10
+    agnhost: "2.66.1"
+---
+
+<Goal>
+
+Node của một cụm tự dựng được vá hệ điều hành hằng tháng, khởi động lại, và sớm muộn bị thay. Học xong bài này, bạn giải thích được:
+
+- `cordon`, `drain` và PodDisruptionBudget làm gì, và vì sao một lệnh `drain` có thể đứng mãi.
+- Vì sao tắt một node không drain làm rớt request trong 40 tới 50 giây, còn drain trước thì không.
+- Sau khi máy khởi động lại, lúc nào node mới thật sự quay lại, và vì sao cột `Ready` chưa đủ để biết.
+- Vá tại chỗ và thay node bằng image mới khác nhau ở đâu, và pod có tự về node mới không.
+
+</Goal>
+
+<Knowledge>
+
+### Rút node có kế hoạch: cordon, drain, PodDisruptionBudget
+
+Bài tự đủ cho phần này; K5.2 đi sâu hơn (topology spread, các cấu hình làm drain treo, preemption).
+
+- **`kubectl cordon <node>`** đánh dấu node là không nhận pod mới (`SchedulingDisabled`). Pod đang chạy trên đó không bị đụng tới.
+- **`kubectl drain <node>`** làm `cordon` rồi rút từng pod trên node. Nó không xoá pod trực tiếp mà gọi **Eviction API**: "xin hãy rút pod này". Pod được rút theo trình tự tắt êm (K1.3): gỡ khỏi endpoint của Service, nhận `SIGTERM`, có thời gian kết thúc việc dở; controller của nó tạo pod thay ở node khác. Pod của DaemonSet và static pod thì ở lại, vì chúng thuộc về chính node đó (`--ignore-daemonsets`).
+- **PodDisruptionBudget (PDB)** là lời khai của chủ ứng dụng: trong các pod khớp `selector`, lúc nào cũng phải còn ít nhất `minAvailable` pod sẵn sàng (hoặc vắng tối đa `maxUnavailable`). Mỗi lần có yêu cầu rút pod, API server tính xem rút xong còn đủ không; không đủ thì từ chối.
+- **`kubectl uncordon <node>`** bỏ đánh dấu. `drain` xong không tự `uncordon`: node ở trạng thái `SchedulingDisabled` cho tới khi bạn mở lại.
+
+```text
+ kubectl drain <node>
+   1. cordon
+   2. với mỗi pod (trừ pod DaemonSet, static pod):  xin rút qua Eviction API
+        PDB còn cho phép  →  pod tắt êm, pod thay được tạo ở node khác
+        PDB không cho     →  API server từ chối; drain chờ 5 giây rồi xin lại, không giới hạn số lần
+   3. hết pod: "node/<node> drained"
+```
+
+Dòng "không giới hạn số lần" là lý do `drain` có thể đứng mãi: một PDB không bao giờ thoả (ứng dụng một bản sao với `minAvailable: 1`, hoặc pod thay không có chỗ để chạy) thì lệnh xin lại cho tới khi bạn can thiệp. Và PDB chỉ đứng ở Eviction API: `kubectl delete pod`, hay một node chết, đi vòng qua nó.
+
+<Check id="d13.4.drain">Kể được `cordon`, `drain`, `uncordon` làm gì, drain rút pod qua đâu và bỏ qua loại pod nào, PDB chặn một lần rút khi nào, và vì sao drain có thể treo.</Check>
+
+### Node biến mất không báo trước
+
+```text
+ t = 0           node tắt (mất điện, kernel panic, ai đó tắt nhầm)
+                 API server chưa biết gì: node vẫn Ready, pod trên đó vẫn là endpoint của Service
+                 kube-proxy ở các node khác vẫn chia request cho pod đã chết  → lỗi, timeout
+ t ≈ 40–50 giây  node controller không thấy node gia hạn Lease quá node-monitor-grace-period (mặc định 50 giây)
+                 → node NotReady, pod trên đó bị gỡ khỏi endpoint                → hết lỗi
+ t ≈ 6 phút      thêm 300 giây toleration mặc định của pod → pod bị xoá, controller tạo pod thay ở node khác
+```
+
+Hai mốc này là hai cơ chế khác nhau. Mốc thứ nhất cứu **traffic**: pod trên node chết thôi nhận request. Mốc thứ hai cứu **số bản sao**: trong hơn năm phút ở giữa, ứng dụng chạy thiếu bản sao, và nếu chỉ có một bản sao thì nó ngừng hẳn suốt thời gian đó.
+
+Drain trước thì không có khoảng lỗi của mốc thứ nhất: endpoint được gỡ **trước** khi container dừng. Vì vậy mọi thao tác có kế hoạch trên node đi theo một khuôn: drain, làm việc cần làm (nâng kubelet, vá OS, reboot), chờ node thật sự `Ready`, rồi uncordon. Một chi tiết của "chờ node Ready": sau khi máy khởi động lại nhanh, API server còn giữ trạng thái `Ready` **cũ** trong vài chục giây. Kiểm chắc bằng `bootID` của node: giá trị đổi nghĩa là kubelet của lần khởi động mới đã báo về.
+
+<Check id="d13.4.node-chet">Kể được chuyện gì xảy ra với traffic trong 40 tới 50 giây đầu và sau khoảng 6 phút khi một node tắt không báo trước, hai mốc đó do cơ chế nào, và vì sao drain trước loại bỏ được khoảng lỗi.</Check>
+
+### Vá tại chỗ hay thay node
+
+D8.5 đã so hai cách vá cho máy thường; với node Kubernetes, cách thứ hai dễ hơn hẳn vì node không giữ trạng thái gì đáng kể:
+
+| | Vá tại chỗ | Thay node (image bất biến) |
+|---|---|---|
+| Cách làm | drain → `apt upgrade` → reboot → uncordon | Thêm node mới từ image mới (D8.4) → drain node cũ → xoá node cũ |
+| Thời gian thiếu một node | Suốt lúc vá và reboot | Không: node mới vào trước rồi mới rút node cũ |
+| Node sau khi vá có giống nhau không | Lệch dần theo lịch sử từng máy | Giống nhau: cùng sinh từ một image |
+| Lui | Gỡ gói, hoặc không lui được | Giữ image cũ, thay ngược lại |
+| Cần gì | SSH và một playbook theo lô (D8.5) | Hạ tầng tạo máy bằng API và một pipeline nướng image |
+| Hợp với | Máy vật lý ít và cố định | Cloud, ảo hoá; nhóm node của dịch vụ quản lý và Cluster API (K10) làm đúng kiểu này |
+
+Nâng kubelet cũng theo một trong hai cách: tại chỗ như lab, hoặc image mới đã có kubelet mới rồi thay node. Dù cách nào, node rời cụm phải qua `drain`, và node vào cụm phải qua `kubeadm join` với một bootstrap token còn hạn (K4.1).
+
+<Callout kind="production">
+
+Đội phát triển của NU.nl kể lại [một lần cụm của họ hỏng dây chuyền](https://www.tibobeijen.nl/2019/02/01/learning-from-kubernetes-cluster-failure/) (bài đăng 01/02/2019). Nhiều dịch vụ thỉnh thoảng trả trang lỗi, chậm và timeout; Grafana và Prometheus chạy trong chính cụm đó cũng bị như vậy. `kubectl get nodes` cho thấy hai trong tám node `NotReady`, và `describe` một node vẫn đang `Ready` cho thấy các cảnh báo `SystemOOM` xen giữa `NodeNotReady` và `NodeReady`. Worker của họ thuộc một auto-scaling group, nên họ quyết định xoá lần lượt các node `NotReady` để xem node mới có ổn không. Không ổn: node mới lên bình thường, nhưng rồi một số node, cũ hoặc mới, lại nhanh chóng `NotReady`. Việc thay node chỉ giúp được một điều tình cờ: Prometheus và Grafana được xếp lên một node còn ổn, và từ đó họ nhìn ra nguyên nhân là các pod ElastAlert có bộ nhớ tăng mãi sau một luật cảnh báo mới, không có giới hạn tài nguyên. Các việc họ giao sau đó gồm đặt limit và LimitRange, tách công cụ vận hành khỏi workload của khách, và đưa mọi thay đổi qua pipeline thay vì apply tay.
+
+Điều rút ra (của bài này): thay node là thuốc cho **node** hỏng. Khi nguyên nhân nằm ở workload, nó theo pod sang node mới, đúng theo mốc 6 phút ở trên, và làm hỏng tiếp node đó. Trước khi thay node hàng loạt, tìm xem vì sao node `NotReady` (K4.7).
+
+</Callout>
+
+<Check id="d13.4.va-hay-thay">So sánh được vá tại chỗ với thay node theo thời gian thiếu node, độ đồng đều và cách lui; nói được mỗi cách cần hạ tầng gì, và khi nào thay node không chữa được gì.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Safely Drain a Node](https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/): `kubectl drain`, Eviction API và cách xử lý khi eviction bị kẹt.
+- [Disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/): gián đoạn tự nguyện và không tự nguyện, PodDisruptionBudget, và một ví dụ drain từng bước.
+- [Nodes](https://kubernetes.io/docs/concepts/architecture/nodes/): heartbeat qua Lease, node controller và cách nó đánh dấu node hỏng.
+- [Node Shutdowns](https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/): graceful node shutdown và xử lý pod khi node tắt đột ngột.
+- [NU.nl: Maximize learnings from a Kubernetes cluster failure](https://www.tibobeijen.nl/2019/02/01/learning-from-kubernetes-cluster-failure/): bài tường thuật dùng trong callout.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cụm của K4.3 ngay sau khi nâng cấp: `k4-cp1` và `k4-w1` ở 1.37.1, control plane không còn taint, ứng dụng `web` hai bản sao (mỗi node một bản) có PodDisruptionBudget `minAvailable: 1`, và công cụ đo `~/k4/probe.sh`. Mở một terminal vào `k4-cp1` và một terminal trên Mac.
+
+**Profile máy.** Như K4.1: hai VM, mỗi VM 2 CPU và 2 GiB. Cuối bài `free -m` cho thấy control plane dùng khoảng 960 MB, worker khoảng 490 MB. Máy 8 GB làm được nếu tắt Docker Desktop.
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+cd ~/k4
+kubectl get nodes
+kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName --no-headers
+kubectl get pdb web
+ls probe.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME          STATUS   ROLES           AGE    VERSION
+lima-k4-cp1   Ready    control-plane   3h9m   v1.37.1
+lima-k4-w1    Ready    <none>          166m   v1.37.1
+web-5c94dc48c-57nmv   Running   lima-k4-cp1
+web-5c94dc48c-rgqs9   Running   lima-k4-w1
+NAME   MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web    1               N/A               1                     3h1m
+probe.sh
+```
+
+</Expected>
+
+Nếu hai bản sao `web` không nằm trên hai node: `kubectl rollout restart deploy/web`. `ALLOWED DISRUPTIONS 1` nghĩa là lúc này PDB cho phép rút một pod: có hai bản sẵn sàng, cần giữ ít nhất một.
+
+### 1. Cordon, drain, và một lần PDB nói không
+
+<Callout kind="danger">
+
+`kubectl drain` rút mọi pod khỏi node. Chạy `kubectl config current-context` trước và chắc rằng nó in `kubernetes-admin@kubernetes` của cụm lab, không phải cụm của công ty. Điều này áp dụng cho mọi lệnh `drain` trong bài.
+
+</Callout>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl config current-context
+kubectl cordon lima-k4-w1
+kubectl get nodes --no-headers | awk '{print $1, $2}'
+kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName --no-headers
+kubectl drain lima-k4-w1 --ignore-daemonsets --delete-emptydir-data 2>&1 | grep -v "^Warning"
+sleep 5; kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName --no-headers
+kubectl get pdb web
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kubernetes-admin@kubernetes
+node/lima-k4-w1 cordoned
+lima-k4-cp1 Ready
+lima-k4-w1 Ready,SchedulingDisabled
+web-5c94dc48c-57nmv   Running   lima-k4-cp1
+web-5c94dc48c-rgqs9   Running   lima-k4-w1
+node/lima-k4-w1 already cordoned
+evicting pod default/web-5c94dc48c-rgqs9
+pod/web-5c94dc48c-rgqs9 evicted
+node/lima-k4-w1 drained
+web-5c94dc48c-57nmv   Running   lima-k4-cp1
+web-5c94dc48c-hpznf   Pending   <none>
+NAME   MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web    1               N/A               0                     3h1m
+```
+
+</Expected>
+
+`cordon` chỉ đổi một nhãn trạng thái: pod `web` trên `k4-w1` vẫn chạy. `drain` mới rút nó. Bản thay nằm ở `Pending`: ràng buộc trải đều của `web` không cho hai bản sao ở chung một node, và node kia đang đóng cửa. PDB vẫn thoả (còn một bản sẵn sàng) nên drain xong, nhưng giờ `ALLOWED DISRUPTIONS` là `0`: không còn pod nào được phép rút.
+
+Thử rút nốt bản sao còn lại. `--pod-selector` giới hạn lệnh vào pod của `web` để không đụng tới các pod hệ thống trên control plane, và `--timeout` để lệnh không chờ mãi:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl drain lima-k4-cp1 --ignore-daemonsets --pod-selector=app=web --timeout=15s 2>&1 | cut -c1-175
+kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,NODE:.spec.nodeName --no-headers
+kubectl uncordon lima-k4-cp1 lima-k4-w1
+kubectl rollout status deploy/web --timeout=120s | tail -1
+kubectl get pdb web --no-headers | awk '{print "ALLOWED DISRUPTIONS:", $4}'
+```
+
+</Terminal>
+
+<Predict question="web chỉ còn một bản sao sẵn sàng, PDB đòi minAvailable 1. Lệnh drain thứ hai làm gì với pod đó?">
+
+```text
+node/lima-k4-cp1 cordoned
+evicting pod default/web-5c94dc48c-57nmv
+error when evicting pods/"web-5c94dc48c-57nmv" -n "default" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod default/web-5c94dc48c-57nmv
+error when evicting pods/"web-5c94dc48c-57nmv" -n "default" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+…
+error: unable to drain node "lima-k4-cp1" due to error: error when evicting pods/"web-5c94dc48c-57nmv" -n "default": global timeout reached: 15s, continuing command...
+…
+web-5c94dc48c-57nmv   Running   lima-k4-cp1
+web-5c94dc48c-hpznf   Pending   <none>
+node/lima-k4-cp1 uncordoned
+node/lima-k4-w1 uncordoned
+deployment "web" successfully rolled out
+ALLOWED DISRUPTIONS: 1
+```
+
+Không làm gì được. API server từ chối yêu cầu rút với lý do vi phạm PodDisruptionBudget, `drain` xin lại mỗi 5 giây, và sau 15 giây thì bỏ cuộc vì `--timeout`; không có `--timeout` nó sẽ xin mãi. Pod vẫn `Running`. Để ý node `k4-cp1` đã bị `cordon` trước khi lệnh thất bại: drain dở dang để lại node đóng cửa, nên phải `uncordon` cả hai. Vừa mở cửa, bản sao đang `Pending` có chỗ chạy và PDB lại cho phép rút một pod.
+
+</Predict>
+
+Đây là cơ chế giữ cho hai người (hoặc một người và một bộ tự động) cùng bảo trì hai node không vô tình tắt hết ứng dụng. Nó cũng là lý do trước mỗi đợt bảo trì nên chạy `kubectl get pdb -A` và tìm cột `ALLOWED DISRUPTIONS` bằng `0`.
+
+<Check id="d13.4.lab-drain">Phân biệt được bằng thực nghiệm `cordon` với `drain`, tái hiện được một lần drain bị PodDisruptionBudget từ chối, và giải thích được vì sao node bị bỏ lại ở trạng thái `SchedulingDisabled`.</Check>
+
+### 2. Tắt node không drain
+
+Giờ là cách sai, để có con số so sánh. Chờ `web` đủ hai bản sao, bật đo, rồi tắt VM của worker mà không drain, như khi ai đó `shutdown` nhầm máy:
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+kubectl get pods -l app=web -o wide | cut -c1-90
+./probe.sh start
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Lệnh dưới tắt VM `k4-w1` trong lúc nó đang phục vụ: một phần request tới `web` sẽ lỗi trong 40 tới 50 giây. Đó là điều bước này muốn đo; chỉ làm trên cụm lab.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+limactl stop k4-w1
+```
+
+</Terminal>
+
+
+Khối dưới in trạng thái node và endpoint của `web` mỗi 10 giây trong một phút, rồi dừng đo:
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+for i in 1 2 3 4 5 6; do
+  sleep 10
+  echo "$(date +%T) $(kubectl get node lima-k4-w1 --no-headers | awk '{print $2}')" \
+    "$(kubectl get endpointslices -l kubernetes.io/service-name=web -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}={.conditions.ready} {end}')"
+done
+./probe.sh stop
+```
+
+</Terminal>
+
+<Predict question="Máy worker đã tắt hẳn. Request đi qua NodePort của k4-cp1 có lỗi không, và lỗi trong bao lâu?">
+
+```text
+04:04:02 Ready 10.244.0.7=true 10.244.1.11=true
+04:04:12 Ready 10.244.0.7=true 10.244.1.11=true
+04:04:22 Ready 10.244.0.7=true 10.244.1.11=true
+04:04:32 Ready 10.244.0.7=true 10.244.1.11=true
+04:04:42 NotReady 10.244.0.7=true 10.244.1.11=false
+04:04:52 NotReady 10.244.0.7=true 10.244.1.11=false
+api         tong=349   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-cp1 tong=188   loi=37   so_lan_gian_doan=15 dai_nhat=7.3 giay
+web-qua-w1  tong=72    loi=68   so_lan_gian_doan=1 dai_nhat=74.5 giay
+```
+
+Có, trong khoảng 40 tới 50 giây. Máy đã chết nhưng cụm chưa biết: node vẫn `Ready`, pod `10.244.1.11` vẫn là endpoint sẵn sàng, và kube-proxy trên `k4-cp1` vẫn chia cho nó khoảng một nửa số request. Mỗi request đó chờ hết 1 giây rồi lỗi. Chỉ khi node controller đánh dấu `NotReady` (thông số `--node-monitor-grace-period` của controller manager) thì endpoint mới bị gỡ và lỗi mới hết. `web-qua-w1` thì lỗi suốt: không có gì đứng trước NodePort của một máy đã tắt để chuyển sang máy khác; đó là việc của load balancer (K4.6). Số request lỗi trên máy bạn sẽ khác, khoảng thời gian thì xấp xỉ.
+
+</Predict>
+
+<Check id="d13.4.lab-no-drain">Đo được số request lỗi và thời gian lỗi khi một node tắt không drain, và chỉ ra được qua endpoint của Service lúc nào cụm mới nhận ra node đã chết.</Check>
+
+Bật lại worker:
+
+<Terminal where="mac">
+
+```bash
+limactl start k4-w1
+```
+
+</Terminal>
+
+### 3. Drain, vá, khởi động lại
+
+Giờ làm đúng: chờ `web` đủ hai bản sao, rồi drain, vá, khởi động lại, chờ node thật sự quay lại, uncordon. Ghi lại `bootID` trước khi tắt máy để biết chắc lúc nào kubelet của lần khởi động mới đã báo về:
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+kubectl wait --for=condition=Ready node/lima-k4-w1 --timeout=180s
+sleep 20; kubectl rollout status deploy/web --timeout=180s | tail -1
+kubectl get node lima-k4-w1 -o jsonpath='{.status.nodeInfo.bootID}' > bootid.truoc
+./probe.sh start
+kubectl drain lima-k4-w1 --ignore-daemonsets --delete-emptydir-data 2>&1 | grep -v "^Warning"
+```
+
+</Terminal>
+
+<Terminal where="mac">
+
+```bash
+limactl shell k4-w1 bash -c 'sudo apt-get update -qq; apt list --upgradable 2>/dev/null | grep -c upgradable; apt-mark showhold | tr "\n" " "; echo'
+limactl shell k4-w1 sudo sh -c 'DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUPPRESS=1 apt-get -y -qq upgrade > /dev/null 2>&1; ls /var/run/reboot-required'
+limactl stop k4-w1
+limactl start k4-w1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+177
+kubeadm kubectl kubelet
+/var/run/reboot-required
+…
+```
+
+</Expected>
+
+Số gói chờ nâng tuỳ ngày bạn làm lab. Ba gói Kubernetes đang `hold` nên `apt upgrade` không đụng tới chúng. File `/var/run/reboot-required` là cách Ubuntu báo bản vá vừa cài cần khởi động lại mới có hiệu lực (D8.5).
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+until [ "$(kubectl get node lima-k4-w1 -o jsonpath='{.status.nodeInfo.bootID}')" != "$(cat bootid.truoc)" ]; do sleep 2; done
+kubectl wait --for=condition=Ready node/lima-k4-w1 --timeout=120s
+kubectl uncordon lima-k4-w1
+kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 5; ./probe.sh stop
+kubectl get nodes -o custom-columns=NAME:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion,OS:.status.nodeInfo.osImage
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-w1 condition met
+node/lima-k4-w1 uncordoned
+deployment "web" successfully rolled out
+api         tong=651   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-cp1 tong=665   loi=1    so_lan_gian_doan=1 dai_nhat=1.2 giay
+web-qua-w1  tong=644   loi=77   so_lan_gian_doan=1 dai_nhat=21.3 giay
+NAME          KUBELET   OS
+lima-k4-cp1   v1.37.1   Ubuntu 26.04 LTS
+lima-k4-w1    v1.37.1   Ubuntu 26.04.1 LTS
+```
+
+</Expected>
+
+Qua `k4-cp1`, worker được vá và khởi động lại mà gần như không ai thấy: nhờ drain, endpoint trên worker được gỡ trước khi máy tắt. Các lượt chạy cho 0 tới 2 request lỗi lẻ (mỗi cái là một lần gọi quá 1 giây, không trùng lúc máy tắt; bài chưa xác định chắc nguyên nhân), so với ba mươi mấy request lỗi suốt 40 tới 50 giây khi không drain. `web-qua-w1` lỗi đúng trong lúc máy tắt, như mọi địa chỉ gắn với một máy. Cột `OS` cho thấy hai node giờ lệch nhau một bản vá; vá tại chỗ luôn có giai đoạn như vậy, và nếu dừng giữa chừng thì độ lệch ở lại.
+
+<Check id="d13.4.lab-reboot">Vá và khởi động lại được một node theo khuôn drain, vá, chờ `bootID` đổi, uncordon; và dùng số đo so được với lần tắt node không drain.</Check>
+
+### 4. Thay node
+
+Cách thứ hai trong bảng "vá tại chỗ hay thay node": bỏ node cũ, đưa node mới vào. Hạ tầng thật sẽ tạo một máy mới từ image mới; lab giả lập bằng cách xoá sạch dấu vết Kubernetes trên `k4-w1` rồi cho nó join lại như một máy lạ.
+
+<Callout kind="danger">
+
+`kubectl delete node` xoá node khỏi cụm, và `kubeadm reset` xoá mọi cấu hình Kubernetes trên máy chạy nó. Chạy `reset` nhầm trên control plane duy nhất là mất cụm. Khối lệnh thứ hai dưới đây chỉ được chạy với `k4-w1`.
+
+</Callout>
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+./probe.sh start
+kubectl drain lima-k4-w1 --ignore-daemonsets --delete-emptydir-data 2>&1 | grep -v "^Warning"
+kubectl delete node lima-k4-w1
+```
+
+</Terminal>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-w1 sudo kubeadm reset --force 2>&1 | grep -E "^\[reset\] (Stopping|Deleting contents)"
+limactl shell k4-cp1 sudo kubeadm token create --ttl 15m --print-join-command > join.sh
+limactl shell k4-w1 sudo bash -s < join.sh | grep "joined"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[reset] Stopping the kubelet service
+[reset] Deleting contents of directories: [/etc/kubernetes/manifests /var/lib/kubelet /etc/kubernetes/pki]
+This node has joined the cluster:
+```
+
+</Expected>
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+kubectl wait --for=condition=Ready node/lima-k4-w1 --timeout=180s
+sleep 5; ./probe.sh stop
+kubectl get nodes
+kubectl get pods -l app=web -o wide | cut -c1-90
+kubectl rollout restart deploy/web
+kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 8; kubectl get pods -l app=web -o wide | cut -c1-90
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-w1 condition met
+api         tong=63    loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-cp1 tong=65    loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-w1  tong=37    loi=6    so_lan_gian_doan=1 dai_nhat=7.3 giay
+NAME          STATUS   ROLES           AGE   VERSION
+lima-k4-cp1   Ready    control-plane   22m   v1.37.1
+lima-k4-w1    Ready    <none>          6s    v1.37.1
+NAME                   READY   STATUS    RESTARTS   AGE     IP            NODE
+web-7785fd4784-jllpm   1/1     Running   0          14s     10.244.0.10   lima-k4-cp1
+web-7785fd4784-nl7ns   1/1     Running   0          6m49s   10.244.0.7    lima-k4-cp1
+deployment.apps/web restarted
+deployment "web" successfully rolled out
+NAME                   READY   STATUS    RESTARTS   AGE   IP            NODE
+web-679644b85b-4cjqq   1/1     Running   0          9s    10.244.0.12   lima-k4-cp1
+web-679644b85b-bdndb   1/1     Running   0          10s   10.244.1.17   lima-k4-w1
+```
+
+</Expected>
+
+`AGE` của `k4-w1` là vài giây: với cụm, đây là một node mới. `web-qua-w1` có vài request lỗi: `kubeadm reset` dừng kubelet và mọi container trên máy đó, kể cả kube-proxy, nên NodePort của `k4-w1` không trả lời cho tới khi node join lại; qua `k4-cp1` thì không lỗi nào. Hai điều nữa lab cho thấy:
+
+- Khi node cũ bị **xoá** khỏi cụm (khác với chỉ cordon), cụm chỉ còn một node nên ràng buộc trải đều cho phép cả hai bản sao `web` nằm ở `k4-cp1`. Node mới vào thì **không ai dời pod về**: scheduler chỉ xếp pod mới (K5.1). `rollout restart` tạo pod mới và chúng trải lại ra hai node (`sleep 8` chờ pod cũ dừng hẳn). Bài dừng ở lệnh này; cụm lớn dùng Descheduler cho việc đó.
+- `kubeadm reset` không dọn cấu hình CNI và luật mạng trên máy (chính nó nói vậy trong output đầy đủ). Một máy thay từ image mới thì không mang theo thứ gì cũ; đó là lợi thế của thay node so với dùng lại máy.
+
+<Check id="d13.4.lab-replace">Thay được một worker: drain, xoá node, cho máy join lại bằng token mới; và giải thích được vì sao pod không tự về node mới.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `./probe.sh: No such file or directory`: công cụ đo được tạo ở phần Chuẩn bị của K4.3; chạy lại khối lệnh đó.
+- `kubectl drain` đứng ở `Cannot evict pod as it would violate the pod's disruption budget` ngoài bước 1: `web` đang chỉ có một bản sao sẵn sàng (thường do bước trước chưa `uncordon`). `kubectl get pods -l app=web -o wide`, sửa nguyên nhân, drain tự đi tiếp.
+- Một bản sao `web` nằm `Pending` mãi sau `uncordon`: `kubectl describe pod` xem scheduler nói gì; hay gặp là node kia còn `SchedulingDisabled` (`kubectl get nodes`).
+- Ở bước 3, vòng chờ `bootID` không kết thúc: VM chưa lên lại (`limactl list`), hoặc kubelet trên `k4-w1` không khởi động (`limactl shell k4-w1 systemctl status kubelet`; K4.7 dạy cách lần tiếp).
+- Ở bước 4, `kubeadm join` báo token không hợp lệ: token trong `join.sh` chỉ sống 15 phút; chạy lại khối lệnh trên Mac.
+- Sau bước 4, node `k4-w1` `NotReady` quá hai phút: pod Flannel trên node mới chưa chạy xong; `kubectl -n kube-flannel get pods -o wide`.
+
+</Callout>
+
+### Dọn dẹp
+
+Cụm này dùng tiếp ở K4.5, K4.6 và K4.7 cùng ứng dụng `web`; chỉ dọn file đo.
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+rm -rf ~/k4/probe ~/k4/bootid.truoc
+kubectl get nodes
+kubectl get pods -l app=web --no-headers | wc -l
+```
+
+</Terminal>
+
+Hai node `Ready` ở `v1.37.1` và dòng cuối in `2` là cụm sẵn sàng cho bài sau. Cuối buổi học: `limactl stop k4-w1` rồi `limactl stop k4-cp1` trên Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Sáu phút mới dời pod khỏi node chết là lâu. Rút ngắn được không?">
+
+Được, ở hai chỗ, và cả hai đều có giá. Mốc thứ nhất là `--node-monitor-grace-period` của controller manager: giảm nó thì node chết được nhận ra sớm hơn, nhưng một lần mạng chập chờn vài chục giây cũng đủ làm node khoẻ bị coi là chết. Mốc thứ hai nằm ở từng pod: Kubernetes tự gắn cho mỗi pod hai toleration với `tolerationSeconds: 300` cho taint `not-ready` và `unreachable`; bạn khai lại chúng trong pod template với con số nhỏ hơn cho những ứng dụng cần được dời nhanh. Dời nhanh quá thì một node chỉ tạm mất liên lạc sẽ kéo theo một đợt tạo pod lớn ở các node khác, đúng kiểu dây chuyền trong callout. Với ứng dụng không trạng thái, cách chắc hơn là chạy đủ bản sao trên nhiều node để không cần được dời nhanh.
+
+</Reveal>
+
+<Reveal title="Máy tắt có báo trước (shutdown, reboot) thì kubelet có tự rút pod không?">
+
+Có một cơ chế cho việc đó, tên là graceful node shutdown: kubelet đăng ký với systemd để được báo trước khi máy tắt, giữ việc tắt máy lại một khoảng thời gian và dùng khoảng đó để tắt êm các pod. Nó chỉ hoạt động khi bạn đặt `shutdownGracePeriod` khác 0 trong cấu hình kubelet; cụm kubeadm của lab để `0s` (xem bằng `grep shutdownGrace /var/lib/kubelet/config.yaml`), tức tắt. Và nó không thay được drain: pod được tắt êm nhưng không được chuyển đi trước, PodDisruptionBudget không được hỏi tới, và việc gỡ endpoint vẫn phụ thuộc vào việc kubelet kịp báo về. Bài không bật thử cơ chế này; coi nó là lưới đỡ cho lần tắt máy ngoài kế hoạch, còn bảo trì có kế hoạch vẫn đi qua drain.
+
+</Reveal>
+
+<Reveal title="Có nên tự động khởi động lại node sau khi vá?">
+
+Được, với điều kiện có thứ điều phối. `unattended-upgrades` tự cài bản vá bảo mật và có thể tự reboot, nhưng nó không biết gì về cụm: mọi node có thể reboot cùng một đêm, không drain. Công cụ như kured làm đúng khuôn của bước 6: thấy `/var/run/reboot-required` thì giữ một khoá chung của cụm (để mỗi lúc chỉ một node), drain, reboot, uncordon, rồi nhả khoá. Trước khi bật, PDB của mọi workload phải đúng, vì giờ đây drain xảy ra lúc không ai nhìn. Với hạ tầng thay node được thì khỏi cần vá tại chỗ: nướng image mới theo lịch (D8.4) và thay node dần.
+
+</Reveal>
+<Callout kind="ai">
+
+Nhờ AI viết playbook Ansible vá worker theo lô từ khuôn của bước 3 (drain, vá, chờ `bootID` đổi, uncordon), hoặc rà PDB của cả cụm và chỉ ra chỗ sẽ làm drain treo. AI hay khuyên `kubectl drain --force --disable-eviction` hoặc `kubectl delete pod --force --grace-period=0` để "khỏi treo" (bỏ qua PDB và tắt êm), hay coi `kubectl wait --for=condition=Ready node` ngay sau lệnh reboot là đủ (trạng thái cũ còn đó vài chục giây), và hay quên `uncordon`. Nó cũng hay bảo "pod sẽ tự cân lại sau khi node quay về". Kiểm bằng cách diễn tập trên cụm lab với `probe.sh` chạy song song: số request lỗi là thước đo duy nhất đáng tin.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.3 dạy trình tự tắt êm của pod, nền của mọi lần rút; K2.1 dạy endpoint của Service. K4.1 dạy `kubeadm join` và bootstrap token, thứ bước 4 dùng lại; K4.3 dùng drain để nâng kubelet. K4.6 đặt một địa chỉ ổn định trước các node, lời giải cho `web-qua-w1` lỗi khi máy tắt; K4.7 chẩn đoán node `NotReady`. K5.1 giải thích vì sao pod không tự cân lại; K5.2 đi sâu vào PodDisruptionBudget, topology spread và drain treo. D8.4 nướng image node, D8.5 vá theo lô với canary. K10 thay node tự động qua Cluster API.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d13.4.mastery-maintain">Thực hiện được một lần bảo trì có khởi động lại trên một node đang phục vụ mà request qua node còn lại không lỗi, và chứng minh bằng số đo.</Check>
+
+<Check id="d13.4.mastery-pdb">Trước một đợt bảo trì, rà được PDB và số bản sao của các workload, chỉ ra chỗ sẽ làm drain treo hoặc làm ứng dụng ngừng, và đề xuất cách sửa.</Check>
+
+<Check id="d13.4.mastery-replace">Thay được một node (rút, xoá khỏi cụm, đưa máy mới vào), nói được việc đó khác vá tại chỗ ở đâu, và khi nào nó không chữa được vấn đề.</Check>
+
+</Mastery>

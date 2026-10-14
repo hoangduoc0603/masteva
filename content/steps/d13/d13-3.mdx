@@ -1,0 +1,754 @@
+---
+title: Nâng cấp cụm
+description: Nâng một cụm kubeadm từ 1.36 lên 1.37 trong lúc ứng dụng vẫn nhận traffic và đo gián đoạn của từng bước; gặp một lần nâng hỏng giữa chừng, đọc xem kubeadm lui được gì và không lui được gì, sửa rồi đi tiếp tới khi mọi node ở phiên bản mới.
+id: d13.3
+step: d13
+prerequisites: [d13.1]
+topics: [d13.nang-cap-cum]
+status: verified
+verified:
+  date: 2026-10-13
+  os: Ubuntu 26.04 LTS (hai VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    kubernetes: 1.36.5 nâng lên 1.37.1
+    kubeadm: 1.37.1
+    containerd: 2.2.2
+    etcd: 3.6.8 nâng lên 3.7.0
+    coredns: 1.14.6
+    flannel: 0.28.10
+    agnhost: "2.66.1"
+---
+
+<Goal>
+
+Một cụm tự dựng phải được nâng phiên bản vài lần mỗi năm, trong lúc ứng dụng đang chạy. Học xong bài này, bạn giải thích được:
+
+- Thành phần nào được phép cũ hơn thành phần nào, và vì sao thứ tự nâng cấp không đảo được.
+- `kubeadm upgrade apply` làm gì với từng static pod, API server gián đoạn bao lâu, và vì sao ứng dụng không hề hấn gì trong lúc đó.
+- Khi một lần nâng hỏng giữa chừng, kubeadm tự lui được gì, bỏ lại gì, và vì sao lối ra thường là sửa rồi đi tiếp.
+- Nâng kubelet của từng node theo trình tự nào để request không rớt.
+
+</Goal>
+
+<Knowledge>
+
+### Ai được cũ hơn ai
+
+Kubernetes ra một minor khoảng bốn tháng một lần và mỗi minor được vá khoảng 14 tháng (giữa tháng 10/2026: 1.37, 1.36, 1.35, và 1.34 tới hết ngày 27/10/2026). Trong lúc nâng cấp, cụm tất yếu có các thành phần lệch phiên bản; **chính sách lệch phiên bản** (version skew policy) nói lệch tới đâu thì còn được hỗ trợ:
+
+| Thành phần | So với `kube-apiserver` |
+|---|---|
+| Các `kube-apiserver` khác trong cụm HA | Lệch nhau tối đa 1 minor |
+| `kube-controller-manager`, `kube-scheduler` | Không mới hơn; được cũ hơn 1 minor |
+| `kubelet`, `kube-proxy` | Không mới hơn; được cũ hơn tối đa 3 minor |
+| `kubectl` | Lệch 1 minor về cả hai phía |
+
+Từ bảng suy ra thứ tự: **API server luôn đi trước**, vì không thành phần nào được mới hơn nó. kubelet đi sau cùng và được phép chậm, nhờ vậy một cụm trăm node không phải nâng xong trong một đêm. Và mỗi lần chỉ lên **một minor**: muốn từ 1.35 lên 1.37 thì đi qua 1.36, vì kubeadm chỉ nâng từ minor liền trước và các bước chuyển đổi dữ liệu của API cũng chỉ được kiểm thử theo từng bước một.
+
+```text
+ 1. kubeadm trên control plane đầu tiên      (gói kubeadm = phiên bản đích)
+ 2. kubeadm upgrade plan  →  kubeadm upgrade apply v1.37.x
+ 3. các control plane còn lại: kubeadm upgrade node            (K4.2)
+ 4. từng control plane: drain → nâng kubelet, kubectl → restart kubelet → uncordon
+ 5. từng worker: kubeadm upgrade node → drain → nâng kubelet → restart → uncordon
+ 6. add-on của bạn (CNI, CSI, ingress, operator) theo bảng tương thích của chúng
+```
+
+Hai từ sẽ gặp suốt bài. **Drain** là rút mọi pod khỏi một node trước khi đụng vào nó: `kubectl drain` đánh dấu node không nhận pod mới (cordon) rồi xin API server rút từng pod, và controller tạo pod thay ở node khác. **PodDisruptionBudget** (PDB) là lời khai của chủ ứng dụng "lúc nào cũng phải còn ít nhất N bản sao sẵn sàng"; API server từ chối rút một pod nếu việc đó vi phạm lời khai. K4.4 dùng kỹ hai thứ này, K5.2 đi sâu hơn nữa.
+
+<Check id="d13.3.skew">Nói được thành phần nào được cũ hơn `kube-apiserver` bao nhiêu minor, và từ đó suy ra được thứ tự nâng cấp cùng lý do mỗi lần chỉ lên một minor.</Check>
+
+### `kubeadm upgrade apply` làm gì
+
+```text
+ kubeadm upgrade apply v1.37.1
+   preflight      cụm khoẻ không, node Ready không, kéo image mới
+   etcd           chép /var/lib/etcd vào /etc/kubernetes/tmp/kubeadm-backup-etcd-<giờ>,
+                  thay manifest etcd.yaml, chờ etcd mới sẵn sàng
+   kube-apiserver          ┐ với từng static pod: gia hạn chứng chỉ của nó, cất manifest cũ vào
+   kube-controller-manager ├ /etc/kubernetes/tmp/kubeadm-backup-manifests-<giờ>, đặt manifest mới,
+   kube-scheduler          ┘ chờ kubelet chạy pod mới và pod đó khoẻ; quá hạn thì trả manifest cũ về
+   upload-config  ghi phiên bản mới vào ConfigMap kubeadm-config, kubelet-config
+   addon          CoreDNS và kube-proxy bản mới (rollout như mọi Deployment, DaemonSet)
+```
+
+Ba điều cần nhớ:
+
+- **Manifest mới sinh từ ConfigMap `kubeadm-config`**, không phải từ file đang nằm trong `manifests/`. Cờ bạn sửa tay vào `kube-apiserver.yaml` sẽ mất sau lần nâng; cờ ghi trong `kubeadm-config` thì theo cụm qua mọi phiên bản, kể cả khi phiên bản mới không còn nhận cờ đó. Lab cho bạn gặp đúng trường hợp này.
+- **Cụm một control plane thì API server gián đoạn** trong lúc etcd và chính nó khởi động lại. Workload không bị ảnh hưởng: đường đi của traffic (kube-proxy, CNI, pod) không qua API server (K1.1). Với ba control plane sau một load balancer (cấu trúc K4.2 dựng), các máy được nâng lần lượt nên luôn còn API server phục vụ; bài này không chạy trường hợp đó.
+- **`apply` gia hạn mọi chứng chỉ của control plane.** Cụm được nâng cấp đều đặn không bao giờ gặp chứng chỉ hết hạn (K4.5).
+
+`kubeadm upgrade` **không** đụng tới gói `kubelet` (bạn nâng bằng `apt` sau khi drain), CNI và mọi thứ bạn tự cài.
+
+Về chuyện lui (rollback): kubeadm tự trả lại manifest của **thành phần đang nâng dở**. Nó không hạ những thành phần đã nâng xong trước đó, và không có lệnh `kubeadm downgrade`. Riêng etcd: kubeadm không lui nó, nhưng etcd có quy trình hạ cấp của riêng mình. Theo tài liệu etcd 3.7, hạ từ 3.7 về 3.6 nhìn chung làm được trực tuyến, từng thành viên một: `etcdctl downgrade validate 3.6`, `etcdctl downgrade enable 3.6`, rồi thay binary của từng thành viên. Đó là thao tác tay nằm ngoài kubeadm; với cụm kubeadm nó còn kéo theo việc tự sửa manifest của etcd, và bài này không chạy nó. Đường lui cứng là bản chép thư mục dữ liệu mà kubeadm để lại trong `/etc/kubernetes/tmp/kubeadm-backup-etcd-*`, hoặc bản chụp của bạn (K4.5); cái giá là mất mọi thay đổi sau lúc chép. Vì vậy trên thực tế lối ra của một lần nâng hỏng thường vẫn là **tìm nguyên nhân, sửa, chạy lại** (`apply` chạy lại được nhiều lần), và việc nên làm trước mỗi lần nâng là chụp etcd.
+
+<Check id="d13.3.apply">Kể được các bước của `kubeadm upgrade apply`, nói được manifest mới sinh từ đâu, thứ gì nó không nâng; và khi lần nâng hỏng, kubeadm tự lui gì, không lui gì, cùng ba đường còn lại cho etcd (để nguyên, hạ cấp bằng quy trình của etcd, khôi phục từ bản chép).</Check>
+
+### Trước khi nâng: thứ làm hỏng không nằm trong kubeadm
+
+Phần lớn sự cố nâng cấp tới từ những thứ **quanh** Kubernetes:
+
+| Kiểm gì | Vì sao |
+|---|---|
+| Mục "Urgent Upgrade Notes" trong changelog của minor đích | API bị gỡ, cờ đổi mặc định, feature gate đã GA và bị khoá |
+| Cờ và feature gate bạn đã đặt trong `kubeadm-config` | Gate đã GA không còn tắt được; bản mới gặp nó là không khởi động |
+| Add-on: CNI, CSI, gateway, operator, service mesh | Mỗi cái có bảng "hỗ trợ Kubernetes từ bản nào tới bản nào"; có cái phải nâng trước, có cái sau |
+| PodDisruptionBudget của mọi workload | `ALLOWED DISRUPTIONS` bằng 0 là `drain` treo (K4.4, K5.2) |
+| Chỗ trống của cụm | Rút một node thì pod của nó phải có chỗ ở node khác |
+| Bản chụp etcd mới nhất, đã thử khôi phục | Đường lui cứng nếu etcd hỏng (K4.5) |
+| Chạy trước trên một cụm thử có cùng add-on | Tương thích giữa các thành phần chỉ lộ ra khi chạy chung |
+
+<Callout kind="production">
+
+Ngày 27/10/2017, ngân hàng Monzo gặp sự cố kéo dài khoảng một tiếng rưỡi: thanh toán của tài khoản vãng lai lỗi từ 14:10, và từ 15:13 tới 15:31 cả nền tảng ngừng phục vụ; trong phần lớn thời gian trước đó, phần lớn khách hàng vẫn dùng được thẻ nhờ các quy trình dự phòng. Theo [bản tường trình của trưởng bộ phận kỹ thuật](https://community.monzo.com/t/resolved-current-account-payments-may-fail-major-outage-27-10-2017/26296/95), hai tuần trước đó họ đã nâng phiên bản cụm etcd và mở rộng nó từ ba lên chín node, không có gián đoạn nào. Việc tái cấu hình ấy làm lộ một lỗi trong Kubernetes và client etcd khiến request có thể hết giờ. Một ngày trước sự cố, một service mới được triển khai rồi thu về không bản sao, còn object Service thì để lại. Lúc 14:10 ngày 27, một lần deploy bình thường khiến request tới service thanh toán thất bại; lui lại không hết lỗi. Proxy linkerd đã không nhận được cập nhật vị trí pod từ Kubernetes. Đội quyết định khởi động lại toàn bộ vài trăm bản linkerd, và tới 15:13 thì cả nền tảng ngừng nhận traffic: các bản linkerd mới gặp `NullPointerException` khi đọc phản hồi của Kubernetes về một service không có endpoint nào, một chỗ không tương thích giữa hai phiên bản Kubernetes và linkerd họ đang chạy. Lúc 15:31 họ xoá Service rỗng kia và hệ thống hồi phục.
+
+Điều rút ra (của bài này): lần nâng cấp "trôi chảy" hai tuần trước chưa hề được kiểm với mọi tình huống mà các thành phần quanh nó sẽ gặp. Bảng tương thích của add-on và một cụm thử chạy đúng tổ hợp phiên bản sẽ dùng trên production là phần của quy trình nâng cấp, không phải việc làm thêm.
+
+</Callout>
+
+<Check id="d13.3.truoc-khi-nang">Lập được danh sách kiểm trước một lần nâng minor và nói được mỗi mục chặn kiểu sự cố nào.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Version Skew Policy](https://kubernetes.io/releases/version-skew-policy/): bảng lệch phiên bản đầy đủ và thứ tự nâng cấp suy ra từ đó.
+- [Upgrading kubeadm clusters](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/): quy trình chính thức; đọc mục "Recovering from a failure state" và "How it works".
+- [Reconfiguring a kubeadm cluster](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-reconfigure/): cách đổi cờ của control plane qua `kubeadm-config`, dùng ở phần Chuẩn bị và bước 3.
+- [etcd: Downgrade etcd from v3.7 to v3.6](https://etcd.io/docs/v3.7/downgrades/downgrade_3_7/): quy trình hạ cấp trực tuyến của etcd, thứ kubeadm không làm thay.
+- [Monzo: bản tường trình sự cố 27/10/2017](https://community.monzo.com/t/resolved-current-account-payments-may-fail-major-outage-27-10-2017/26296/95): nguồn của callout, đọc phần dòng thời gian.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cụm của K4.1 đang chạy Kubernetes 1.36.5 trên `k4-cp1` và `k4-w1` (nếu đã dừng VM: `limactl start k4-cp1` rồi `limactl start k4-w1`). Mở hai terminal vào `k4-cp1` (`limactl shell k4-cp1`) và một terminal trên Mac.
+
+**Profile máy.** Như K4.1: hai VM, mỗi VM 2 CPU và 2 GiB. Cuối bài `free -m` cho thấy control plane dùng khoảng 960 MB, worker khoảng 490 MB. Bài kéo thêm khoảng 400 MB image của 1.37. Máy 8 GB làm được nếu tắt Docker Desktop.
+
+Ba việc chuẩn bị. Thứ nhất, lab chỉ có hai node, nên bỏ taint của control plane để nó cũng chạy workload; nhờ vậy rút node nào thì node kia vẫn phục vụ. Cụm thật giữ taint này và có đủ worker. Thứ hai, một ứng dụng `web` hai bản sao, mỗi node một bản, có PodDisruptionBudget, mở qua NodePort `30080`:
+
+<Terminal where="vm" title="k4-cp1: ~/k4/web.yaml">
+
+```bash
+mkdir -p ~/k4 && cd ~/k4
+kubectl taint nodes lima-k4-cp1 node-role.kubernetes.io/control-plane:NoSchedule-
+cat > web.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        matchLabelKeys: [pod-template-hash]
+        labelSelector:
+          matchLabels: {app: web}
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: web
+        image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+        args: [netexec, --http-port=8080, --delay-shutdown=5]
+        readinessProbe: {httpGet: {path: /healthz, port: 8080}, periodSeconds: 2}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: NodePort
+  selector: {app: web}
+  ports:
+  - {port: 80, targetPort: 8080, nodePort: 30080}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app: web}}
+EOF
+kubectl apply -f web.yaml
+kubectl rollout status deploy/web --timeout=180s | tail -1
+kubectl get pods -l app=web -o wide | cut -c1-90
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+…
+deployment "web" successfully rolled out
+NAME                   READY   STATUS    RESTARTS   AGE   IP           NODE
+web-7785fd4784-6ckvz   1/1     Running   0          16s   10.244.0.6   lima-k4-cp1
+web-7785fd4784-7chml   1/1     Running   0          16s   10.244.1.4   lima-k4-w1
+```
+
+</Expected>
+
+`topologySpreadConstraints` buộc hai bản sao nằm ở hai node khác nhau; `matchLabelKeys: [pod-template-hash]` làm phép đếm đó chỉ tính các pod của cùng một lần rollout, nhờ vậy sau mỗi lần deploy vẫn là mỗi node một bản (K5.2 đi sâu). PodDisruptionBudget `minAvailable: 1` cấm rút pod nếu việc đó làm số bản sao sẵn sàng xuống dưới một. `--delay-shutdown=5` cho ứng dụng phục vụ tiếp 5 giây sau `SIGTERM` (K1.3), để việc rút pod không tự nó gây lỗi và số đo của bài chỉ phản ánh thao tác trên node.
+
+Thứ ba, công cụ đo. `probe.sh` gọi ba đích khoảng 5 lần mỗi giây: ứng dụng qua NodePort của từng node, và `/readyz` của API server:
+
+<Terminal where="vm" title="k4-cp1: ~/k4/probe.sh">
+
+```bash
+cd ~/k4
+cat > probe.sh <<'EOF'
+#!/usr/bin/env bash
+# probe.sh start | stop: đo gián đoạn của từng đích trong lúc bảo trì cụm.
+# Mỗi đích được gọi khoảng 5 lần mỗi giây, timeout 1 giây; kết quả ghi vào ~/k4/probe/<tên>.log
+D=$HOME/k4/probe
+CP1=$(getent hosts lima-k4-cp1.internal | awk '{print $1}')
+W1=$(getent hosts lima-k4-w1.internal | awk '{print $1}')
+TARGETS="web-qua-cp1=http://$CP1:30080/hostname web-qua-w1=http://$W1:30080/hostname api=https://k4-api.lab:6443/readyz"
+
+loop() {
+  while :; do
+    t=$(date +%s.%N)
+    if curl -sk -f -m 1 -o /dev/null "$2"; then echo "$t ok"; else echo "$t LOI"; fi
+    sleep 0.2
+  done >> "$D/$1.log"
+}
+
+report() {
+  for f in "$D"/*.log; do
+    awk -v name="$(basename "$f" .log)" '
+      { n++ }
+      $2 == "LOI" { loi++; if (!bad) { bad = 1; from = $1 } }
+      $2 == "ok" && bad { bad = 0; d = $1 - from; if (d > max) max = d; lan++ }
+      END {
+        if (bad) { d = $1 - from; if (d > max) max = d; lan++ }
+        printf "%-11s tong=%-5d loi=%-4d so_lan_gian_doan=%d dai_nhat=%.1f giay\n", name, n, loi, lan, max
+      }' "$f"
+  done
+}
+
+case "${1:-}" in
+  start)
+    mkdir -p "$D"; rm -f "$D"/*.log "$D"/pids
+    for t in $TARGETS; do loop "${t%%=*}" "${t#*=}" < /dev/null > /dev/null 2>&1 & echo $! >> "$D/pids"; done
+    echo "dang do" ;;
+  stop)
+    [ -f "$D/pids" ] && xargs -r kill < "$D/pids" 2>/dev/null; rm -f "$D/pids"; report ;;
+  *) echo "dung: probe.sh start|stop" >&2; exit 1 ;;
+esac
+EOF
+chmod +x probe.sh
+./probe.sh start; sleep 6; ./probe.sh stop
+```
+
+</Terminal>
+
+Lệnh cuối đo thử 6 giây và phải in ba dòng `api`, `web-qua-cp1`, `web-qua-w1`, mỗi dòng có `tong` gần 30 và `loi=0`. `dai_nhat` là khoảng dài nhất tính từ lần gọi lỗi đầu tiên tới lần gọi thành công kế tiếp.
+
+Cuối cùng, cho cụm một chút "lịch sử". Giả sử năm ngoái đội vận hành đã tắt một tính năng beta bằng feature gate, theo đúng cách tài liệu "Reconfiguring a kubeadm cluster" chỉ: sửa `kubeadm-config` rồi sinh lại manifest.
+
+<Callout kind="danger">
+
+Khối dưới sinh lại manifest của API server, nên API server khởi động lại và cụm lab không nhận lệnh trong khoảng nửa phút. Chỉ chạy trên `k4-cp1` của lab.
+
+</Callout>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+cd ~/k4
+kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' > cluster.yaml
+sed -i 's/^apiServer: {}/apiServer:\n  extraArgs:\n  - name: feature-gates\n    value: PodReadyToStartContainersCondition=false/' cluster.yaml
+sudo kubeadm init phase upload-config kubeadm --config cluster.yaml
+sudo kubeadm init phase control-plane apiserver --config cluster.yaml
+sleep 5; until kubectl get --raw /readyz > /dev/null 2>&1; do sleep 2; done
+ps -o args= -C kube-apiserver | grep -o 'feature-gates=[A-Za-z=]*'
+kubectl get nodes
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[upload-config] Storing the configuration used in ConfigMap "kubeadm-config" in the "kube-system" Namespace
+[control-plane] Creating static Pod manifest for "kube-apiserver"
+feature-gates=PodReadyToStartContainersCondition=false
+NAME          STATUS   ROLES           AGE     VERSION
+lima-k4-cp1   Ready    control-plane   8m49s   v1.36.5
+lima-k4-w1    Ready    <none>          7m59s   v1.36.5
+```
+
+</Expected>
+
+Cụm 1.36 chạy bình thường với cờ này. Hai lệnh `kubeadm init phase` là cách đúng để đổi cờ của control plane: pha `upload-config` ghi vào ConfigMap, pha `control-plane` sinh lại manifest, kubelet thấy file đổi và tạo lại API server.
+
+### 1. Lập kế hoạch
+
+Kho `pkgs.k8s.io` tách theo minor (K4.1), nên bước đầu của mọi lần nâng là trỏ `apt` sang kho của minor đích, rồi nâng **chỉ kubeadm**. Khoá ký không phải tải lại: tài liệu cài đặt của Kubernetes ghi rằng mọi kho minor dùng chung một khoá, cái mà K4.1 đã kiểm fingerprint.
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+sudo sed -i 's|/v1.36/|/v1.37/|' /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update -qq
+apt-cache madison kubeadm | head -2
+sudo apt-mark unhold kubeadm
+sudo apt-get install -y -qq kubeadm=1.37.1-1.1 > /dev/null
+sudo apt-mark hold kubeadm
+kubeadm version -o short; kubelet --version
+sudo kubeadm upgrade plan 2>&1 | grep -A 13 "^Components that must" | grep -v "^$"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   kubeadm | 1.37.1-1.1 | https://pkgs.k8s.io/core:/stable:/v1.37/deb  Packages
+   kubeadm | 1.37.0-1.1 | https://pkgs.k8s.io/core:/stable:/v1.37/deb  Packages
+Canceled hold on kubeadm.
+kubeadm set on hold.
+v1.37.1
+Kubernetes v1.36.5
+Components that must be upgraded manually after you have upgraded the control plane with 'kubeadm upgrade apply':
+COMPONENT   NODE          CURRENT   TARGET
+kubelet     lima-k4-cp1   v1.36.5   v1.37.1
+kubelet     lima-k4-w1    v1.36.5   v1.37.1
+Upgrade to the latest stable version:
+COMPONENT                 NODE          CURRENT   TARGET
+kube-apiserver            lima-k4-cp1   v1.36.5   v1.37.1
+kube-controller-manager   lima-k4-cp1   v1.36.5   v1.37.1
+kube-scheduler            lima-k4-cp1   v1.36.5   v1.37.1
+kube-proxy                              1.36.5    v1.37.1
+CoreDNS                                 v1.14.2   v1.14.6
+etcd                      lima-k4-cp1   3.6.8-0   3.7.0-0
+```
+
+</Expected>
+
+Lúc này máy có kubeadm 1.37.1 bên cạnh kubelet 1.36.5: đúng trạng thái mong muốn. `upgrade plan` không đổi gì trong cụm; nó liệt kê thứ `apply` sẽ nâng (ba thành phần control plane, kube-proxy, CoreDNS, và etcd từ 3.6.8 lên 3.7.0) và thứ bạn phải tự nâng (kubelet). `plan` kiểm cụm có khoẻ không; nó **không** kiểm cờ của bạn có còn hợp lệ ở bản mới không.
+
+<Check id="d13.3.lab-plan">Chuyển được kho gói sang minor mới, nâng riêng kubeadm, và đọc được từ `kubeadm upgrade plan` thứ gì sẽ được nâng tự động, thứ gì phải làm tay.</Check>
+
+### 2. Lần nâng hỏng giữa chừng
+
+<Callout kind="danger">
+
+`kubeadm upgrade apply` thay etcd và API server. Trên cụm một control plane này, API server vắng mặt hơn hai phút trong lần chạy hỏng dưới đây, và khoảng 40 giây trong lần chạy thành công ở bước 3. Chạy `kubectl config current-context` trước và chắc rằng nó in `kubernetes-admin@kubernetes` của cụm lab.
+
+</Callout>
+
+File cấu hình cho lần nâng rút thời gian chờ mỗi static pod từ 5 phút mặc định xuống 2 phút, để lab không phải chờ lâu:
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+cat > upgrade.yaml <<'EOF'
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: UpgradeConfiguration
+apply:
+  kubernetesVersion: v1.37.1
+timeouts:
+  upgradeManifests: 2m0s
+EOF
+./probe.sh start
+sudo kubeadm upgrade apply --config upgrade.yaml --yes 2>&1 | grep -v -E "Renewing|bootstrap-token|RBAC"
+```
+
+</Terminal>
+
+Lệnh chạy khoảng 4 phút. Ngay sau khi nó in dòng `Preparing for "kube-apiserver" upgrade`, sang terminal thứ hai. Khối lệnh dưới tự chờ tới khi có một container `kube-apiserver` đã thoát rồi in log của nó:
+
+<Terminal where="vm" title="k4-cp1 (terminal 2)">
+
+```bash
+until sudo crictl ps -a --name kube-apiserver --state exited -q | grep -q .; do sleep 2; done
+sudo crictl ps -a --name kube-apiserver | awk 'NR > 1 {print $(NF-4), $(NF-5), "attempt=" $(NF-3)}'
+sudo crictl logs "$(sudo crictl ps -a --name kube-apiserver --state exited -q | head -1)" 2>&1 | grep -o '"command failed".*'
+```
+
+</Terminal>
+
+<Predict question="kubeadm 1.37 đặt manifest mới cho API server, vẫn mang cờ `PodReadyToStartContainersCondition=false` từ kubeadm-config. Chuyện gì xảy ra?">
+
+Terminal 2:
+
+```text
+kube-apiserver Running attempt=1
+kube-apiserver Exited attempt=0
+"command failed" err="cannot set feature gate PodReadyToStartContainersCondition to false, feature is locked to true"
+```
+
+Terminal 1:
+
+```text
+[upgrade/control-plane] Upgrading your static Pod-hosted control plane to version "v1.37.1" (timeout: 2m0s)...
+…
+[upgrade/staticpods] Component "etcd" upgraded successfully!
+[upgrade/staticpods] Preparing for "kube-apiserver" upgrade
+[upgrade/staticpods] Moving new manifest to "/etc/kubernetes/manifests/kube-apiserver.yaml" and backing up old manifest to "/etc/kubernetes/tmp/kubeadm-backup-manifests-2026-10-13-03-56-02/kube-apiserver.yaml"
+[upgrade/staticpods] This can take up to 2m0s
+error: error execution phase control-plane: couldn't complete the static pod upgrade: couldn't upgrade control plane. kubeadm has tried to recover everything into the earlier state. Errors faced: failed to obtain static Pod hash for component kube-apiserver on Node lima-k4-cp1: Get "https://k4-api.lab:6443/api/v1/namespaces/kube-system/pods/kube-apiserver-lima-k4-cp1?timeout=10s": dial tcp 192.168.104.1:6443: connect: connection refused
+```
+
+Ở 1.37 tính năng này đã GA và gate bị khoá ở `true`: API server mới coi việc đặt `false` là lỗi cấu hình và thoát ngay khi khởi động. kubelet chạy lại nó, nó lại thoát (tuỳ lúc, terminal 2 in một dòng `Exited`, hoặc thêm một dòng `Running` của lần thử kế tiếp như ở đây). kubeadm chờ hết 2 phút, không thấy pod mới khoẻ, trả manifest cũ về và báo lỗi. Lỗi kubeadm in ra chỉ nói "không gọi được API server"; nguyên nhân thật nằm trong log của container, và chỉ `crictl` đọc được vì lúc này không có API server để `kubectl logs`. Giờ trong tên thư mục trên máy bạn sẽ khác.
+
+</Predict>
+
+Chờ lệnh ở terminal 1 kết thúc, rồi xem cụm đang ở trạng thái nào:
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+until kubectl get --raw /readyz > /dev/null 2>&1; do sleep 2; done
+./probe.sh stop
+kubectl version | tail -1
+sudo grep -h "image:" /etc/kubernetes/manifests/*.yaml
+sudo ls /etc/kubernetes/tmp
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+api         tong=892   loi=697  so_lan_gian_doan=2 dai_nhat=135.9 giay
+web-qua-cp1 tong=1134  loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-w1  tong=1134  loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+Server Version: v1.36.5
+    image: registry.k8s.io/etcd:3.7.0-0
+    image: registry.k8s.io/kube-apiserver:v1.36.5
+    image: registry.k8s.io/kube-controller-manager:v1.36.5
+    image: registry.k8s.io/kube-scheduler:v1.36.5
+kubeadm-backup-etcd-2026-10-13-03-56-02
+kubeadm-backup-manifests-2026-10-13-03-56-02
+kubeadm-upgraded-manifests3123779265
+```
+
+</Expected>
+
+Đọc ba nhóm dòng:
+
+- **Ứng dụng không rớt request nào** dù API server chết hai lần, lần dài nhất hơn 2 phút (lúc bản mới chết đi sống lại). Lần gián đoạn ngắn hơn, khoảng một phút, là lúc etcd được thay.
+- **Cụm không quay về đúng trạng thái cũ.** API server lại là 1.36.5, nhưng **etcd đã là 3.7.0**: nó nâng xong trước khi API server hỏng, và kubeadm chỉ lui thành phần đang dở. "kubeadm has tried to recover everything into the earlier state" đúng với manifest của API server, không đúng với etcd.
+- **Hai bản sao lưu nằm trong `/etc/kubernetes/tmp`**: thư mục dữ liệu etcd chép ngay trước khi nâng, và manifest cũ. Bản chép dữ liệu là đường lui cứng của etcd nếu mọi cách khác thất bại.
+
+Cụm đang chạy API server 1.36 với etcd 3.7, tổ hợp không ai chủ định. Nó hoạt động, và đây chính là lúc dễ quyết định sai: lao vào hạ cấp etcd bằng tay, hoặc khôi phục từ bản chép và mất mọi thay đổi sau đó, trong khi nguyên nhân chỉ là một cờ.
+
+<Check id="d13.3.lab-fail">Tái hiện được một lần `kubeadm upgrade apply` hỏng vì cờ không còn hợp lệ, tìm được nguyên nhân bằng `crictl logs` khi API server không chạy, và chỉ ra được thành phần nào đã được lui, thành phần nào không.</Check>
+
+### 3. Sửa rồi đi tiếp
+
+Gỡ cờ khỏi `kubeadm-config` rồi chạy lại `apply`. Không cần sinh lại manifest 1.36: `apply` sẽ sinh manifest mới từ ConfigMap đã sửa.
+
+<Callout kind="danger">
+
+Lần chạy này lại khởi động lại etcd và API server: cụm lab không nhận lệnh khoảng 40 giây.
+
+</Callout>
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+sed -i '/^  extraArgs:/,/PodReadyToStartContainersCondition/d; s/^apiServer:$/apiServer: {}/' cluster.yaml
+head -1 cluster.yaml
+sudo kubeadm init phase upload-config kubeadm --config cluster.yaml
+./probe.sh start
+sudo kubeadm upgrade apply --config upgrade.yaml --yes 2>&1 | grep -E "upgraded successfully|SUCCESS|error"
+until kubectl get --raw /readyz > /dev/null 2>&1; do sleep 2; done
+sleep 10; ./probe.sh stop
+kubectl version | tail -1
+kubectl get nodes
+kubectl -n kube-system get pods -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image | grep proxy
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+apiServer: {}
+[upload-config] Storing the configuration used in ConfigMap "kubeadm-config" in the "kube-system" Namespace
+dang do
+[upgrade/staticpods] Component "etcd" upgraded successfully!
+[upgrade/staticpods] Component "kube-apiserver" upgraded successfully!
+[upgrade/staticpods] Component "kube-controller-manager" upgraded successfully!
+[upgrade/staticpods] Component "kube-scheduler" upgraded successfully!
+[upgrade] SUCCESS! A control plane node of your cluster was upgraded to "v1.37.1".
+api         tong=632   loi=152  so_lan_gian_doan=1 dai_nhat=40.9 giay
+web-qua-cp1 tong=681   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-w1  tong=680   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+Server Version: v1.37.1
+NAME          STATUS   ROLES           AGE   VERSION
+lima-k4-cp1   Ready    control-plane   16m   v1.36.5
+lima-k4-w1    Ready    <none>          15m   v1.36.5
+kube-proxy-npffm                      registry.k8s.io/kube-proxy:v1.37.1
+kube-proxy-psq2q                      registry.k8s.io/kube-proxy:v1.37.1
+```
+
+</Expected>
+
+Lần này mất khoảng hai phút. API server gián đoạn một lần, khoảng 40 giây trong hai lượt chạy của bài; ứng dụng vẫn không rớt request nào. Trong lúc API server vắng mặt, cụm "đóng băng": không deploy được, pod chết không được thay, nhưng thứ đang chạy vẫn chạy. Với cụm ba control plane, khoảng vắng mặt này biến mất (K4.2).
+
+Cột `VERSION` của `kubectl get nodes` vẫn là `v1.36.5`: đó là phiên bản **kubelet** của từng node, chưa ai đụng tới. Control plane đã ở 1.37.1 (`Server Version`), kube-proxy và CoreDNS đã được thay; một dòng `kube-proxy` có thể còn là 1.36.5 trong vài giây nếu DaemonSet chưa thay xong.
+
+<Check id="d13.3.lab-apply">Sửa được nguyên nhân trong `kubeadm-config`, chạy lại `kubeadm upgrade apply` tới thành công, và dùng số đo chứng minh được API server gián đoạn còn ứng dụng thì không.</Check>
+
+### 4. kubelet của control plane
+
+Giờ tới từng node: drain, nâng kubelet, khởi động lại kubelet, uncordon. Trước mọi lệnh `drain`, kiểm bạn đang ở đúng cụm.
+
+<Callout kind="danger">
+
+`kubectl drain` rút mọi pod khỏi node. Chạy `kubectl config current-context` trước và chắc rằng nó in `kubernetes-admin@kubernetes` của cụm lab, không phải cụm của công ty. Điều này áp dụng cho mọi lệnh `drain` từ đây tới hết bài.
+
+</Callout>
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+kubectl config current-context
+./probe.sh start
+kubectl drain lima-k4-cp1 --ignore-daemonsets --delete-emptydir-data 2>&1 | grep -v "^Warning"
+kubectl get pods -l app=web -o wide | cut -c1-90
+sudo apt-mark unhold kubelet kubectl > /dev/null
+sudo apt-get install -y -qq kubelet=1.37.1-1.1 kubectl=1.37.1-1.1 > /dev/null
+sudo apt-mark hold kubelet kubectl > /dev/null
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+sleep 5; until kubectl get --raw /readyz > /dev/null 2>&1; do sleep 2; done
+kubectl uncordon lima-k4-cp1
+kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 5; ./probe.sh stop
+kubectl get nodes
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kubernetes-admin@kubernetes
+dang do
+node/lima-k4-cp1 cordoned
+evicting pod default/web-7785fd4784-6ckvz
+…
+pod/web-7785fd4784-6ckvz evicted
+node/lima-k4-cp1 drained
+NAME                   READY   STATUS    RESTARTS   AGE     IP           NODE
+web-7785fd4784-7chml   1/1     Running   0          8m17s   10.244.1.4   lima-k4-w1
+web-7785fd4784-nl7ns   0/1     Pending   0          6s      <none>       <none>
+…
+node/lima-k4-cp1 uncordoned
+deployment "web" successfully rolled out
+api         tong=218   loi=9    so_lan_gian_doan=1 dai_nhat=3.5 giay
+web-qua-cp1 tong=232   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-w1  tong=230   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+NAME          STATUS   ROLES           AGE   VERSION
+lima-k4-cp1   Ready    control-plane   16m   v1.37.1
+lima-k4-w1    Ready    <none>          16m   v1.36.5
+```
+
+</Expected>
+
+Ba điều đáng nhìn:
+
+- Bản sao `web` bị rút khỏi `k4-cp1` nằm `Pending`: ràng buộc trải đều không cho nó sang `k4-w1`, nơi đã có một bản. PDB `minAvailable: 1` vẫn thoả nên drain đi tiếp, và bản sao còn lại gánh toàn bộ traffic. Cụm thật cần dư chỗ cho pod bị rút; ở đây ta chấp nhận chạy một bản trong lúc bảo trì.
+- `drain` không rút static pod và pod của DaemonSet: control plane vẫn chạy trên node đang drain.
+- **Khởi động lại kubelet bản mới làm API server gián đoạn thêm từ vài giây tới hơn mười giây** (3,5, 7,8 và 11,4 giây trong ba lượt chạy). kubelet 1.37 tính lại cấu hình của các static pod và tạo lại container của chúng. Giữa output còn có vài dòng của `needrestart`, công cụ của Ubuntu tự khởi động lại dịch vụ sau khi gói được nâng: kubelet vì thế khởi động lại hai lần, một lần do `needrestart` và một lần do lệnh `systemctl restart` của bài. Vòng `until … /readyz` chờ API server quay lại rồi mới `uncordon`; thiếu nó, lệnh `uncordon` sẽ gặp `connection refused`.
+
+### 5. Worker
+
+Worker cần hai việc: `kubeadm upgrade node` để lấy cấu hình kubelet của phiên bản mới, và nâng gói kubelet. Gói cả hai vào một script trên Mac để dùng lại cho mọi worker:
+
+<Terminal where="mac" title="~/masteva-d13/node-upgrade.sh">
+
+```bash
+cd ~/masteva-d13
+cat > node-upgrade.sh <<'EOF'
+#!/usr/bin/env bash
+# node-upgrade.sh <minor> <phiên bản gói> <bước>: nâng một node, chạy bằng root trên chính node đó
+#   bước kubeadm: chuyển kho apt sang minor mới (khoá ký dùng chung cho mọi minor), nâng kubeadm, chạy "kubeadm upgrade node"
+#   bước kubelet: nâng kubelet và kubectl rồi khởi động lại kubelet (chạy sau khi node đã được drain)
+set -euo pipefail
+MINOR=${1:?thiếu minor, ví dụ 1.37}; PKG=${2:?thiếu phiên bản gói, ví dụ 1.37.1-1.1}; STEP=${3:?thiếu bước: kubeadm hoặc kubelet}
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUPPRESS=1
+case "$STEP" in
+  kubeadm)
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v$MINOR/deb/ /" \
+      > /etc/apt/sources.list.d/kubernetes.list
+    apt-get update -qq
+    apt-mark unhold kubeadm > /dev/null
+    apt-get install -y -qq "kubeadm=$PKG" > /dev/null
+    apt-mark hold kubeadm > /dev/null
+    kubeadm upgrade node 2>&1 | grep -E "kubelet-config|error" ;;
+  kubelet)
+    apt-mark unhold kubelet kubectl > /dev/null
+    apt-get install -y -qq "kubelet=$PKG" "kubectl=$PKG" > /dev/null
+    apt-mark hold kubelet kubectl > /dev/null
+    systemctl daemon-reload
+    systemctl restart kubelet
+    echo "$(hostname): kubelet $(kubelet --version | awk '{print $2}')" ;;
+  *) echo "bước phải là kubeadm hoặc kubelet" >&2; exit 1 ;;
+esac
+EOF
+limactl shell k4-w1 sudo bash -s 1.37 1.37.1-1.1 kubeadm < node-upgrade.sh 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[upgrade/kubelet-config] The kubelet configuration for this node was successfully upgraded!
+```
+
+</Expected>
+
+Trên worker, `kubeadm upgrade node` bỏ qua mọi pha của control plane và chỉ ghi lại `/var/lib/kubelet/config.yaml` từ ConfigMap `kubelet-config`. Giờ drain từ control plane, nâng kubelet từ Mac, rồi uncordon:
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+./probe.sh start
+kubectl drain lima-k4-w1 --ignore-daemonsets --delete-emptydir-data 2>&1 | grep -v "^Warning"
+```
+
+</Terminal>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-w1 sudo bash -s 1.37 1.37.1-1.1 kubelet < node-upgrade.sh 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-cp1 (terminal 1)">
+
+```bash
+cd ~/k4
+kubectl wait --for=jsonpath='{.status.nodeInfo.kubeletVersion}'=v1.37.1 node/lima-k4-w1 --timeout=120s
+kubectl uncordon lima-k4-w1
+kubectl rollout status deploy/web --timeout=120s | tail -1
+sleep 5; ./probe.sh stop
+kubectl get nodes
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-w1 condition met
+node/lima-k4-w1 uncordoned
+deployment "web" successfully rolled out
+api         tong=111   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-cp1 tong=114   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+web-qua-w1  tong=114   loi=0    so_lan_gian_doan=0 dai_nhat=0.0 giay
+NAME          STATUS   ROLES           AGE   VERSION
+lima-k4-cp1   Ready    control-plane   17m   v1.37.1
+lima-k4-w1    Ready    <none>          16m   v1.37.1
+```
+
+</Expected>
+
+Không lỗi nào ở cả ba đích. `web-qua-w1` vẫn trả lời trong lúc `k4-w1` không còn pod `web` nào: kube-proxy trên node đó chuyển request sang pod ở `k4-cp1`. Khởi động lại kubelet không dừng container đang chạy và không đụng tới luật của kube-proxy; nó chỉ làm node vắng mặt với API server trong vài giây. Lệnh `kubectl wait --for=jsonpath` chờ tới khi kubelet mới báo phiên bản của nó, bằng chứng chắc hơn cột `Ready`.
+
+Một chuyện output không cho thấy: lệnh drain vừa rồi rút cả các pod CoreDNS đang nằm trên `k4-w1`, và nếu cả hai pod CoreDNS cùng ở đó thì tên trong cụm không phân giải được trong vài giây. kubeadm không tạo PodDisruptionBudget cho CoreDNS; trên cụm thật, thêm PDB cho nó và trải nó ra nhiều node.
+
+Cụm đã ở 1.37.1 trọn vẹn. Trên cụm nhiều worker, bạn lặp bước này theo lô (D8.5): một node canary trước, rồi vài node một lượt, và dừng lại khi PDB hay số pod `Pending` báo cụm hết chỗ.
+
+<Check id="d13.3.lab-worker">Nâng được kubelet của control plane và của worker theo trình tự drain, nâng gói, khởi động lại, chờ node báo phiên bản mới, uncordon; giải thích được vì sao một bản sao `web` nằm `Pending` trong lúc đó mà drain không treo, và chứng minh được bằng số đo không request nào lỗi.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `kubeadm upgrade apply` báo `[ERROR CreateJob]` hoặc treo ở "Running cluster health checks": bước kiểm sức khoẻ chạy một Job thử trên cụm; node đang `cordon` hoặc không còn chỗ thì Job không chạy được. `kubectl get nodes` và `uncordon` node còn kẹt.
+- Terminal 2 ở bước 2 không in gì: bạn chạy nó quá muộn, sau khi kubeadm đã trả manifest cũ về và container hỏng đã bị dọn. Bài học vẫn nguyên: log của static pod hỏng chỉ có ở node và không tồn tại lâu.
+- Sau bước 2, API server không lên lại: xem `sudo crictl ps -a --name kube-apiserver` và log của nó. Nếu manifest trong `/etc/kubernetes/manifests` vẫn là bản mới, chép lại bản cũ từ `/etc/kubernetes/tmp/kubeadm-backup-manifests-*`.
+- `apt-get install kubelet=1.37.1-1.1` báo `Version not found`: máy đó chưa chuyển kho sang `/v1.37/` (bước 1 với control plane, bước `kubeadm` của `node-upgrade.sh` với worker).
+- `kubectl drain` đứng ở `Cannot evict pod as it would violate the pod's disruption budget`: `web` đang chỉ có một bản sao sẵn sàng (thường do bước trước chưa `uncordon`). `kubectl get pods -l app=web -o wide`, sửa nguyên nhân, drain tự đi tiếp (K5.2).
+- Một bản sao `web` nằm `Pending` mãi sau `uncordon`: `kubectl describe pod` xem scheduler nói gì; hay gặp là node kia còn `SchedulingDisabled`.
+
+</Callout>
+
+### Dọn dẹp
+
+Không dọn gì: K4.4 dùng tiếp ngay cụm này cùng `web` và `~/k4/probe.sh`, và các bài sau cũng vậy. Kiểm trạng thái cuối:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl get nodes
+kubectl get pods -l app=web --no-headers | wc -l
+```
+
+</Terminal>
+
+Hai node `Ready` ở `v1.37.1` và dòng cuối in `2` là cụm sẵn sàng cho bài sau. Cuối buổi học: `limactl stop k4-w1` rồi `limactl stop k4-cp1` trên Mac.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Cụm có ba control plane thì nâng thế nào?">
+
+Máy đầu tiên chạy `kubeadm upgrade apply`; hai máy còn lại chạy `kubeadm upgrade node`, lệnh này trên control plane sẽ nâng các static pod của máy đó theo phiên bản đã ghi trong `kubeadm-config`. Mỗi lần một máy, và chờ etcd đủ ba thành viên khoẻ rồi mới sang máy kế: nâng hai máy cùng lúc là tự làm mất quorum (K4.2). Trong lúc đó có hai phiên bản API server cùng chạy sau load balancer, điều chính sách lệch phiên bản cho phép trong phạm vi một minor. Vì client có thể gặp bản cũ ở request này và bản mới ở request sau, đừng bật tính năng mới của minor đích cho tới khi mọi API server đã nâng xong.
+
+</Reveal>
+
+<Reveal title="API bị gỡ ở phiên bản mới thì object của tôi ra sao?">
+
+Object nằm trong etcd dưới một phiên bản lưu trữ, và API server phục vụ nó qua mọi phiên bản API còn được bật. Khi một phiên bản API bị gỡ (ví dụ `policy/v1beta1` của PodDisruptionBudget ở 1.25), object không mất, nhưng manifest, Helm chart và client còn gọi phiên bản cũ sẽ nhận `no matches for kind`. Trước khi nâng, tìm xem ai còn dùng: metric `apiserver_requested_deprecated_apis` của API server, cảnh báo `Warning:` mà `kubectl` in khi bạn apply một phiên bản sắp bị gỡ, và trang "Deprecated API Migration Guide". Chart Helm đã cài bằng API cũ còn một bẫy riêng: bản ghi release lưu manifest cũ, và lần `helm upgrade` kế tiếp có thể thất bại; cách chữa là sửa chart và nâng release **trước** khi nâng cụm.
+
+</Reveal>
+
+<Reveal title="Vì sao kubelet được phép cũ hơn API server tới ba minor?">
+
+Vì nâng kubelet đắt: mỗi node phải drain, và một cụm lớn có hàng trăm node. Cho phép lệch ba minor nghĩa là bạn có thể nâng control plane mỗi minor (khoảng bốn tháng một lần) mà chỉ đụng tới node mỗi năm một lần, gộp việc nâng kubelet với việc thay image hệ điều hành (K4.4). Cái giá: tính năng nào cần cả API server lẫn kubelet thì chỉ dùng được khi node đã theo kịp, và bạn phải tự theo dõi node nào đang ở bản nào (`kubectl get nodes` cho biết ngay). Đừng nhầm "được phép" với "nên để vậy mãi": kubelet cũ quá ba minor là không được hỗ trợ, và mỗi minor cũng chỉ được vá trong khoảng 14 tháng.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI đọc changelog của minor đích và liệt kê thay đổi ảnh hưởng tới một danh sách cờ, API và add-on bạn đưa vào; hoặc viết playbook Ansible nâng worker theo lô từ `node-upgrade.sh`. AI hay sai ở chỗ: bảo nâng kubelet trước control plane, bỏ bước chuyển kho `pkgs.k8s.io` sang minor mới, dùng lệnh cũ `kubeadm upgrade node config`, khuyên `kubectl drain --force --disable-eviction` để "khỏi treo" (bỏ qua PDB), và khẳng định "kubeadm tự rollback nếu lỗi" mà không nói etcd không được lui. Kiểm lại bằng `kubeadm upgrade plan`, `kubeadm upgrade apply --dry-run`, và diễn tập trên một cụm thử dựng từ đúng `kubeadm-config` của production.
+
+</Callout>
+<Callout kind="link">
+
+K4.1 dựng cụm này và giải thích kho gói theo minor; K1.3 dạy tắt êm, lý do `web` chịu được việc bị rút. K4.2 dựng cấu trúc ba control plane, nơi việc nâng từng máy không làm API vắng mặt. K4.4 đi tiếp với phần còn lại của vòng đời node: tắt node không báo trước, vá hệ điều hành, thay node. K4.5 chụp etcd trước khi nâng và gia hạn chứng chỉ, việc mà `upgrade apply` vừa làm hộ. K4.7 dùng lại `crictl logs` để chẩn đoán static pod. K5.2 đi sâu vào drain và PodDisruptionBudget; D8.5 dạy vá theo lô với canary; K10 nâng cấp bằng cách thay node qua Cluster API; D13 đưa cấu hình cụm vào Git.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d13.3.mastery-plan">Viết được kế hoạch nâng một cụm kubeadm lên minor kế tiếp: việc kiểm trước, thứ tự từng thành phần, lệnh trên từng loại node, điểm dừng để kiểm, và đường lui cho từng giai đoạn.</Check>
+
+<Check id="d13.3.mastery-recover">Khi `kubeadm upgrade apply` thất bại, xác định được cụm đang ở tổ hợp phiên bản nào, tìm được nguyên nhân từ log của static pod, và quyết định được có căn cứ giữa sửa rồi chạy lại, hạ cấp etcd bằng quy trình của nó, và khôi phục từ bản chép.</Check>
+
+<Check id="d13.3.mastery-measure">Nâng được một cụm lab lên minor kế tiếp từ đầu tới cuối trong lúc có traffic, và trình bày được số đo gián đoạn của API server và của ứng dụng ở từng bước.</Check>
+
+</Mastery>

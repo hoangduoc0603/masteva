@@ -1,0 +1,992 @@
+---
+title: CSI, StorageClass, snapshot và clone
+description: Đi theo một PersistentVolumeClaim qua từng thành phần của một driver CSI, hiểu StorageClass quyết định đĩa nằm ở đâu và sống tới khi nào, mở rộng volume, chụp snapshot rồi khôi phục và clone, và biết vì sao snapshot không thay được backup.
+id: k7.1
+step: k7
+prerequisites: [k2.3]
+topics: [k7.csi-storageclass, k7.snapshot]
+status: verified
+verified:
+  date: 2026-10-13
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    csi-driver-host-path: 1.18.0
+    external-snapshotter: 8.6.0 (CRD, snapshot-controller, csi-snapshotter)
+    csi-provisioner: 6.3.0
+    csi-attacher: 4.12.0
+    csi-resizer: 2.2.1
+    local-path-provisioner: v20260820-69b56db7
+    git: 2.39.3
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+K2.3 dạy xin một ổ đĩa bằng PVC và coi StorageClass là hộp đen. Bài này mở hộp đó ra: ai tạo đĩa, ai gắn đĩa vào node, ai mount vào pod, và khi một khâu kẹt thì nhìn vào đâu. Học xong, bạn giải thích được:
+
+- Vì sao PVC đã `Bound` mà pod vẫn `Pending` với dòng `didn't match PersistentVolume's node affinity`.
+- Vì sao sửa PVC từ 1Gi lên 2Gi xong, PV đã 2Gi mà PVC vẫn báo 1Gi thêm cả phút.
+- Vì sao một PVC `ReadWriteMany` được cấp mà chưa chắc nhiều node dùng chung được.
+- Vì sao `kubectl delete namespace` xoá luôn các snapshot trong đó khi VolumeSnapshotClass có `deletionPolicy: Delete`, và vì sao snapshot không phải backup.
+
+</Goal>
+
+<Knowledge>
+
+### CSI: Kubernetes không tự biết tạo đĩa
+
+Kubernetes không chứa code nói chuyện với EBS, Ceph hay một SAN nào. Nó định nghĩa **CSI** (Container Storage Interface): một bộ lời gọi gRPC như `CreateVolume`, `NodePublishVolume`. Mỗi hệ lưu trữ tự viết một **driver** trả lời các lời gọi đó. Các plugin lưu trữ "in-tree" cũ (`awsElasticBlockStore`, `azureDisk`…) đã bị thay bằng driver CSI tương ứng.
+
+Driver CSI chỉ biết gRPC, không biết PVC là gì. Phần dịch giữa object Kubernetes và gRPC do các **sidecar** của dự án kubernetes-csi làm, dùng chung cho mọi driver:
+
+```text
+                          API server
+        PVC, PV, VolumeAttachment, VolumeSnapshotContent ...
+        ^  watch + ghi trạng thái                      ^ watch
+        |                                              |
+ +------+---------------------------------------+   +--+----------------------------+
+ | CONTROLLER PLUGIN                            |   | NODE PLUGIN                   |
+ | Deployment, 1-2 bản, node nào cũng được      |   | DaemonSet, MỖI node một pod   |
+ |                                              |   |                               |
+ |  external-provisioner   CreateVolume         |   |  node-driver-registrar:       |
+ |  external-attacher      ControllerPublish    |   |   đăng ký driver với kubelet  |
+ |  external-resizer       ControllerExpand     |   |                               |
+ |  external-snapshotter   CreateSnapshot       |   |  kubelet gọi THẲNG driver     |
+ |        | gRPC qua unix socket                |   |  qua unix socket:             |
+ |        v                                     |   |   NodeStageVolume             |
+ |  driver (controller service)                 |   |   NodePublishVolume           |
+ |        | API của hệ lưu trữ                  |   |   NodeExpandVolume            |
+ +--------+-------------------------------------+   |  driver (node service):       |
+          v                                         |   format, mount trên node     |
+   tạo, xoá, gắn, snapshot đĩa                      +-------------------------------+
+```
+
+| Sidecar | Theo dõi | Gọi driver | Kết quả ghi lại |
+|---|---|---|---|
+| `external-provisioner` | PVC chưa có PV | `CreateVolume`, `DeleteVolume` | Object PV |
+| `external-attacher` | VolumeAttachment | `ControllerPublishVolume`, `ControllerUnpublishVolume` | `status.attached` |
+| `external-resizer` | PVC xin dung lượng lớn hơn | `ControllerExpandVolume` | Dung lượng của PV, condition của PVC |
+| `external-snapshotter` (`csi-snapshotter`) | VolumeSnapshotContent | `CreateSnapshot`, `DeleteSnapshot` | `status.readyToUse` |
+| `node-driver-registrar` | (không theo dõi gì) | `NodeGetInfo` | kubelet ghi driver vào CSINode |
+
+Ba object cấp cụm cho bạn biết driver đang ở trạng thái nào:
+
+- **CSIDriver:** driver tự khai với cụm, mỗi driver một object. Trường quan trọng nhất là `attachRequired`: `true` nghĩa là trước khi mount phải có bước gắn đĩa vào node.
+- **CSINode:** mỗi node một object, liệt kê driver nào **đã đăng ký với kubelet của node đó**, kèm **topology key** của nó: tên label mà driver dùng để nói node thuộc zone hay vùng lưu trữ nào. Node không có tên driver ở đây thì không mount được volume của driver.
+- **VolumeAttachment:** "volume X phải được gắn vào node Y". Do `kube-controller-manager` tạo khi một pod dùng volume được xếp vào node, do `external-attacher` thực hiện.
+
+### Đường đi của một PVC, và kẹt ở đâu thì nhìn ở đâu
+
+```text
+ (1) Provision   PVC được tạo
+                 external-provisioner --CreateVolume--> đĩa mới; ghi object PV; PVC Bound
+ (2) Schedule    Pod dùng PVC; scheduler chỉ chọn node thoả nodeAffinity của PV
+ (3) Attach      kube-controller-manager tạo VolumeAttachment(PV, node)
+                 external-attacher --ControllerPublishVolume--> đĩa hiện ra trên node
+ (4) Stage       kubelet --NodeStageVolume--> format nếu đĩa trống, mount vào một
+                 thư mục chung của node:  .../plugins/kubernetes.io/csi/<driver>/<hash>/globalmount
+ (5) Publish     kubelet --NodePublishVolume--> bind-mount vào thư mục của pod:
+                 .../pods/<uid>/volumes/kubernetes.io~csi/<pv>/mount
+ (6) Container khởi động, thấy thư mục đó ở mountPath
+```
+
+Xoá pod đi ngược lại: unpublish, unstage, detach. Xoá PVC (với reclaim policy `Delete`) thì thêm `DeleteVolume`.
+
+| Kẹt ở bước | Bạn thấy | Nhìn vào |
+|---|---|---|
+| 1 | PVC `Pending`, event `ProvisioningFailed` hoặc chỉ có `ExternalProvisioning` | `kubectl describe pvc`; log container `csi-provisioner` của controller plugin |
+| 2 | Pod `Pending`, `didn't match PersistentVolume's node affinity` hoặc `exceed max volume count` | `kubectl get pv -o yaml` phần `nodeAffinity`; `kubectl get csinode` |
+| 3 | Pod `ContainerCreating`, event `FailedAttachVolume` (`Waiting for detach for volume …`; tới Kubernetes 1.35 là `Multi-Attach error for volume …`) | `kubectl get volumeattachment`; log `csi-attacher` |
+| 4, 5 | Pod `ContainerCreating`, event `FailedMount` | Log pod node plugin **trên đúng node đó**; `kubectl get csinode <node>` |
+
+Quy tắc nhớ: PVC kẹt thì hỏi controller plugin, pod kẹt ở `ContainerCreating` thì hỏi node plugin của node đó.
+
+<Check id="k7.1.csi-duong-di">Kể được hai nửa của một driver CSI và việc của từng sidecar, CSIDriver, CSINode, VolumeAttachment cho biết điều gì, và sáu bước từ lúc tạo PVC tới lúc container thấy thư mục cùng thành phần làm mỗi bước.</Check>
+
+### StorageClass: khuôn tạo đĩa
+
+K2.3 đã dùng `reclaimPolicy` và `volumeBindingMode`. Đủ các trường:
+
+| Trường | Ý nghĩa | Sửa sau khi tạo |
+|---|---|---|
+| `provisioner` | Tên driver, trùng tên object CSIDriver | Không |
+| `parameters` | Chuyển nguyên cho driver; mỗi driver một bộ riêng (loại đĩa, IOPS, số bản sao, mã hoá, `csi.storage.k8s.io/fstype`) | Không |
+| `reclaimPolicy` | `Delete` (mặc định) hoặc `Retain`, **chép vào PV lúc tạo** | Không |
+| `volumeBindingMode` | `Immediate` (mặc định) hoặc `WaitForFirstConsumer` | Không |
+| `allowVolumeExpansion` | Cho phép tăng dung lượng PVC | Được |
+| `allowedTopologies` | Chỉ tạo đĩa ở các zone hoặc node liệt kê | Được |
+| `mountOptions` | Tuỳ chọn mount, chép vào PV | Được |
+
+Cột cuối là kết quả thử trên Kubernetes 1.37. StorageClass chỉ là khuôn: PV đã đúc ra không đổi theo khi bạn sửa hay tạo lại khuôn. Muốn đổi `reclaimPolicy` của một volume đang có dữ liệu, sửa thẳng **PV** (bước 6 của lab).
+
+**StorageClass mặc định** là class có annotation `storageclass.kubernetes.io/is-default-class: "true"`; PVC không ghi `storageClassName` sẽ nhận nó. Cụm có thể có hai class mặc định cùng lúc (để chuyển đổi dần), khi đó class tạo sau cùng được dùng. Trên cloud, class mặc định thường là `Delete`: database nên có class riêng với `Retain`, không dựa vào mặc định.
+
+**Vì sao `WaitForFirstConsumer` quan trọng với topology.** Đĩa mạng của cloud thuộc một zone; đĩa cục bộ thuộc một node. Driver khai điều đó bằng topology key, và PV mang `nodeAffinity` tương ứng: pod dùng PV chỉ chạy được ở node khớp.
+
+```text
+ Immediate:              PVC --> đĩa được tạo NGAY, ở zone do driver tự chọn (ví dụ zone-a)
+                         ... sau đó pod mới xuất hiện, chỉ chạy được ở zone-b
+                             (hết chỗ ở zone-a, node pool riêng, anti-affinity)
+                         --> Pending mãi: đĩa ở zone-a không gắn được sang zone-b
+
+ WaitForFirstConsumer:   PVC Pending, chưa tạo gì
+                         pod xuất hiện --> scheduler chọn node thoả MỌI ràng buộc của pod
+                         --> provisioner tạo đĩa ở đúng zone của node đó
+```
+
+`Immediate` chỉ an toàn khi kho lưu trữ tới được từ mọi node (NFS, hệ lưu trữ phân tán trải khắp cụm). `WaitForFirstConsumer` không tạo ra kho ở nơi không có: node được chọn phải có node plugin, và hệ lưu trữ phải có chỗ ở đó.
+
+<Check id="k7.1.storageclass-truong">Kể được các trường của StorageClass, trường nào được chép vào PV lúc tạo, và giải thích được vì sao `Immediate` làm pod kẹt khi đĩa gắn với một zone hoặc một node.</Check>
+
+### Access mode: lời khai, không phải ổ khoá
+
+K2.3 đã có bảng bốn access mode. Điều cần biết thêm là **ai kiểm**:
+
+| Mode | Ai kiểm, lúc nào | Không kiểm |
+|---|---|---|
+| `ReadWriteOnce` | Bước attach: `kube-controller-manager` từ chối gắn volume sang node thứ hai (event `FailedAttachVolume`, thông báo `Waiting for detach…`), chỉ với driver có `attachRequired: true` | Nhiều pod cùng node; driver không có bước attach |
+| `ReadWriteOncePod` | Scheduler (pod thứ hai `Pending`) và kubelet | |
+| `ReadWriteMany`, `ReadOnlyMany` | Không ai trong Kubernetes | Hệ lưu trữ có thật sự cho nhiều node ghi chung không; `ReadOnlyMany` cũng không tự làm volume thành chỉ đọc |
+
+PVC ghi mode nào thì driver được hỏi mode đó lúc `CreateVolume`. Driver nghiêm túc sẽ từ chối mode nó không làm được (K2.3: `local-path` từ chối RWX). Driver dễ dãi thì cấp, và bạn chỉ biết khi pod thứ hai nằm ở node khác. Bước 2 của lab gặp đúng một driver như thế.
+
+Hệ quả vận hành của RWO: khi một node **chết hẳn**, pod thay thế ở node khác sẽ kẹt ở `ContainerCreating` với event `FailedAttachVolume`, vì VolumeAttachment cũ còn đó và không ai xác nhận được đĩa đã tháo. Phần Đào sâu nói cách xử lý.
+
+<Check id="k7.1.access-mode">Nói được với từng access mode thì thành phần nào kiểm, kiểm lúc nào, và trường hợp nào không ai kiểm.</Check>
+
+### Mở rộng volume: hai bước, hai nơi
+
+Tăng `spec.resources.requests.storage` của PVC (StorageClass phải có `allowVolumeExpansion: true`) kích hoạt hai bước ở hai nửa của driver:
+
+1. **Controller:** `external-resizer` gọi `ControllerExpandVolume`, hệ lưu trữ nới đĩa. PV báo dung lượng mới; PVC nhận condition `FileSystemResizePending`.
+2. **Node:** kubelet của node đang mount volume gọi `NodeExpandVolume`, driver nới filesystem (`resize2fs`, `xfs_growfs`). Lúc này `status.capacity` của PVC mới đổi, nên đó là con số để tin.
+
+Ba giới hạn: chỉ tăng, không giảm; bước 2 cần **một pod đang dùng** PVC, nên PVC không ai mount sẽ đứng ở `FileSystemResizePending` tới khi có pod; và `volumeClaimTemplates` của StatefulSet không sửa được: phải sửa từng PVC, rồi nếu muốn template khớp thực tế thì xoá StatefulSet với `--cascade=orphan` (pod và PVC ở lại) và tạo lại.
+
+### Snapshot và clone
+
+**Snapshot** là ảnh của một volume tại một thời điểm, do hệ lưu trữ chụp. Kubernetes mô tả nó bằng ba CRD, song song với bộ ba của volume:
+
+| Volume | Snapshot | Vai trò |
+|---|---|---|
+| StorageClass | **VolumeSnapshotClass** | Khuôn: driver nào, `deletionPolicy` (`Delete` hoặc `Retain`) |
+| PVC | **VolumeSnapshot** | Yêu cầu của người dùng, thuộc namespace |
+| PV | **VolumeSnapshotContent** | Snapshot thật trên hệ lưu trữ, cấp cụm |
+
+Ba CRD này và **snapshot-controller** không thuộc Kubernetes lõi, cũng không thuộc driver nào: người dựng cụm phải cài một lần cho cả cụm. Thiếu chúng, `kubectl apply` một VolumeSnapshot báo `no matches for kind`. snapshot-controller ghép VolumeSnapshot với VolumeSnapshotContent; sidecar `csi-snapshotter` của driver mới gọi `CreateSnapshot`.
+
+Snapshot **không khôi phục đè lên volume cũ**. Khôi phục là tạo một PVC mới có `dataSource` trỏ tới snapshot, rồi chuyển ứng dụng sang PVC đó. **Clone** là PVC mới có `dataSource` trỏ thẳng tới một PVC khác: bản sao của volume **tại lúc clone**. Cả hai đòi nguồn và đích cùng namespace, và đích không nhỏ hơn nguồn.
+
+Snapshot của driver chỉ nhất quán ở mức "như vừa rút điện" (crash-consistent): database tự phục hồi được từ WAL (write-ahead log, nhật ký nó ghi trước khi sửa file dữ liệu), nhưng dữ liệu ứng dụng còn trong bộ nhớ thì không có trong ảnh. Database cần cơ chế sao lưu riêng, K7.4 dạy.
+
+**Snapshot không phải backup**, vì nó sống chung số phận với thứ nó bảo vệ:
+
+| Sự cố | Snapshot | Backup ngoài cụm |
+|---|---|---|
+| Ghi đè, xoá nhầm dữ liệu trong volume | Cứu được | Cứu được |
+| Xoá namespace | Mất (VolumeSnapshot thuộc namespace, `deletionPolicy: Delete`) | Còn |
+| Hệ lưu trữ hỏng, mất node giữ dữ liệu, mất tài khoản cloud | Thường mất theo: snapshot nằm trong chính hệ lưu trữ hoặc tài khoản đó | Còn |
+| Xoá cả cụm | Object mất; ảnh trên hệ lưu trữ thành mồ côi hoặc bị xoá theo | Còn |
+
+<Callout kind="production">
+
+Ngày 24/05/2023, một scale unit của Azure DevOps ở Nam Brazil ngừng phục vụ khoảng 10,5 giờ. Theo [postmortem của Microsoft](https://status.dev.azure.com/_event/392143683/post-mortem), kỹ sư của họ đôi khi chụp snapshot một database production để điều tra, và một job nền chạy hằng ngày xoá các snapshot database quá hạn. Trong một pull request lớn thay thư viện gọi Azure, lời gọi xoá **database** bị đổi nhầm thành lời gọi xoá **Azure SQL Server chứa database đó**. Ở vòng triển khai nội bộ không có snapshot database nào nên job không chạy; ở vòng kế có một snapshot đủ cũ, và job xoá cả server cùng mười bảy database production trên đó. Không mất dữ liệu, nhưng khôi phục mất hơn mười giờ: phải nhờ đội Azure SQL khôi phục server (khách hàng không tự làm được), việc khôi phục chép dữ liệu sang vùng cặp đôi kéo dài thêm nhiều giờ, và web server của họ không vào lại được cân bằng tải khi còn database đang khôi phục. Trong các việc họ cam kết làm sau đó có hai việc đáng chép: tạo snapshot database trên **server khác** với production, và gắn khoá chống xoá lên tài nguyên quan trọng.
+
+Điều rút ra cho bài này (của bài): snapshot nằm chung một nơi với dữ liệu gốc thì một lệnh xoá nơi đó lấy đi cả hai. Ở Azure DevOps nơi đó là SQL Server; trên Kubernetes là namespace, và khoá chống xoá gần nhất là `Retain` trên PV và trên VolumeSnapshotClass. Thứ họ dùng để khôi phục là backup của database, không phải snapshot; và thời gian khôi phục là con số họ chỉ biết khi phải làm thật.
+
+</Callout>
+
+<Check id="k7.1.snapshot-mo-hinh">Kể được ba CRD của snapshot và object tương ứng bên volume, ai phải cài snapshot-controller, và khôi phục khác clone thế nào.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Kubernetes CSI Sidecar Containers](https://kubernetes-csi.github.io/docs/sidecar-containers.html): mỗi sidecar làm gì, theo dõi object nào; đọc khi cần biết log của container nào trả lời câu hỏi nào.
+- [Storage Classes | Kubernetes](https://kubernetes.io/docs/concepts/storage/storage-classes/): từng trường của StorageClass, phần "Volume binding mode" và "Allowed topologies".
+- [Persistent Volumes | Kubernetes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/): phần "Expanding Persistent Volumes Claims" (cả cách gỡ một lần mở rộng thất bại) và "Access Modes".
+- [Volume Snapshots | Kubernetes](https://kubernetes.io/docs/concepts/storage/volume-snapshots/): vòng đời snapshot, snapshot tạo sẵn (pre-provisioned) và `deletionPolicy`.
+- [Postmortem: Azure DevOps South Brazil, 24/05/2023](https://status.dev.azure.com/_event/392143683/post-mortem): nguồn của callout về job xoá snapshot.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cần Docker đang chạy, cùng `kind`, `kubectl`, `jq`, `yq`, `git`, `curl` (D0.2). Bài dựng cụm kind `k7-lab` gồm 1 control plane và 3 worker; K7.4 dùng lại cụm này.
+
+**Profile máy.** Cuối bài, bốn node dùng 1,4 tới 1,7 GiB RAM của Docker qua bốn lượt đo (control plane 0,7 GiB, worker có pod driver 0,3 tới 0,5 GiB, hai worker còn lại mỗi cái 0,15 tới 0,25 GiB), và bốn node chiếm khoảng 4,5 GB đĩa của Docker. Máy 8 GB: đặt Docker 4 GB và dừng VM Lima cùng các cụm kind khác. Cần đủ ba worker cho bước 3.
+
+Lab dùng hai hệ cấp volume để so sánh:
+
+| | `local-path` (có sẵn trong kind) | `csi-driver-host-path` (cài ở bước 1) |
+|---|---|---|
+| Loại | Provisioner riêng, **không phải CSI** | Driver CSI mẫu của dự án kubernetes-csi |
+| Kho nằm ở | Thư mục trên node mà pod được xếp vào | Thư mục trên **một** node, nơi pod driver chạy |
+| Snapshot, clone, mở rộng | Không | Có |
+
+`csi-driver-host-path` cài đặt đủ các lời gọi CSI nên dùng được để học cơ chế, nhưng nó **không dành cho production**: dữ liệu nằm trên một node, không nhân bản, không ép dung lượng, snapshot là một file nén cạnh dữ liệu gốc. Mỗi chỗ nó khác driver thật, bài sẽ nói.
+
+Nhiều lệnh `apply`, `wait`, `delete` trong bài có `> /dev/null` để output chỉ còn phần cần đọc. Lỗi vẫn hiện, vì kubectl in lỗi ra stderr.
+
+### 1. Dựng cụm và cài driver CSI
+
+<Terminal where="mac" title="~/masteva-k7/kind.yaml">
+
+```bash
+mkdir -p ~/masteva-k7/k7-1 && cd ~/masteva-k7
+cat > kind.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k7-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+EOF
+export KUBECONFIG=~/masteva-k7/kubeconfig
+kind create cluster --config kind.yaml
+kubectl wait --for=condition=Ready node --all --timeout=180s > /dev/null
+kubectl get storageclass
+kubectl get csidriver
+kubectl get csinode
+```
+
+</Terminal>
+
+Cuối output:
+
+<Expected>
+
+```text
+NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  27s
+No resources found
+NAME                   DRIVERS   AGE
+k7-lab-control-plane   0         31s
+k7-lab-worker          0         15s
+k7-lab-worker2         0         15s
+k7-lab-worker3         0         15s
+```
+
+</Expected>
+
+Kubeconfig nằm trong thư mục lab. **Mọi terminal dùng cho K7 phải chạy `export KUBECONFIG=~/masteva-k7/kubeconfig` trước.**
+
+Cụm có StorageClass nhưng không có CSIDriver nào, và mọi node báo 0 driver: `local-path` cấp volume mà không qua CSI. Hệ quả nằm ngay trên bảng: `ALLOWVOLUMEEXPANSION` là `false`, và nó không có khái niệm snapshot.
+
+Cài hai thứ. Thứ nhất là phần snapshot dùng chung cho cả cụm: ba CRD và snapshot-controller. Manifest ở tag `v8.6.0` còn ghi image `v8.5.0`, nên lệnh `sed` sửa lại cho khớp với sidecar `csi-snapshotter` 8.6.0 mà driver dùng.
+
+Thứ hai là driver. Dự án phát hành nó dưới dạng một script cài trong repo, không có chart. Lấy đúng tag `v1.18.0` và kiểm mã commit trước khi chạy: script tạo pod `privileged` trên cụm, nên bạn cần chắc mình chạy đúng bản đã công bố. Khối lệnh chỉ chạy script khi commit đúng là `cc78ee78ae23908c9e0607df2fe09c7ecfa52597`.
+
+<Terminal where="mac">
+
+```bash
+SNAP=https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.6.0
+for f in volumesnapshotclasses volumesnapshotcontents volumesnapshots; do
+  kubectl apply -f $SNAP/client/config/crd/snapshot.storage.k8s.io_$f.yaml > /dev/null
+done
+kubectl apply -f $SNAP/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml > /dev/null
+curl -sL $SNAP/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml \
+  | sed 's/snapshot-controller:v8.5.0/snapshot-controller:v8.6.0/' | kubectl apply -f - > /dev/null
+kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=300s | tail -1
+kubectl get crd -o name | grep snapshot.storage
+git -c advice.detachedHead=false clone -q --depth 1 --branch v1.18.0 \
+  https://github.com/kubernetes-csi/csi-driver-host-path.git
+if [ "$(git -C csi-driver-host-path rev-parse HEAD)" = cc78ee78ae23908c9e0607df2fe09c7ecfa52597 ]; then
+  HOSTPATHPLUGIN_TAG=v1.18.0 bash csi-driver-host-path/deploy/kubernetes-latest/deploy.sh > deploy.log 2>&1
+else
+  echo "Commit không khớp: không chạy deploy.sh"
+fi
+grep using deploy.log | sed 's|.*/||' | sort -u | tr '\n' ' '; echo
+kubectl rollout status statefulset/csi-hostpathplugin --timeout=300s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "snapshot-controller" successfully rolled out
+customresourcedefinition.apiextensions.k8s.io/volumesnapshotclasses.snapshot.storage.k8s.io
+customresourcedefinition.apiextensions.k8s.io/volumesnapshotcontents.snapshot.storage.k8s.io
+customresourcedefinition.apiextensions.k8s.io/volumesnapshots.snapshot.storage.k8s.io
+csi-attacher:v4.12.0 csi-external-health-monitor-controller:v0.18.0 csi-node-driver-registrar:v2.17.0 csi-provisioner:v6.3.0 csi-resizer:v2.2.1 csi-snapshotter:v8.6.0 hostpathplugin:v1.18.0 livenessprobe:v2.19.0 
+partitioned roll out complete: 1 new pods have been updated...
+```
+
+</Expected>
+
+Cả khối mất vài phút vì phải kéo chín image; dòng liệt kê tám image là bằng chứng script đã chạy, và nếu lệnh cuối báo lỗi thì đọc `deploy.log`. Biến `HOSTPATHPLUGIN_TAG` ép image của driver về đúng `v1.18.0` (manifest trong tag còn ghi bản trước). Script cài mọi thứ vào namespace `default`.
+
+<Terminal where="mac">
+
+```bash
+kubectl get pod csi-hostpathplugin-0 -o custom-columns='POD:.metadata.name,NODE:.spec.nodeName,READY:.status.containerStatuses[*].ready'
+kubectl get pod csi-hostpathplugin-0 -o jsonpath='{.spec.containers[*].name}{"\n"}'
+kubectl get csidriver -o custom-columns='NAME:.metadata.name,ATTACHREQUIRED:.spec.attachRequired'
+kubectl get csinode -o custom-columns='NODE:.metadata.name,DRIVER:.spec.drivers[*].name,TOPOLOGY-KEY:.spec.drivers[*].topologyKeys[*]'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+POD                    NODE             READY
+csi-hostpathplugin-0   k7-lab-worker3   true,true,true,true,true,true,true,true
+hostpath csi-external-health-monitor-controller node-driver-registrar liveness-probe csi-attacher csi-provisioner csi-resizer csi-snapshotter
+NAME                  ATTACHREQUIRED
+hostpath.csi.k8s.io   true
+NODE                   DRIVER                TOPOLOGY-KEY
+k7-lab-control-plane   <none>                <none>
+k7-lab-worker          <none>                <none>
+k7-lab-worker2         <none>                <none>
+k7-lab-worker3         hostpath.csi.k8s.io   topology.hostpath.csi/node
+```
+
+</Expected>
+
+Đối chiếu với sơ đồ ở phần Kiến thức:
+
+- Driver mẫu gộp cả hai nửa vào **một pod tám container**: `hostpath` là driver; `csi-provisioner`, `csi-attacher`, `csi-resizer`, `csi-snapshotter` là bốn sidecar phía controller; `node-driver-registrar` là sidecar phía node; hai container còn lại theo dõi sức khoẻ. Driver thật tách thành một Deployment và một DaemonSet, nhưng tên container giống hệt: `kubectl logs <pod> -c csi-provisioner` dùng được ở mọi driver.
+- Có object CSIDriver, và **chỉ một node** có driver trong CSINode: node mà pod driver được xếp vào (ở đây `k7-lab-worker3`; máy bạn có thể là worker khác). `topology.hostpath.csi/node` là topology key của driver, tương đương `topology.kubernetes.io/zone` của đĩa cloud; node đó cũng nhận một label cùng tên.
+
+<Check id="k7.1.lab-thanh-phan">Cài được CRD snapshot, snapshot-controller và một driver CSI, chỉ ra được container nào thuộc nửa controller, container nào thuộc nửa node, và đọc được CSINode để biết node nào dùng được driver.</Check>
+
+### 2. Theo dấu một PVC
+
+Tạo một StorageClass cho driver, với `Immediate` để thấy volume được tạo mà chưa cần pod, rồi một PVC.
+
+<Terminal where="mac" title="~/masteva-k7/k7-1/sc.yaml, data.yaml">
+
+```bash
+kubectl create namespace k7
+kubectl config set-context --current --namespace k7 > /dev/null
+cd ~/masteva-k7/k7-1
+cat > sc.yaml <<'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-lab
+provisioner: hostpath.csi.k8s.io
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+EOF
+cat > data.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  storageClassName: csi-lab
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+kubectl apply -f sc.yaml -f data.yaml
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/data --timeout=60s > /dev/null
+kubectl get events --field-selector involvedObject.name=data -o custom-columns='REASON:.reason,FROM:.source.component' | cut -c1-70
+kubectl get pv -o yaml | yq '.items[0].spec | {"driver": .csi.driver, "volumeHandle": .csi.volumeHandle,
+  "nodeAffinity": .nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0], "reclaim": .persistentVolumeReclaimPolicy}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k7 created
+storageclass.storage.k8s.io/csi-lab created
+persistentvolumeclaim/data created
+REASON                  FROM
+ExternalProvisioning    persistentvolume-controller
+Provisioning            hostpath.csi.k8s.io_csi-hostpathplugin-0_3b27f
+ProvisioningSucceeded   hostpath.csi.k8s.io_csi-hostpathplugin-0_3b27f
+driver: hostpath.csi.k8s.io
+volumeHandle: 4d72e666-c6a8-11f1-9b93-7ef07bc750a0
+nodeAffinity:
+  key: topology.hostpath.csi/node
+  operator: In
+  values:
+    - k7-lab-worker3
+reclaim: Delete
+```
+
+</Expected>
+
+Bước 1 của đường đi, đọc từ event: controller của Kubernetes chỉ ghi "đang chờ một provisioner bên ngoài" rồi đứng yên; `external-provisioner` trong pod driver nhận việc và báo xong. PV sinh ra mang ba thứ: `volumeHandle` là mã của volume **phía hệ lưu trữ** (với EBS là `vol-…`), `nodeAffinity` theo topology key của driver, và `reclaim` chép từ StorageClass. Mã và tên trong output của bạn sẽ khác.
+
+Giờ cho một pod dùng nó, và ghi một dòng "đơn hàng" để các bước sau có dữ liệu.
+
+<Terminal where="mac" title="~/masteva-k7/k7-1/app.yaml">
+
+```bash
+cat > app.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: data
+EOF
+kubectl apply -f app.yaml
+kubectl wait --for=condition=Ready pod/app --timeout=120s > /dev/null
+kubectl exec app -- sh -c 'echo "don 1001" >> /data/orders.txt'
+kubectl get volumeattachment -o custom-columns='ATTACHER:.spec.attacher,PV:.spec.source.persistentVolumeName,NODE:.spec.nodeName,ATTACHED:.status.attached'
+DNODE=$(kubectl -n default get pod csi-hostpathplugin-0 -o jsonpath='{.spec.nodeName}')
+docker exec $DNODE cat /var/lib/csi-hostpath-data/state.json | jq -r '.Volumes[] | .VolID, .Staged[0], .Published[0]'
+kubectl -n default logs csi-hostpathplugin-0 -c hostpath \
+  | grep -oE 'GRPC call: /csi.v1.(Controller|Node)/[A-Za-z]+' \
+  | grep -vE 'GetCapabilities|GetInfo|ListVolumes|GetVolumeStats'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/app created
+ATTACHER              PV                                         NODE             ATTACHED
+hostpath.csi.k8s.io   pvc-debef469-9ded-49bf-93b5-a84c7546edb9   k7-lab-worker3   true
+4d72e666-c6a8-11f1-9b93-7ef07bc750a0
+/var/lib/kubelet/plugins/kubernetes.io/csi/hostpath.csi.k8s.io/666ac1b3a2724f20347418692b5b9709c9b28700a013d55c777fb28aa4e346a2/globalmount
+/var/lib/kubelet/pods/51748543-d43f-4ac4-a464-a44599bb63b9/volumes/kubernetes.io~csi/pvc-debef469-9ded-49bf-93b5-a84c7546edb9/mount
+GRPC call: /csi.v1.Controller/CreateVolume
+GRPC call: /csi.v1.Node/NodeStageVolume
+GRPC call: /csi.v1.Node/NodePublishVolume
+```
+
+</Expected>
+
+Mỗi dòng ứng với một bước của sơ đồ:
+
+- **Attach:** có một VolumeAttachment nối PV với node, `ATTACHED: true`.
+- **Stage và Publish:** file trạng thái của driver (đọc thẳng trên node) ghi mã volume cùng đúng hai đường dẫn của bước 4 và 5: thư mục `globalmount` chung của node, và thư mục trong `pods/<uid>/` của riêng pod `app`.
+- **Ba lời gọi gRPC**, theo đúng thứ tự: một của controller, hai của node.
+
+Thiếu `ControllerPublishVolume`: driver mẫu không có đĩa nào để gắn, nên `csi-attacher` chỉ đánh dấu VolumeAttachment là xong (log của nó ghi `using trivial handler`). Với đĩa mạng thật, đây là lúc driver gọi API của cloud, thường mất vài giây tới vài chục giây, và là khâu hay kẹt nhất.
+
+<Callout kind="danger">
+
+Từ đây tới hết bài có các lệnh xoá pod, PVC và cả namespace. Trên cụm thật, cùng những lệnh này xoá đĩa có dữ liệu. Trước khi chạy, kiểm `kubectl config current-context` in ra `kind-k7-lab`.
+
+</Callout>
+
+Access mode. Kho của driver này nằm trên một node duy nhất. Xin thêm hai PVC: một `ReadWriteMany` (nhiều node cùng ghi), một `ReadWriteOncePod`, rồi cho hai pod cùng dùng PVC thứ hai.
+
+<Terminal where="mac">
+
+```bash
+yq '.metadata.name = "chung" | .spec.accessModes = ["ReadWriteMany"]' data.yaml | kubectl apply -f - > /dev/null
+yq '.metadata.name = "rieng" | .spec.accessModes = ["ReadWriteOncePod"]' data.yaml | kubectl apply -f - > /dev/null
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/chung pvc/rieng --timeout=60s > /dev/null
+yq '.metadata.name = "rieng-a" | .spec.volumes[0].persistentVolumeClaim.claimName = "rieng"' app.yaml | kubectl apply -f - > /dev/null
+kubectl wait --for=condition=Ready pod/rieng-a --timeout=120s > /dev/null
+yq '.metadata.name = "rieng-b" | .spec.volumes[0].persistentVolumeClaim.claimName = "rieng"' app.yaml | kubectl apply -f - > /dev/null
+until kubectl get events --field-selector involvedObject.name=rieng-b,reason=FailedScheduling -o name | grep -q .; do sleep 1; done
+kubectl get pvc -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,MODES:.spec.accessModes'
+kubectl get pods -o custom-columns='NAME:.metadata.name,STATUS:.status.phase'
+kubectl get events --field-selector involvedObject.name=rieng-b,reason=FailedScheduling -o jsonpath='{.items[0].message}{"\n"}' | sed 's/ preemption:.*//'
+kubectl delete pod rieng-a rieng-b --now > /dev/null
+kubectl delete pvc chung rieng > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME    STATUS   MODES
+chung   Bound    [ReadWriteMany]
+data    Bound    [ReadWriteOnce]
+rieng   Bound    [ReadWriteOncePod]
+NAME      STATUS
+app       Running
+rieng-a   Running
+rieng-b   Pending
+0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) unavailable due to PersistentVolumeClaim with ReadWriteOncePod access mode already in-use by another pod.
+```
+
+</Expected>
+
+Hai kết quả ngược nhau:
+
+- PVC `chung` được cấp và `Bound` ngay, dù kho chỉ ở một node. Driver mẫu nhận mọi access mode mà không kiểm mình làm được hay không; Kubernetes cũng không kiểm. PV của nó vẫn mang `nodeAffinity` về một node, nên "nhiều node" không bao giờ thành sự thật. So với K2.3: `local-path` từ chối RWX ngay lúc cấp. Access mode trên PVC là lời bạn khai và lời driver hứa; đọc tài liệu của driver trước khi tin.
+- `ReadWriteOncePod` là mode duy nhất được kiểm tới từng pod: scheduler không cho `rieng-b` vào node nào. Dùng nó cho database một bản, nơi hai tiến trình cùng mở một thư mục dữ liệu là hỏng dữ liệu.
+
+<Check id="k7.1.lab-theo-dau">Chỉ ra được bằng lệnh từng bước của một PVC: event của provisioner, `volumeHandle` và `nodeAffinity` trên PV, VolumeAttachment, hai đường dẫn stage và publish trên node, các lời gọi gRPC trong log driver; và chứng minh được RWX được cấp mà không ai kiểm, còn RWOP thì scheduler kiểm.</Check>
+
+### 3. `volumeBindingMode` và topology
+
+Kho của `csi-driver-host-path` nằm trên một node (gọi là `DNODE`); kho của `local-path` có ở mọi node. Dùng cặp này để thấy thứ tự "tạo đĩa trước" hay "chọn node trước" quyết định điều gì. `OTHER` là một worker không có kho của driver, đóng vai "zone duy nhất còn chỗ cho pod".
+
+<Terminal where="mac" title="~/masteva-k7/k7-1/ghim.yaml">
+
+```bash
+OTHER=$(kubectl get nodes -o name | grep worker | grep -vx "node/$DNODE" | head -1 | cut -d/ -f2)
+echo "kho của driver: $DNODE; pod bị ghim vào: $OTHER"
+yq '.metadata.name = "som"' data.yaml | kubectl apply -f - > /dev/null
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/som --timeout=60s
+cat > ghim.yaml <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ghim
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $OTHER
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: som
+EOF
+kubectl apply -f ghim.yaml
+until kubectl get events --field-selector involvedObject.name=ghim,reason=FailedScheduling -o name | grep -q .; do sleep 1; done
+kubectl get pod ghim -o custom-columns='NAME:.metadata.name,STATUS:.status.phase'
+kubectl get events --field-selector involvedObject.name=ghim,reason=FailedScheduling -o jsonpath='{.items[0].message}{"\n"}' | sed 's/ preemption:.*//'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kho của driver: k7-lab-worker3; pod bị ghim vào: k7-lab-worker
+persistentvolumeclaim/som condition met
+pod/ghim created
+NAME   STATUS
+ghim   Pending
+0/4 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity, 1 node(s) had untolerated taint(s), 2 node(s) didn't match Pod's node affinity/selector.
+```
+
+</Expected>
+
+PVC `Bound` từ trước khi pod tồn tại, nên đĩa đã nằm ở `DNODE`. Pod chỉ chạy được ở `OTHER`. Scheduler đếm đủ bốn node: một node pod được vào nhưng đĩa không nằm ở đó (`OTHER`), hai node pod không được vào vì `nodeSelector` (trong đó có `DNODE`, nơi đĩa đang nằm), một control plane có taint. PV không dời được sang node khác. Hai lối ra giữ được dữ liệu: đưa pod về nơi có đĩa, hoặc chép dữ liệu sang một volume mới ở đúng chỗ (snapshot rồi khôi phục như bước 5, nếu hệ lưu trữ cho khôi phục sang vùng khác). Xoá PVC rồi tạo lại là mất dữ liệu. Trên cloud, câu `didn't match PersistentVolume's node affinity` (Kubernetes trước 1.33 ghi `volume node affinity conflict`) gần như luôn là chuyện này: đĩa ở zone này, node còn chỗ ở zone khác.
+
+Giờ cùng pod đó với một PVC của `standard`, class `WaitForFirstConsumer` có kho ở mọi node:
+
+<Terminal where="mac">
+
+```bash
+kubectl delete pod ghim --now > /dev/null
+yq '.metadata.name = "tre" | .spec.storageClassName = "standard"' data.yaml | kubectl apply -f - > /dev/null
+kubectl get pvc tre -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CLASS:.spec.storageClassName'
+sed 's/claimName: som/claimName: tre/' ghim.yaml | kubectl apply -f - > /dev/null
+kubectl wait --for=condition=Ready pod/ghim --timeout=120s
+kubectl get pv --sort-by=.spec.claimRef.name -o custom-columns='CLAIM:.spec.claimRef.name,CLASS:.spec.storageClassName,NODE:.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]'
+kubectl delete pod ghim --now > /dev/null
+kubectl delete pvc som tre > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME   STATUS    CLASS
+tre    Pending   standard
+pod/ghim condition met
+CLAIM   CLASS      NODE
+data    csi-lab    k7-lab-worker3
+som     csi-lab    k7-lab-worker3
+tre     standard   k7-lab-worker
+```
+
+</Expected>
+
+PVC `tre` chờ. Khi pod xuất hiện, scheduler chọn `OTHER` (node duy nhất thoả pod), rồi provisioner mới tạo volume **ở đó**. Thứ tự đảo lại, và pod chạy.
+
+`WaitForFirstConsumer` để scheduler chọn trước, nhưng không tạo ra kho ở nơi driver không có mặt. Khi soạn bài, thử thêm một StorageClass `WaitForFirstConsumer` cho driver CSI của lab với đúng pod ghim vào `OTHER`: PVC đứng ở `Pending` với event `error generating accessibility requirements: no topology key found for node k7-lab-worker`, vì CSINode của `OTHER` không có driver (bước 1 đã in). Trên cụm thật đây là lỗi triển khai hay gặp: DaemonSet node plugin thiếu toleration nên không chạy trên một node pool có taint, và mọi pod dùng PVC trên pool đó kẹt. Khi PVC `WaitForFirstConsumer` kẹt, `kubectl get csinode` là lệnh đầu tiên.
+
+<Check id="k7.1.lab-binding">Tái hiện được pod `Pending` vì PV `Immediate` nằm ở node khác với node pod chạy được, và thấy được `WaitForFirstConsumer` tạo volume theo node của pod.</Check>
+
+### 4. Mở rộng volume
+
+<Predict question="Sửa PVC `data` từ 1Gi lên 2Gi. Vài giây sau, PV báo 2Gi nhưng PVC vẫn 1Gi. Có lỗi không?">
+
+Không. Hai bước của mở rộng chạy ở hai nơi. Bước controller xong ngay, nên PV đã 2Gi. Bước node do kubelet làm, và kubelet chỉ nhận ra PV đã đổi ở lượt đồng bộ định kỳ của nó; ở lab này là 40 tới khoảng 80 giây sau. Trong lúc chờ, PVC mang condition `FileSystemResizePending`.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl patch pvc data --type merge -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
+kubectl wait --for=condition=FileSystemResizePending pvc/data --timeout=60s > /dev/null
+kubectl get pv "$(kubectl get pvc data -o jsonpath='{.spec.volumeName}')" -o custom-columns='CLAIM:.spec.claimRef.name,PV-CAPACITY:.spec.capacity.storage'
+kubectl get pvc data -o json | jq -c '{xin: .spec.resources.requests.storage, dang_co: .status.capacity.storage,
+  dieu_kien: [.status.conditions[] | select(.status == "True") | .type], trang_thai: .status.allocatedResourceStatuses}'
+kubectl wait --for=jsonpath='{.status.capacity.storage}'=2Gi pvc/data --timeout=240s
+kubectl get events --field-selector involvedObject.name=data -o custom-columns='REASON:.reason,FROM:.source.component' | grep -iE 'resiz|expand' | cut -c1-70
+kubectl -n default logs csi-hostpathplugin-0 -c hostpath | grep -E 'GRPC call: /csi.v1.[A-Za-z]+/[A-Za-z]+ExpandVolume' | awk '{print $2, $NF}' | cut -c1-8,16-
+kubectl exec app -- df -h /data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+persistentvolumeclaim/data patched
+CLAIM   PV-CAPACITY
+data    2Gi
+{"xin":"2Gi","dang_co":"1Gi","dieu_kien":["Resizing","FileSystemResizePending"],"trang_thai":{"storage":"NodeResizePending"}}
+persistentvolumeclaim/data condition met
+ExternalExpanding            volume_expand
+Resizing                     external-resizer hostpath.csi.k8s.io
+FileSystemResizeRequired     external-resizer hostpath.csi.k8s.io
+FileSystemResizeSuccessful   kubelet
+01:49:49 /csi.v1.Controller/ControllerExpandVolume
+01:50:45 /csi.v1.Node/NodeExpandVolume
+Filesystem                Size      Used Available Use% Mounted on
+/dev/vda1               117.8G    100.9G     10.9G  90% /data
+```
+
+</Expected>
+
+Hai lời gọi cách nhau 56 giây ở lượt này; qua các lượt đo là 40 tới khoảng 80 giây (giờ trong log là UTC). Các event kể lại đúng hai bước, và ứng dụng không phải khởi động lại.
+
+Dòng `df` là chỗ driver mẫu khác driver thật: volume của nó là một thư mục trên đĩa của node, nên "2Gi" chỉ là sổ sách, pod vẫn thấy cả ổ đĩa. Với đĩa thật, sau `NodeExpandVolume` dòng này mới nhảy lên 2G.
+
+Hai giới hạn, đã thử khi soạn bài. Sửa PVC `data` ngược về 1Gi bị API server từ chối: `field can not be less than status.capacity`; cần volume nhỏ hơn thì tạo volume mới và chép dữ liệu sang. Và tăng một PVC của `standard` (class không có `allowVolumeExpansion: true`) bị từ chối ngay: `only dynamically provisioned pvc can be resized and the storageclass that provisions the pvc must support resize`.
+
+<Check id="k7.1.lab-mo-rong">Mở rộng được một PVC đang có pod dùng, chỉ ra được hai bước qua condition, event và hai lời gọi gRPC, và giải thích được vì sao PV đổi dung lượng trước PVC.</Check>
+
+### 5. Snapshot, làm hỏng, khôi phục và clone
+
+Ghi thêm hai đơn hàng rồi chụp snapshot.
+
+<Terminal where="mac" title="~/masteva-k7/k7-1/snap.yaml">
+
+```bash
+kubectl exec app -- sh -c 'echo "don 1002" >> /data/orders.txt; echo "don 1003" >> /data/orders.txt'
+cat > snap.yaml <<'EOF'
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: data-truoc-khi-sua
+spec:
+  volumeSnapshotClassName: csi-hostpath-snapclass
+  source:
+    persistentVolumeClaimName: data
+EOF
+kubectl apply -f snap.yaml
+kubectl wait --for=jsonpath='{.status.readyToUse}'=true volumesnapshot/data-truoc-khi-sua --timeout=60s > /dev/null
+kubectl get volumesnapshot -o custom-columns='NAME:.metadata.name,READY:.status.readyToUse,SOURCE:.spec.source.persistentVolumeClaimName,SIZE:.status.restoreSize'
+kubectl get volumesnapshotcontent -o custom-columns='READY:.status.readyToUse,POLICY:.spec.deletionPolicy,SNAPSHOT:.spec.volumeSnapshotRef.name,HANDLE:.status.snapshotHandle'
+docker exec $DNODE ls /var/lib/csi-hostpath-data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+volumesnapshot.snapshot.storage.k8s.io/data-truoc-khi-sua created
+NAME                 READY   SOURCE   SIZE
+data-truoc-khi-sua   true    data     2Gi
+READY   POLICY   SNAPSHOT             HANDLE
+true    Delete   data-truoc-khi-sua   8201baa2-c6a8-11f1-9b93-7ef07bc750a0
+4d72e666-c6a8-11f1-9b93-7ef07bc750a0
+8201baa2-c6a8-11f1-9b93-7ef07bc750a0.snap
+state.json
+```
+
+</Expected>
+
+Cùng hình dạng với bộ ba của volume: VolumeSnapshot của bạn, VolumeSnapshotContent do hệ thống sinh ra, và `HANDLE` là mã của snapshot phía hệ lưu trữ. VolumeSnapshotClass `csi-hostpath-snapclass` do script cài driver tạo sẵn, với `deletionPolicy: Delete`. Dòng `ls` cho thấy snapshot của driver mẫu là gì: một file `.snap` (bản nén của thư mục dữ liệu) **nằm ngay cạnh** thư mục volume, trên cùng một node. Hệ lưu trữ thật chụp nhanh hơn nhiều nhờ copy-on-write (không chép cả đĩa, chỉ giữ lại bản cũ của những khối bị ghi đè sau lúc chụp), nhưng vị trí thì tương tự: Ceph và Longhorn giữ snapshot ngay trong cụm lưu trữ; đĩa cloud giữ ở một dịch vụ khác nhưng vẫn cùng tài khoản và cùng vùng.
+
+Giờ làm hỏng dữ liệu: một lệnh sửa sai xoá mất đơn 1002, rồi ứng dụng ghi tiếp đơn 1004. Sau đó tạo hai PVC mới: `data-khoi-phuc` từ snapshot, và `data-clone` clone thẳng từ PVC `data`.
+
+<Predict question="Mỗi PVC mới chứa những đơn nào?">
+
+`data-khoi-phuc` chứa 1001, 1002, 1003: trạng thái lúc chụp. `data-clone` chứa 1001, 1003, 1004: trạng thái **lúc clone**, tức đã hỏng. Clone không phải cách quay về quá khứ; nó dùng để lấy một bản sao của hiện tại, ví dụ dựng môi trường thử từ dữ liệu thật. Và không cái nào có đủ cả 1002 lẫn 1004: khôi phục từ snapshot là mất mọi thứ ghi sau lúc chụp, trừ khi bạn tự ghép lại.
+
+</Predict>
+
+<Terminal where="mac" title="~/masteva-k7/k7-1/restore.yaml">
+
+```bash
+kubectl exec app -- sh -c 'sed -i "/1002/d" /data/orders.txt; echo "don 1004" >> /data/orders.txt; cat /data/orders.txt'
+cat > restore.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-khoi-phuc
+spec:
+  storageClassName: csi-lab
+  dataSource:
+    name: data-truoc-khi-sua
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+EOF
+kubectl apply -f restore.yaml
+yq '.metadata.name = "data-clone" | .spec.dataSource = {"name": "data", "kind": "PersistentVolumeClaim"}' restore.yaml \
+  | kubectl apply -f -
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/data-khoi-phuc pvc/data-clone --timeout=60s > /dev/null
+yq '.metadata.name = "xem" | .spec.containers[0].volumeMounts = [{"name": "a", "mountPath": "/khoi-phuc"}, {"name": "b", "mountPath": "/clone"}]
+  | .spec.volumes = [{"name": "a", "persistentVolumeClaim": {"claimName": "data-khoi-phuc"}}, {"name": "b", "persistentVolumeClaim": {"claimName": "data-clone"}}]' app.yaml \
+  | kubectl apply -f - > /dev/null
+kubectl wait --for=condition=Ready pod/xem --timeout=120s > /dev/null
+kubectl exec xem -- sh -c 'for d in khoi-phuc clone; do echo "== $d"; cat /$d/orders.txt; done'
+kubectl delete pod app xem --now > /dev/null
+kubectl delete pvc data-clone > /dev/null
+sed 's/claimName: data/claimName: data-khoi-phuc/' app.yaml | kubectl apply -f -
+kubectl wait --for=condition=Ready pod/app --timeout=120s > /dev/null
+kubectl exec app -- cat /data/orders.txt
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+don 1001
+don 1003
+don 1004
+persistentvolumeclaim/data-khoi-phuc created
+persistentvolumeclaim/data-clone created
+== khoi-phuc
+don 1001
+don 1002
+don 1003
+== clone
+don 1001
+don 1003
+don 1004
+pod/app created
+don 1001
+don 1002
+don 1003
+```
+
+</Expected>
+
+Cả hai PVC dùng lại đúng đường đi của bước 2; khác biệt duy nhất là `CreateVolume` nhận thêm nguồn. Bốn lệnh cuối hoàn tất việc khôi phục: bỏ bản clone, tạo lại pod `app` trỏ vào PVC mới, và ứng dụng thấy lại đơn 1002.
+
+Với Deployment hay StatefulSet thật, bước chuyển này là sửa `claimName` (hoặc tạo lại PVC đúng tên cũ từ snapshot) trong lúc ứng dụng dừng: khôi phục từ snapshot luôn có một khoảng ngừng, và nên được tập trước.
+
+<Check id="k7.1.lab-snapshot">Chụp được snapshot, chỉ ra VolumeSnapshotContent và nơi snapshot thật nằm, khôi phục dữ liệu đã hỏng sang một PVC mới, và giải thích được vì sao bản clone không cứu được dữ liệu.</Check>
+
+### 6. Xoá namespace: cái gì mất, cái gì còn
+
+Namespace `k7` giờ có PVC `data` (bản hỏng), `data-khoi-phuc` (bản tốt, ứng dụng đang dùng) và một snapshot. Giả sử `data-khoi-phuc` là dữ liệu không được phép mất. Thử đổi StorageClass sang `Retain`, rồi đổi đúng chỗ, rồi chạy loại lệnh mà callout ở phần Kiến thức kể: xoá cả nơi chứa, ở đây là namespace.
+
+<Terminal where="mac">
+
+```bash
+kubectl patch storageclass csi-lab -p '{"reclaimPolicy":"Retain"}'
+PV=$(kubectl get pvc data-khoi-phuc -o jsonpath='{.spec.volumeName}')
+kubectl patch pv $PV -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' > /dev/null
+kubectl get pv --sort-by=.spec.claimRef.name -o custom-columns='CLAIM:.spec.claimRef.name,RECLAIM:.spec.persistentVolumeReclaimPolicy,STATUS:.status.phase'
+kubectl config current-context
+kubectl delete namespace k7
+kubectl get pv --sort-by=.spec.claimRef.name -o custom-columns='CLAIM:.spec.claimRef.name,RECLAIM:.spec.persistentVolumeReclaimPolicy,STATUS:.status.phase'
+kubectl get volumesnapshotcontent
+docker exec $DNODE ls /var/lib/csi-hostpath-data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+The StorageClass "csi-lab" is invalid: reclaimPolicy: Invalid value: null: field is immutable
+CLAIM            RECLAIM   STATUS
+data             Delete    Bound
+data-khoi-phuc   Retain    Bound
+kind-k7-lab
+namespace "k7" deleted
+CLAIM            RECLAIM   STATUS
+data-khoi-phuc   Retain    Released
+No resources found
+82ecdc5c-c6a8-11f1-9b93-7ef07bc750a0
+state.json
+```
+
+</Expected>
+
+`reclaimPolicy` của StorageClass không sửa được, và có sửa được cũng không ảnh hưởng PV đã tạo: chính sách có hiệu lực là dòng trên **PV**. Sau một lệnh xoá namespace:
+
+- PVC `data` mất, PV `Delete` của nó mất, thư mục dữ liệu mất.
+- **Snapshot mất cả ba tầng:** VolumeSnapshot thuộc namespace nên bị xoá theo, VolumeSnapshotContent có `deletionPolicy: Delete` nên bị xoá theo, và file `.snap` trên node cũng không còn. Thứ lẽ ra cứu được dữ liệu đã đi cùng dữ liệu.
+- Chỉ PV có `Retain` ở lại, trạng thái `Released`, thư mục của nó còn nguyên.
+
+Nhận lại PV đó theo cách của K2.3 (bước 3): gỡ `claimRef`, tạo PVC chỉ đích danh `volumeName`.
+
+<Terminal where="mac">
+
+```bash
+kubectl create namespace k7
+kubectl patch pv $PV --type json -p '[{"op":"remove","path":"/spec/claimRef"}]' > /dev/null
+yq "del(.spec.dataSource) | .spec.volumeName = \"$PV\"" restore.yaml | kubectl apply -f -
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/data-khoi-phuc --timeout=60s > /dev/null
+sed 's/claimName: data/claimName: data-khoi-phuc/' app.yaml | kubectl apply -f -
+kubectl wait --for=condition=Ready pod/app --timeout=120s > /dev/null
+kubectl exec app -- cat /data/orders.txt
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k7 created
+persistentvolumeclaim/data-khoi-phuc created
+pod/app created
+don 1001
+don 1002
+don 1003
+```
+
+</Expected>
+
+`Retain` cứu được volume khỏi một lệnh xoá nhầm. Nó không cứu được khi node giữ dữ liệu hỏng, khi hệ lưu trữ lỗi, hay khi dữ liệu bị ghi đè từ bên trong. Ba lớp bảo vệ xếp theo thứ tự: `Retain` cho lệnh xoá nhầm object; snapshot cho việc quay lại nhanh trong cùng hệ lưu trữ; backup ra ngoài cụm (K7.4 cho database, D20 cho cả cụm) cho mọi thứ còn lại.
+
+<Check id="k7.1.lab-retain">Đổi được reclaim policy của một PV đang có dữ liệu, chỉ ra được sau khi xoá namespace thì volume, snapshot và dữ liệu trên node cái nào còn cái nào mất, và gắn lại được PV `Released` cho một PVC mới.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `kubectl apply` VolumeSnapshot báo `no matches for kind "VolumeSnapshot"` | Chưa cài CRD snapshot | `kubectl get crd \| grep snapshot.storage` |
+| VolumeSnapshot đứng ở `READY: false`, không có VolumeSnapshotContent | Chưa có snapshot-controller, hoặc sai tên VolumeSnapshotClass | `kubectl -n kube-system get deploy snapshot-controller`; `kubectl describe volumesnapshot` |
+| PVC `Pending`, chỉ có event `ExternalProvisioning` | Controller plugin của driver không chạy, hoặc `provisioner` trong StorageClass sai tên | `kubectl get csidriver`; log container `csi-provisioner` |
+| PVC từ snapshot `Pending`, event `requested volume size … is less than the size … for the source snapshot` | PVC đích nhỏ hơn snapshot | Xin dung lượng bằng hoặc lớn hơn `restoreSize` |
+| PVC `WaitForFirstConsumer` `Pending`, event `no topology key found for node` | Node được chọn không có node plugin | `kubectl get csinode`; xem DaemonSet node plugin có thiếu toleration không |
+| PVC đứng mãi ở `FileSystemResizePending` | Không có pod nào đang mount PVC | Tạo một pod dùng PVC đó |
+| Xoá pod và PVC xong, node vẫn ghi volume trong `status.volumesInUse`, VolumeAttachment không mất, kubelet lặp `UnmountVolume.TearDown failed` | Pod bị xoá cưỡng bức (grace period 0), nên PVC và volume bị xoá trước khi kubelet kịp unmount. Bản nháp của lab này gặp đúng lỗi đó khi đặt `terminationGracePeriodSeconds: 0` | Không xoá cưỡng bức pod đang mount volume; `kubectl get node <node> -o jsonpath='{.status.volumesInUse}'` |
+| `deploy.sh` dừng giữa chừng | Mạng chậm khi kéo image, hoặc chưa cài CRD snapshot | `tail deploy.log`; `kubectl describe pod csi-hostpathplugin-0`; chạy lại script |
+
+### Dọn dẹp
+
+K7.4 dùng tiếp cụm `k7-lab` nhưng không dùng driver hay namespace của bài này. PV giữ lại ở bước 6 có `Retain`: xoá PVC rồi xoá PV sẽ **để lại thư mục dữ liệu mồ côi** trên node, vì không ai gọi `DeleteVolume`. Cách bỏ một volume `Retain` cho sạch là đổi nó về `Delete` trước, rồi mới xoá PVC.
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá namespace `k7` cùng dữ liệu của PV đã giữ lại. Khối thứ hai xoá cả cụm và thư mục lab; chỉ chạy nó khi không học tiếp K7.4.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K7.4">
+
+```bash
+kubectl patch pv $PV -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}' > /dev/null
+kubectl delete namespace k7
+kubectl wait --for=delete pv/$PV --timeout=120s > /dev/null
+kubectl delete storageclass csi-lab
+kubectl config set-context --current --namespace default > /dev/null
+kubectl get pv
+docker exec $DNODE ls /var/lib/csi-hostpath-data
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace "k7" deleted
+storageclass.storage.k8s.io "csi-lab" deleted
+No resources found
+state.json
+```
+
+</Expected>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k7-lab
+rm -rf ~/masteva-k7
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Node chết hẳn, pod dùng volume RWO không chạy lại được ở node khác. Vì sao, và làm gì?">
+
+Volume RWO chỉ được gắn vào một node. Khi node chết, VolumeAttachment cũ vẫn còn: không ai xác nhận được đĩa đã tháo khỏi máy đó, và nếu máy chỉ mất mạng chứ chưa chết, gắn đĩa sang node khác là để hai máy cùng ghi một đĩa. Nên Kubernetes chờ. Pod trên node chết đứng ở `Terminating` vì không còn kubelet để xác nhận nó đã dừng. Với Deployment, sau khoảng 5 phút (`tolerationSeconds` mặc định, K5.1) pod cũ bị đánh dấu xoá, pod thay được tạo ở node khác và kẹt ở `ContainerCreating` với event `FailedAttachVolume`: `Waiting for detach for volume "pvc-…" Volume is already used by pod(s) …`. Tới Kubernetes 1.35 thông báo này mở đầu bằng `Multi-Attach error`, tên vẫn gặp trong tài liệu và issue cũ; K7.2 gặp đúng event này trong lab. Với StatefulSet còn chậm hơn: nó không tạo pod thay chừng nào pod cũ chưa biến mất hẳn. Chỉ khi pod cũ đã bị xoá khỏi API (có người xoá cưỡng bức, hoặc node bị gỡ khỏi cụm), `kube-controller-manager` mới tính 6 phút chờ unmount rồi buộc tháo đĩa.
+
+Lối ra chính thức là **non-graceful node shutdown**: khi bạn **chắc chắn** máy đã tắt (đã tắt nguồn, đã xoá VM), gắn taint `node.kubernetes.io/out-of-service` lên node. Kubernetes xoá cưỡng bức pod trên đó và tháo volume ngay, không chờ. Gắn taint này lên một node còn sống là tự tay tạo ra đúng tình huống hai máy ghi một đĩa. Lab không tái hiện được chuyện này vì driver mẫu chỉ có kho ở một node.
+
+</Reveal>
+
+<Reveal title="Snapshot một volume đang chạy database có dùng được không?">
+
+Được, với điều kiện hiểu nó là gì. Snapshot của hệ lưu trữ là crash-consistent: giống trạng thái đĩa nếu rút điện đúng lúc đó. PostgreSQL, MySQL (InnoDB) được thiết kế để sống lại từ trạng thái ấy bằng cách phát lại WAL, nên bản khôi phục sẽ khởi động được và nhất quán tới giao dịch cuối đã commit. Ba điều kiện: dữ liệu và WAL nằm trên **cùng một volume** hoặc được chụp cùng một lúc (VolumeGroupSnapshot, còn beta); hệ lưu trữ chụp nguyên tử; và bạn đã thử khôi phục. Thứ snapshot không cho là khôi phục tới một thời điểm bất kỳ giữa hai lần chụp: việc đó cần lưu WAL liên tục, tức cơ chế sao lưu của chính database. K7.4 làm đúng việc đó với CloudNativePG.
+
+</Reveal>
+
+<Reveal title="Vậy đặt `Retain` cho mọi volume và mọi snapshot có phải an toàn nhất không?">
+
+An toàn hơn trước lệnh xoá nhầm, và đổi lại bằng việc dọn dẹp thuộc về bạn. Phần Dọn dẹp của lab đã nói cái giá: xoá PVC rồi xoá PV `Retain` không gọi `DeleteVolume`, nên dữ liệu nằm lại trên hệ lưu trữ, không còn object nào trong cụm trỏ tới, và trên cloud vẫn bị tính tiền. VolumeSnapshotClass có `deletionPolicy: Retain` cũng vậy: VolumeSnapshotContent và snapshot ở lại sau khi namespace mất, tới khi có người dọn. Cách dùng hợp lý: `Retain` cho dữ liệu không tái tạo được, kèm một quy trình rà PV `Released` và snapshot mồ côi định kỳ; `Delete` cho phần còn lại. Và `Retain` không thay được backup: thứ nó giữ vẫn nằm trong chính hệ lưu trữ đó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết StorageClass theo tài liệu tham số của một driver cụ thể, giải thích một event `FailedAttachVolume` hay `FailedMount`, viết manifest VolumeSnapshot và PVC khôi phục.
+
+**AI hay sai ở đâu:** dùng `storageClassName` hoặc tên VolumeSnapshotClass không có trên cụm của bạn; viết VolumeSnapshot với `apiVersion` `v1beta1` đã bị gỡ; quên `apiGroup: snapshot.storage.k8s.io` trong `dataSource`; coi `kubectl patch storageclass` là cách đổi reclaim policy của volume đang chạy; khuyên "bật snapshot hằng ngày là có backup"; đề xuất `Immediate` cho đĩa cloud theo zone; gợi ý xoá finalizer của PV hay VolumeAttachment để "gỡ kẹt" mà không hỏi đĩa thật đang ở đâu.
+
+**Cách kiểm tra:** `kubectl get storageclass,volumesnapshotclass,csidriver` trước khi tin một manifest; `kubectl apply --dry-run=server` bắt sai `apiVersion` và trường; và với mọi lời khuyên về khôi phục, làm thử trọn vòng như bước 5 và 6 trên một namespace thử rồi mới tin.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.3 là nền: PVC, PV, access mode, reclaim policy. K1.4 dùng PVC qua `volumeClaimTemplates` của StatefulSet. K7.2 và K7.3 dạy Longhorn và Rook với Ceph, hai hệ lưu trữ phân tán có nhân bản. K7.4 dùng PVC làm đĩa cho PostgreSQL và sao lưu ra object storage. K4 là chặng dựng và vận hành cụm nhiều máy. K5.1 dạy vòng lọc của scheduler, nơi `nodeAffinity` của PV tham gia, và dòng thời gian khi một node chết. D10 là chặng cloud, nơi đĩa theo zone là chuyện thường ngày. D20 là chặng sao lưu và khôi phục sau thảm hoạ.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k7.1.mastery-chan-doan">Với một pod dùng PVC đang kẹt ở `Pending` hoặc `ContainerCreating`, xác định được nó kẹt ở bước nào trong sáu bước, và chỉ ra object cùng log của thành phần nào chứa câu trả lời.</Check>
+
+<Check id="k7.1.mastery-storageclass">Viết được StorageClass cho một database trên hệ lưu trữ theo zone, chọn `volumeBindingMode`, `reclaimPolicy`, `allowVolumeExpansion` có lý do, và đổi được chính sách của một volume đang chạy mà không mất dữ liệu.</Check>
+
+<Check id="k7.1.mastery-snapshot">Chụp, khôi phục và clone được một volume, nói được sau mỗi thao tác thì dữ liệu nào có và không có, và giải thích được cho đồng nghiệp ba sự cố mà snapshot không cứu được cùng lớp bảo vệ cần thêm cho từng cái.</Check>
+
+</Mastery>

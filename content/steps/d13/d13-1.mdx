@@ -1,0 +1,952 @@
+---
+title: Dựng cụm bằng kubeadm
+description: Tự dựng một cụm Kubernetes trên hai máy ảo Ubuntu, từ container runtime và kubelet tới kubeadm init, CNI và kubeadm join; đọc từng thứ kubeadm tạo ra trong /etc/kubernetes để biết kind đã làm thay bạn những gì, và so với dịch vụ quản lý như EKS, GKE, AKS.
+id: d13.1
+step: d13
+prerequisites: [k3.1]
+topics: [d13.kubeadm-dich-vu-quan-ly]
+status: verified
+verified:
+  date: 2026-10-13
+  os: Ubuntu 26.04 LTS (hai VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    kubernetes: 1.36.5
+    kubeadm: 1.36.5
+    containerd: 2.2.2
+    runc: 1.4.0
+    cri-tools: 1.36.0
+    etcd: 3.6.8
+    flannel: 0.28.10
+    coredns: 1.14.2
+---
+
+<Goal>
+
+Từ K1 tới K3, `kind create cluster` cho bạn một cụm trong 35 giây. Bài này dựng cụm bằng tay trên hai máy Ubuntu để thấy 35 giây đó chứa những việc gì, vì trên máy vật lý và VM của công ty không có ai làm thay. Học xong, bạn giải thích được:
+
+- Một máy Linux cần những gì trước khi làm được node: swap, module kernel, container runtime, kubelet.
+- `kubeadm init` chạy những pha nào, mỗi pha để lại file gì trong `/etc/kubernetes`, và vì sao node vừa dựng xong lại `NotReady`.
+- Một máy lạ dùng token nào, kiểm cụm bằng gì và nhận chứng chỉ ra sao khi `kubeadm join`.
+- Khi nào tự dựng bằng kubeadm, khi nào thuê dịch vụ quản lý, và thuê rồi thì bạn còn phải lo những gì.
+
+</Goal>
+
+<Knowledge>
+
+### kind đã giấu những gì
+
+kind chạy mỗi node trong một container Docker, bên trong đã cài sẵn mọi thứ. Trên máy thật, từng dòng dưới đây là việc của bạn:
+
+| Việc | kind | Tự dựng bằng kubeadm |
+|---|---|---|
+| Máy và hệ điều hành | Image `kindest/node` đóng sẵn | Bạn cấp máy, cài OS, vá OS (D8) |
+| Container runtime | containerd có sẵn trong image | Cài containerd, chỉnh cgroup driver |
+| kubelet, kubeadm | Có sẵn, đúng phiên bản | Cài từ kho gói, ghim phiên bản |
+| `kubeadm init`, `kubeadm join` | kind tự gọi | Bạn gọi, bạn giữ file cấu hình |
+| Plugin mạng (CNI) | kindnet cài sẵn | Bạn chọn và cài |
+| Địa chỉ của API server | Một cổng trên `127.0.0.1` | Một tên hoặc IP ổn định do bạn quy hoạch |
+| Chứng chỉ, etcd, nâng cấp | Xoá cụm, tạo lại | Gia hạn, sao lưu, nâng cấp tại chỗ (K4.3, K4.5) |
+
+**kubeadm** là công cụ chính thức của dự án Kubernetes để dựng cụm theo cách chuẩn. Nó chỉ lo phần "biến một máy đã có runtime và kubelet thành node"; nó không cấp máy, không cài runtime, không cài CNI. Các bản phân phối như RKE2, Talos hay Kubespray tự động hoá thêm những phần đó, nhưng bên dưới vẫn là các thành phần và file của bài này.
+
+### Chuẩn bị một máy làm node
+
+```text
+ kubelet (dịch vụ systemd)
+    │  gRPC qua socket /run/containerd/containerd.sock  (giao diện CRI)
+    ▼
+ containerd ──► containerd-shim ──► runc ──► tiến trình trong namespace và cgroup (D1.5)
+    │
+    └─ kéo image, giải nén thành các layer overlay
+```
+
+| Thứ cần có | Vì sao |
+|---|---|
+| Không bật swap | kubelet mặc định từ chối khởi động khi máy có swap: request và limit bộ nhớ (K1.2) mất nghĩa nếu kernel lén đẩy trang nhớ ra đĩa |
+| Module `overlay` | containerd xếp các layer của image bằng overlayfs (D5.1) |
+| Module `br_netfilter`, `net.bridge.bridge-nf-call-iptables = 1` | Gói đi giữa hai pod cùng node đi qua bridge; thiếu hai thứ này chúng không qua netfilter và luật của kube-proxy không áp được |
+| `net.ipv4.ip_forward = 1` | Node chuyển tiếp gói giữa mạng pod và mạng ngoài như một router (D2.4) |
+| **Container runtime** nói được **CRI** | kubelet không tự tạo container; nó ra lệnh cho runtime qua CRI (Container Runtime Interface). containerd là lựa chọn phổ biến nhất |
+| cgroup driver `systemd` ở cả kubelet và containerd | Trên máy dùng systemd với cgroup v2 (D1.5), hai bên phải cùng nhờ systemd quản lý cgroup; lệch nhau thì kubelet báo lỗi hoặc node mất ổn định khi thiếu tài nguyên |
+| `kubelet`, `kubeadm`, `kubectl` cùng phiên bản | Cài từ kho `pkgs.k8s.io`. Mỗi minor có **kho riêng** (`/v1.36/deb/`), nên máy không tự nhảy minor khi `apt upgrade`; bài còn `apt-mark hold` để chặn cả bản vá |
+
+Hai chi tiết hay làm hỏng lần cài đầu:
+
+- **Image pause.** Mỗi pod có một container `pause` giữ network namespace cho các container còn lại (K1.1). containerd và kubeadm mỗi bên có một phiên bản pause mặc định; lệch nhau thì `kubeadm init` cảnh báo và node kéo hai image. Script của bài đặt `sandbox` của containerd theo đúng bản kubeadm dùng.
+- **`crictl`** là `docker ps` của node Kubernetes: nó hỏi thẳng runtime qua CRI, nên dùng được cả khi API server chết. K4.7 sống nhờ nó. Gói `cri-tools` không còn được kéo theo kubeadm, phải cài riêng.
+
+`sudo` đặt lại môi trường khi chuyển sang root (cả sudo cổ điển lẫn sudo-rs của Ubuntu 26.04, D1.2), nên script trong bài tự `export` biến cần thiết khi đã là root.
+
+<Check id="d13.1.node-prep">Kể được những việc kind làm thay mà trên máy thật bạn phải tự làm và phần nào kubeadm không lo; giải thích được vì sao node cần tắt swap, hai module kernel, ba sysctl và cgroup driver thống nhất; nói được CRI là gì và `crictl` khác `kubectl` ở chỗ nào.</Check>
+
+### `kubeadm init` làm gì
+
+`kubeadm init` là một chuỗi pha (phase) chạy lần lượt; mỗi pha gọi riêng được bằng `kubeadm init phase …`, và K4.3, K4.5 sẽ gọi lại vài pha.
+
+```text
+ preflight       kiểm swap, module, runtime, cổng; kéo image
+     ▼
+ certs           /etc/kubernetes/pki: ba CA và các chứng chỉ ký từ chúng (K4.5)
+     ▼
+ kubeconfig      admin.conf, super-admin.conf, kubelet.conf, controller-manager.conf, scheduler.conf
+     ▼
+ etcd, control-plane   bốn manifest static pod trong /etc/kubernetes/manifests
+     ▼
+ kubelet-start   ghi /var/lib/kubelet/config.yaml, khởi động kubelet
+     ▼              kubelet đọc thư mục manifests và chạy etcd, API server, controller manager, scheduler
+ upload-config   lưu cấu hình vào ConfigMap kubeadm-config và kubelet-config (để join và upgrade đọc lại)
+     ▼
+ mark-control-plane   gắn label và taint node-role.kubernetes.io/control-plane:NoSchedule
+     ▼
+ bootstrap-token      tạo token 24 giờ, ConfigMap cluster-info, RBAC cho node mới xin chứng chỉ
+     ▼
+ addon           CoreDNS (Deployment) và kube-proxy (DaemonSet)
+```
+
+Điểm mấu chốt là thứ tự **con gà và quả trứng**: chưa có API server thì không `kubectl apply` được gì, nên bốn thành phần control plane chạy dưới dạng **static pod**. K1.1 đã cho bạn thấy thư mục manifests trong node kind; ở đây chính bạn nhìn kubeadm viết ra nó. kubelet theo dõi thư mục đó: có file thì chạy pod, sửa file thì tạo lại pod, bỏ file đi thì dừng pod, không cần ai cho phép. Với mỗi static pod, kubelet còn tạo một **mirror pod** trên API server để `kubectl get pods` nhìn thấy; xoá mirror pod không dừng được container.
+
+Sau `init`, node vẫn `NotReady` và CoreDNS `Pending`. kubeadm cố ý dừng ở đó: nó không chọn plugin mạng cho bạn. kubelet báo node chưa sẵn sàng cho tới khi có một file cấu hình CNI trong `/etc/cni/net.d`, tức là tới khi bạn cài một CNI. Bài dùng Flannel vì nó nhỏ và dễ đọc: mỗi node nhận một dải `/24` trong `10.244.0.0/16`, gói giữa hai node được bọc trong VXLAN (UDP 8472). K6 dạy Cilium và cách chọn CNI cho production.
+
+<Callout kind="production">
+
+Ngày 19/09/2019, FREE NOW gặp sự cố node mới không vào được cụm. Theo [bản postmortem họ công bố](https://github.com/freenowtech/postmortems/blob/master/2019-09-19%20-%20New%20K8s%20workers%20unable%20to%20join%20cluster.pdf), worker ở mọi môi trường của họ là spot instance, có thể bị thu hồi bất cứ lúc nào, và cụm chịu được điều đó chừng nào cuối cùng vẫn có đủ chỗ. Khoảng hai tới ba ngày trước, kho CentOS được sắp xếp lại và gói `container-selinux-2.68-1.el7.noarch.rpm` đổi chỗ; trong khi đó bước khởi tạo node của kops ghi cứng URL của gói này. Gói không tải được, việc khởi tạo node không bao giờ xong. Lúc 16:00 (giờ CEST) lập trình viên báo trên Slack rằng deploy lên môi trường Prelive thất bại; đội tìm thấy bốn instance mới ở Prelive không vào được cụm và pod kẹt ở `Pending` vì thiếu chỗ. Theo postmortem, mọi cụm đều bị đe doạ thiếu chỗ kể từ lúc kho đổi cấu trúc, và phần may mắn là trong lúc đó không có đợt spot instance lớn nào chết ở production. Cách vá đầu tiên (tải gói từ một bucket S3 lúc khởi động) không thành; họ đổi image của node sang Debian và tuyên bố xong lúc 19:08. Trong bốn việc họ giao sau sự cố có: cảnh báo khi node không vào được cụm, và ghi lại các phụ thuộc bên ngoài của việc khởi động node để tìm cách bớt đi.
+
+Điều rút ra (của bài này): script chuẩn bị node ở bước 2 của lab tải gói từ hai kho trên Internet mỗi lần chạy, đúng kiểu phụ thuộc đã làm FREE NOW mất khả năng thêm node. Với cụm thật, kho gói nên có bản sao nội bộ, hoặc gói được nướng sẵn vào image của node (D8.4); K4.4 bàn tiếp chuyện image bất biến.
+
+</Callout>
+
+<Check id="d13.1.init-phases">Kể được các pha của `kubeadm init` theo thứ tự và file mỗi pha tạo ra; giải thích được vì sao control plane chạy bằng static pod và vì sao node `NotReady` cho tới khi cài CNI.</Check>
+
+### `kubeadm join`: cho một máy lạ vào cụm
+
+Máy mới chưa có chứng chỉ nào, còn cụm thì không được tin một máy chỉ vì nó gọi tới. `kubeadm join` giải quyết sự nghi ngờ ở cả hai chiều:
+
+```text
+ máy mới                                              cụm
+   │ 1. GET cluster-info (ConfigMap công khai trong kube-public)
+   │ ─────────────────────────────────────────────────►│
+   │    nhận về ca.crt của cụm
+   │ 2. băm khoá công khai của ca.crt, so với --discovery-token-ca-cert-hash
+   │    khớp: đúng là cụm mình định vào (chống API server giả)
+   │ 3. dùng bootstrap token để xác thực, gửi CSR xin chứng chỉ cho kubelet
+   │ ─────────────────────────────────────────────────►│ controller csrapprover duyệt,
+   │    nhận chứng chỉ system:node:<tên>, nhóm system:nodes │ controller manager ký bằng CA
+   │◄───────────────────────────────────────────────── │
+   │ 4. ghi kubelet.conf, bỏ token; từ đây kubelet tự xin gia hạn chứng chỉ (K4.5)
+```
+
+- **Bootstrap token** có dạng `abcdef.0123456789abcdef`, mặc định hết hạn sau 24 giờ. Nó chỉ đủ quyền đọc `cluster-info` và gửi CSR. Token lộ ra thì người lạ đưa được máy của họ vào cụm, nên đừng tạo token không hạn rồi để trong script.
+- **Hash của CA** không bí mật; nó là dấu vân tay để máy mới biết mình nói chuyện với đúng cụm.
+- Bước 3 và 4 gọi là **TLS bootstrap**: kubelet đổi một token ngắn hạn lấy một chứng chỉ riêng của node.
+
+Worker sau khi join chỉ có `kubelet.conf` và `ca.crt`. Nó không giữ khoá của CA và không chạy static pod nào.
+
+<Check id="d13.1.join-flow">Kể được bốn bước của `kubeadm join`, vai trò của bootstrap token và hash của CA, và vì sao token nên có hạn ngắn.</Check>
+
+### Một địa chỉ ổn định cho API server
+
+Mọi kubelet, kube-proxy và `kubectl` đều phải biết API server ở đâu, và địa chỉ đó được ghi vào chứng chỉ lẫn hàng chục file kubeconfig. Nếu bạn `init` với IP của máy đầu tiên, cụm bị buộc vào máy đó: muốn thêm control plane thứ hai (K4.2) hay chuyển sang máy khác đều phải sửa chứng chỉ và mọi kubeconfig.
+
+Vì vậy bài `init` với `controlPlaneEndpoint: k4-api.lab:6443`, một cái tên. Hôm nay tên đó trỏ vào máy control plane duy nhất; khi có load balancer, chỉ cần trỏ tên sang đó. Lab khai tên trong `/etc/hosts`; hệ thống thật dùng DNS nội bộ (D2.2). Đây là quyết định phải làm ngay lúc dựng, vì kubeadm không có lệnh đổi endpoint cho cụm đang chạy.
+
+<Check id="d13.1.endpoint">Giải thích được vì sao nên `kubeadm init` với `controlPlaneEndpoint` là một tên ổn định ngay cả khi cụm mới có một control plane.</Check>
+
+### kubeadm hay dịch vụ quản lý
+
+Dịch vụ quản lý (Amazon EKS, Google GKE, Azure AKS) bán cho bạn phần control plane của bài này như một dịch vụ.
+
+| | Tự dựng (kubeadm và họ hàng) | Dịch vụ quản lý |
+|---|---|---|
+| API server, etcd, HA của control plane | Bạn dựng và trực (K4.2) | Nhà cung cấp; [tài liệu kiến trúc của EKS](https://docs.aws.amazon.com/eks/latest/userguide/eks-architecture.html) ghi ít nhất hai API server và ba etcd trải trên ba Availability Zone |
+| Sao lưu etcd | Bạn (K4.5) | Nhà cung cấp; bạn không chạm được etcd |
+| Chứng chỉ của control plane | Bạn gia hạn (K4.5) | Nhà cung cấp, nhưng đọc kỹ tài liệu: K4.5 kể một cụm GKE cũ mà việc xoay chứng chỉ không tự diễn ra |
+| Nâng cấp control plane | Bạn làm từng bước (K4.3) | Bạn bấm nút hoặc để tự động; nhà cung cấp thực hiện |
+| Node: OS, runtime, kubelet, vá | Bạn | Vẫn là bạn với node tự quản; nhóm node được quản lý, GKE Autopilot hay EKS Auto Mode nhận phần lớn việc này |
+| Load balancer, ổ đĩa | Bạn tự tìm (MetalLB ở K4.6, lưu trữ ở K7) | Gắn sẵn với hạ tầng của cloud |
+| Cờ của API server, feature gate, phiên bản | Tuỳ ý | Giới hạn theo nhà cung cấp; phiên bản cũ bị buộc nâng khi hết hỗ trợ |
+| Chi phí | Máy và người | Máy, và thường thêm phí control plane theo giờ cho mỗi cụm; có nhà cung cấp có bậc miễn phí với cam kết thấp hơn (kiểm bảng giá hiện hành) |
+
+Thuê control plane không có nghĩa là hết việc. Dù ở bên nào, phần sau vẫn là của bạn: workload và cấu hình của chúng, RBAC và NetworkPolicy (K2), lên lịch và kiểm tương thích trước mỗi lần nâng phiên bản (API bị gỡ, add-on phải nâng theo), PodDisruptionBudget để node rút được (K5.2), sao lưu tài nguyên và dữ liệu (D20), và hoá đơn.
+
+Cách chọn thường gặp:
+
+- **Có cloud và không có ràng buộc đặc biệt:** dùng dịch vụ quản lý. Trực control plane là việc khó, lặp lại, không tạo khác biệt cho sản phẩm.
+- **Buộc phải chạy ở datacenter của mình** (quy định dữ liệu, có sẵn máy, độ trễ tới hệ thống nội bộ, chi phí ở quy mô lớn): tự dựng. Khi đó cả chặng K4 là việc hằng ngày của đội bạn.
+- **Dù chọn bên nào,** hiểu bài này vẫn có ích: node của EKS cũng chạy kubelet và containerd, và khi node `NotReady` bạn vẫn phải SSH vào đọc `journalctl -u kubelet` (K4.7).
+
+<Check id="d13.1.managed">So sánh được tự dựng với dịch vụ quản lý theo ai lo control plane, etcd, nâng cấp và node; kể được những việc vẫn là của bạn khi đã thuê dịch vụ quản lý.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/): yêu cầu của máy và cách cài từ `pkgs.k8s.io`.
+- [Creating a cluster with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/): trình tự `init`, cài CNI, `join`, và phần "Considerations about apiserver-advertise-address and ControlPlaneEndpoint".
+- [kubeadm init](https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-init/): mục "Init workflow" liệt kê từng pha, đối chiếu với output ở bước 3.
+- [Container Runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/): điều kiện về mạng, cgroup driver và cấu hình containerd.
+- [FREE NOW: New K8s workers unable to join cluster](https://github.com/freenowtech/postmortems/blob/master/2019-09-19%20-%20New%20K8s%20workers%20unable%20to%20join%20cluster.pdf): postmortem dùng trong bài, đọc phần Timeline và Action Items.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Máy đã có Lima (D0.1). Lab dùng hai VM Ubuntu 26.04: `k4-cp1` làm control plane, `k4-w1` làm worker. Cụm này được dùng tiếp ở K4.3, K4.4, K4.5, K4.6 và K4.7, nên cuối bài chỉ dừng VM, không xoá.
+
+**Profile máy.** Mỗi VM 2 CPU, 2 GiB RAM, 20 GiB đĩa (kubeadm đòi control plane có ít nhất 2 CPU và 1.700 MB). Cuối bài, `free -m` cho thấy control plane dùng khoảng 850 MB, worker khoảng 500 MB. Máy 8 GB làm được bài này nếu tắt Docker Desktop và các VM khác trước khi bắt đầu. Lần đầu mỗi VM tải khoảng 600 MB image và gói.
+
+Bài dựng Kubernetes **1.36** dù 1.37 đã có, để K4.3 có cái mà nâng cấp.
+
+<Terminal where="mac">
+
+```bash
+limactl --version
+mkdir -p ~/masteva-d13 && cd ~/masteva-d13
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+limactl version 2.2.0
+```
+
+</Expected>
+
+### 1. Hai máy trên cùng một mạng
+
+Hai điểm khác với VM của D0.1. `--network lima:user-v2` đặt các VM vào chung mạng `192.168.104.0/24` của Lima để chúng gọi được nhau; mạng mặc định của Lima cho mọi VM cùng một địa chỉ và không cho chúng thấy nhau. `--plain` tắt mount thư mục của Mac và tắt việc tự chuyển tiếp cổng về Mac: một node Kubernetes mở hàng chục cổng, và hai VM cùng mở `6443` hay `10250` sẽ tranh nhau trên `127.0.0.1` của Mac.
+
+<Terminal where="mac">
+
+```bash
+limactl start --name k4-cp1 --cpus 2 --memory 2 --disk 20 --plain --network lima:user-v2 --tty=false template:ubuntu-26.04
+limactl start --name k4-w1 --cpus 2 --memory 2 --disk 20 --plain --network lima:user-v2 --tty=false template:ubuntu-26.04
+limactl shell k4-cp1 hostname -I
+limactl shell k4-w1 hostname -I
+limactl shell k4-cp1 ping -c 2 lima-k4-w1.internal
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+…
+INFO[0012] READY. Run `ssh -F `/Users/…/.lima/k4-w1/ssh.config` lima-k4-w1` to open the shell.
+192.168.104.1
+192.168.104.3
+PING lima-k4-w1.internal (192.168.104.3) 56(84) bytes of data.
+64 bytes from 192.168.104.3: icmp_seq=1 ttl=64 time=0.468 ms
+64 bytes from 192.168.104.3: icmp_seq=2 ttl=64 time=1.57 ms
+…
+```
+
+</Expected>
+
+Địa chỉ trên máy bạn có thể khác; các lệnh sau đều tự đọc địa chỉ thay vì ghi cứng. Lima nhớ địa chỉ đã cấp cho từng VM, nên chúng giữ nguyên qua các lần `limactl stop` và `start`: điều kiện cần cho một cụm sống qua nhiều buổi học. Mạng này cũng cho mỗi VM một tên `lima-<tên VM>.internal`. Với `--plain`, `limactl shell` vẫn vào được VM như thường.
+
+### 2. Biến máy thành node
+
+Script dưới làm đủ bảng "Chuẩn bị một máy làm node" ở phần Kiến thức. Viết nó một lần trên Mac rồi đẩy vào từng VM qua stdin; K4.2 dùng lại nó cho các control plane mới. Tham số là minor muốn cài.
+
+<Terminal where="mac" title="~/masteva-d13/node-prep.sh">
+
+```bash
+cd ~/masteva-d13
+cat > node-prep.sh <<'EOF'
+#!/usr/bin/env bash
+# node-prep.sh <minor>: chuẩn bị một máy Ubuntu 26.04 làm node Kubernetes (chạy bằng root)
+# Ví dụ: sudo bash node-prep.sh 1.36
+set -euo pipefail
+MINOR=${1:?thiếu minor, ví dụ 1.36}
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUPPRESS=1
+
+# 1. kubelet mặc định từ chối chạy khi máy có swap
+if [ -n "$(swapon --show --noheadings)" ]; then
+  echo "Máy đang bật swap: chạy 'swapoff -a' và bỏ dòng swap trong /etc/fstab" >&2; exit 1
+fi
+
+# 2. Module kernel: overlay cho containerd xếp layer image, br_netfilter để gói đi qua bridge chịu luật của netfilter
+printf 'overlay\nbr_netfilter\n' > /etc/modules-load.d/k8s.conf
+modprobe overlay
+modprobe br_netfilter
+
+# 3. Node là một router nhỏ: phải chuyển tiếp gói giữa pod và mạng ngoài
+cat > /etc/sysctl.d/99-k8s.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+SYSCTL
+sysctl --system > /dev/null
+
+# 4. Container runtime và runc từ kho Ubuntu
+apt-get update -qq
+apt-get install -y -qq containerd > /dev/null
+
+# 5. kubeadm, kubelet, kubectl, crictl từ kho pkgs.k8s.io của đúng minor (mỗi minor một kho riêng)
+#    Khoá ký của kho được so fingerprint trước khi tin: không khớp thì dừng
+K8S_KEY_FPR=DE15B14486CD377B9E876E1A234654DA9A296436
+mkdir -p /etc/apt/keyrings
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/v$MINOR/deb/Release.key" -o /tmp/k8s-release.key
+FPR=$(gpg --show-keys --with-colons /tmp/k8s-release.key 2> /dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+if [ "$FPR" != "$K8S_KEY_FPR" ]; then
+  echo "Fingerprint khoá kho Kubernetes không khớp (nhận được: $FPR). Dừng." >&2; exit 1
+fi
+gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v$MINOR/deb/ /" \
+  > /etc/apt/sources.list.d/kubernetes.list
+apt-get update -qq
+apt-get install -y -qq kubelet kubeadm kubectl cri-tools > /dev/null
+apt-mark hold kubelet kubeadm kubectl > /dev/null
+
+# 6. Cấu hình containerd: cgroup driver systemd cho khớp kubelet, image pause đúng bản kubeadm dùng
+PAUSE=$(kubeadm config images list --kubernetes-version "$(kubeadm version -o short)" | grep /pause:)
+mkdir -p /etc/containerd
+containerd config default \
+  | sed -e 's/SystemdCgroup = false/SystemdCgroup = true/' -e "s|sandbox = .*|sandbox = '$PAUSE'|" \
+  > /etc/containerd/config.toml
+systemctl restart containerd
+printf 'runtime-endpoint: unix:///run/containerd/containerd.sock\n' > /etc/crictl.yaml
+
+echo "$(hostname): containerd $(containerd --version | awk '{print $3}'), runc $(runc --version | awk 'NR==1{print $3}'), kubeadm $(kubeadm version -o short), kubelet $(kubelet --version | awk '{print $2}')"
+EOF
+limactl shell k4-cp1 sudo bash -s 1.36 < node-prep.sh 2>&1 | tail -1
+limactl shell k4-w1 sudo bash -s 1.36 < node-prep.sh 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lima-k4-cp1: containerd 2.2.2, runc 1.4.0-0ubuntu1, kubeadm v1.36.5, kubelet v1.36.5
+lima-k4-w1: containerd 2.2.2, runc 1.4.0-0ubuntu1, kubeadm v1.36.5, kubelet v1.36.5
+```
+
+</Expected>
+
+Mỗi máy mất từ nửa phút tới một phút, tuỳ đường mạng. `tail -1` chỉ giữ dòng tổng kết; nếu không thấy dòng đó, chạy lại lệnh không có `| tail -1` để đọc lỗi. Script tải khoá ký của kho rồi so **fingerprint** với giá trị ghi sẵn trước khi nạp: `DE15 B144 86CD 377B 9E87 6E1A 2346 54DA 9A29 6436` là fingerprint của khoá mà cả `pkgs.k8s.io` lẫn máy chủ build gốc `download.opensuse.org` trả về ngày 13/10/2026 (tài liệu Kubernetes không in fingerprint này; nó ghi rằng mọi kho minor dùng chung một khoá). Khoá có hạn tới 29/12/2026: khi dự án gia hạn hay đổi khoá, script sẽ dừng ở bước này, và bạn đối chiếu lại rồi mới sửa biến `K8S_KEY_FPR`. Sau đó `apt` kiểm chữ ký của từng gói bằng khoá ấy, nên gói bị sửa trên đường tải sẽ bị từ chối.
+
+Mở một terminal riêng cho control plane và xem máy trước khi nó thành cụm:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+systemctl is-enabled kubelet; systemctl is-active kubelet
+grep -E "SystemdCgroup|sandbox =" /etc/containerd/config.toml
+sudo crictl ps
+ls /etc/kubernetes/manifests | wc -l
+kubeadm config images list --kubernetes-version v1.36.5
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+enabled
+inactive
+      sandbox = 'registry.k8s.io/pause:3.10.2'
+            SystemdCgroup = true
+CONTAINER           IMAGE               CREATED             STATE               NAME                ATTEMPT             POD ID              POD                 NAMESPACE
+0
+registry.k8s.io/kube-apiserver:v1.36.5
+registry.k8s.io/kube-controller-manager:v1.36.5
+registry.k8s.io/kube-scheduler:v1.36.5
+registry.k8s.io/kube-proxy:v1.36.5
+registry.k8s.io/coredns/coredns:v1.14.2
+registry.k8s.io/pause:3.10.2
+registry.k8s.io/etcd:3.6.8-0
+```
+
+</Expected>
+
+kubelet đã cài và sẽ tự chạy khi máy khởi động, nhưng đang nằm im: nó chưa có file cấu hình nào. containerd chạy và chưa có container nào. Bảy image ở cuối là toàn bộ "phần mềm Kubernetes" của một control plane; `kubeadm init` sẽ kéo chúng về.
+
+<Check id="d13.1.lab-node">Tạo được hai VM trên mạng `user-v2` gọi được nhau bằng tên, chuẩn bị được chúng làm node bằng script, và chỉ ra được trên máy kết quả của từng bước: module, sysctl, cấu hình containerd, trạng thái kubelet.</Check>
+
+### 3. `kubeadm init`
+
+Khai tên `k4-api.lab` trỏ vào control plane trên cả hai máy:
+
+<Terminal where="mac">
+
+```bash
+CP1_IP=$(limactl shell k4-cp1 hostname -I | awk '{print $1}')
+for v in k4-cp1 k4-w1; do limactl shell $v sudo sh -c "echo '$CP1_IP k4-api.lab' >> /etc/hosts"; done
+limactl shell k4-w1 getent hosts k4-api.lab
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+192.168.104.1   k4-api.lab
+```
+
+</Expected>
+
+Cấu hình của cụm nằm trong một file thay vì một hàng cờ dòng lệnh, để về sau còn biết cụm đã được dựng thế nào. `advertiseAddress` là địa chỉ API server của **máy này** báo cho các thành phần khác; `controlPlaneEndpoint` là địa chỉ chung của **cụm**; `podSubnet` phải khớp dải mà CNI sẽ dùng.
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+mkdir -p ~/k4 && cd ~/k4
+cat > kubeadm-init.yaml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: $(hostname -I | awk '{print $1}')
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v1.36.5
+controlPlaneEndpoint: k4-api.lab:6443
+networking:
+  podSubnet: 10.244.0.0/16
+EOF
+sudo kubeadm init --config kubeadm-init.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[init] Using Kubernetes version: v1.36.5
+[preflight] Running pre-flight checks
+[preflight] Pulling images required for setting up a Kubernetes cluster
+[certs] Using certificateDir folder "/etc/kubernetes/pki"
+[certs] Generating "ca" certificate and key
+[certs] Generating "apiserver" certificate and key
+[certs] apiserver serving cert is signed for DNS names [k4-api.lab kubernetes kubernetes.default kubernetes.default.svc kubernetes.default.svc.cluster.local lima-k4-cp1] and IPs [10.96.0.1 192.168.104.1]
+…
+[kubeconfig] Writing "admin.conf" kubeconfig file
+…
+[etcd] Creating static Pod manifest for local etcd in "/etc/kubernetes/manifests"
+[control-plane] Creating static Pod manifest for "kube-apiserver"
+[control-plane] Creating static Pod manifest for "kube-controller-manager"
+[control-plane] Creating static Pod manifest for "kube-scheduler"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[kubelet-start] Starting the kubelet
+[wait-control-plane] Waiting for the kubelet to boot up the control plane as static Pods from directory "/etc/kubernetes/manifests"
+[control-plane-check] kube-apiserver is healthy after 1.001274941s
+[upload-config] Storing the configuration used in ConfigMap "kubeadm-config" in the "kube-system" Namespace
+[mark-control-plane] Marking the node lima-k4-cp1 as control-plane by adding the labels: [node-role.kubernetes.io/control-plane node.kubernetes.io/exclude-from-external-load-balancers]
+[mark-control-plane] Marking the node lima-k4-cp1 as control-plane by adding the taints [node-role.kubernetes.io/control-plane:NoSchedule]
+[bootstrap-token] Using token: dgxvb0.ouh8e2bo5ohc2hyj
+[bootstrap-token] Creating the "cluster-info" ConfigMap in the "kube-public" namespace
+[addons] Applied essential addon: CoreDNS
+[addons] Applied essential addon: kube-proxy
+
+Your Kubernetes control-plane has initialized successfully!
+…
+kubeadm join k4-api.lab:6443 --token dgxvb0.ouh8e2bo5ohc2hyj \
+	--discovery-token-ca-cert-hash sha256:8b119db921cee158352a691623f7d32140beed27a712f383f8442c32e2ac93c5
+```
+
+</Expected>
+
+Lần đầu mất khoảng 40 giây, phần lớn là kéo image. Đối chiếu từng tiền tố trong ngoặc vuông với sơ đồ các pha: `[certs]`, `[kubeconfig]`, `[etcd]` và `[control-plane]`, `[kubelet-start]`, `[upload-config]`, `[mark-control-plane]`, `[bootstrap-token]`, `[addons]`. Dòng `apiserver serving cert is signed for DNS names` cho thấy tên `k4-api.lab` đã nằm trong chứng chỉ của API server. Token và hash trên máy bạn sẽ khác; không cần chép lại, bước 6 tạo token mới.
+
+Làm theo hướng dẫn cuối output để `kubectl` của người dùng thường dùng được:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+mkdir -p $HOME/.kube
+sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+kubectl get nodes
+kubectl get pods -A
+```
+
+</Terminal>
+
+<Predict question="Cụm vừa init xong. Node ở trạng thái gì, và pod nào chưa chạy được?">
+
+```text
+NAME          STATUS     ROLES           AGE   VERSION
+lima-k4-cp1   NotReady   control-plane   11s   v1.36.5
+NAMESPACE     NAME                                  READY   STATUS    RESTARTS   AGE
+kube-system   coredns-589f44dc88-5stks              0/1     Pending   0          2s
+kube-system   coredns-589f44dc88-w25ls              0/1     Pending   0          2s
+kube-system   etcd-lima-k4-cp1                      0/1     Running   0          9s
+kube-system   kube-apiserver-lima-k4-cp1            0/1     Running   0          9s
+kube-system   kube-controller-manager-lima-k4-cp1   0/1     Running   0          9s
+kube-system   kube-proxy-cnnk2                      1/1     Running   0          3s
+kube-system   kube-scheduler-lima-k4-cp1            0/1     Running   0          9s
+```
+
+Node `NotReady` và CoreDNS `Pending`, đúng như phần Kiến thức báo trước: chưa có CNI. Bốn static pod và kube-proxy chạy được vì chúng dùng thẳng mạng của máy (`hostNetwork`), không cần CNI cấp IP. Cột `READY` của bốn static pod sẽ thành `1/1` sau vài giây, khi kubelet cập nhật mirror pod.
+
+</Predict>
+
+`admin.conf` chứa chứng chỉ có quyền cao nhất trong cụm. Trên hệ thống thật, đừng phát file này cho mọi người; cấp cho mỗi người một danh tính riêng với quyền vừa đủ (K2.3).
+
+<Check id="d13.1.lab-init">Viết được file cấu hình cho `kubeadm init`, chạy được nó, và chỉ ra được trong output dòng nào ứng với pha nào.</Check>
+
+### 4. Đọc những gì kubeadm để lại
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+sudo find /etc/kubernetes -maxdepth 2 | sort
+sudo grep server: /etc/kubernetes/*.conf
+ps -o args= -C kubelet
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/etc/kubernetes
+/etc/kubernetes/admin.conf
+/etc/kubernetes/controller-manager.conf
+/etc/kubernetes/kubelet.conf
+/etc/kubernetes/manifests
+/etc/kubernetes/manifests/.kubelet-keep
+/etc/kubernetes/manifests/etcd.yaml
+/etc/kubernetes/manifests/kube-apiserver.yaml
+/etc/kubernetes/manifests/kube-controller-manager.yaml
+/etc/kubernetes/manifests/kube-scheduler.yaml
+/etc/kubernetes/pki
+/etc/kubernetes/pki/apiserver-etcd-client.crt
+/etc/kubernetes/pki/apiserver-etcd-client.key
+/etc/kubernetes/pki/apiserver-kubelet-client.crt
+/etc/kubernetes/pki/apiserver-kubelet-client.key
+/etc/kubernetes/pki/apiserver.crt
+/etc/kubernetes/pki/apiserver.key
+/etc/kubernetes/pki/ca.crt
+/etc/kubernetes/pki/ca.key
+/etc/kubernetes/pki/etcd
+/etc/kubernetes/pki/front-proxy-ca.crt
+/etc/kubernetes/pki/front-proxy-ca.key
+/etc/kubernetes/pki/front-proxy-client.crt
+/etc/kubernetes/pki/front-proxy-client.key
+/etc/kubernetes/pki/sa.key
+/etc/kubernetes/pki/sa.pub
+/etc/kubernetes/scheduler.conf
+/etc/kubernetes/super-admin.conf
+/etc/kubernetes/admin.conf:    server: https://k4-api.lab:6443
+/etc/kubernetes/controller-manager.conf:    server: https://192.168.104.1:6443
+/etc/kubernetes/kubelet.conf:    server: https://192.168.104.1:6443
+/etc/kubernetes/scheduler.conf:    server: https://192.168.104.1:6443
+/etc/kubernetes/super-admin.conf:    server: https://k4-api.lab:6443
+/usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml
+```
+
+</Expected>
+
+Ba nhóm file, ứng với ba pha:
+
+- `pki/`: chứng chỉ và khoá. `ca.key` là khoá của CA cụm: ai có nó thì tự cấp được cho mình mọi quyền. K4.5 đọc kỹ thư mục này.
+- Năm file `.conf`: kubeconfig cho từng danh tính. Người (`admin.conf`) đi qua địa chỉ chung của cụm; controller manager, scheduler và kubelet **của chính máy control plane** nói thẳng với API server trên máy mình. Nhờ vậy khi cụm có ba control plane và bạn nâng cấp từng máy (K4.3), các thành phần trên một máy luôn gặp API server cùng phiên bản với chúng.
+- `manifests/`: bốn static pod.
+
+Nhìn từ phía runtime, không qua API server:
+
+<Callout kind="danger">
+
+Khối dưới có một lệnh `kubectl delete pod` trong `kube-system`. Trên cụm lab nó vô hại, và đó chính là điều cần thấy; đừng chạy lệnh này trên cụm khác khi chưa hiểu vì sao.
+
+</Callout>
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+sudo crictl ps | awk 'NR > 1 {print $(NF-4)}' | sort
+kubectl -n kube-system get pod kube-scheduler-lima-k4-cp1 -o jsonpath='{.metadata.ownerReferences[0].kind}{"\n"}'
+kubectl -n kube-system delete pod kube-scheduler-lima-k4-cp1
+sleep 3; sudo crictl ps --name kube-scheduler | awk 'NR > 1 {print $(NF-4), $(NF-5), "attempt=" $(NF-3)}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+etcd
+kube-apiserver
+kube-controller-manager
+kube-proxy
+kube-scheduler
+Node
+pod "kube-scheduler-lima-k4-cp1" deleted from kube-system namespace
+kube-scheduler Running attempt=0
+```
+
+</Expected>
+
+`awk` lấy cột tính từ cuối dòng vì cột `CREATED` có số từ thay đổi. Mirror pod của scheduler thuộc về `Node`, không thuộc ReplicaSet nào. Xoá nó qua API chẳng làm gì container: `attempt` vẫn là `0`, tức container chưa hề khởi động lại, và kubelet tạo lại mirror pod ngay. Muốn dừng hay sửa một static pod, phải sửa **file** trong `manifests/`.
+
+Còn lý do node `NotReady`:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl get node lima-k4-cp1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+container runtime network not ready: NetworkReady=false reason:NetworkPluginNotReady message:Network plugin returns error: cni plugin not initialized
+```
+
+</Expected>
+
+### 5. Cài CNI
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl apply -f https://github.com/flannel-io/flannel/releases/download/v0.28.10/kube-flannel.yml
+kubectl -n kube-flannel rollout status ds/kube-flannel-ds --timeout=180s | tail -1
+kubectl wait --for=condition=Ready node/lima-k4-cp1 --timeout=120s
+kubectl -n kube-system rollout status deploy/coredns --timeout=180s | tail -1
+cat /run/flannel/subnet.env
+ip -br addr show | grep -E "flannel|cni0"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/kube-flannel created
+serviceaccount/flannel created
+clusterrole.rbac.authorization.k8s.io/flannel created
+clusterrolebinding.rbac.authorization.k8s.io/flannel created
+configmap/kube-flannel-cfg created
+daemonset.apps/kube-flannel-ds created
+daemon set "kube-flannel-ds" successfully rolled out
+node/lima-k4-cp1 condition met
+deployment "coredns" successfully rolled out
+FLANNEL_NETWORK=10.244.0.0/16
+FLANNEL_SUBNET=10.244.0.1/24
+FLANNEL_MTU=1450
+FLANNEL_IPMASQ=true
+flannel.1        UNKNOWN        10.244.0.0/32 fe80::b428:49ff:fe99:cc5/64
+cni0             UP             10.244.0.1/24 fe80::4cff:89ff:fef2:1f82/64
+```
+
+</Expected>
+
+Flannel là một DaemonSet. Pod của nó trên mỗi node chép plugin vào `/opt/cni/bin`, ghi cấu hình vào `/etc/cni/net.d`, và ghi dải địa chỉ của node vào `/run/flannel/subnet.env`. Vừa có file cấu hình CNI, kubelet báo node `Ready`, scheduler xếp được CoreDNS, và CoreDNS nhận IP trong `10.244.0.0/24`. `cni0` là bridge nối các pod trên node; `flannel.1` là đầu VXLAN đi sang node khác, MTU 1450 vì phần bọc VXLAN chiếm 50 byte. Dải `10.244.0.0/16` trong manifest của Flannel khớp `podSubnet` ở bước 3; nếu bạn đổi một bên thì phải đổi bên kia.
+
+<Check id="d13.1.lab-cni">Chỉ ra được ba nhóm file trong `/etc/kubernetes` và pha nào tạo ra nhóm nào; chứng minh được xoá mirror pod không dừng static pod; đọc được lý do `NotReady` từ condition của node, cài được CNI và chỉ ra được ba thứ Flannel để lại làm node chuyển sang `Ready`.</Check>
+
+### 6. `kubeadm join`
+
+Trước khi join, tự tính hash của CA để thấy nó không có gì bí ẩn, rồi so với lệnh join do kubeadm in ra:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+openssl x509 -pubkey -noout -in /etc/kubernetes/pki/ca.crt | openssl pkey -pubin -outform der | sha256sum | cut -d' ' -f1
+kubeadm token list -o jsonpath='{.token}{"  "}{.expires}{"\n"}'
+kubectl -n kube-public get configmap cluster-info -o jsonpath='{.data.kubeconfig}' | grep server:
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+8b119db921cee158352a691623f7d32140beed27a712f383f8442c32e2ac93c5
+dgxvb0.ouh8e2bo5ohc2hyj  2026-10-14T03:46:04Z
+    server: https://k4-api.lab:6443
+```
+
+</Expected>
+
+Hash là SHA-256 của khoá công khai trong `ca.crt`, trùng với giá trị `init` đã in. Token của `init` hết hạn sau 24 giờ. Tạo một token mới kèm lệnh join đầy đủ, rồi chạy lệnh đó trên worker. Mac đóng vai máy của người vận hành, chuyển lệnh từ máy này sang máy kia:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-cp1 sudo kubeadm token create --ttl 30m --print-join-command > join.sh
+cut -c1-60 join.sh
+limactl shell k4-w1 sudo bash -s < join.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kubeadm join k4-api.lab:6443 --token o6aroz.v51lhehb2zc0iys4
+[preflight] Running pre-flight checks
+[preflight] Reading configuration from the "kubeadm-config" ConfigMap in namespace "kube-system"...
+…
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[kubelet-start] Starting the kubelet
+[kubelet-check] The kubelet is healthy after 500.654174ms
+[kubelet-start] Waiting for the kubelet to perform the TLS Bootstrap
+
+This node has joined the cluster:
+* Certificate signing request was sent to apiserver and a response was received.
+* The Kubelet was informed of the new secure connection details.
+```
+
+</Expected>
+
+`join.sh` chứa một token còn hạn 30 phút; coi nó như mật khẩu và đừng đưa vào Git. Máy mới đọc cấu hình kubelet từ ConfigMap mà pha `upload-config` đã lưu, nên mọi node dùng chung một cấu hình. Nếu thấy cảnh báo về `bindAddress` của `KubeProxyConfiguration` thì bỏ qua được: nó nói về giá trị mặc định cho IPv6. Xem kết quả từ hai phía:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl wait --for=condition=Ready node/lima-k4-w1 --timeout=180s
+kubectl get csr -o custom-columns=NAME:.metadata.name,REQUESTOR:.spec.username,CONDITION:.status.conditions[*].type
+kubectl get nodes -o wide | awk '{print $1, $2, $3, $5, $6}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-w1 condition met
+NAME        REQUESTOR                 CONDITION
+csr-dqrjp   system:bootstrap:o6aroz   Approved
+csr-jx2wx   system:node:lima-k4-cp1   Approved
+NAME STATUS ROLES VERSION INTERNAL-IP
+lima-k4-cp1 Ready control-plane v1.36.5 192.168.104.1
+lima-k4-w1 Ready <none> v1.36.5 192.168.104.3
+```
+
+</Expected>
+
+CSR của worker do `system:bootstrap:<mã token>` gửi và được duyệt tự động: đó là bước 3 trong sơ đồ join. Tên CSR trên máy bạn sẽ khác. Node mới `Ready` sau vài chục giây vì DaemonSet của Flannel và kube-proxy tự chạy thêm một pod trên nó.
+
+<Terminal where="vm" title="k4-w1">
+
+```bash
+sudo ls /etc/kubernetes /etc/kubernetes/pki /etc/kubernetes/manifests
+echo "/var/lib/kubelet/pki:"; sudo ls /var/lib/kubelet/pki
+sudo grep server: /etc/kubernetes/kubelet.conf
+sudo crictl ps | awk 'NR > 1 {print $(NF-4)}' | sort
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+/etc/kubernetes:
+kubelet.conf
+manifests
+pki
+
+/etc/kubernetes/manifests:
+
+/etc/kubernetes/pki:
+ca.crt
+/var/lib/kubelet/pki:
+kubelet-client-2026-10-13-03-46-52.pem
+kubelet-client-current.pem
+kubelet.crt
+kubelet.key
+    server: https://k4-api.lab:6443
+kube-flannel
+kube-proxy
+```
+
+</Expected>
+
+Worker chỉ giữ chứng chỉ của riêng nó và `ca.crt` để kiểm API server. Nó tìm API server qua tên chung `k4-api.lab`, không qua IP của một máy cụ thể.
+
+<Check id="d13.1.lab-join">Tự tính được hash của CA và đối chiếu với lệnh join, đưa được một worker vào cụm bằng token có hạn ngắn, và chỉ ra được CSR của node mới cùng những file worker giữ.</Check>
+
+### 7. Một workload chạy qua hai node
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+cd ~/k4
+kubectl create deployment hello --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 --replicas=2 -- /agnhost netexec --http-port=8080
+kubectl expose deployment hello --type=NodePort --port=80 --target-port=8080
+kubectl rollout status deploy/hello --timeout=180s | tail -1
+kubectl get pods -o wide | cut -c1-90
+PORT=$(kubectl get svc hello -o jsonpath='{.spec.ports[0].nodePort}')
+curl -s http://lima-k4-w1.internal:$PORT/hostname; echo
+curl -s http://lima-k4-cp1.internal:$PORT/hostname; echo
+ip route | grep flannel
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/hello created
+service/hello exposed
+deployment "hello" successfully rolled out
+NAME                     READY   STATUS    RESTARTS   AGE   IP           NODE
+hello-5c4688974f-s6bdz   1/1     Running   0          26s   10.244.1.2   lima-k4-w1
+hello-5c4688974f-xpcqq   1/1     Running   0          26s   10.244.1.3   lima-k4-w1
+hello-5c4688974f-xpcqq
+hello-5c4688974f-s6bdz
+10.244.1.0/24 via 10.244.1.0 dev flannel.1 onlink
+```
+
+</Expected>
+
+Cả hai pod nằm trên worker: taint `NoSchedule` giữ workload khỏi control plane. Lệnh `curl` thứ hai gọi NodePort trên **control plane**, nơi không có pod nào của `hello`; kube-proxy ở đó chuyển kết nối sang pod trên worker (K2.1), và gói đi theo tuyến `10.244.1.0/24 … dev flannel.1`, tức qua đường hầm VXLAN giữa hai máy. Tên pod trên máy bạn sẽ khác, và pod nào trả lời là ngẫu nhiên.
+
+Số đo RAM cho profile máy:
+
+<Terminal where="mac">
+
+```bash
+limactl shell k4-cp1 free -m | sed -n 2p
+limactl shell k4-w1 free -m | sed -n 2p
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Mem:            1949         825          37           2        1183        1124
+Mem:            1949         502          65           1        1477        1446
+```
+
+</Expected>
+
+Cột thứ ba là bộ nhớ đang dùng (MB): control plane khoảng 830, worker khoảng 500. Riêng `kube-apiserver` chiếm gần 280 MB; đó là lý do kubeadm đòi 1.700 MB cho máy control plane.
+
+<Check id="d13.1.lab-workload">Chạy được một Deployment và gọi được nó qua NodePort của cả hai node; chỉ ra được tuyến đường mà gói đi từ node này sang pod trên node kia.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `limactl start` báo `instance "k4-cp1" already exists`: VM đã có từ lần trước. `limactl start k4-cp1` để bật lại.
+- `node-prep.sh` dừng ở `Máy đang bật swap`: image Ubuntu của Lima không có swap; nếu bạn dùng máy khác, tắt swap theo đúng lời nhắn.
+- `kubeadm init` dừng ở `[ERROR NumCPU]` hoặc `[ERROR Mem]`: VM dưới 2 CPU hoặc dưới 1.700 MB. Dừng VM, `limactl edit k4-cp1 --cpus 2 --memory 2`, bật lại.
+- `kubeadm init` treo ở `[wait-control-plane]` rồi hết giờ: kubelet không dựng được static pod. Xem `sudo journalctl -u kubelet -n 30 --no-pager` và `sudo crictl ps -a`. Hay gặp nhất là `k4-api.lab` không phân giải được (`getent hosts k4-api.lab`).
+- Muốn làm lại `init` từ đầu: cách chắc nhất trong lab là xoá hai VM bằng khối "Xoá hẳn lab" ở phần Dọn dẹp rồi làm lại từ bước 1. Lệnh gỡ một máy khỏi cụm mà không xoá máy là `kubeadm reset`; K4.4 dùng và giải thích nó.
+- `kubeadm join` báo `could not find a JWS signature` hoặc `token … is invalid`: token đã hết hạn. Chạy lại khối lệnh trên Mac ở bước 6 để tạo token mới.
+- Node worker `NotReady` quá 2 phút: `kubectl -n kube-flannel get pods -o wide` xem pod Flannel trên node đó; thường là đang kéo image.
+- `kubectl` báo `The connection to the server localhost:8080 was refused`: chưa có `~/.kube/config` (khối lệnh sau `init`), hoặc bạn đang ở terminal của worker.
+
+</Callout>
+
+### Dọn dẹp
+
+Xoá workload thử, giữ cụm:
+
+<Terminal where="vm" title="k4-cp1">
+
+```bash
+kubectl delete deployment hello
+kubectl delete service hello
+```
+
+</Terminal>
+
+Cuối buổi học, dừng hai VM để trả RAM cho Mac. Cụm sống lại khi bật VM: kubelet là dịch vụ systemd, và nó dựng lại control plane từ thư mục manifests.
+
+<Terminal where="mac">
+
+```bash
+limactl stop k4-w1
+limactl stop k4-cp1
+limactl start k4-cp1
+limactl start k4-w1
+limactl shell k4-cp1 bash -c 'until kubectl get --raw /readyz > /dev/null 2>&1; do sleep 2; done; kubectl get nodes'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME          STATUS   ROLES           AGE     VERSION
+lima-k4-cp1   Ready    control-plane   2m16s   v1.36.5
+lima-k4-w1    Ready    <none>          86s     v1.36.5
+```
+
+</Expected>
+
+Vòng `until` chờ API server trả lời `/readyz`: nó cần khoảng 20 giây sau khi máy lên. Trạng thái `Ready` ngay sau khi bật có thể là trạng thái cũ còn lưu trong etcd; K4.4 chỉ cách kiểm chắc hơn.
+
+<Callout kind="danger">
+
+Hai lệnh dưới xoá hẳn hai VM cùng cụm bên trong. Chỉ chạy khi bạn không học tiếp K4.3 tới K4.7, hoặc muốn làm lại từ đầu. Dòng cuối xoá thư mục lab trên Mac.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn lab (chỉ khi không học tiếp)">
+
+```bash
+for vm in k4-cp1 k4-w1; do limactl stop "$vm"; done
+limactl delete k4-cp1 k4-w1
+rm -rf ~/masteva-d13
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao kubelet không chạy trong container như mọi thứ khác?">
+
+Vì nó là thứ tạo ra container. kubelet phải có trước mọi pod, phải mount được volume vào đường dẫn của máy, đọc được cgroup của cả node và nói chuyện với runtime qua socket của máy. Nó là một dịch vụ systemd bình thường (D1.1): `systemctl status kubelet`, `journalctl -u kubelet`, file drop-in `10-kubeadm.conf` khai cờ. Cấu hình của nó tới từ ba nơi: `/var/lib/kubelet/config.yaml` (kubeadm sinh từ ConfigMap `kubelet-config`, giống nhau trên mọi node), `/var/lib/kubelet/kubeadm-flags.env` (cờ riêng của node do kubeadm ghi) và `/etc/default/kubelet` (chỗ cho bạn ghi đè, phương án cuối). Sửa tay `config.yaml` trên một node thì lần `kubeadm upgrade` sau sẽ ghi đè; sửa đúng chỗ là ConfigMap, hoặc file patch của kubeadm.
+
+</Reveal>
+
+<Reveal title="Cụm một control plane chết máy đó thì sao?">
+
+Workload đang chạy vẫn chạy: bước 7 cho thấy traffic đi từ NodePort tới pod không qua API server. Thứ mất là mọi thay đổi: không deploy được, pod chết không được thay, node hỏng không được phát hiện, HPA đứng yên. Mất luôn đĩa của máy đó là mất etcd, tức mất toàn bộ mô tả của cụm; khi ấy chỉ còn bản sao lưu etcd (K4.5) cứu được. Cụm một control plane hợp với lab, môi trường thử, và những hệ thống chấp nhận "không deploy được vài giờ". Production cần ba control plane sau một địa chỉ chung, và đó là lý do bài này đã `init` với `controlPlaneEndpoint`. K4.2 dựng cấu trúc đó.
+
+</Reveal>
+
+<Reveal title="kubeadm không phải cách duy nhất. Các công cụ khác khác ở đâu?">
+
+Chúng khác ở phần quanh kubeadm, không khác ở phần lõi. Kubespray là bộ playbook Ansible (D8) làm việc của `node-prep.sh` rồi gọi kubeadm trên cả đội máy. Cluster API coi cụm là tài nguyên Kubernetes và dùng kubeadm làm bước bootstrap mặc định (K10). RKE2 và K3s của SUSE đóng control plane vào một binary và tự lo chứng chỉ, etcd; Talos Linux bỏ luôn SSH và quản node qua API. Dùng công cụ nào thì bên dưới vẫn là kubelet, containerd, static pod hoặc tương đương, etcd và một PKI. Người hiểu bài này đọc được cụm dựng bằng bất kỳ công cụ nào trong số đó.
+
+</Reveal>
+
+<Reveal title="Vì sao `apt-mark hold` các gói Kubernetes?">
+
+Vì nâng kubelet là một bước của quy trình nâng cấp cụm, có thứ tự và có drain (K4.3), không phải việc của `apt upgrade` hay `unattended-upgrades` (D8.5). Kho `pkgs.k8s.io` tách theo minor nên máy không tự nhảy từ 1.36 lên 1.37, nhưng bản vá (1.36.5 lên 1.36.6) nằm cùng kho và sẽ được cài nếu không `hold`. Một kubelet tự nâng và tự khởi động lại giữa giờ cao điểm, trên mọi node cùng lúc, là kiểu thay đổi đồng loạt mà D8.5 đã cảnh báo.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một dòng log của `kubeadm init`, hoặc viết file `ClusterConfiguration` từ mô tả. AI hay đưa hướng dẫn cũ: kho `apt.kubernetes.io` (đã bị gỡ; nay là `pkgs.k8s.io` tách theo minor), cài Docker làm runtime (kubelet bỏ dockershim từ 1.24), `apiVersion: kubeadm.k8s.io/v1beta3` (bản hiện hành là `v1beta4`, nơi `extraArgs` là danh sách chứ không phải map), và quên `SystemdCgroup = true`. Nó cũng hay bảo `kubeadm init --pod-network-cidr` với dải của một CNI khác CNI bạn cài. Kiểm lại bằng `kubeadm config validate --config <file>`, `kubeadm config print init-defaults` để xem dạng đúng của phiên bản đang dùng, và `kubeadm init --dry-run` trước khi chạy thật.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.1 đã giới thiệu các thành phần control plane và static pod; D1.5 dạy cgroup và namespace mà containerd dùng; D5.1 dạy image và overlayfs; D2.4 dạy `ip_forward` và netfilter. K4.2 dựng một cụm mới có nhiều control plane sau một VIP do HAProxy và Keepalived giữ. K4.3 nâng cụm này lên 1.37; K4.5 sao lưu etcd và đọc thư mục `pki/`; K4.6 cho Service một IP thật bằng MetalLB; K4.7 làm hỏng từng thứ bài này dựng. K6 thay Flannel bằng Cilium. D8.4 nướng `node-prep.sh` vào image; K10 dựng cụm bằng Cluster API.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d13.1.mastery-build">Từ hai máy Ubuntu trắng, dựng được một cụm kubeadm có một control plane và một worker với CNI, không nhìn bài, và giải thích được từng bước đang thoả điều kiện gì của kubelet hay kubeadm.</Check>
+
+<Check id="d13.1.mastery-read">Trên một control plane lạ, chỉ bằng `ls`, `crictl` và `systemctl`, chỉ ra được runtime, kubelet, bốn static pod, các kubeconfig và CA của cụm, và nói được mỗi thứ do pha nào của `kubeadm init` tạo.</Check>
+
+<Check id="d13.1.mastery-choose">Với một tình huống cho trước (startup trên cloud, ngân hàng buộc chạy tại datacenter, đội ba người), đề xuất được tự dựng hay dùng dịch vụ quản lý, và liệt kê được những việc vận hành còn lại của đội trong mỗi lựa chọn.</Check>
+
+</Mastery>

@@ -1,0 +1,938 @@
+---
+title: "Control plane HA: ba control plane sau một VIP"
+description: Dựng một cụm kubeadm nhiều control plane sau một địa chỉ ảo do HAProxy và Keepalived giữ, đo API server gián đoạn bao lâu khi máy giữ VIP hỏng, và tự tay làm etcd mất quorum để thấy vì sao hai control plane tệ hơn một và ba mới là con số nhỏ nhất.
+id: d13.2
+step: d13
+prerequisites: [d13.1, d21.3]
+topics: [d13.ha-control-plane]
+status: draft
+---
+
+<Goal>
+
+Cụm của K4.1 có một control plane: máy đó tắt thì không ai deploy được, và mất đĩa của nó là mất cụm. Bài này dựng control plane chịu được một máy hỏng. Học xong, bạn giải thích được:
+
+- Vì sao etcd cần **đa số** thành viên còn sống, và vì sao số control plane luôn là số lẻ.
+- Một địa chỉ chung cho nhiều API server được dựng bằng gì trên máy vật lý, và nó chuyển máy trong bao lâu.
+- `--control-plane-endpoint` và `--upload-certs` giải quyết việc gì khi thêm control plane.
+- Khi etcd mất quorum, thứ gì còn chạy, thứ gì dừng, và vì sao ứng dụng bắt đầu rớt request dù không ai đụng tới nó.
+
+</Goal>
+
+<Knowledge>
+
+### Quorum: vì sao ba, không phải hai
+
+etcd giữ dữ liệu nhất quán giữa các thành viên bằng thuật toán đồng thuận **Raft**. Ý chính đủ dùng cho vận hành:
+
+- Tại mỗi thời điểm có một thành viên là **leader**; mọi lần ghi đi qua leader.
+- Một lần ghi chỉ được coi là xong khi **đa số** thành viên (quorum) đã lưu nó. Bầu leader mới cũng cần đa số phiếu.
+- Đọc mặc định cũng hỏi qua đa số, để không bao giờ trả dữ liệu cũ.
+
+"Đa số" tính trên **tổng số thành viên đã khai**, kể cả thành viên đang chết:
+
+| Số thành viên | Quorum | Chịu được mấy thành viên hỏng |
+|---|---|---|
+| 1 | 1 | 0 |
+| 2 | 2 | **0** |
+| 3 | 2 | 1 |
+| 4 | 3 | 1 |
+| 5 | 3 | 2 |
+
+Hai dòng đáng nhìn. Hai thành viên không an toàn hơn một: cả hai phải cùng sống, nên bạn có gấp đôi số máy có thể hỏng mà không thêm được chút chịu lỗi nào. Bốn không hơn ba. Vì vậy số thành viên luôn lẻ: ba cho hầu hết cụm, năm khi cần chịu được hai máy hỏng cùng lúc (ví dụ đang bảo trì một máy thì một máy khác chết).
+
+Quy tắc đa số cũng là thứ chống split-brain mà D9.3 nói VRRP không có: khi mạng tách cụm làm hai, chỉ bên có đa số tiếp tục ghi được; bên thiểu số tự biết mình không có quyền và dừng. Cái giá là **mất quorum thì mất cả ghi lẫn đọc**, dù dữ liệu trên các máy còn sống vẫn nguyên vẹn.
+
+<Callout kind="production">
+
+Ngày 02/11/2020, API và dashboard của Cloudflare chập chờn trong 6 giờ 33 phút; theo [bài tường trình của họ](https://blog.cloudflare.com/a-byzantine-failure-in-the-real-world/), tỉ lệ request API thành công có lúc xuống 75% và dashboard chậm tới 80 lần, còn mạng biên phục vụ khách hàng không bị ảnh hưởng. Khởi đầu là một switch trong một rack hỏng **nửa vời** lúc 14:43 UTC: các giao thức điều khiển như LACP và BGP của nó vẫn chạy, nhưng vPC thì không, và nó không chuyển hết gói dữ liệu; sáu phút sau nó tự hồi phục. Rack đó chứa một máy của một cụm etcd. Bài viết mô tả bằng ba node: đường từ node 1 (trong rack hỏng) tới node 3 (leader) đi qua switch hỏng, đường từ node 1 tới node 2 đi qua switch còn tốt, và đường giữa node 2 với node 3 **không bị ảnh hưởng**. Node 1 liên tục khởi xướng bầu cử và tự bỏ phiếu cho mình, node 2 vẫn bỏ phiếu cho node 3, và các cuộc bầu cử hoà không đưa lên được một leader mà node 1 tới được. Bài viết nêu hệ quả: bầu cử của Raft chặn mọi lần ghi cho tới khi xong, nên cụm thành chỉ đọc cho tới khi switch hồi phục. Hệ thống quản lý các cụm database dựa vào etcd này; hai cụm không báo được rằng primary còn khoẻ và tự đưa một replica lên làm primary, không lỗi và không mất dữ liệu. Một lỗi khác buộc dựng lại mọi replica sau mỗi lần đổi primary. Với một cụm thì ảnh hưởng nhỏ; cụm còn lại là database xác thực cho API và dashboard, vốn cần một replica gánh phần đọc, nên primary mới bị quá tải cho tới khi replica đầu tiên dựng xong lúc 21:20 UTC.
+
+Điều rút ra (của bài này): ở đây cụm etcd **vẫn còn đa số** (node 2 và node 3 nói chuyện được với nhau), vậy mà một thành viên bị cô lập nửa vời, cứ đòi bầu cử, đủ làm cả cụm ngừng nhận ghi. Bảng quorum cho biết cụm chịu được mấy máy **chết hẳn**; nó không bảo đảm gì cho kiểu hỏng lưng chừng. Thứ cần chuẩn bị là mọi hệ thống dựa vào etcd phải xử sự tử tế khi etcd tạm không ghi được: với Kubernetes, đó là API server và mọi controller. Lab cho bạn thấy cụm trông ra sao trong trạng thái ấy, để lần đầu gặp nó không phải là lúc đang có sự cố.
+
+</Callout>
+
+<Check id="d13.2.quorum">Tính được quorum và số thành viên được phép hỏng cho cụm 1, 2, 3, 5 thành viên; giải thích được vì sao hai thành viên không hơn một, và mất quorum thì etcd từ chối những gì.</Check>
+
+### Những gì có nhiều bản, và bản nào làm việc
+
+```text
+                     k4-ha.lab:8443  →  VIP 192.168.104.100   (Keepalived: một máy giữ tại mỗi thời điểm)
+                              │
+            ┌─────────────────┼─────────────────┐
+        HAProxy           HAProxy           HAProxy        mỗi máy một bản; bản trên máy giữ VIP nhận traffic,
+            └────────┬────────┴────────┬────────┘        và chia cho MỌI API server còn khoẻ
+        kube-apiserver   kube-apiserver   kube-apiserver   cả ba cùng phục vụ (không trạng thái)
+        controller-mgr   controller-mgr   controller-mgr   một bản làm việc, chọn qua Lease (K1.1)
+        scheduler        scheduler        scheduler        một bản làm việc, chọn qua Lease
+        etcd  ◄────────► etcd  ◄────────► etcd             một leader, ghi cần 2 trên 3
+          ha1               ha2               ha3
+```
+
+| Thành phần | Kiểu dự phòng | Một máy chết thì |
+|---|---|---|
+| `kube-apiserver` | Cả ba cùng chạy; load balancer bỏ bản không khoẻ | Kết nối đang mở tới bản đó đứt; client nối lại sang bản khác |
+| `kube-controller-manager`, `kube-scheduler` | Một bản giữ Lease, các bản khác chờ | Nếu bản giữ Lease chết: bản khác nhận sau khi Lease hết hạn (khoảng 15 giây) |
+| etcd | Raft, cần đa số | Còn 2 trên 3: bầu leader mới trong vài giây, vẫn ghi được |
+| VIP và HAProxy | Keepalived, một máy giữ VIP | Máy giữ VIP chết: máy khác nhận sau khoảng 3 tới 4 giây (D9.3) |
+
+Cấu trúc trong hình, etcd chạy ngay trên máy control plane, gọi là **stacked etcd** và là mặc định của kubeadm. Lựa chọn kia là **external etcd**: ba máy riêng cho etcd.
+
+| | Stacked | External |
+|---|---|---|
+| Số máy | 3 | 6 (3 control plane, 3 etcd) |
+| Mất một máy là mất | Một API server **và** một thành viên etcd | Một trong hai |
+| Vận hành | kubeadm lo cả etcd (join, nâng cấp) | Bạn tự dựng, tự cấp chứng chỉ, tự nâng cấp etcd |
+| Hợp với | Phần lớn cụm | Cụm rất lớn, etcd cần đĩa và máy riêng; tổ chức có đội riêng cho etcd |
+
+<Check id="d13.2.thanh-phan">Nói được trong một control plane HA thành phần nào chạy song song, thành phần nào chỉ một bản làm việc, và so sánh được stacked etcd với external etcd.</Check>
+
+### Một địa chỉ cho nhiều API server
+
+K4.1 đã `init` với `controlPlaneEndpoint` là một cái tên. Giờ cái tên đó phải trỏ vào thứ còn sống khi một máy chết. Trên cloud đó là load balancer của nhà cung cấp. Trên máy vật lý, tài liệu của kubeadm đưa cấu trúc mà D9.2 và D9.3 đã dựng: HAProxy chia traffic, Keepalived giữ một VIP. Bài này chỉ thêm phần riêng của Kubernetes:
+
+Nhắc lại ba khái niệm của D9.3 mà phần này dùng. **VIP** là một địa chỉ IP không thuộc hẳn về máy nào: tại mỗi thời điểm một máy gắn nó lên card mạng và trả lời ARP cho nó. **Keepalived** cho các máy thoả thuận ai giữ VIP bằng giao thức VRRP: máy giữ VIP gửi "advertisement" mỗi giây, máy khác không nghe thấy trong khoảng 3 tới 4 giây thì tự nhận VIP, và máy có `priority` cao hơn thắng. **`track_script`** là một lệnh Keepalived chạy định kỳ; lệnh thất bại thì máy đó tự bỏ VIP.
+
+- **HAProxy ở `mode tcp`.** API server tự làm TLS và xác thực client bằng chứng chỉ (K4.5), nên load balancer không được giải mã; nó chuyển nguyên dòng byte.
+- **Health check phải là `/readyz` qua TLS**, không chỉ kiểm cổng mở. API server mở cổng trước khi sẵn sàng, và một API server mất liên lạc với etcd vẫn mở cổng. `/readyz` cho phép gọi không cần đăng nhập.
+- **Cổng 8443.** Khi HAProxy chạy ngay trên máy control plane, cổng 6443 đã thuộc về API server của máy đó; HAProxy phải nghe cổng khác, và `controlPlaneEndpoint` trỏ vào cổng đó.
+- **Timeout dài.** `kubectl logs -f`, `kubectl exec` và mọi `watch` của controller là kết nối sống hàng giờ; `timeout client` và `timeout server` vài chục giây sẽ cắt chúng liên tục.
+- **`track_script` của Keepalived kiểm HAProxy, không kiểm API server.** Lý do như D9.3: nếu script trượt vì API server hỏng, lúc cụm mới dựng (chưa có API server nào) sẽ không máy nào chịu giữ VIP và `kubeadm init` không gọi được chính mình.
+- **VRRP unicast.** Mạng lab không chuyển multicast giữa các VM; D9.3 đã nêu cách chữa cho đúng trường hợp này: `unicast_peer`, mỗi máy gửi advertisement thẳng tới IP của các máy kia. Nhiều mạng ảo hoá và một số switch cũng cần vậy.
+
+Một lựa chọn gọn hơn cho cùng việc là kube-vip: một tiến trình chạy như static pod, tự giữ VIP bằng ARP hoặc BGP và có thể kiêm chia tải. Bài dùng HAProxy và Keepalived vì bạn đã hiểu từng mảnh của chúng, và vì đó là tổ hợp tài liệu kubeadm gọi là đã được kiểm chứng lâu năm.
+
+<Check id="d13.2.endpoint">Kể được năm điểm riêng của load balancer trước API server (mode, health check, cổng, timeout, đối tượng của `track_script`) và lý do của từng điểm.</Check>
+
+### Thêm một control plane: `--upload-certs` và `join --control-plane`
+
+Một worker chỉ cần `ca.crt`. Một control plane mới cần **khoá** của ba CA, `sa.key` và `sa.pub` (K4.5): mọi API server phải ký và kiểm bằng cùng một bộ khoá. Chép tay bằng `scp` được, nhưng kubeadm có đường tắt:
+
+```text
+ ha1:  kubeadm init --upload-certs
+         → mã hoá các khoá dùng chung bằng một "certificate key" ngẫu nhiên,
+           cất vào Secret kubeadm-certs (kube-system); Secret tự xoá sau 2 giờ
+ ha2:  kubeadm join k4-ha.lab:8443 --token … --discovery-token-ca-cert-hash … \
+         --control-plane --certificate-key <khoá>
+         → tải Secret, giải mã, ghi vào /etc/kubernetes/pki
+         → tự cấp chứng chỉ riêng của máy (apiserver, etcd/server, etcd/peer: SAN chứa IP máy này)
+         → báo với etcd "có thành viên mới", chạy etcd của mình, chờ nó đồng bộ rồi mới thành thành viên biểu quyết
+         → viết bốn manifest static pod, gắn label và taint control plane
+```
+
+Certificate key cho phép lấy khoá của CA cụm: coi nó như mật khẩu root, và đừng kéo dài hạn 2 giờ của Secret. Hết hạn thì tạo lại bằng `kubeadm init phase upload-certs --upload-certs`.
+
+Thành viên etcd mới vào cụm ở dạng **learner**: nó nhận dữ liệu nhưng chưa được tính vào quorum, và chỉ được nâng thành thành viên biểu quyết khi đã bắt kịp. Nhờ vậy thêm một thành viên chậm hoặc cấu hình sai không làm cụm đang chạy mất quorum.
+
+<Check id="d13.2.join-cp">Kể được control plane mới cần những khoá nào mà worker không cần, `--upload-certs` và certificate key chuyển chúng ra sao, và vì sao thành viên etcd mới bắt đầu là learner.</Check>
+
+### Khi hỏng: bảng tra
+
+| Chuyện xảy ra | API server | Ứng dụng đang chạy | Việc của bạn |
+|---|---|---|---|
+| Một trong ba control plane chết | Gián đoạn vài giây nếu máy đó giữ VIP hoặc là leader của etcd | Không ảnh hưởng | Sửa hoặc thay máy; trong lúc đó cụm **không còn chịu thêm lỗi nào** |
+| Hai trong ba chết (mất quorum) | Mọi lệnh đọc, ghi đều hết giờ chờ | Vẫn chạy, nhưng không ai sửa gì: pod chết không được thay, endpoint của node chết không được gỡ | Đưa ít nhất một máy quay lại; không được thì khôi phục từ snapshot (K4.5) |
+| HAProxy trên máy giữ VIP chết | Gián đoạn tới khi VIP chuyển (khoảng 3 giây) | Không ảnh hưởng | Sửa HAProxy |
+| Một máy chết hẳn, không cứu được | Như dòng đầu | Không ảnh hưởng | Gỡ thành viên etcd cũ (`etcdctl member remove`), xoá node, cho máy mới `join --control-plane` |
+
+Dòng thứ hai là dòng cần nhớ: mất quorum không dừng ứng dụng ngay, nó **đóng băng** cụm trong trạng thái cuối cùng, kể cả những thứ sai trong trạng thái đó.
+
+<Check id="d13.2.failure-modes">Với mỗi kiểu hỏng trong bảng, nói được API server và ứng dụng bị ảnh hưởng thế nào, và việc đầu tiên phải làm.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Creating Highly Available Clusters with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/high-availability/): quy trình chính thức với `--control-plane-endpoint` và `--upload-certs`, cả hai kiểu stacked và external etcd.
+- [Options for Highly Available Topology](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/ha-topology/): hình và so sánh stacked etcd với external etcd.
+- [kubeadm: High Availability Considerations](https://github.com/kubernetes/kubeadm/blob/main/docs/ha-considerations.md): cấu hình Keepalived, HAProxy và kube-vip trước API server.
+- [etcd FAQ](https://etcd.io/docs/v3.7/faq/): "Why an odd number of cluster members?", kích thước cụm và bảng chịu lỗi.
+- [Cloudflare: A Byzantine failure in the real world](https://blog.cloudflare.com/a-byzantine-failure-in-the-real-world/): bài tường trình dùng trong callout.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Lab dựng một cụm **mới** trên các VM riêng (`k4-ha1`, `k4-ha2`, rồi `k4-ha3`), không đụng tới cụm của K4.1. Dừng hai VM cũ trước để lấy lại RAM; cụm trong đó vẫn nguyên khi bạn bật lại.
+
+**Profile máy.** Phần A cần hai VM, mỗi VM 2 CPU và 2 GiB: máy 8 GB làm được nếu tắt Docker Desktop. Phần B cần ba VM cùng lúc (6 GiB): chỉ làm trên máy 16 GB còn rảnh; máy 8 GB đọc theo. Cuối phần A, `free -m` cho thấy mỗi control plane dùng khoảng 800 tới 860 MB.
+
+**Trạng thái kiểm chứng.** Phần A (hai control plane, VIP, mất quorum) đã chạy thật ngày 13/10/2026 trên hai VM Lima với Kubernetes 1.37.1, etcd 3.7.0, HAProxy 3.2.9, Keepalived 2.3.4. Phần B (control plane thứ ba) cần ba VM chạy cùng lúc và **chưa chạy được** trên máy kiểm chứng vì thiếu RAM: lệnh ở phần B lặp lại đúng các lệnh của phần A, còn kết quả mô tả ở đó là dự kiến. Bài giữ nhãn nháp cho tới khi phần B được chạy.
+
+Lab dùng `node-prep.sh` của K4.1 trong `~/masteva-d13`; nếu chưa có, làm khối lệnh tạo file đó ở bước 2 của K4.1. Bài cài thẳng 1.37 vì không có gì để nâng ở đây.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl stop k4-w1
+limactl stop k4-cp1
+for v in k4-ha1 k4-ha2; do limactl start --name $v --cpus 2 --memory 2 --disk 20 --plain --network lima:user-v2 --tty=false template:ubuntu-26.04 2>&1 | tail -1 | cut -c1-70; done
+for v in k4-ha1 k4-ha2; do limactl shell $v sudo bash -s 1.37 < node-prep.sh 2>&1 | tail -1; done
+for v in k4-ha1 k4-ha2; do limactl shell $v hostname -I; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+…
+lima-k4-ha1: containerd 2.2.2, runc 1.4.0-0ubuntu1, kubeadm v1.37.1, kubelet v1.37.1
+lima-k4-ha2: containerd 2.2.2, runc 1.4.0-0ubuntu1, kubeadm v1.37.1, kubelet v1.37.1
+192.168.104.4
+192.168.104.5
+```
+
+</Expected>
+
+`limactl stop` báo lỗi nếu VM đã dừng sẵn; bỏ qua. Địa chỉ của hai VM trên máy bạn có thể khác; script dưới đây tự đọc. VIP của lab là `192.168.104.100`: một địa chỉ cùng subnet mà Lima không cấp cho VM nào.
+
+**Phần A: hai control plane**
+
+### 1. Dựng load balancer trước, khi chưa có cụm
+
+Thứ tự này là bắt buộc: `kubeadm init` sẽ gọi chính mình qua `k4-ha.lab:8443`, nên địa chỉ đó phải tồn tại trước. Script nhận priority của Keepalived và danh sách IP của **mọi** control plane; chạy trên từng máy với cùng danh sách.
+
+<Terminal where="mac" title="~/masteva-d13/lb-setup.sh">
+
+```bash
+cd ~/masteva-d13
+cat > lb-setup.sh <<'EOF'
+#!/usr/bin/env bash
+# lb-setup.sh <priority> <ip control plane 1> <ip control plane 2> ...
+# Cài HAProxy và Keepalived trước API server; chạy bằng root trên từng control plane, cùng một danh sách IP.
+set -euo pipefail
+PRIO=${1:?thiếu priority}; shift
+ALL="$*"; [ -n "$ALL" ] || { echo "thiếu danh sách IP" >&2; exit 1; }
+VIP=192.168.104.100
+ME=$(hostname -I | awk '{print $1}')
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUPPRESS=1
+apt-get install -y -qq haproxy keepalived > /dev/null
+
+# HAProxy: nhận ở cổng 8443 (cổng 6443 đã thuộc về API server trên cùng máy), chia cho mọi API server còn khoẻ
+{
+cat <<'CFG'
+global
+  log /dev/log local0
+
+defaults
+  log global
+  mode tcp
+  option tcplog
+  timeout connect 3s
+  timeout client  1h
+  timeout server  1h
+
+frontend kube_api
+  bind :8443
+  default_backend apiservers
+
+backend apiservers
+  option httpchk
+  http-check send meth GET uri /readyz
+  http-check expect status 200
+  default-server check check-ssl verify none inter 2s fall 2 rise 2
+CFG
+n=0; for ip in $ALL; do n=$((n + 1)); echo "  server cp$n $ip:6443"; done
+cat <<'CFG'
+
+frontend lb_health
+  mode http
+  bind 127.0.0.1:8444
+  monitor-uri /lb-health
+CFG
+} > /etc/haproxy/haproxy.cfg
+systemctl enable haproxy > /dev/null 2>&1
+systemctl restart haproxy
+
+# Keepalived: giữ VIP trên máy có HAProxy khoẻ; VRRP unicast vì mạng lab không chuyển multicast
+{
+cat <<CFG
+global_defs {
+  router_id $(hostname)
+  script_user root
+  enable_script_security
+}
+
+vrrp_script chk_haproxy {
+  script "/usr/bin/curl -fs -o /dev/null -m 1 http://127.0.0.1:8444/lb-health"
+  interval 1
+  fall 2
+  rise 2
+}
+
+vrrp_instance K4_API {
+  state BACKUP
+  interface eth0
+  virtual_router_id 54
+  priority $PRIO
+  advert_int 1
+  unicast_src_ip $ME
+  unicast_peer {
+CFG
+for ip in $ALL; do [ "$ip" = "$ME" ] || echo "    $ip"; done
+cat <<CFG
+  }
+  virtual_ipaddress {
+    $VIP/24
+  }
+  track_script {
+    chk_haproxy
+  }
+}
+CFG
+} > /etc/keepalived/keepalived.conf
+systemctl enable keepalived > /dev/null 2>&1
+systemctl restart keepalived
+
+grep -q k4-ha.lab /etc/hosts || echo "$VIP k4-ha.lab" >> /etc/hosts
+echo "$(hostname): haproxy $(systemctl is-active haproxy), keepalived $(systemctl is-active keepalived), priority $PRIO"
+EOF
+HA1=$(limactl shell k4-ha1 hostname -I | awk '{print $1}')
+HA2=$(limactl shell k4-ha2 hostname -I | awk '{print $1}')
+limactl shell k4-ha1 sudo bash -s 110 $HA1 $HA2 < lb-setup.sh 2>&1 | tail -1
+limactl shell k4-ha2 sudo bash -s 100 $HA1 $HA2 < lb-setup.sh 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lima-k4-ha1: haproxy active, keepalived active, priority 110
+lima-k4-ha2: haproxy active, keepalived active, priority 100
+```
+
+</Expected>
+
+Đối chiếu script với D9.2 và D9.3: `mode tcp`, health check HTTP qua TLS tới `/readyz`, một frontend `lb_health` chỉ để Keepalived hỏi "HAProxy còn sống không", `state BACKUP` trên mọi máy với priority quyết định ai lên, và `unicast_peer` thay cho multicast. Kiểm lớp này trước khi có Kubernetes:
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+sleep 5
+getent hosts k4-ha.lab
+ip -br addr show eth0 | grep -c 192.168.104.100
+ping -c 1 -W 1 192.168.104.100 > /dev/null && ip neigh show 192.168.104.100 | awk '{print "VIP dang o MAC:", $5}'
+curl -sk -m 2 -o /dev/null -w "%{http_code} %{errormsg}\n" https://k4-ha.lab:8443/readyz
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+192.168.104.100 k4-ha.lab
+0
+VIP dang o MAC: 52:55:55:23:4f:e2
+000 TLS connect error: error:0A000126:SSL routines::unexpected eof while reading
+```
+
+</Expected>
+
+`k4-ha2` không giữ VIP (dòng `0`); VIP trả lời từ một địa chỉ MAC khác, của `k4-ha1`, máy có priority cao hơn. Gọi tới `k4-ha.lab:8443` thì HAProxy nhận kết nối rồi đóng ngay: nó chưa có API server nào khoẻ để chuyển tới. Đúng như mong đợi ở thời điểm này. Địa chỉ MAC trên máy bạn sẽ khác.
+
+<Check id="d13.2.lab-lb">Dựng được HAProxy và Keepalived (VRRP unicast) trên các máy sẽ làm control plane trước khi có cụm, xác định được máy giữ VIP, và giải thích được vì sao lúc này gọi qua VIP nhận kết nối bị đóng.</Check>
+
+### 2. `kubeadm init` qua VIP
+
+<Terminal where="vm" title="k4-ha1">
+
+```bash
+mkdir -p ~/k4 && cd ~/k4
+cat > kubeadm-ha.yaml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: $(hostname -I | awk '{print $1}')
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v1.37.1
+controlPlaneEndpoint: k4-ha.lab:8443
+networking:
+  podSubnet: 10.244.0.0/16
+EOF
+sudo kubeadm init --config kubeadm-ha.yaml --upload-certs 2>&1 | grep -E "upload-certs\]|^[a-f0-9]{64}|initialized|As a safeguard" | cut -c1-110
+mkdir -p $HOME/.kube
+sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+kubectl apply -f https://github.com/flannel-io/flannel/releases/download/v0.28.10/kube-flannel.yml > /dev/null
+kubectl wait --for=condition=Ready node/lima-k4-ha1 --timeout=180s
+grep server: ~/.kube/config
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[upload-certs] Storing the certificates in Secret "kubeadm-certs" in the "kube-system" Namespace
+[upload-certs] Using certificate key:
+d930cdbf6b7c06ce436ef20b3c55721d5dc57d128734d75781929b6724209b9f
+Your Kubernetes control-plane has initialized successfully!
+As a safeguard, uploaded-certs will be deleted in two hours; If necessary, you can use
+node/lima-k4-ha1 condition met
+    server: https://k4-ha.lab:8443
+```
+
+</Expected>
+
+Khác K4.1 ở ba chỗ: endpoint có cổng `8443`, cờ `--upload-certs`, và dòng certificate key. `kubectl` của bạn giờ đi qua VIP và HAProxy rồi mới tới API server. Khoá trên máy bạn sẽ khác; không cần chép lại, bước sau tạo khoá mới.
+
+### 3. Control plane thứ hai
+
+Tạo lại certificate key và một token ngắn hạn, ghép thành lệnh join cho control plane, rồi chạy trên `k4-ha2`:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl shell k4-ha1 bash -c 'KEY=$(sudo kubeadm init phase upload-certs --upload-certs 2> /dev/null | tail -1); sudo kubeadm token create --ttl 30m --print-join-command --certificate-key "$KEY"' > join-cp.sh
+grep -o -- "--control-plane --certificate-key [a-f0-9]\{8\}" join-cp.sh
+limactl shell k4-ha2 sudo bash -s < join-cp.sh 2>&1 | grep -E "download-certs\] Saving|etcd\] Announced|This node has joined|new etcd member was"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+--control-plane --certificate-key 89e1c7d3
+[download-certs] Saving the certificates to the folder: "/etc/kubernetes/pki"
+[etcd] Announced new etcd member joining to the existing etcd cluster
+This node has joined the cluster and a new control plane instance was created:
+* A new etcd member was added to the local/stacked etcd cluster.
+```
+
+</Expected>
+
+`join-cp.sh` chứa cả token lẫn certificate key: ai có file này trong 30 phút tới là thêm được một control plane vào cụm và lấy được khoá của CA. Xoá nó khi xong. Việc join mất khoảng nửa phút; giữa chừng có thể hiện vài dòng cảnh báo của client etcd trong lúc thành viên mới đồng bộ.
+
+Trên `k4-ha2`, lấy kubeconfig, lấy `etcdctl` ra từ chính container etcd (image etcd có sẵn binary này, và hệ thống file của container nhìn được từ máy qua `/proc/<pid>/root`; K4.5 dùng lại cách này), rồi xem cụm:
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+mkdir -p $HOME/.kube ~/k4 && cd ~/k4
+sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+sudo cp /proc/$(pgrep -x etcd)/root/usr/local/bin/etcdctl /usr/local/bin/
+cat > etcd.env <<'EOF'
+export ETCDCTL_ENDPOINTS=https://127.0.0.1:2379
+export ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt
+export ETCDCTL_CERT=/etc/kubernetes/pki/etcd/healthcheck-client.crt
+export ETCDCTL_KEY=/etc/kubernetes/pki/etcd/healthcheck-client.key
+EOF
+kubectl wait --for=condition=Ready node/lima-k4-ha2 --timeout=180s
+kubectl get nodes
+sudo bash -c '. ./etcd.env; etcdctl endpoint status --cluster' | cut -d, -f1,9,11
+kubectl -n kube-system get lease kube-controller-manager kube-scheduler --no-headers -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity | cut -c1-45
+sudo ls /etc/kubernetes/pki | grep -c key
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-ha2 condition met
+NAME          STATUS   ROLES           AGE     VERSION
+lima-k4-ha1   Ready    control-plane   110s   v1.37.1
+lima-k4-ha2   Ready    control-plane   21s    v1.37.1
+https://192.168.104.4:2379, true, 2
+https://192.168.104.5:2379, false, 2
+kube-controller-manager   lima-k4-ha1_0373091
+kube-scheduler            lima-k4-ha1_92fda6b
+7
+```
+
+</Expected>
+
+Ba cột của `etcdctl endpoint status`: địa chỉ thành viên, có phải leader không, và **term** của Raft (tăng một mỗi lần bầu leader). etcd có hai thành viên, leader là `k4-ha1`. Controller manager và scheduler chạy trên cả hai máy nhưng Lease cho thấy chỉ bản trên `k4-ha1` đang làm việc. Và `k4-ha2` giờ giữ 7 file khoá trong `pki/`, gồm khoá của ba CA: nó là một control plane đầy đủ.
+
+<Check id="d13.2.lab-join">Đưa được máy thứ hai vào làm control plane bằng `--control-plane` và certificate key, và chỉ ra được thành viên etcd mới, leader của etcd, cùng bản controller manager đang giữ Lease.</Check>
+
+### 4. VIP chuyển máy
+
+Công cụ đo gọi `/readyz` qua VIP khoảng 5 lần mỗi giây và in mỗi lần trạng thái đổi:
+
+<Terminal where="vm" title="k4-ha2: ~/k4/api-probe.sh">
+
+```bash
+cd ~/k4
+cat > api-probe.sh <<'EOF'
+#!/usr/bin/env bash
+# api-probe.sh <giây>: gọi /readyz của API server qua VIP khoảng 5 lần mỗi giây, in mỗi lần trạng thái đổi
+end=$(( $(date +%s) + ${1:-20} )); prev=""; n=0; bad=0; since=0
+while (( $(date +%s) < end )); do
+  now=$(date +%s.%N)
+  code=$(curl -sk -m 1 -o /dev/null -w '%{http_code}' https://k4-ha.lab:8443/readyz)
+  case "$code" in 200) st=ok ;; 000) st=KHONG-NOI-DUOC ;; *) st="HTTP-$code" ;; esac
+  n=$((n + 1)); [[ $st == ok ]] || bad=$((bad + 1))
+  if [[ $st != "$prev" ]]; then
+    note=""
+    [[ -n $prev && $prev != ok && $st == ok ]] && note=$(awk -v a="$since" -v b="$now" 'BEGIN { printf "  (gian doan %.1f giay)", b - a }')
+    [[ $prev == ok || -z $prev ]] && since=$now
+    printf '%s  %s%s\n' "$(date -d "@$now" +%T)" "$st" "$note"; prev=$st
+  fi
+  sleep 0.2
+done
+echo "tong=$n khong_ok=$bad"
+EOF
+chmod +x api-probe.sh
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Hai lần thử dưới đây dừng Keepalived rồi HAProxy trên máy đang giữ VIP, làm API server của cụm lab gián đoạn vài giây mỗi lần. Chỉ chạy trên `k4-ha1` của lab.
+
+</Callout>
+
+Chạy phép đo 15 giây trên `k4-ha2`, và trong lúc nó chạy, dừng Keepalived trên `k4-ha1` (máy đang giữ VIP) ở terminal kia:
+
+<Terminal where="vm" title="k4-ha2 (đo)">
+
+```bash
+~/k4/api-probe.sh 15
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-ha1">
+
+```bash
+sudo systemctl stop keepalived
+sleep 8; ip -br addr show eth0 | grep -c 192.168.104.100
+sudo systemctl start keepalived
+sleep 6; ip -br addr show eth0 | grep -c 192.168.104.100
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+1
+```
+
+</Expected>
+
+Terminal đo in ra:
+
+```text
+05:16:47  ok
+05:16:51  KHONG-NOI-DUOC
+05:16:52  ok  (gian doan 1.2 giay)
+tong=61 khong_ok=1
+```
+
+Dừng có chủ đích: Keepalived gửi advertisement priority 0, `k4-ha2` nhận VIP sau chưa tới một giây (D9.3 bước 4), và chỉ một lần gọi thất bại. Khi Keepalived trên `k4-ha1` chạy lại, nó giành lại VIP vì priority cao hơn (dòng `1`).
+
+Lặp lại với kiểu hỏng khó chịu hơn: HAProxy trên máy giữ VIP chết, máy và Keepalived vẫn sống.
+
+<Terminal where="vm" title="k4-ha2 (đo)">
+
+```bash
+~/k4/api-probe.sh 15
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-ha1">
+
+```bash
+sudo systemctl stop haproxy
+sleep 8; sudo journalctl -u keepalived --no-pager -n 8 | grep -o -E "(VRRP_Script|\(K4_API\)).*" | tail -2
+sudo systemctl start haproxy
+```
+
+</Terminal>
+
+<Predict question="Keepalived trên k4-ha1 vẫn chạy. Ai phát hiện HAProxy chết, và API gián đoạn khoảng bao lâu?">
+
+Trên `k4-ha1`:
+
+```text
+VRRP_Script(chk_haproxy) failed (exited with status 7)
+(K4_API) Entering FAULT STATE
+```
+
+Terminal đo:
+
+```text
+05:17:06  ok
+05:17:10  KHONG-NOI-DUOC
+05:17:13  ok  (gian doan 3.2 giay)
+tong=60 khong_ok=10
+```
+
+`track_script` trên chính `k4-ha1` phát hiện: hai lần kiểm thất bại liên tiếp (`interval 1`, `fall 2`), instance vào `FAULT` và bỏ VIP, `k4-ha2` nhận. Khoảng 3 giây (2,9 và 3,2 trong hai lượt chạy của bài). Đây là con số cho mọi người dùng `kubectl` và mọi kubelet của worker khi máy giữ VIP gặp chuyện; các lượt đo trên máy bạn sẽ dao động quanh đó.
+
+</Predict>
+
+<Check id="d13.2.lab-vip">Đo được thời gian API gián đoạn khi dừng Keepalived có chủ đích và khi HAProxy trên máy giữ VIP chết, và giải thích được chênh lệch bằng cơ chế của VRRP và `track_script`.</Check>
+
+### 5. Hai thành viên etcd, mất một
+
+Trước khi làm hỏng, cho cụm một ứng dụng để thấy tác động lên traffic. Hai máy đều là control plane nên gỡ taint cho chúng chạy workload; đây là lối tắt của lab, cụm thật giữ taint và có worker riêng. Ràng buộc `topologySpreadConstraints` trong lệnh `patch` buộc hai bản sao nằm ở hai máy khác nhau.
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule-
+kubectl create deployment web --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 --replicas=2 -- /agnhost netexec --http-port=8080
+kubectl patch deployment web -p '{"spec":{"template":{"spec":{"topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"kubernetes.io/hostname","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"web"}},"matchLabelKeys":["pod-template-hash"]}]}}}}'
+kubectl create service nodeport web --tcp=80:8080 --node-port=30080
+kubectl rollout status deploy/web --timeout=180s | tail -1
+sleep 8; kubectl get pods -o wide --no-headers | awk '{print $1, $3, $7}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/lima-k4-ha1 untainted
+node/lima-k4-ha2 untainted
+deployment.apps/web created
+deployment.apps/web patched
+service/web created
+deployment "web" successfully rolled out
+web-5d78998f69-gdvc5 Running lima-k4-ha2
+web-5d78998f69-sj5zg Running lima-k4-ha1
+```
+
+</Expected>
+
+<Callout kind="danger">
+
+Lệnh dưới tắt nguồn đột ngột VM `k4-ha1`, một nửa control plane của cụm lab. Cụm sẽ ngừng nhận mọi lệnh cho tới khi bạn bật lại VM đó ở cuối bước.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+limactl stop --force k4-ha1
+```
+
+</Terminal>
+
+Chờ khoảng 30 giây rồi xem cụm từ máy còn sống:
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+cd ~/k4; sleep 30
+ip -br addr show eth0 | grep -c 192.168.104.100
+kubectl get nodes --request-timeout=8s 2>&1 | tail -1 | cut -c1-120
+curl -sk -m 3 -o /dev/null -w "readyz: %{http_code}\n" https://127.0.0.1:6443/readyz
+sudo crictl ps --name 'kube-apiserver|etcd' | awk 'NR > 1 {print $(NF-4), $(NF-5)}'
+sudo bash -c '. ./etcd.env
+etcdctl endpoint status 2>&1 | cut -d, -f1,9,11,14
+timeout 8 etcdctl get /registry/namespaces/default --keys-only 2>&1 | tail -1 | cut -c1-60
+etcdctl get /registry/namespaces/default --keys-only --consistency=s | head -1'
+```
+
+</Terminal>
+
+<Predict question="Còn một trong hai control plane, VIP đã chuyển sang nó, API server và etcd trên nó vẫn chạy. kubectl get nodes trả về gì?">
+
+```text
+1
+context deadline exceeded - error from a previous attempt: EOF
+readyz: 000
+kube-apiserver Running
+etcd Running
+https://127.0.0.1:2379, false, 2, etcdserver: no leader
+Error: context deadline exceeded
+/registry/namespaces/default
+```
+
+Không gì cả: lệnh hết giờ chờ. Lần lượt từng dòng:
+
+- VIP đã ở `k4-ha2` (dòng `1`): lớp load balancer làm đúng việc của nó.
+- API server và etcd trên `k4-ha2` đều `Running`, nhưng `/readyz` của API server không trả lời nổi trong 3 giây (`000`; có lúc nó kịp trả `500`): tiến trình sống mà không phục vụ được, vì phép kiểm sẵn sàng của nó cũng phải hỏi etcd.
+- etcd báo `no leader`. Cụm có **hai** thành viên nên quorum là hai; còn một thì không bầu được leader.
+- Một lệnh đọc bình thường hết giờ chờ, vì đọc mặc định cũng phải hỏi qua leader. Lệnh đọc với `--consistency=s` (đọc thẳng từ thành viên này, chấp nhận dữ liệu có thể cũ) trả về key: **dữ liệu vẫn còn nguyên trên đĩa**. Thứ mất là quyền quyết định, không phải dữ liệu.
+
+Đây là dòng "2 thành viên, chịu được 0" của bảng quorum, và là lý do không ai chạy hai control plane: cụm này vừa có thêm một máy có thể hỏng, vừa chết ngay khi một trong hai hỏng. Thông báo lỗi chính xác của `kubectl` trên máy bạn có thể khác, miễn là nó hết giờ chờ.
+
+</Predict>
+
+Còn ứng dụng? Gọi nó vài lần qua NodePort của máy còn sống:
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do curl -s -m 1 -o /dev/null -w "%{http_code} " http://127.0.0.1:30080/hostname; done; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 000 000 200 200 000 200 200
+```
+
+</Expected>
+
+Pod trên `k4-ha2` vẫn trả lời. Nhưng một phần request rơi vào pod trên máy đã tắt và hết giờ chờ (`000`): bình thường, node controller đánh dấu một node chết là `NotReady` sau khoảng 40 tới 50 giây và endpoint của nó được gỡ (K4.4 đo chuyện này); lần này **không còn ai để gỡ**, vì gỡ endpoint là một lần ghi vào etcd. Cụm bị đóng băng cùng với lỗi của nó, và sẽ ở nguyên như vậy tới khi có lại quorum. Thứ tự `200` và `000` là ngẫu nhiên; trên máy bạn sẽ khác.
+
+Bật lại máy đã tắt:
+
+<Terminal where="mac">
+
+```bash
+limactl start k4-ha1
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+cd ~/k4
+until kubectl get nodes --request-timeout=3s > /dev/null 2>&1; do sleep 1; done
+kubectl get nodes
+sudo bash -c '. ./etcd.env; etcdctl endpoint status --cluster' | cut -d, -f1,9,11
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME          STATUS   ROLES           AGE     VERSION
+lima-k4-ha1   Ready    control-plane   4m18s   v1.37.1
+lima-k4-ha2   Ready    control-plane   2m49s   v1.37.1
+https://192.168.104.4:2379, false, 3
+https://192.168.104.5:2379, true, 3
+```
+
+</Expected>
+
+Trong hai lượt chạy của bài, API server trả lời lại khoảng 15 giây sau khi VM lên: thành viên thứ hai quay về, đủ quorum, bầu leader. Term của Raft tăng từ 2 lên 3 và leader giờ là `k4-ha2`. Không cần khôi phục gì, vì không mất dữ liệu nào.
+
+<Check id="d13.2.lab-quorum">Tái hiện được etcd mất quorum trên cụm hai thành viên, phân biệt được "API server còn chạy" với "API server phục vụ được" bằng `/readyz` và `etcdctl`, chứng minh được dữ liệu còn nguyên bằng một lệnh đọc không qua quorum, và chỉ ra được hậu quả với traffic của ứng dụng.</Check>
+
+**Phần B: control plane thứ ba**
+
+Phần này cần ba VM chạy cùng lúc và **chưa được chạy kiểm chứng** (xem ghi chú đầu bài). Các lệnh lặp lại đúng những gì phần A đã làm; output ghi dưới đây là dự kiến.
+
+### 6. Thêm `k4-ha3`
+
+Tạo VM thứ ba, chuẩn bị node, rồi chạy lại `lb-setup.sh` trên **cả ba** máy với danh sách ba IP, để HAProxy nào cũng biết đủ ba API server và Keepalived nào cũng biết đủ hai máy kia. Thứ tự chạy có lý do (suy luận từ cấu hình, chưa kiểm bằng lượt chạy): `k4-ha2` trước, `k4-ha1` (máy giữ VIP) kế tiếp, `k4-ha3` sau cùng. Nếu chạy trên `k4-ha3` trước, hai máy kia chưa có nó trong `unicast_peer` nên không gửi advertisement cho nó, và nó sẽ tự nhận VIP trong vài giây.
+
+<Callout kind="danger">
+
+Chạy lại `lb-setup.sh` làm HAProxy và Keepalived trên máy đó khởi động lại; trên máy đang giữ VIP, API server của cụm lab gián đoạn vài giây. Làm từng máy một.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d13
+limactl start --name k4-ha3 --cpus 2 --memory 2 --disk 20 --plain --network lima:user-v2 --tty=false template:ubuntu-26.04 2>&1 | tail -1 | cut -c1-70
+limactl shell k4-ha3 sudo bash -s 1.37 < node-prep.sh 2>&1 | tail -1
+HA1=$(limactl shell k4-ha1 hostname -I | awk '{print $1}')
+HA2=$(limactl shell k4-ha2 hostname -I | awk '{print $1}')
+HA3=$(limactl shell k4-ha3 hostname -I | awk '{print $1}')
+limactl shell k4-ha2 sudo bash -s 100 $HA1 $HA2 $HA3 < lb-setup.sh 2>&1 | tail -1
+limactl shell k4-ha1 sudo bash -s 110 $HA1 $HA2 $HA3 < lb-setup.sh 2>&1 | tail -1
+limactl shell k4-ha3 sudo bash -s 90 $HA1 $HA2 $HA3 < lb-setup.sh 2>&1 | tail -1
+limactl shell k4-ha1 bash -c 'KEY=$(sudo kubeadm init phase upload-certs --upload-certs 2> /dev/null | tail -1); sudo kubeadm token create --ttl 30m --print-join-command --certificate-key "$KEY"' > join-cp.sh
+limactl shell k4-ha3 sudo bash -s < join-cp.sh 2>&1 | grep -E "new control plane instance|new etcd member"
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+cd ~/k4
+kubectl wait --for=condition=Ready node/lima-k4-ha3 --timeout=180s
+kubectl taint nodes lima-k4-ha3 node-role.kubernetes.io/control-plane:NoSchedule-
+sudo bash -c '. ./etcd.env; etcdctl endpoint status --cluster' | cut -d, -f1,9,11
+```
+
+</Terminal>
+
+Kết quả cần thấy: ba dòng thành viên etcd, đúng một dòng `true`.
+
+### 7. Mất một, rồi mất hai
+
+<Callout kind="danger">
+
+Hai lệnh `limactl stop --force` của bước này tắt nguồn đột ngột lần lượt hai trong ba control plane của cụm lab. Sau lệnh thứ hai cụm ngừng nhận mọi lệnh cho tới khi bạn bật lại máy.
+
+</Callout>
+
+Tắt một máy (chọn máy **không** phải `k4-ha2`, nơi bạn đang ngồi) trong lúc đo:
+
+<Terminal where="vm" title="k4-ha2 (đo)">
+
+```bash
+~/k4/api-probe.sh 30
+```
+
+</Terminal>
+
+<Terminal where="mac">
+
+```bash
+limactl stop --force k4-ha1
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+cd ~/k4
+kubectl create configmap con-ghi-duoc --from-literal=luc="$(date +%T)"
+sudo bash -c '. ./etcd.env; etcdctl endpoint status' | cut -d, -f1,9,11
+kubectl wait --for=condition=Ready=false node/lima-k4-ha1 --timeout=180s
+for i in 1 2 3 4 5 6 7 8; do curl -s -m 1 -o /dev/null -w "%{http_code} " http://127.0.0.1:30080/hostname; done; echo
+```
+
+</Terminal>
+
+Điều cần thấy, khác hẳn bước 5: phép đo có một khoảng gián đoạn vài giây (VIP chuyển, và etcd bầu leader mới nếu máy vừa tắt là leader) rồi `ok` trở lại; lệnh tạo ConfigMap **thành công**; lệnh `kubectl wait` trả về khi node chết được đánh dấu `NotReady` (khoảng 40 tới 50 giây sau khi tắt máy), endpoint của nó được gỡ, và dãy mã HTTP về toàn `200`. Còn hai trên ba thành viên là còn quorum: cụm vừa nhận ghi vừa tự chữa. Một chi tiết suy ra từ cấu hình HAProxy (`inter 2s fall 2`): nó cần tới 4 giây mới loại API server vừa chết khỏi danh sách, và trong lúc đó khoảng một phần ba kết nối mới qua VIP rơi vào máy chết.
+
+<Callout kind="danger">
+
+Lệnh dưới tắt nguồn control plane thứ hai: etcd mất quorum và cụm lab ngừng nhận mọi lệnh cho tới khi bạn bật lại một máy.
+
+</Callout>
+
+Giờ tắt thêm một máy nữa:
+
+<Terminal where="mac">
+
+```bash
+limactl stop --force k4-ha3
+```
+
+</Terminal>
+
+<Terminal where="vm" title="k4-ha2">
+
+```bash
+cd ~/k4; sleep 20
+kubectl get nodes --request-timeout=8s 2>&1 | tail -1 | cut -c1-120
+sudo bash -c '. ./etcd.env; etcdctl endpoint status 2>&1' | cut -d, -f1,9,11,14
+```
+
+</Terminal>
+
+Điều cần thấy: đúng trạng thái của bước 5, `no leader` và `kubectl` hết giờ chờ. Một trên ba thành viên không phải đa số. Bật lại **một** máy là đủ để có lại quorum (hai trên ba); bật nốt máy kia để cụm chịu được lỗi trở lại:
+
+<Terminal where="mac">
+
+```bash
+limactl start k4-ha3
+limactl start k4-ha1
+```
+
+</Terminal>
+
+<Check id="d13.2.lab-three">Với ba control plane, chứng minh được mất một máy thì cụm vẫn nhận ghi và tự gỡ endpoint của node chết, mất hai máy thì mất quorum, và chỉ cần một máy quay lại là cụm hoạt động.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- `lb-setup.sh` xong nhưng không máy nào giữ VIP: xem `sudo journalctl -u keepalived -n 20 --no-pager`. Hay gặp là `chk_haproxy` thất bại vì HAProxy không chạy (`sudo haproxy -c -f /etc/haproxy/haproxy.cfg` để kiểm cấu hình).
+- **Cả hai** máy cùng giữ VIP: advertisement VRRP không tới được nhau (D9.3 bước 5). Kiểm danh sách IP đã truyền cho script trên từng máy, và `sudo tcpdump -ni eth0 vrrp` phải thấy gói từ máy kia.
+- `kubeadm init` treo ở `[control-plane-check]` rồi hết giờ: gọi qua `k4-ha.lab:8443` không tới được API server. Kiểm `getent hosts k4-ha.lab`, máy nào giữ VIP, và `sudo journalctl -u haproxy -n 20 --no-pager` xem backend đã `UP` chưa.
+- `kubeadm join --control-plane` báo `error downloading the secret` hoặc `certificate-key … is invalid`: Secret `kubeadm-certs` đã hết hạn 2 giờ hoặc khoá không khớp. Chạy lại khối lệnh trên Mac ở bước 3 để tạo khoá và token mới.
+- `kubeadm join --control-plane` dừng ở `[check-etcd]` với `etcd cluster is not healthy`: một thành viên etcd đã khai đang chết. Đưa nó quay lại, hoặc gỡ nó bằng `etcdctl member remove <ID>` trước khi thêm thành viên mới.
+- Sau khi bật lại một máy mà API không lên: `sudo crictl ps -a --name etcd` và log của etcd trên máy đó (K4.7). Hay gặp là đồng hồ hai máy lệch nhau nhiều sau khi VM ngủ.
+- `api-probe.sh` in toàn `KHONG-NOI-DUOC` dù cụm khoẻ: máy đang đo không phân giải được `k4-ha.lab`, hoặc HAProxy trên máy giữ VIP đang dừng.
+
+</Callout>
+
+### Dọn dẹp
+
+Cụm HA không được dùng ở bài sau; các bài K4.3 tới K4.7 quay lại cụm của K4.1.
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá hẳn các VM `k4-ha1`, `k4-ha2`, `k4-ha3` cùng cụm bên trong, và xoá file chứa token cùng certificate key. Kiểm tên VM trước khi chạy: `k4-cp1` và `k4-w1` không được nằm trong lệnh.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm HA">
+
+```bash
+for vm in k4-ha1 k4-ha2 k4-ha3; do limactl stop "$vm"; done
+limactl delete k4-ha1 k4-ha2 k4-ha3
+rm -f ~/masteva-d13/join-cp.sh
+limactl start k4-cp1
+limactl start k4-w1
+```
+
+</Terminal>
+
+Nếu chỉ làm phần A thì bỏ `k4-ha3` khỏi hai lệnh đầu.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Cụm K4.1 đang chạy một control plane. Nâng nó lên HA mà không dựng lại được không?">
+
+Được, nếu lúc `init` bạn đã đặt `controlPlaneEndpoint` là một tên, đúng lý do K4.1 làm vậy. Các bước: dựng load balancer ở nơi khác (hai máy riêng, hoặc load balancer của hạ tầng) nghe cổng `6443` và trỏ về API server hiện có; đổi bản ghi DNS của tên đó sang load balancer; rồi `kubeadm init phase upload-certs --upload-certs` và `join --control-plane` hai máy mới. Nếu muốn đặt HAProxy ngay trên các máy control plane như lab này thì cổng phải khác `6443`, tức endpoint đổi, và đổi endpoint của một cụm đang chạy nghĩa là sửa `kubeadm-config`, `cluster-info`, cấu hình kube-proxy và kubeconfig của mọi kubelet: làm được nhưng dễ sót. Cụm `init` bằng IP của máy đầu tiên thì còn khó hơn, vì IP đó nằm trong mọi kubeconfig. Bài không chạy kịch bản này.
+
+</Reveal>
+
+<Reveal title="Ba control plane đặt ở đâu?">
+
+Ở ba nơi không hỏng cùng nhau: ba rack, ba máy chủ vật lý khác nhau nếu là VM, ba zone nếu là cloud. Ba VM trên cùng một máy chủ vật lý là HA trên giấy. Với hai datacenter thì không có cách chia ba thành viên nào sống sót khi mất datacenter chứa hai thành viên; cần một nơi thứ ba, dù chỉ để đặt một thành viên. Và etcd nhạy với độ trễ: mỗi lần ghi chờ đĩa của đa số thành viên và một vòng mạng giữa chúng, nên các thành viên phải gần nhau (cùng vùng, độ trễ vài mili giây) và có đĩa nhanh. Trải một cụm etcd ra hai châu lục cho "an toàn" là cách chắc chắn để nó bầu lại leader liên tục.
+
+</Reveal>
+
+<Reveal title="Mất quorum vĩnh viễn (hai máy cháy) thì cứu thế nào?">
+
+Hai đường. Có snapshot gần đây: dựng lại theo K4.5, khôi phục một cụm etcd mới từ snapshot trên các máy mới, chấp nhận mất thay đổi sau lúc chụp. Không có snapshot nhưng còn một thành viên với dữ liệu nguyên vẹn: etcd có cờ `--force-new-cluster` để thành viên đó tự lập một cụm một thành viên từ dữ liệu nó đang có (lệnh đọc `--consistency=s` ở bước 5 cho thấy dữ liệu vẫn ở đó); sau đó thêm lại các thành viên mới bằng `join --control-plane`. Cả hai đều là thao tác trên cụm đang chết, làm dưới áp lực; hãy diễn tập trước trên cụm lab. Điều **không** được làm: khởi động một thành viên với `--force-new-cluster` trong khi các thành viên khác vẫn có thể quay lại, vì khi đó bạn có hai cụm cùng tin mình là thật.
+
+</Reveal>
+
+<Reveal title="Vì sao controller manager chỉ một bản làm việc mà API server thì cả ba?">
+
+API server không có trạng thái riêng: mọi thứ nằm trong etcd, nên ba bản trả lời cùng một request cho cùng kết quả. Controller thì **hành động**: hai Deployment controller cùng thấy thiếu một pod sẽ cùng tạo, thành thừa. Vì vậy mỗi loại chỉ một bản được làm việc, chọn bằng cách giữ một object `Lease` và gia hạn nó vài giây một lần; bản khác chỉ nhận việc khi Lease hết hạn mà không ai gia hạn. Bản đang giữ mà không gia hạn kịp (API server chậm, etcd đang bầu leader) sẽ tự thoát, đó là lý do sau mỗi lần etcd trục trặc bạn thấy `RESTARTS` của controller manager và scheduler tăng. Mẫu này dùng lại ở mọi operator bạn sẽ cài (K9).
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết `haproxy.cfg` và `keepalived.conf` cho ba control plane từ danh sách IP, hoặc giải thích log bầu leader của etcd. AI hay sai: health check chỉ kiểm cổng TCP (API server chưa sẵn sàng vẫn nhận traffic), `timeout client 30s` (cắt mọi `watch`), HAProxy nghe `6443` trên chính máy control plane (đụng cổng), `track_script` gọi `/healthz` của API server (VIP không lên nổi lúc dựng cụm), và khuyên chạy hai control plane "cho đỡ tốn máy". Nó cũng hay chép `scp` khoá CA giữa các máy thay vì `--upload-certs`. Kiểm bằng `haproxy -c -f`, `keepalived -t -f`, và quan trọng nhất là diễn tập: tắt từng máy một và nhìn `etcdctl endpoint status --cluster`.
+
+</Callout>
+
+<Callout kind="link">
+
+D9.2 dạy HAProxy `mode tcp` và health check; D9.3 dạy VRRP, `track_script`, `unicast_peer` và split-brain, và nói vì sao VRRP không thay được quorum. K1.1 giới thiệu leader election qua Lease. K4.1 đặt `controlPlaneEndpoint` từ đầu; K4.3 nêu thứ tự nâng một cụm nhiều control plane (lab của nó chỉ có một); K4.5 sao lưu etcd và khôi phục khi quorum mất hẳn; K4.6 dùng lại kỹ thuật VIP cho Service; K4.7 chẩn đoán khi API server không trả lời. D19 dùng cùng nguyên lý quorum cho database. K10 dựng control plane HA bằng Cluster API.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d13.2.mastery-design">Thiết kế được control plane HA cho một cụm trên máy vật lý: số máy và nơi đặt, stacked hay external etcd, load balancer và VIP, các timeout và health check; và nêu được mỗi lựa chọn chịu được kiểu hỏng nào.</Check>
+
+<Check id="d13.2.mastery-build">Dựng được một cụm kubeadm nhiều control plane sau một VIP, từ load balancer tới `join --control-plane`, và chứng minh bằng số đo rằng API còn phục vụ khi một máy hỏng.</Check>
+
+<Check id="d13.2.mastery-diagnose">Trước một cụm mà `kubectl` hết giờ chờ, phân biệt được trong vài phút giữa VIP hỏng, load balancer hỏng, API server hỏng và etcd mất quorum, bằng `ip addr`, `/readyz` và `etcdctl endpoint status`.</Check>
+
+</Mastery>
