@@ -1,12 +1,13 @@
 import { i18n, isLanguage } from '@/lib/i18n';
 import { getMessages } from '@/lib/messages';
 import { source, type LessonPage } from '@/lib/source';
-import { getLessonContext, getSearchScope } from '@/lib/content/manifest';
+import { getLessonContext, getSearchFileSteps, getSearchScope } from '@/lib/content/manifest';
 import { buildSearchFile, type SearchSourcePage } from '@/lib/search/lesson-index';
 
 /**
- * Nội dung bài cho hộp tìm ⌘K, sinh thành file tĩnh lúc build, mỗi roadmap một file
- * (`/<lang>/search/<roadmap>.json`, ADR-009). Trình duyệt chỉ tải khi tìm lần đầu và tự dựng chỉ mục.
+ * Nội dung bài cho hộp tìm ⌘K, sinh thành file tĩnh lúc build: mỗi roadmap một hoặc vài file
+ * (`/<lang>/search/<roadmap>-<n>.json`, tối đa 30 bài mỗi file, ADR-009). Trình duyệt chỉ tải khi tìm lần đầu
+ * và tự dựng chỉ mục.
  */
 export const dynamic = 'force-static';
 export const dynamicParams = false;
@@ -32,14 +33,14 @@ async function structuredDataOf(page: LessonPage): Promise<StructuredData> {
 
 export async function GET(_request: Request, context: RouteContext<'/[lang]/search/[file]'>) {
   const { lang, file } = await context.params;
-  const roadmapId = file.replace(/\.json$/, '');
-  if (!isLanguage(lang) || !getSearchScope().files.includes(roadmapId)) return new Response('Not found', { status: 404 });
+  const steps = getSearchFileSteps(file.replace(/\.json$/, ''));
+  if (!isLanguage(lang) || !steps) return new Response('Not found', { status: 404 });
   const t = getMessages(lang);
   const pages: SearchSourcePage[] = [];
   for (const page of source.getPages(lang)) {
     // Mọi chặng thuộc đúng một roadmap (`content:check` kiểm), nên bài nào cũng có ngữ cảnh.
     const ctx = getLessonContext(page.data.id, lang);
-    if (ctx?.roadmap.id !== roadmapId) continue;
+    if (!ctx || !steps.has(ctx.step.id)) continue;
     pages.push({
       url: page.url,
       title: page.data.title,

@@ -1,5 +1,9 @@
 import { expect, test, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
+import { readdirSync } from 'node:fs';
+
+/** Các file tìm kiếm bản build sinh ra cho tiếng Việt (`<roadmap>-<n>.json`), đọc từ thư mục xuất tĩnh. */
+const searchFiles = () => readdirSync('out/vi/search').filter((name) => name.endsWith('.json')).sort();
 
 const LESSON = '/vi/learn/d1/d1-1';
 const CHECK = '[data-check-id="d1.1.exit-code"]';
@@ -129,7 +133,7 @@ test('tìm kiếm không dấu ra bài có dấu', async ({ page }) => {
   await expect(page.getByRole('dialog')).toContainText('Tiến trình, signal, systemd và journald');
 });
 
-test('hộp ⌘K chỉ tải file tìm kiếm khi mở, mỗi roadmap một file, roadmap đang xem trước', async ({ page }) => {
+test('hộp ⌘K chỉ tải file tìm kiếm khi mở, đủ mọi file, các file của roadmap đang xem trước', async ({ page }) => {
   const requests: string[] = [];
   page.on('request', (r) => {
     const path = new URL(r.url()).pathname;
@@ -149,18 +153,26 @@ test('hộp ⌘K chỉ tải file tìm kiếm khi mở, mỗi roadmap một file
   await expect(page.getByRole('dialog')).toContainText('JDK, javac, java và jshell');
   await input.fill('tien trinh');
   await expect(page.getByRole('dialog')).toContainText('Tiến trình, signal, systemd và journald');
-  expect(requests[0]).toBe('/vi/search/devops.json');
-  expect([...requests].sort()).toEqual(['/vi/search/devops.json', '/vi/search/java.json', '/vi/search/kubernetes.json', '/vi/search/spring-boot.json']);
+  const all = searchFiles().map((name) => `/vi/search/${name}`);
+  const devops = all.filter((path) => path.startsWith('/vi/search/devops-'));
+  expect(devops.length).toBeGreaterThan(1);
+  expect(requests.slice(0, devops.length).sort()).toEqual(devops);
+  expect([...requests].sort()).toEqual(all);
 });
 
-test('mỗi file tìm kiếm dưới 2 MB, file gộp cũ và /api/search không còn', async ({ request }) => {
-  for (const id of ['java', 'spring-boot', 'devops', 'kubernetes']) {
-    const file = await request.get(`/vi/search/${id}.json`);
-    expect(file.ok(), id).toBe(true);
-    expect((await file.body()).length, id).toBeLessThan(2 * 1024 * 1024);
+test('mỗi file tìm kiếm dưới 2 MB và không quá 30 bài; file theo roadmap cũ, file gộp cũ và /api/search không còn', async ({ request }) => {
+  const names = searchFiles();
+  expect(names).toEqual(expect.arrayContaining(['java-1.json', 'spring-boot-1.json', 'devops-1.json', 'kubernetes-1.json']));
+  for (const name of names) {
+    const file = await request.get(`/vi/search/${name}`);
+    expect(file.ok(), name).toBe(true);
+    const body = await file.body();
+    expect(body.length, name).toBeLessThan(2 * 1024 * 1024);
+    expect((JSON.parse(body.toString()) as { pages: unknown[] }).pages.length, name).toBeLessThanOrEqual(30);
   }
-  expect((await request.get('/en/search/java.json')).ok()).toBe(true);
-  expect((await request.get('/vi/search/microservices.json')).status()).toBe(404);
+  expect((await request.get('/en/search/java-1.json')).ok()).toBe(true);
+  expect((await request.get('/vi/search/java.json')).status()).toBe(404);
+  expect((await request.get('/vi/search/microservices-1.json')).status()).toBe(404);
   expect((await request.get('/vi/search.json')).status()).toBe(404);
   expect((await request.get('/api/search')).status()).toBe(404);
 });

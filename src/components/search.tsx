@@ -19,7 +19,7 @@ import type { SearchFile } from '@/lib/search/lesson-index';
 import { takeHandOff } from '@/lib/search/handoff';
 import { roadmapOfPath, useSearchScope } from '@/lib/search/scope';
 
-// Mỗi ngôn ngữ một client: mỗi file `/<lang>/search/<roadmap>.json` chỉ tải một lần trong phiên (ADR-009).
+// Mỗi ngôn ngữ một client: mỗi file `/<lang>/search/<roadmap>-<n>.json` chỉ tải một lần trong phiên (ADR-009).
 const clients = new Map<string, LessonSearchClient>();
 
 function clientFor(locale: string, ids: readonly string[]): LessonSearchClient {
@@ -40,8 +40,9 @@ export default function MastevaSearchDialog(props: SharedProps) {
   const scope = useSearchScope();
   const pathname = usePathname();
   const client = clientFor(locale ?? 'vi', scope.files);
-  // Roadmap đang xem được tìm trước; khi file của roadmap khác vào chỉ mục thì tìm lại để bổ sung kết quả.
-  client.setFirst(roadmapOfPath(pathname, scope));
+  // Các file của roadmap đang xem được tìm trước; khi file của roadmap khác vào chỉ mục thì tìm lại để bổ sung kết quả.
+  const roadmap = roadmapOfPath(pathname, scope);
+  client.setFirst(roadmap ? scope.roadmaps[roadmap] : []);
   const loaded = useSyncExternalStore(client.subscribe, client.loadedCount, () => 0);
   const { search, setSearch, query } = useDocsSearch({ client }, [client, loaded]);
 
