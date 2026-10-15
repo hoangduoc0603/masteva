@@ -1,0 +1,817 @@
+---
+title: Mô hình mối đe doạ và kho artifact
+description: Vẽ chuỗi cung ứng phần mềm thành từng mắt xích để biết ai đổi được gì ở đâu, rồi dựng một registry zot và tự tay thử bốn việc một kho artifact phải làm được, gồm giữ digest khỏi bị dọn rác, làm proxy cache cho registry ngoài và ngắt nguồn, phân quyền đẩy kéo, và khoá tag đã phát hành.
+id: d8.1
+step: d8
+prerequisites: [d7.2]
+topics: [d8.kho-artifact]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    zot: v2.1.22
+    registry: 3.1.2
+    crane: v0.22.1
+    httpd-image: 2.4.69-alpine (htpasswd)
+    golang-image: 1.27.2-alpine
+    jq: 1.8.2
+---
+
+<Goal>
+
+Xem đường đi của một thay đổi, từ commit tới container đang chạy, như một chuỗi mắt xích: ở mắt xích nào cũng có người đổi được nội dung. Rồi làm cho mắt xích "kho artifact" đáng tin. Học xong bài này, bạn giải thích được:
+
+- Vì sao ghim digest trong manifest triển khai rồi mà một ngày node mới vẫn không kéo được image, dù không ai xoá gì.
+- Vì sao cả công ty hết kéo được image từ Docker Hub lúc 9 giờ sáng, và proxy cache giải quyết được gì, không giải quyết được gì.
+- Vì sao "CI được đẩy image" và "CI được ghi đè tag `1.0.0`" phải là hai quyền khác nhau.
+- Vì sao một gói nhỏ bị gỡ khỏi npm làm hỏng build của hàng nghìn dự án, và kho của bạn phải giữ thứ gì để không phụ thuộc vào chuyện đó.
+
+</Goal>
+
+<Knowledge>
+
+### Chuỗi cung ứng: ai đổi được gì, ở đâu
+
+**Chuỗi cung ứng phần mềm** (software supply chain) là mọi thứ góp vào thứ đang chạy trên production: mã của đội, thư viện, base image, công cụ build, pipeline, kho lưu artifact và đường phân phối. D5 và D6 đã dựng chuỗi đó: Dockerfile, registry, pipeline. Chặng này hỏi câu ngược lại: ở mỗi mắt xích, **ai có thể đổi nội dung mà người phía sau không biết**.
+
+Khung SLSA (D14.4 đi sâu) đánh chữ cái cho từng điểm kẻ tấn công có thể chen vào (xem link ở phần Tài liệu). Bài gom chúng thành năm mắt xích, cộng thêm "tính sẵn có":
+
+```text
+  Nguồn ──▶ Build ──▶ Phân phối (kho artifact) ──▶ Chọn gói / nơi chạy
+              ▲
+          Phụ thuộc
+  (thư viện, base image, action, compiler, công cụ build)
+```
+
+| Mắt xích | Kẻ tấn công đổi được gì | Biện pháp chính | Dạy ở |
+|---|---|---|---|
+| Nguồn | Đưa mã vào mà không qua review; maintainer bị mua chuộc hoặc bị chiếm tài khoản; sửa lịch sử | Bảo vệ nhánh, review bắt buộc, CODEOWNERS | D4.2 |
+| Build | Build từ nhánh hay fork lạ; tiêm mã trong lúc build; đầu độc cache; lấy secret của pipeline | Runner cô lập, ghim action theo SHA, quyền tối thiểu; provenance ghi lại "build từ đâu, bằng gì" | D6.1, D6.5, D14.4 |
+| Phụ thuộc | Thư viện, base image, action hay công cụ build đã bị cài mã độc hoặc có lỗ hổng | Ghim theo digest, SBOM (danh sách thành phần của artifact, D14.3), quét, cập nhật có kiểm soát | D5.2, D14.3 |
+| Phân phối (kho artifact) | Đẩy artifact không qua pipeline; **dời tag**; sửa artifact ngay trong kho | Kho bất biến có phân quyền (bài này); chữ ký (D14.2) | D14.1, D14.2 |
+| Chọn gói / nơi chạy | Lừa trình quản lý gói lấy nhầm gói: trùng tên với gói nội bộ, tên gần giống | Kho riêng có phạm vi rõ, proxy có kiểm soát | D14.5 |
+| Tính sẵn có | Nguồn bị gỡ, bị xoá, bị giới hạn tốc độ | Proxy cache, giữ bản sao những gì mình phụ thuộc | Bài này |
+
+Hai điều rút ra từ bảng. Một: không có biện pháp nào che hết; mỗi biện pháp chặn một mắt xích, và kẻ tấn công chọn mắt xích yếu nhất. Hai: **kho artifact đứng giữa mọi đường đi**. Thứ gì chạy trên production cũng được kéo ra từ nó, và thứ gì build dùng cũng nên đi qua nó. Kho yếu thì chữ ký, SBOM hay provenance của các bài sau không còn chỗ dựa.
+
+<Check id="d8.1.threat-model">Vẽ được chuỗi cung ứng thành các mắt xích nguồn, build, phụ thuộc, phân phối (kho artifact), chọn gói và nơi chạy; với mỗi mắt xích, cùng tính sẵn có, nói được kẻ tấn công đổi được gì và biện pháp nào chặn.</Check>
+
+### Kho artifact phải làm được gì
+
+**Kho artifact** là nơi giữ kết quả build để nơi khác dùng: registry cho image và chart (D5.2, K3.2), kho gói cho thư viện (Maven, npm, PyPI), kho file cho binary. D6.2 đã nêu yêu cầu: bất biến, truy được nguồn gốc, phân quyền ai được ghi. Bài này biến từng yêu cầu thành cấu hình.
+
+| Yêu cầu | Nghĩa là | Thiếu thì |
+|---|---|---|
+| Tên đã phát hành không đổi nội dung | Tag `1.0.0` trỏ tới một digest, mãi mãi | Hai node cùng chạy "1.0.0" ra hai hành vi (D5.2); bản đã kiểm bị thay sau khi kiểm |
+| Thứ đang dùng thì còn đó | Digest mà production tham chiếu không bị dọn | Rollback, mở rộng số node hay khôi phục sau sự cố đều hỏng vì không kéo được image |
+| Tách quyền đẩy và quyền kéo | Chỉ danh tính của pipeline đẩy được vào repo phát hành; người và node chỉ kéo | Một laptop bị chiếm là đủ để phát hành bản giả |
+| Nguồn ngoài đi qua một cửa | Image và gói từ Internet được kéo qua proxy của tổ chức, có bản lưu | Build dừng khi nguồn ngoài chết, bị gỡ hay bị giới hạn; không ai biết tổ chức đang dùng những gì từ ngoài |
+| Dọn có chính sách | Xoá theo luật viết ra: giữ bản đã phát hành, giữ N bản gần nhất của nhánh, giữ thứ đang chạy | Đầy đĩa, hoặc tệ hơn: dọn tay và xoá nhầm |
+
+Các lựa chọn hay gặp:
+
+| Kho | Giữ gì | Ghi chú |
+|---|---|---|
+| Registry của cloud (ECR, Artifact Registry, GHCR) | Image, artifact OCI | Có tag bất biến, quét, phân quyền theo IAM; không phải vận hành |
+| Harbor | Image, chart, artifact OCI | Tự host, hay gặp ở các đội tự vận hành hạ tầng; có project, tag bất biến, proxy cache, replication, dọn theo luật; nhiều thành phần |
+| zot | Image, artifact OCI | Một binary, bám sát chuẩn OCI; lab dùng nó |
+| `registry` (CNCF Distribution) | Image | Bản tham chiếu tối giản của D5.2; không có phân quyền theo repo, không có tag bất biến |
+| Nexus, Artifactory | Gói Maven, npm, PyPI, và cả image | Một kho cho nhiều định dạng; mô hình "repo nội bộ, repo proxy, repo gộp" |
+
+Một điểm đáng nhớ về OCI registry: nó không chỉ giữ image. Chart Helm (K3.2), chữ ký, SBOM và provenance (ba bài sau) đều là **artifact OCI** nằm cùng repo với image, nên luật bất biến, phân quyền và dọn rác của kho áp lên tất cả chúng.
+
+<Check id="d8.1.repo-requirements">Kể được năm yêu cầu của một kho artifact đáng tin và hậu quả khi thiếu từng cái.</Check>
+
+### Tag bất biến, digest và dọn rác
+
+D5.2 đã cho thấy tag bị ghi đè còn digest thì không, và D6.2 để pipeline tự từ chối ghi đè khi registry không làm. Pipeline tự từ chối chỉ là quy ước của chính pipeline đó. **Tag bất biến phải do kho ép**, vì kẻ có token đẩy sẽ không chạy script kiểm tra của bạn.
+
+| Kho | Cách bật |
+|---|---|
+| ECR | Thuộc tính của repo: `IMMUTABLE`; có thể kèm bộ lọc tên tag được miễn |
+| Harbor | Luật "tag immutability" theo project: mẫu repo và mẫu tag |
+| zot | Không có công tắc riêng: cấp `create` mà không cấp `update` cho danh tính đẩy (lab bước 4) |
+
+Bất biến không áp cho mọi tag. Tag "trôi" như `main`, `nightly`, `1.2` (bản vá mới nhất của 1.2) sinh ra để dời. Vấn đề của chúng nằm ở chỗ khác: mỗi lần tag dời đi, manifest cũ thành **không còn tag nào trỏ tới** (untagged). Nó vẫn kéo được theo digest, cho tới lần dọn rác kế tiếp.
+
+**Dọn rác** (garbage collection, GC) của registry làm hai việc: tìm những blob và manifest không còn gì tham chiếu, rồi xoá. Để không xoá nhầm thứ đang được đẩy dở, GC chỉ đụng tới thứ cũ hơn một khoảng trễ (`gcDelay` của zot, mặc định một giờ).
+
+```text
+ 09:00  nightly ──▶ sha256:9e11…   manifest triển khai ghim 9e11…
+ Đêm    CI đẩy nightly mới
+        nightly ──▶ sha256:3cef…   9e11… không còn tag: vẫn kéo được theo digest
+ GC     manifest không tag, cũ hơn gcDelay ──▶ bị xoá
+ Sau    node mới kéo price-api@sha256:9e11… ──▶ "not found"
+```
+
+Ghim digest trả lời câu "đúng nội dung này"; nó không giữ cho nội dung đó tồn tại. Ba cách giữ, theo thứ tự nên dùng:
+
+1. **Mỗi bản build một tag riêng không bao giờ dời** (commit SHA như D6.2, hoặc phiên bản). Tag trôi nếu cần thì là tên thêm, không phải tên duy nhất.
+2. **Chính sách giữ (retention) viết theo tag**: giữ mọi tag phiên bản, giữ N bản gần nhất của tag theo commit, giữ thứ được kéo trong 30 ngày gần đây. zot, Harbor và ECR đều có.
+3. Không dọn manifest không tag. Dễ nhất, và kho phình mãi.
+
+<Check id="d8.1.immutable-gc">Giải thích được vì sao tag bất biến phải do kho ép, và vì sao một digest đã ghim vẫn có thể biến mất sau khi tag trôi cộng với dọn rác; nêu được cách giữ.</Check>
+
+### Proxy cache cho nguồn ngoài
+
+Build của bạn kéo `golang`, `alpine`, distroless, và runtime kéo hàng chục image từ Docker Hub, `ghcr.io`, `registry.k8s.io`. Mỗi lần kéo thẳng là một lần phụ thuộc vào ba thứ ngoài tầm tay:
+
+- **Giới hạn tốc độ.** Theo trang giới hạn sử dụng của Docker Hub (link ở phần Tài liệu), Docker Hub giới hạn người không đăng nhập ở 100 lượt kéo mỗi 6 giờ **cho mỗi địa chỉ IPv4** (hoặc mỗi dải IPv6 /64). Cả văn phòng, cả cụm Kubernetes đi ra Internet qua một địa chỉ NAT dùng chung một hạn mức; một đợt node khởi động lại là đủ chạm trần.
+- **Nguồn sập hoặc chậm.** Registry ngoài có sự cố thì build và việc mở rộng số node của bạn dừng theo.
+- **Nguồn biến mất.** Người phát hành gỡ gói, nhà phát hành đổi chính sách, tag cũ bị xoá.
+
+**Proxy cache** (còn gọi pull-through cache) là một repo trong kho của bạn đứng thay cho registry ngoài:
+
+```text
+ Client ── kéo mirror/library/alpine:3.24 ──▶ Kho của bạn
+                                               │ đã có và nguồn không đổi? ──▶ trả từ đĩa
+                                               │ chưa có, hoặc tag ở nguồn đã dời
+                                               ▼
+                                         Registry ngoài ──▶ kéo về, LƯU LẠI, rồi trả
+                                         (nguồn không tới được: trả bản đang có, nếu có)
+```
+
+| Proxy cache làm được | Không làm được |
+|---|---|
+| Mỗi image chỉ kéo từ nguồn một lần: thoát giới hạn tốc độ, nhanh hơn | Giữ thứ **chưa từng** được kéo qua nó |
+| Nguồn sập hay gỡ image: thứ đã kéo vẫn còn | Chặn nội dung xấu: nó lưu đúng thứ nguồn đưa |
+| Một cửa duy nhất ra ngoài: biết tổ chức dùng gì, chặn được registry lạ ở firewall | Đóng băng tag: tag ở nguồn dời thì lần kéo sau nó dời theo (lab bước 3) |
+
+Dòng cuối quyết định cách dùng: proxy cache là **bộ đệm**, không phải bản chụp. Muốn nội dung không đổi thì vẫn phải ghim digest, hoặc chép hẳn image vào repo nội bộ (`crane copy`, replication của Harbor) với tag do mình quản.
+
+<Callout kind="production">
+
+Theo bài tường thuật của npm ngày 23/03/2016: sau một tranh chấp về tên gói `kik`, một lập trình viên gỡ gói đó cùng **272 gói khác** của mình khỏi npm, không báo trước cho các dự án phụ thuộc. Trong số đó có `left-pad`. Thứ Ba 22/03, ngay sau 14:30 giờ Thái Bình Dương, npm ghi nhận hàng trăm lượt lỗi mỗi phút từ các dự án phụ thuộc. Trong vòng mười phút, một lập trình viên khác đã phát hành lại một `left-pad` tương đương dưới phiên bản 1.0.0, nhưng lỗi vẫn tiếp diễn vì nhiều chuỗi phụ thuộc, trong đó có `babel` và `atom` qua gói `line-numbers`, yêu cầu **đúng bản 0.0.3**. Lúc 16:05 npm thông báo sẽ phát hành lại bản 0.0.3 gốc từ bản sao lưu, và hoàn tất lúc 16:55; bài viết tính tổng thời gian gián đoạn là 2,5 giờ. Trong cùng bài, npm cho biết sẽ làm cho việc gỡ một phiên bản khó hơn khi nó làm hỏng các gói khác.
+
+Phần rút ra của bài: đội nào kéo dependency qua một proxy có lưu bản sao thì vẫn build được suốt 2,5 giờ đó, vì bản `0.0.3` họ cần đã nằm trong kho của họ. Đội kéo thẳng từ Internet thì chờ nguồn sửa.
+
+</Callout>
+
+<Check id="d8.1.proxy-cache">Giải thích được ba rủi ro khi kéo thẳng từ registry ngoài, proxy cache hoạt động thế nào, và vì sao nó không thay được việc ghim digest.</Check>
+
+### Phân quyền đẩy và kéo
+
+Ai có quyền ghi vào repo phát hành là người quyết định production chạy gì. Chia theo vai:
+
+| Danh tính | Quyền | Lý do |
+|---|---|---|
+| Node, cụm Kubernetes | Chỉ kéo, chỉ repo cần | Node bị chiếm không sửa được image của service khác |
+| Lập trình viên | Kéo; đẩy vào repo thử nghiệm riêng nếu cần | Bản phát hành không đến từ laptop |
+| Pipeline CI | Kéo; **tạo** tag mới trong repo của đúng service đó | Là đường phát hành duy nhất; không được ghi đè, không được xoá |
+| Quản trị kho | Mọi quyền, kể cả xoá | Ít người, có nhật ký, không dùng cho việc hằng ngày |
+
+zot diễn đạt bằng bốn hành động trên từng mẫu repo: `read`, `create`, `update`, `delete`. Pipeline có `read` và `create`: đẩy được tag mới, không sửa được tag cũ. Đó cũng là cách zot làm tag bất biến.
+
+Hai lưu ý từ D6.5 áp nguyên ở đây. Token đẩy là secret có giá trị cao: giữ nó ngắn hạn (OIDC đổi lấy credential tạm với ECR, GHCR) và chỉ cấp cho job phát hành. Và quyền đẩy vào kho **không phải** bằng chứng artifact đến từ pipeline: token lộ thì kẻ khác đẩy được y như pipeline. Khoảng trống đó là việc của chữ ký ở D14.2.
+
+<Check id="d8.1.authz">Thiết kế được phân quyền cho node, lập trình viên, pipeline và quản trị trên một repo phát hành, và giải thích được vì sao quyền tạo tách khỏi quyền sửa và xoá.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [SLSA v1.2: Threats & mitigations](https://slsa.dev/spec/v1.2/threats): sơ đồ các điểm tấn công từ A tới I mà bảng đầu bài dùng lại, kèm ví dụ cho từng điểm.
+- [Open Container Initiative Distribution Specification](https://github.com/opencontainers/distribution-spec/blob/main/spec.md): API mà mọi registry trong bài nói; đọc phần "Deleting tags" và "Deleting manifests" để hiểu thứ gì thành không tag.
+- Tài liệu zot: [Retention Policies](https://zotregistry.dev/v2.1.22/articles/retention/), [Immutable Tags](https://zotregistry.dev/v2.1.22/articles/immutable-tags/) và [Mirroring](https://zotregistry.dev/v2.1.22/articles/mirroring/): `gcDelay` và luật giữ theo tag (bước 2), tag bất biến bằng phân quyền (bước 4), cấu hình `sync` gồm `onDemand`, `content`, `manifestCheckInterval` (bước 3).
+- [Docker Hub usage and limits (Docker Docs)](https://docs.docker.com/docker-hub/usage/): giới hạn lượt kéo theo loại tài khoản mà phần Proxy cache nhắc tới.
+- [kik, left-pad, and npm (The npm Blog)](https://blog.npmjs.org/post/141577284765/kik-left-pad-and-npm): bài tường thuật gốc của vụ việc trong callout, có mốc giờ và các thay đổi chính sách sau đó.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker Desktop hoặc Docker Engine 29 đang chạy (D0.1), có `curl`, `jq`, `openssl`; máy có mạng. Lab tải khoảng 200 MB image (zot 69 MB, Go 72 MB, httpd 25 MB, registry 19 MB, crane 10 MB, distroless 2 MB) và chép hai image nhỏ từ `mirror.gcr.io`. Dùng cổng **9720** (registry; cổng **9721** để chạy thử image dùng từ D14.2), thư mục `~/masteva-d8`. **Profile máy:** zot dùng khoảng 50–70 MiB RAM, registry phụ khoảng 13 MiB; build Go cần khoảng 1 GB trong vài chục giây. Máy 8 GB chạy được nguyên bài. Bài chạy trên macOS; trên Linux các lệnh giống hệt nhưng chưa được chạy thử.
+
+Ba bài D14.2, D14.3, D14.4 dùng tiếp registry và image của bài này, nên phần dọn dẹp cuối bài có hai mức.
+
+### 0. Registry và công cụ
+
+Bài dùng **crane**, công cụ dòng lệnh nói thẳng API của registry: liệt kê tag, đọc digest, chép image và gắn tag mà không cần Docker daemon. Như mọi công cụ trong chặng, nó chạy bằng image đã ghim cả tag lẫn digest (như D5.2 làm với Trivy), qua vài hàm shell đặt trong `env.sh`. Hàm `tool` cho container công cụ dùng chung network namespace với registry (`--network container:d14-zot`, D5.1 đã giải thích namespace): bên trong nó, `localhost:9720` chính là registry, nên máy bạn và công cụ gọi registry bằng **cùng một tên**. `--user` để file công cụ ghi ra thuộc về bạn.
+
+Khối đầu chỉ viết file: `env.sh` và cấu hình registry `zot/open.json`. Nó không in gì.
+
+<Terminal where="mac" title="~/masteva-d8">
+
+```bash
+mkdir -p ~/masteva-d8/zot ~/masteva-d8/price-api && cd ~/masteva-d8
+cat > env.sh <<'EOF'
+CRANE=gcr.io/go-containerregistry/crane:v0.22.1@sha256:1f968817b95790bed063f71175aa6b8ff879fa17064020415f3e18bb6e6a36e1
+tool() { docker run --rm --user "$(id -u):$(id -g)" --network container:d14-zot \
+  -v "$HOME/masteva-d8":/work -w /work -e HOME=/tmp "$@"; }
+crane()    { tool $CRANE "$@"; }
+crane_as() { local u=$1; shift; tool -e DOCKER_CONFIG=/work/auth/$u $CRANE "$@"; }
+zot_use()  { cp "$HOME/masteva-d8/zot/$1.json" "$HOME/masteva-d8/zot/config.json" && docker restart d14-zot >/dev/null &&
+  for i in $(seq 1 30); do curl -s -o /dev/null localhost:9720/v2/ && break; sleep 1; done; echo "zot: cấu hình $1"; }
+EOF
+cat > zot/open.json <<'EOF'
+{
+  "distSpecVersion": "1.1.1",
+  "storage": { "rootDirectory": "/var/lib/registry", "gc": true, "gcDelay": "1h", "gcInterval": "1h" },
+  "http": { "address": "0.0.0.0", "port": "9720" },
+  "log": { "level": "info" }
+}
+EOF
+cp zot/open.json zot/config.json
+```
+
+</Terminal>
+
+`zot_use <tên>` chép `zot/<tên>.json` thành cấu hình đang dùng, khởi động lại zot và chờ nó trả lời; bài dùng hàm này để đổi cấu hình registry giữa các bước. `crane_as <tài khoản>` chạy crane bằng thông tin đăng nhập của tài khoản đó (bước 4).
+
+Khối thứ hai tạo mạng `d14-net`, khởi động zot với cấu hình vừa viết, chờ nó trả lời, nạp các hàm, rồi hỏi danh sách repo (lúc này còn rỗng).
+
+<Terminal where="mac" title="~/masteva-d8">
+
+```bash
+cd ~/masteva-d8
+docker network create d14-net
+docker run -d --name d14-zot --network d14-net -p 9720:9720 --memory 512m \
+  -v ~/masteva-d8/zot:/etc/zot:ro -v d14-zot-data:/var/lib/registry -v d14-zot-mirror:/var/lib/registry-mirror \
+  ghcr.io/project-zot/zot:v2.1.22@sha256:96cda11459ce6f8c60da3b03f03e9f67fd11b3ae2d82c4c04c92b3c608996080
+for i in $(seq 1 30); do curl -sf -o /dev/null localhost:9720/v2/ && break; sleep 1; done
+. ./env.sh
+curl -s localhost:9720/v2/_catalog
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+9280f12b3058be2b9a233f12face85844fa709b7f885bbc92c7fde3ca99ace19
+519c79df2adb857f775fa4d6eb8e0af8e457eab780bb97ea87e88ca09d6e4b12
+{"repositories":[]}
+```
+
+</Expected>
+
+Kết quả sẽ giống thế này. Lần đầu chạy, Docker in thêm tiến trình kéo image zot trước dòng thứ hai. Hai dòng đầu là ID của network và container, sẽ khác trên máy bạn. Cấu hình `open.json` cho phép mọi người đẩy và kéo không cần đăng nhập: tiện cho lab, và là thứ bước 4 sẽ đóng lại.
+
+**Mở terminal mới giữa bài?** Các hàm trong `env.sh` mất theo terminal cũ, và mỗi bước giả định bạn đang đứng đúng thư mục. Bước 1 tới 3 đứng trong `price-api`, bước 4 về `~/masteva-d8`. Ở terminal mới, chạy:
+
+<Terminal where="mac" title="Khôi phục ở terminal mới">
+
+```bash
+cd ~/masteva-d8/price-api && . ../env.sh && crane ls localhost:9720/price-api
+```
+
+</Terminal>
+
+Lệnh cuối chỉ để kiểm registry còn chạy (đầu bài, khi chưa có image nào, nó báo lỗi `NAME_UNKNOWN`; như vậy là bình thường). Biến (`N1` ở bước 2, `OLD` ở bước 3) và hàm khai báo giữa bài (`copy_up`, `tags` ở bước 3) chỉ sống trong terminal đã tạo ra chúng: mở terminal mới giữa một bước thì làm lại bước đó từ khối đầu tiên của nó.
+
+### 1. Hai bản phát hành
+
+`price-api` là bản rút gọn của service ở D5.2: một endpoint `/price`, dùng thư viện `golang.org/x/text` bản cũ có chủ đích (D14.3 cần nó), Dockerfile multi-stage với distroless và user thường.
+
+<Terminal where="mac" title="~/masteva-d8/price-api">
+
+```bash
+cd ~/masteva-d8/price-api
+cat > main.go <<'EOF'
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
+)
+
+var version = "dev" // ghi đè lúc build: -ldflags "-X main.version=..."
+
+func main() {
+	p := message.NewPrinter(language.Vietnamese)
+	http.HandleFunc("/price", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "{\"price\":\"%s\",\"version\":\"%s\"}\n", p.Sprintf("%d đ", 1250000), version)
+	})
+	log.Printf("price-api %s listening on :8080", version)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+EOF
+cat > go.mod <<'EOF'
+module example.com/price-api
+
+go 1.27
+
+require golang.org/x/text v0.3.7
+EOF
+cat > go.sum <<'EOF'
+golang.org/x/text v0.3.7 h1:olpwvP2KacW1ZWvsR7uQhoyTYvKAupfQrRGBFM352Gk=
+golang.org/x/text v0.3.7/go.mod h1:u+2+/6zg+i71rQMx5EYifcz6MCKuco9NR6JIITiCfzQ=
+EOF
+cat > Dockerfile <<'EOF'
+# syntax=docker/dockerfile:1
+FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY *.go ./
+ARG VERSION=dev
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/price-api .
+
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+COPY --from=build /out/price-api /price-api
+USER 65532:65532
+ENTRYPOINT ["/price-api"]
+EOF
+for v in 1.0.0 1.0.1; do
+  docker build -q --build-arg VERSION=$v -t localhost:9720/price-api:$v . >/dev/null
+  docker push -q localhost:9720/price-api:$v
+done
+crane ls localhost:9720/price-api
+crane digest localhost:9720/price-api:1.0.0
+crane digest localhost:9720/price-api:1.0.1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+localhost:9720/price-api:1.0.0
+localhost:9720/price-api:1.0.1
+1.0.0
+1.0.1
+sha256:37a65f91691025aba3152316bb1d5e428a22dec9ae445aba4b7ed49bf1282e7d
+sha256:09c4cba85a8f5b837c5ff7d550630c6a7693ce8c05085ccaf3650e5abc7cd844
+```
+
+</Expected>
+
+Hai dòng `FROM` ghim base image theo `tag@digest`, như D5.2 làm với Trivy: tag để người đọc biết phiên bản, digest để build hôm nay và tháng sau dùng đúng những byte đó (D14.2 xác minh chữ ký của chính digest distroless này, D14.4 dùng nó để build tái lập). Đọc output: hai dòng đầu do `docker push -q` in (tên đã đẩy), hai dòng tiếp là `crane ls` (các tag trong repo), hai dòng cuối là digest của từng tag. Lần đầu chạy `crane`, Docker kéo image của nó. Digest trên máy bạn sẽ khác bài, vì thời điểm build đi vào image (D14.4 mổ chuyện này); các bài sau của chặng in lại đúng các digest này, nên trên máy bạn chúng sẽ khác bài nhưng giữ nguyên giữa các bài.
+
+### 2. Tag trôi, digest đã ghim và lần dọn rác
+
+Dựng lại sơ đồ ở phần Kiến thức: một tag `nightly` được pipeline đẩy đè mỗi đêm, và một manifest triển khai ghim digest của bản đêm qua.
+
+<Callout kind="danger">
+
+Từ bước này, lab khởi động lại registry `d14-zot` nhiều lần (qua hàm `zot_use`), xoá tên image cục bộ bằng `docker rmi`, và ở bước 3 dừng container `d14-upstream`. Tất cả chỉ đụng tới container và image tên `d14-…`, `localhost:9720/…` do lab tạo. Registry thật đang có người dùng thì mỗi lần khởi động lại là một lần gián đoạn kéo image.
+
+</Callout>
+
+Khối dưới build và đẩy hai bản `nightly` liên tiếp lên cùng một tag, giữ digest của bản đầu trong biến `N1`, rồi hỏi registry xem digest đó còn không.
+
+<Terminal where="mac" title="~/masteva-d8/price-api">
+
+```bash
+docker build -q --build-arg VERSION=nightly-1 -t localhost:9720/price-api:nightly . >/dev/null
+docker push -q localhost:9720/price-api:nightly
+N1=$(crane digest localhost:9720/price-api:nightly); echo "đêm 1: $N1"
+docker build -q --build-arg VERSION=nightly-2 -t localhost:9720/price-api:nightly . >/dev/null
+docker push -q localhost:9720/price-api:nightly
+echo "đêm 2: $(crane digest localhost:9720/price-api:nightly)"
+curl -s -o /dev/null -w 'bản đêm 1 theo digest: %{http_code}\n' localhost:9720/v2/price-api/manifests/$N1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+localhost:9720/price-api:nightly
+đêm 1: sha256:9e110435d101aa6f1e4c99df518c275920ea7e1c6db8ba256d00cfe1ad9c5155
+localhost:9720/price-api:nightly
+đêm 2: sha256:3cef29e062ea04a78a1e2f8130edd71d618b902d7ccd18278694edd10e8d1def
+bản đêm 1 theo digest: 200
+```
+
+</Expected>
+
+Tag đã dời, bản đêm 1 không còn tag nào nhưng vẫn kéo được theo digest. Nó còn đó vì `gcDelay` là một giờ. Lab không chờ một giờ. Khối lệnh dưới tạo một bản cấu hình có `gcDelay` và `gcInterval` 20 giây (GC chạy mỗi 20 giây và chỉ đụng tới thứ đã quá 20 giây tuổi), khởi động lại registry, rồi cứ ba giây hỏi lại digest đó một lần, tối đa ba phút, cho tới khi câu trả lời đổi. Để ý dòng in số giây, và lệnh `docker pull` cuối cùng.
+
+<Terminal where="mac" title="~/masteva-d8/price-api">
+
+```bash
+sed 's/"1h"/"20s"/g' ../zot/open.json > ../zot/gc.json
+zot_use gc
+s=$(date +%s)
+for i in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' localhost:9720/v2/price-api/manifests/$N1)
+  [ "$code" = 404 ] && break; sleep 3
+done
+echo "bản đêm 1 theo digest: $code sau $(( $(date +%s) - s )) giây"
+docker rmi localhost:9720/price-api:nightly >/dev/null
+docker pull -q localhost:9720/price-api@$N1
+zot_use open
+```
+
+</Terminal>
+
+<Predict question="Không ai chạy lệnh xoá nào. Sau khi GC chạy, kéo bản đêm 1 theo đúng digest đã ghim thì được gì?">
+
+```text
+zot: cấu hình gc
+bản đêm 1 theo digest: 404 sau 21 giây
+Error response from daemon: failed to resolve reference "localhost:9720/price-api@sha256:9e110435d101aa6f1e4c99df518c275920ea7e1c6db8ba256d00cfe1ad9c5155": localhost:9720/price-api@sha256:9e110435d101aa6f1e4c99df518c275920ea7e1c6db8ba256d00cfe1ad9c5155: not found
+zot: cấu hình open
+```
+
+`not found`. Lượt GC đầu tiên sau khi manifest đủ 20 giây tuổi đã xoá nó. Số giây trên máy bạn sẽ khác, thường trong khoảng 20–60: nó tuỳ lượt GC đầu tiên rơi vào lúc nào sau khi registry khởi động lại. Trên production chuyện này lộ ra muộn và sai chỗ: container đang chạy vẫn chạy, node đã có image trong cache vẫn khởi động lại được, chỉ node **mới** (autoscaling, thay node hỏng) mới kéo và nhận lỗi. Kubernetes báo `ImagePullBackOff` cho đúng những pod cần nhất lúc tải cao.
+
+</Predict>
+
+Hai bản `1.0.0` và `1.0.1` không hề hấn gì: chúng có tag. Đó là cách giữ thứ nhất trong phần Kiến thức: thứ gì đã triển khai thì phải có một tag riêng không bao giờ dời. `docker rmi` trong khối lệnh chỉ xoá tên cục bộ, để `docker pull` buộc phải hỏi registry như một node mới.
+
+<Check id="d8.1.lab-gc">Tái hiện được việc một digest đang được ghim biến mất khỏi registry sau khi tag trôi đi và GC chạy, và nói được vì sao lỗi chỉ lộ ra ở node mới.</Check>
+
+### 3. Proxy cache, rồi ngắt nguồn
+
+Bước này dựng một proxy cache rồi thử ba tình huống: kéo lần đầu, nguồn dời tag, nguồn chết.
+
+Một container `registry` thứ hai, `d14-upstream`, đóng vai registry công cộng ngoài Internet. Lệnh `crane copy` chép vào đó hai image thật: Alpine 3.24.1 dưới tag trôi `3.24`, và BusyBox. Cấu hình `mirror.json` thêm hai thứ cho zot:
+
+- Phần `sync`: mọi repo ở nguồn hiện ra dưới tiền tố `mirror/`, và được kéo về khi có người hỏi (`onDemand`).
+- Phần `subPaths`: các repo `mirror/…` nằm ở một vùng lưu riêng **không dọn rác**. Cuối bước này bạn sẽ thấy điều gì xảy ra nếu bỏ phần đó.
+
+<Terminal where="mac" title="~/masteva-d8/price-api">
+
+```bash
+cat > ../zot/mirror.json <<'EOF'
+{
+  "distSpecVersion": "1.1.1",
+  "storage": {
+    "rootDirectory": "/var/lib/registry", "gc": true, "gcDelay": "1h", "gcInterval": "1h",
+    "subPaths": { "/mirror": { "rootDirectory": "/var/lib/registry-mirror", "gc": false } }
+  },
+  "http": { "address": "0.0.0.0", "port": "9720" },
+  "log": { "level": "info" },
+  "extensions": {
+    "sync": {
+      "enable": true,
+      "registries": [
+        {
+          "urls": ["http://d14-upstream:5000"],
+          "onDemand": true,
+          "tlsVerify": false,
+          "content": [ { "prefix": "**", "destination": "/mirror" } ]
+        }
+      ]
+    }
+  }
+}
+EOF
+docker run -d --name d14-upstream --network d14-net --memory 256m registry:3.1.2@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8 >/dev/null
+zot_use mirror
+copy_up() { crane copy "mirror.gcr.io/library/$1" "d14-upstream:5000/library/$2" --insecure >/dev/null 2>&1 &&
+  echo "$2: $(crane digest --insecure d14-upstream:5000/library/$2)" || echo "LỖI: chép $1 thất bại"; }
+copy_up alpine:3.24.1 alpine:3.24
+copy_up busybox:1.37.0 busybox:1.37.0
+curl -s localhost:9720/v2/_catalog; echo
+docker pull -q localhost:9720/mirror/library/alpine:3.24
+curl -s localhost:9720/v2/_catalog; echo
+OLD=$(crane digest localhost:9720/mirror/library/alpine:3.24); echo "qua mirror: $OLD"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+zot: cấu hình mirror
+alpine:3.24: sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+busybox:1.37.0: sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+{"repositories":["price-api"]}
+localhost:9720/mirror/library/alpine:3.24
+{"repositories":["price-api","mirror/library/alpine"]}
+qua mirror: sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+```
+
+</Expected>
+
+Kết quả sẽ giống thế này. Đọc từ trên xuống: hai dòng `catalog` cho thấy trước lần kéo đầu, zot chưa có repo nào tên `mirror/…`; sau đó có, vì nó đã kéo từ nguồn, lưu lại, rồi mới trả cho Docker. Hàm `copy_up` chép một image công khai lên registry "nguồn" rồi in digest ở đó; crane gọi được `d14-upstream:5000` theo tên vì container của nó dùng chung mạng với zot, nằm trong `d14-net` cùng `d14-upstream`, và cần `--insecure` vì registry nguồn của lab nói HTTP thường, không TLS; chép lỗi thì nó in `LỖI` thay vì im lặng (mỗi lần chép mất khoảng mười giây vì chép mọi kiến trúc). Đây là image công khai nên digest trên máy bạn giống bài.
+
+Lab lấy image từ `mirror.gcr.io`, bản sao Docker Hub do Google vận hành, thay vì từ Docker Hub. Một lần chép image đa kiến trúc tốn nhiều lượt kéo (mỗi kiến trúc một manifest), nên vài lần chạy lại lab là đủ chạm giới hạn 100 lượt mỗi 6 giờ của phần Kiến thức. Đây cũng là một proxy cache: kéo qua một bản sao, không kéo thẳng từ nguồn. Với Docker Hub thật, `urls` là `https://index.docker.io`, bỏ `tlsVerify: false`, và client kéo `kho-của-bạn/mirror/library/alpine` thay cho `alpine`.
+
+Giờ nguồn phát hành bản vá: tag trôi `3.24` ở nguồn dời sang Alpine 3.24.2.
+
+<Terminal where="mac" title="~/masteva-d8/price-api">
+
+```bash
+copy_up alpine:3.24.2 alpine:3.24
+docker pull -q localhost:9720/mirror/library/alpine:3.24
+echo "qua mirror: $(crane digest localhost:9720/mirror/library/alpine:3.24)"
+curl -s -o /dev/null -w 'digest cũ qua mirror: %{http_code}\n' localhost:9720/v2/mirror/library/alpine/manifests/$OLD
+```
+
+</Terminal>
+
+<Predict question="Mirror đã có sẵn alpine:3.24 trên đĩa. Lần kéo này trả bản đang có, hay bản mới của nguồn?">
+
+```text
+alpine:3.24: sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+localhost:9720/mirror/library/alpine:3.24
+qua mirror: sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+digest cũ qua mirror: 200
+```
+
+Bản mới. Mỗi lần có người hỏi một tag, zot hỏi lại nguồn xem tag đó đang trỏ đâu (tài liệu của zot: `manifestCheckInterval` mặc định bằng 0, tức kiểm ở mọi request) và kéo về nếu đã đổi. Với một bản vá thì đây là điều bạn muốn. Với một tag bị kẻ tấn công dời, như 76 tag của `trivy-action` ở D5.2, mirror chuyển tiếp luôn nội dung xấu. Digest cũ vẫn còn (`200`): vùng mirror của lab không dọn rác, nên không có chuyện của bước 2 ở đây; cái giá là nó chỉ lớn lên.
+
+</Predict>
+
+Cuối cùng, ngắt nguồn. Xoá tên cục bộ để Docker buộc phải kéo lại, rồi kéo một image đã từng qua mirror và một image chưa từng:
+
+<Terminal where="mac" title="~/masteva-d8/price-api">
+
+```bash
+docker stop d14-upstream >/dev/null
+docker rmi localhost:9720/mirror/library/alpine:3.24 >/dev/null
+s=$(date +%s); docker pull -q localhost:9720/mirror/library/alpine:3.24; echo "đã từng kéo: $(( $(date +%s) - s )) giây"
+s=$(date +%s); docker pull -q localhost:9720/mirror/library/busybox:1.37.0; echo "chưa từng kéo: $(( $(date +%s) - s )) giây"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+localhost:9720/mirror/library/alpine:3.24
+đã từng kéo: 7 giây
+Error response from daemon: unknown: failed to resolve reference "localhost:9720/mirror/library/busybox:1.37.0": unexpected status from HEAD request to http://localhost:9720/v2/mirror/library/busybox/manifests/1.37.0: 503 Service Unavailable
+chưa từng kéo: 19 giây
+```
+
+</Expected>
+
+Alpine vẫn kéo được dù nguồn đã chết: zot thử hỏi nguồn, không được, rồi trả bản trên đĩa; vài giây chờ là thời gian thử đó (số giây của bạn sẽ khác, trong khoảng vài giây tới vài chục giây). BusyBox có ở nguồn nhưng chưa ai kéo qua mirror, nên mirror không có gì để trả: `503`. Đây là giới hạn đầu tiên trong bảng ở phần Kiến thức, và là lý do pipeline nên kéo **mọi** base image qua mirror ngay từ ngày đầu, không chờ tới hôm nguồn có sự cố.
+
+Còn một câu hỏi: vì sao `mirror.json` phải đặt vùng `mirror/` ở chỗ không dọn rác? Thử bỏ phần `subPaths` và cho GC chạy nhanh như bước 2. Khối dưới bật lại nguồn, dùng `jq` tạo cấu hình `mirror-gc.json` (bỏ `subPaths`, GC 20 giây), kéo lại Alpine qua mirror, rồi cứ ba giây hỏi danh sách tag của repo đó, tối đa ba phút. Sau đó nó tắt nguồn và kéo lại Alpine như một node mới: đúng phép thử "ngắt nguồn" vừa làm, nhưng lần này sau một lượt dọn rác. Để ý danh sách tag trước và sau, và lần kéo cuối cùng, khi nguồn đã tắt.
+
+<Terminal where="mac" title="~/masteva-d8/price-api">
+
+```bash
+jq 'del(.storage.subPaths) | .storage.gcDelay = "20s" | .storage.gcInterval = "20s"' ../zot/mirror.json > ../zot/mirror-gc.json
+docker start d14-upstream >/dev/null && zot_use mirror-gc
+docker pull -q localhost:9720/mirror/library/alpine:3.24
+tags() { curl -s localhost:9720/v2/mirror/library/alpine/tags/list | jq -c '.tags // .errors[0].code'; }
+echo "ngay sau khi kéo: $(tags)"
+s=$(date +%s)
+for i in $(seq 1 60); do t=$(tags); [ "$t" != '["3.24"]' ] && break; sleep 3; done
+echo "sau $(( $(date +%s) - s )) giây: $t"
+docker logs d14-zot 2>&1 | grep -o '"message":"pruned stale manifest entry from index"' | head -1
+docker stop d14-upstream >/dev/null
+docker rmi localhost:9720/mirror/library/alpine:3.24 >/dev/null
+docker pull -q localhost:9720/mirror/library/alpine:3.24 2>&1 | grep -o '503 Service Unavailable\|^localhost.*'
+```
+
+</Terminal>
+
+<Predict question="Image vừa được kéo thành công qua mirror và vẫn có tag. GC chỉ dọn thứ không còn tag. Repo mirror/library/alpine có giữ được tag 3.24 không?">
+
+```text
+zot: cấu hình mirror-gc
+localhost:9720/mirror/library/alpine:3.24
+ngay sau khi kéo: ["3.24"]
+sau 21 giây: "NAME_UNKNOWN"
+"message":"pruned stale manifest entry from index"
+503 Service Unavailable
+```
+
+Không. Ở lượt GC kế tiếp, zot ghi log `pruned stale manifest entry from index` cho chính tag vừa kéo, rồi xoá tag đó: hàm `tags` in danh sách rỗng (`[]`), hoặc `"NAME_UNKNOWN"` khi cả repo đã biến mất, tuỳ bạn hỏi vào lúc nào. Số giây trên máy bạn sẽ khác, trong khoảng vài giây tới khoảng một phút, tuỳ lượt GC rơi vào lúc nào.
+
+Dòng cuối là cái giá: nguồn đã tắt, mirror không còn bản nào để trả, và node mới nhận `503`, đúng điều proxy cache sinh ra để tránh. Tài liệu của zot chưa giải thích hành vi này với image nhiều kiến trúc kéo qua `sync`, nên quy tắc thực tế là: đừng để GC chạy trên vùng mirror. Với `subPaths` tắt GC như `mirror.json`, Alpine vẫn còn sau phép thử ngắt nguồn ở trên. Đổi lại, vùng mirror chỉ lớn lên, phải dọn bằng tay hoặc bằng luật giữ riêng.
+
+</Predict>
+
+Bài học vận hành từ hai khối lệnh vừa rồi: một proxy cache chỉ đáng tin sau khi bạn đã **ngắt nguồn và kéo lại sau ít nhất một chu kỳ dọn rác**, như bạn vừa làm, trên đúng phiên bản kho bạn định chạy. Nâng phiên bản kho artifact cũng phải qua bài thử đó. Registry lúc này đang ở cấu hình `mirror-gc`; bước 4 sẽ đổi sang cấu hình khác.
+
+<Check id="d8.1.lab-proxy">Cấu hình được một proxy cache kéo theo yêu cầu, và chứng minh được ba hành vi: tag ở nguồn dời thì mirror dời theo, nguồn chết thì thứ đã kéo vẫn còn, thứ chưa kéo thì không; giải thích được vì sao phải thử lại sau một chu kỳ dọn rác.</Check>
+
+### 4. Phân quyền và tag bất biến
+
+Giờ bật đăng nhập và phân quyền cho registry. Ba tài khoản: `dev` (lập trình viên), `ci` (pipeline), `admin` (quản trị kho). Mật khẩu sinh ngẫu nhiên vào thư mục `auth/`, không in ra; file `htpasswd` chỉ chứa hash bcrypt, tạo bằng công cụ `htpasswd` trong image `httpd`.
+
+<Terminal where="mac" title="Cấu hình phân quyền">
+
+```bash
+cd ~/masteva-d8
+cat > zot/authz.json <<'EOF'
+{
+  "distSpecVersion": "1.1.1",
+  "storage": { "rootDirectory": "/var/lib/registry", "gc": true, "gcDelay": "1h", "gcInterval": "1h" },
+  "http": {
+    "address": "0.0.0.0", "port": "9720",
+    "auth": { "htpasswd": { "path": "/etc/zot/htpasswd" } },
+    "accessControl": {
+      "repositories": {
+        "**": {
+          "defaultPolicy": ["read"],
+          "policies": [ { "users": ["ci"], "actions": ["read", "create"] } ]
+        }
+      },
+      "adminPolicy": { "users": ["admin"], "actions": ["read", "create", "update", "delete"] }
+    }
+  },
+  "log": { "level": "info" }
+}
+EOF
+mkdir -p auth && : > zot/htpasswd
+for u in dev ci admin; do
+  openssl rand -hex 12 > auth/$u.pass
+  docker run --rm httpd:2.4.69-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1ad28aa795f71888889 htpasswd -nbB $u "$(cat auth/$u.pass)" | grep -v '^$' >> zot/htpasswd
+done
+zot_use authz
+for u in dev ci admin; do
+  mkdir -p auth/$u
+  crane_as $u auth login localhost:9720 -u $u -p "$(cat auth/$u.pass)" 2>&1 | grep -o 'logged in via.*'
+done
+cut -d: -f1 zot/htpasswd | tr '\n' ' '; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+zot: cấu hình authz
+logged in via /work/auth/dev/config.json
+logged in via /work/auth/ci/config.json
+logged in via /work/auth/admin/config.json
+dev ci admin 
+```
+
+</Expected>
+
+Lần đầu, Docker in thêm tiến trình kéo image `httpd` ở đầu output. Đọc cấu hình: `defaultPolicy` cho mọi tài khoản đã đăng nhập quyền `read`; riêng `ci` có thêm `create`; `adminPolicy` cho `admin` mọi quyền trên mọi repo. Không có `anonymousPolicy`, nên người chưa đăng nhập không làm được gì. `crane_as <tài khoản>` chạy `crane` với thông tin đăng nhập của tài khoản đó, lưu trong `auth/<tài khoản>/config.json` (chỉ mã hoá base64, nên thư mục `auth/` phải được giữ như một secret). Bài không dùng `docker login`, để không ghi gì vào cấu hình Docker hay keychain của bạn.
+
+Giờ thử từng vai. Lệnh `crane tag A T` gắn tag `T` cho image `A`, tức một lần `PUT` manifest, đúng thao tác mà `docker push` làm:
+
+<Terminal where="mac">
+
+```bash
+echo "1. chưa đăng nhập kéo:"; crane digest localhost:9720/price-api:1.0.0 2>&1 | grep -o -m1 '401 Unauthorized'
+echo "2. dev kéo:";           crane_as dev digest localhost:9720/price-api:1.0.0
+echo "3. dev đẩy tag mới:";   crane_as dev tag localhost:9720/price-api:1.0.0 thu-nghiem 2>&1 | grep -o 'DENIED: [a-z ]*'
+echo "4. ci đẩy tag mới:";    crane_as ci tag localhost:9720/price-api:1.0.1 1.0.1-rc1 2>&1 | grep -o 'localhost.*'
+echo "5. ci dời tag 1.0.0:";  crane_as ci tag localhost:9720/price-api:1.0.1 1.0.0 2>&1 | grep -o 'DENIED: [a-z ]*'
+echo "6. ci xoá tag:";        crane_as ci delete localhost:9720/price-api:1.0.1-rc1 2>&1 | grep -o 'DENIED: [a-z ]*'
+echo "7. ci đẩy lại đúng digest cũ:"; crane_as ci tag localhost:9720/price-api:1.0.0 1.0.0 2>&1 | grep -o 'DENIED: [a-z ]*'
+crane_as dev digest localhost:9720/price-api:1.0.0
+```
+
+</Terminal>
+
+<Predict question="ci có quyền create. Nó đẩy được tag mới 1.0.1-rc1. Nó có dời được tag 1.0.0 sang nội dung của 1.0.1 không?">
+
+```text
+1. chưa đăng nhập kéo:
+401 Unauthorized
+2. dev kéo:
+sha256:37a65f91691025aba3152316bb1d5e428a22dec9ae445aba4b7ed49bf1282e7d
+3. dev đẩy tag mới:
+DENIED: requested access to the resource is denied
+4. ci đẩy tag mới:
+localhost:9720/price-api:1.0.1-rc1: digest: sha256:09c4cba85a8f5b837c5ff7d550630c6a7693ce8c05085ccaf3650e5abc7cd844 size: 856
+5. ci dời tag 1.0.0:
+DENIED: requested access to the resource is denied
+6. ci xoá tag:
+DENIED: requested access to the resource is denied
+7. ci đẩy lại đúng digest cũ:
+DENIED: requested access to the resource is denied
+sha256:37a65f91691025aba3152316bb1d5e428a22dec9ae445aba4b7ed49bf1282e7d
+```
+
+Không. Đẩy lên một tag **đã tồn tại** là hành động `update`, và `ci` không có. Dòng cuối xác nhận `1.0.0` vẫn trỏ tới digest cũ. Vậy token của pipeline có lộ thì kẻ lấy được nó phát hành được bản **mới** (đủ nguy hiểm, và là việc của chữ ký ở D14.2), nhưng không thay được bản đã phát hành và không xoá được dấu vết. Vì không tag nào bị dời, cũng không manifest nào thành không tag để GC dọn như ở bước 2.
+
+</Predict>
+
+Dòng 7 là một hệ quả cho pipeline: đẩy lại **đúng digest cũ** lên tag `1.0.0` cũng nhận `DENIED`, vì zot coi mọi lần ghi lên tag đã có là `update`. Job phát hành chạy lại (retry) sẽ đỏ ở bước đẩy, nên nó phải kiểm "tag đã có và digest trùng thì coi là xong" **trước khi** đẩy. Script gắn tên phát hành của D6.2 (`SRC` là digest cần phát hành, `OLD` là digest mà tag đang trỏ tới) vẫn gửi `PUT` manifest khi hai digest trùng nhau (registry của D6.2 không bật phân quyền này nên không sao); chạy với kho có tag bất biến thì nó cần thêm một nhánh `[ "$OLD" = "$SRC" ] && exit 0` đứng trước lệnh `PUT`.
+
+Việc dọn thuộc về quản trị:
+
+<Callout kind="danger">
+
+`crane delete` xoá một tag khỏi registry; manifest phía sau thành không tag và sẽ bị GC dọn. Lệnh dưới chỉ xoá tag `1.0.1-rc1` vừa tạo ở bước này.
+
+</Callout>
+
+Khối dưới để `admin` xoá tag thử nghiệm, liệt kê lại các tag, rồi trả registry về cấu hình mở và xem RAM của nó.
+
+<Terminal where="mac">
+
+```bash
+crane_as admin delete localhost:9720/price-api:1.0.1-rc1 && echo "admin: đã xoá 1.0.1-rc1"
+crane_as dev ls localhost:9720/price-api | tr '\n' ' '; echo
+zot_use open
+docker stats --no-stream --format '{{.Name}}  {{.MemUsage}}' d14-zot
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+admin: đã xoá 1.0.1-rc1
+1.0.0 1.0.1 nightly 
+zot: cấu hình open
+d14-zot  52.44MiB / 512MiB
+```
+
+</Expected>
+
+RAM trên máy bạn sẽ khác, thường 50–70 MiB.
+
+Lệnh `zot_use open` mở lại registry cho ba bài sau: chúng cần `docker push` mà không đăng nhập. Đây là nhượng bộ của lab. Registry thật không bao giờ cho đẩy ẩn danh, và cấu hình nên dùng là `authz.json`.
+
+<Check id="d8.1.lab-authz">Cấu hình được ba vai trên một registry, và chứng minh được bằng mã trả về rằng tài khoản pipeline tạo được tag mới nhưng không ghi đè, không xoá được tag đã có.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`crane` báo `docker: Error response from daemon: No such container: d14-zot`:** registry chưa chạy. `docker start d14-zot`, rồi chạy lại lệnh.
+- **`docker: Error response from daemon: Conflict. The container name "/d14-upstream" is already in use`** (hoặc `d14-zot`, hoặc `network with name d14-net already exists`): bạn đang chạy lại một khối đã chạy. Container và mạng đã có sẵn; `docker start d14-upstream` (hoặc `d14-zot`) rồi chạy các dòng còn lại của khối.
+- **`command not found: crane`** (hoặc `zot_use`, `crane_as`): terminal mới chưa nạp hàm. Chạy `. ~/masteva-d8/env.sh`.
+- **`docker push` báo `unauthorized` hoặc `authentication required`:** registry đang ở cấu hình `authz`. Chạy `zot_use open`.
+- **Bước 2 in `200 sau 180 giây`:** registry chưa nhận cấu hình GC ngắn. Xem `grep gcDelay ~/masteva-d8/zot/config.json` có ra `20s` không, rồi chạy lại khối lệnh.
+- **`copy_up` in `LỖI: chép … thất bại`:** chạy lại lệnh `crane copy` trong hàm mà bỏ phần `>/dev/null 2>&1` để đọc lỗi; thường là mạng tới `mirror.gcr.io`. Nếu bạn đổi nguồn sang Docker Hub và gặp `TOOMANYREQUESTS`, địa chỉ IP của bạn đã chạm hạn mức 100 lượt kéo mỗi 6 giờ, đúng rủi ro bước 3 nói tới.
+- **`zot_use` chạy xong nhưng `curl localhost:9720/v2/` không trả lời:** file cấu hình sai cú pháp JSON nên zot thoát. Xem `docker logs d14-zot | tail -3`.
+
+</Callout>
+
+### Dọn dẹp
+
+Nếu học tiếp D14.2 ngay, chỉ dừng các container, giữ lại dữ liệu:
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu cho D14.2">
+
+```bash
+docker stop d14-zot d14-upstream
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Khối dưới xoá hẳn hai container, hai volume `d14-zot-data`, `d14-zot-mirror` (mọi image đã đẩy và đã kéo qua mirror), mạng `d14-net`, các image `localhost:9720/…` trên máy và cả thư mục `~/masteva-d8` (gồm mật khẩu lab trong `auth/`). Chỉ chạy khi không học tiếp D14.2 tới D14.4.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn">
+
+```bash
+docker rm -f d14-zot d14-upstream
+docker volume rm d14-zot-data d14-zot-mirror
+docker network rm d14-net
+docker rmi $(docker images -q --filter reference='localhost:9720/*' --filter reference='localhost:9720/*/*/*' | sort -u)
+rm -rf ~/masteva-d8
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Tag bất biến rồi thì latest, nightly, 1.2 sống ở đâu?">
+
+Ở repo khác, hoặc dưới luật khác trong cùng repo. Cách chia hay gặp: repo phát hành (`prod/price-api`) chỉ nhận tag phiên bản và tag commit, bất biến với mọi danh tính trừ quản trị; repo tích hợp (`dev/price-api`) cho phép tag trôi và dọn mạnh tay (giữ 20 bản gần nhất). Harbor và ECR viết được luật theo mẫu tag ngay trong một repo. Điều cần giữ là quy ước: **không môi trường nào ngoài dev được triển khai từ tag trôi**, và manifest triển khai luôn ghi digest (D6.3). Khi đó tag trôi chỉ còn là tiện ích cho người, không còn là thứ quyết định production chạy gì.
+
+</Reveal>
+
+<Reveal title="Proxy cache, mirror định kỳ hay chép tay: chọn cái nào?">
+
+Ba mức kiểm soát tăng dần. Proxy cache kéo theo yêu cầu: không phải làm gì thêm, nhưng nội dung do nguồn và do thứ tự ai kéo trước quyết định. Mirror định kỳ (zot `pollInterval`, replication của Harbor) kéo sẵn một danh sách repo và tag: nguồn chết lúc nào cũng có bản gần nhất, đổi lại tốn đĩa và phải giữ danh sách. Chép có chủ đích vào repo nội bộ (`crane copy` trong một pipeline, kèm quét và, từ D14.2, kiểm chữ ký): mỗi base image là một lần phát hành nội bộ có review, và tên nội bộ không bao giờ tự đổi nội dung. Đội nhỏ bắt đầu bằng proxy cache cho mọi thứ, rồi chuyển dần các base image quan trọng sang chép có chủ đích.
+
+</Reveal>
+
+<Reveal title="Vì sao GC của registry cần khoảng trễ?">
+
+Vì một lần đẩy không nguyên tử. Client tải từng blob lên trước, cuối cùng mới đẩy manifest tham chiếu tới chúng. Giữa hai thời điểm đó, các blob "không ai tham chiếu", y hệt rác. GC chạy đúng lúc ấy mà không có khoảng trễ sẽ xoá blob của một lần đẩy đang dở, và manifest tới sau trỏ vào chỗ trống. `gcDelay` nói: thứ gì mới hơn ngần này thì chưa đụng. Vì vậy đặt `gcDelay` 20 giây như bước 2 chỉ dùng được trong lab; tài liệu của zot khuyên chỉnh theo tốc độ mạng của client và kích thước blob. Registry `registry:3` của D5.2 còn thận trọng hơn: GC là một lệnh chạy tay, nên chạy khi registry ở chế độ chỉ đọc.
+
+</Reveal>
+
+<Reveal title="Kho artifact bị chiếm thì còn lại gì?">
+
+Kẻ có quyền quản trị kho thay được nội dung dưới mọi tag, xoá được mọi thứ, và phục vụ nội dung khác nhau cho từng client. Digest vẫn là hàng rào đầu: client yêu cầu `@sha256:…` sẽ tự tính lại hash của thứ nhận được, kho không giả được. Nhưng digest đó phải đến từ nơi **khác** kho: manifest triển khai trong Git, hồ sơ phát hành của pipeline. Hàng rào thứ hai là chữ ký mà khoá không nằm trong kho (D14.2): kho giữ chữ ký nhưng không tạo ra được chữ ký hợp lệ cho nội dung giả. Thiết kế đúng coi kho là nơi **lưu**, không phải nơi **quyết định** thứ gì đáng tin.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nên nhờ AI viết nháp cấu hình phân quyền hoặc luật giữ từ một bảng vai trò bạn mô tả, hoặc giải thích một dòng log của registry. AI hay sai ở chỗ: bịa khoá cấu hình không tồn tại (ví dụ một công tắc `immutableTags` cho zot), trộn cú pháp của Harbor, `registry` và zot, và viết luật giữ nghe hợp lý nhưng xoá cả thứ đang chạy. Kiểm bằng đúng cách của lab: với phân quyền, thử từng vai và đọc mã trả về (`401`, `DENIED`, thành công); với luật giữ, bật chế độ chạy thử (`dryRun` của zot) và đọc danh sách sẽ bị xoá trước khi cho xoá thật. Đừng hỏi AI "tag này trỏ digest nào": hỏi registry.
+
+</Callout>
+
+<Callout kind="link">
+
+D14.2 ký các image của bài này bằng cosign; chữ ký là artifact nằm cùng repo, nên luật `create` không `update` ở bước 4 áp lên cả nó. D14.3 gắn SBOM vào image theo cùng cách. D14.5 quay lại proxy với kho gói npm và chỉ ra mặt trái: proxy gộp gói nội bộ với gói công cộng là cửa cho dependency confusion. K3.2 đẩy chart Helm vào registry OCI. K8 đặt chính sách admission để cụm Kubernetes chỉ nhận image từ kho được phép. D15 quản lý token của registry như mọi secret khác.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d8.1.mastery-threats">Với một hệ thống của mình, chỉ ra được từng mắt xích của chuỗi cung ứng, ai có quyền ghi ở đó, và mắt xích nào đang không có biện pháp nào.</Check>
+
+<Check id="d8.1.mastery-registry">Tự cấu hình được một registry có phân quyền theo vai và tag bất biến cho repo phát hành, và chứng minh được bằng cách thử từng vai.</Check>
+
+<Check id="d8.1.mastery-availability">Giải thích được cho đồng nghiệp vì sao cần kéo image ngoài qua proxy cache, proxy cache không bảo vệ khỏi điều gì, và chính sách giữ nào đảm bảo digest đang chạy trên production không bị dọn.</Check>
+
+</Mastery>

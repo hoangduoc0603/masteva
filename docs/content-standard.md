@@ -90,6 +90,22 @@ Mọi bài đều có đủ 6 phần theo đúng thứ tự.
 
 **Giọng văn (bản tiếng Việt):** tiếng Việt tự nhiên, xưng "bạn", không dùng từ ngữ quảng cáo, không phóng đại.
 
+### 3.1 Dạy người học, không kể chuyện người viết
+
+Bài viết cho người đang học, theo thứ tự họ làm: sắp làm gì, vì sao, gõ gì, sẽ thấy gì, điều đó nghĩa là gì. Người học chỉ thấy bài; họ không thấy các lần chạy của người viết, nên bài không được dựa vào những lần chạy đó.
+
+| Đúng | Sai |
+|---|---|
+| "Kết quả sẽ giống thế này. Số giây trên máy bạn sẽ khác, thường trong khoảng 20–60 giây tuỳ máy bận hay rảnh." | "Trên máy kiểm chứng, ba lượt chạy cho 24, 41 và 58 giây." |
+| Thêm một bước để người học tự thấy hiện tượng, hoặc nêu nó như kiến thức có nguồn | "Khi soạn bài đã thử X và thấy Y" (người học không làm X) |
+| "Nếu lệnh dừng ở `Pending` quá 2 phút, xem mục Gỡ lỗi." | "Lượt chạy thứ hai của bài từng kẹt ở `Pending`." |
+| Thông tin kiểm chứng (ngày, hệ điều hành, phiên bản) nằm ở frontmatter `verified` | Lặp lại trong thân bài "bài được kiểm chứng trên máy … ngày …" |
+
+- **Giải thích trước khi dùng:** thuật ngữ mới có một câu định nghĩa ở lần đầu xuất hiện; ví dụ cụ thể đi trước khái quát.
+- **Lời dẫn quanh khối lệnh:** trước khối lệnh nói người học sắp làm gì và cần để ý gì; sau output nói cách đọc output.
+- **Giới hạn của bài** (chưa chạy trên Linux, cần máy nhiều RAM…) viết ngắn ở một chỗ (profile máy ở phần Chuẩn bị hoặc mục Gỡ lỗi) và hướng tới việc người học cần làm.
+- **Duyệt bài có một lượt đọc như người học:** đọc từ đầu tới cuối như người lần đầu học chủ đề, chưa làm lab, chỉ biết những gì bài này và các bài trước đã dạy; đánh dấu chỗ khó hiểu, chỗ nhảy bước, thuật ngữ chưa giải thích, câu kể chuyện người viết.
+
 ## 4. Kiểm chứng nội dung
 
 Một bài đi qua ba trạng thái:
