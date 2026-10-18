@@ -1,0 +1,615 @@
+---
+title: Pod Security Admission
+description: Bắt buộc mức bảo mật cho mọi pod của một namespace bằng Pod Security Admission có sẵn trong API server - ba mức privileged, baseline, restricted, ba chế độ enforce, audit, warn, mặc định cho cả cụm, ghim phiên bản chính sách - và siết một namespace đang chạy từ baseline lên restricted mà không làm gãy ứng dụng.
+id: k8.1
+step: k8
+prerequisites: [k2.4, d13.1]
+topics: [k8.pod-security-admission]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    agnhost: 2.66.1
+    busybox: 1.38.0
+---
+
+<Goal>
+
+K2.4 dạy bạn tự viết `securityContext` cho pod của mình. Bài này chuyển việc đó từ "mong mọi người nhớ viết" sang "cụm từ chối pod không đạt". Học xong, bạn:
+
+- Đặt được mức bảo mật cho từng namespace và cho cả cụm, kèm ngoại lệ có chủ đích.
+- Giải thích được vì sao `kubectl apply` một Deployment báo `created` mà không có pod nào chạy, và tìm ra lý do trong vài giây.
+- Siết được một namespace đang có ứng dụng chạy từ `baseline` lên `restricted` theo từng bước, biết trước pod nào sẽ bị chặn trước khi chặn thật.
+- Giải thích được vì sao một pod hôm nay được nhận lại bị từ chối sau khi nâng cấp cụm, và cách ghim phiên bản chính sách để tránh điều đó.
+
+</Goal>
+
+<Knowledge>
+
+### Pod Security Standards: ba mức
+
+Ai có quyền tạo pod trong một namespace thì viết được pod spec tuỳ ý (K2.3 đã nói: RBAC kiểm "được tạo pod không", không kiểm nội dung pod). Một pod `privileged: true`, hay một pod mount `/` của node qua `hostPath`, là đủ để chiếm node đó. **Pod Security Standards** (PSS) là ba mức chính sách do dự án Kubernetes định nghĩa, mỗi mức là một danh sách trường trong pod spec bị cấm hoặc bắt buộc:
+
+| Mức | Dành cho | Điều chính bị cấm hoặc bắt buộc |
+|---|---|---|
+| `privileged` | Thành phần hạ tầng tin cậy: CNI, agent giám sát node, CSI driver | Không giới hạn gì |
+| `baseline` | Ứng dụng thông thường; ngăn leo quyền đã biết mà không cần sửa ứng dụng | Cấm `privileged`, `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `hostPort`; cấm thêm capability ngoài danh sách mặc định của runtime; cấm seccomp hay AppArmor `Unconfined`; cấm trường `host` trong probe (từ v1.34) |
+| `restricted` | Ứng dụng nhạy cảm, người dùng ít được tin | Mọi thứ của `baseline`, cộng: phải `runAsNonRoot: true` và không `runAsUser: 0`; phải `allowPrivilegeEscalation: false`; phải bỏ `ALL` capability (chỉ được thêm lại `NET_BIND_SERVICE`); phải đặt seccomp `RuntimeDefault` hoặc `Localhost`; volume chỉ thuộc các loại như `configMap`, `secret`, `emptyDir`, `persistentVolumeClaim`, `projected` |
+
+Bốn trường K2.4 đã dạy (`runAsNonRoot`, `allowPrivilegeEscalation`, `capabilities.drop`, `seccompProfile`) chính là phần chênh giữa `baseline` và `restricted`. Hầu hết ứng dụng web chạy được dưới `baseline` mà không sửa gì; lên `restricted` thường phải sửa Dockerfile để chạy bằng user thường.
+
+<Check id="k8.1.pss">Kể được ba mức của Pod Security Standards, mỗi mức dành cho loại workload nào, và nêu được các trường làm một pod rớt `baseline` hoặc rớt `restricted`.</Check>
+
+### Pod Security Admission: ai kiểm, kiểm lúc nào
+
+**Admission** là bước API server xét một yêu cầu ghi sau khi đã biết ai gửi (xác thực) và người đó có quyền không (RBAC), trước khi lưu vào etcd. **Pod Security Admission** (PSA) là một admission plugin có sẵn trong API server, bật mặc định, ổn định từ Kubernetes 1.25 (nó thay PodSecurityPolicy đã bị gỡ ở cùng bản). Nó đọc nhãn của namespace để biết áp mức nào:
+
+```text
+ kubectl apply pod / deployment
+        |
+        v
+ API server: xác thực -> RBAC -> mutating admission -> kiểm schema
+        |
+        v
+ validating admission, trong đó có PodSecurity
+        |   1. yêu cầu này có chứa pod spec không? (Pod, hoặc template của Deployment, Job...)
+        |   2. namespace có nhãn pod-security.kubernetes.io/<chế độ>=<mức>?
+        |      thiếu nhãn nào thì lấy mặc định của cụm (AdmissionConfiguration)
+        |   3. so pod spec với mức đó, theo phiên bản chính sách <chế độ>-version
+        |
+        +-- enforce vi phạm: từ chối (403 Forbidden), không lưu gì
+        +-- audit   vi phạm: cho qua, gắn chú thích vào bản ghi audit log (K8.5)
+        +-- warn    vi phạm: cho qua, trả dòng "Warning:" về cho kubectl
+        v
+ etcd
+```
+
+Mỗi namespace có tối đa sáu nhãn, hai nhãn cho mỗi chế độ:
+
+```yaml
+pod-security.kubernetes.io/enforce: restricted
+pod-security.kubernetes.io/enforce-version: v1.37
+pod-security.kubernetes.io/audit: restricted
+pod-security.kubernetes.io/audit-version: latest
+pod-security.kubernetes.io/warn: restricted
+pod-security.kubernetes.io/warn-version: latest
+```
+
+Ba chế độ độc lập với nhau, và mỗi chế độ có mức riêng. Cách dùng phổ biến: `enforce` ở mức hiện tại đang đạt, `warn` và `audit` ở mức muốn lên. Người triển khai thấy cảnh báo ngay trên terminal, đội nền tảng thấy danh sách vi phạm trong audit log, còn ứng dụng không gãy.
+
+Hai chi tiết gây nhầm nhiều nhất:
+
+- **`enforce` chỉ áp lên pod, không áp lên Deployment.** `warn` và `audit` áp cả lên template của Deployment, StatefulSet, Job…, để báo sớm. Nhưng Deployment vi phạm vẫn được tạo; chỉ khi ReplicaSet controller tạo pod thì pod mới bị từ chối. Lỗi đó không về terminal của bạn: nó nằm trong event của ReplicaSet, và Deployment đứng ở `0/2`.
+- **PSA kiểm lúc tạo pod và lúc sửa phần spec của pod** (ví dụ thêm ephemeral container bằng `kubectl debug`); **nó không đuổi pod đang chạy khi nhãn namespace đổi.** Đổi nhãn lên mức chặt hơn, API server chỉ trả cảnh báo liệt kê pod vi phạm. Các pod đó vẫn chạy cho tới lần được tạo lại tiếp theo (rollout, node hỏng, drain), và lúc ấy mới không lên được.
+
+<Check id="k8.1.psa-che-do">Vẽ lại được vị trí của PSA trong đường đi của một yêu cầu, phân biệt được ba chế độ `enforce`, `audit`, `warn`, và giải thích được vì sao Deployment vi phạm vẫn được tạo còn pod của nó thì không.</Check>
+
+### Phiên bản chính sách
+
+Danh sách trường của mỗi mức thay đổi theo thời gian: v1.34 thêm luật cấm trường `host` trong probe vào `baseline`. Nhãn `<chế độ>-version` chọn **phiên bản** danh sách đó. `latest` (mặc định) nghĩa là "theo bản Kubernetes đang chạy": nâng cấp cụm là nâng chính sách theo. Ghim `enforce-version: v1.37` nghĩa là "chặn theo luật của 1.37", kể cả khi cụm đã lên 1.38.
+
+Cách làm an toàn: ghim `enforce-version` ở bản hiện tại, để `warn-version` và `audit-version` ở `latest`. Sau mỗi lần nâng cấp cụm, cảnh báo cho biết luật mới sẽ chặn những gì; sửa xong thì mới dời `enforce-version` lên.
+
+### Mặc định cho cả cụm và ngoại lệ
+
+Namespace không có nhãn thì PSA dùng mặc định của cụm, và mặc định có sẵn là `privileged` cho cả ba chế độ: không kiểm gì. Đổi mặc định bằng một file `AdmissionConfiguration` truyền cho API server qua cờ `--admission-control-config-file`:
+
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: PodSecurity
+    configuration:
+      apiVersion: pod-security.admission.config.k8s.io/v1
+      kind: PodSecurityConfiguration
+      defaults:            # áp cho namespace không có nhãn tương ứng
+        enforce: baseline
+        enforce-version: latest
+        audit: restricted
+        warn: restricted
+      exemptions:          # bỏ qua hoàn toàn: không enforce, không audit, không warn
+        usernames: []
+        runtimeClasses: []
+        namespaces: [kube-system]
+```
+
+Ngoại lệ có ba chiều: theo tên người dùng gửi yêu cầu, theo RuntimeClass của pod, theo namespace. Ngoại lệ theo người dùng ít tác dụng hơn bạn nghĩ: pod của Deployment do ReplicaSet controller tạo, không phải do bạn, nên miễn trừ cho bạn chỉ có tác dụng khi bạn tạo pod trực tiếp. Tài liệu Kubernetes khuyên không miễn trừ ServiceAccount của controller (như `system:serviceaccount:kube-system:replicaset-controller`), vì làm thế là miễn trừ cho bất kỳ ai tạo được Deployment.
+
+Trên cụm managed (EKS, GKE, AKS), bạn không sửa được cờ của API server. Mặc định cụm khi đó là `privileged`, và cách duy nhất là gắn nhãn cho từng namespace, thường qua GitOps (D13) hoặc một policy tự sinh nhãn cho namespace mới (K8.3).
+
+<Check id="k8.1.mac-dinh">Giải thích được mặc định của cụm lấy từ đâu, phiên bản chính sách ghim để làm gì, và vì sao miễn trừ theo tên người dùng không miễn trừ cho Deployment của người đó.</Check>
+
+<Callout kind="production">
+
+Tháng 3/2022, Unit 42 của Palo Alto Networks [phân tích lỗ hổng kernel CVE-2022-0492](https://unit42.paloaltonetworks.com/cve-2022-0492-cgroups/) trong cgroups v1. File `release_agent` của cgroup chỉ định một chương trình mà kernel chạy bằng root với đủ capability trên máy chủ; kernel đã quên kiểm người ghi file có `CAP_SYS_ADMIN` không. Theo bài phân tích, một container thoát được ra máy chủ qua lỗi này khi hội đủ các điều kiện: tiến trình chạy bằng root hoặc không có cờ `no_new_privs`; không có AppArmor hay SELinux; không có seccomp; máy chủ cho phép user namespace không đặc quyền; container nằm ở cgroup gốc của một subsystem v1. Seccomp chặn lời gọi `unshare()` mà kỹ thuật này cần, AppArmor hoặc SELinux chặn bước mount. Họ kết luận các lớp bảo vệ mặc định của phần lớn môi trường container là đủ để chặn, và khuyên vá kernel, bật seccomp, bật AppArmor hoặc SELinux.
+
+Đối chiếu của bài này: gần như mỗi điều kiện trên là một luật của `restricted`. `runAsNonRoot` loại điều kiện chạy root, `allowPrivilegeEscalation: false` đặt cờ `no_new_privs`, `seccompProfile` bắt buộc có seccomp; `baseline` cấm `privileged` và cấm thêm `SYS_ADMIN`, hai cách khác để có quyền mount. Một pod không khai `securityContext` trên cụm mặc định `privileged` thì không có lớp nào trong số đó: Kubernetes không đặt seccomp cho pod nếu kubelet không bật `seccompDefault` (K8.2).
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/): bảng đầy đủ các trường của `baseline` và `restricted`, kèm phiên bản thêm từng luật.
+- [Pod Security Admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/): nhãn, ba chế độ, cách áp lên workload, ngoại lệ và metric của API server.
+- [Enforce Pod Security Standards by Configuring the Built-in Admission Controller](https://kubernetes.io/docs/tasks/configure-pod-container/enforce-standards-admission-controller/): file `AdmissionConfiguration` cho mặc định toàn cụm.
+- [Unit 42: CVE-2022-0492 cgroups container escape](https://unit42.paloaltonetworks.com/cve-2022-0492-cgroups/): nguồn của callout, đọc phần điều kiện thoát container và phần giảm thiểu.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cần Docker, kind 0.33, kubectl 1.37, `jq` và `yq` như ở D0.2. Bài dựng cụm kind một node tên `k8-lab`, dùng cho các bài K8.1 tới K8.4 (K8.2 tạm xoá cụm khi chuyển sang VM, K8.3 tạo lại); K8.5 tạo lại cụm với audit log.
+
+**Profile máy.** Cuối bài, node kind dùng khoảng 0,7 tới 0,9 GiB RAM của Docker; bài chỉ kéo image `agnhost` và `busybox` (vài chục MB). Máy 8 GB chạy thoải mái.
+
+Mọi terminal dùng cho chặng cần dòng `export KUBECONFIG=~/masteva-k8/kubeconfig`, để kind ghi cấu hình vào thư mục lab thay vì `~/.kube/config`. Mở terminal mới giữa bài thì chạy lại dòng đó và `cd ~/masteva-k8/k8-1`.
+
+### 1. Cụm có mặc định PSA
+
+Khối dưới viết file `AdmissionConfiguration` như ở phần Kiến thức: mặc định `enforce: baseline`, `audit` và `warn` ở `restricted`, miễn trừ `kube-system` (nơi chạy kindnet, kube-proxy, cần quyền của node) và `local-path-storage` (pod hỗ trợ của kind tạo volume bằng `hostPath`).
+
+<Terminal where="mac" title="~/masteva-k8/apiserver/admission.yaml">
+
+```bash
+export KUBECONFIG=~/masteva-k8/kubeconfig
+mkdir -p ~/masteva-k8/apiserver ~/masteva-k8/seccomp ~/masteva-k8/k8-1 && cd ~/masteva-k8
+cat > apiserver/admission.yaml <<'EOF'
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: PodSecurity
+    configuration:
+      apiVersion: pod-security.admission.config.k8s.io/v1
+      kind: PodSecurityConfiguration
+      defaults:
+        enforce: baseline
+        enforce-version: latest
+        audit: restricted
+        audit-version: latest
+        warn: restricted
+        warn-version: latest
+      exemptions:
+        usernames: []
+        runtimeClasses: []
+        namespaces: [kube-system, local-path-storage]
+EOF
+```
+
+</Terminal>
+
+API server của kind chạy trong container node, dưới dạng static pod (K4.1). File trên máy bạn phải đi qua hai lớp để tới được nó: `extraMounts` gắn thư mục `apiserver` vào node, rồi `extraVolumes` trong cấu hình kubeadm gắn tiếp vào pod API server. `extraArgs` thêm cờ `--admission-control-config-file`. Thư mục `seccomp` được gắn sẵn vào chỗ kubelet tìm profile seccomp, để K8.2 dùng.
+
+<Terminal where="mac" title="~/masteva-k8/kind.yaml">
+
+```bash
+cat > kind.yaml <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k8-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraMounts:
+      - hostPath: $HOME/masteva-k8/apiserver
+        containerPath: /etc/kubernetes/masteva
+        readOnly: true
+      - hostPath: $HOME/masteva-k8/seccomp
+        containerPath: /var/lib/kubelet/seccomp/profiles
+        readOnly: true
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            - name: admission-control-config-file
+              value: /etc/kubernetes/masteva/admission.yaml
+          extraVolumes:
+            - name: masteva
+              hostPath: /etc/kubernetes/masteva
+              mountPath: /etc/kubernetes/masteva
+              readOnly: true
+              pathType: Directory
+EOF
+kind create cluster --config kind.yaml > /dev/null 2>&1 || echo "kind create cluster lỗi: chạy lại 'kind create cluster --config kind.yaml' để xem lý do"
+kubectl wait --for=condition=Ready node --all --timeout=180s
+docker exec k8-lab-control-plane grep -- --admission-control-config-file /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k8-lab-control-plane condition met
+    - --admission-control-config-file=/etc/kubernetes/masteva/admission.yaml
+```
+
+</Expected>
+
+Lệnh `kind create cluster` mất khoảng một phút; output của nó được ẩn cho gọn. Dòng cuối xác nhận cờ đã vào manifest của API server. `extraArgs` viết dạng danh sách `name`/`value` vì kind 0.33 sinh cấu hình kubeadm `v1beta4`; ví dụ cũ trên mạng viết dạng map `audit-log-path: …` là của `v1beta3` và không còn khớp.
+
+### 2. Ba mức trên ba namespace
+
+Tạo ba namespace: `dev` không gắn nhãn (nhận mặc định của cụm), `ops` gắn `privileged`, `pay` gắn `restricted` có ghim phiên bản. Rồi thử cùng một pod `privileged: true` ở cả ba.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k8/k8-1
+kubectl create namespace dev
+kubectl create namespace ops
+kubectl label namespace ops pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/warn=privileged
+kubectl create namespace pay
+kubectl label namespace pay pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=v1.37
+for ns in dev ops pay; do
+  echo "== $ns"
+  kubectl -n $ns run root-shell --image=busybox:1.38.0 --privileged --restart=Never -- sleep 3600 2>&1 | cut -c1-160
+done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/dev created
+namespace/ops created
+namespace/ops labeled
+namespace/pay created
+namespace/pay labeled
+== dev
+Error from server (Forbidden): pods "root-shell" is forbidden: violates PodSecurity "baseline:latest": privileged (container "root-shell" must not set securityC
+== ops
+pod/root-shell created
+== pay
+Error from server (Forbidden): pods "root-shell" is forbidden: violates PodSecurity "restricted:v1.37": privileged (container "root-shell" must not set security
+```
+
+</Expected>
+
+Thông báo nói đủ ba điều: mức nào (`baseline`), phiên bản nào (`latest` hay `v1.37`), trường nào vi phạm. `dev` bị chặn dù không có nhãn nào: đó là mặc định của cụm từ bước 1. `ops` có nhãn `warn=privileged` để tắt cảnh báo mặc định `restricted`, nên không in dòng `Warning`. Trên cụm thật, namespace như `ops` chỉ dành cho thành phần hạ tầng, và quyền tạo pod trong đó phải hẹp.
+
+Giờ một pod đạt `restricted`. Đối chiếu từng dòng `securityContext` với bảng ở phần Kiến thức:
+
+<Terminal where="mac" title="~/masteva-k8/k8-1/pod-restricted.yaml">
+
+```bash
+cat > pod-restricted.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ok
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: app
+      image: busybox:1.38.0
+      command: ["sleep", "3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+EOF
+kubectl -n pay apply -f pod-restricted.yaml
+kubectl -n pay run plain --image=busybox:1.38.0 --restart=Never -- sleep 3600 2>&1 | cut -c1-200
+kubectl -n pay wait --for=condition=Ready pod/ok --timeout=60s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/ok created
+Error from server (Forbidden): pods "plain" is forbidden: violates PodSecurity "restricted:v1.37": allowPrivilegeEscalation != false (container "plain" must set securityContext.allowPrivilegeEscalatio
+pod/ok condition met
+```
+
+</Expected>
+
+Pod `plain` không khai `securityContext` nào: đạt `baseline` nhưng rớt `restricted` ở bốn trường. Lệnh `cut` cắt bớt dòng lỗi; chạy lại không có `cut` để đọc đủ bốn trường.
+
+<Check id="k8.1.lab-ba-muc">Tạo được namespace ở ba mức, đọc được thông báo từ chối để biết mức, phiên bản và trường vi phạm, và viết được pod đạt `restricted`.</Check>
+
+### 3. Deployment "created" mà không có pod
+
+<Predict question="Trong namespace `pay` (enforce `restricted`), bạn tạo một Deployment 2 bản sao với image `agnhost` và không khai `securityContext`. `kubectl` báo gì, và có mấy pod chạy?">
+
+`kubectl` báo `deployment.apps/web created`, kèm một dòng `Warning` từ chế độ `warn`. Không pod nào chạy: `enforce` không áp lên Deployment, chỉ áp lên pod mà ReplicaSet tạo ra, và ReplicaSet bị từ chối mỗi lần thử. Lỗi nằm trong event của ReplicaSet.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n pay create deployment web --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 --replicas=2 -- /agnhost netexec --http-port=8080 2>&1 | cut -c1-120
+sleep 5
+kubectl -n pay get deployment,replicaset
+kubectl -n pay events --for replicaset/$(kubectl -n pay get rs -l app=web -o jsonpath='{.items[0].metadata.name}') | head -2 | cut -c1-200
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (container "agnhost" must set
+deployment.apps/web created
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   0/2     0            0           5s
+
+NAME                             DESIRED   CURRENT   READY   AGE
+replicaset.apps/web-6fb755dd8f   2         0         0       5s
+LAST SEEN   TYPE      REASON         OBJECT                      MESSAGE
+5s          Warning   FailedCreate   ReplicaSet/web-6fb755dd8f   Error creating: pods "web-6fb755dd8f-f56xt" is forbidden: violates PodSecurity "restricted:v1.37": allowPrivilegeEscalation != false (c
+```
+
+</Expected>
+
+Tên ReplicaSet và pod trên máy bạn sẽ khác. Để ý hai nhãn phiên bản: dòng `Warning` lúc tạo Deployment đến từ chế độ `warn`, theo `latest`; lỗi trong event đến từ `enforce`, theo `v1.37` đã ghim. `DESIRED 2, CURRENT 0` là dấu hiệu nhận biết: ReplicaSet muốn tạo pod mà không tạo được. Ngoài PSA, ResourceQuota (K5.5) và admission policy (K8.3) gây đúng triệu chứng này; event của ReplicaSet luôn là chỗ xem đầu tiên.
+
+Trong pipeline triển khai, `kubectl rollout status` sẽ chờ tới hết hạn rồi báo lỗi chung chung về thời gian chờ. Vì vậy dòng `Warning` lúc apply đáng được coi là lỗi: `kubectl apply --warnings-as-errors` biến nó thành exit code khác 0.
+
+<Check id="k8.1.lab-deployment">Tái hiện được Deployment tạo thành công nhưng `0/2` vì PSA, và tìm được lý do trong event của ReplicaSet.</Check>
+
+### 4. Siết một namespace đang chạy, từng bước
+
+Namespace `shop` đang ở mặc định `baseline` và có một ứng dụng chạy. Mục tiêu: đưa nó lên `restricted` mà không có lúc nào ứng dụng không lên được. Trước hết dựng hiện trạng:
+
+<Terminal where="mac">
+
+```bash
+kubectl create namespace shop
+kubectl -n shop create deployment web --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 --replicas=2 -- /agnhost netexec --http-port=8080 2>&1 | grep -v '^Warning'
+kubectl -n shop rollout status deployment/web --timeout=120s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/shop created
+deployment.apps/web created
+Waiting for deployment "web" rollout to finish: 0 of 2 updated replicas are available...
+Waiting for deployment "web" rollout to finish: 1 of 2 updated replicas are available...
+deployment "web" successfully rolled out
+```
+
+</Expected>
+
+Câu hỏi đầu tiên: nếu bật `enforce=restricted` ngay bây giờ, cái gì gãy? `--dry-run=server` gửi yêu cầu đổi nhãn tới API server để nó chạy đủ các bước kiểm, kể cả PSA, rồi không lưu gì:
+
+<Terminal where="mac">
+
+```bash
+kubectl label --dry-run=server --overwrite namespace shop pod-security.kubernetes.io/enforce=restricted 2>&1 | cut -c1-150
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Warning: existing pods in namespace "shop" violate the new PodSecurity enforce level "restricted:latest"
+Warning: web-6fb755dd8f-8nplm (and 1 other pod): allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile
+namespace/shop labeled (server dry run)
+```
+
+</Expected>
+
+API server liệt kê các pod sẽ không tạo lại được nếu nhãn có hiệu lực. Nếu bạn bỏ `--dry-run`, nhãn vẫn được gắn và pod vẫn chạy, nhưng lần rollout hay lần drain kế tiếp sẽ để lại một Deployment `0/2`. Với nhiều namespace, chạy lệnh này trên cả cụm (`kubectl label --dry-run=server --overwrite ns --all …`) là cách kiểm kê trước khi đổi mặc định của cụm.
+
+Sửa Deployment cho đạt `restricted`. Image `agnhost` chạy bằng root theo mặc định, nên ngoài bốn trường quen thuộc còn phải chọn một UID khác 0:
+
+<Terminal where="mac">
+
+```bash
+OLD=$(kubectl -n shop get replicaset -l app=web -o jsonpath='{.items[0].metadata.labels.pod-template-hash}')
+kubectl -n shop patch deployment web --type=strategic -p '{"spec":{"template":{"spec":{
+  "securityContext":{"runAsNonRoot":true,"runAsUser":65534,"seccompProfile":{"type":"RuntimeDefault"}},
+  "containers":[{"name":"agnhost","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+kubectl -n shop rollout status deployment/web --timeout=120s | tail -1
+kubectl -n shop wait --for=delete pod -l pod-template-hash=$OLD --timeout=90s > /dev/null
+kubectl label --dry-run=server --overwrite namespace shop pod-security.kubernetes.io/enforce=restricted
+kubectl label --overwrite namespace shop pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=v1.37
+kubectl -n shop rollout restart deployment/web && kubectl -n shop rollout status deployment/web --timeout=120s | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web patched
+deployment "web" successfully rolled out
+namespace/shop labeled (server dry run)
+namespace/shop labeled
+deployment.apps/web restarted
+deployment "web" successfully rolled out
+```
+
+</Expected>
+
+`rollout status` báo xong khi pod mới sẵn sàng, nhưng pod cũ có thể còn vài giây tới nửa phút để tắt êm (K1.3), và PSA vẫn đếm chúng là pod đang có; vì vậy khối lệnh chờ pod của ReplicaSet cũ (`pod-template-hash` cũ) biến mất rồi mới dry-run lần hai. Lần dry-run đó không còn dòng `Warning` nào: an toàn để bật thật. `rollout restart` ở cuối là phép thử: pod mới được tạo dưới `enforce=restricted` và lên bình thường. Trình tự này dùng được cho mọi lần siết: bật `warn`/`audit` ở mức mới (mặc định của cụm đã làm sẵn), dry-run để kiểm kê, sửa ứng dụng, dry-run lại, rồi mới bật `enforce`.
+
+<Check id="k8.1.lab-siet-dan">Dùng được `kubectl label --dry-run=server` để biết pod nào sẽ vi phạm trước khi đổi nhãn, sửa được Deployment cho đạt `restricted`, và kiểm lại bằng một lần rollout.</Check>
+
+### 5. Phiên bản chính sách thay đổi kết quả
+
+`baseline` từ v1.34 cấm trường `host` trong probe: một probe trỏ `host` ra ngoài pod có thể bị dùng để kubelet gọi tới địa chỉ tuỳ ý thay cho kẻ tấn công. Pod dưới đây có probe như vậy. Namespace `legacy` ghim `enforce-version: v1.33`, còn mức thì lấy mặc định của cụm (`baseline`):
+
+<Terminal where="mac" title="~/masteva-k8/k8-1/probe-host.yaml">
+
+```bash
+kubectl create namespace legacy
+kubectl label namespace legacy pod-security.kubernetes.io/enforce-version=v1.33
+cat > probe-host.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe-host
+spec:
+  containers:
+    - name: app
+      image: registry.k8s.io/e2e-test-images/agnhost:2.66.1
+      args: ["netexec", "--http-port=8080"]
+      readinessProbe:
+        httpGet: { host: 127.0.0.1, path: /healthz, port: 8080 }
+EOF
+kubectl -n legacy apply -f probe-host.yaml 2>&1 | grep -v '^Warning'
+kubectl label --overwrite namespace legacy pod-security.kubernetes.io/enforce-version=latest
+kubectl -n legacy delete pod probe-host --wait=true
+kubectl -n legacy apply -f probe-host.yaml 2>&1 | grep -v '^Warning: would violate'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/legacy created
+namespace/legacy labeled
+pod/probe-host created
+Warning: existing pods in namespace "legacy" violate the new PodSecurity enforce level "baseline:latest"
+Warning: probe-host: probe or lifecycle host
+namespace/legacy labeled
+pod "probe-host" deleted from legacy namespace
+Error from server (Forbidden): error when creating "probe-host.yaml": pods "probe-host" is forbidden: violates PodSecurity "baseline:latest": probe or lifecycle host (container "app" uses probe or lifecycle host "127.0.0.1")
+```
+
+</Expected>
+
+Cùng một pod, cùng mức `baseline`: được nhận theo luật v1.33, bị từ chối theo luật hiện hành. Đó chính là điều xảy ra khi bạn để `latest` rồi nâng cụm từ 1.33 lên 1.34: không ai đổi gì, mà pod tạo lại sau nâng cấp không lên. Dòng thứ tư là cách API server báo trước khi bạn dời phiên bản.
+
+Mỗi lần PSA đánh giá, API server đếm vào một metric. Đây là chỗ đặt cảnh báo trên Prometheus (D12.2) khi cả cụm đang ở giai đoạn `warn`/`audit`:
+
+<Terminal where="mac">
+
+```bash
+kubectl get --raw /metrics | grep '^pod_security_evaluations_total' | grep 'decision="deny"' | grep 'resource="pod"' | sed 's/,request_operation=.*}/}/'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod_security_evaluations_total{decision="deny",mode="audit",policy_level="restricted",policy_version="latest"} 22
+pod_security_evaluations_total{decision="deny",mode="enforce",policy_level="baseline",policy_version="latest"} 2
+pod_security_evaluations_total{decision="deny",mode="enforce",policy_level="restricted",policy_version="v1.37"} 16
+pod_security_evaluations_total{decision="deny",mode="warn",policy_level="restricted",policy_version="latest"} 3
+```
+
+</Expected>
+
+Con số trên máy bạn sẽ khác tuỳ số lần thử: ReplicaSet ở bước 3 thử lại nhiều lần, mỗi lần một lượt `enforce` bị từ chối. Lệnh lọc giữ các dòng về pod (`resource="pod"`); metric còn có dòng `resource="controller"` cho Deployment, chỉ ở chế độ `warn` và `audit`. Dòng `mode="enforce"` là số lần tạo pod đã bị chặn thật; dòng `mode="audit"` là số lần sẽ bị chặn nếu cả cụm lên `restricted`.
+
+<Check id="k8.1.lab-phien-ban">Chứng minh được cùng một pod được nhận hay bị từ chối tuỳ phiên bản chính sách, và đọc được metric `pod_security_evaluations_total` theo chế độ và quyết định.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `kind create cluster` lỗi, API server không lên | File `admission.yaml` sai cú pháp hoặc sai đường dẫn: API server thoát ngay lúc khởi động | `docker exec k8-lab-control-plane crictl ps -a --name kube-apiserver` rồi `crictl logs` container đã thoát (K4.7) |
+| Pod ở `dev` vẫn tạo được dù `privileged` | Cờ `--admission-control-config-file` không vào manifest; hoặc namespace có nhãn `enforce=privileged` | Lệnh `grep` ở bước 1; `kubectl get ns dev --show-labels` |
+| Deployment `0/N`, không có pod | PSA (hoặc quota, policy) từ chối pod | `kubectl events --for replicaset/<tên>` |
+| Không thấy dòng `Warning` nào | Namespace có nhãn `warn=privileged`, hoặc công cụ triển khai nuốt cảnh báo | `kubectl get ns <ns> --show-labels`; chạy lại bằng `kubectl apply` trên terminal |
+| Pod hệ thống (CNI, agent) không lên sau khi đổi mặc định | Namespace của nó không được miễn trừ và không có nhãn `privileged` | Gắn `enforce=privileged` cho đúng namespace đó, không hạ mặc định của cả cụm |
+
+### Dọn dẹp
+
+K8.2 dùng tiếp cụm này. Xoá các namespace của bài:
+
+<Callout kind="danger">
+
+Xoá namespace xoá mọi thứ bên trong. Kiểm `kubectl config current-context` ra `kind-k8-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl delete namespace dev ops pay shop legacy --wait=false
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k8-lab
+namespace "dev" deleted
+namespace "ops" deleted
+namespace "pay" deleted
+namespace "shop" deleted
+namespace "legacy" deleted
+```
+
+</Expected>
+
+Nếu dừng hẳn ở đây, xoá cụm bằng `kind delete cluster --name k8-lab`; K8.2 có lệnh tạo lại từ `kind.yaml` của bài này.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao PSA không sửa pod cho đạt chuẩn mà chỉ từ chối?">
+
+PSA là validating admission: nó chỉ trả "được" hoặc "không". Thiết kế này có chủ ý: PodSecurityPolicy, thứ PSA thay thế, vừa kiểm vừa tự điền giá trị mặc định, và việc pod nhận policy nào phụ thuộc quyền của người tạo pod lẫn thứ tự tên policy, khó đoán tới mức dự án quyết định bỏ hẳn. Muốn tự điền `seccompProfile: RuntimeDefault` hay `runAsNonRoot` cho pod quên khai, dùng một mutating policy (MutatingAdmissionPolicy hoặc Kyverno, K8.3) chạy trước PSA; nhưng cách bền hơn là sửa template gốc (Helm chart, K3.2), vì giá trị điền lén không ai thấy khi đọc manifest.
+
+</Reveal>
+
+<Reveal title="Có cần PSA khi đã có Kyverno hay ValidatingAdmissionPolicy?">
+
+Vẫn nên giữ PSA làm nền. Nó có sẵn, không có pod nào để chết, không có webhook nào làm chậm hay chặn API server, và bộ luật được dự án Kubernetes duy trì theo từng phiên bản. Policy tự viết (K8.3) dùng cho phần PSA không nói được: image phải từ registry nào, nhãn bắt buộc, ngoại lệ chi tiết theo từng workload (PSA chỉ miễn trừ theo namespace, người dùng, RuntimeClass). Kyverno có bộ policy viết lại PSS, hữu ích khi cần ngoại lệ từng pod, đổi lại là thêm một thành phần phải vận hành.
+
+</Reveal>
+
+<Reveal title="Namespace `ops` ở mức `privileged` có phải lỗ hổng không?">
+
+Có, nếu quyền tạo pod trong đó rộng. PSA không biết ai đáng tin; nó tin nhãn của namespace. Hai lớp đi kèm: RBAC chỉ cho đúng ServiceAccount của thành phần hạ tầng tạo pod ở đó (K2.3), và quyền **sửa nhãn namespace** phải hẹp, vì ai gắn được `enforce=privileged` lên namespace của mình là tự gỡ được PSA. Quyền `patch` trên `namespaces` thường nằm sẵn trong role `admin` của nhiều công cụ; K8.3 viết policy cấm đổi nhãn `pod-security.kubernetes.io/*` trừ nhóm vận hành.
+
+</Reveal>
+
+<Reveal title="`warn` hiện cho người chạy kubectl. Pipeline GitOps có thấy không?">
+
+Thường là không. Argo CD và Flux (D13) apply bằng API, cảnh báo chỉ nằm trong log của controller. Vì vậy `audit` quan trọng hơn `warn` ở quy mô lớn: vi phạm được ghi vào audit log của API server cùng với ai tạo, lúc nào (K8.5 đọc chúng bằng `jq`). Cách bổ sung là kiểm ngay trong CI: chạy `kubectl apply --dry-run=server --warnings-as-errors` với manifest đã render, để pull request vi phạm bị chặn trước khi tới cụm.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết `securityContext` đạt `restricted` khá tốt, và hay sai ở chỗ khác: gặp lỗi PSA thì khuyên gắn `enforce=privileged` cho namespace, tức là gỡ bảo vệ; quên `runAsUser` khác 0 cho image chạy root nên pod `CreateContainerConfigError` (`runAsNonRoot` mà image là root); dùng nhãn cũ của PodSecurityPolicy hay annotation `seccomp.security.alpha.kubernetes.io`; viết `AdmissionConfiguration` với `apiVersion` `v1beta1`. Kiểm bằng lab: `kubectl label --dry-run=server` cho namespace, `kubectl apply --dry-run=server` cho manifest, và một lần rollout thật.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.4 dạy từng trường của `securityContext` mà PSA kiểm; K2.3 dạy RBAC, lớp quyết định ai được tạo pod và sửa nhãn namespace. K4.1 giải thích static pod và cấu hình API server mà bước 1 sửa; K4.7 cách đọc log khi API server không lên. K5.5 đặt PSA trong bức tranh multi-tenancy. K8.2 đi sâu seccomp và AppArmor, hai trường PSA chỉ kiểm có hay không; K8.3 viết policy cho phần PSA không phủ; K8.5 đọc chú thích `audit` của PSA trong audit log. D15 nối PSA vào quy trình tuân thủ của tổ chức.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k8.1.mastery-thiet-ke">Thiết kế được nhãn PSA cho các namespace của một cụm dùng chung (hạ tầng, ứng dụng, đội ít được tin) cùng mặc định của cụm và danh sách ngoại lệ, có lý do cho từng lựa chọn.</Check>
+
+<Check id="k8.1.mastery-siet">Lên được kế hoạch đưa một cụm đang chạy từ mặc định `privileged` lên `baseline` rồi `restricted`: kiểm kê bằng dry-run, sửa workload, bật từng chế độ, và theo dõi bằng metric.</Check>
+
+<Check id="k8.1.mastery-chan-doan">Khi một Deployment đứng ở `0/N` sau khi nâng cấp cụm, chỉ ra được trong vài phút đó có phải do PSA và do phiên bản chính sách hay không.</Check>
+
+</Mastery>

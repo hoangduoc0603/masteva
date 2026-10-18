@@ -1,0 +1,908 @@
+---
+title: "Controller và vòng reconcile: tự viết bằng controller-runtime"
+description: Bên trong một controller có gì (informer, cache, workqueue, rate limit), vì sao reconcile phải idempotent và không quan tâm sự kiện nào gọi nó, owner reference và garbage collection, generation và observedGeneration, conflict khi ghi, server-side apply và leader election. Lab viết bằng Go một controller cho CRD WebApp của K9.1 rồi làm hỏng nó theo đủ cách.
+id: k9.2
+step: k9
+prerequisites: [k9.1, k2.3]
+topics: [k9.controller]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    go: 1.27.1
+    controller-runtime: 0.25.2
+    client-go: 0.37.1
+    podinfo: 6.15.0
+---
+
+<Goal>
+
+K1.1 mô tả controller từ phía người dùng: một vòng lặp so `spec` với thực tế rồi sửa độ lệch. Bài này mở nó ra và tự viết một cái, cho `WebApp` của K9.1. Học xong, bạn giải thích được:
+
+- Vì sao hàm `Reconcile` chỉ nhận một cái tên, không được biết "chuyện gì vừa xảy ra", và vì sao đó là ưu điểm.
+- Vì sao 30 lần sửa liên tiếp có lúc gây 30 lần reconcile, có lúc chỉ 2.
+- Vì sao xoá `WebApp` thì Deployment con biến mất dù controller không có dòng code xoá nào.
+- Vì sao `status` có thể nói `Available=True` về một `spec` đã cũ, và `observedGeneration` chữa chuyện đó ra sao.
+- Vì sao một operator chứng chỉ phổ biến từng gửi tới Let's Encrypt lượng request gấp hàng trăm nghìn lần bình thường, nhất là khi nhiều bản cùng chạy, và Let's Encrypt phải chặn các bản cũ.
+
+</Goal>
+
+<Knowledge>
+
+### Level-triggered, không phải edge-triggered
+
+K1.1 đã nêu lý do controller so trạng thái thay vì xử lý từng sự kiện. Gọi đúng tên:
+
+| | Edge-triggered (theo cạnh) | Level-triggered (theo mức) |
+|---|---|---|
+| Phản ứng với | Sự kiện: "Deployment X vừa bị xoá" | Trạng thái: "WebApp X muốn có Deployment, hiện không có" |
+| Mất một sự kiện | Lệch vĩnh viễn, không ai biết | Lần reconcile kế tiếp vẫn thấy độ lệch |
+| Controller khởi động lại | Phải tự nhớ đã xử lý tới đâu | Đọc lại toàn bộ, tính lại từ đầu |
+| Nhiều sự kiện dồn | Phải xử lý từng cái theo thứ tự | Gộp thành một lần: chỉ trạng thái cuối có nghĩa |
+
+Trong controller-runtime (thư viện mà Kubebuilder, Operator SDK và phần lớn operator viết bằng Go dùng), hợp đồng này nằm ngay trong chữ ký hàm:
+
+```go
+func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error)
+// req chỉ có Namespace và Name. Không có "loại sự kiện", không có "object cũ".
+```
+
+Sự kiện chỉ là tín hiệu "nên nhìn lại object này". Reconcile phải tự đọc trạng thái hiện tại rồi quyết định.
+
+### Bên trong một controller
+
+```text
+ API server
+   |  LIST một lần, rồi WATCH (luồng sự kiện)
+   v
+ informer -----------------> cache (bản sao object trong RAM của controller)
+   |  sự kiện thêm/sửa/xoá          ^
+   v                                | r.Get(), r.List() đọc ở đây
+ event handler                      |
+   |  WebApp đổi      -> khoá k9/web |
+   |  Deployment đổi  -> khoá của chủ nó (ownerReference) -> k9/web
+   v                                |
+ workqueue  [k9/web, k9/shop]  -- một khoá chỉ nằm trong hàng MỘT lần
+   |  rate limiter: lỗi thì thử lại sau 5ms, 10ms, 20ms ... tối đa 1000 giây
+   v
+ worker (mặc định 1) --> Reconcile(k9/web) --> ghi lên API server (apply, patch status)
+                              |
+                              +-- trả lỗi        -> khoá vào lại hàng, có backoff
+                              +-- RequeueAfter t -> khoá vào lại hàng sau t
+                              +-- xong           -> rời hàng tới sự kiện sau
+```
+
+| Thành phần | Việc | Hệ quả cần biết |
+|---|---|---|
+| Informer | LIST một lần rồi WATCH, giữ cache cập nhật | Controller khởi động lại thì LIST lại toàn bộ: đó là cách nó "bắt kịp" |
+| Cache | Mọi lệnh đọc của controller đi vào đây, không tốn một request tới API server | Cache có thể **trễ** một chút so với API server: vừa ghi xong, đọc lại có thể chưa thấy |
+| Workqueue | Hàng các khoá cần reconcile | Khoá đã nằm trong hàng thì sự kiện mới **không** thêm bản thứ hai: sự kiện dồn được gộp. Một khoá không bao giờ được hai worker xử lý cùng lúc |
+| Rate limiter | Giãn thời gian thử lại khi reconcile lỗi | controller-runtime 0.25 mặc định dùng hàng có ưu tiên (priority queue: khoá đến từ một thay đổi thật được xử lý trước khoá đến từ lần LIST lúc khởi động hay từ resync), backoff riêng từng khoá từ 5 ms tới 1000 giây |
+| Resync | Định kỳ đẩy mọi object trong cache vào hàng | Mặc định 10 giờ. Không thay cho việc đọc lại API server; muốn kiểm định kỳ một hệ thống bên ngoài thì trả `RequeueAfter` |
+
+Cache theo dõi mọi object của loại nó watch, **trong cả cụm**: controller của bài watch Deployment thì giữ trong RAM mọi Deployment của mọi namespace. Trên cụm lớn, đó là lý do một operator vô hại có thể dùng vài GiB RAM; controller-runtime cho lọc cache theo namespace hoặc label.
+
+<Check id="k9.2.co-che">Vẽ lại được đường đi từ một thay đổi trên API server tới lần gọi `Reconcile`, và giải thích được cache, workqueue, rate limiter, resync mỗi thứ làm gì.</Check>
+
+### Reconcile phải idempotent
+
+**Idempotent** (lặp lại không đổi kết quả): gọi `Reconcile(k9/web)` một lần hay mười lần liên tiếp, cụm phải ở cùng trạng thái. Vì Reconcile bị gọi vì đủ lý do: object của nó đổi, object con đổi, controller khởi động lại, resync, lần trước lỗi. Khung chung:
+
+1. Đọc object chính. Không còn thì thôi (con của nó đã có garbage collector lo).
+2. Tính **toàn bộ** trạng thái mong muốn của object con từ `spec`, không tính "phần thay đổi".
+3. Đưa thực tế về trạng thái đó. Cách gọn nhất là **server-side apply**: gửi trạng thái mong muốn, API server tự so và chỉ đổi phần khác.
+4. Ghi `status` từ điều quan sát được.
+
+Những thứ phá idempotent: "nếu chưa có thì tạo" mà không xử lý trường hợp đã có nhưng sai; sinh tên ngẫu nhiên cho object con (mỗi lần gọi tạo thêm một cái); ghi vào `status` một giá trị đổi mỗi lần gọi, như thời điểm hiện tại (K9.3 gặp hậu quả).
+
+### Owner reference và garbage collection
+
+Object con mang `metadata.ownerReferences` trỏ về object chủ (K1.1 đã lần theo chuỗi Pod, ReplicaSet, Deployment). Hai việc dựa vào nó:
+
+- **Garbage collector** của `kube-controller-manager`: chủ biến mất thì con bị xoá. Mặc định là xoá nền (background): chủ đi ngay, con đi sau. `kubectl delete --cascade=foreground` chờ con đi hết rồi mới xoá chủ; `--cascade=orphan` để con lại.
+- **Watch con**: `Owns(&appsv1.Deployment{})` bảo controller-runtime khi một Deployment đổi thì đọc owner reference có `controller: true` của nó và đưa **khoá của chủ** vào hàng. Nhờ đó ai xoá hay sửa Deployment con, `WebApp` chủ được reconcile lại.
+
+Owner reference không vượt namespace: con trong namespace `a` không thể có chủ ở namespace `b`, và object trong namespace không làm chủ được object toàn cụm. Tài nguyên ngoài cụm (bản ghi DNS, bucket) càng không. Những trường hợp đó cần **finalizer** (K9.1): controller tự dọn rồi mới gỡ finalizer.
+
+### generation, observedGeneration, conditions
+
+K9.1 cho thấy `metadata.generation` chỉ tăng khi `spec` đổi. Controller ghi lại `generation` nó vừa xử lý vào `status.observedGeneration`:
+
+```text
+ generation=2, observedGeneration=1, Available=True  -> status đang nói về spec CŨ; chưa biết spec mới ra sao
+ generation=2, observedGeneration=2, Available=False -> controller đã thấy spec mới, đang triển khai
+ generation=2, observedGeneration=2, Available=True  -> spec mới đã chạy xong
+```
+
+Công cụ chờ (pipeline, `kubectl wait`, GitOps ở D13) phải xét cả hai: chỉ chờ `Available=True` là có thể thoát ngay vì condition còn sót từ bản trước.
+
+**Conditions** là danh sách theo quy ước API của Kubernetes: mỗi phần tử có `type` (`Available`, `Progressing`, `Degraded`…), `status` (`True`, `False`, `Unknown`), `reason` (một từ CamelCase cho máy đọc), `message` (cho người đọc), `lastTransitionTime` (chỉ đổi khi `status` đổi), và có thể có `observedGeneration` riêng.
+
+<Check id="k9.2.idempotent-owner">Giải thích được vì sao reconcile phải idempotent và kể được hai cách phá nó, owner reference giúp garbage collection và watch con thế nào, và vì sao phải xét `observedGeneration` cùng với condition.</Check>
+
+### Ghi thế nào cho không giẫm lên nhau
+
+Mỗi object có `metadata.resourceVersion`, đổi sau mỗi lần ghi. Ba cách ghi khác nhau ở chỗ có dùng nó không:
+
+| Cách | Gửi gì | Khi object đã bị người khác sửa |
+|---|---|---|
+| Update (đọc rồi ghi đè cả object) | Toàn bộ object kèm `resourceVersion` đã đọc | API server từ chối: `the object has been modified` (conflict). Nếu bạn đọc từ cache đã trễ, gặp lỗi này thường xuyên |
+| Patch (merge, JSON patch) | Chỉ phần muốn đổi | Ghi đè trường đó, không kiểm phiên bản (trừ khi bạn kèm `resourceVersion`) |
+| Server-side apply (K3.1) | Trạng thái mong muốn của **những trường mình quản lý**, kèm tên field manager | Không cần `resourceVersion`. Trường của người khác không bị đụng; giành trường người khác đang giữ thì báo conflict, trừ khi dùng `ForceOwnership` |
+
+Controller trong lab dùng apply với field manager `webapp-controller` và `ForceOwnership`: những trường nó khai (replicas, image, selector…) luôn bị kéo về, còn annotation hay label ai đó thêm tay thì được giữ. Đó là hành vi đúng cho một controller: giành lại thứ thuộc về mình, không xoá thứ của người khác. Lỗi conflict khi dùng Update không phải sự cố: trả lỗi, để workqueue thử lại với dữ liệu mới.
+
+### Leader election
+
+Chạy hai bản controller cho sẵn sàng cao thì hai bản cùng reconcile cùng object. Với controller idempotent và cùng phiên bản, kết quả không sai nhưng tốn gấp đôi; với hai **phiên bản khác nhau** (đang nâng cấp dở, hay ai đó cài thêm một bản), hai bên sửa qua sửa lại cùng một object không dứt. **Leader election** chỉ cho một bản làm việc, dùng object `Lease` như `kube-controller-manager` (K1.1):
+
+| Tham số (controller-runtime) | Mặc định | Ý nghĩa |
+|---|---|---|
+| `LeaseDuration` | 15 giây | Bản dự phòng chờ chừng này kể từ lần gia hạn cuối rồi mới được giành lease |
+| `RenewDeadline` | 10 giây | Bản đang giữ không gia hạn được trong khoảng này thì tự dừng |
+| `RetryPeriod` | 2 giây | Nhịp thử giành hoặc gia hạn |
+| `LeaderElectionReleaseOnCancel` | `false` | `true`: khi được tắt êm, nhả lease ngay thay vì để nó tự hết hạn |
+
+Leader election không phải khoá tuyệt đối: một bản bị treo (GC dài, mất mạng) có thể chưa kịp biết mình đã mất lease. Controller vì thế vẫn phải chịu được việc thỉnh thoảng có hai bản cùng ghi, tức là quay lại yêu cầu idempotent.
+
+<Callout kind="production">
+
+Ngày 01/08/2019, Jacob Hoffman-Andrews (Let's Encrypt) mở [issue #1948 trên kho cert-manager](https://github.com/cert-manager/cert-manager/issues/1948): cert-manager 0.8.0 và 0.8.1 sinh lưu lượng quá mức tới Let's Encrypt trong một số tình huống. Hai kiểu trong log của họ: cùng một chứng chỉ bị xin đi xin lại, và tạo hay tra cứu tài khoản lặp lại. Họ coi hơn khoảng 10 request mỗi ngày ở trạng thái ổn định là quá mức, và ghi nhận nhiều người dùng bị ảnh hưởng có nhiều tài khoản, đôi khi chạy nhiều bản cert-manager độc lập trên cùng một IP. Trước đó ba ngày (29/07/2019), [Let's Encrypt đã thông báo](https://community.letsencrypt.org/t/blocking-old-cert-manager-versions/98753) sẽ chặn mọi lưu lượng từ cert-manager dưới 0.8.0, bắt đầu từ ngày 01/11, vì các bản này có lúc rơi vào kiểu gửi lưu lượng quá mức liên tục.
+
+Người dùng góp số liệu vào issue: một bản 0.9.0 gọi API ACME 1.641 lần trong khoảng bảy giờ cho một tên miền họ không sở hữu, và người đó nhận xét cert-manager không có cơ chế backoff cho chứng chỉ cấu hình sai; một người khác thấy sự kiện `CertIssued` lặp 1.662.301 lần trong bốn ngày, và nghi (chính họ ghi là chưa chắc) hai Ingress đang tranh nhau cùng một Secret TLS. Theo Hoffman-Andrews, cài hai bản cert-manager có thể làm số request tăng 100.000 tới 1.000.000 lần so với một bản.
+
+Người bảo trì nêu ba thay đổi họ tin sẽ giải quyết dứt điểm: chuyển CRD sang dùng subresource `status` (bản 0.11), để bản cũ còn chạy không giẫm lên bản mới; làm một số trường của `Order` bất biến, để API server từ chối thay đổi và controller nhận lỗi rồi lùi dần thay vì gọi ACME liên tục; và sửa leader election để nhiều bản không còn "đánh nhau". Issue đóng ngày 27/01/2020.
+
+Điều bài này rút ra (của bài): mỗi lần reconcile của một operator có thể là một lời gọi tới hệ thống bên ngoài, và hệ thống đó không có workqueue gộp sự kiện giúp bạn. Hai thứ lab dưới cho bạn thấy (subresource `status`, leader election), cùng backoff khi lỗi mà sơ đồ ở trên mô tả, là ba thứ đã thiếu ở đây.
+
+</Callout>
+
+<Check id="k9.2.ghi-va-leader">So sánh được Update, Patch và server-side apply khi object bị người khác sửa, và giải thích được leader election chặn điều gì, các tham số mặc định, và vì sao nó không thay được idempotent.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Controllers | Kubernetes](https://kubernetes.io/docs/concepts/architecture/controller/): mô hình vòng điều khiển, đọc lại sau bài để thấy từng câu ứng với phần nào của code.
+- [Garbage Collection | Kubernetes](https://kubernetes.io/docs/concepts/architecture/garbage-collection/): owner reference, cascading deletion kiểu background, foreground, orphan.
+- [API Conventions (Kubernetes community)](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md): mục "Typical status properties" về conditions và `observedGeneration`, và mục về concurrency với `resourceVersion`.
+- [controller-runtime/FAQ.md](https://github.com/kubernetes-sigs/controller-runtime/blob/main/FAQ.md): vì sao Reconcile không nhận sự kiện, cache trễ, nhiều controller cho một loại.
+- [cert-manager issue #1948](https://github.com/cert-manager/cert-manager/issues/1948): nguồn của callout, đọc cả chuỗi bình luận.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k9-lab` và CRD `WebApp` phiên bản `v1` từ cuối K9.1 (file `~/masteva-k9/webapp-crd.yaml`). Nếu đã dọn K9.1 hoặc dựng lại cụm, xem khối khôi phục ngay dưới khối biến môi trường. Cần Go từ 1.26 (`go version`); controller-runtime 0.25 đòi tối thiểu bản này. Trong bài này, controller chạy **trên máy bạn** (không đóng image) và nói chuyện với cụm qua kubeconfig; K9.4 mới đưa nó vào cụm.
+
+**Profile máy.** Ứng dụng là podinfo (tối đa 3 pod); node kind lên khoảng 0,8 tới 1 GiB. Lần build đầu tải khoảng 200 MB module Go và cần 1 tới 3 phút; thư mục cache Go chiếm khoảng 1,5 GB đĩa của máy sau bài này và khoảng 2,5 GB ở cuối chặng. Máy 8 GB làm được.
+
+Bạn sẽ để module và cache Go trong thư mục lab, để lệnh dọn cuối chặng xoá sạch. **Mọi terminal dùng cho bài cần khối biến môi trường dưới**; bài gọi các terminal là Terminal 1 (lệnh `kubectl`) và Terminal 2 (chạy controller).
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k9/kubeconfig
+export GOPATH=~/masteva-k9/go GOMODCACHE=~/masteva-k9/go/pkg/mod GOCACHE=~/masteva-k9/go/cache
+mkdir -p ~/masteva-k9/k9-2/webapp-controller && cd ~/masteva-k9/k9-2/webapp-controller
+kubectl config current-context
+kubectl get crd webapps.apps.masteva.example -o jsonpath='{.spec.versions[*].name}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k9-lab
+v1
+```
+
+</Expected>
+
+Khối khôi phục, **chỉ dùng** khi cụm hay thư mục K9.1 đã bị dọn: chạy khối đầu tiên của K9.1 (tạo cụm), rồi khối ghi CRD ở bước 1 của K9.1 (nó tạo `webapp-crd.yaml` và cài CRD bản `v1alpha1`), rồi khối dưới. Khối dưới xoá CRD `v1alpha1` vừa cài (cụm mới nên chưa có object nào) và cài CRD cuối cùng của K9.1, chỉ có phiên bản `v1`. Nếu bạn đi thẳng từ K9.1 sang, bỏ qua khối này.
+
+<Callout kind="danger">
+
+Khối khôi phục xoá CRD `webapps.apps.masteva.example` cùng mọi `WebApp` đang có. Chỉ chạy trên `kind-k9-lab` vừa dựng lại.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl delete crd webapps.apps.masteva.example
+yq '.spec.versions[0].name = "v1"' ~/masteva-k9/k9-1/webapp-crd.yaml > ~/masteva-k9/webapp-crd.yaml
+kubectl apply -f ~/masteva-k9/webapp-crd.yaml
+kubectl get crd webapps.apps.masteva.example -o jsonpath='{.spec.versions[*].name} {.status.storedVersions}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+customresourcedefinition.apiextensions.k8s.io "webapps.apps.masteva.example" deleted
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example created
+v1 ["v1"]
+```
+
+</Expected>
+
+### 1. Viết controller
+
+Một file `main.go` khoảng 140 dòng. `WebApp` chưa có kiểu Go (K9.3 sẽ sinh), nên controller đọc nó dưới dạng `unstructured`: một map chung, lấy trường bằng `NestedString`. Phần còn lại dùng kiểu có sẵn của client-go. Đọc kỹ ba khối trong `Reconcile` theo đúng khung ở phần Kiến thức; cờ `--slow` dùng ở bước 5 để làm mỗi lần Reconcile chậm đi.
+
+Khối dưới ghi `main.go`, tạo module Go, tải controller-runtime và client-go, rồi build và chạy `go vet`. Lần đầu mất 1 tới 3 phút để tải module; các lệnh tải chạy im lặng, nên điều cần thấy là hai dòng cuối: kích thước binary và phiên bản hai thư viện.
+
+<Terminal where="mac" title="~/masteva-k9/k9-2/webapp-controller/main.go">
+
+```bash
+cat > main.go <<'EOF'
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+)
+
+var webAppGVK = schema.GroupVersionKind{Group: "apps.masteva.example", Version: "v1", Kind: "WebApp"}
+
+const fieldOwner = client.FieldOwner("webapp-controller")
+
+type reconciler struct {
+	client.Client
+	slow  time.Duration
+	count atomic.Int64
+}
+
+func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	n := r.count.Add(1)
+
+	// 1. Đọc trạng thái mong muốn (từ cache của informer, không gọi API server).
+	app := &unstructured.Unstructured{}
+	app.SetGroupVersionKind(webAppGVK)
+	if err := r.Get(ctx, req.NamespacedName, app); err != nil {
+		// WebApp đã bị xoá: Deployment và Service có ownerReference, garbage collector lo.
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	time.Sleep(r.slow) // bước 5 của bài: giả lập một reconcile chậm
+
+	image, _, _ := unstructured.NestedString(app.Object, "spec", "image")
+	replicas, _, _ := unstructured.NestedInt64(app.Object, "spec", "replicas")
+	port, _, _ := unstructured.NestedInt64(app.Object, "spec", "port")
+	message, _, _ := unstructured.NestedString(app.Object, "spec", "message")
+
+	// 2. Dựng TOÀN BỘ trạng thái mong muốn của object con rồi server-side apply.
+	//    Chạy bao nhiêu lần cũng ra cùng kết quả: reconcile idempotent.
+	lbl := map[string]string{"app.kubernetes.io/name": app.GetName(), "app.kubernetes.io/managed-by": "webapp-controller"}
+	owner := metav1ac.OwnerReference().
+		WithAPIVersion(webAppGVK.GroupVersion().String()).WithKind(webAppGVK.Kind).
+		WithName(app.GetName()).WithUID(app.GetUID()).
+		WithController(true).WithBlockOwnerDeletion(true)
+
+	deploy := appsv1ac.Deployment(app.GetName(), app.GetNamespace()).
+		WithLabels(lbl).WithOwnerReferences(owner).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(int32(replicas)).
+			WithSelector(metav1ac.LabelSelector().WithMatchLabels(lbl)).
+			WithTemplate(corev1ac.PodTemplateSpec().WithLabels(lbl).
+				WithSpec(corev1ac.PodSpec().WithContainers(corev1ac.Container().
+					WithName("app").WithImage(image).
+					WithPorts(corev1ac.ContainerPort().WithContainerPort(int32(port))).
+					WithEnv(
+						corev1ac.EnvVar().WithName("PODINFO_PORT").WithValue(strconv.FormatInt(port, 10)),
+						corev1ac.EnvVar().WithName("PODINFO_UI_MESSAGE").WithValue(message)).
+					WithReadinessProbe(corev1ac.Probe().WithHTTPGet(
+						corev1ac.HTTPGetAction().WithPath("/readyz").WithPort(intstr.FromInt32(int32(port)))))))))
+	if err := r.Apply(ctx, deploy, fieldOwner, client.ForceOwnership); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	svc := corev1ac.Service(app.GetName(), app.GetNamespace()).
+		WithLabels(lbl).WithOwnerReferences(owner).
+		WithSpec(corev1ac.ServiceSpec().WithSelector(lbl).
+			WithPorts(corev1ac.ServicePort().WithPort(80).WithTargetPort(intstr.FromInt32(int32(port)))))
+	if err := r.Apply(ctx, svc, fieldOwner, client.ForceOwnership); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 3. Ghi status: điều controller quan sát được, qua subresource status.
+	current := &appsv1.Deployment{}
+	if err := r.Get(ctx, req.NamespacedName, current); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	cond := map[string]any{"type": "Available", "status": "False", "reason": "Progressing",
+		"message": strconv.Itoa(int(current.Status.ReadyReplicas)) + "/" + strconv.Itoa(int(replicas)) + " pod sẵn sàng"}
+	if int64(current.Status.ReadyReplicas) == replicas && current.Status.UpdatedReplicas == current.Status.Replicas {
+		cond["status"], cond["reason"] = "True", "AllReplicasReady"
+	}
+	status := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": webAppGVK.GroupVersion().String(), "kind": webAppGVK.Kind,
+		"metadata": map[string]any{"name": app.GetName(), "namespace": app.GetNamespace()},
+		"status": map[string]any{
+			"replicas":           int64(current.Status.Replicas),
+			"readyReplicas":      int64(current.Status.ReadyReplicas),
+			"selector":           labels.SelectorFromSet(lbl).String(),
+			"observedGeneration": app.GetGeneration(),
+			"conditions":         []any{cond},
+		},
+	}}
+	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(status), fieldOwner, client.ForceOwnership); err != nil {
+		return ctrl.Result{}, err
+	}
+	fmt.Printf("reconcile #%d %s generation=%d ready=%d/%d\n", n, req.NamespacedName, app.GetGeneration(), current.Status.ReadyReplicas, replicas)
+	return ctrl.Result{}, nil
+}
+
+func main() {
+	slow := flag.Duration("slow", 0, "ngủ thêm trong mỗi lần reconcile (bước 5)")
+	metricsAddr := flag.String("metrics-addr", "127.0.0.1:9740", "địa chỉ trang metrics")
+	leaderElect := flag.Bool("leader-elect", false, "bật leader election")
+	flag.Parse()
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Metrics:                       metricsserver.Options{BindAddress: *metricsAddr},
+		HealthProbeBindAddress:        "0",
+		LeaderElection:                *leaderElect,
+		LeaderElectionID:              "webapp-controller",
+		LeaderElectionNamespace:       "k9",
+		LeaderElectionReleaseOnCancel: true,
+	})
+	if err != nil {
+		ctrl.Log.Error(err, "không tạo được manager")
+		os.Exit(1)
+	}
+
+	app := &unstructured.Unstructured{}
+	app.SetGroupVersionKind(webAppGVK)
+	err = ctrl.NewControllerManagedBy(mgr).
+		Named("webapp").
+		For(app).                   // WebApp đổi -> reconcile WebApp đó
+		Owns(&appsv1.Deployment{}). // Deployment con đổi -> reconcile WebApp chủ
+		Owns(&corev1.Service{}).
+		Complete(&reconciler{Client: mgr.GetClient(), slow: *slow})
+	if err != nil {
+		ctrl.Log.Error(err, "không tạo được controller")
+		os.Exit(1)
+	}
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		ctrl.Log.Error(err, "manager dừng vì lỗi")
+		os.Exit(1)
+	}
+}
+EOF
+go mod init example.com/webapp-controller > /dev/null 2>&1
+go get sigs.k8s.io/controller-runtime@v0.25.2 k8s.io/client-go@v0.37.1 k8s.io/api@v0.37.1 k8s.io/apimachinery@v0.37.1 > /dev/null 2>&1
+go mod tidy > /dev/null 2>&1
+go build -o webapp-controller . && go vet . && ls -lh webapp-controller | awk '{print $5, $NF}'
+grep -E 'controller-runtime|client-go' go.mod
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+43M webapp-controller
+	k8s.io/client-go v0.37.1
+	sigs.k8s.io/controller-runtime v0.25.2
+```
+
+</Expected>
+
+Vài chỗ trong code:
+
+- `For(app)` và hai `Owns` là toàn bộ phần "lắng nghe". Không có dòng nào xử lý riêng sự kiện xoá hay sửa.
+- Mọi object con mang owner reference `controller: true` trỏ về `WebApp`, bằng UID của nó.
+- `r.Apply(..., fieldOwner, client.ForceOwnership)` là server-side apply với field manager `webapp-controller`.
+- Status ghi qua `r.Status().Apply`, tức subresource `status` của K9.1, kèm `observedGeneration`.
+- Cổng metrics `127.0.0.1:9740` in số liệu của controller-runtime theo chuẩn Prometheus (D12.2), bước 5 dùng.
+- podinfo đọc cổng và lời chào từ biến môi trường `PODINFO_PORT`, `PODINFO_UI_MESSAGE`; với image khác, đây là chỗ đổi.
+
+### 2. Chạy controller và tạo một WebApp
+
+**Terminal 2** (đặt khối biến môi trường ở phần Chuẩn bị trước): chạy controller và để nó ở đó. Log của controller-runtime in kèm giờ; dòng `reconcile #…` do chính code của bạn in. Trong kết quả mẫu dưới, dấu `…` thay cho giờ và các trường lặp lại.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k9/k9-2/webapp-controller && ./webapp-controller
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+…	INFO	controller-runtime.metrics	Starting metrics server
+…	INFO	Starting EventSource	{"controller": "webapp", … "source": "kind source: *v1.Deployment"}
+…	INFO	Starting Controller	{"controller": "webapp", "controllerGroup": "apps.masteva.example", "controllerKind": "WebApp"}
+…	INFO	Starting workers	{"controller": "webapp", … "worker count": 1}
+```
+
+</Expected>
+
+**Terminal 1:** tạo `WebApp` hai bản sao.
+
+<Terminal where="mac" title="~/masteva-k9/k9-2/web.yaml">
+
+```bash
+cd ~/masteva-k9/k9-2
+cat > web.yaml <<'EOF'
+apiVersion: apps.masteva.example/v1
+kind: WebApp
+metadata:
+  name: web
+spec:
+  image: ghcr.io/stefanprodan/podinfo:6.15.0
+  replicas: 2
+  message: Xin chào từ K9.2
+EOF
+kubectl apply -f web.yaml
+kubectl wait --for=condition=Available wa/web --timeout=300s
+kubectl get wa,deploy,svc,pods
+kubectl get deploy web -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name} controller={.metadata.ownerReferences[0].controller}{"\n"}'
+kubectl get --raw /api/v1/namespaces/k9/services/web:80/proxy/ | jq -r .message
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/web created
+webapp.apps.masteva.example/web condition met
+NAME                              IMAGE                                 DESIRED   READY   AGE
+webapp.apps.masteva.example/web   ghcr.io/stefanprodan/podinfo:6.15.0   2         2       10s
+
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   2/2     2            2           10s
+
+NAME          TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+service/web   ClusterIP   10.96.92.237   <none>        80/TCP    10s
+
+NAME                       READY   STATUS    RESTARTS   AGE
+pod/web-5d765d5bb6-627gx   1/1     Running   0          10s
+pod/web-5d765d5bb6-cdp46   1/1     Running   0          10s
+WebApp/web controller=true
+Xin chào từ K9.2
+```
+
+</Expected>
+
+Lệnh cuối gọi Service qua proxy của API server, không cần port-forward: lời chào trong `spec.message` đã tới tận ứng dụng. Terminal 2 in khoảng tám dòng `reconcile` (trên máy bạn có thể nhiều hơn hay ít hơn vài dòng): một cho lúc `WebApp` được tạo, rồi thêm mỗi khi Deployment, Service con hay chính status của `WebApp` đổi, trong lúc pod sẵn sàng dần. Lần đầu chạy, node phải kéo image podinfo nên `wait` có thể mất tới một phút.
+
+```text
+reconcile #1 k9/web generation=1 ready=0/2
+reconcile #2 k9/web generation=1 ready=0/2
+…
+reconcile #5 k9/web generation=1 ready=1/2
+…
+reconcile #8 k9/web generation=1 ready=2/2
+```
+
+### 3. Xoá, sửa tay, và sửa thứ không thuộc về controller
+
+Ba thử thách cho controller: xoá Deployment con, sửa tay số bản sao của nó, và thêm một annotation mà controller không quản. In UID trước và sau khi xoá để biết Deployment có thật sự được tạo mới không; lệnh cuối in `managedFields`, danh sách field manager đang sở hữu các trường của Deployment (K3.1).
+
+<Callout kind="danger">
+
+Bước này xoá Deployment `web` đang chạy. Chỉ chạy trên `kind-k9-lab`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl get deploy web -o jsonpath='uid cũ={.metadata.uid}{"\n"}'
+kubectl delete deploy web
+kubectl wait --for=condition=Available deploy/web --timeout=120s
+kubectl get deploy web -o jsonpath='uid mới={.metadata.uid}{"\n"}'
+kubectl scale deploy web --replicas=5
+for i in $(seq 1 20); do [ "$(kubectl get deploy web -o jsonpath='{.spec.replicas}')" = 2 ] && break; sleep 1; done
+kubectl get deploy web -o jsonpath='spec.replicas={.spec.replicas}{"\n"}'
+kubectl annotate deploy web ghi-chu=sua-tay
+kubectl get deploy web -o jsonpath='ghi-chu={.metadata.annotations.ghi-chu}{"\n"}'
+kubectl get deploy web --show-managed-fields -o json | jq -r '.metadata.managedFields[] | "\(.manager) \(.operation) \(.subresource // "")"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+uid cũ=400941c2-0a5d-4760-bdcb-a1d3506d56db
+deployment.apps "web" deleted from k9 namespace
+deployment.apps/web condition met
+uid mới=29f319c9-b0a1-49b7-bdd0-0a2d85328b56
+deployment.apps/web scaled
+spec.replicas=2
+deployment.apps/web annotated
+ghi-chu=sua-tay
+webapp-controller Apply 
+kube-controller-manager Update status
+kubectl-annotate Update 
+```
+
+</Expected>
+
+- Deployment bị xoá được tạo lại (UID mới) gần như ngay, trước cả khi lệnh `wait` kế tiếp chạy: sự kiện xoá đi qua `Owns`, tới khoá `k9/web`, và Reconcile chỉ thấy "thiếu Deployment".
+- `kubectl scale` lên 5 bị kéo về 2. Field manager `kubectl` vừa giành `.spec.replicas`; lần apply kế tiếp với `ForceOwnership` giành lại. Trong `managedFields` không còn dòng nào của `kubectl scale`.
+- Annotation thêm tay **còn nguyên**: controller không khai trường đó, nên apply không đụng tới. Với cách "đọc rồi ghi đè cả object", annotation này đã mất.
+
+<Check id="k9.2.lab-tu-sua">Cho thấy được controller tạo lại object con bị xoá, kéo về trường mình quản lý khi bị sửa tay, và giữ nguyên trường không thuộc về nó; đọc được `managedFields` để giải thích.</Check>
+
+### 4. Tắt controller, đổi mọi thứ, bật lại
+
+Ở Terminal 2, bấm Ctrl+C để dừng controller. Rồi ở Terminal 1, đổi `spec` và xoá luôn Service:
+
+<Callout kind="danger">
+
+Khối dưới xoá Service `web`. Chỉ chạy trên `kind-k9-lab`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl patch wa web --type merge -p '{"spec":{"replicas":3,"message":"Đổi khi controller tắt"}}'
+kubectl delete svc web
+kubectl get wa web -o jsonpath='generation={.metadata.generation} observedGeneration={.status.observedGeneration} Available={.status.conditions[0].status}{"\n"}'
+kubectl get deploy web -o jsonpath='deploy.spec.replicas={.spec.replicas}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/web patched
+service "web" deleted from k9 namespace
+generation=2 observedGeneration=1 Available=True
+deploy.spec.replicas=2
+```
+
+</Expected>
+
+Đây là trạng thái nguy hiểm mà phần Kiến thức nói tới: `Available=True`, nhưng là về `generation` 1. Một pipeline chỉ chờ condition sẽ báo xong trong khi chưa có gì đổi. Bật lại controller ở **Terminal 2** (cùng lệnh ở bước 2), rồi ở Terminal 1 chờ đúng điều kiện:
+
+<Terminal where="mac">
+
+```bash
+kubectl wait --for=jsonpath='{.status.observedGeneration}'=2 wa/web --timeout=60s
+kubectl wait --for=condition=Available wa/web --timeout=120s
+kubectl get deploy,svc web
+kubectl get --raw /api/v1/namespaces/k9/services/web:80/proxy/ | jq -r .message
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/web condition met
+webapp.apps.masteva.example/web condition met
+NAME                  READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/web   3/3     3            3           31s
+
+NAME          TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+service/web   ClusterIP   10.96.126.10   <none>        80/TCP    12s
+Đổi khi controller tắt
+```
+
+</Expected>
+
+Controller vừa khởi động thì LIST lại mọi `WebApp`, đưa `k9/web` vào hàng, và một lần Reconcile sửa cả ba độ lệch: số bản sao, lời chào (rollout pod mới), Service mất. Nó không biết, và không cần biết, chuyện gì đã xảy ra lúc nó tắt.
+
+<Check id="k9.2.lab-bat-kip">Tái hiện được việc controller bắt kịp mọi thay đổi xảy ra khi nó tắt, và chỉ ra được bằng `observedGeneration` vì sao chỉ chờ condition `Available` là không đủ.</Check>
+
+### 5. Sự kiện dồn: 30 lần sửa, bao nhiêu lần reconcile?
+
+Bước này đếm bằng hai metric của controller-runtime: `controller_runtime_reconcile_total` (số lần Reconcile đã chạy) và `workqueue_adds_total` (số lần một khoá thực sự được **thêm** vào hàng). Hàm `dem` in hai con số đó; nếu sau này bạn mở terminal mới, chạy lại khối định nghĩa `dem` trước khi dùng. Mỗi lệnh `kubectl annotate` là một lần sửa `WebApp`, tức một sự kiện.
+
+<Terminal where="mac">
+
+```bash
+dem() { curl -s 127.0.0.1:9740/metrics | grep -E '^(controller_runtime_reconcile_total\{controller="webapp",result="success"\}|workqueue_adds_total\{controller="webapp")' | awk '{printf "%s ", $2} END {print "(reconcile, adds)"}'; }
+dem
+for i in $(seq 1 30); do kubectl annotate wa web lan=$i --overwrite > /dev/null; done
+sleep 3
+dem
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+43 43 (reconcile, adds)
+73 73 (reconcile, adds)
+```
+
+</Expected>
+
+30 sự kiện, 30 lần reconcile. Reconcile của controller này mất vài mili giây; mỗi lệnh `kubectl` mất vài chục. Khoá luôn đã rời hàng khi sự kiện kế tiếp tới, nên không có gì để gộp. Con số đầu trên máy bạn sẽ khác, vì nó gồm mọi lần reconcile từ lúc controller khởi động; điều cần xem là hiệu giữa hai lần đo: 30.
+
+<Predict question="Khởi động lại controller với `--slow=2s` (mỗi Reconcile mất thêm 2 giây), rồi lặp lại đúng 30 lệnh annotate. Bao nhiêu lần reconcile?">
+
+Khoảng 2 hoặc 3. Lệnh annotate đầu tiên đưa khoá vào hàng, worker lấy ra và ngủ 2 giây. Trong 2 giây đó, 29 sự kiện còn lại tới; sự kiện đầu tiên trong số đó đưa khoá vào hàng lần nữa (khoá đang được xử lý thì không tính là đang nằm trong hàng), 28 sự kiện sau thấy khoá đã có trong hàng nên không thêm gì. Xong lần thứ nhất, worker lấy khoá ra lần hai và đọc trạng thái **cuối cùng**: annotation `lan=30`. Nếu 30 lệnh kéo dài quá 2 giây, có thêm một lần. Không lần nào bị bỏ sót, và không lần nào thừa.
+
+</Predict>
+
+Ở Terminal 2, Ctrl+C rồi chạy lại với cờ mới:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k9/k9-2/webapp-controller && ./webapp-controller --slow=2s
+```
+
+</Terminal>
+
+Chờ Terminal 2 in dòng `reconcile #1` (khoảng 2 giây sau khi khởi động), rồi ở Terminal 1:
+
+<Terminal where="mac">
+
+```bash
+dem
+for i in $(seq 1 30); do kubectl annotate wa web lan=b$i --overwrite > /dev/null; done
+sleep 6
+dem
+kubectl get wa web -o jsonpath='{.metadata.annotations.lan}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1 1 (reconcile, adds)
+3 3 (reconcile, adds)
+b30
+```
+
+</Expected>
+
+Hiệu giữa hai lần đo thường là 2: hai lần reconcile cho 30 sự kiện. Trên máy chậm, 30 lệnh annotate có thể kéo dài quá 2 giây và bạn thấy 3; vẫn rất xa con số 30. `sleep 6` đủ cho các lần reconcile 2 giây chạy xong trước khi đo. Đây là lý do level-triggered chịu tải tốt: càng bận, controller càng gộp nhiều, vì chỉ trạng thái cuối có nghĩa. Ngược lại, một hệ thống edge-triggered sẽ có 30 việc xếp hàng, mỗi việc 2 giây.
+
+<Check id="k9.2.lab-gop-su-kien">Đo được số lần reconcile cho cùng một chuỗi sự kiện khi reconcile nhanh và khi reconcile chậm, và giải thích được kết quả bằng cách workqueue gộp khoá.</Check>
+
+### 6. Conflict khi đọc rồi ghi đè
+
+Controller của bài dùng apply nên không gặp chuyện này. Để thấy cái nó tránh được, đóng vai một controller viết kiểu "đọc rồi ghi đè cả object" với dữ liệu đọc từ trước:
+
+<Terminal where="mac">
+
+```bash
+kubectl get wa web -o yaml > web-cu.yaml
+kubectl patch wa web --type merge -p '{"spec":{"replicas":2}}'
+sed 's/message: .*/message: Ghi đè bằng dữ liệu cũ/' web-cu.yaml | kubectl replace -f -
+kubectl get wa web -o jsonpath='replicas={.spec.replicas}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/web patched
+Error from server (Conflict): error when replacing "STDIN": Operation cannot be fulfilled on webapps.apps.masteva.example "web": the object has been modified; please apply your changes to the latest version and try again
+replicas=2
+```
+
+</Expected>
+
+`web-cu.yaml` mang `resourceVersion` của lúc đọc. Giữa lúc đọc và lúc ghi, object đã đổi, nên API server từ chối thay vì để bản cũ đè mất `replicas: 2`. Trong controller, lỗi này nghĩa là: trả lỗi, để workqueue thử lại với dữ liệu mới; đừng vòng lặp "đọc lại rồi ghi" ngay trong Reconcile.
+
+### 7. Hai bản controller và leader election
+
+Ở Terminal 2, Ctrl+C. Mở thêm **Terminal 3** (cùng khối biến môi trường). Chạy hai bản, mỗi bản một cổng metrics, cả hai bật leader election:
+
+Terminal 2:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k9/k9-2/webapp-controller && ./webapp-controller --leader-elect --metrics-addr 127.0.0.1:9740
+```
+
+</Terminal>
+
+Terminal 3:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k9/k9-2/webapp-controller && ./webapp-controller --leader-elect --metrics-addr 127.0.0.1:9741
+```
+
+</Terminal>
+
+Terminal 2 in `Successfully acquired lease`; Terminal 3 dừng ở `Attempting to acquire leader lease...`. Ở Terminal 1:
+
+<Terminal where="mac">
+
+```bash
+kubectl get lease webapp-controller -o custom-columns='HOLDER:.spec.holderIdentity,DURATION:.spec.leaseDurationSeconds,TRANSITIONS:.spec.leaseTransitions'
+kubectl annotate wa web lan=c1 --overwrite > /dev/null
+sleep 2
+for p in 9740 9741; do printf "%s: " $p; curl -s 127.0.0.1:$p/metrics | grep -E '^controller_runtime_reconcile_total\{controller="webapp",result="success"\}' | awk '{print $2}' | grep . || echo "chưa reconcile lần nào"; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+HOLDER                                                  DURATION   TRANSITIONS
+<tên máy>.local_9d644a9b-db73-4033-a6a1-90d59f79d6aa    15         0
+9740: 2
+9741: chưa reconcile lần nào
+```
+
+</Expected>
+
+`HOLDER` là tên máy của bạn cộng một mã ngẫu nhiên của tiến trình, nên sẽ khác; số lần reconcile ở dòng `9740` cũng tuỳ lúc, miễn là lớn hơn 0. Chỉ bản giữ lease reconcile. Bản kia đã khởi động, đã kết nối, nhưng chưa chạy controller nào. Giờ dừng bản đang giữ lease: ở Terminal 2, Ctrl+C, rồi nhìn Terminal 3.
+
+<Expected>
+
+```text
+…	INFO	leaderelection	Attempting to acquire leader lease...	{"lock": "k9/webapp-controller"}
+…	INFO	leaderelection	Successfully acquired lease	{"lock": "k9/webapp-controller"}
+…	INFO	Starting Controller	{"controller": "webapp", …}
+reconcile #1 k9/web generation=3 ready=2/2
+```
+
+</Expected>
+
+Terminal 3 giành được lease chỉ vài giây sau Ctrl+C, thường dưới 5 giây: bản cũ nhả lease ngay khi tắt êm (`LeaderElectionReleaseOnCancel: true`), bản mới chỉ cần chờ tới lần thử kế tiếp của nó (`RetryPeriod` khoảng 2 giây). Khi tiến trình giữ lease chết đột ngột, không ai nhả lease, và bản dự phòng phải chờ lease hết hạn: tới `LeaseDuration` 15 giây kể từ lần gia hạn cuối. Lab không tạo trường hợp chết đột ngột; ở K9.4 bạn sẽ đo một khoảng trống cùng loại khi nâng cấp operator trong cụm.
+
+<Check id="k9.2.lab-leader">Chạy được hai bản controller với leader election, chỉ ra được bản nào đang làm việc qua `Lease` và metric, và giải thích được thời gian chuyển giao khi bản giữ lease tắt êm và khi chết đột ngột.</Check>
+
+### 8. Xoá WebApp: không có dòng code nào xoá
+
+Ở Terminal 3, Ctrl+C: không còn controller nào chạy.
+
+<Callout kind="danger">
+
+Khối dưới xoá `WebApp` `web` và mọi thứ nó sở hữu. Chỉ chạy trên `kind-k9-lab`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl delete wa web
+kubectl wait --for=delete deploy/web svc/web --timeout=60s
+kubectl get deploy,svc,pods
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example "web" deleted from k9 namespace
+NAME                       READY   STATUS        RESTARTS   AGE
+pod/web-85fc9bdbff-9k5dd   1/1     Terminating   0          87s
+pod/web-85fc9bdbff-cvxtp   1/1     Terminating   0          89s
+```
+
+</Expected>
+
+Không controller nào chạy, vậy mà Deployment và Service đã đi, pod đang đi: garbage collector của `kube-controller-manager` thấy chủ của chúng (theo UID trong owner reference) không còn, xoá Deployment, rồi tới ReplicaSet và pod theo cùng chuỗi owner reference. Pod còn `Terminating` vài giây trong lúc podinfo tắt êm (K1.3); chạy lại `kubectl get pods` sau đó sẽ thấy `No resources found`.
+
+<Check id="k9.2.lab-gc">Chứng minh được object con bị xoá theo chủ mà không cần controller chạy, và nói được thành phần nào làm việc đó.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `go build` báo `requires go >= 1.26` | Go trên máy cũ hơn | `go version`; cài Go mới hơn |
+| Controller thoát ngay, lỗi `no matches for kind "WebApp"` | CRD chưa cài hoặc chưa có phiên bản `v1` | `kubectl get crd webapps.apps.masteva.example -o jsonpath='{.spec.versions[*].name}'` |
+| `listen tcp 127.0.0.1:9740: bind: address already in use` | Một bản controller khác còn chạy | Tìm terminal đang chạy nó, Ctrl+C |
+| `wa/web` không lên `Available`, pod `ImagePullBackOff` | Mạng chậm hoặc sai tag image | `kubectl describe pod -l app.kubernetes.io/name=web` |
+| Lệnh `kubectl get --raw …/proxy/` lỗi `no endpoints available` | Pod chưa sẵn sàng hoặc Service vừa tạo lại | Chờ `kubectl wait --for=condition=Available wa/web` |
+| Bước 5 ra số reconcile lớn hơn nhiều khi chạy với `--slow` | Bạn chạy annotate trước khi `reconcile #1` in ra | Chờ dòng đầu tiên ở Terminal 2 rồi chạy lại |
+
+### Dọn dẹp
+
+Dừng mọi bản controller (Ctrl+C ở Terminal 2 và 3). K9.3 dùng tiếp cụm và CRD; namespace `k9` đã trống sau bước 8. Lease `webapp-controller` còn lại trong namespace `k9`, vô hại; xoá nếu muốn:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá Lease `webapp-controller`. Chỉ chạy khi không còn bản controller nào đang chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl delete lease webapp-controller
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đọc từ cache có thể trễ. Vừa ghi xong đọc lại không thấy, phải làm sao?">
+
+Cache được cập nhật qua watch, nên có độ trễ nhỏ sau mỗi lần ghi. Hệ quả kinh điển: Reconcile tạo Job, lần Reconcile kế tiếp (đến ngay vì chính sự kiện tạo Job) đọc cache chưa thấy Job, tạo thêm một cái. Cách chữa truyền thống là thiết kế để không cần đọc lại điều mình vừa ghi: tên object con cố định theo tên chủ, dùng apply (ghi lại cùng nội dung là vô hại), hoặc đọc thẳng API server qua `mgr.GetAPIReader()` ở chỗ thật sự cần. controller-runtime 0.25 thêm tuỳ chọn thử nghiệm `ReadYourWritesConsistency`: client chờ cache thấy lần ghi của chính nó rồi mới trả kết quả đọc. Tính năng còn ở mức thử nghiệm; bài không dùng.
+
+</Reveal>
+
+<Reveal title="Có nên tăng số worker (`MaxConcurrentReconciles`) cho nhanh?">
+
+Mặc định là 1. Tăng lên thì nhiều **khoá khác nhau** được xử lý song song; một khoá vẫn không bao giờ chạy song song với chính nó, nên logic của bạn không cần khoá. Tăng khi có nhiều object và mỗi lần reconcile chủ yếu chờ I/O (gọi API bên ngoài). Đừng tăng để che một reconcile chậm vì làm thừa việc, và nhớ mỗi worker là thêm request tới API server. CloudNativePG (K7.4) chạy với `--max-concurrent-reconciles=10`.
+
+</Reveal>
+
+<Reveal title="Khi nào trả `RequeueAfter` thay vì chờ sự kiện?">
+
+Khi trạng thái cần theo dõi **không phát sự kiện** trong cụm: chứng chỉ sắp hết hạn, một API bên ngoài, một bản sao lưu đang chạy ở nơi khác. Reconcile kiểm, ghi status, rồi trả `ctrl.Result{RequeueAfter: 5 * time.Minute}`. Đừng dùng `RequeueAfter` ngắn để "chắc ăn" cho mọi object: một nghìn object với chu kỳ 5 giây là 200 lần reconcile mỗi giây, mỗi lần vài request tới API server. Đừng trả lỗi để được gọi lại: lỗi đi qua backoff tăng dần và làm nhiễu metric lỗi.
+
+</Reveal>
+
+<Reveal title="Hai controller khác nhau cùng quản lý một Deployment thì sao?">
+
+Nếu cả hai khai **cùng một trường** với giá trị khác nhau và cùng dùng `ForceOwnership`, chúng giành nhau mãi: mỗi lần ghi của bên này là một sự kiện cho bên kia. HPA và một controller cùng ghi `spec.replicas` là ví dụ quen (K3.1 gặp với Helm). Cách tránh: mỗi trường chỉ một chủ. Controller của bạn không khai `replicas` khi người dùng bật autoscaling, giống chart viết tốt ở K3.1.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết khung Reconcile cho một CRD, viết apply configuration cho object con, giải thích một log lỗi của controller-runtime.
+
+**AI hay sai ở đâu:** viết Reconcile theo kiểu sự kiện ("nếu là sự kiện xoá thì…"); dùng `r.Update` cả object rồi gặp conflict liên tục; quên owner reference rồi viết code tự xoá object con; cập nhật status bằng `r.Update` (không đi qua subresource) hoặc ghi thời điểm hiện tại vào status mỗi lần; dùng API cũ của controller-runtime như `client.Apply` kiểu patch hay `Watches(&source.Kind{…})` từ các bản trước 0.15; và tăng `MaxConcurrentReconciles` để sửa một vòng lặp vô tận.
+
+**Cách kiểm tra:** chạy controller rồi làm đúng các bước của lab này với CRD của bạn: xoá con, sửa tay, tắt rồi bật lại, dồn sự kiện. Theo dõi `controller_runtime_reconcile_total` khi không có ai sửa gì: nó phải đứng yên.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.1 là nền: vòng điều khiển, owner reference, event. K3.1 dạy server-side apply và field manager. K2.3 dạy RBAC; bài này chạy controller bằng quyền admin của kubeconfig, K9.4 cho nó quyền tối thiểu. K9.1 thiết kế CRD bài này đọc. K9.3 viết lại controller này bằng Kubebuilder với kiểu Go có sẵn, test bằng envtest và gặp vòng lặp vô tận thật. D12.2 dạy Prometheus, thứ thu metric controller-runtime vừa dùng. D13 (GitOps) là một họ controller khác cùng mô hình: Git là `spec`.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k9.2.mastery-viet">Tự viết được một controller bằng controller-runtime cho một CRD: watch object chính và object con, reconcile idempotent bằng server-side apply, ghi status có `observedGeneration`.</Check>
+
+<Check id="k9.2.mastery-giai-thich">Giải thích được cho đồng nghiệp vì sao controller chịu được việc bị khởi động lại, mất sự kiện, bị sửa tay, và đo được điều đó bằng metric.</Check>
+
+<Check id="k9.2.mastery-chay-nhieu-ban">Lập luận được khi nào cần leader election, điều gì xảy ra khi thiếu nó hoặc khi hai phiên bản controller cùng chạy, và chỉ ra được dấu hiệu của hai controller đang giành nhau một object.</Check>
+
+</Mastery>

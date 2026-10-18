@@ -1,0 +1,945 @@
+---
+title: Kế hoạch dung lượng và load test cả hệ thống
+description: Tính trần của một hệ bằng định luật Little, dùng k6 tăng dần lưu lượng để tìm đầu gối của đường cong độ trễ, thấy mô hình số người dùng cố định che mất độ trễ thật thế nào, biến SLO thành tiêu chí đạt của load test, rồi dự báo từ metric ngày nào đỉnh lưu lượng chạm mức an toàn để biết lúc phải mua thêm.
+id: d23.1
+step: d23
+prerequisites: [d16.1]
+topics: [d23.ke-hoach-dung-luong, d23.load-test-ca-he]
+status: verified
+verified:
+  date: 2026-10-18
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    golang-image: 1.27.2-alpine
+    k6: 2.3.0
+    prometheus: 3.15.0
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Trả lời được bằng số đo hai câu hỏi mà đội sản phẩm sẽ hỏi bạn trước mỗi đợt khuyến mãi: "hệ thống chịu được bao nhiêu" và "bao giờ thì phải thêm máy". Học xong bài này, bạn giải thích được:
+
+- Vì sao một database với 4 kết nối, mỗi truy vấn 20 ms, không bao giờ phục vụ quá khoảng 200 truy vấn mỗi giây, dù bạn thêm bao nhiêu bản service phía trước.
+- Vì sao độ trễ gần như phẳng tới khoảng 80% mức dùng rồi tăng vọt, và vì sao "CPU mới 70%, còn dư" không phải là còn dư.
+- Vì sao cùng một hệ, cùng thông lượng, load test với 8 người dùng ảo báo p99 khoảng 120 ms còn người dùng thật thấy p99 gấp hai tới năm lần.
+- Vì sao load test chỉ một service (database giả) kết luận "chịu được 600 request/giây" mà cả hệ thì không.
+- Vì sao dự báo bằng `predict_linear` trên dữ liệu thô cho con số vô nghĩa, và dự báo trên đỉnh thì không.
+
+</Goal>
+
+<Knowledge>
+
+### Định luật Little: trần của một hệ đến từ đâu
+
+**Định luật Little** áp cho mọi hàng đợi ổn định: số việc đang nằm trong hệ bằng tốc độ việc đến nhân thời gian mỗi việc ở trong hệ.
+
+```text
+ L = λ × W
+ L: số request đang được xử lý cùng lúc
+ λ: số request đến mỗi giây
+ W: thời gian một request ở trong hệ (giây)
+```
+
+Đảo lại, một tài nguyên có `N` chỗ, mỗi việc giữ chỗ `S` giây, có **trần thông lượng** `N / S`. Database của lab có 4 kết nối, mỗi truy vấn trung bình 20 ms: trần là 4 / 0,02 = 200 truy vấn mỗi giây. Service phía trước có 10 bản hay 100 bản cũng vậy; thêm bản chỉ thêm người xếp hàng trước cùng 4 kết nối đó. Trần của cả hệ là trần **nhỏ nhất** trên đường đi của request: pool kết nối, số thread, số worker của proxy, băng thông, hạn mức API của bên thứ ba. SB12.2 đã dùng phép tính này cho thread pool của Tomcat; ở đây bạn áp nó cho cả chuỗi.
+
+Cũng định luật đó cho bạn **mức dùng** (utilization) của một tài nguyên khi chỉ biết lưu lượng: `ρ = λ × S / N`. Ở 150 request mỗi giây, 4 kết nối của lab bận 150 × 0,02 / 4 = 75% thời gian.
+
+### Vì sao không chạy ở 90%: đầu gối của đường cong độ trễ
+
+Lưu lượng thật không đến đều như nhịp đồng hồ, và thời gian xử lý mỗi request cũng không bằng nhau. Có lúc ba request đến cùng một mili giây, có truy vấn mất 5 ms, có truy vấn mất 90 ms. Khi tài nguyên đang bận, request đến sau phải **xếp hàng**, và thời gian chờ đó cộng vào độ trễ.
+
+Lý thuyết hàng đợi cho một công thức đơn giản cho trường hợp một server, request đến ngẫu nhiên, thời gian xử lý ngẫu nhiên (mô hình M/M/1): thời gian chờ trung bình bằng `ρ / (1 − ρ)` lần thời gian xử lý.
+
+| Mức dùng ρ | 50% | 70% | 80% | 90% | 95% | 99% |
+|---|---|---|---|---|---|---|
+| Thời gian chờ, tính theo số lần thời gian xử lý | 1 | 2,3 | 4 | 9 | 19 | 99 |
+
+```text
+ độ trễ
+   │                                            ╱
+   │                                           ╱   quá đầu gối: thêm 5% tải,
+   │                                         ╱     độ trễ nhân đôi
+   │                                      ╱
+   │                                 ╱
+   │ ─────────────────────────────╱                dưới đầu gối: gần như phẳng
+   └──────────────────────────────┬──────────┬─── mức dùng
+                                 ~80%      100%
+```
+
+Hệ thật có nhiều server (4 kết nối thay vì 1), nên đầu gối dịch sang phải một chút, nhưng hình dạng giữ nguyên. Ba hệ quả cho vận hành:
+
+- **"Còn dư 30%" không có nghĩa là chịu thêm được 30% tải** mà giữ nguyên độ trễ. Từ 70% lên 90%, thời gian chờ tăng khoảng bốn lần.
+- **Ngưỡng an toàn tính theo độ trễ, không theo 100%.** Điểm vận hành là mức dùng mà p99 còn nằm trong SLO, thường ở khoảng 60–80% tuỳ tài nguyên. Lab đo nó bằng số thật.
+- **Ngay trên 100% không có trạng thái ổn định**: hàng đợi dài ra mỗi giây, độ trễ tăng theo thời gian chứ không dừng ở một con số. Đó là lý do D18.2 nói về giới hạn hàng đợi và bỏ bớt tải.
+
+D12.3 đã phân biệt utilization với **saturation** (lượng việc phải chờ) trong phương pháp USE. Đầu gối là chỗ saturation bắt đầu khác 0 một cách đều đặn.
+
+<Check id="d23.1.little-knee">Dùng được định luật Little để tính trần thông lượng và mức dùng của một tài nguyên, và giải thích được vì sao độ trễ tăng vọt khi mức dùng vượt khoảng 80%.</Check>
+
+### Headroom: chừa chỗ cho lúc hỏng, không chỉ cho lúc đông
+
+**Headroom** là phần dung lượng bạn cố ý để trống. Nó phải đủ cho hai việc cùng lúc: đỉnh lưu lượng, và mất một phần hệ thống ngay lúc đỉnh.
+
+| Quy tắc | Nghĩa | Ví dụ với điểm vận hành 80% |
+|---|---|---|
+| **N+1** | Mất một bản (máy, pod, node) thì các bản còn lại vẫn dưới điểm vận hành | 3 bản: mỗi bản chạy tối đa 80% × 2/3 ≈ 53% lúc đỉnh |
+| **N+2** | Chịu được một bản đang bảo trì (drain, vá OS) cộng một bản hỏng | 4 bản: mỗi bản tối đa 80% × 2/4 = 40% |
+| **Theo vùng** | Mất cả một zone thì các zone còn lại gánh hết | 3 zone: mỗi zone tối đa 80% × 2/3 ≈ 53% |
+
+Công thức chung: mức dùng tối đa lúc bình thường = điểm vận hành × (số phần còn lại khi hỏng) ÷ (số phần đang chạy). Hệ ít bản thì headroom đắt: 2 bản theo N+1 nghĩa là chạy dưới 40%. Đó là một lý do hệ lớn dùng nhiều bản nhỏ hơn là ít bản to.
+
+Autoscaling (K5.3, K5.4) không thay được headroom: HPA cần vài chục giây tới vài phút để thêm pod, cluster autoscaler cần thêm thời gian khởi động node. Headroom là phần gánh tải trong khoảng thời gian đó.
+
+### Dự báo: từ metric tới ngày phải mua thêm
+
+Kế hoạch dung lượng là trả lời "ngày nào đỉnh lưu lượng chạm mức an toàn", sớm hơn **thời gian chờ có thêm dung lượng** (lead time): vài phút với một auto scaling group, vài ngày nếu phải xin tăng hạn mức của nhà cung cấp cloud, vài tuần tới vài tháng nếu phải mua máy chủ và lắp vào tủ.
+
+Prometheus có sẵn **`predict_linear(v[d], t)`**: dựng đường thẳng (hồi quy tuyến tính) qua các mẫu trong cửa sổ `d` và trả về giá trị dự đoán sau `t` giây. Tài liệu ghi rõ nó chỉ dùng cho gauge. Hai cái bẫy:
+
+- **Dữ liệu có chu kỳ ngày.** Lưu lượng của một cửa hàng lên đỉnh lúc 20 giờ và gần như không có gì lúc 4 giờ sáng. Đường thẳng qua mọi mẫu dự báo **trung bình**, trong khi hệ sập vì **đỉnh**. Cách sửa: dự báo trên chuỗi đỉnh, ví dụ `max_over_time(x[7d])` lấy theo từng ngày bằng subquery `[60d:1d]`.
+- **Mùa vụ và sự kiện.** Tết, ngày đôi (11/11, 12/12), đợt quảng cáo không nằm trên đường thẳng nào. Chúng được lên kế hoạch riêng với đội sản phẩm: dự kiến bao nhiêu lần lưu lượng thường, rồi load test ở mức đó cộng headroom.
+
+```text
+ rps
+  │ ngưỡng an toàn ──────────────────────────────────────╳────────────
+  │                                                ╱    ▲ ngày chạm: phải có
+  │                                   ●      ●  ╱         thêm dung lượng trước đó
+  │                        ●      ●       ╱
+  │             ●      ●          ╱   ← predict_linear trên các đỉnh tuần (●)
+  │  ●      ●              ╱
+  │      ╱╲      ╱╲      ╱╲      ╱╲      ╱╲
+  │ ╱╲  ╱  ╲ ╱╲ ╱  ╲ ╱╲ ╱  ╲ ╱╲ ╱  ╲ ╱╲ ╱  ╲  ← dữ liệu thô: đường thẳng qua nó
+  │╱  ╲╱    ╲╱ ╲╱    ╲╱ ╲╱   ╲╱ ╲╱    ╲╱ ╲╱     nằm ở mức trung bình, thấp hơn đỉnh nhiều
+  └──────────────────────────────────────────────────────────── thời gian
+```
+
+Ngưỡng an toàn lấy từ load test (điểm vận hành) nhân hệ số headroom ở mục trên, không lấy từ con số "100%" trên giấy.
+
+<Callout kind="production">
+
+Theo bài của Google Cloud về ngày ra mắt Pokémon GO (30/09/2016), Niantic và Google lên kế hoạch cho mức lưu lượng mục tiêu "1X", với ước tính xấu nhất khoảng 5X. Lưu lượng thật nhanh chóng lên 50X mục tiêu, tức gấp mười lần kịch bản xấu nhất. Cloud Datastore, database chính của trò chơi, được bài viết gọi là thước đo trực tiếp độ phổ biến của game. Đội Customer Reliability Engineering của Google cấp thêm dung lượng thay Niantic, và trước khi ra mắt ở Nhật, hai bên nâng cấp cụm GKE lên phiên bản cho phép thêm hơn một nghìn node; bài viết cũng kể việc chuyển sang HTTP/S Load Balancer. Theo bài, lần ra mắt ở Nhật diễn ra không sự cố dù số người đăng ký mới gấp ba lần lần ra mắt ở Mỹ hai tuần trước đó. Phần sau là nhận xét của bài học này: không đường dự báo nào từ metric quá khứ cho ra con số 50X cho một sản phẩm mới, nên với sự kiện, thứ cứu bạn là biết trần của từng tầng (bằng load test) và có sẵn đường để thêm dung lượng nhanh, không phải một dự báo chính xác hơn.
+
+</Callout>
+
+<Check id="d23.1.headroom-forecast">Tính được mức dùng tối đa lúc bình thường theo N+1 hoặc theo zone, và giải thích được vì sao dự báo phải dựa trên đỉnh, so với lead time có thêm dung lượng.</Check>
+
+### Load test: loại nào trả lời câu hỏi nào
+
+| Loại | Tải | Trả lời câu hỏi | Chạy khi |
+|---|---|---|---|
+| **Smoke** | Rất nhỏ, vài phút | Kịch bản và môi trường có chạy đúng không | Trước mọi loại khác |
+| **Load** (tải trung bình hoặc đỉnh) | Mức dự kiến, giữ vài chục phút | Ở mức này có đạt SLO không | Trước phát hành, trước sự kiện |
+| **Stress** | Trên đỉnh dự kiến | Quá tải thì hỏng kiểu gì, có tự hồi không | Định kỳ |
+| **Breakpoint** (tìm điểm gãy) | Tăng dần tới khi hỏng | Trần và đầu gối nằm ở đâu | Khi đổi kiến trúc, đổi loại máy |
+| **Soak** | Mức thường, nhiều giờ | Rò bộ nhớ, rò kết nối, đĩa đầy, log quay vòng | Trước phát hành lớn |
+| **Spike** | Nhảy vọt trong vài giây | Autoscaling, pool, cache lạnh phản ứng kịp không | Trước sự kiện có giờ mở bán |
+
+Bài này làm smoke, breakpoint và load có tiêu chí đạt. D18.2 làm một dạng stress. Ngoài loại test, hai quyết định định hình mọi kết quả: sinh tải theo mô hình nào, và đo cái gì.
+
+### Mô hình mở, mô hình đóng và coordinated omission
+
+| | Mô hình **đóng** (closed) | Mô hình **mở** (open) |
+|---|---|---|
+| Bạn đặt | Số người dùng ảo (VU), mỗi VU gửi rồi **chờ** trả lời mới gửi tiếp | Số request đến mỗi giây, bất kể request trước xong chưa |
+| Executor của k6 | `constant-vus`, `ramping-vus` | `constant-arrival-rate`, `ramping-arrival-rate` |
+| Khi hệ chậm | VU gửi ít đi, tải tự giảm theo hệ | Request vẫn đến và xếp hàng, như người dùng thật |
+| Giống | Một số worker cố định gọi vào, ví dụ consumer của hàng đợi | Người dùng Internet, webhook, lưu lượng qua load balancer |
+
+Người dùng của một website không chờ người khác xong mới bấm. Mô hình đóng có một lỗi đo kinh điển tên là **coordinated omission** (bỏ sót có phối hợp): khi hệ chậm lại, chính công cụ đo cũng gửi chậm lại, nên nó không ghi nhận những request lẽ ra đã phải xếp hàng. Kết quả là con số p99 đẹp hơn thực tế, đúng ở vùng bạn quan tâm nhất là gần đầu gối. SB12.1 đã cho thấy hiện tượng này với một service Spring khựng lại định kỳ; bước 3 của lab cho thấy nó ở mức cả hệ, khi database chạm trần.
+
+Với mô hình mở, k6 cần đủ VU để giữ nhịp. Hết VU, nó bỏ lượt và đếm vào **`dropped_iterations`**; con số này khác 0 nghĩa là bài test không còn gửi đúng lưu lượng bạn đặt.
+
+### Tiêu chí đạt viết theo SLO
+
+Một load test không có tiêu chí đạt chỉ là một biểu đồ. Theo cách D16.1 định nghĩa SLO, giả định service của lab có hai SLO: 99% request dưới 300 ms, và 99,9% request thành công. Load test dùng chính các SLO đó làm **threshold** của k6:
+
+```javascript
+thresholds: {
+  'http_req_duration{expected_response:true}': ['p(99)<300'],  // SLO độ trễ: 99% request dưới 300 ms
+  http_req_failed: ['rate<0.001'],                            // SLO khả dụng 99,9%
+  dropped_iterations: ['count<1'],                            // bài test phải gửi đủ tải
+},
+```
+
+Ngưỡng trượt thì k6 thoát với mã **99**, nên pipeline (D6) chặn được một thay đổi làm hệ chậm đi. Dòng thứ ba hay bị quên: không có nó, một bài test mà k6 không theo kịp nhịp vẫn "đạt", vì nó đã gửi ít hơn bạn tưởng.
+
+Threshold đo **trong lúc test**, trên một cửa sổ vài phút; SLO đo trên 30 ngày. Load test không chứng minh được SLO, nó chứng minh rằng ở mức tải X, hệ không đốt budget nhanh hơn mức cho phép.
+
+<Check id="d23.1.models-thresholds">Phân biệt được mô hình đóng với mô hình mở, giải thích được coordinated omission, và viết được threshold k6 từ SLO kèm điều kiện về `dropped_iterations`.</Check>
+
+### Test cả hệ, không chỉ một service
+
+Trần của hệ nằm ở tài nguyên nhỏ nhất trên đường đi, và tài nguyên đó thường **không** nằm trong service bạn đang test: pool kết nối database, khoá trên một hàng nóng, hạn mức của API thanh toán, consumer của hàng đợi, cache. Test một service với các phụ thuộc giả (mock) trả lời rất nhanh thì đo được trần của chính service đó, và bỏ qua đúng chỗ sẽ hỏng. Bước 4 của lab cho thấy khoảng cách giữa hai con số.
+
+Môi trường test giống production tới đâu là một đánh đổi về tiền. Thứ phải giống, vì nó đổi vị trí đầu gối:
+
+| Phải giống | Vì |
+|---|---|
+| Lượng dữ liệu và phân bố của nó | Truy vấn trên bảng 1.000 dòng và 100 triệu dòng là hai truy vấn khác nhau |
+| Tỉ lệ cache trúng | Cache lạnh đẩy toàn bộ tải xuống database; test với cache ấm báo trần cao giả |
+| Loại máy, giới hạn CPU và RAM của container, số kết nối của pool | Đây chính là `N` và `S` trong định luật Little |
+| Các phụ thuộc thật, hoặc bản giả có độ trễ và giới hạn đồng thời như thật | Phụ thuộc giả trả lời 1 ms che mất trần |
+| Hỗn hợp request (đọc và ghi, endpoint nặng và nhẹ) | 1.000 request đọc trang chủ không nói gì về 1.000 request đặt hàng |
+
+Được phép khác: quy mô (đo trên một **cell**, tức một bản đầy đủ và độc lập của cả hệ, rồi nhân lên, nếu đã kiểm rằng hệ co giãn tuyến tính; kiến trúc cell là một chủ đề của chặng D21), dữ liệu cá nhân (dùng dữ liệu tổng hợp có cùng phân bố). Và đừng chạy load test vào production chung hạ tầng với khách hàng nếu chưa có cách dừng khẩn cấp và chưa báo các đội liên quan.
+
+<Check id="d23.1.whole-system">Giải thích được vì sao load test một service với phụ thuộc giả cho trần sai, và kể được những thứ của môi trường test phải giống production.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Load test types (Grafana k6)](https://grafana.com/docs/k6/latest/testing-guides/test-types/): sáu loại test, mỗi loại kèm hình dạng tải và lúc nên chạy.
+- [Open and closed models (Grafana k6)](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/): hai mô hình sinh tải và cảnh báo về coordinated omission.
+- [Ramping arrival rate (Grafana k6)](https://grafana.com/docs/k6/latest/using-k6/scenarios/executors/ramping-arrival-rate/): `stages`, `preAllocatedVUs`, `maxVUs` và khi nào k6 bỏ lượt.
+- [Query functions (Prometheus)](https://prometheus.io/docs/prometheus/latest/querying/functions/): mục `predict_linear()` và `deriv()`; đọc câu "should only be used with gauges".
+- [Bringing Pokémon GO to life on Google Cloud](https://cloud.google.com/blog/products/gcp/bringing-pokemon-go-to-life-on-google-cloud): nguồn của callout; đọc đoạn về ước tính 1X, 5X và lưu lượng thật.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker Desktop hoặc Docker Engine 29 đang chạy, có `curl`, `jq`, `awk`, máy có mạng. Lab tải image Go (khoảng 70 MB nén), k6 (khoảng 30 MB) và Prometheus (khoảng 100 MB). Dùng cổng **9780** (api), **9781** (db) và **9790** (Prometheus), chỉ nghe trên `127.0.0.1`. Thư mục lab `~/masteva-d23`, D18.2 dùng tiếp. Mọi khối lệnh chạy trong `~/masteva-d23`; nếu mở terminal mới giữa chừng, chạy `cd ~/masteva-d23` trước.
+
+**Profile máy:** ba container của hệ dùng khoảng 80–120 MiB RAM, k6 thêm khoảng 100 MiB lúc chạy; mỗi container của hệ bị giới hạn 1 CPU. k6 dùng dưới nửa nhân CPU ở mức tải của bài. Build image Go cần khoảng 1 GB RAM trong một phút. Máy 8 GB với Docker VM 4 GB chạy thoải mái. Các con số độ trễ phụ thuộc rất ít vào tốc độ máy, vì trần của lab đến từ thời gian chờ của database giả chứ không từ CPU; nếu máy bạn đang bận việc khác, đầu gối có thể đến sớm hơn một chút.
+
+### 0. Hệ thống mẫu
+
+Lab là một chuỗi hai service viết bằng Go, chỉ dùng thư viện chuẩn. Một binary chạy hai vai:
+
+```text
+ k6 ──HTTP──▶ api :9780 ──h2c──▶ db :9781
+               │                  │ 4 "kết nối": tối đa 4 truy vấn chạy cùng lúc,
+               │                  │ mỗi truy vấn ngẫu nhiên, trung bình 20 ms;
+               │                  │ phần còn lại xếp hàng
+               └──── /metrics ────┴──── Prometheus :9790
+```
+
+9780, 9781 và 9790 là cổng trên Mac, để bạn gọi bằng `curl` hay mở Prometheus trên trình duyệt. k6 chạy trong một container trên mạng Docker `d18-net` cùng các service, nên nó gọi thẳng `d18-api:8080`.
+
+- **db** đóng vai một database có pool 4 kết nối. Thời gian mỗi truy vấn theo phân phối mũ (nhiều truy vấn nhanh, thỉnh thoảng một truy vấn chậm, tối đa 100 ms), giống truy vấn thật hơn là một con số cố định. Nó đếm thời gian bận vào `db_busy_seconds_total` để tính mức dùng.
+- **api** nhận request, gọi db một lần, trả `200`. Tham số `?mock=1` bỏ qua db, dùng ở bước 4. Các cờ `-retries`, `-drop-expired`, header hạn chót và đường `/admin/slow` của db là cho D18.2; bài này chưa dùng.
+- api gọi db bằng HTTP/2 không mã hoá (h2c): nhiều request đi chung một kết nối TCP. D18.2 giải thích vì sao điều này quan trọng khi có timeout.
+
+<Terminal where="mac" title="~/masteva-d23/app/main.go">
+
+```bash
+mkdir -p ~/masteva-d23/app ~/masteva-d23/k6 ~/masteva-d23/prometheus && cd ~/masteva-d23
+cat > app/main.go <<'EOF'
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"math"
+	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	role    = flag.String("role", "db", "db hoặc api")
+	slots   = flag.Int("slots", 4, "db: số truy vấn chạy cùng lúc")
+	mean    = flag.Duration("mean", 20*time.Millisecond, "db: thời gian trung bình một truy vấn")
+	queue   = flag.Int("queue", 2000, "db: số truy vấn được xếp hàng tối đa")
+	dropOld = flag.Bool("drop-expired", false, "db: bỏ truy vấn mà phía gọi đã hết hạn chờ")
+	dbURL   = flag.String("db", "http://d18-db:8080", "api: địa chỉ db")
+	tryTO   = flag.Duration("try-timeout", 2*time.Second, "api: thời gian chờ mỗi lần gọi db")
+	retries = flag.Int("retries", 0, "api: số lần gọi lại db ngay khi lỗi")
+)
+
+var (
+	mu      sync.Mutex
+	counter = map[string]float64{}
+	waiting atomic.Int64
+	slowX   atomic.Int64 // hệ số chậm của db, nhân 100
+)
+
+func count(k string, v float64) { mu.Lock(); counter[k] += v; mu.Unlock() }
+
+func main() {
+	flag.Parse()
+	slowX.Store(100)
+	http.HandleFunc("/metrics", metrics)
+	if *role == "db" {
+		sem := make(chan struct{}, *slots)
+		http.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) { query(w, r, sem) })
+		http.HandleFunc("/admin/slow", func(w http.ResponseWriter, r *http.Request) {
+			x, _ := strconv.ParseFloat(r.URL.Query().Get("x"), 64)
+			slowX.Store(int64(x * 100))
+			fmt.Fprintf(w, "db chậm x%.1f\n", x)
+		})
+	} else {
+		client := &http.Client{Transport: &http.Transport{Protocols: h2c()}}
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { api(w, r, client) })
+	}
+	srv := &http.Server{Addr: ":8080", Protocols: h2c()}
+	srv.Protocols.SetHTTP1(true)
+	log.Printf("%s listening on :8080", *role)
+	log.Fatal(srv.ListenAndServe())
+}
+
+// HTTP/2 không mã hoá (h2c): nhiều request chung một kết nối, timeout chỉ huỷ một stream.
+func h2c() *http.Protocols {
+	p := new(http.Protocols)
+	p.SetUnencryptedHTTP2(true)
+	return p
+}
+
+// db: tối đa -slots truy vấn chạy cùng lúc, phần còn lại xếp hàng (tối đa -queue).
+// Thời gian một truy vấn ngẫu nhiên theo phân phối mũ, trung bình -mean.
+func query(w http.ResponseWriter, r *http.Request, sem chan struct{}) {
+	count("db_requests_total", 1)
+	if waiting.Load() >= int64(*queue) {
+		count(`db_queries_total{result="rejected"}`, 1)
+		http.Error(w, "queue full", http.StatusServiceUnavailable)
+		return
+	}
+	waiting.Add(1)
+	sem <- struct{}{} // chờ tới lượt, không để ý phía gọi đã bỏ đi hay chưa
+	waiting.Add(-1)
+	defer func() { <-sem }()
+	ms, err := strconv.ParseInt(r.Header.Get("X-Deadline-Ms"), 10, 64)
+	if *dropOld && err == nil && time.Now().UnixMilli() > ms {
+		count(`db_queries_total{result="expired"}`, 1)
+		http.Error(w, "expired", http.StatusGatewayTimeout)
+		return
+	}
+	t := time.Now()
+	time.Sleep(time.Duration(math.Min(rand.ExpFloat64(), 5) * float64(*mean) * float64(slowX.Load()) / 100))
+	count("db_busy_seconds_total", time.Since(t).Seconds())
+	count(`db_queries_total{result="ok"}`, 1)
+	fmt.Fprintln(w, "ok")
+}
+
+// api: gọi db cho mỗi request; ?mock=1 thì trả lời luôn, không gọi db.
+func api(w http.ResponseWriter, r *http.Request, client *http.Client) {
+	code := http.StatusOK
+	defer func() { count(fmt.Sprintf(`api_requests_total{path=%q,code="%d"}`, r.URL.Path, code), 1) }()
+	if r.URL.Query().Get("mock") == "1" {
+		w.WriteHeader(code)
+		return
+	}
+	// Hạn chót của cả request: lấy từ header Envoy gửi kèm, không có thì 2 giây.
+	deadline := time.Now().Add(2 * time.Second)
+	if ms, err := strconv.Atoi(r.Header.Get("X-Envoy-Expected-Rq-Timeout-Ms")); err == nil {
+		deadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
+	}
+	for attempt := 0; attempt <= *retries; attempt++ {
+		left := time.Until(deadline)
+		if left <= 0 {
+			code = http.StatusGatewayTimeout
+			break
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), min(*tryTO, left))
+		req, _ := http.NewRequestWithContext(ctx, "GET", *dbURL+"/query", nil)
+		req.Header.Set("X-Deadline-Ms", strconv.FormatInt(deadline.UnixMilli(), 10))
+		resp, err := client.Do(req)
+		switch {
+		case err != nil:
+			count(`api_db_calls_total{result="timeout"}`, 1)
+			code = http.StatusGatewayTimeout
+		case resp.StatusCode != http.StatusOK:
+			count(`api_db_calls_total{result="error"}`, 1)
+			code = http.StatusBadGateway
+		default:
+			count(`api_db_calls_total{result="ok"}`, 1)
+			code = http.StatusOK
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		cancel()
+		if code == http.StatusOK {
+			break
+		}
+	}
+	w.WriteHeader(code)
+}
+
+func metrics(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	for k, v := range counter {
+		fmt.Fprintf(w, "%s %g\n", k, v)
+	}
+	if *role == "db" {
+		fmt.Fprintf(w, "db_waiting %d\ndb_slow_factor %g\n", waiting.Load(), float64(slowX.Load())/100)
+	}
+}
+EOF
+```
+
+</Terminal>
+
+Đóng gói thành image, ghim image Go theo `tag@digest` như D5.2, và kéo trước k6, Prometheus cũng theo digest:
+
+<Terminal where="mac" title="~/masteva-d23">
+
+```bash
+cat > app/go.mod <<'EOF'
+module d18/app
+
+go 1.27
+EOF
+cat > app/Dockerfile <<'EOF'
+FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
+WORKDIR /src
+COPY go.mod main.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /app .
+FROM scratch
+COPY --from=build /app /app
+USER 65532:65532
+ENTRYPOINT ["/app"]
+EOF
+docker build -q -t d18-app:1 app
+docker pull -q grafana/k6:2.3.0@sha256:9c2dee7f8ed74d317e4027c06a10f169b625638189de8d4555d0b3486a5aeb34
+docker pull -q prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+docker image ls d18-app
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+sha256:a3674fb7bf738edfbd731e598fd169fd8ae95d22389eb49fa27b25e093dc83cc
+docker.io/grafana/k6:2.3.0@sha256:9c2dee7f8ed74d317e4027c06a10f169b625638189de8d4555d0b3486a5aeb34
+docker.io/prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+IMAGE       ID             DISK USAGE   CONTENT SIZE   EXTRA
+d18-app:1   a3674fb7bf73       8.43MB         2.52MB
+```
+
+</Expected>
+
+ID của image trên máy bạn sẽ khác. Hai dòng `docker pull` in lại đúng `tag@digest`: Docker từ chối nếu nội dung tải về không khớp digest, nên bạn chạy đúng bản image mà bài dùng.
+
+### 1. Chạy hệ và tính trần trước khi đo
+
+<Terminal where="mac" title="~/masteva-d23/compose.yaml">
+
+```bash
+cat > compose.yaml <<'EOF'
+name: d18
+services:
+  db:
+    image: d18-app:1
+    container_name: d18-db
+    command: -role db -slots 4 -mean 20ms ${DB_FLAGS:-}
+    ports: ["127.0.0.1:9781:8080"]
+    cpus: 1
+    mem_limit: 256m
+  api:
+    image: d18-app:1
+    container_name: d18-api
+    command: -role api -db http://d18-db:8080 ${API_FLAGS:-}
+    ports: ["127.0.0.1:9780:8080"]
+    cpus: 1
+    mem_limit: 256m
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    container_name: d18-prom
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus",
+              "--storage.tsdb.retention.time=180d"]
+    volumes: ["./prometheus:/etc/prometheus:ro", "d18-prom-data:/prometheus"]
+    ports: ["127.0.0.1:9790:9090"]
+    mem_limit: 384m
+volumes:
+  d18-prom-data:
+    name: d18-prom-data
+networks:
+  default:
+    name: d18-net
+EOF
+cat > prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 2s
+scrape_configs:
+  - job_name: d18
+    static_configs:
+      - targets: ["d18-db:8080", "d18-api:8080"]
+EOF
+cat > pq <<'EOF'
+#!/bin/sh
+curl -s localhost:9790/api/v1/query --data-urlencode "query=$1" ${2:+--data-urlencode "time=$2"} | jq -r '
+  if .status != "success" then "LỖI: \(.error)"
+  else .data.result[] | "\(.metric | to_entries | map("\(.key)=\(.value)") | join(" "))  =>  \(.value[1] | tonumber | . * 1000 | round / 1000)"
+  end'
+EOF
+chmod +x pq
+docker compose up -d
+for i in $(seq 30); do curl -sf localhost:9790/-/ready > /dev/null && break; sleep 2; done
+for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' localhost:9780/order; done
+for i in $(seq 15); do [ "$(./pq 'up' | wc -l)" -ge 2 ] && break; sleep 2; done
+./pq 'up'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200 0.051591s
+200 0.013317s
+200 0.010439s
+__name__=up instance=d18-api:8080 job=d18  =>  1
+__name__=up instance=d18-db:8080 job=d18  =>  1
+```
+
+</Expected>
+
+Trước các dòng này, `docker compose up` in tiến trình tạo mạng, volume và ba container, kết thúc bằng các dòng `Container … Started`. Ba request đều `200`, mỗi cái mất vài tới vài chục mili giây tuỳ truy vấn ngẫu nhiên. Vòng `for` thứ hai chờ tới khi Prometheus đã thu metric lần đầu; `up` bằng 1 nghĩa là lần thu gần nhất của target đó thành công. Nếu `docker compose up` báo lỗi, đọc nguyên văn thông báo của nó; hay gặp nhất là cổng đã bị chiếm, xem mục Gỡ lỗi.
+
+Trước khi đo, tính. Theo định luật Little, db có trần 4 / 0,02 = **200 truy vấn mỗi giây**, và vì mỗi request vào api gọi db đúng một lần, đó cũng là trần của cả hệ. Theo bảng của phần Kiến thức, đầu gối sẽ nằm quanh 80–90% của trần, tức khoảng 160–180 request mỗi giây. Bước sau kiểm hai dự đoán đó.
+
+<Check id="d23.1.lab-predict">Tính được trần và đầu gối dự kiến của hệ lab bằng định luật Little trước khi chạy load test.</Check>
+
+### 2. Tìm đầu gối bằng `ramping-arrival-rate`
+
+Kịch bản dưới đây là một bài test **breakpoint** theo mô hình mở: lưu lượng tăng theo bậc 40, 80, 120, 150, 170, 185, 200, 215 request mỗi giây, mỗi bậc giữ 15 giây. Mỗi request được gắn tag `rate` là bậc đang chạy, và `handleSummary` in một dòng cho mỗi bậc thay cho bản tóm tắt dài mặc định. Mấy dòng `thresholds` với điều kiện luôn đúng (`max>=0`, `count>=0`) chỉ để k6 tách số đo theo từng tag; chúng không phải tiêu chí đạt.
+
+<Terminal where="mac" title="~/masteva-d23/k6/knee.js">
+
+```bash
+cat > k6/knee.js <<'EOF'
+import http from 'k6/http';
+import exec from 'k6/execution';
+
+const RATES = [40, 80, 120, 150, 170, 185, 200, 215];
+const HOLD = 15;
+
+export const options = {
+  discardResponseBodies: true,
+  scenarios: {
+    knee: {
+      executor: 'ramping-arrival-rate',
+      startRate: RATES[0], timeUnit: '1s',
+      preAllocatedVUs: 300, maxVUs: 600,
+      stages: RATES.flatMap((r) => [{ target: r, duration: '1s' }, { target: r, duration: `${HOLD - 1}s` }]),
+    },
+  },
+  thresholds: Object.fromEntries(RATES.flatMap((r) => [
+    [`http_req_duration{rate:${r}}`, ['max>=0']], [`http_reqs{rate:${r}}`, ['count>=0']]])),
+  summaryTrendStats: ['p(50)', 'p(99)', 'max'],
+};
+
+export default function () {
+  const step = Math.min(Math.floor((Date.now() - exec.scenario.startTime) / 1000 / HOLD), RATES.length - 1);
+  http.get('http://d18-api:8080/order', { tags: { rate: String(RATES[step]) }, timeout: '10s' });
+}
+
+export function handleSummary(data) {
+  let out = 'mục tiêu  đạt/s    p50       p99       max\n';
+  for (const r of RATES) {
+    const d = data.metrics[`http_req_duration{rate:${r}}`].values;
+    const n = data.metrics[`http_reqs{rate:${r}}`].values.count;
+    out += `${String(r).padStart(6)}  ${(n / HOLD).toFixed(0).padStart(5)}  ${d['p(50)'].toFixed(0).padStart(5)} ms  ` +
+      `${d['p(99)'].toFixed(0).padStart(5)} ms  ${d.max.toFixed(0).padStart(5)} ms\n`;
+  }
+  const m = data.metrics;
+  return { stdout: out + `lỗi: ${m.http_req_failed.values.passes}, dropped_iterations: ${m.dropped_iterations ? m.dropped_iterations.values.count : 0}\n` };
+}
+EOF
+```
+
+</Terminal>
+
+Chạy nó, ghi lại thời điểm bắt đầu, rồi hỏi Prometheus mức dùng của db ở cuối mỗi bậc. k6 chạy trong container trên cùng mạng `d18-net` nên gọi được `d18-api` theo tên. Khối lệnh mất khoảng 2 phút 10 giây; trong lúc chờ, đọc trước phần giải thích bên dưới.
+
+<Terminal where="mac">
+
+```bash
+K6=grafana/k6:2.3.0@sha256:9c2dee7f8ed74d317e4027c06a10f169b625638189de8d4555d0b3486a5aeb34
+START=$(date +%s)
+docker run --rm --name d18-k6 --network d18-net -v "$PWD/k6:/scripts:ro" $K6 run --quiet /scripts/knee.js
+k=0; for r in 40 80 120 150 170 185 200 215; do k=$((k+1)); echo "$r req/s: db bận $(./pq 'round(100 * sum(rate(db_busy_seconds_total[10s])) / 4)' $((START + 15*k + 1)) | awk '{print $NF}')%"; done
+```
+
+</Terminal>
+
+<Predict question="Theo phép tính ở bước 1, p99 sẽ bắt đầu tăng mạnh ở bậc nào? Ở bậc 215, cao hơn trần 200, độ trễ sẽ ra sao?">
+
+```text
+mục tiêu  đạt/s    p50       p99       max
+    40     40     16 ms     90 ms    103 ms
+    80     79     16 ms     90 ms    105 ms
+   120    119     17 ms     93 ms    119 ms
+   150    149     20 ms    102 ms    139 ms
+   170    169     23 ms    100 ms    136 ms
+   185    184     40 ms    157 ms    223 ms
+   200    199    420 ms    861 ms    923 ms
+   215    208   1690 ms   1969 ms   2002 ms
+lỗi: 3, dropped_iterations: 103
+40 req/s: db bận 21%
+80 req/s: db bận 41%
+120 req/s: db bận 62%
+150 req/s: db bận 79%
+170 req/s: db bận 86%
+185 req/s: db bận 93%
+200 req/s: db bận 99%
+215 req/s: db bận 100%
+```
+
+Đọc bảng từ trên xuống:
+
+- **Tới 150 request mỗi giây (db bận 75%)**, p50 gần như không đổi và p99 nằm quanh 90–100 ms. p99 này đến từ chính các truy vấn chậm ngẫu nhiên (tối đa 100 ms), không phải từ xếp hàng.
+- **Ở 170 và 185 (db bận khoảng 85–95%)**, p50 bắt đầu tăng và p99 lên khoảng 110–300 ms tuỳ lượt: đầu gối, có thể rơi vào bậc 185 hoặc 200. Giữa hai bậc này, p99 có thể đứng yên hay thậm chí giảm nhẹ ở một lượt: 15 giây chỉ có vài chục request rơi vào 1% chậm nhất, nên p99 của từng bậc dao động.
+- **Ở 200 (db bận gần 100%)**, p99 nhảy lên vài trăm mili giây: thêm 15 request mỗi giây làm p99 gấp ba tới năm lần.
+- **Ở 215**, cột "đạt/s" dừng quanh 200–210 dù bạn gửi nhiều hơn: đó là trần đo được. Phần vượt trần không biến mất mà nằm trong hàng đợi, nên độ trễ tăng **theo thời gian**: bậc 215 tệ hơn bậc 200 vì nó thừa kế hàng đợi của bậc trước. Nếu hàng đợi dài tới mức request phải chờ quá 2 giây, api cắt chúng ở hạn chót đó: `max` dừng ở khoảng 2000 ms và dòng `lỗi` khác 0. k6 cũng có thể hết VU sẵn sàng và bỏ lượt (`dropped_iterations`).
+
+Mức dùng đo được khớp với dự đoán `λ × S / N`: 150 × 0,02 / 4 = 75%. Các con số của bạn sẽ khác, nhiều nhất ở ba bậc cuối: thời gian truy vấn là ngẫu nhiên, và trần đo được dao động trong khoảng 190–210 tuỳ máy bận hay rảnh (mỗi lần `time.Sleep` có thể dài hơn con số yêu cầu một chút). Vị trí đầu gối (từ bậc 170 tới 200) và hình dạng bảng thì giữ nguyên.
+
+</Predict>
+
+Từ bảng này, **điểm vận hành** của hệ là khoảng 150–170 request mỗi giây nếu SLO độ trễ là "p99 dưới 300 ms" (bước 4 kiểm lại), không phải 200. Trên production, đó là con số bạn dùng để tính headroom.
+
+<Check id="d23.1.lab-knee">Chạy được bài test breakpoint theo mô hình mở, đọc được đầu gối từ bảng p50, p99 theo bậc và mức dùng của tài nguyên nghẽn, và giải thích được vì sao trên trần thì độ trễ tăng theo thời gian.</Check>
+
+### 3. Cùng thông lượng, hai câu trả lời: coordinated omission
+
+Giờ đóng vai một người test không biết về mô hình mở: chạy 8 VU cố định trong 30 giây, xem hệ "chịu được" bao nhiêu. Rồi gửi đúng lưu lượng đó theo mô hình mở, như người dùng thật.
+
+<Terminal where="mac" title="~/masteva-d23/k6/model.js">
+
+```bash
+cat > k6/model.js <<'EOF'
+import http from 'k6/http';
+
+const closed = { executor: 'constant-vus', vus: Number(__ENV.VUS || 8), duration: '30s' };
+const open = { executor: 'constant-arrival-rate', rate: Number(__ENV.RATE || 190), timeUnit: '1s',
+  duration: '30s', preAllocatedVUs: 300, maxVUs: 600 };
+
+export const options = {
+  discardResponseBodies: true,
+  scenarios: { run: __ENV.MODEL === 'open' ? open : closed },
+  summaryTrendStats: ['p(50)', 'p(99)', 'max'],
+};
+
+export default function () {
+  http.get('http://d18-api:8080/order', { timeout: '10s' });
+}
+
+export function handleSummary(data) {
+  const m = data.metrics, d = m.http_req_duration.values;
+  const label = __ENV.MODEL === 'open' ? `open ${__ENV.RATE || 190}/s` : `closed ${__ENV.VUS || 8} VU`;
+  return { stdout: `${label}: đạt ${m.http_reqs.values.rate.toFixed(0)} req/s, p50 ${d['p(50)'].toFixed(0)} ms, ` +
+    `p99 ${d['p(99)'].toFixed(0)} ms, max ${d.max.toFixed(0)} ms, lỗi ${m.http_req_failed.values.passes}, ` +
+    `dropped ${m.dropped_iterations ? m.dropped_iterations.values.count : 0}\n` };
+}
+EOF
+K6=grafana/k6:2.3.0@sha256:9c2dee7f8ed74d317e4027c06a10f169b625638189de8d4555d0b3486a5aeb34
+docker run --rm --network d18-net -v "$PWD/k6:/scripts:ro" -e MODEL=closed -e VUS=8 $K6 run --quiet /scripts/model.js
+sleep 5
+docker run --rm --network d18-net -v "$PWD/k6:/scripts:ro" -e MODEL=open -e RATE=190 $K6 run --quiet /scripts/model.js
+```
+
+</Terminal>
+
+<Predict question="Hai lượt có thông lượng gần bằng nhau. p99 của chúng có gần nhau không?">
+
+```text
+closed 8 VU: đạt 192 req/s, p50 37 ms, p99 114 ms, max 143 ms, lỗi 0, dropped 0
+open 190/s: đạt 187 req/s, p50 250 ms, p99 543 ms, max 587 ms, lỗi 0, dropped 0
+```
+
+Không. Lượt đóng kết luận "hệ chịu khoảng 190 request mỗi giây với p99 dưới 120 ms, đạt SLO". Lượt mở, với gần đúng lưu lượng đó, cho p99 gấp khoảng ba tới năm lần. Lý do: 8 VU chỉ có tối đa 8 request đang chờ, nên hàng đợi ở db không bao giờ dài quá 4; khi db chậm, VU tự gửi chậm lại. Người dùng thật thì không chờ nhau: ở 190 request mỗi giây (sát trần đo được), hàng đợi dài ngắn ngẫu nhiên, có lúc vài chục request, và mỗi request trong đó đều chậm. Lượt đóng **không đo** những request đó vì nó không gửi chúng: coordinated omission.
+
+Con số của lượt mở dao động nhiều giữa các lần chạy (p99 từ khoảng 250 ms tới hơn nửa giây), vì sát trần thì độ dài hàng đợi rất nhạy với vài giây xui; lượt đóng thì lần nào cũng quanh 110–120 ms. Chạy lại khối lệnh vài lần để tự thấy. Chính sự dao động đó là thông tin: hệ đang vận hành ngay đầu gối.
+
+</Predict>
+
+Mô hình đóng không sai; nó trả lời câu hỏi "8 worker cố định gọi vào thì thông lượng là bao nhiêu". Nó chỉ sai khi dùng để trả lời câu hỏi về người dùng Internet.
+
+<Check id="d23.1.lab-co">Tái hiện được việc mô hình đóng báo p99 tốt hơn nhiều so với mô hình mở ở cùng thông lượng, và giải thích được bằng độ dài hàng đợi.</Check>
+
+### 4. SLO làm tiêu chí đạt, và cái bẫy của test một service
+
+Viết threshold từ SLO giả định của service: 99% request dưới 300 ms, tỉ lệ lỗi dưới 0,1%, và k6 phải gửi đủ tải. `handleSummary` in từng threshold kèm dấu `✓` hoặc `✗`; mã thoát của k6 vẫn do threshold quyết định.
+
+<Terminal where="mac" title="~/masteva-d23/k6/slo.js">
+
+```bash
+cat > k6/slo.js <<'EOF'
+import http from 'k6/http';
+
+export const options = {
+  discardResponseBodies: true,
+  scenarios: {
+    peak: { executor: 'constant-arrival-rate', rate: Number(__ENV.RATE), timeUnit: '1s',
+      duration: '30s', preAllocatedVUs: 200, maxVUs: 600 },
+  },
+  thresholds: {
+    'http_req_duration{expected_response:true}': ['p(99)<300'],
+    http_req_failed: ['rate<0.001'],
+    dropped_iterations: ['count<1'],
+  },
+  summaryTrendStats: ['p(50)', 'p(99)', 'max'],
+};
+
+export default function () {
+  http.get(`http://d18-api:8080/order${__ENV.MOCK ? '?mock=1' : ''}`, { timeout: '10s' });
+}
+
+export function handleSummary(data) {
+  let out = `${__ENV.RATE} req/s${__ENV.MOCK ? ' (db giả)' : ''}: đạt ${data.metrics.http_reqs.values.rate.toFixed(0)} req/s\n`;
+  for (const [name, m] of Object.entries(data.metrics)) {
+    for (const [expr, t] of Object.entries(m.thresholds || {})) {
+      const v = expr.startsWith('p(') ? `${m.values[expr.split('<')[0]].toFixed(1)} ms`
+        : expr.startsWith('rate') ? `${(m.values.rate * 100).toFixed(2)}%` : `${m.values.count}`;
+      out += `  ${t.ok ? '✓' : '✗'} ${name} ${expr}: ${v}\n`;
+    }
+  }
+  return { stdout: out };
+}
+EOF
+```
+
+</Terminal>
+
+Chạy ba lượt. Lượt đầu là cách nhiều đội test: chỉ service api, database thay bằng bản giả trả lời ngay (`MOCK=1`), ở 600 request mỗi giây. Hai lượt sau là cả hệ, ở 150 request mỗi giây (dưới đầu gối) và 210 request mỗi giây (trên trần). Sau mỗi lượt, `echo` in mã thoát của k6.
+
+<Terminal where="mac">
+
+```bash
+K6=grafana/k6:2.3.0@sha256:9c2dee7f8ed74d317e4027c06a10f169b625638189de8d4555d0b3486a5aeb34
+docker run --rm --network d18-net -v "$PWD/k6:/scripts:ro" -e RATE=600 -e MOCK=1 $K6 run --quiet /scripts/slo.js; echo "exit=$?"
+docker run --rm --network d18-net -v "$PWD/k6:/scripts:ro" -e RATE=150 $K6 run --quiet /scripts/slo.js; echo "exit=$?"
+docker run --rm --network d18-net -v "$PWD/k6:/scripts:ro" -e RATE=210 $K6 run --quiet /scripts/slo.js; echo "exit=$?"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+600 req/s (db giả): đạt 600 req/s
+  ✓ http_req_duration{expected_response:true} p(99)<300: 0.5 ms
+  ✓ http_req_failed rate<0.001: 0.00%
+  ✓ dropped_iterations count<1: 0
+exit=0
+150 req/s: đạt 150 req/s
+  ✓ http_req_failed rate<0.001: 0.00%
+  ✓ dropped_iterations count<1: 0
+  ✓ http_req_duration{expected_response:true} p(99)<300: 99.5 ms
+exit=0
+210 req/s: đạt 194 req/s
+  ✗ dropped_iterations count<1: 145
+  ✗ http_req_duration{expected_response:true} p(99)<300: 1828.3 ms
+  ✓ http_req_failed rate<0.001: 0.00%
+time="2026-10-18T05:40:02Z" level=error msg="thresholds on metrics 'dropped_iterations, http_req_duration{expected_response:true}' have been crossed"
+exit=99
+```
+
+</Expected>
+
+- **Test một service** đạt thoải mái ở 600 request mỗi giây với p99 dưới 1 mili giây. Nếu bạn dừng ở đây, bạn sẽ báo với đội sản phẩm một con số gấp ba lần trần thật.
+- **Cả hệ ở 150** đạt: p99 khoảng 100 ms, mã thoát 0. Thứ tự các dòng threshold có thể khác giữa các lượt.
+- **Cả hệ ở 210** trượt ngưỡng độ trễ: hàng đợi dài ra suốt 30 giây. Nó cũng trượt `dropped_iterations` vì k6 không kịp có VU rảnh để giữ nhịp, nên không gửi đủ tải. Ở một số lượt, hàng đợi dài tới mức api cắt request quá 2 giây và ngưỡng tỉ lệ lỗi cũng trượt. k6 in thêm một dòng `level=error` và thoát mã **99**; một pipeline có bước này sẽ dừng. Nếu thử `RATE=190` vài lần, bạn sẽ thấy lúc đạt lúc trượt: đó là dấu hiệu bạn đang đứng ngay đầu gối, không phải là k6 thất thường.
+
+Kết luận dùng được cho kế hoạch dung lượng: một cell của hệ này phục vụ được khoảng **150–170 request mỗi giây** trong SLO.
+
+<Check id="d23.1.lab-slo">Viết được threshold k6 từ SLO, chứng minh bằng mã thoát rằng hệ đạt ở một mức tải và trượt ở mức khác, và chỉ ra được bằng số đo vì sao test một service với phụ thuộc giả cho trần sai.</Check>
+
+### 5. Dự báo ngày phải thêm dung lượng
+
+Bạn chưa có 120 ngày metric của production, nên bước này **nạp lịch sử** (backfill) vào Prometheus như D16.1: một chuỗi `job:http_requests:rate5m` (request mỗi giây, trung bình 5 phút, gộp theo `job`: tên theo quy ước `level:metric:operations` của recording rule ở D12.3), mỗi 5 phút một mẫu, với ba thành phần như lưu lượng thật của một cửa hàng ở Việt Nam:
+
+- Chu kỳ ngày: đỉnh lúc 20 giờ 30 (giờ Việt Nam), một đỉnh nhỏ buổi trưa, gần như không có gì lúc rạng sáng.
+- Chu kỳ tuần: thứ Bảy và Chủ nhật cao hơn 20%.
+- Tăng trưởng: mức nền tăng 0,4 request mỗi giây mỗi ngày.
+
+Lịch sử phải kết thúc trước mẫu đầu tiên Prometheus đã thu: tài liệu Prometheus (phần Backfilling) ghi rằng nạp dữ liệu vào 3 giờ gần nhất, phần head block mà Prometheus vẫn đang ghi, là không an toàn; D16.1 đã gặp đúng giới hạn này. Cờ `--max-block-duration=720h` cho `promtool` ghi 120 ngày thành vài block lớn thay vì hơn một nghìn block 2 giờ; Prometheus đã được chạy với `--storage.tsdb.retention.time=180d` ở bước 1, vì với mặc định 15 ngày nó sẽ xoá ngay phần lịch sử cũ hơn.
+
+<Terminal where="mac">
+
+```bash
+HEAD_MIN=$(curl -s localhost:9790/api/v1/status/tsdb | jq '.data.headStats.minTime / 1000 | floor')
+awk -v end="$((HEAD_MIN - 60))" 'BEGIN {
+  print "# HELP job:http_requests:rate5m Request mỗi giây của cửa hàng, trung bình 5 phút."
+  print "# TYPE job:http_requests:rate5m gauge"
+  start = end - 120 * 86400
+  for (t = start; t <= end; t += 300) {
+    day = (t - start) / 86400
+    h = ((t + 7 * 3600) % 86400) / 3600
+    dow = int((t + 7 * 3600) / 86400 + 4) % 7
+    base = 50 + 0.4 * day
+    shape = 0.25 + 0.75 * exp(-((h - 20.5) ^ 2) / 6) + 0.3 * exp(-((h - 12) ^ 2) / 3)
+    week = (dow == 0 || dow == 6) ? 1.2 : 1
+    v = base * shape * week * (1 + 0.04 * sin(t / 997))
+    printf "job:http_requests:rate5m{job=\"shop\"} %.2f %d\n", v, t
+  }
+  print "# EOF"
+}' > prometheus/history.om
+wc -l < prometheus/history.om
+BLOCKS_BEFORE=$(curl -s localhost:9790/api/v1/status/tsdb/blocks | jq '.data.blocks | length')
+docker exec d18-prom promtool tsdb create-blocks-from openmetrics --max-block-duration=720h /etc/prometheus/history.om /prometheus | wc -l
+for i in $(seq 40); do [ "$(curl -s localhost:9790/api/v1/status/tsdb/blocks | jq '.data.blocks | length')" -gt "$BLOCKS_BEFORE" ] && break; sleep 5; done
+./pq 'max_over_time(job:http_requests:rate5m[1d])'
+./pq 'avg_over_time(job:http_requests:rate5m[1d])'
+./pq 'max_over_time(job:http_requests:rate5m[7d])'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   34564
+       8
+job=shop  =>  115.27
+job=shop  =>  49.263
+job=shop  =>  117.32
+```
+
+</Expected>
+
+File có 34.561 mẫu (120 ngày × 288 mẫu mỗi ngày, cộng mẫu cuối) cộng ba dòng mô tả. `promtool` in một dòng tiêu đề rồi một dòng cho mỗi block: 7 hoặc 8 dòng, tức 6 hoặc 7 block dài khoảng 20 ngày tuỳ chỗ cắt. Vòng `for` đếm số block Prometheus đang có trước khi nạp (biến `BLOCKS_BEFORE`), rồi chờ tới khi con số đó tăng, thường dưới một phút; nếu bạn để Prometheus chạy nhiều giờ trước bước này, nó đã tự cắt head thành block của chính nó, nên chỉ chờ "có block" là không đủ. Ba truy vấn cho thấy vì sao trung bình vô dụng cho kế hoạch dung lượng: đỉnh của 24 giờ qua khoảng 100–115 request mỗi giây, trung bình chỉ khoảng 40–50; đỉnh của 7 ngày (rơi vào cuối tuần) khoảng 120. Các số của bạn lệch tuỳ giờ và ngày trong tuần bạn chạy: nếu 24 giờ qua có một tối thứ Bảy hay Chủ nhật, đỉnh ngày gần bằng đỉnh tuần.
+
+Giờ dự báo 60 ngày tới bằng hai cách, và tính tốc độ tăng của đỉnh mỗi 30 ngày:
+
+<Terminal where="mac">
+
+```bash
+./pq 'predict_linear(job:http_requests:rate5m[30d], 60 * 86400)'
+./pq 'predict_linear(max_over_time(job:http_requests:rate5m[7d])[60d:1d], 60 * 86400)'
+./pq 'deriv(max_over_time(job:http_requests:rate5m[7d])[60d:1d]) * 30 * 86400'
+```
+
+</Terminal>
+
+<Predict question="Cách thứ nhất dựng đường thẳng qua mọi mẫu 5 phút của 30 ngày. Nó sẽ dự báo đỉnh 60 ngày tới là bao nhiêu?">
+
+```text
+job=shop  =>  52.175
+job=shop  =>  150.387
+job=shop  =>  15.218
+```
+
+Cách thứ nhất dự báo khoảng 50, thấp hơn cả đỉnh **hôm nay**: đường thẳng qua dữ liệu có chu kỳ ngày đi qua giữa đỉnh và đáy, và vì cửa sổ kết thúc ở một thời điểm bất kỳ trong ngày, con số còn đổi theo giờ bạn chạy. Cách thứ hai lấy đỉnh 7 ngày của từng ngày trong 60 ngày (subquery `[60d:1d]`) rồi mới dựng đường thẳng: khoảng 150 request mỗi giây sau 60 ngày. `deriv` cho độ dốc của chính đường đó: đỉnh tăng khoảng 15 request mỗi giây mỗi 30 ngày.
+
+</Predict>
+
+Ghép với số đo của bạn. Giả sử production chạy hệ này thành **3 cell** sau load balancer, mỗi cell có điểm vận hành khoảng 170 request mỗi giây (bước 2 và bước 4). Theo N+1, mất một cell thì hai cell còn lại phải gánh hết, nên ngưỡng an toàn cho đỉnh của cả hệ là 170 × 2 = **340** request mỗi giây, không phải 170 × 3 = 510. Viết điều kiện đó thành truy vấn: "30 ngày nữa đỉnh có vượt ngưỡng không", và "còn bao nhiêu ngày".
+
+<Terminal where="mac">
+
+```bash
+./pq 'predict_linear(max_over_time(job:http_requests:rate5m[7d])[60d:1d], 30 * 86400) > 340'
+./pq '(340 - max_over_time(job:http_requests:rate5m[7d])) / deriv(max_over_time(job:http_requests:rate5m[7d])[60d:1d]) / 86400'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+job=shop  =>  438.986
+```
+
+</Expected>
+
+Truy vấn đầu không in gì: 30 ngày nữa đỉnh dự báo khoảng 135, chưa tới 340, nên phép so sánh lọc mất chuỗi, đúng cách một alert rule của D12.4 "không kêu". Truy vấn thứ hai cho số ngày còn lại tới khi đỉnh chạm 340 với tốc độ tăng hiện tại: khoảng 420–440 ngày. Với lead time vài phút của cloud, bạn có dư thời gian; với lead time ba tháng để mua máy chủ, bạn vẫn còn dư, và lần xem lại tiếp theo là sau đợt sự kiện lớn kế tiếp, vì sự kiện không nằm trên đường thẳng này. Ở production, đặt truy vấn thứ nhất thành alert dạng ticket (D16.2) với `30 * 86400` thay bằng lead time thật của bạn.
+
+<Check id="d23.1.lab-forecast">Nạp được lịch sử bằng `promtool`, chỉ ra được bằng truy vấn vì sao `predict_linear` trên dữ liệu thô cho kết quả sai, và tính được số ngày tới khi đỉnh chạm ngưỡng an toàn theo N+1.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`Bind for 127.0.0.1:9780 failed: port is already allocated`:** cổng đang bị chiếm, thường bởi một lab khác. Tìm bằng `docker ps --filter publish=9780`, hoặc đổi cổng bên trái dấu `:` trong `compose.yaml`.
+- **Bảng ở bước 2 có `đạt/s` thấp hơn mục tiêu ngay từ bậc đầu, hoặc `dropped_iterations` lớn ở mọi bậc:** k6 hoặc Docker không đủ CPU. Đóng bớt ứng dụng, kiểm `docker stats`; trên máy 8 GB, đảm bảo Docker VM có ít nhất 2 CPU.
+- **Dòng `db bận` in rỗng:** Prometheus chưa có dữ liệu ở thời điểm hỏi, thường vì `docker run` của k6 phải kéo image và bắt đầu muộn. Chạy lại khối lệnh; image đã có sẵn thì lệch không quá một giây.
+- **`./pq` in `LỖI: ... bad_data`:** truy vấn sai cú pháp; kiểm dấu nháy đơn quanh truy vấn.
+- **Vòng chờ ở bước 5 hết 200 giây mà các truy vấn không in gì:** `promtool` báo lỗi; xem bằng cách chạy lại riêng lệnh `docker exec … promtool …` không có `| wc -l`. Đừng chạy khối nạp lịch sử hai lần: lần hai nạp thêm một bộ block trùng đúng khoảng thời gian đó. Nếu lỡ chạy, xoá volume theo mục Dọn dẹp rồi làm lại từ bước 1.
+- **Lượt `MOCK=1` ở bước 4 có `dropped_iterations` khác 0:** máy không sinh nổi 600 request mỗi giây; giảm `RATE=600` xuống 400, kết luận không đổi.
+
+</Callout>
+
+### Dọn dẹp
+
+D18.2 dùng lại image `d18-app:1`, thư mục `~/masteva-d23` và viết lại `compose.yaml`. Nếu học tiếp ngay, chỉ dừng hệ:
+
+<Terminal where="mac">
+
+```bash
+docker compose down
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Ba lệnh dưới xoá vĩnh viễn volume `d18-prom-data` (toàn bộ metric và lịch sử vừa nạp), image `d18-app:1` và thư mục `~/masteva-d23`. Chỉ chạy khi không học D18.2 nữa.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn">
+
+```bash
+docker compose down -v
+docker rmi d18-app:1
+cd ~ && rm -rf ~/masteva-d23
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không dùng CPU làm thước đo dung lượng cho mọi service?">
+
+Vì CPU chỉ là một trong nhiều tài nguyên có `N` chỗ. Trong lab, CPU của api và db gần như rảnh khi hệ đã chạm trần: tài nguyên nghẽn là 4 "kết nối". Ở production, thứ chạm trần trước thường là pool kết nối database, số worker của một proxy, hạn mức của API bên ngoài hay khoá trên một hàng nóng; HPA theo CPU (K5.3) sẽ không thêm pod nào trong khi người dùng chờ. Cách làm: load test tới đầu gối, xem USE (D12.3) của từng tài nguyên lúc đó để biết cái nào bão hoà trước, rồi lấy metric của **chính nó** (hoặc lưu lượng request, vì Little nối hai thứ) làm thước đo dung lượng và tín hiệu scale.
+
+</Reveal>
+
+<Reveal title="Load test trên staging nhỏ hơn production có dùng được không?">
+
+Dùng được nếu bạn đo trên một đơn vị có thể nhân lên và kiểm rằng nó nhân lên tuyến tính. Ví dụ: một cell gồm 2 pod api và một database bản nhỏ cho đầu gối ở 170 request mỗi giây; production có 10 cell giống hệt thì trần khoảng 1.700, với điều kiện không có tài nguyên **dùng chung** giữa các cell (một database chính, một cache, một hạn mức API chung). Tài nguyên dùng chung không nhân lên, và đầu gối của nó phải được test riêng ở quy mô thật, hoặc tính bằng Little từ số đo trên đơn vị nhỏ. Bỏ qua bước này là cách phổ biến nhất để staging "đạt" mà production gãy.
+
+</Reveal>
+
+<Reveal title="Vì sao p99 ở mức tải thấp của lab đã là 100 ms, và điều đó có ý nghĩa gì?">
+
+Vì thời gian truy vấn trong lab theo phân phối mũ, bị cắt ở 5 lần trung bình: khoảng 1% truy vấn mất gần 100 ms dù không phải chờ ai. Đó là độ trễ **nội tại**, có ngay cả khi hệ rảnh, và không có load test hay headroom nào làm nó giảm; muốn p99 thấp hơn thì phải sửa chính truy vấn chậm (index, cache, chia nhỏ việc). Load test cho bạn phần **xếp hàng** cộng thêm trên nền đó. Khi đặt SLO, tách hai phần này ra: nếu p99 lúc rảnh đã sát ngưỡng SLO, đầu gối sẽ đến rất sớm.
+
+</Reveal>
+
+<Reveal title="Có nên chạy load test vào production không?">
+
+Nhiều công ty làm, vì chỉ production mới có đúng dữ liệu, đúng cache và đúng hạ tầng. Điều kiện tối thiểu: request test được đánh dấu (header hoặc tài khoản riêng) để loại khỏi số liệu kinh doanh và không gây tác dụng phụ như trừ kho, gửi email; có công tắc dừng ngay lập tức; tăng tải từ từ và theo dõi burn rate của SLO (D16.2) để dừng trước khi tiêu hết budget; và báo trước cho các đội có phụ thuộc. Chạy ở giờ thấp điểm cho bạn đo được phần trên của đường cong mà không cạnh tranh với người dùng thật.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết kịch bản k6 nhanh và đúng cú pháp, nhưng hay mặc định dùng `vus` và `duration` (mô hình đóng), không có threshold, hoặc có threshold trên trung bình (`avg<200`) thay vì percentile, và quên `dropped_iterations`. Khi nhờ AI phân tích kết quả, nó hay kết luận "hệ chịu được X request mỗi giây" từ thông lượng mà không nhìn độ trễ ở mức đó. Kiểm lại bằng ba câu hỏi: executor là mô hình nào, threshold có lấy từ SLO không, và k6 có gửi đủ tải không. Với dự báo, AI hay viết `predict_linear` thẳng trên counter hoặc trên chuỗi có chu kỳ ngày; chạy cả hai truy vấn của bước 5 để so.
+
+</Callout>
+
+<Callout kind="link">
+
+D18.2 dùng chính hệ này để đẩy nó quá trần, xem retry làm tải nhân lên thế nào và sửa từng lớp. D18.3 đi xuống tầng hệ điều hành và mạng khi trần nằm ở kernel. SLO và burn rate dùng làm tiêu chí ở đây đến từ D16.1 và D16.2. Tự động scale theo metric là K5.3 và K5.4; chaos engineering có hệ thống thuộc chặng D17. Ở roadmap Spring Boot, SB12.1 và SB12.2 đo và chỉnh hiệu năng bên trong một service JVM (thread pool, pool kết nối, profiler), phần mà bài này coi là một hộp đen có trần.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d23.1.mastery-plan">Tự lập được kế hoạch dung lượng cho một hệ: tính trần bằng Little, đo đầu gối bằng test breakpoint mô hình mở, chọn điểm vận hành theo SLO và headroom theo N+1 hoặc theo zone.</Check>
+
+<Check id="d23.1.mastery-test">Tự viết được bài load test cả hệ có threshold từ SLO, chọn đúng mô hình sinh tải, và nhận ra được kết quả bị coordinated omission hoặc phụ thuộc giả làm sai.</Check>
+
+<Check id="d23.1.mastery-forecast">Viết được truy vấn dự báo trên đỉnh và alert dung lượng theo lead time, và giải thích được vì sao sự kiện phải lên kế hoạch riêng.</Check>
+
+</Mastery>

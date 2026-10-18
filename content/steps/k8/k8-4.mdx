@@ -1,0 +1,560 @@
+---
+title: Xác minh chữ ký image khi triển khai
+description: Đặt bước kiểm chữ ký image vào admission của Kubernetes bằng ImageValidatingPolicy của Kyverno - ký bằng cosign với khoá của lab, đẩy vào registry cục bộ, chặn image không chữ ký hoặc ký bằng khoá lạ, ghim digest vào pod - và gặp một cái bẫy tương thích có thật giữa định dạng chữ ký của cosign 3 và Kyverno 1.19.
+id: k8.4
+step: k8
+prerequisites: [k8.3]
+topics: [k8.xac-minh-image]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    kyverno: 1.19.1
+    cosign: v3.1.3
+    crane: v0.22.1
+    registry: 3.1.2
+    jq: 1.8.2
+---
+
+<Goal>
+
+Chữ ký image chỉ có giá trị ở nơi có người kiểm và từ chối khi sai. Bài này đặt nơi kiểm đó vào API server, chỗ mọi pod phải đi qua dù được tạo bằng `kubectl`, pipeline, GitOps hay một operator. Học xong, bạn:
+
+- Viết được ImageValidatingPolicy chỉ cho chạy image của registry nội bộ có chữ ký của khoá phát hành.
+- Giải thích được vì sao pod phải chạy đúng **digest** đã được xác minh, và Kyverno làm điều đó thế nào.
+- Giải thích được vì sao `cosign verify` báo chữ ký hợp lệ mà Kyverno vẫn từ chối image, và tìm ra nguyên nhân.
+- Biết khoảng cách giữa lab (khoá trong file, không log minh bạch) và production (ký keyless, log minh bạch Rekor, khoá trong KMS; mục Kiến thức giải thích từng thứ), và cách khai việc kiểm attestation provenance trong policy.
+
+</Goal>
+
+<Knowledge>
+
+### Từ chữ ký tới luật của cụm
+
+D14 (chặng chuỗi cung ứng phần mềm của roadmap DevOps) dạy phía **ký**: cosign ký lên **digest** của image (mã băm nội dung, không đổi được, khác với tag là cái tên dời được), chữ ký là một artifact thứ hai nằm cùng repo trong registry, và người xác minh cần khoá công khai để kiểm. Cách thứ hai là **keyless**: không có khoá dài hạn; lúc ký, người ký chứng minh danh tính qua OIDC (ví dụ danh tính của job CI) và nhận chứng chỉ ngắn hạn từ **Fulcio** (CA của Sigstore); người xác minh kiểm danh tính và nhà phát hành OIDC thay cho khoá. **Rekor** là log minh bạch của Sigstore: mỗi lần ký ghi một dòng không sửa được, cho mốc thời gian độc lập. Nếu bạn chỉ học roadmap Kubernetes, ba câu đó là đủ để theo bài này.
+
+Phía **xác minh** trong cụm là một admission webhook (K8.3): mỗi lần có pod, hay template pod trong Deployment, Job…, Kyverno đọc danh sách image, hỏi registry chữ ký của từng image, kiểm bằng khoá đã khai, rồi cho qua hoặc từ chối.
+
+```text
+ kubectl apply deployment (image: k8-registry:5000/shop/api:1.0)
+        |
+        v
+ API server -> mutating webhook của Kyverno (ImageValidatingPolicy)
+        |   1. image khớp matchImageReferences? (k8-registry:5000/shop/*)
+        |   2. hỏi registry: tag 1.0 đang trỏ tới digest nào?        -> sha256:e50b…
+        |   3. tìm chữ ký của digest đó trong registry
+        |   4. kiểm chữ ký bằng khoá công khai của attestor
+        |   5. mutateDigest: sửa image thành 1.0@sha256:e50b…
+        v
+ validating webhook của Kyverno: biểu thức CEL trong validations
+        |   verifyImageSignatures(image, [attestors.release]) > 0 ?
+        v
+ lưu vào etcd; kubelet kéo đúng digest đã kiểm
+```
+
+Bước 5 đóng một khe hở mà D14.2 đã nêu: kiểm theo tag rồi chạy theo tag thì tag có thể dời giữa hai bước. Sau khi Kyverno ghi digest vào pod spec, node chỉ kéo đúng những byte đã được xác minh, bất kể tag về sau trỏ đi đâu.
+
+<Check id="k8.4.luong-xac-minh">Kể được các bước Kyverno làm khi một pod có image khớp policy được tạo, và giải thích được vì sao ghi digest vào pod spec là phần của việc xác minh.</Check>
+
+### ImageValidatingPolicy
+
+Loại policy của Kyverno (`policies.kyverno.io/v1`, K8.3) dành cho image, thay cho rule `verifyImages` của `ClusterPolicy` cũ. Các phần chính:
+
+| Trường | Ý nghĩa |
+|---|---|
+| `matchConstraints` | Như ValidatingAdmissionPolicy: loại tài nguyên và thao tác. Khai `pods`; Kyverno tự áp cho template pod của Deployment, StatefulSet, Job, CronJob |
+| `matchImageReferences` | Image nào phải kiểm, theo `glob` hoặc biểu thức CEL. Image không khớp thì policy bỏ qua (không chặn) |
+| `attestors` | Ai được tin: `cosign.key` (khoá công khai, KMS) hoặc `cosign.keyless` (danh tính và nhà phát hành OIDC, trust root của Sigstore); `ctlog` cấu hình log minh bạch Rekor |
+| `attestations` | Attestation cần kiểm (in-toto, ví dụ provenance SLSA), cho phần mở rộng ở cuối mục Kiến thức |
+| `validations` | Biểu thức CEL dùng `verifyImageSignatures`, `verifyAttestationSignatures`, `extractPayload` |
+| `validationConfigurations` | `mutateDigest` (ghi digest vào pod), `verifyDigest` (đòi image theo digest), `required` (image khớp mà không được kiểm thì từ chối) |
+| `credentials` | Cách đăng nhập registry riêng; `allowInsecureRegistry` cho registry HTTP của lab |
+
+`matchImageReferences` là chỗ hay để lọt: một policy chỉ khớp `k8-registry:5000/shop/*` không nói gì về `docker.io/...`. Luật "chỉ được chạy image từ registry nội bộ" phải là một luật riêng (VAP image-registry ở K8.3), và hai luật đi cùng nhau.
+
+### Chữ ký nằm ở đâu, và hai định dạng
+
+Registry không có chỗ riêng cho chữ ký; cosign lưu nó như một artifact OCI trong cùng repo. Có hai định dạng, và chúng tìm lại chữ ký theo cách khác nhau:
+
+| | cosign 2, và cosign 3 khi tắt bundle | cosign 3 mặc định (bundle) |
+|---|---|---|
+| Artifact | Manifest có layer `application/vnd.dev.cosign.simplesigning.v1+json`, chữ ký trong annotation | Sigstore **bundle**: một file gói chữ ký cùng mọi thứ cần để kiểm nó (chứng chỉ hay khoá, bằng chứng từ log), kiểu `application/vnd.dev.sigstore.bundle.v0.3+json` |
+| Tìm lại bằng | Tag theo quy ước `sha256-<digest>.sig` | Referrers API của OCI 1.1 (`/v2/<repo>/referrers/<digest>`); registry không có API này thì một tag dự phòng `sha256-<digest>` chứa index các referrer |
+| Payload ký | Digest và tên repo (`docker-reference`) | in-toto statement chỉ có digest |
+
+Người ký và người xác minh phải hiểu cùng định dạng. Bước 2 của lab cho bạn gặp trường hợp chúng không hiểu nhau: cosign 3.1.3 ký mặc định bằng bundle, `cosign verify` xác nhận hợp lệ, còn Kyverno 1.19.1 với khoá công khai báo `no signatures found`. Kyverno có các báo lỗi về chữ ký bundle: [#16664](https://github.com/kyverno/kyverno/issues/16664) (cho `verifyImages`, registry không có referrers API) và [#17363](https://github.com/kyverno/kyverno/issues/17363) (xác minh bằng khoá thất bại với bundle, đã sửa trên nhánh chính sau 1.19.1). Triệu chứng gần giống, nhưng nguyên nhân chính xác ở 1.19.1 với registry của lab chưa được chỉ rõ trong issue nào. Cách lab xử lý là ký thêm ở định dạng cũ, thứ cả hai bên cùng đọc được. Bài học rộng hơn: thử xác minh **bằng chính thành phần admission** trước khi đổi cách ký trong pipeline, không chỉ bằng CLI.
+
+<Check id="k8.4.dinh-dang">So sánh được hai định dạng chữ ký của cosign (lưu ở đâu, tìm lại bằng gì), và giải thích được vì sao CLI xác minh được mà admission thì không.</Check>
+
+### Lab và production khác nhau ở đâu
+
+Lab dùng cặp khoá trong file, mật khẩu rỗng, và tắt log minh bạch, để không gửi gì ra ngoài máy. Mỗi lựa chọn đó có giá trên production:
+
+| Lab | Production | Vì sao |
+|---|---|---|
+| Khoá riêng trong file | Khoá trong KMS (`cosign.key.kms`), hoặc keyless | Khoá trong file lộ là ai cũng ký được; KMS thu quyền ký bằng IAM, có nhật ký |
+| Khoá công khai dán vào policy | Keyless: `identity` (ví dụ đường dẫn workflow CI) và `issuer` cụ thể | Không còn khoá để xoay vòng; nhưng phải ghim **danh tính**, không chỉ nhà phát hành (D14.2) |
+| `insecureIgnoreTlog: true` | Kiểm log Rekor (công cộng hoặc tự vận hành) | Log cho mốc thời gian độc lập và cho phép phát hiện chữ ký lạ của khoá mình |
+| `allowInsecureRegistry: true` | Registry có TLS | Kyverno gọi registry qua mạng ở mỗi lần admission |
+
+Hai điều vận hành nữa. Kyverno gọi registry ở mỗi lần admission (có cache), nên registry chậm hay sập ảnh hưởng thẳng tới việc tạo pod, theo `failurePolicy` của K8.3. Và bản sao image sang registry khác (mirror, thăng cấp môi trường) phải chép cả chữ ký; công cụ chỉ chép image sẽ để lại image không chữ ký ở đích (D14.2 đã cho thấy với `crane copy` và `oras copy -r`).
+
+Kiểm **provenance** (D14.4: image build từ repo nào, nhánh nào, bởi hệ build nào) dùng cùng policy: khai `attestations` kiểu in-toto với `type: https://slsa.dev/provenance/v1`, một attestor là khoá của hệ build, và trong `validations` gọi `verifyAttestationSignatures(image, attestations.provenance, [attestors.builder])` rồi đọc trường bằng `extractPayload(image, attestations.provenance).predicate…`. Lab không chạy phần kiểm attestation. Nếu bạn làm trên cụm của mình, áp đúng cách của bước 2: tạo attestation bằng cả hai định dạng (bundle và định dạng cũ), rồi thử bằng chính Kyverno, không chỉ bằng `cosign verify-attestation`, trước khi dựa vào luật này.
+
+<Check id="k8.4.production">Kể được bốn điểm lab đơn giản hoá so với production và hệ quả của mỗi điểm, và nêu được hai rủi ro vận hành khi admission phụ thuộc registry.</Check>
+
+<Callout kind="production">
+
+Ngày 26/03/2021, Aviv Sasson của Unit 42 (Palo Alto Networks) [công bố](https://unit42.paloaltonetworks.com/malicious-cryptojacking-images/) 30 image độc hại trên Docker Hub, thuộc 10 tài khoản, tổng cộng hơn 20 triệu lượt kéo. Hầu hết chứa XMRig để đào Monero; tác giả ước tính các chiến dịch này mang về khoảng 200.000 USD, con số ngoại suy từ một nửa số image dùng pool có công bố thu nhập. Bài viết nêu cách các image này được dùng: trong các cuộc tấn công vào hạ tầng cloud, kẻ tấn công triển khai miner bằng một image trên Docker Hub, vì ở một số môi trường đó là registry mặc định. Tác giả cho rằng vấn đề còn lớn hơn những gì tìm thấy, vì bộ quét của ông chỉ bắt được payload đơn giản.
+
+Điều rút ra (của bài): kẻ tấn công đã có quyền tạo pod sẽ kéo công cụ của họ từ nơi dễ nhất, và một cụm chấp nhận image từ bất kỳ registry nào giúp họ. Hai luật đi cùng nhau chặn được kiểu này: chỉ nhận image từ registry nội bộ (VAP của K8.3), và chỉ nhận image có chữ ký của khoá phát hành (bài này). Chữ ký không giúp gì nếu bản thân pipeline ký bị chiếm; phần đó là của D14.4 và D14.5.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [ImageValidatingPolicy (Kyverno)](https://kyverno.io/docs/policy-types/image-validating-policy/): attestor bằng khoá, keyless, KMS; `attestations`; các hàm CEL và `validationConfigurations`.
+- [Verifying Signatures (Sigstore)](https://docs.sigstore.dev/cosign/verifying/verify/): các cờ xác minh, `--certificate-identity` và `--certificate-oidc-issuer` cho keyless.
+- [OCI Distribution Specification: Listing Referrers](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers): referrers API và cơ chế tag dự phòng mà bước 2 gặp.
+- [Unit 42: Malicious Cryptojacking Images Found on Docker Hub](https://unit42.paloaltonetworks.com/malicious-cryptojacking-images/): nguồn của callout.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Cần cụm `k8-lab` có Kyverno từ K8.3. Lab chạy registry `registry:3` trong container `k8-registry`, gắn vào network `kind` của Docker để node kéo được image theo tên `k8-registry:5000`, và mở cổng `9775` trên `127.0.0.1` để bạn hỏi nó từ máy. cosign 3.1.3 và crane chạy bằng image ghim digest (như D14.1, D14.2), không cài gì lên máy.
+
+**Profile máy.** Như cuối K8.3: node kind khoảng 1,4 GiB RAM của Docker, registry dưới 60 MiB. Nếu máy chưa có từ D14, lab tải image cosign (khoảng 60 MB), crane và registry (mỗi thứ vài chục MB).
+
+Khối đầu dựng registry, khai cho containerd trong node rằng `k8-registry:5000` nói HTTP thường (file `hosts.toml`, containerd đọc lại thư mục này khi kéo image, không cần khởi động lại), viết `env.sh` với hai hàm `crane` và `cosign`, rồi chép hai image nhỏ làm "ứng dụng": `shop/api:1.0` và `shop/api:1.1`. Cả hai chỉ là image `pause` của Kubernetes (chạy một tiến trình chờ mãi): bài cần hai digest khác nhau, không cần ứng dụng thật. `--platform` chỉ chép bản đúng kiến trúc máy bạn, cho nhanh.
+
+<Terminal where="mac" title="~/masteva-k8/k8-4/env.sh">
+
+```bash
+export KUBECONFIG=~/masteva-k8/kubeconfig
+mkdir -p ~/masteva-k8/k8-4/keys && cd ~/masteva-k8/k8-4
+docker run -d --name k8-registry --network kind -p 127.0.0.1:9775:5000 \
+  registry:3.1.2@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8 > /dev/null
+docker exec -i k8-lab-control-plane sh -c 'mkdir -p "/etc/containerd/certs.d/k8-registry:5000" && cat > "/etc/containerd/certs.d/k8-registry:5000/hosts.toml"' <<'EOF'
+server = "http://k8-registry:5000"
+
+[host."http://k8-registry:5000"]
+  capabilities = ["pull", "resolve"]
+EOF
+cat > env.sh <<'EOF'
+CRANE=gcr.io/go-containerregistry/crane:v0.22.1@sha256:1f968817b95790bed063f71175aa6b8ff879fa17064020415f3e18bb6e6a36e1
+COSIGN=ghcr.io/sigstore/cosign/cosign:v3.1.3@sha256:9e5c2f2edc34351160407ca3416c61855bdf9403c3c5936e0f0be7fc261611b8
+tool() { docker run --rm --user "$(id -u):$(id -g)" --network kind \
+  -v "$HOME/masteva-k8/k8-4":/work -w /work -e HOME=/tmp "$@"; }
+crane()  { tool $CRANE "$@"; }
+cosign() { tool -e COSIGN_PASSWORD $COSIGN "$@"; }
+EOF
+. ./env.sh
+ARCH=$(docker version --format '{{.Server.Arch}}')
+crane copy --insecure --platform linux/$ARCH registry.k8s.io/pause:3.10 k8-registry:5000/shop/api:1.0 2>&1 | grep -o 'digest: .*'
+crane copy --insecure --platform linux/$ARCH registry.k8s.io/pause:3.10.1 k8-registry:5000/shop/api:1.1 2>&1 | grep -o 'digest: .*'
+kubectl create namespace shop
+kubectl label namespace shop pod-security.kubernetes.io/warn=baseline
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+digest: sha256:e50b7059b633caf3c1449b8da680d11845cda4506b513ee7a2de00725f0a34a7 size: 501
+digest: sha256:e9c466420bcaeede00f46ecfa0ca8cd854c549f2f13330e2723173d88f2de70f size: 501
+namespace/shop created
+namespace/shop labeled
+```
+
+</Expected>
+
+Digest trên máy x86-64 sẽ khác (đó là bản amd64 của cùng image); các lệnh sau tự đọc digest nên không cần sửa gì. Mọi lệnh `crane` và `cosign` chạy trong network `kind` và gọi registry bằng tên `k8-registry:5000`, đúng tên mà node và Kyverno dùng, để tên trong chữ ký khớp tên trong pod spec. Mở terminal mới giữa bài thì chạy lại `export KUBECONFIG=~/masteva-k8/kubeconfig`, `cd ~/masteva-k8/k8-4 && . ./env.sh` và `export COSIGN_PASSWORD=""`. Biến `D10`, `D11` của các bước sau cũng mất theo terminal: `D11=$(crane digest --insecure k8-registry:5000/shop/api:1.1)` lấy lại được bất cứ lúc nào; `D10` thì lấy lại bằng `D10=$(crane digest --insecure k8-registry:5000/shop/api:1.0)` chỉ khi chưa làm bước 3 (bước 3 dời tag `1.0`), sau đó chép giá trị từ dòng `D10=` đã in ở bước 2. Thiếu biến, các lệnh sẽ hỏng lặng lẽ với tên image cụt như `k8-registry:5000/shop/api@`.
+
+### 1. Khoá và policy
+
+Hai cặp khoá: `release` là khoá phát hành mà cụm tin, `ke-gian` là khoá của một người khác (giả lập kẻ có quyền đẩy vào registry). Mật khẩu khoá để rỗng cho gọn; D14.2 đã dạy cách giữ nó trên production.
+
+<Terminal where="mac">
+
+```bash
+export COSIGN_PASSWORD=""
+cosign generate-key-pair --output-key-prefix keys/release 2>&1 | tail -1
+cosign generate-key-pair --output-key-prefix keys/ke-gian 2>&1 | tail -1
+cosign signing-config create --out keys/offline.json
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Public key written to keys/release.pub
+Public key written to keys/ke-gian.pub
+```
+
+</Expected>
+
+`offline.json` là signing config rỗng như D14.2: không Fulcio, không Rekor, để cosign 3 không gửi gì lên Sigstore công cộng.
+
+Policy dưới dán khoá công khai `release` vào attestor, chỉ áp cho image `k8-registry:5000/shop/*`, và chặn (`Deny`) khi không xác minh được. `ctlog.insecureIgnoreTlog` tương ứng với việc không dùng Rekor lúc ký.
+
+<Terminal where="mac" title="~/masteva-k8/k8-4/ivp.yaml">
+
+```bash
+cat > ivp.yaml <<EOF
+apiVersion: policies.kyverno.io/v1
+kind: ImageValidatingPolicy
+metadata:
+  name: shop-co-chu-ky
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchImageReferences:
+    - glob: "k8-registry:5000/shop/*"
+  credentials:
+    allowInsecureRegistry: true
+  attestors:
+    - name: release
+      cosign:
+        key:
+          data: |
+$(sed 's/^/            /' keys/release.pub)
+        ctlog:
+          insecureIgnoreTlog: true
+          insecureIgnoreSCT: true
+  validations:
+    - expression: >-
+        images.containers.map(image, verifyImageSignatures(image, [attestors.release])).all(e, e > 0)
+      message: "image phải có chữ ký của khoá release"
+EOF
+kubectl apply -f ivp.yaml
+kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true imagevalidatingpolicy/shop-co-chu-ky --timeout=60s
+kubectl -n shop run api --image=k8-registry:5000/shop/api:1.0
+kubectl -n shop run tu-ngoai --image=registry.k8s.io/pause:3.10
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+imagevalidatingpolicy.policies.kyverno.io/shop-co-chu-ky created
+imagevalidatingpolicy.policies.kyverno.io/shop-co-chu-ky condition met
+Error from server: admission webhook "ivpol.validate.kyverno.svc-fail" denied the request: Policy shop-co-chu-ky failed: image phải có chữ ký của khoá release
+pod/tu-ngoai created
+```
+
+</Expected>
+
+Image `1.0` chưa ký nên bị chặn. Image từ `registry.k8s.io` đi qua vì không khớp `matchImageReferences`: đúng điều mục Kiến thức cảnh báo, và lý do luật registry ở K8.3 phải đi kèm.
+
+### 2. Ký kiểu cosign 3 mặc định, và Kyverno không thấy
+
+Ký `1.0` đúng như D14.2: theo digest, signing config offline, định dạng bundle mặc định của cosign 3. Rồi xác minh bằng cosign, và thử tạo pod lần nữa.
+
+<Terminal where="mac">
+
+```bash
+D10=$(crane digest --insecure k8-registry:5000/shop/api:1.0); echo "D10=$D10"
+cosign sign --key keys/release.key --signing-config keys/offline.json --allow-http-registry \
+  k8-registry:5000/shop/api@$D10 2>&1 | grep -E '^(Pushing|Error)'
+cosign verify --key keys/release.pub --insecure-ignore-tlog=true --allow-http-registry \
+  k8-registry:5000/shop/api@$D10 2>/dev/null | jq -r '.[0].critical.image."docker-manifest-digest"'
+kubectl -n shop run api --image=k8-registry:5000/shop/api:1.0
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+D10=sha256:e50b7059b633caf3c1449b8da680d11845cda4506b513ee7a2de00725f0a34a7
+Pushing signature to: k8-registry:5000/shop/api
+sha256:e50b7059b633caf3c1449b8da680d11845cda4506b513ee7a2de00725f0a34a7
+Error from server: admission webhook "ivpol.validate.kyverno.svc-fail" denied the request: Policy shop-co-chu-ky failed: image phải có chữ ký của khoá release
+```
+
+</Expected>
+
+<Predict question="Cùng khoá, cùng digest: `cosign verify` thành công mà Kyverno từ chối. Bạn tìm nguyên nhân ở đâu trước?">
+
+Ở log của Kyverno: thông báo trả về kubectl chỉ là `message` của policy, còn lý do thật (không tìm thấy chữ ký, sai khoá, lỗi mạng tới registry) nằm trong log của admission controller. Rồi so cách hai bên tìm chữ ký trong registry.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n kyverno logs deploy/kyverno-admission-controller -c kyverno --since=3m | grep -o 'failed to verify cosign signatures: [a-z ]*' | sort | uniq -c
+crane ls --insecure k8-registry:5000/shop/api
+curl -s -o /dev/null -w "referrers API: %{http_code}\n" localhost:9775/v2/shop/api/referrers/$D10
+crane manifest --insecure k8-registry:5000/shop/api:sha256-${D10#sha256:} | jq -c '.manifests[] | {artifactType}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   2 failed to verify cosign signatures: no signatures found
+1.0
+1.1
+sha256-e50b7059b633caf3c1449b8da680d11845cda4506b513ee7a2de00725f0a34a7
+referrers API: 404
+{"artifactType":"application/vnd.dev.sigstore.bundle.v0.3+json"}
+```
+
+</Expected>
+
+Đọc từ trên xuống: Kyverno nói **không tìm thấy** chữ ký (không phải sai chữ ký). `registry:3` không có referrers API (404), nên cosign 3 đặt bundle vào tag dự phòng `sha256-<digest>`; `cosign verify` đọc được chữ ký ở đó, còn Kyverno 1.19.1 với attestor bằng khoá thì không tìm thấy. Con số đầu dòng là số lần từ chối trong ba phút gần nhất: `2` nếu bạn làm bước 1 và bước 2 trong khoảng đó, `1` nếu bước 1 đã cũ hơn.
+
+Ký thêm ở định dạng cũ: tắt bundle (`--new-bundle-format=false`), không dùng signing config, không đẩy lên log minh bạch. Cosign đặt chữ ký vào tag `sha256-<digest>.sig`:
+
+<Terminal where="mac">
+
+```bash
+cosign sign --key keys/release.key --new-bundle-format=false --use-signing-config=false --tlog-upload=false \
+  --allow-http-registry k8-registry:5000/shop/api@$D10 2>&1 | grep -E '^(Pushing|Error)'
+crane ls --insecure k8-registry:5000/shop/api | grep '\.sig$'
+kubectl -n shop run api --image=k8-registry:5000/shop/api:1.0
+kubectl -n shop get pod api -o jsonpath='{.spec.containers[0].image}{"\n"}'
+kubectl -n shop wait --for=condition=Ready pod/api --timeout=60s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Pushing signature to: k8-registry:5000/shop/api
+sha256-e50b7059b633caf3c1449b8da680d11845cda4506b513ee7a2de00725f0a34a7.sig
+pod/api created
+k8-registry:5000/shop/api:1.0@sha256:e50b7059b633caf3c1449b8da680d11845cda4506b513ee7a2de00725f0a34a7
+pod/api condition met
+```
+
+</Expected>
+
+Pod được tạo, và image trong spec đã thành `1.0@sha256:…`: đó là `mutateDigest`, mặc định bật. Kubelet kéo theo digest, nên dù tag `1.0` có bị dời sau đó, pod này và mọi lần khởi động lại của nó vẫn chạy đúng bản đã được xác minh.
+
+<Check id="k8.4.lab-dinh-dang">Tái hiện được trường hợp `cosign verify` thành công mà Kyverno báo `no signatures found`, tìm ra nguyên nhân bằng log của Kyverno, danh sách tag và referrers API, rồi ký lại ở định dạng mà Kyverno đọc được.</Check>
+
+### 3. Khoá lạ, tag bị dời, và Deployment
+
+Ba cách vượt mặt hay gặp (ngoài image không chữ ký ở bước 1), thử từng cách. Kẻ có quyền đẩy vào registry ký `1.1` bằng khoá của mình; rồi dời tag `1.0` sang bản `1.1` của họ; rồi thử qua Deployment thay vì pod.
+
+<Terminal where="mac">
+
+```bash
+D11=$(crane digest --insecure k8-registry:5000/shop/api:1.1)
+cosign sign --key keys/ke-gian.key --new-bundle-format=false --use-signing-config=false --tlog-upload=false \
+  --allow-http-registry k8-registry:5000/shop/api@$D11 2>&1 | grep -E '^(Pushing|Error)'
+kubectl -n shop run gia-mao --image=k8-registry:5000/shop/api:1.1
+crane tag --insecure k8-registry:5000/shop/api@$D11 1.0 2> /dev/null
+kubectl -n shop run doi-tag --image=k8-registry:5000/shop/api:1.0
+kubectl -n shop create deployment web --image=k8-registry:5000/shop/api:1.1
+kubectl -n shop get deployment 2>&1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Pushing signature to: k8-registry:5000/shop/api
+Error from server: admission webhook "ivpol.validate.kyverno.svc-fail" denied the request: Policy shop-co-chu-ky failed: image phải có chữ ký của khoá release
+Error from server: admission webhook "ivpol.validate.kyverno.svc-fail" denied the request: Policy shop-co-chu-ky failed: image phải có chữ ký của khoá release
+error: failed to create deployment: admission webhook "ivpol.validate.kyverno.svc-fail" denied the request: Policy shop-co-chu-ky failed: image phải có chữ ký của khoá release
+No resources found in shop namespace.
+```
+
+</Expected>
+
+Chữ ký của khoá `ke-gian` hợp lệ về mặt mật mã, nhưng không phải của attestor mà policy tin. Tag `1.0` giờ trỏ tới digest của `1.1`; Kyverno phân giải tag thành digest lúc admission và kiểm digest đó, nên dời tag không kéo theo chữ ký của bản cũ. Còn Deployment bị chặn **ngay lúc tạo**: khác với PSA ở K8.1 (Deployment được tạo, pod thì không), Kyverno áp policy lên cả template pod của Deployment, nên lỗi về thẳng terminal hay pipeline thay vì nằm trong event của ReplicaSet.
+
+Pod `api` tạo ở bước 2 vẫn chạy, với digest cũ:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n shop get pod api -o jsonpath='{.status.containerStatuses[0].imageID}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k8-registry:5000/shop/api@sha256:e50b7059b633caf3c1449b8da680d11845cda4506b513ee7a2de00725f0a34a7
+```
+
+</Expected>
+
+<Check id="k8.4.lab-vuot-mat">Chứng minh được policy chặn image ký bằng khoá lạ, chặn tag bị dời sang bản không có chữ ký hợp lệ, và chặn ngay ở Deployment; giải thích được vì sao pod đã chạy không bị ảnh hưởng bởi việc dời tag.</Check>
+
+### 4. Mở chữ ký ra xem
+
+Chữ ký định dạng cũ là một manifest OCI với một layer. Payload được ký là một đoạn JSON nhỏ:
+
+<Terminal where="mac">
+
+```bash
+crane manifest --insecure k8-registry:5000/shop/api:sha256-${D10#sha256:}.sig \
+  | jq -c '.layers[] | {mediaType, annotations: (.annotations | keys)}'
+L=$(crane manifest --insecure k8-registry:5000/shop/api:sha256-${D10#sha256:}.sig | jq -r '.layers[0].digest')
+crane blob --insecure k8-registry:5000/shop/api@$L | jq -c .
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"mediaType":"application/vnd.dev.cosign.simplesigning.v1+json","annotations":["dev.cosignproject.cosign/signature"]}
+{"critical":{"identity":{"docker-reference":"k8-registry:5000/shop/api"},"image":{"docker-manifest-digest":"sha256:e50b7059b633caf3c1449b8da680d11845cda4506b513ee7a2de00725f0a34a7"},"type":"cosign container image signature"},"optional":null}
+```
+
+</Expected>
+
+Layer là payload; chữ ký nằm trong annotation `dev.cosignproject.cosign/signature`. Payload cam kết hai điều: digest, và tên repo `k8-registry:5000/shop/api`. Đây là khác biệt với bundle của D14.2, nơi payload chỉ có digest: chép image và chữ ký định dạng cũ sang một registry tên khác thì phía xác minh có thể kiểm thêm `docker-reference` có khớp nơi image đang nằm không.
+
+### 5. Đưa policy lên cụm đang chạy
+
+Trên một cụm thật, khi bạn viết policy này lần đầu, đã có hàng trăm pod chạy từ image chưa ai ký. Bật `Deny` ngay thì lần tạo lại kế tiếp của chúng (rollout, node hỏng) bị chặn. Trình tự giống K8.3: chạy `Audit` kèm quét nền, đọc PolicyReport để biết pod nào sẽ gãy, xử lý chúng, rồi mới `Deny`. Đổi policy sang `Audit`, bật quét nền, rồi tạo một pod từ image `1.1` (không có chữ ký của `release`):
+
+<Terminal where="mac">
+
+```bash
+kubectl patch imagevalidatingpolicy shop-co-chu-ky --type=merge \
+  -p '{"spec":{"validationActions":["Audit"],"evaluation":{"background":{"enabled":true}}}}'
+sleep 3
+kubectl -n shop run cu --image=k8-registry:5000/shop/api@$D11
+for i in $(seq 1 60); do [ "$(kubectl -n shop get policyreport --no-headers 2>/dev/null | wc -l)" -ge 3 ] && break; sleep 2; done
+kubectl -n shop get policyreport -o custom-columns=KIND:.scope.kind,NAME:.scope.name,PASS:.summary.pass,FAIL:.summary.fail
+kubectl patch imagevalidatingpolicy shop-co-chu-ky --type=merge -p '{"spec":{"validationActions":["Deny"]}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+imagevalidatingpolicy.policies.kyverno.io/shop-co-chu-ky patched
+pod/cu created
+KIND   NAME       PASS   FAIL
+Pod    tu-ngoai   1      0
+Pod    cu         0      1
+Pod    api        1      0
+imagevalidatingpolicy.policies.kyverno.io/shop-co-chu-ky patched
+```
+
+</Expected>
+
+Ở chế độ `Audit`, pod `cu` được tạo, nhưng PolicyReport ghi nó `FAIL`. Pod `api` `PASS`: quét nền kiểm lại digest mà pod đang chạy, không kiểm tag (tag `1.0` giờ đã bị dời). Pod `tu-ngoai` cũng `PASS` vì image của nó không khớp `matchImageReferences`, tức policy không có gì để nói về nó: một báo cáo toàn `PASS` chưa có nghĩa là mọi image đều đã được kiểm. Thứ tự dòng trên máy bạn có thể khác. Chuyển lại `Deny` ở dòng cuối không đuổi pod `cu` đang chạy; danh sách `FAIL` là việc phải xử lý (ký lại từ nguồn tin cậy, hoặc thay image) trước lần tạo lại kế tiếp của nó.
+
+<Check id="k8.4.lab-audit">Chạy được policy chữ ký ở chế độ `Audit` có quét nền, đọc được PolicyReport để biết pod nào đang chạy từ image không hợp lệ, và giải thích được vì sao `PASS` của image không khớp `matchImageReferences` không có nghĩa là image đó đã được kiểm.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Pod `ErrImagePull` với `http: server gave HTTP response to HTTPS client` | Thiếu `hosts.toml` trong node | `docker exec k8-lab-control-plane cat "/etc/containerd/certs.d/k8-registry:5000/hosts.toml"` |
+| `cosign` hay `crane` báo `no such host` | Container công cụ không ở network `kind`, hoặc registry chưa chạy | `docker ps --filter name=k8-registry`; hàm `tool` trong `env.sh` có `--network kind` |
+| Kyverno từ chối dù đã ký định dạng cũ | Ký theo tag thay vì digest; hoặc khoá trong policy không phải `release.pub` | `crane ls` phải có `sha256-<digest>.sig` đúng digest; log Kyverno |
+| Log Kyverno có lỗi kết nối tới registry | Pod Kyverno không phân giải được `k8-registry` | Registry phải ở network `kind`: `docker network inspect kind` |
+| `cosign sign` hỏi mật khẩu | Biến `COSIGN_PASSWORD` chưa được export trong terminal này | `export COSIGN_PASSWORD=""` |
+
+### Dọn dẹp
+
+K8.5 tạo lại cụm. Xoá policy, namespace và registry của bài:
+
+<Callout kind="danger">
+
+`docker rm -f` xoá container registry cùng mọi image và chữ ký trong nó. Xoá namespace xoá các pod bên trong.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl delete -f ~/masteva-k8/k8-4/ivp.yaml
+kubectl delete namespace shop --wait=false
+docker rm -f k8-registry
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+imagevalidatingpolicy.policies.kyverno.io "shop-co-chu-ky" deleted
+namespace "shop" deleted
+k8-registry
+```
+
+</Expected>
+
+Thư mục `~/masteva-k8/k8-4/keys` giữ các khoá của lab; chúng chỉ dùng cho bài này và có thể xoá cùng thư mục lab ở cuối chặng.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Xác minh ở admission có thay được việc kiểm trong pipeline không?">
+
+Không, hai nơi bổ sung nhau. Pipeline kiểm sớm, báo lỗi cho đúng người, và có thể kiểm thứ admission không kiểm được rẻ (quét lỗ hổng, SBOM của D14.3). Admission là chốt cuối mà mọi đường đều đi qua, kể cả người có quyền `kubectl` vòng qua pipeline. Thêm một nơi thứ ba: quét định kỳ thứ đang chạy, vì admission chỉ xét lúc tạo; pod chạy từ trước khi có policy, hay chạy từ một khoá về sau bị thu hồi, không bị ai xét lại. ImageValidatingPolicy có thể bật quét nền như ValidatingPolicy ở K8.3, ghi kết quả vào PolicyReport.
+
+</Reveal>
+
+<Reveal title="Thu hồi một khoá phát hành bị lộ thì cụm cần làm gì?">
+
+Đổi attestor trong policy sang khoá mới là bước dễ. Phần khó là những gì đã ký bằng khoá cũ: image cũ cần được ký lại bằng khoá mới (từ một nguồn đáng tin như digest ghi trong hồ sơ phát hành, D14.2), nếu không thì lần tạo pod kế tiếp của chúng bị chặn, kể cả pod thay thế khi node hỏng. Trình tự an toàn là thêm khoá mới vào danh sách attestor (policy chấp nhận cả hai), ký lại, theo dõi PolicyReport cho tới khi không còn gì phụ thuộc khoá cũ, rồi mới gỡ khoá cũ. Pod đang chạy không bị đuổi; muốn chắc không còn gì chạy từ khoá lộ thì phải tìm theo digest và tạo lại.
+
+</Reveal>
+
+<Reveal title="Vì sao không đặt `failurePolicy: Ignore` cho policy chữ ký để cụm không phụ thuộc registry?">
+
+Vì khi đó registry chậm hay Kyverno treo là đủ để mọi image đi qua mà không kiểm, và kẻ tấn công chỉ cần làm Kyverno chậm (ví dụ trỏ tới một registry treo kết nối). Với luật bảo mật, `Fail` là đúng; phần sẵn sàng được lo bằng cách khác: nhiều bản sao Kyverno, registry nội bộ có nhiều bản sao gần cụm, cache của Kyverno, và `matchImageReferences` hẹp để image hệ thống không phụ thuộc chuỗi này. K8.3 đã đo cái giá của `Fail` khi webhook treo.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết policy kiểm chữ ký gần như luôn ở dạng `ClusterPolicy` với `verifyImages` (thế hệ sắp bị gỡ ở Kyverno 1.20), và hay bỏ quên ba thứ: `matchImageReferences` quá hẹp nên image ngoài danh sách đi qua; keyless chỉ ghim `issuer` mà không ghim `subject`/`identity`; và giả định Kyverno đọc được mọi định dạng chữ ký mà cosign tạo. Kiểm như bước 2 và 3: một image ký đúng phải qua, một image không ký, một image ký bằng khoá lạ, một tag bị dời, tất cả phải bị chặn, và đọc log của Kyverno chứ không chỉ thông báo trả về.
+
+</Callout>
+
+<Callout kind="link">
+
+D14.2 dạy ký bằng cosign, keyless, xoay và thu hồi khoá; D14.3 và D14.4 gắn SBOM và provenance thành attestation; D14.1 dạy registry và tính bất biến của tag. K8.3 là nền: Kyverno, webhook và `failurePolicy`, cùng VAP giới hạn registry. K1.1 giải thích vì sao Deployment tạo pod qua ReplicaSet. D13 là nơi digest đã xác minh được ghi vào Git; D15 cất khoá ký vào KMS và nối việc xác minh vào quy trình tuân thủ.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k8.4.mastery-policy">Viết được bộ luật cho một cụm: chỉ image từ registry nội bộ, có chữ ký của khoá phát hành hoặc danh tính CI, chạy theo digest; và chứng minh nó chặn được image không chữ ký cùng ba cách vượt mặt ở bước 3.</Check>
+
+<Check id="k8.4.mastery-tuong-thich">Khi đổi công cụ hay phiên bản ký trong pipeline, lên được kế hoạch kiểm tương thích với thành phần xác minh trong cụm trước khi phát hành, và chẩn đoán được lỗi bằng log của Kyverno.</Check>
+
+<Check id="k8.4.mastery-production">Chỉ ra được những gì cần đổi để đưa cấu hình của lab lên production (KMS hoặc keyless, Rekor, registry TLS, mirror chép chữ ký) và rủi ro của từng điểm nếu bỏ qua.</Check>
+
+</Mastery>

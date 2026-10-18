@@ -1,0 +1,611 @@
+---
+title: Phát hiện tấn công lúc chạy với Falco
+description: Cài Falco bằng Helm chart ghim phiên bản lên cụm kind, để nó đọc sự kiện kernel qua modern eBPF; thấy cảnh báo khi có người mở shell trong container, đọc /etc/shadow, chạy một file vừa thả vào /tmp; viết rule riêng, thêm ngoại lệ để bớt báo nhầm, đo chi phí CPU, và thấy tận mắt một cách né rule mặc định.
+id: k8.6
+step: k8
+prerequisites: [k8.5]
+topics: [k8.runtime-falco]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop, kernel 7.0.12-linuxkit)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    falco: 0.45.0
+    falco-chart: 9.2.0
+    falco-rules: 5.2.0
+    falcoctl: 0.14.2
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+K8.1 tới K8.5 chặn và ghi những gì đi qua API server. Một khi kẻ tấn công đã có code chạy **bên trong** một container (qua lỗ hổng ứng dụng, image độc, hay `kubectl exec` với quyền bị lộ), những gì họ làm tiếp không đi qua API server nữa. Học xong bài này, bạn:
+
+- Giải thích được Falco thấy gì mà admission và audit log không thấy, và nó lấy dữ liệu đó từ đâu.
+- Cài được Falco lên cụm, ghim phiên bản cả chương trình lẫn bộ rule, và đọc cảnh báo của nó.
+- Viết được rule riêng, thêm ngoại lệ cho một hành vi hợp lệ mà không tắt cả rule.
+- Nói được giới hạn của phát hiện lúc chạy: rule né được, và mỗi syscall đều có giá.
+
+</Goal>
+
+<Knowledge>
+
+### Vì sao cần phát hiện lúc chạy
+
+Admission quyết định pod được **tạo** với spec nào. Audit log ghi **yêu cầu tới API server**: K8.5 thấy một lệnh `exec` mở phiên, nhưng không thấy gì được gõ trong phiên đó. Sau khi tiến trình đã chạy, mọi việc nó làm (mở file, tạo tiến trình con, kết nối mạng) đi thẳng vào kernel qua syscall. **Phát hiện lúc chạy** (runtime detection) là quan sát chính những syscall đó và báo khi chúng khớp một mẫu đáng ngờ.
+
+| Lớp | Thấy gì | Làm gì khi sai |
+|---|---|---|
+| Admission (K8.1, K8.3, K8.4) | Spec của pod lúc tạo | Chặn |
+| Audit log (K8.5) | Yêu cầu tới API server | Ghi lại |
+| seccomp, AppArmor (K8.2) | Syscall, đường dẫn của từng tiến trình | Chặn, theo profile cố định |
+| Falco | Syscall của mọi tiến trình trên node, kèm ngữ cảnh container và pod | Báo động, theo rule |
+
+Falco không chặn: nó báo. Đổi lại, rule của nó nói được những điều profile seccomp không nói được, kiểu "một shell có terminal được mở trong container" hay "một file không có trong image vừa được thực thi".
+
+### Falco lấy dữ liệu từ đâu
+
+```text
+ node
+ ┌───────────────────────────────────────────────────────────────────┐
+ │  tiến trình trong container ── syscall (execve, openat, connect) ─┐ │
+ │                                                                   v │
+ │  kernel: chương trình eBPF của Falco gắn vào tracepoint syscall     │
+ │          ghi sự kiện vào ring buffer chung với user space           │
+ │                                   |                                 │
+ │  pod Falco (DaemonSet, privileged)v                                 │
+ │    libs: dựng lại ngữ cảnh: tiến trình cha, file descriptor, user   │
+ │    plugin container: container id -> tên, image, pod, namespace     │
+ │          (hỏi containerd qua socket của node)                       │
+ │    engine: so mỗi sự kiện với rule -> cảnh báo ra stdout, file,     │
+ │            HTTP, hoặc Falcosidekick                                  │
+ └───────────────────────────────────────────────────────────────────┘
+```
+
+**Driver** là phần chạy trong kernel. Falco 0.45 mặc định dùng **modern eBPF probe**: chương trình eBPF có sẵn trong binary của Falco, nạp lúc khởi động, không cần biên dịch theo từng kernel. Điều kiện: kernel có **BTF** (BPF Type Format, mô tả kiểu dữ liệu của kernel, file `/sys/kernel/btf/vmlinux`) và BPF ring buffer; tài liệu Falco ghi kernel từ 5.8 thường là đủ. Lựa chọn còn lại là kernel module, cần build theo từng kernel. Kernel của Docker Desktop có BTF, nên Falco chạy được ngay trong cụm kind; điều mà AppArmor ở K8.2 không làm được.
+
+Vì Falco đọc ở mức kernel, nó thấy mọi tiến trình trên **kernel đó**. Với kind trên Docker Desktop, đó là cả VM của Docker: Falco thấy cả container Docker không thuộc cụm nào. Sự kiện của chúng không có tên pod và namespace; lab lọc theo namespace để chỉ xem phần của mình.
+
+<Check id="k8.6.kien-truc">Giải thích được Falco thấy gì mà admission và audit log không thấy, kể được đường đi của một sự kiện từ syscall tới cảnh báo, và nêu được điều kiện của modern eBPF probe.</Check>
+
+### Rule, macro, list
+
+Bộ rule của Falco là YAML với ba loại phần tử:
+
+| Phần tử | Ví dụ | Vai trò |
+|---|---|---|
+| `list` | `sensitive_file_names: [/etc/shadow, /etc/sudoers, …]` | Danh sách giá trị dùng lại |
+| `macro` | `open_read`: `evt.type in (open, openat, openat2) and evt.is_open_read=true and fd.typechar='f'…` | Điều kiện con đặt tên |
+| `rule` | `Read sensitive file untrusted` | `condition`, `output` (chuỗi có trường `%proc.cmdline`, `%fd.name`…), `priority` (Emergency tới Debug), `tags` |
+
+Điều kiện là biểu thức trên **trường** (field) của sự kiện: `evt.type` (syscall), `proc.name`, `proc.cmdline`, `proc.exepath`, `proc.tty`, `fd.name` (file hay socket), `user.name`, `container.id`, `k8s.ns.name`, `k8s.pod.name`. Bộ rule mặc định (`falco-rules`, phát hành riêng với Falco) có vài chục rule ở mức `stable`, ví dụ:
+
+| Rule | Bắt |
+|---|---|
+| `Terminal shell in container` | Shell có terminal được mở trong container (`kubectl exec -it`) |
+| `Read sensitive file untrusted` | Chương trình không thuộc danh sách tin cậy đọc `/etc/shadow`, `/etc/sudoers`… |
+| `Drop and execute new binary in container` | Thực thi một file không có trong các layer của image (vừa được tải hay chép vào) |
+| `Contact K8S API Server From Container` | Container không thuộc danh sách gọi tới API server |
+| `Redirect STDOUT/STDIN to Network Connection in Container` | Dấu hiệu reverse shell |
+
+**Tinh chỉnh** để giảm báo nhầm. Không sửa file rule gốc (lần cập nhật sau sẽ ghi đè), mà thêm một file rule riêng nạp sau nó:
+
+- `exceptions` cộng `override: { exceptions: append }`: thêm ngoại lệ có cấu trúc (bộ giá trị của vài trường) vào một rule có sẵn.
+- Macro có tên `user_known_…` mà rule gốc chừa sẵn (mặc định `never_true`): ghi đè để thêm điều kiện bỏ qua.
+- `enabled: false` cho rule không hợp với môi trường; thêm `override` cho `condition` hay `output` khi cần.
+
+Ngoại lệ phải hẹp nhất có thể: "namespace `backup`, chương trình `cat`" thay vì "chương trình `cat`". Mỗi ngoại lệ là một chỗ kẻ tấn công biết thì đứng vào được.
+
+<Check id="k8.6.rule">Phân biệt được list, macro, rule; đọc được điều kiện của một rule mặc định; và nêu được cách thêm ngoại lệ mà không sửa file rule gốc.</Check>
+
+### Giới hạn
+
+- **Rule né được.** Rule là mẫu cụ thể; kẻ tấn công biết rule thì chọn cách khác cho cùng mục đích. `Read sensitive file untrusted` bỏ qua các chương trình trong danh sách tin cậy, trong đó có shell, nên đọc `/etc/shadow` bằng chính chuyển hướng của shell (`< /etc/shadow`) không sinh cảnh báo. Bước 3 cho bạn thấy. Phòng thủ dựa vào nhiều rule chồng nhau và vào việc giữ bộ rule cập nhật, không dựa vào một rule.
+- **Chi phí.** Mỗi syscall được theo dõi đi qua chương trình eBPF và được Falco đánh giá. Chi phí tỉ lệ với **tốc độ syscall** của mọi thứ trên node, không phải số pod. Khi ring buffer đầy, sự kiện bị bỏ (Falco ghi `syscall_event_drops`), và một cảnh báo có thể mất đúng lúc node bận nhất.
+- **Báo, không chặn.** Giữa cảnh báo và hành động là con người hoặc một hệ phản ứng (Falco Talon, một function nhận cảnh báo rồi xoá pod). Cảnh báo nằm trong log của pod Falco thì không ai đọc; **Falcosidekick** nhận cảnh báo qua HTTP rồi đẩy tới Slack, Alertmanager (D12.4), Loki, hay hàng chục đích khác.
+
+<Check id="k8.6.gioi-han">Kể được ba giới hạn của Falco (né rule, chi phí theo tốc độ syscall và sự kiện bị bỏ, chỉ báo không chặn) và một cách giảm mỗi giới hạn.</Check>
+
+<Callout kind="production">
+
+Ngày 17/04/2024, Microsoft Threat Intelligence [mô tả một chiến dịch](https://www.microsoft.com/en-us/security/blog/2024/04/17/attackers-exploiting-new-critical-openmetadata-vulnerabilities-on-kubernetes-clusters/) khai thác năm lỗ hổng của OpenMetadata (công bố ngày 15/03/2024, ảnh hưởng các bản trước 1.3.1) trên các workload chạy trong Kubernetes, bắt đầu từ đầu tháng 4/2024. Theo bài viết, kẻ tấn công nhiều khả năng quét các workload OpenMetadata mở ra Internet, khai thác để chạy code trong container, rồi: ping tới tên miền của dịch vụ Interactsh (`oast.me`, `oast.pro`) để kiểm kết nối; thu thập cấu hình mạng, phần cứng, hệ điều hành, người dùng đang hoạt động; đọc biến môi trường (có thể chứa chuỗi kết nối và thông tin đăng nhập); tải mã đào coin từ một máy chủ từ xa, cấp quyền thực thi, chạy nó, rồi xoá file tải ban đầu; mở reverse shell bằng Netcat; và dùng cronjob để duy trì. Microsoft ghi rằng Defender for Containers của họ sinh cảnh báo về một lần thử reverse shell từ container trong cụm Kubernetes. Khuyến nghị chính: nâng lên OpenMetadata 1.3.1 trở lên, không để giao diện mở ra Internet với thông tin đăng nhập mặc định.
+
+Đối chiếu của bài: cả chuỗi sau bước khai thác diễn ra bên trong container, không có yêu cầu nào tới API server, nên admission và audit log không thấy gì. Ba bước "tải, cấp quyền thực thi, chạy" khớp rule `Drop and execute new binary in container` (bước 3 của lab tái hiện ở quy mô nhỏ); reverse shell khớp nhóm rule về chuyển hướng stdin/stdout ra kết nối mạng. Lỗ hổng là của ứng dụng; phát hiện lúc chạy là lớp cho biết nó **đã** bị khai thác.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [Kernel Events (Falco)](https://falco.org/docs/concepts/event-sources/kernel/): modern eBPF probe và kernel module, điều kiện BTF, ring buffer.
+- [Basic Elements of Falco Rules](https://falco.org/docs/concepts/rules/basic-elements/): rule, macro, list, các trường; đọc kèm [Exceptions](https://falco.org/docs/concepts/rules/exceptions/) và [Overriding](https://falco.org/docs/concepts/rules/overriding/) cho phần tinh chỉnh.
+- [falco_rules.yaml (falcosecurity/rules)](https://github.com/falcosecurity/rules/blob/main/rules/falco_rules.yaml): bộ rule `stable`; đọc điều kiện của `Read sensitive file untrusted` và `Drop and execute new binary in container`.
+- [Falcosidekick](https://github.com/falcosecurity/falcosidekick): danh sách đích đẩy cảnh báo và cách bật cùng chart Falco.
+- [Microsoft: Attackers exploiting new critical OpenMetadata vulnerabilities on Kubernetes clusters](https://www.microsoft.com/en-us/security/blog/2024/04/17/attackers-exploiting-new-critical-openmetadata-vulnerabilities-on-kubernetes-clusters/): nguồn của callout.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng cụm `k8-lab` của K8.5. Nếu đã xoá, tạo lại bằng `cd ~/masteva-k8 && kind create cluster --config kind.yaml` (bản có audit của K8.5).
+
+**Profile máy.** Falco dùng khoảng 80 tới 130 MiB RAM và khoảng 1 tới 15% một lõi CPU tuỳ tốc độ syscall trên VM của Docker (bước 5 đo); node kind tổng cộng khoảng 0,9 tới 1 GiB. Lab tải chart Falco (khoảng 190 KB), image Falco và falcoctl (khoảng 50 MB và 30 MB), cùng bộ rule và plugin container (vài MB). Máy 8 GB chạy được.
+
+Kiểm điều kiện của modern eBPF probe trên kernel mà node kind dùng:
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k8/kubeconfig
+mkdir -p ~/masteva-k8/k8-6 && cd ~/masteva-k8/k8-6
+docker exec k8-lab-control-plane uname -r
+docker exec k8-lab-control-plane ls -l /sys/kernel/btf/vmlinux
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+7.0.12-linuxkit
+-r--r--r-- 1 root root 6710304 Oct 15 07:33 /sys/kernel/btf/vmlinux
+```
+
+</Expected>
+
+Phiên bản kernel và kích thước file trên máy bạn sẽ khác tuỳ bản Docker Desktop. Thiếu file `vmlinux` thì modern eBPF probe không chạy; xem mục Gỡ lỗi.
+
+### 1. Cài Falco, ghim phiên bản
+
+Chart Falco 9.2.0 (Falco 0.45.0). Chart mặc định dùng tag image và để falcoctl tải bộ rule theo nhánh lớn nhất (`falco-rules:5`), rồi một sidecar kiểm bản mới mỗi tuần: tiện, nhưng cảnh báo của cụm có thể đổi mà không ai triển khai gì. File values dưới ghim image theo digest, ghim bộ rule ở `5.2.0`, tắt sidecar cập nhật, chọn modern eBPF, và bật `json_output` để đọc cảnh báo bằng `jq`.
+
+<Terminal where="mac" title="~/masteva-k8/k8-6/values.yaml">
+
+```bash
+cat > values.yaml <<'EOF'
+image:
+  tag: "0.45.0@sha256:788f1129c542171813083d4afc61b16730a47dde8c23d9c39370acef996349b6"
+driver:
+  kind: modern_ebpf
+tty: true
+falcoctl:
+  image:
+    tag: "0.14.2@sha256:90ba9627886e8f26b746fa52465d755b28ee49b76eb1d047a0fefd8cadb21907"
+  artifact:
+    follow:
+      enabled: false
+  config:
+    artifact:
+      install:
+        refs: [falco-rules:5.2.0]
+falco:
+  json_output: true
+EOF
+curl -fsSLO https://github.com/falcosecurity/charts/releases/download/falco-9.2.0/falco-9.2.0.tgz
+SUM=$(curl -fsSL https://falcosecurity.github.io/charts/index.yaml | yq '.entries.falco[] | select(.version == "9.2.0") | .digest')
+echo "index: $SUM"
+kubectl create namespace falco
+kubectl label namespace falco pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/warn=privileged
+if echo "$SUM  falco-9.2.0.tgz" | shasum -a 256 -c; then
+  helm install falco ./falco-9.2.0.tgz -n falco -f values.yaml --wait --timeout 6m 2>&1 | grep -E '^(STATUS|Error)'
+fi
+kubectl -n falco logs daemonset/falco -c falco | grep -E 'Loading rules|rules.yaml|modern BPF|Enabled event sources'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+index: 5e0699e68e5e4abd5eab1d501b3e0300a15888f3a5c2b0977bf3ca3229a8d04a
+namespace/falco created
+namespace/falco labeled
+falco-9.2.0.tgz: OK
+STATUS: deployed
+Thu Oct 15 07:45:31 2026: Loading rules from:
+Thu Oct 15 07:45:31 2026:    /etc/falco/falco_rules.yaml | schema validation: ok
+Thu Oct 15 07:45:31 2026: Enabled event sources: syscall
+Thu Oct 15 07:45:31 2026: Opening 'syscall' source with modern BPF probe.
+```
+
+</Expected>
+
+Mất một tới hai phút, phần lớn là kéo image. Namespace `falco` phải ở mức `privileged` (K8.1): Falco cần nạp eBPF, đọc `/proc` của node và socket của containerd. Init container `falcoctl-artifact-install` tải bộ rule và plugin container từ registry của dự án Falco và kiểm chữ ký cosign của chúng trước khi cài (`kubectl -n falco logs daemonset/falco -c falcoctl-artifact-install` có dòng `Signature successfully verified!`): đúng việc K8.4 làm với image, ở phía Falco.
+
+Log khởi động có thể có vài dòng `failed to create tracepoint 'syscalls/sys_enter_open'` hay `sys_enter_creat`: các syscall cũ đó không tồn tại trên arm64, Falco ghi rằng việc phát hiện vẫn hoạt động.
+
+### 2. Ba hành vi, ba cảnh báo
+
+Một ứng dụng `web` trong namespace `app`. Khai báo hàm `canh_bao` đọc cảnh báo của Falco trong hai phút gần nhất, chỉ giữ cảnh báo của namespace `app` (Falco thấy cả container Docker khác trên máy), và in mức, tên rule, lệnh.
+
+<Terminal where="mac">
+
+```bash
+kubectl create namespace app
+kubectl label namespace app pod-security.kubernetes.io/warn=baseline
+kubectl -n app create deployment web --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 -- /agnhost netexec --http-port=8080
+kubectl -n app rollout status deployment/web --timeout=120s | tail -1
+canh_bao() { kubectl -n falco logs daemonset/falco -c falco --since=2m | grep '^{' \
+  | jq -r --arg ns "${1:-app}" 'select(.output_fields["k8s.ns.name"] == $ns)
+      | "\(.priority)\t\(.rule)\t\(.output_fields["proc.cmdline"])"'; }
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/app created
+namespace/app labeled
+deployment.apps/web created
+deployment "web" successfully rolled out
+```
+
+</Expected>
+
+Giờ đóng vai người đã có quyền `exec`: mở shell có terminal, đọc `/etc/shadow`, rồi chép một chương trình vào `/tmp` và chạy nó (thứ một kẻ tấn công làm với công cụ tải về). Lệnh đầu cần `-it`, nên chạy nó trong terminal bình thường của bạn; shell `sh -c 'id'` tự thoát sau khi in.
+
+<Terminal where="mac">
+
+```bash
+kubectl -n app exec -it deployment/web -- sh -c 'id'
+kubectl -n app exec deployment/web -- cat /etc/shadow > /dev/null
+kubectl -n app exec deployment/web -- sh -c 'cp /bin/busybox /tmp/cat && /tmp/cat /etc/hostname'
+sleep 3
+canh_bao
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),20(dialout),26(tape),27(video)
+web-6fb755dd8f-9sx6s
+Notice	Terminal shell in container	sh -c id
+Warning	Read sensitive file untrusted	cat /etc/shadow
+Critical	Drop and execute new binary in container	cat /etc/hostname
+```
+
+</Expected>
+
+Tên pod trên máy bạn sẽ khác. Ba mức khác nhau phản ánh độ chắc chắn: một shell có terminal có thể là kỹ sư đang gỡ lỗi (`Notice`); một file không có trong image được thực thi gần như không bao giờ là hành vi bình thường của ứng dụng (`Critical`). Rule thứ ba không quan tâm tên `cat`: nó thấy file thực thi nằm ở layer ghi được của container (`/tmp/cat`), không thuộc layer nào của image.
+
+Xem đủ một cảnh báo để biết Falco gửi kèm những gì:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n falco logs daemonset/falco -c falco --since=5m | grep '^{' \
+  | jq 'select(.rule == "Drop and execute new binary in container" and .output_fields["k8s.ns.name"] == "app")
+        | {time, priority, rule, output_fields: (.output_fields | with_entries(select(.key | IN("container.image.repository",
+            "container.image.tag", "container.name", "k8s.ns.name", "k8s.pod.name", "proc.cmdline", "proc.exepath", "proc.pname"))))}' 
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{
+  "time": "2026-10-15T07:45:44.302575304Z",
+  "priority": "Critical",
+  "rule": "Drop and execute new binary in container",
+  "output_fields": {
+    "container.image.repository": "registry.k8s.io/e2e-test-images/agnhost",
+    "container.image.tag": "2.66.1",
+    "container.name": "agnhost",
+    "k8s.ns.name": "app",
+    "k8s.pod.name": "web-6fb755dd8f-9sx6s",
+    "proc.cmdline": "cat /etc/hostname",
+    "proc.exepath": "/tmp/cat",
+    "proc.pname": "containerd-shim"
+  }
+}
+```
+
+</Expected>
+
+Mỗi cảnh báo mang đủ ngữ cảnh để hành động: pod nào, namespace nào, image nào, file thực thi nằm ở đâu, tiến trình cha là gì. Tiến trình cha ở đây là `containerd-shim` vì `sh -c` thay chính nó bằng lệnh cuối cùng trong chuỗi thay vì tạo tiến trình con. Lệnh `jq` chỉ giữ vài trường; cảnh báo thật có thêm vài chục trường khác. Đây là dạng mà Falcosidekick nhận và đẩy đi.
+
+<Check id="k8.6.lab-mac-dinh">Cài được Falco ghim phiên bản, kích được ba rule mặc định bằng ba hành vi, và đọc được cảnh báo cùng ngữ cảnh pod, image, tiến trình.</Check>
+
+### 3. Né một rule
+
+<Predict question="Rule `Read sensitive file untrusted` bỏ qua các chương trình trong danh sách tin cậy, kể cả shell. Đọc `/etc/shadow` bằng chuyển hướng của shell (`while read l; do :; done < /etc/shadow`) có sinh cảnh báo không?">
+
+Không. Tiến trình mở file là chính `sh`, có tên trong `shell_binaries`, thuộc danh sách loại trừ của rule. Nội dung file vẫn bị đọc.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n app exec deployment/web -- sh -c 'while read l; do :; done < /etc/shadow; echo "đã đọc xong"'
+sleep 3
+canh_bao | grep -c 'while read' || true
+kubectl -n falco exec daemonset/falco -c falco -- grep -A16 '^- rule: Read sensitive file untrusted' /etc/falco/falco_rules.yaml | grep -A4 'not proc.name in'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+đã đọc xong
+0
+    and not proc.name in (user_mgmt_binaries, userexec_binaries, package_mgmt_binaries,
+     cron_binaries, read_sensitive_file_binaries, shell_binaries, hids_binaries,
+     vpn_binaries, mail_config_binaries, nomachine_binaries, sshkit_script_binaries,
+     in.proftpd, mandb, salt-call, salt-minion, postgres_mgmt_binaries,
+     google_oslogin_
+```
+
+</Expected>
+
+Không có cảnh báo nào cho lệnh vừa chạy. Danh sách loại trừ tồn tại vì lý do tốt: trên một máy bình thường, shell script hệ thống đọc các file này hằng ngày, và rule không có ngoại lệ sẽ báo nhầm liên tục. Đó là giá của mọi rule dựa trên mẫu. Rule riêng ở bước 4 cho thấy cách viết luật hẹp cho đúng môi trường của bạn (container chỉ nên chạy ứng dụng, không cần đọc `/etc/shadow` bằng bất cứ chương trình nào).
+
+<Check id="k8.6.lab-ne">Tái hiện được việc đọc `/etc/shadow` không sinh cảnh báo, và chỉ ra được dòng điều kiện của rule giải thích vì sao.</Check>
+
+### 4. Rule riêng và ngoại lệ
+
+Hai thay đổi trong một file rule riêng, nạp qua `customRules` của chart:
+
+- Rule mới `Ghi file duoi etc trong container`: mọi lần mở một file dưới `/etc` để ghi, trong container. Bộ rule `stable` không có rule này; với container bất biến, ghi vào `/etc` lúc chạy là bất thường.
+- Ngoại lệ cho `Read sensitive file untrusted`: namespace `backup` được chạy `cat` trên file nhạy cảm (giả lập một job sao lưu hợp lệ). Ngoại lệ ghép hai trường, nên `cat` ở namespace khác vẫn bị báo.
+
+<Terminal where="mac" title="~/masteva-k8/k8-6/rules.yaml">
+
+```bash
+cat > rules.yaml <<'EOF'
+customRules:
+  masteva-rules.yaml: |-
+    - rule: Ghi file duoi etc trong container
+      desc: Tiến trình trong container mở một file dưới /etc để ghi
+      condition: >
+        open_write and container and fd.name startswith /etc/
+      output: >
+        File dưới /etc bị ghi trong container
+        (file=%fd.name cmd=%proc.cmdline pod=%k8s.pod.name ns=%k8s.ns.name image=%container.image.repository)
+      priority: ERROR
+      tags: [masteva, filesystem]
+
+    - rule: Read sensitive file untrusted
+      exceptions:
+        - name: sao-luu-hop-le
+          fields: [k8s.ns.name, proc.name]
+          comps: [=, in]
+          values:
+            - [backup, [cat]]
+      override:
+        exceptions: append
+EOF
+helm upgrade falco ./falco-9.2.0.tgz -n falco -f values.yaml -f rules.yaml --wait --timeout 6m 2>&1 | grep -E '^(STATUS|Error)'
+kubectl -n falco logs daemonset/falco -c falco | grep 'rules.yaml'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+STATUS: deployed
+Thu Oct 15 07:46:22 2026:    /etc/falco/falco_rules.yaml | schema validation: ok
+Thu Oct 15 07:46:22 2026:    /etc/falco/rules.d/masteva-rules.yaml | schema validation: ok
+```
+
+</Expected>
+
+`helm upgrade` tạo lại pod Falco (cấu hình là ConfigMap mount vào pod). Trong lúc pod mới khởi động, node không có ai quan sát: trên cụm thật, cập nhật rule cũng là một lần triển khai có rủi ro. Thử cả hai thay đổi:
+
+<Terminal where="mac">
+
+```bash
+kubectl create namespace backup
+kubectl label namespace backup pod-security.kubernetes.io/warn=baseline
+for ns in app backup; do
+  kubectl -n $ns run sao-luu --image=busybox:1.38.0 --restart=Never -- sh -c 'sleep 5; cat /etc/shadow > /dev/null; sleep 3600'
+done
+kubectl -n app wait --for=condition=Ready pod/sao-luu --timeout=60s
+kubectl -n backup wait --for=condition=Ready pod/sao-luu --timeout=60s
+kubectl -n app exec deployment/web -- sh -c 'echo "10.0.0.9 kho-du-lieu" >> /etc/hosts'
+sleep 10
+echo "== app";    canh_bao app
+echo "== backup"; canh_bao backup
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/backup created
+namespace/backup labeled
+pod/sao-luu created
+pod/sao-luu created
+pod/sao-luu condition met
+pod/sao-luu condition met
+== app
+Error	Ghi file duoi etc trong container	sh -c echo "10.0.0.9 kho-du-lieu" >> /etc/hosts
+Warning	Read sensitive file untrusted	cat /etc/shadow
+== backup
+```
+
+</Expected>
+
+Rule mới bắn với mức `Error`, kèm lệnh đầy đủ. Hai pod `sao-luu` giống hệt nhau, cùng chạy `cat /etc/shadow` bằng tiến trình chính của chúng: pod trong `app` bị báo, pod trong `backup` thì không, nhờ ngoại lệ. Các cảnh báo của bước 2 không còn trong danh sách: `helm upgrade` đã tạo lại pod Falco, và `kubectl logs` chỉ đọc log của pod mới.
+
+<Check id="k8.6.lab-tuy-chinh">Viết được rule riêng và ngoại lệ có cấu trúc trong một file nạp qua chart, và chứng minh được ngoại lệ chỉ miễn đúng tổ hợp namespace và chương trình đã khai.</Check>
+
+### 5. Chi phí
+
+`crictl stats` trong node cho biết tổng thời gian CPU mà container Falco đã dùng từ lúc khởi động (`usageCoreNanoSeconds`). Hàm `cpu_ms` đọc con số đó theo mili giây. Lấy hiệu của nó qua hai khoảng: 30 giây rảnh, rồi khoảng thời gian một pod chạy vòng lặp 40.000 lần `cat` (mỗi lần là một tiến trình mới, một `execve`, vài `openat`).
+
+<Terminal where="mac">
+
+```bash
+cpu_ms() { docker exec k8-lab-control-plane crictl stats -o json --label io.kubernetes.container.name=falco \
+  | jq -r '.stats[0].cpu.usageCoreNanoSeconds.value | tonumber / 1000000 | floor'; }
+A=$(cpu_ms); T=$(date +%s); sleep 30
+B=$(cpu_ms); echo "rảnh: $((B - A)) ms CPU trong $(( $(date +%s) - T )) giây"
+T=$(date +%s)
+kubectl -n app run tai --image=busybox:1.38.0 --restart=Never -- sh -c 'i=0; while [ $i -lt 40000 ]; do cat /etc/hostname > /dev/null; i=$((i+1)); done'
+kubectl -n app wait --for=jsonpath='{.status.phase}'=Succeeded pod/tai --timeout=300s
+C=$(cpu_ms); echo "có tải: $((C - B)) ms CPU trong $(( $(date +%s) - T )) giây"
+docker exec k8-lab-control-plane crictl stats -o json --label io.kubernetes.container.name=falco \
+  | jq -r '.stats[0].memory.workingSetBytes.value | tonumber / 1048576 | floor | "RAM của Falco: \(.) MiB"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+rảnh: 582 ms CPU trong 30 giây
+pod/tai created
+pod/tai condition met
+có tải: 2523 ms CPU trong 20 giây
+RAM của Falco: 123 MiB
+```
+
+</Expected>
+
+Con số trên máy bạn sẽ khác: lúc rảnh, Falco vẫn xử lý syscall của mọi container trên VM của Docker, kể cả những container không thuộc cụm, và thời gian chạy vòng lặp tuỳ CPU. Điều cần thấy là tỉ lệ: lúc rảnh Falco dùng khoảng 15 tới 20 ms CPU mỗi giây (dưới 2% một lõi), lúc có tải khoảng 130 ms mỗi giây, gấp chừng sáu tới mười lần, trong khi RAM gần như không đổi (khoảng 80 tới 130 MiB tuỳ máy). Chi phí đi theo **tốc độ syscall** của workload, không theo số pod. Trên một node chạy service nhiều kết nối ngắn hay nhiều tiến trình con, phần này đáng kể, nên DaemonSet Falco cần `resources` riêng và cần theo dõi số sự kiện bị bỏ.
+
+<Check id="k8.6.lab-chi-phi">Đo được CPU và RAM của Falco lúc rảnh và lúc có tải syscall, và giải thích được chi phí tỉ lệ với cái gì.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Pod Falco `CrashLoopBackOff`, log nói không mở được modern BPF | Kernel thiếu BTF hoặc quá cũ | `docker exec k8-lab-control-plane ls /sys/kernel/btf/vmlinux`; trên Linux thật, đổi sang `driver.kind=kmod` |
+| `helm install` bị từ chối hoặc pod không tạo được | Namespace `falco` không ở mức `privileged` | `kubectl get ns falco --show-labels`; `kubectl -n falco get events` |
+| Init container `falcoctl-artifact-install` lỗi | Máy không ra được `ghcr.io` hay `falcosecurity.github.io` | `kubectl -n falco logs daemonset/falco -c falcoctl-artifact-install` |
+| `canh_bao` không in gì | Cảnh báo cũ hơn hai phút, hoặc `exec` không có `-it` thì rule shell không bắn | Tăng `--since`; chạy lệnh `exec -it` trong terminal tương tác |
+| Có cảnh báo `k8s.ns.name` rỗng | Sự kiện của container Docker ngoài cụm (Falco thấy cả VM) | Lọc theo namespace như hàm `canh_bao` |
+| Rule riêng báo lỗi lúc nạp | Sai cú pháp hoặc sai tên trường | `kubectl -n falco logs daemonset/falco -c falco \| grep -i error` |
+
+### Dọn dẹp
+
+Xoá Falco và các namespace của bài:
+
+<Callout kind="danger">
+
+`helm uninstall` gỡ Falco; xoá namespace xoá mọi pod bên trong. Kiểm `kubectl config current-context` ra `kind-k8-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+helm uninstall falco -n falco
+kubectl delete namespace falco app backup --wait=false
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k8-lab
+release "falco" uninstalled
+namespace "falco" deleted
+namespace "app" deleted
+namespace "backup" deleted
+```
+
+</Expected>
+
+Đây là bài cuối của chặng. Khi không cần cụm nữa, xoá nó:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá cụm `k8-lab` và mọi thứ trong nó.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kind delete cluster --name k8-lab
+```
+
+</Terminal>
+
+Thư mục `~/masteva-k8` còn lại các file cấu hình, khoá và log của chặng. Khi không cần làm lại chặng K8, xoá nó:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá vĩnh viễn thư mục lab, kể cả khoá cosign của K8.4 và audit log của K8.5.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+rm -rf ~/masteva-k8
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Falco hay Tetragon, hay công cụ thương mại?">
+
+Cùng ý tưởng (eBPF, rule trên syscall), khác ở chỗ đặt trọng tâm. Falco là dự án CNCF đã tốt nghiệp, có bộ rule cộng đồng lớn, và chủ yếu **báo**. Tetragon (thuộc hệ Cilium, K6.1) viết policy bằng `TracingPolicy` và có thể **chặn ngay trong kernel** (gửi tín hiệu giết tiến trình) khi khớp, đổi lại policy gần kernel hơn và khó viết hơn. Sản phẩm thương mại (Defender for Containers trong callout, Sysdig, Aqua…) đóng gói cùng loại cảm biến với bộ rule do họ duy trì, giao diện điều tra và phản ứng. Lựa chọn thường theo hạ tầng đã có: cụm dùng Cilium cân nhắc Tetragon, cần rule mở và đẩy cảnh báo về hệ có sẵn thì Falco.
+
+</Reveal>
+
+<Reveal title="Falco đọc được audit log của Kubernetes không?">
+
+Có, qua plugin `k8saudit`: API server gửi audit event (backend webhook của K8.5) tới Falco, và rule của Falco chạy trên chúng như trên syscall, với các trường `ka.user.name`, `ka.target.resource`… Bộ rule `k8saudit` có sẵn những luật như "tạo ClusterRoleBinding cho cluster-admin" hay "exec vào pod trong kube-system". Ưu điểm là một nơi viết rule và đẩy cảnh báo cho cả hai nguồn; nhược điểm là Falco thành một phụ thuộc của đường audit, phải đặt ở nơi nhận được kết nối từ API server.
+
+</Reveal>
+
+<Reveal title="Có nên cho hệ thống tự xoá pod khi Falco báo `Critical`?">
+
+Với vài rule có độ chính xác rất cao trên một nhóm workload hẹp (ví dụ `Drop and execute new binary` trong namespace chỉ chạy ứng dụng bất biến), có thể, qua Falco Talon hay một function nhận cảnh báo từ Falcosidekick. Cái giá: xoá pod xoá luôn bằng chứng (hệ thống file của container, tiến trình đang chạy), và một rule báo nhầm thành một sự cố tự gây ra. Cách thận trọng hơn là cô lập trước (gắn nhãn để NetworkPolicy chặn mạng của pod, `cordon` node) rồi mới điều tra, và chỉ tự động hoá sau khi rule đã chạy đủ lâu ở chế độ chỉ báo.
+
+</Reveal>
+
+<Reveal title="Giữ bộ rule cập nhật mà vẫn kiểm soát được thay đổi thế nào?">
+
+Bài tắt sidecar `follow` và ghim `falco-rules:5.2.0` để kết quả tái lập được. Trên production, bộ rule cũng là một phụ thuộc: ghim phiên bản, đọc release notes, cập nhật qua cùng quy trình như mọi thay đổi (GitOps, D13), thử trên một nhóm node trước. Bật `follow` cho tự cập nhật thì nhận rule mới sớm hơn, đổi lại cảnh báo có thể thay đổi giữa hai lần triển khai mà không ai duyệt. falcoctl kiểm chữ ký của bộ rule trước khi cài, nên rủi ro không nằm ở việc rule bị giả mạo mà ở việc rule mới báo nhiều hơn hay ít hơn.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết rule Falco đúng cú pháp nhưng hay dùng trường cũ hoặc không tồn tại (`container.image` thay vì `container.image.repository`, `k8s.pod.name` khi plugin container không được nạp), sửa thẳng `falco_rules.yaml` thay vì dùng file riêng và `override`, và đề xuất ngoại lệ quá rộng (`proc.name in (cat)` không kèm namespace). Với chart, AI hay đưa `driver.kind=ebpf` (probe eBPF cũ) thay cho `modern_ebpf`. Kiểm như lab: kích rule bằng một hành vi thật, đọc cảnh báo bằng `jq`, và thử một hành vi lẽ ra phải được miễn lẫn một hành vi lẽ ra vẫn bị báo.
+
+</Callout>
+
+<Callout kind="link">
+
+K8.2 dạy seccomp và AppArmor: chặn syscall theo profile, cùng tầng dữ liệu mà Falco quan sát. K8.5 là audit log, nguồn còn lại của plugin `k8saudit`; nó thấy `exec` được mở, Falco thấy gì xảy ra bên trong. K8.4 kiểm chữ ký image, cùng cơ chế mà falcoctl dùng cho bộ rule. D12.4 là Alertmanager, một đích của Falcosidekick; D12.5 đưa log của pod Falco về Loki. K6.1 là Cilium, nền của Tetragon. D15 nối cảnh báo lúc chạy vào quy trình phản ứng sự cố của tổ chức.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k8.6.mastery-trien-khai">Triển khai được Falco lên một cụm với phiên bản ghim, đích cảnh báo phù hợp, và quy trình cập nhật bộ rule có kiểm soát.</Check>
+
+<Check id="k8.6.mastery-rule">Từ một kịch bản tấn công như callout, viết hoặc chọn được các rule bắt từng bước của nó, và chỉ ra được bước nào rule mặc định bỏ sót.</Check>
+
+<Check id="k8.6.mastery-tinh-chinh">Giảm được báo nhầm cho một workload cụ thể bằng ngoại lệ hẹp, và giải thích được mỗi ngoại lệ mở ra khe nào.</Check>
+
+</Mastery>

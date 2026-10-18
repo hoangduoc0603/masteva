@@ -1,0 +1,743 @@
+---
+title: Metric dài hạn, nhiều cụm và cardinality
+description: Thấy giới hạn của một Prometheus đứng một mình, so sánh sidecar với remote write và Thanos với Mimir, VictoriaMetrics; dựng hai "cụm" Prometheus có nhãn ngoài, đẩy block lên object storage SeaweedFS bằng Thanos sidecar, truy vấn gộp qua Thanos Query, giữ được lịch sử khi một cụm chết, chạy compactor để gộp và hạ độ phân giải; rồi gây một vụ nổ cardinality, tìm thủ phạm bằng TSDB status và chặn nó bằng giới hạn scrape, thấy vì sao labeldrop là cái bẫy.
+id: d16.3
+step: d16
+prerequisites: [d16.1]
+topics: [d16.metric-dai-han, d16.cardinality]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    prometheus: 3.15.0
+    thanos: 0.42.4
+    seaweedfs: "4.48"
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Đưa metric ra khỏi giới hạn của một máy: giữ lâu, hỏi được cả nhiều cụm trong một truy vấn, không mất khi một Prometheus chết; và giữ cho số chuỗi không phá vỡ cả hệ thống. Học xong bài này, bạn giải thích được:
+
+- Vì sao Prometheus không được thiết kế để giữ dữ liệu một năm, và hai cách phổ biến để đưa dữ liệu ra ngoài khác nhau ở đâu.
+- Vì sao hai cụm cùng tên job vẫn phân biệt được trong một truy vấn gộp.
+- Vì sao downsampling không tiết kiệm dung lượng mà vẫn đáng làm.
+- Vì sao một dòng code thêm label `customer` làm Prometheus phình gấp đôi bộ nhớ trong vài phút, và vì sao `labeldrop` không sửa được nó.
+
+</Goal>
+
+<Knowledge>
+
+### Giới hạn của một Prometheus
+
+D12.2 dựng một Prometheus: một tiến trình scrape, lưu vào TSDB trên đĩa cục bộ, trả lời truy vấn. Mô hình đó đơn giản và bền, và nó có bốn giới hạn khi hệ thống lớn lên:
+
+| Giới hạn | Vì sao | Hậu quả |
+|---|---|---|
+| Thời gian lưu | Dữ liệu nằm trên đĩa của một máy; mặc định giữ 15 ngày | Muốn so với tháng trước, năm trước thì đĩa phải rất lớn, và máy chết là mất |
+| Một máy | Bộ nhớ tăng theo số chuỗi đang hoạt động (head); không chia tải sang máy khác | Một cụm lớn vượt RAM của một máy; phải chia (shard) bằng tay |
+| Không có bản sao | Hai Prometheus scrape cùng target là hai bản dữ liệu độc lập, lệch nhau vài giây | Chạy hai bản cho HA thì mỗi truy vấn trả về hai lần, phải khử trùng lặp |
+| Không có góc nhìn chung | Mỗi cụm Kubernetes thường có Prometheus riêng | "Tỉ lệ lỗi của checkout trên mọi vùng" phải hỏi từng cái rồi cộng tay |
+
+Cách làm phổ biến: giữ Prometheus ở mỗi cụm với thời gian lưu ngắn (vài giờ tới vài ngày) để scrape và chạy alert gần nguồn, và đẩy dữ liệu về một hệ thống lưu dài hạn dùng chung, nằm trên **object storage** (S3, GCS, hay SeaweedFS như D11.3): rẻ, gần như không giới hạn, có sẵn bản sao.
+
+### Sidecar hay remote write
+
+```text
+ SIDECAR (Thanos)                                     REMOTE WRITE (Mimir, Thanos Receive, VictoriaMetrics…)
+ Prometheus ── mỗi 2 giờ ghi 1 block ra đĩa            Prometheus ── gửi từng lô mẫu ngay khi scrape
+     │                                                     │  (hàng đợi trên WAL, thử lại khi lỗi)
+ sidecar ── tải block lên ──▶ object storage               ▼
+     │                              │                 bộ nhận (ingester) ── giữ vài giờ, rồi ghi block ──▶ object storage
+     └─ phục vụ 2 giờ gần nhất       │                     │
+        cho truy vấn                ▼                     ▼
+ Query ◀── store gateway đọc block cũ                truy vấn qua thành phần query của backend
+```
+
+| | Sidecar | Remote write |
+|---|---|---|
+| Dữ liệu mới nhất nằm ở | Prometheus của từng cụm (tới 2 giờ chưa tải lên) | Backend trung tâm, chậm vài giây |
+| Cụm mất mạng tới trung tâm | Prometheus vẫn lưu, sidecar tải lên khi có mạng lại | Hàng đợi giữ được một lúc; quá lâu thì mất mẫu |
+| Cụm chết hẳn | Mất phần 2 giờ chưa tải lên | Gần như không mất |
+| Truy vấn gộp | Query phải gọi tới từng sidecar ở từng cụm | Chỉ hỏi backend |
+| Prometheus cần | Đủ đĩa cho vài block | Có thể chạy **Agent mode**: chỉ scrape và gửi, không lưu, không truy vấn |
+| Độ phức tạp ở trung tâm | Thấp: Query, store gateway, compactor | Cao hơn: phải nhận và lưu mọi mẫu của mọi cụm |
+
+Lab dùng sidecar vì nó nhẹ và cho thấy rõ từng block đi đâu. Remote write là hướng đi của phần lớn hệ thống mới (và của các dịch vụ metric có quản lý), và cấu hình phía Prometheus chỉ là một khối `remote_write` có URL của bộ nhận.
+
+### Thanos, Mimir, VictoriaMetrics
+
+| | Thanos | Grafana Mimir | VictoriaMetrics |
+|---|---|---|---|
+| Giấy phép | Apache-2.0 (dự án CNCF) | AGPL-3.0 | Apache-2.0 (bản mã nguồn mở); có bản Enterprise |
+| Nhận dữ liệu | Sidecar, hoặc Receive (remote write) | Remote write, OTLP | Remote write, nhiều giao thức khác |
+| Lưu dữ liệu chính | Object storage | Object storage | Đĩa cục bộ của node lưu trữ; sao lưu lên S3 bằng `vmbackup` |
+| Downsampling | Có (compactor) | Không: tài liệu ghi rõ Mimir không hỗ trợ downsampling của Thanos | Chỉ bản Enterprise |
+| Nhiều tenant | Có ở Receive | Có, là mặc định | Có ở bản cluster |
+| Giới hạn chuỗi ở phía nhận | Có ở Receive | `max_global_series_per_user` (mặc định 150.000 mỗi tenant) | `-storage.maxHourlySeries`, `-storage.maxDailySeries` |
+| Ngôn ngữ truy vấn | PromQL | PromQL | MetricsQL, mở rộng của PromQL |
+
+Không có lựa chọn đúng cho mọi nơi. Thanos hợp khi đã có nhiều Prometheus và muốn thêm dần từng mảnh; Mimir hợp khi muốn một backend trung tâm nhiều tenant theo mô hình remote write; VictoriaMetrics hợp khi cần ít thành phần và ít RAM, chấp nhận lưu trên đĩa thay vì object storage.
+
+### Nhãn ngoài, nhiều cụm và khử trùng lặp
+
+**External labels** (nhãn ngoài) là label mà một Prometheus gắn vào mọi dữ liệu khi nó rời khỏi Prometheus: khi gửi alert, khi remote write, và vào block mà sidecar tải lên. Nó không xuất hiện trong truy vấn trực tiếp tới chính Prometheus đó. Hai nhãn hay dùng:
+
+- `cluster`: cụm nào. Hai cụm cùng có `job="shop"`, nhờ `cluster` mà truy vấn gộp vẫn tách được.
+- `replica`: bản nào trong một cặp Prometheus HA cùng scrape một cụm. Thanos Query nhận cờ `--query.replica-label=replica` để coi hai chuỗi chỉ khác nhau ở label này là một và khử trùng lặp. Lab chỉ chạy một bản cho mỗi cụm.
+
+Nhãn ngoài phải **duy nhất** cho mỗi nguồn: hai Prometheus cùng `cluster="a"` mà không phân biệt bằng `replica` thì dữ liệu của chúng bị trộn lẫn trong object storage.
+
+### Object storage, compaction và downsampling
+
+Block tải lên dài 2 giờ. **Compactor** của Thanos chạy định kỳ trên bucket và làm ba việc:
+
+```text
+ block 2 giờ ×4  ──gộp──▶ block 8 giờ ×6 ──gộp──▶ block 2 ngày ──gộp──▶ block 14 ngày      (compaction)
+                                                    │
+                                    block dài từ 40 giờ: thêm bản 5 phút
+                                    block dài từ 10 ngày: thêm bản 1 giờ                      (downsampling)
+ xoá block quá thời gian lưu của từng độ phân giải: --retention.resolution-raw / -5m / -1h     (retention)
+```
+
+- **Compaction** gộp nhiều block nhỏ thành block lớn: ít file, index gọn, truy vấn dài nhanh hơn.
+- **Downsampling** thêm một bản của dữ liệu ở độ phân giải thấp (mỗi 5 phút, mỗi 1 giờ), mỗi điểm giữ đủ các tổng hợp (đếm, tổng, nhỏ nhất, lớn nhất, counter) để PromQL vẫn đúng. Tài liệu của Thanos nói thẳng: mục tiêu **không phải** tiết kiệm dung lượng, vì nó thêm block chứ không thay; mục tiêu là truy vấn một năm không phải đọc từng mẫu 15 giây. Muốn tiết kiệm thì đặt thời gian lưu dữ liệu thô ngắn hơn dữ liệu đã hạ độ phân giải, chấp nhận không "phóng to" được vào dữ liệu cũ.
+- Compactor phải là **duy nhất** cho mỗi bucket (hoặc mỗi nhóm nhãn ngoài): hai compactor cùng gộp một chỗ có thể làm hỏng dữ liệu.
+
+<Check id="d16.3.long-term">Nêu được bốn giới hạn của một Prometheus, so sánh được sidecar với remote write, chọn được giữa Thanos, Mimir và VictoriaMetrics cho một tình huống, và giải thích được nhãn ngoài, compaction, downsampling.</Check>
+
+### Cardinality ở quy mô
+
+D12.2 đã định nghĩa: mỗi tổ hợp label là một chuỗi, số chuỗi bằng tích số giá trị của từng label, và label lấy giá trị từ request là nguy hiểm. Ở quy mô lớn, thêm ba điều.
+
+**Chi phí đi theo số chuỗi đang hoạt động.** Prometheus giữ mọi chuỗi đang hoạt động trong head (bộ nhớ) ít nhất tới lần cắt block kế tiếp; chuỗi đã ngừng nhận mẫu vẫn chiếm chỗ cho tới khi head được dọn. Backend dài hạn và dịch vụ có quản lý thường tính tiền theo số **chuỗi hoạt động**. Vì thế một label mới không chỉ tốn ở nơi nó sinh ra mà nhân lên ở mọi tầng phía sau.
+
+**Churn.** Một label có giá trị đổi liên tục (tên pod, mã phiên bản, mã request) tạo chuỗi mới mà không xoá chuỗi cũ khỏi head ngay. Một Deployment có HPA và triển khai mười lần mỗi ngày sinh ra hàng nghìn tên pod khác nhau, dù lúc nào cũng chỉ có vài chục pod.
+
+**Ba chỗ để chặn, từ gốc ra ngoài:**
+
+| Chỗ | Cách | Ưu | Nhược |
+|---|---|---|---|
+| Mã nguồn | Bỏ label, hoặc gom giá trị về tập cố định (như `route` của ứng dụng mẫu) | Sửa tận gốc | Cần triển khai lại; đội khác sở hữu code |
+| Lúc scrape | `metric_relabel_configs` với `action: drop` để bỏ hẳn chuỗi; `sample_limit`, `label_limit` để từ chối cả lần scrape quá lớn | Có hiệu lực ngay khi nạp lại cấu hình | Mất dữ liệu của target đó; `labeldrop` làm sai số liệu (bước 6) |
+| Phía nhận | Giới hạn số chuỗi theo tenant ở Mimir, Receive, VictoriaMetrics | Bảo vệ backend dùng chung khỏi một cụm hư | Cụm vượt giới hạn bị từ chối mẫu mới |
+
+**Tìm thủ phạm.** API `/api/v1/status/tsdb` (trang **Status › TSDB status**) xếp hạng metric theo số chuỗi và label theo số giá trị; D12.2 đã đọc nó. Metric `scrape_series_added` cho biết mỗi lần scrape một target tạo thêm bao nhiêu chuỗi mới: một target bình thường gần như luôn bằng 0, một target đang nổ thì luôn dương.
+
+<Callout kind="production">
+
+Trivago kể trên blog kỹ thuật (08/2022) về giai đoạn GraphQL API của họ, chạy trên GKE ở ba vùng, tăng traffic khi người dân đi du lịch trở lại năm 2021: khoảng 1.000 pod mỗi vùng lúc cao điểm, HPA co giãn liên tục và nhiều lần triển khai mỗi ngày, tức hơn 3.000 pod khác nhau trong khoảng 3 giờ, xấp xỉ thời gian lưu thực tế của Prometheus khi đó. Mỗi tên pod là một giá trị label mới, nên cardinality tăng rất cao. Trong một sự cố ban đêm, đội giảm thời gian lưu từ 2 giờ xuống 1 giờ, giãn nhịp scrape từ 10 lên 15 giây và tăng bộ nhớ từ 1000Mi lên 25000Mi; kết quả là Prometheus mất sáu giờ để cạn bộ nhớ thay vì một giờ. Nhờ Thanos đã lưu metric lên object storage, dữ liệu chỉ mất trong những lúc Prometheus khởi động lại. Các bước sau đó: kéo dài cửa sổ ổn định khi giảm pod của HPA để bớt tên pod mới; đọc trang TSDB status, thấy label `pod` thuộc nhóm nhiều giá trị nhất và bỏ nó; bỏ các metric phía đích của Istio và metric nội bộ của Envoy không dùng tới; tách Prometheus sang node pool riêng vì chính workload làm node cạn bộ nhớ và giết Prometheus; rồi chia Prometheus thành nhiều shard. Bài viết cho biết lúc đó họ có khoảng 40 Prometheus, mỗi cái chừng 2,5 GiB bộ nhớ.
+
+</Callout>
+
+<Check id="d16.3.cardinality">Giải thích được vì sao chi phí đi theo chuỗi đang hoạt động, churn là gì, và chọn được chỗ chặn cardinality (mã nguồn, lúc scrape, phía nhận) cho một tình huống cụ thể.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Sidecar](https://thanos.io/tip/components/sidecar.md/) và [Compactor](https://thanos.io/tip/components/compact.md/) (Thanos): cách sidecar tải block, các mức compaction, downsampling và đoạn nói nó không tiết kiệm dung lượng.
+- [Configuration: scrape_config và metric_relabel_configs (Prometheus)](https://prometheus.io/docs/prometheus/latest/configuration/configuration/): `external_labels`, `sample_limit`, `label_limit`, `metric_relabel_configs`, `remote_write`.
+- [Migrate from Thanos or Prometheus to Grafana Mimir](https://grafana.com/docs/mimir/latest/set-up/migrate/migrate-from-thanos-or-prometheus/): khác biệt giữa hai hệ thống, gồm việc Mimir không hỗ trợ downsampling.
+- [How we scaled our Prometheus setup (trivago tech blog)](https://tech.trivago.com/post/2022-08-23-how-we-scaled-our-prometheus-setup): bài trong callout.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã build image `d16-app:1.0.0` ở bước 1 của D16.1. Cụm của D16.1 và D16.2 không cần cho bài này; nếu còn chạy, dừng nó để nhường RAM: `cd ~/masteva-d16/slo && docker compose stop`. Lab tải image Thanos (khoảng 100 MB nén) và SeaweedFS (khoảng 175 MB). Dùng cổng **9763** và **9764** (hai Prometheus), **9765** (Thanos Query). **Profile máy:** mười một container dùng khoảng 400 đến 720 MiB, cao nhất ở bước 5 và 6 khi cardinality nổ (Prometheus của cụm b lên gấp đôi cụm a, khoảng 80 đến 100 MiB); SeaweedFS nặng nhất và dao động nhiều, khoảng 150 đến 320 MiB. Mọi khối lệnh chạy trong `~/masteva-d16/lt`; mở terminal mới thì `cd ~/masteva-d16/lt` trước. Máy 8 GB với Docker VM 4 GB chạy được.
+
+### 1. Kho S3 và hai "cụm"
+
+Mỗi "cụm" gồm một ứng dụng: container tên `shop-a` (hay `shop-b`) nhưng không đặt `STOCK_URL`, nên nó chạy ở vai `stock` và chỉ có route `/reserve` cùng `/healthz`; bài này chỉ cần nó phát metric. Thêm một bộ sinh tải 10 request mỗi giây, một Prometheus và một Thanos sidecar dùng chung volume dữ liệu với Prometheus. Ở trung tâm: SeaweedFS làm S3 (như D11.3), store gateway đọc block từ bucket, và Thanos Query gộp mọi nguồn. Compactor khai trong profile `tools` nên chỉ chạy khi gọi.
+
+```text
+ cụm a: shop-a ◀── loadgen-a        cụm b: shop-b ◀── loadgen-b
+        │ scrape                           │ scrape
+        ▼                                  ▼
+     prom-a ── volume ── sidecar-a      prom-b ── volume ── sidecar-b
+  {cluster="a"}            │  │       {cluster="b"}            │  │
+                     tải block│                          tải block│
+                           ▼  │                                ▼  │ StoreAPI (gRPC)
+                       ┌──────┴───── s3 (SeaweedFS), bucket metrics ──┐
+                       │                     ▲                        │
+                       │               store gateway                  │
+                       └──────────────────▶ query ◀────────────────────┘
+                                         :9765
+```
+
+Thông tin đăng nhập S3 sinh ngẫu nhiên, nằm trong hai file: `s3.json` cho SeaweedFS, `bucket.yml` cho Thanos. Quyền file là 644 chứ không phải 600: Thanos trong container chạy bằng user 1001 hoặc 65534, khác user của bạn trên máy, và trên Docker Engine của Linux file bind mount giữ nguyên quyền nên 600 có thể làm container không đọc được (Docker Desktop không áp quyền này). Vì vậy hãy giữ thư mục lab ở nơi chỉ bạn vào được; ở production, bí mật đi qua cơ chế secret của nền tảng, không qua file ai cũng đọc được.
+
+<Terminal where="mac" title="~/masteva-d16/lt">
+
+```bash
+mkdir -p ~/masteva-d16/lt/prom-a ~/masteva-d16/lt/prom-b && cd ~/masteva-d16/lt
+S3_SECRET=$(openssl rand -hex 16)
+cat > s3.json <<EOF
+{
+  "identities": [
+    {
+      "name": "thanos",
+      "credentials": [{ "accessKey": "d16thanos", "secretKey": "$S3_SECRET" }],
+      "actions": ["Read:metrics", "Write:metrics", "List:metrics"]
+    }
+  ]
+}
+EOF
+cat > bucket.yml <<EOF
+type: S3
+config:
+  bucket: metrics
+  endpoint: s3:8333
+  access_key: d16thanos
+  secret_key: $S3_SECRET
+  insecure: true
+EOF
+chmod 644 s3.json bucket.yml
+for c in a b; do cat > prom-$c/prometheus.yml <<EOF
+global:
+  scrape_interval: 15s
+  external_labels:
+    cluster: $c
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: shop
+    static_configs:
+      - targets: ["shop-$c:8080"]
+EOF
+done
+cat > compose.yaml <<'EOF'
+name: d16-lt
+
+x-app: &app
+  image: d16-app:1.0.0
+  restart: unless-stopped
+x-thanos: &thanos
+  image: quay.io/thanos/thanos:v0.42.4@sha256:b567818fe608067eb0f1d7c2c4fe361e7ad83c8a256234c97685f1d0bf670cc8
+  restart: unless-stopped
+x-prom: &prom
+  image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+  restart: unless-stopped
+  command:
+    - --config.file=/etc/prometheus/prometheus.yml
+    - --storage.tsdb.path=/prometheus
+    - --storage.tsdb.min-block-duration=2h
+    - --storage.tsdb.max-block-duration=2h
+    - --web.enable-lifecycle
+
+services:
+  s3:
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    container_name: d16-s3
+    command: server -dir=/data -s3 -s3.config=/etc/seaweedfs/s3.json
+    volumes: ["s3-data:/data", "./s3.json:/etc/seaweedfs/s3.json:ro"]
+  shop-a:
+    <<: *app
+    container_name: d16-shop-a
+  loadgen-a:
+    <<: *app
+    container_name: d16-loadgen-a
+    environment: { MODE: loadgen, TARGET: "http://shop-a:8080", RPS: "10", PATHS: "/reserve,/healthz" }
+  shop-b:
+    <<: *app
+    container_name: d16-shop-b
+    environment: { CUSTOMER_LABEL: "${CUSTOMER_LABEL:-off}" }
+  loadgen-b:
+    <<: *app
+    container_name: d16-loadgen-b
+    environment: { MODE: loadgen, TARGET: "http://shop-b:8080", RPS: "10", PATHS: "/reserve,/healthz", CUSTOMERS: "${CUSTOMERS:-0}" }
+  prom-a:
+    <<: *prom
+    container_name: d16-prom-a
+    volumes: ["./prom-a:/etc/prometheus:ro", "prom-a-data:/prometheus"]
+    ports: ["127.0.0.1:9763:9090"]
+  prom-b:
+    <<: *prom
+    container_name: d16-prom-b
+    volumes: ["./prom-b:/etc/prometheus:ro", "prom-b-data:/prometheus"]
+    ports: ["127.0.0.1:9764:9090"]
+  sidecar-a:
+    <<: *thanos
+    container_name: d16-sidecar-a
+    user: "65534"
+    command: [sidecar, --prometheus.url=http://prom-a:9090, --tsdb.path=/prometheus, --objstore.config-file=/etc/thanos/bucket.yml]
+    volumes: ["prom-a-data:/prometheus", "./bucket.yml:/etc/thanos/bucket.yml:ro"]
+  sidecar-b:
+    <<: *thanos
+    container_name: d16-sidecar-b
+    user: "65534"
+    command: [sidecar, --prometheus.url=http://prom-b:9090, --tsdb.path=/prometheus, --objstore.config-file=/etc/thanos/bucket.yml]
+    volumes: ["prom-b-data:/prometheus", "./bucket.yml:/etc/thanos/bucket.yml:ro"]
+  store:
+    <<: *thanos
+    container_name: d16-store
+    command: [store, --data-dir=/tmp/store, --sync-block-duration=1m, --objstore.config-file=/etc/thanos/bucket.yml]
+    volumes: ["./bucket.yml:/etc/thanos/bucket.yml:ro"]
+  query:
+    <<: *thanos
+    container_name: d16-query
+    command: [query, --endpoint=sidecar-a:10901, --endpoint=sidecar-b:10901, --endpoint=store:10901]
+    ports: ["127.0.0.1:9765:10902"]
+  compact:
+    <<: *thanos
+    profiles: [tools]
+    restart: "no"
+    command: [compact, --data-dir=/tmp/compact, --objstore.config-file=/etc/thanos/bucket.yml,
+              --consistency-delay=0s, --retention.resolution-raw=30d, --retention.resolution-5m=90d, --retention.resolution-1h=1y]
+    volumes: ["./bucket.yml:/etc/thanos/bucket.yml:ro"]
+
+volumes:
+  s3-data:
+  prom-a-data:
+  prom-b-data:
+EOF
+docker compose up -d s3 2>&1 | tail -1
+weed() { echo "$*" | docker exec -i d16-s3 weed shell 2>/dev/null; }
+for i in $(seq 30); do weed s3.bucket.list | grep -q metrics && break; weed s3.bucket.create -name metrics > /dev/null; sleep 2; done
+weed s3.bucket.list
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d16-s3 Started 
+  metrics	size:0	logical:0	chunk:0
+```
+
+</Expected>
+
+Những chỗ đáng đọc trong `compose.yaml`:
+
+- **Hai cờ `block-duration` bằng nhau (2h)** tắt việc Prometheus tự gộp block cục bộ: sidecar chỉ tải block 2 giờ, còn gộp là việc của compactor trên bucket. Tài liệu sidecar yêu cầu điều này.
+- **Sidecar dùng chung volume** với Prometheus để thấy block mới, và chạy bằng user 65534 (`nobody`), cùng user với Prometheus, để đọc được file. Nó cũng gọi API của Prometheus để lấy `external_labels`.
+- **Store gateway** đọc bucket mỗi phút (`--sync-block-duration=1m`, mặc định lâu hơn nhiều; lab rút ngắn để thấy block mới sớm). `--data-dir` chỉ là cache, mất cũng không sao.
+- **`shop-b` và `loadgen-b`** đọc hai biến môi trường `CUSTOMER_LABEL` và `CUSTOMERS`, mặc định tắt; bước 5 bật chúng.
+- **`compact`** không chạy cùng `up` vì nằm trong profile `tools`. `--consistency-delay=0s` cho phép nó xử lý block vừa tải lên; mặc định nó bỏ qua block mới hơn 30 phút để không đọc phải block tải dở.
+
+### 2. Lịch sử của cụm a lên object storage
+
+Như D16.1, bạn nạp 5 ngày lịch sử, lần này vào `prom-a`, rồi bật mọi thứ và xem sidecar tải chúng lên:
+
+<Terminal where="mac">
+
+```bash
+NOW=$(date +%s)
+awk -v now="$NOW" 'BEGIN {
+  print "# TYPE http_requests counter"
+  for (t = now - 5 * 86400; t <= now - 7200; t += 60) {
+    n += 300
+    printf "http_requests_total{job=\"shop\",instance=\"shop-a:8080\",route=\"/reserve\",status=\"200\"} %d %d\n", n, t
+  }
+  print "# EOF"
+}' > prom-a/history.om
+docker compose run --rm --no-deps --entrypoint promtool prom-a \
+  tsdb create-blocks-from openmetrics /etc/prometheus/history.om /prometheus < /dev/null 2> /dev/null | wc -l
+docker compose up -d 2>&1 | grep -c -E 'Started|Running'
+for i in $(seq 40); do [ "$(docker logs d16-sidecar-a 2>&1 | grep -c 'upload new block')" -ge 59 ] && break; sleep 3; done
+docker logs d16-sidecar-a 2>&1 | grep -c 'upload new block'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+      61
+11
+60
+```
+
+</Expected>
+
+- Lịch sử dài 5 ngày trừ 2 giờ cuối, mỗi phút một mẫu, 300 request mỗi phút (5 mỗi giây). Vì sao dừng 2 giờ trước hiện tại: `prom-a` sắp khởi động sẽ ghi dữ liệu mới vào head block, và tài liệu Prometheus cảnh báo không nạp vào khoảng của head (3 giờ gần nhất). Ở đây `prom-a` chưa chạy nên không mẫu nào chồng lên nhau; khoảng cách 2 giờ giữ mọi block lịch sử nằm hẳn trước phần head sắp có, và sidecar tải chúng lên ngay. `promtool` in một dòng cho mỗi block 2 giờ cùng một dòng tiêu đề; `wc -l` đếm chúng.
+- `docker compose run` chạy một container tạm từ cấu hình của `prom-a` để ghi block vào volume trước khi Prometheus khởi động. `< /dev/null` ngăn lệnh đọc mất các dòng lệnh bạn dán phía sau: `docker compose run` mặc định nhận bàn phím làm đầu vào. `2> /dev/null` giấu các dòng thông báo tạo volume của Compose; nếu số in ra là 0, chạy lại lệnh không có phần đó để đọc lỗi.
+- Sidecar thấy block trong thư mục dữ liệu và tải từng cái lên bucket, kèm nhãn ngoài `cluster="a"`. Vòng `for` chờ tới khi sidecar báo đã tải ít nhất 59 block (tối đa 2 phút); lệnh cuối in số block đã tải, khoảng 60.
+
+Giờ hỏi Thanos Query, nơi gộp mọi nguồn. Script `tq` giống `pq` của D16.1, chỉ đổi cổng:
+
+<Terminal where="mac">
+
+```bash
+cat > tq <<'EOF'
+#!/bin/sh
+curl -s localhost:9765/api/v1/query --data-urlencode "query=$1" | jq -r '
+  if .status != "success" then "LỖI: \(.error)"
+  else .data.result[] | "\(.metric | to_entries | map("\(.key)=\(.value)") | join(" "))  =>  \(.value[1] | tonumber | . * 1000 | round / 1000)"
+  end'
+EOF
+chmod +x tq
+for i in $(seq 40); do
+  [ "$(./tq 'sum by (cluster) (rate(http_requests_total{job="shop"}[1m]))' | wc -l)" -eq 2 ] \
+    && curl -s localhost:9765/api/v1/stores | jq -e '.data.store[]?.labelSets[]? | select(.cluster == "a")' > /dev/null && break
+  sleep 5
+done
+curl -s localhost:9765/api/v1/stores | jq -r '.data | to_entries[] | "\(.key): \([.value[] | .labelSets[]?.cluster] | join(", "))"'
+./tq 'sum by (cluster) (rate(http_requests_total{job="shop"}[1m]))'
+./tq 'sum by (cluster) (increase(http_requests_total[1d] offset 3d))'
+./tq 'count by (cluster) (up)'
+```
+
+</Terminal>
+
+<Predict question="Cả hai cụm có job shop và job prometheus giống hệt nhau. Kết quả gộp phân biệt chúng thế nào? Và hỏi một ngày cách đây 3 ngày thì ai trả lời, khi cụm b mới chạy vài phút?">
+
+```text
+sidecar: a, b
+store: a
+cluster=a  =>  9.973
+cluster=b  =>  7.939
+cluster=a  =>  432000
+cluster=a  =>  2
+cluster=b  =>  2
+```
+
+- `/api/v1/stores` liệt kê nguồn mà Query đang dùng: hai sidecar (mỗi cái phục vụ dữ liệu gần đây của một cụm) và store gateway (phục vụ block trong bucket, hiện chỉ có của cụm a).
+- Mọi chuỗi đều có label `cluster`, dù cấu hình scrape của hai Prometheus giống nhau: Query thêm nhãn ngoài của từng nguồn vào kết quả. Nhờ đó `sum by (cluster)` tách được.
+- Ngày cách đây 3 ngày chỉ có cụm a: khoảng 432.000 request (300 mỗi phút × 1.440 phút), lấy từ block trong bucket qua store gateway. Cụm b không có dữ liệu ngày đó nên không có dòng nào.
+- Mỗi cụm có hai target (`prometheus` và `shop`).
+
+</Predict>
+
+<Check id="d16.3.lab-global">Dựng được hai Prometheus có nhãn ngoài khác nhau cùng Thanos sidecar, store gateway và Query, và truy vấn gộp được dữ liệu mới của hai cụm cùng dữ liệu cũ trong object storage.</Check>
+
+### 3. Một cụm chết
+
+Dừng Prometheus và sidecar của cụm a, như một cụm mất điện:
+
+<Callout kind="danger">
+
+Lệnh dưới dừng `prom-a` và `sidecar-a` để mô phỏng một cụm chết. Dữ liệu trong volume không bị xoá; khối sau bật lại chúng.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker compose stop prom-a sidecar-a 2>&1 | grep -c Stopped
+sleep 10
+./tq 'sum by (cluster) (rate(http_requests_total{job="shop"}[1m]))'
+./tq 'sum by (cluster) (increase(http_requests_total[1d] offset 3d))'
+curl -s localhost:9765/api/v1/stores | jq -r '.data | to_entries[] | .key as $k | .value[] | "\($k) \(.labelSets[0].cluster): \((.lastError // "ok")[:45])"'
+docker compose start prom-a sidecar-a 2>&1 | grep -c Started
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2
+cluster=b  =>  9.999
+cluster=a  =>  432000
+sidecar a: rpc error: code = DeadlineExceeded desc = con
+sidecar b: ok
+store a: ok
+2
+```
+
+</Expected>
+
+- Dữ liệu **mới** của cụm a biến mất khỏi truy vấn gộp: nó chỉ nằm trên Prometheus và sidecar vừa dừng. Đây là phần mà mô hình sidecar có thể mất khi một cụm chết hẳn: tới 2 giờ chưa kịp thành block.
+- Dữ liệu **cũ** của cụm a vẫn còn nguyên, vì nằm trong bucket. Đó là điều trivago dựa vào trong callout: Prometheus chết và khởi động lại nhiều lần mà lịch sử không mất.
+- Danh sách nguồn vẫn có sidecar của cụm a nhưng kèm lỗi kết nối (nội dung lỗi trên máy bạn có thể khác, tuỳ lúc Query thử gọi lại). Query bỏ nguồn lỗi khỏi truy vấn và trả lời từ phần còn lại, không kèm cảnh báo nào trong kết quả. Dashboard nhờ vậy vẫn hiện, nhưng một alert kiểu "tổng traffic mọi cụm" sẽ thấy traffic giảm một nửa mà không biết vì sao. Việc phát hiện một nguồn biến mất thuộc về giám sát chính hệ thống giám sát, D16.5.
+
+### 4. Compactor: gộp và hạ độ phân giải
+
+Chạy compactor một lượt (không có `--wait` nên nó làm xong rồi thoát), rồi xem bucket bằng `thanos tools bucket inspect`:
+
+<Terminal where="mac">
+
+```bash
+docker compose run --rm compact < /dev/null 2>&1 | grep -c -E 'compacted blocks|downsampled block'
+docker compose run --rm compact tools bucket inspect --objstore.config-file=/etc/thanos/bucket.yml < /dev/null 2>/dev/null \
+  | awk -F'|' 'NR > 2 { gsub(/ /, "", $10); gsub(/ /, "", $13); print "level=" $10, "resolution=" $13 }' | sort | uniq -c
+docker compose run --rm compact tools bucket inspect --objstore.config-file=/etc/thanos/bucket.yml < /dev/null 2>/dev/null \
+  | awk -F'|' 'NR > 2 && $10 + 0 >= 3 { print $5, $13 }'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+18
+  60 level=1 resolution=0s
+  14 level=2 resolution=0s
+   2 level=3 resolution=0s
+   1 level=3 resolution=5m0s
+ 38h16m0.001s   0s         
+ 47h59m0.001s   0s         
+ 47h59m0.001s   5m0s       
+```
+
+</Expected>
+
+Mỗi dòng của `inspect` là một block; lệnh `awk` đếm theo mức compaction (cột `COMP-LEVEL`) và độ phân giải (`RESOLUTION`):
+
+- **Level 1, 0s**: block 2 giờ gốc do sidecar tải lên. Chúng chưa biến mất: compactor chỉ **đánh dấu** để xoá, và xoá thật sau một khoảng trễ (mặc định 48 giờ) để store gateway không mất block đang đọc.
+- **Level 2 và 3, 0s**: block 8 giờ và 2 ngày do compactor gộp ra, vẫn ở độ phân giải gốc.
+- **Resolution 5m0s**: bản hạ độ phân giải của các block 2 ngày. Chỉ block dài từ 40 giờ trở lên mới được hạ. Các dòng cuối liệt kê mọi block level 3 với độ dài và độ phân giải: block 38 giờ (chứa phần đầu của lịch sử, bắt đầu giữa một khoảng 2 ngày) chỉ có bản gốc, block gần 48 giờ có thêm bản 5 phút. Trên máy bạn, block đầu có thể dài hơn hay ngắn hơn 40 giờ tuỳ giờ chạy. Block 1 giờ chỉ xuất hiện khi có block dài từ 10 ngày, nên lab không thấy. Số block cụ thể trên máy bạn phụ thuộc giờ bạn chạy, vì ranh giới gộp tính theo mốc 2 giờ và 2 ngày tuyệt đối.
+
+Ở production, compactor chạy liên tục (`--wait`) như một tiến trình duy nhất cho mỗi bucket.
+
+<Check id="d16.3.lab-compact">Chứng minh được trên lab rằng dữ liệu cũ của một cụm vẫn truy vấn được khi cụm đó chết, và đọc được kết quả compaction, downsampling trong bucket.</Check>
+
+### 5. Nổ cardinality ở cụm b
+
+Một đội phát hành bản mới của `shop` ở cụm b: để "theo dõi từng khách hàng", họ thêm label `customer` vào metric HTTP. Có 2.000 khách hàng. Bật biến môi trường đã khai ở bước 1 và theo dõi số chuỗi trong head của `prom-b` mỗi 30 giây:
+
+<Terminal where="mac">
+
+```bash
+cat > pb <<'EOF'
+#!/bin/sh
+curl -s localhost:9764/api/v1/query --data-urlencode "query=$1" | jq -r '.data.result[] | .value[1]'
+EOF
+chmod +x pb
+echo "trước: $(./pb 'prometheus_tsdb_head_series') chuỗi"
+CUSTOMER_LABEL=on CUSTOMERS=2000 docker compose up -d shop-b loadgen-b 2>&1 | grep -c Started
+for i in 1 2 3 4 5 6; do sleep 30; echo "+$((i * 30))s  $(./pb 'prometheus_tsdb_head_series') chuỗi, lần scrape vừa rồi thêm $(./pb 'scrape_series_added{job="shop"}')"; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trước: 876 chuỗi
+2
++30s  3359 chuỗi, lần scrape vừa rồi thêm 1752
++60s  6659 chuỗi, lần scrape vừa rồi thêm 1632
++90s  9731 chuỗi, lần scrape vừa rồi thêm 1548
++120s  12671 chuỗi, lần scrape vừa rồi thêm 1464
++150s  15179 chuỗi, lần scrape vừa rồi thêm 1212
++180s  17675 chuỗi, lần scrape vừa rồi thêm 1176
+```
+
+</Expected>
+
+Số chuỗi tăng vài nghìn mỗi 30 giây và chưa có dấu hiệu dừng, vì mỗi khách hàng mới gặp lần đầu sinh thêm 1 chuỗi counter và 11 chuỗi histogram (9 bucket, `_sum`, `_count`) cho mỗi route. Trần lý thuyết là khoảng 2.000 × 2 route × 12 = 48.000 chuỗi, gấp hơn 50 lần lúc trước, cho **một** service. `scrape_series_added` của target `shop` dương ở mọi lần scrape: tín hiệu rõ nhất của một target đang nổ.
+
+Tìm thủ phạm như một người trực chưa biết gì về bản phát hành đó:
+
+<Terminal where="mac">
+
+```bash
+curl -s localhost:9764/api/v1/status/tsdb | jq -r '"metric:", (.data.seriesCountByMetricName[:3][] | "  \(.value)  \(.name)"), "label:", (.data.labelValueCountByLabelName[:3][] | "  \(.value)  \(.name)")'
+./tq 'count by (cluster) ({__name__=~"http_.+"})'
+docker stats --no-stream --format '{{.Name}}  {{.MemUsage}}' d16-prom-a d16-prom-b | sed 's| / .*||'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+metric:
+  13455  http_request_duration_seconds_bucket
+  1495  http_request_duration_seconds_sum
+  1495  http_request_duration_seconds_count
+label:
+  1218  customer
+  333  __name__
+  93  le
+cluster=a  =>  24
+cluster=b  =>  17916
+d16-prom-a  59.36MiB
+d16-prom-b  101MiB
+```
+
+</Expected>
+
+- **TSDB status** của `prom-b` chỉ ngay: metric nhiều chuỗi nhất là `http_request_duration_seconds_bucket`, label nhiều giá trị nhất là `customer`, nhiều hơn cả `__name__` (số tên metric). Hai dòng đó đủ để biết phải hỏi đội nào.
+- **Qua Thanos Query**, câu hỏi "mỗi cụm có bao nhiêu chuỗi metric HTTP" trả lời được cho mọi cụm một lúc, nhờ label `cluster`: cụm a vẫn 24 chuỗi, cụm b hơn mười sáu nghìn.
+- **Bộ nhớ** của `prom-b` đã cao hơn `prom-a` rõ rệt dù hai cụm nhận cùng một lượng request. Số MiB trên máy bạn sẽ khác, nhưng chênh lệch thì giống.
+
+### 6. Chặn: giới hạn, và một cái bẫy
+
+Cách nhanh nhất để bảo vệ Prometheus là một giới hạn: `sample_limit` từ chối **cả** lần scrape nếu target trả về quá số mẫu cho phép. Đặt 2.000 cho job `shop` của cụm b rồi nạp lại cấu hình:
+
+<Terminal where="mac">
+
+```bash
+perl -0pi -e 's/  - job_name: shop\n/  - job_name: shop\n    sample_limit: 2000\n/' prom-b/prometheus.yml
+curl -s -X POST localhost:9764/-/reload -w 'reload: %{http_code}\n'
+sleep 35
+./pb 'up{job="shop"}'
+./pb 'scrape_samples_scraped{job="shop"}'
+curl -s localhost:9764/api/v1/targets | jq -r '.data.activeTargets[] | select(.labels.job == "shop") | .lastError'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+reload: 200
+0
+22040
+sample limit exceeded
+```
+
+</Expected>
+
+Target vẫn trả lời, nhưng Prometheus từ chối cả lần scrape vì nó có khoảng 20.000 mẫu, gấp mười lần giới hạn: `up` thành 0, lỗi ghi rõ `sample limit exceeded`, và không chuỗi mới nào vào head. Prometheus an toàn, đổi lại cụm b mất **toàn bộ** metric của `shop`, kể cả những metric bình thường. Ít nhất đó là một sự cố ồn ào: alert `up == 0` (D12.4) sẽ kêu và người trực biết phải tìm ở đâu.
+
+Một ý tưởng thường gặp tiếp theo: "chỉ cần bỏ label `customer` lúc scrape". Thử nó với `metric_relabel_configs` và `action: labeldrop`, bỏ `sample_limit`:
+
+<Terminal where="mac">
+
+```bash
+perl -0pi -e 's/    sample_limit: 2000\n/    metric_relabel_configs:\n      - action: labeldrop\n        regex: customer\n/' prom-b/prometheus.yml
+sed -n '/job_name: shop/,$p' prom-b/prometheus.yml
+curl -s -X POST localhost:9764/-/reload -w 'reload: %{http_code}\n'
+sleep 45
+./pb 'up{job="shop"}'
+curl -s localhost:9764/api/v1/targets | jq -r '.data.activeTargets[] | select(.labels.job == "shop") | "lastError: \"\(.lastError)\""'
+./pb 'prometheus_target_scrapes_sample_duplicate_timestamp_total'
+./tq 'sum by (cluster) (rate(http_requests_total{job="shop", route="/reserve"}[1m]))'
+```
+
+</Terminal>
+
+<Predict question="Hai cụm nhận cùng 5 request mỗi giây vào /reserve. Sau labeldrop, cụm b báo bao nhiêu?">
+
+```text
+  - job_name: shop
+    metric_relabel_configs:
+      - action: labeldrop
+        regex: customer
+    static_configs:
+      - targets: ["shop-b:8080"]
+reload: 200
+1
+lastError: ""
+0
+cluster=a  =>  4.889
+cluster=b  =>  0
+```
+
+`up` trở lại 1, không lỗi nào; nhưng cụm b báo gần như **0** request mỗi giây vào `/reserve`, trong khi cụm a báo khoảng 5, và traffic thật của hai cụm như nhau. Lý do: bỏ label `customer` làm 2.000 chuỗi khác nhau trùng thành **một** tập label. Trong một lần scrape, Prometheus chỉ giữ một mẫu cho mỗi tập label, nên giá trị còn lại là counter của một khách hàng bất kỳ, gần như không tăng. Số liệu sai mà không báo lỗi, như hai dòng giữa cho thấy: target không có lỗi nào (`lastError` rỗng) và bộ đếm mẫu trùng thời điểm của Prometheus vẫn là 0. Tệ hơn mất số liệu. `labeldrop` chỉ an toàn với label **không** góp phần phân biệt chuỗi. Trivago ở callout cũng `labeldrop` label `pod`, và điều đó an toàn vì mỗi target là một pod, nên label `instance` đã phân biệt các chuỗi.
+
+</Predict>
+
+Cách sửa đúng là ở mã nguồn: lui `shop-b` về bản không có label `customer` (chạy `up` không kèm hai biến môi trường, chúng về giá trị mặc định `off` và `0`), và gỡ `metric_relabel_configs`:
+
+<Terminal where="mac">
+
+```bash
+docker compose up -d shop-b loadgen-b 2>&1 | grep -c Started
+perl -0pi -e 's/    metric_relabel_configs:\n      - action: labeldrop\n        regex: customer\n//' prom-b/prometheus.yml
+curl -s -X POST localhost:9764/-/reload -w 'reload: %{http_code}\n'
+sleep 75
+./pb 'scrape_series_added{job="shop"}'
+./tq 'sum by (cluster) (rate(http_requests_total{job="shop", route="/reserve"}[1m]))'
+./pb 'prometheus_tsdb_head_series'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2
+reload: 200
+0
+cluster=a  =>  5
+cluster=b  =>  5
+21346
+```
+
+</Expected>
+
+Không còn chuỗi mới, và hai cụm báo cùng tốc độ. Số chuỗi trong head vẫn cao: chuỗi cũ của các khách hàng chỉ được dọn khỏi head sau lần cắt block kế tiếp, mà Prometheus chỉ cắt khi head đã dài hơn 1,5 lần độ dài block (3 giờ với block 2 giờ), nên chúng có thể nằm đó tới khoảng 3 giờ; và chúng đã nằm trong block sẽ được tải lên bucket. Hậu quả của một vụ nổ cardinality kéo dài hơn chính vụ nổ.
+
+<Check id="d16.3.lab-cardinality">Gây được và phát hiện được một vụ nổ cardinality bằng `scrape_series_added` và TSDB status, chặn được bằng `sample_limit`, và chứng minh được vì sao `labeldrop` trên label phân biệt chuỗi làm sai số liệu.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Sidecar log `WAL dir is not accessible` ngay lúc khởi động:** sidecar lên trước Prometheus; nó tự thử lại, lỗi biến mất sau vài giây.
+- **Sidecar log `permission denied` khi đọc block:** thiếu `user: "65534"`; sidecar phải chạy cùng user với Prometheus.
+- **Store gateway khởi động lại liên tục, log `mkdir … permission denied`:** `--data-dir` trỏ vào thư mục mà user `thanos` (1001) không ghi được; dùng `/tmp/...` như lab.
+- **`weed s3.bucket.list` không có `metrics` sau vòng lặp:** SeaweedFS chưa lên xong; chạy lại hai dòng `weed` cuối của bước 1.
+- **Truy vấn `offset 3d` rỗng:** store gateway chưa thấy block (nó quét mỗi phút) hoặc sidecar chưa tải xong. Xem `docker logs d16-sidecar-a 2>&1 | grep -c 'upload new block'` và `curl -s localhost:9765/api/v1/stores | jq`.
+- **Compactor báo `overlaps found`:** bạn chạy bước 2 hai lần trên cùng bucket, nên có hai bộ block lịch sử chồng nhau. Dọn bài (cuối D16.5) rồi làm lại.
+
+</Callout>
+
+### Dọn dẹp
+
+Bài sau không dùng cụm này. Dừng nó để nhường RAM:
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu">
+
+```bash
+cd ~/masteva-d16/lt && docker compose stop
+```
+
+</Terminal>
+
+Lệnh dọn hẳn cả chặng nằm ở cuối D16.5.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đã có object storage rồi, thời gian lưu cục bộ của Prometheus nên đặt bao nhiêu?">
+
+Đủ dài để chạy alert và phục vụ dashboard gần đây mà không phụ thuộc trung tâm, và đủ để chịu được một lần mất mạng tới object storage. Với sidecar, ít nhất vài block 2 giờ (thường 6 giờ tới 1 ngày); với remote write, đủ để hàng đợi không vỡ khi bộ nhận chậm. Cụm cạn bộ nhớ như trivago thậm chí giảm xuống 1 giờ. Đừng quên: alert chạy trên Prometheus cục bộ chỉ thấy dữ liệu cục bộ. Alert cần nhiều cụm (ví dụ "tổng traffic mọi vùng giảm") phải chạy ở tầng trung tâm (Thanos Ruler, ruler của Mimir), và tầng đó trở thành một thứ cần giám sát, chủ đề của D16.5.
+
+</Reveal>
+
+<Reveal title="Remote write có làm Prometheus nặng hơn không?">
+
+Có, và cần theo dõi. Prometheus đọc lại WAL để gửi, giữ hàng đợi theo shard, và tăng số shard khi bộ nhận chậm. Các metric `prometheus_remote_storage_*` (mẫu đang chờ, mẫu bị bỏ, độ trễ gửi tính bằng giây) là thứ cần alert: độ trễ gửi tăng dần nghĩa là dữ liệu ở trung tâm ngày càng cũ. Nếu Prometheus chỉ để gửi đi, Agent mode bỏ phần lưu và truy vấn cục bộ, nhẹ hơn đáng kể; đổi lại không chạy alert cục bộ được.
+
+</Reveal>
+
+<Reveal title="Muốn biết số liệu theo từng khách hàng thì làm thế nào, nếu không được thêm label?">
+
+Câu hỏi "khách hàng X có bị lỗi không" là câu hỏi về **sự kiện**, không phải về tổng; nó thuộc về log và trace, nơi mỗi request mang mã khách hàng mà không tạo chuỗi mới (D12.5 đặt trace id ở structured metadata vì cùng lý do). Nếu thật sự cần metric theo khách hàng, chỉ cho một tập nhỏ và cố định (top 50 khách hàng lớn, gom phần còn lại vào `other`), hoặc tính từ log thành metric ở một hệ thống riêng có ngân sách cardinality riêng. Exemplar (D12.6) là một cầu nối: metric giữ ở mức tổng, và mỗi bucket mang một trace id mẫu để đi xuống chi tiết.
+
+</Reveal>
+
+<Reveal title="Có cách nào biết trước một thay đổi sẽ làm nổ cardinality không?">
+
+Có, và nên đặt ở CI. Chạy ứng dụng trong môi trường thử, scrape `/metrics` của nó, đếm số chuỗi theo metric (như bước 5), rồi so với bản đang chạy; một pull request làm số chuỗi tăng quá một ngưỡng thì cần người duyệt. Bài [How Cloudflare runs Prometheus at scale](https://blog.cloudflare.com/how-cloudflare-runs-prometheus-at-scale/) mô tả một kiểm tra trong CI đi từ giới hạn: mặc định mỗi scrape có `sample_limit` 200; một pull request thêm scrape cho 10 target với `sample_limit` 1.500 có thể sinh thêm tối đa 15.000 chuỗi, và CI kiểm mọi Prometheus server còn chỗ cho ít nhất chừng đó trước khi cho merge. Phía Prometheus, alert trên `scrape_series_added` dương kéo dài và trên tốc độ tăng của `prometheus_tsdb_head_series` bắt được những gì lọt qua.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết cấu hình Thanos, Mimir hay VictoriaMetrics khá nhanh, và giải thích được kết quả TSDB status. Chỗ hay sai: trộn cờ của các phiên bản Thanos khác nhau (`--store` cũ thay cho `--endpoint`), quên đặt hai cờ `block-duration` bằng nhau cho sidecar, chạy hai compactor trên cùng bucket, quên nhãn ngoài hoặc đặt trùng giữa hai cụm, gợi ý `labeldrop` để "giảm cardinality" mà không nói tới việc chuỗi trùng nhau, và khẳng định downsampling tiết kiệm dung lượng. Kiểm lại: `thanos tools bucket inspect` cho thấy block thật, TSDB status trước và sau mỗi thay đổi relabel, và so `rate` của cùng một traffic ở hai nơi như bước 6.
+
+</Callout>
+
+<Callout kind="link">
+
+D12.2 định nghĩa cardinality và đọc TSDB status lần đầu; D12.3 dạy recording rule, cách giảm chuỗi cho dữ liệu cần giữ lâu. D11.3 dựng SeaweedFS làm S3 cho state của OpenTofu. D16.4 làm việc tương tự cho trace và log: chọn giữ gì, ở đâu, bao lâu. D16.5 giám sát chính các thành phần vừa dựng. D23 nhìn chi phí của cả hệ thống quan sát dưới góc FinOps; roadmap Kubernetes cài cùng các thành phần này bằng Helm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d16.3.mastery-architecture">Thiết kế được kiến trúc lưu metric dài hạn cho nhiều cụm (sidecar hay remote write, backend nào, nhãn ngoài, thời gian lưu theo độ phân giải) và bảo vệ được từng lựa chọn bằng giới hạn của Prometheus.</Check>
+
+<Check id="d16.3.mastery-cardinality">Với một Prometheus đang phình bộ nhớ, tìm được metric và label gây ra, chặn tạm được bằng giới hạn phù hợp, và chỉ ra được cách sửa tận gốc.</Check>
+
+<Check id="d16.3.mastery-guard">Đặt được giới hạn cardinality lúc scrape (`sample_limit`, `label_limit`), nói được giới hạn phía nhận của Mimir hay VictoriaMetrics bảo vệ thêm điều gì, và mỗi giới hạn đổi lấy bảo vệ bằng cái giá gì.</Check>
+
+</Mastery>

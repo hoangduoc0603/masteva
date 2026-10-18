@@ -1,0 +1,622 @@
+---
+title: seccomp và AppArmor cho pod
+description: Hai lớp kernel giới hạn việc một tiến trình trong container được làm - seccomp lọc system call, AppArmor lọc đường dẫn và thao tác - đặt từ pod spec. Thấy một syscall bị chặn trông thế nào, viết profile Localhost, bật seccomp mặc định cho cả node, và nạp profile AppArmor trên node thật vì kernel của Docker Desktop không có AppArmor.
+id: k8.2
+step: k8
+prerequisites: [k8.1, d1.5]
+topics: [k8.seccomp-apparmor]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop, kernel 7.0.12-linuxkit) và Ubuntu 26.04 LTS (VM Lima, kernel 7.0.0-28-generic)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes-kind: 1.37.0
+    kubectl: 1.37.1
+    lima: 2.2.0
+    kubeadm: 1.37.1
+    containerd-vm: 2.2.2
+    runc-vm: 1.4.0
+    flannel: 0.28.10
+    busybox: 1.38.0
+---
+
+<Goal>
+
+K8.1 bắt buộc pod **khai** seccomp; D1.5 dạy AppArmor ở mức một máy Linux. Bài này nối hai thứ: chúng làm gì bên dưới một pod, và vận hành chúng trên cụm thế nào. Học xong, bạn:
+
+- Giải thích được vì sao cùng một lệnh `unshare` chạy được trong pod này mà báo `Operation not permitted` trong pod kia, dù cả hai đều là root.
+- Viết được profile seccomp riêng, dùng chế độ ghi log để biết ứng dụng gọi những syscall nào trước khi chặn.
+- Biết pod không khai gì thì chạy với seccomp nào, và bật được seccomp mặc định cho cả node.
+- Giải thích được vì sao một pod khai AppArmor đứng ở `CreateContainerError` trên node này mà chạy được trên node khác.
+
+</Goal>
+
+<Knowledge>
+
+### seccomp: lọc system call
+
+Mọi việc thật của một tiến trình (mở file, tạo socket, tạo namespace) đều đi qua **system call** (syscall): lời gọi từ chương trình vào kernel. Kernel Linux có khoảng 450 syscall; một web server bình thường dùng vài chục. Phần còn lại (nạp module kernel, đổi giờ hệ thống, tạo user namespace, `ptrace` tiến trình khác…) là bề mặt tấn công: nhiều lỗ hổng kernel chỉ chạm được qua một syscall hiếm dùng.
+
+**seccomp** (secure computing mode) cho một tiến trình gắn một bộ lọc vào chính nó: trước mỗi syscall, kernel chạy bộ lọc và làm theo kết quả. Bộ lọc được kế thừa sang tiến trình con và không gỡ được. Container runtime gắn bộ lọc vào tiến trình đầu tiên của container, trước khi chạy lệnh của image.
+
+```text
+ tiến trình trong container gọi unshare(CLONE_NEWUSER)
+        |
+        v
+ kernel: tiến trình có bộ lọc seccomp?
+        |-- không (Unconfined) ----------------------------> thực thi syscall
+        |-- có: tra bộ lọc theo số syscall (và đối số)
+               |-- SCMP_ACT_ALLOW  -------------------------> thực thi
+               |-- SCMP_ACT_ERRNO  -> trả lỗi, thường EPERM: "Operation not permitted"
+               |-- SCMP_ACT_LOG    -> thực thi, ghi một dòng audit vào log kernel
+               |-- SCMP_ACT_KILL_PROCESS -> giết tiến trình
+```
+
+Profile là một file JSON: một hành động mặc định và danh sách ngoại lệ theo tên syscall. Ba loại profile trong pod spec (`securityContext.seccompProfile.type`):
+
+| Loại | Profile nằm ở đâu | Ghi chú |
+|---|---|---|
+| `Unconfined` | Không có bộ lọc | Mặc định khi pod không khai gì và kubelet không bật `seccompDefault`. Container `privileged: true` luôn chạy `Unconfined`, bất kể khai gì |
+| `RuntimeDefault` | Profile mặc định của containerd hoặc CRI-O | Chặn khoảng vài chục syscall nguy hiểm hoặc cần quyền như `unshare` khi không có `CAP_SYS_ADMIN`, `mount`, `keyctl`, `bpf`, `kexec_load`. Đủ cho gần như mọi ứng dụng |
+| `Localhost` | File JSON trên **từng node**, đường dẫn tương đối với `/var/lib/kubelet/seccomp/` | Profile tự viết. File thiếu trên node nào thì pod đặt lên node đó không tạo được container |
+
+Một điểm dễ nhầm: `RuntimeDefault` chặn `unshare` có điều kiện. Root có `CAP_SYS_ADMIN` vẫn gọi được, vì runtime coi người đó đã đủ quyền. Seccomp và capability (K2.4) là hai lớp bổ sung nhau, không thay nhau.
+
+**`seccompDefault` của kubelet.** Từ Kubernetes 1.27 (GA), kubelet có tuỳ chọn `seccompDefault: true`: pod không khai seccomp sẽ chạy `RuntimeDefault` thay vì `Unconfined`. Đây là cấu hình của **node**, không phải của API server, nên PSA không thấy nó: `restricted` vẫn đòi pod khai `seccompProfile` tường minh, kể cả khi mọi node đã bật.
+
+<Check id="k8.2.seccomp">Giải thích được seccomp lọc cái gì và ở đâu, kể được ba loại profile trong pod spec cùng nơi profile nằm, và nói được pod không khai gì thì chạy với seccomp nào.</Check>
+
+### Viết profile Localhost mà không làm gãy ứng dụng
+
+Cách an toàn để viết profile riêng: chạy ứng dụng với một profile có hành động mặc định `SCMP_ACT_LOG` (cho chạy, ghi log), đọc log kernel để biết nó gọi những syscall nào, rồi viết profile `SCMP_ACT_ERRNO` mặc định cùng danh sách được phép. Log ghi **số** syscall, và số này tuỳ kiến trúc: `fchmodat` là 53 trên arm64, 268 trên x86-64. Profile JSON dùng tên, nên không phụ thuộc kiến trúc trừ khi bạn khai trường `architectures`.
+
+Profile Localhost phải có mặt trên mọi node mà pod có thể được đặt lên. Ở quy mô cụm, việc chép file đó là của công cụ quản lý cấu hình (D8.1) hoặc của **Security Profiles Operator** (dự án kubernetes-sigs): bạn khai profile thành object `SeccompProfile` trong cụm, một DaemonSet chép nó xuống mọi node, và nó có chế độ ghi lại syscall của một pod để sinh profile.
+
+### AppArmor: lọc theo đường dẫn
+
+AppArmor (D1.5 đã dạy profile, `enforce` và `complain`, cách đọc dòng `DENIED`) là một LSM (Linux Security Module): kernel kiểm mỗi thao tác của tiến trình (mở file để đọc hay ghi, mount, dùng capability, mở socket) theo profile gắn với tiến trình đó. Seccomp hỏi "được gọi syscall `openat` không"; AppArmor hỏi "được ghi vào `/etc/passwd` không". Hai lớp bổ sung nhau.
+
+Trong pod spec, từ Kubernetes 1.30 (GA) AppArmor là trường `securityContext.appArmorProfile` ở cấp pod hoặc container, thay cho annotation `container.apparmor.security.beta.kubernetes.io/*` cũ:
+
+| `type` | Nghĩa |
+|---|---|
+| `RuntimeDefault` | Profile mặc định của runtime; với containerd tên là `cri-containerd.apparmor.d`. Đây cũng là profile pod nhận khi không khai gì, nếu node có AppArmor |
+| `Localhost` + `localhostProfile: <tên>` | Profile theo **tên** đã nạp sẵn trong kernel của node |
+| `Unconfined` | Không giới hạn; `baseline` cấm |
+
+Ba điều khác với seccomp, cả ba đều gây sự cố vận hành:
+
+- **Profile phải nạp vào kernel của node** (`apparmor_parser`), không phải chép file vào một thư mục. Node khởi động lại thì phải nạp lại; thường là việc của systemd unit hoặc DaemonSet.
+- **Node phải có AppArmor.** Ubuntu và Debian bật sẵn; RHEL, Fedora dùng SELinux thay thế; kernel của Docker Desktop (LinuxKit) không có AppArmor. Vì vậy phần AppArmor của lab chạy trong VM Ubuntu.
+- **Sửa profile có hiệu lực ngay với container đang chạy.** `apparmor_parser -r` thay profile trong kernel; mọi tiến trình đang gắn profile đó dùng luật mới từ lần kiểm kế tiếp. Seccomp thì ngược lại: bộ lọc đã gắn không đổi được, phải tạo lại container.
+
+<Check id="k8.2.apparmor">So sánh được seccomp với AppArmor (lọc cái gì, profile nằm ở đâu, sửa profile có tác dụng với container đang chạy không), và giải thích được vì sao profile AppArmor `Localhost` gây lỗi trên node chưa nạp nó.</Check>
+
+<Callout kind="production">
+
+Tháng 1/2022, nhóm CTF Crusaders of Rust [công bố CVE-2022-0185](https://www.willsroot.io/2022/01/cve-2022-0185.html), lỗi tràn bộ đệm heap trong hàm `legacy_parse_param` của kernel Linux (có từ 5.1-rc1), chạm tới được qua syscall `fsconfig`. Syscall này đòi `CAP_SYS_ADMIN`, nhưng chỉ trong namespace hiện tại, và một user thường có được quyền đó bằng `unshare(CLONE_NEWNS|CLONE_NEWUSER)`. Nhóm dùng lỗi này để thoát khỏi container trên hạ tầng CTF Kubernetes được gia cố của Google (chương trình kCTF), đọc được flag nằm trong một container khác, và nhận tiền thưởng của Google.
+
+[Phân tích của CrowdStrike](https://www.crowdstrike.com/en-us/blog/cve-2022-0185-kubernetes-container-escape-using-linux-kernel-exploit/) ngày 31/01/2022 nhấn vào phía Kubernetes: theo bài viết, Kubernetes mặc định không áp profile seccomp, AppArmor hay SELinux nào cho pod. Họ minh hoạ rằng một pod khai `seccompProfile: RuntimeDefault` nhận `unshare failed: Operation not permitted`, tức là đường lấy `CAP_SYS_ADMIN` bị cắt. Khuyến nghị của họ: nâng kernel càng sớm càng tốt, áp `RuntimeDefault` qua SecurityContext, dùng Pod Security Admission, và với máy không chạy container thì tắt user namespace không đặc quyền.
+
+Bước 1 của lab tái hiện đúng đoạn `unshare` đó trên cụm của bạn. Điều rút ra (của bài): seccomp không vá lỗ hổng, nó cắt đường tới lỗ hổng; lỗ hổng kernel kế tiếp đi qua một syscall hiếm dùng khác vẫn bị `RuntimeDefault` chặn nếu syscall đó nằm trong danh sách, trong khi bản vá kernel luôn tới sau.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [Restrict a Container's Syscalls with seccomp](https://kubernetes.io/docs/tutorials/security/seccomp/): profile Localhost, chế độ `SCMP_ACT_LOG`, và phần bật `seccompDefault` cho kubelet.
+- [Restrict a Container's Access to Resources with AppArmor](https://kubernetes.io/docs/tutorials/security/apparmor/): trường `appArmorProfile`, cách nạp profile lên node, và điều gì xảy ra khi profile thiếu.
+- [seccomp(2), Linux manual page](https://man7.org/linux/man-pages/man2/seccomp.2.html): các hành động `SECCOMP_RET_*` và việc bộ lọc được kế thừa, không gỡ được.
+- [Security Profiles Operator](https://github.com/kubernetes-sigs/security-profiles-operator): quản lý profile seccomp và AppArmor như object trong cụm, kèm chế độ ghi lại syscall.
+- [CrowdStrike: CVE-2022-0185 Kubernetes Container Escape](https://www.crowdstrike.com/en-us/blog/cve-2022-0185-kubernetes-container-escape-using-linux-kernel-exploit/): nguồn của callout; đọc kèm [bài gốc của nhóm phát hiện](https://www.willsroot.io/2022/01/cve-2022-0185.html) phần mở đầu và phần thoát container.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bước 1 tới 3 dùng cụm `k8-lab` của K8.1 trên Docker. Bước 4 và 5 dùng một VM Lima Ubuntu 26.04 có cụm kubeadm một node, vì AppArmor cần kernel có AppArmor mà Docker Desktop không có. Nếu đã xoá cụm `k8-lab`, tạo lại: `cd ~/masteva-k8 && kind create cluster --config kind.yaml`.
+
+**Profile máy.** Bước 1 tới 3: node kind khoảng 0,7 tới 0,8 GiB RAM của Docker. Bước 4 và 5: VM 2 GiB, 2 CPU; cuối bài, VM dùng khoảng 0,85 GiB tính cả hệ điều hành (`free -m`); bài xoá cụm kind trước khi bật VM, nên hai phần không chạy cùng lúc. Máy 8 GB chạy được nếu tắt các lab khác. Lần đầu, VM tải image Ubuntu, gói Kubernetes và image control plane, cỡ vài trăm MB.
+
+### 1. Pod không khai gì chạy với seccomp nào
+
+Ba pod busybox chạy bằng root trong namespace `sc`: một không khai seccomp, một khai `RuntimeDefault`, một khai `Unconfined`. Trong mỗi pod, đọc trạng thái seccomp của tiến trình đầu tiên (`0` là không lọc, `2` là đang lọc) rồi thử tạo user namespace bằng `unshare -U -r`, đúng bước mở đầu của CVE-2022-0185.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k8/kubeconfig
+mkdir -p ~/masteva-k8/k8-2 && cd ~/masteva-k8/k8-2
+kubectl create namespace sc
+kubectl label namespace sc pod-security.kubernetes.io/warn=baseline
+kubectl -n sc run mac-dinh --image=busybox:1.38.0 --restart=Never -- sleep 3600
+kubectl -n sc run runtime-default --image=busybox:1.38.0 --restart=Never \
+  --overrides='{"spec":{"securityContext":{"seccompProfile":{"type":"RuntimeDefault"}}}}' -- sleep 3600
+kubectl -n sc run unconfined --image=busybox:1.38.0 --restart=Never \
+  --overrides='{"spec":{"securityContext":{"seccompProfile":{"type":"Unconfined"}}}}' -- sleep 3600 2>&1 | cut -c1-140
+kubectl -n sc wait --for=condition=Ready pod/mac-dinh pod/runtime-default --timeout=60s
+for p in mac-dinh runtime-default; do
+  echo "== $p"
+  kubectl -n sc exec $p -- sh -c 'grep Seccomp: /proc/1/status; unshare -U -r cat /proc/self/uid_map'
+done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/sc created
+namespace/sc labeled
+pod/mac-dinh created
+pod/runtime-default created
+Error from server (Forbidden): pods "unconfined" is forbidden: violates PodSecurity "baseline:latest": seccompProfile (pod must not set secu
+pod/mac-dinh condition met
+pod/runtime-default condition met
+== mac-dinh
+Seccomp:	0
+         0          0          1
+== runtime-default
+Seccomp:	2
+unshare: unshare(0x10000000): Operation not permitted
+command terminated with exit code 1
+```
+
+</Expected>
+
+Nhãn `warn=baseline` chỉ để tắt các dòng cảnh báo `restricted` cho output gọn; mức `enforce` vẫn là `baseline` mặc định của cụm từ K8.1. `baseline` từ chối `Unconfined` khi khai tường minh, nhưng không đòi pod khai gì, nên `mac-dinh` lên được và chạy **không có bộ lọc** (`Seccomp: 0`). Trong pod đó, `unshare -U -r` tạo được user namespace: lệnh không báo lỗi, và bảng ánh xạ UID của namespace mới (`/proc/self/uid_map`, ba cột: UID bên trong, UID bên ngoài, số lượng) cho thấy tiến trình bên trong là root (UID 0) của namespace đó, với đủ capability trong namespace ấy: đúng điều kiện CVE-2022-0185 cần. Với `RuntimeDefault`, `unshare` bị chặn; `0x10000000` là cờ `CLONE_NEWUSER`.
+
+<Check id="k8.2.lab-mac-dinh">Chỉ ra được bằng `/proc/1/status` và `unshare` rằng pod không khai seccomp chạy không lọc, còn pod `RuntimeDefault` bị chặn tạo user namespace; giải thích được vì sao `baseline` không bắt được pod không khai gì.</Check>
+
+### 2. Profile Localhost: chặn một syscall và ghi log một syscall
+
+Profile dưới cho phép mọi thứ (`defaultAction: SCMP_ACT_ALLOW`), trừ hai ngoại lệ: `mkdir` và `mkdirat` trả lỗi số 1 (`EPERM`), còn họ `chmod` được chạy nhưng ghi log. File nằm trong `~/masteva-k8/seccomp`, thư mục K8.1 đã gắn vào `/var/lib/kubelet/seccomp/profiles` của node, nên `localhostProfile` là `profiles/chan-mkdir.json`.
+
+<Terminal where="mac" title="~/masteva-k8/seccomp/chan-mkdir.json">
+
+```bash
+cat > ~/masteva-k8/seccomp/chan-mkdir.json <<'EOF'
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    { "names": ["mkdir", "mkdirat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1 },
+    { "names": ["chmod", "fchmod", "fchmodat", "fchmodat2"], "action": "SCMP_ACT_LOG" }
+  ]
+}
+EOF
+docker exec k8-lab-control-plane ls /var/lib/kubelet/seccomp/profiles
+kubectl -n sc run localhost --image=busybox:1.38.0 --restart=Never \
+  --overrides='{"spec":{"securityContext":{"seccompProfile":{"type":"Localhost","localhostProfile":"profiles/chan-mkdir.json"}}}}' -- sleep 3600
+kubectl -n sc wait --for=condition=Ready pod/localhost --timeout=60s
+kubectl -n sc exec localhost -- sh -c 'mkdir /tmp/thu-muc; touch /tmp/f && chmod 600 /tmp/f && echo "chmod chạy được"'
+docker exec k8-lab-control-plane dmesg | grep 'type=1326' | tail -1 | grep -o 'comm=.*syscall=[0-9]*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+chan-mkdir.json
+pod/localhost created
+pod/localhost condition met
+mkdir: can't create directory '/tmp/thu-muc': Operation not permitted
+chmod chạy được
+comm="chmod" exe="/bin/chmod" sig=0 arch=c00000b7 syscall=53
+```
+
+</Expected>
+
+`mkdir` bị từ chối bằng đúng thông báo của lỗi quyền thông thường: không có gì trong output cho biết đó là seccomp. Dòng `type=1326` là bản ghi audit mà kernel viết cho hành động `SCMP_ACT_LOG`; node kind dùng chung kernel với VM của Docker Desktop, nên `dmesg` trong node đọc được nó. `arch=c00000b7` và `syscall=53` là `fchmodat` trên arm64; máy x86-64 sẽ in `arch=c000003e` và một số khác. Profile thật bắt đầu đúng như vậy: mặc định `SCMP_ACT_LOG`, chạy thử ứng dụng qua mọi luồng, thu danh sách syscall, rồi đổi mặc định sang `SCMP_ACT_ERRNO`.
+
+Profile Localhost thiếu trên node thì sao:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n sc run thieu-profile --image=busybox:1.38.0 --restart=Never \
+  --overrides='{"spec":{"securityContext":{"seccompProfile":{"type":"Localhost","localhostProfile":"profiles/khong-co.json"}}}}' -- sleep 3600
+sleep 8
+kubectl -n sc get pod thieu-profile
+kubectl -n sc events --for pod/thieu-profile | grep Failed | tail -1 | cut -c1-210
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/thieu-profile created
+NAME            READY   STATUS                 RESTARTS   AGE
+thieu-profile   0/1     CreateContainerError   0          8s
+8s (x2 over 8s)   Warning   Failed      Pod/thieu-profile   Error: failed to create containerd container: cannot load seccomp profile "/var/lib/kubelet/seccomp/profiles/khong-co.json": open /var/lib/kubelet/sec
+```
+
+</Expected>
+
+API server nhận pod (nó không biết node có file gì), scheduler đặt pod lên node, và chỉ tới lúc containerd tạo container thì lỗi mới lộ ra. Trên cụm nhiều node, triệu chứng là "pod chạy được trên vài node, `CreateContainerError` trên node mới thêm": node mới chưa được chép profile.
+
+<Check id="k8.2.lab-localhost">Viết được profile seccomp Localhost chặn một nhóm syscall và ghi log một nhóm khác, đọc được dòng log `type=1326`, và nhận ra được lỗi `CreateContainerError` khi profile thiếu trên node.</Check>
+
+### 3. Bật seccomp mặc định cho node
+
+Bật `seccompDefault` trong cấu hình kubelet của node, khởi động lại kubelet, rồi tạo lại một pod không khai gì. Pod đang chạy không bị ảnh hưởng: kubelet khởi động lại không dừng container.
+
+Sửa thẳng file như dưới chỉ hợp để thử. Trên cụm kubeadm, `/var/lib/kubelet/config.yaml` bị ghi đè ở mỗi lần `kubeadm upgrade` (K4.3) từ ConfigMap `kube-system/kubelet-config`. Muốn giữ cho cả cụm thì sửa ConfigMap đó (khoá `data.kubelet`), rồi trên từng node chạy `kubeadm upgrade node phase kubelet-config` và khởi động lại kubelet, mỗi lần một node, theo tài liệu "Reconfiguring a kubeadm cluster".
+
+<Terminal where="mac">
+
+```bash
+docker exec k8-lab-control-plane sh -c "echo 'seccompDefault: true' >> /var/lib/kubelet/config.yaml && systemctl restart kubelet"
+for i in $(seq 1 30); do
+  kubectl get node k8-lab-control-plane -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True && break
+  sleep 2
+done
+kubectl -n sc run mac-dinh-moi --image=busybox:1.38.0 --restart=Never -- sleep 3600
+kubectl -n sc wait --for=condition=Ready pod/mac-dinh-moi --timeout=60s
+kubectl -n sc exec mac-dinh-moi -- sh -c 'grep Seccomp: /proc/1/status; unshare -U -r cat /proc/self/uid_map'
+kubectl -n sc exec mac-dinh -- grep Seccomp: /proc/1/status
+kubectl -n sc get pod mac-dinh-moi -o jsonpath='{.spec.securityContext}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/mac-dinh-moi created
+pod/mac-dinh-moi condition met
+Seccomp:	2
+unshare: unshare(0x10000000): Operation not permitted
+command terminated with exit code 1
+Seccomp:	0
+{}
+```
+
+</Expected>
+
+Pod mới không khai gì mà vẫn chạy `RuntimeDefault`. Pod `mac-dinh` cũ vẫn `Seccomp: 0`: bộ lọc gắn lúc tạo container và không đổi được, phải tạo lại pod. Dòng cuối là chỗ cần nhớ: `securityContext` của pod vẫn rỗng, nên một namespace `restricted` vẫn từ chối pod này dù trên node nó được lọc. Tài liệu Kubernetes khuyên bật tính năng này trên một nhóm node trước, vì vài ứng dụng cần syscall mà `RuntimeDefault` chặn.
+
+<Check id="k8.2.lab-seccomp-default">Bật được `seccompDefault` trên kubelet, chứng minh được pod mới chạy `RuntimeDefault` còn pod cũ không đổi, và giải thích được vì sao PSA `restricted` vẫn đòi khai tường minh.</Check>
+
+### 4. Cụm kubeadm một node trong VM Ubuntu
+
+Thử AppArmor ngay trên cụm kind trước: một pod khai profile `Localhost` (tên profile không quan trọng ở đây), và kiểm module AppArmor trong kernel của node.
+
+<Terminal where="mac">
+
+```bash
+kubectl -n sc run aa-thu --image=busybox:1.38.0 --restart=Never \
+  --overrides='{"spec":{"securityContext":{"appArmorProfile":{"type":"Localhost","localhostProfile":"k8-chan-ghi"}}}}' -- sleep 3600
+sleep 5
+kubectl -n sc get pod aa-thu -o jsonpath='{.status.phase} / {.status.reason}: {.status.message}{"\n"}'
+docker exec k8-lab-control-plane ls /sys/module/apparmor 2>&1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/aa-thu created
+Failed / AppArmor: Pod was rejected: Cannot enforce AppArmor: AppArmor is not enabled on the host
+ls: cannot access '/sys/module/apparmor': No such file or directory
+```
+
+</Expected>
+
+API server nhận pod; kubelet từ chối chạy nó (`Failed`, lý do `AppArmor`) vì kernel của node không có AppArmor: kernel của Docker Desktop không nạp module này. Kubelet không âm thầm chạy pod mà bỏ qua profile. Đặt cụm kind trong một VM Ubuntu cũng không đủ: containerd bên trong node kind tự tắt AppArmor khi phát hiện mình chạy trong container. Cách gọn nhất là một node Kubernetes chạy thẳng trên VM, dựng bằng kubeadm như K4.1 nhưng chỉ một máy.
+
+Trước khi bật VM, xoá cụm kind để trả RAM cho máy. K8.3 tạo lại cụm từ `kind.yaml` của K8.1 bằng một lệnh.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá cụm `k8-lab` cùng mọi thứ trong nó. Các file trong `~/masteva-k8` (cấu hình cụm, profile seccomp) vẫn còn.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kind delete cluster --name k8-lab
+limactl start --name k8-vm --cpus 2 --memory 2 --disk 20 --plain --tty=false template:ubuntu-26.04 2>&1 | tail -1
+limactl shell k8-vm cat /sys/module/apparmor/parameters/enabled
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Deleting cluster "k8-lab" ...
+Deleted nodes: ["k8-lab-control-plane"]
+time="…" level=info msg="READY. Run `ssh -F `/Users/…/.lima/k8-vm/ssh.config` lima-k8-vm` to open the shell."
+Y
+```
+
+</Expected>
+
+`Y`: kernel của VM có AppArmor. Bài dùng lại script `node-prep.sh` của K4.1 (bước 2): nó cài containerd, kubeadm, kubelet đúng minor và so fingerprint khoá ký của kho gói trước khi tin. Nếu không còn file `~/masteva-d13/node-prep.sh`, chạy `mkdir -p ~/masteva-d13 && cd ~/masteva-d13`, rồi mở K4.1 bước 2 và chỉ dán phần từ dòng `cat > node-prep.sh <<'EOF'` tới dòng `EOF` kết thúc script; bỏ các dòng `limactl shell k4-…` cuối khối đó, vì chúng chạy trên VM của K4.1.
+
+<Terminal where="mac">
+
+```bash
+cp ~/masteva-d13/node-prep.sh ~/masteva-k8/node-prep.sh
+limactl shell k8-vm sudo bash -s 1.37 < ~/masteva-k8/node-prep.sh 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+lima-k8-vm: containerd 2.2.2, runc 1.4.0-0ubuntu1, kubeadm v1.37.1, kubelet v1.37.1
+```
+
+</Expected>
+
+Mở một terminal vào VM bằng `limactl shell k8-vm`. Khối dưới dựng control plane, gỡ taint `NoSchedule` để pod thường được đặt lên chính node này (cụm chỉ có một máy), và cài Flannel làm CNI như K4.1. Mất khoảng hai tới ba phút.
+
+<Terminal where="vm" title="k8-vm">
+
+```bash
+mkdir -p ~/k8 && cd ~/k8
+cat > kubeadm.yaml <<'EOF'
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v1.37.1
+networking:
+  podSubnet: 10.244.0.0/16
+EOF
+sudo kubeadm init --config kubeadm.yaml > init.log 2>&1 && echo "kubeadm init xong" || tail -5 init.log
+mkdir -p ~/.kube && sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown "$(id -u):$(id -g)" ~/.kube/config
+kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule-
+kubectl apply -f https://github.com/flannel-io/flannel/releases/download/v0.28.10/kube-flannel.yml > /dev/null
+kubectl -n kube-flannel rollout status daemonset/kube-flannel-ds --timeout=180s | tail -1
+kubectl wait --for=condition=Ready node --all --timeout=120s
+sudo aa-status | grep -E 'profiles are loaded|cri-containerd'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kubeadm init xong
+node/lima-k8-vm untainted
+daemon set "kube-flannel-ds" successfully rolled out
+node/lima-k8-vm condition met
+179 profiles are loaded.
+   cri-containerd.apparmor.d
+   /usr/local/bin/kube-apiserver (16108) cri-containerd.apparmor.d
+   /usr/local/bin/etcd (16120) cri-containerd.apparmor.d
+   /usr/local/bin/kube-controller-manager (16121) cri-containerd.apparmor.d
+   /usr/local/bin/kube-scheduler (16140) cri-containerd.apparmor.d
+   /opt/bin/flanneld (16713) cri-containerd.apparmor.d
+```
+
+</Expected>
+
+Số profile và PID trên máy bạn sẽ khác. `cri-containerd.apparmor.d` là profile `RuntimeDefault` mà containerd nạp lúc khởi động, và các thành phần control plane (static pod) đang chạy dưới nó: không khai gì, pod trên node có AppArmor tự nhận profile mặc định của runtime.
+
+### 5. AppArmor Localhost: nạp trên node, đổi khi đang chạy
+
+Profile `k8-chan-ghi` cho phép mọi thao tác file trừ ghi. Viết nó, nhưng **chưa nạp**, rồi tạo hai pod: một không khai AppArmor, một khai `Localhost` trỏ tới profile này.
+
+<Terminal where="vm" title="k8-vm: ~/k8/k8-chan-ghi">
+
+```bash
+cd ~/k8
+cat > k8-chan-ghi <<'EOF'
+abi <abi/5.0>,
+include <tunables/global>
+
+profile k8-chan-ghi flags=(attach_disconnected) {
+  include <abstractions/base>
+  file,
+  audit deny /** w,
+}
+EOF
+cat > aa-pods.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: { name: aa-mac-dinh }
+spec:
+  containers:
+    - { name: c, image: "busybox:1.38.0", command: ["sleep", "3600"] }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: aa-chan-ghi }
+spec:
+  securityContext:
+    appArmorProfile: { type: Localhost, localhostProfile: k8-chan-ghi }
+  containers:
+    - { name: c, image: "busybox:1.38.0", command: ["sleep", "3600"] }
+EOF
+kubectl apply -f aa-pods.yaml
+kubectl wait --for=condition=Ready pod/aa-mac-dinh --timeout=120s
+sleep 5
+kubectl get pod aa-chan-ghi
+kubectl events --for pod/aa-chan-ghi | grep Failed | tail -1 | cut -c1-200
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/aa-mac-dinh created
+pod/aa-chan-ghi created
+pod/aa-mac-dinh condition met
+NAME          READY   STATUS                 RESTARTS   AGE
+aa-chan-ghi   0/1     CreateContainerError   0          10s
+3s (x2 over 3s)   Warning   Failed      Pod/aa-chan-ghi   Error: failed to get container spec opts: failed to generate apparmor spec opts: apparmor profile not found k8-chan-ghi
+```
+
+</Expected>
+
+Cùng triệu chứng với seccomp ở bước 2, khác nguyên nhân: profile AppArmor được tìm **theo tên trong kernel**, không theo file. Nạp nó, và kubelet tự tạo lại container ở lần thử kế tiếp:
+
+<Terminal where="vm" title="k8-vm">
+
+```bash
+sudo apparmor_parser -r ~/k8/k8-chan-ghi
+kubectl wait --for=condition=Ready pod/aa-chan-ghi --timeout=120s
+for p in aa-mac-dinh aa-chan-ghi; do
+  echo "== $p"
+  kubectl exec $p -- sh -c 'cat /proc/1/attr/current; echo hi > /tmp/f && echo "ghi được"'
+done
+sudo journalctl -k --since "-1min" --no-pager -o cat | grep -o 'apparmor="DENIED".*profile="k8-chan-ghi".*name="[^"]*"' | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/aa-chan-ghi condition met
+== aa-mac-dinh
+cri-containerd.apparmor.d (enforce)
+ghi được
+== aa-chan-ghi
+k8-chan-ghi (enforce)
+sh: line 0: can't create /tmp/f: Permission denied
+command terminated with exit code 1
+apparmor="DENIED" operation="mknod" class="file" profile="k8-chan-ghi" name="/tmp/f"
+```
+
+</Expected>
+
+`/proc/1/attr/current` cho biết tiến trình đang gắn profile nào. Lỗi là `Permission denied` (không phải `Operation not permitted` như seccomp), và dòng `DENIED` trong log kernel của **node** ghi profile, thao tác, đường dẫn. Profile dùng `audit deny` chứ không phải `deny`: luật `deny` thường chặn mà không ghi log, nên khi điều tra bạn sẽ không thấy gì.
+
+<Predict question="Sửa profile để chỉ cấm ghi dưới `/etc`, nạp lại bằng `apparmor_parser -r`. Pod `aa-chan-ghi` đang chạy có ghi được vào `/tmp` ngay không, hay phải tạo lại pod?">
+
+Ghi được ngay. AppArmor kiểm theo profile hiện có trong kernel ở mỗi thao tác, và `-r` thay profile cùng tên tại chỗ. Khác với seccomp ở bước 3, nơi bộ lọc đã gắn không đổi được.
+
+</Predict>
+
+<Terminal where="vm" title="k8-vm">
+
+```bash
+sed -i 's|  audit deny /\*\* w,|  audit deny /etc/** w,|' ~/k8/k8-chan-ghi
+grep deny ~/k8/k8-chan-ghi
+sudo apparmor_parser -r ~/k8/k8-chan-ghi
+kubectl exec aa-chan-ghi -- sh -c 'echo hi > /tmp/f && echo "ghi /tmp được"; echo x >> /etc/hosts'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  audit deny /etc/** w,
+ghi /tmp được
+sh: line 0: can't create /etc/hosts: Permission denied
+command terminated with exit code 1
+```
+
+</Expected>
+
+Mặt trái của tính chất này: một lần nạp profile sai trên node làm gãy ngay mọi container đang dùng nó, không cần rollout nào. Vì vậy profile AppArmor được triển khai như mã: qua review, thử trên một node, rồi mới nạp lên cả nhóm node.
+
+<Check id="k8.2.lab-apparmor">Tái hiện được pod `CreateContainerError` vì profile AppArmor chưa nạp, nạp profile và chứng minh nó chặn ghi, đọc được dòng `DENIED`, và cho thấy sửa profile có hiệu lực ngay với container đang chạy.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `unshare` chạy được trong pod `mac-dinh-moi` ở bước 3 | kubelet chưa nhận cấu hình mới: dòng `seccompDefault` không vào file, hoặc kubelet chưa khởi động lại | `docker exec k8-lab-control-plane grep seccompDefault /var/lib/kubelet/config.yaml`; `docker exec k8-lab-control-plane systemctl status kubelet` |
+| `unshare -U -r` ở bước 1 báo lỗi cả trong pod `mac-dinh` | Kernel chạy Docker của bạn chặn user namespace không đặc quyền (ví dụ `user.max_user_namespaces=0`); kernel của Docker Desktop cho phép | `docker run --rm --security-opt seccomp=unconfined busybox:1.38.0 unshare -U -r id -u` phải in `0` (cần tắt seccomp mặc định của Docker, vì chính nó chặn `unshare`); so sánh `Seccomp: 0` và `2` vẫn đúng |
+| Không thấy dòng `type=1326` | Lệnh `chmod` chưa chạy, hoặc kernel tắt ghi log cho hành động `log` | `docker exec k8-lab-control-plane cat /proc/sys/kernel/seccomp/actions_logged` phải có `log` |
+| `limactl shell k8-vm sudo bash -s 1.37` dừng ở fingerprint | Kho gói Kubernetes đã đổi hoặc gia hạn khoá | Làm theo hướng dẫn kiểm fingerprint ở K4.1 bước 2 |
+| `kubeadm init` lỗi preflight về RAM hoặc CPU | VM tạo với ít hơn 2 CPU hoặc 2 GiB | `limactl list`; tạo lại VM đúng tham số |
+| Pod `aa-chan-ghi` vẫn `CreateContainerError` sau khi nạp | Tên trong `profile …` khác `localhostProfile` | `sudo aa-status \| grep k8-chan-ghi` |
+
+### Dọn dẹp
+
+Dừng VM để trả RAM; đĩa của VM vẫn giữ, `limactl start k8-vm` bật lại khoảng 20 giây. K8.3 không dùng VM này.
+
+<Terminal where="mac">
+
+```bash
+limactl stop k8-vm
+```
+
+</Terminal>
+
+Khi không cần làm lại bước 4 và 5 nữa, xoá hẳn VM:
+
+<Callout kind="danger">
+
+`limactl delete` xoá VM cùng đĩa của nó: cụm kubeadm và profile AppArmor trong VM mất hết.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+limactl delete k8-vm
+```
+
+</Terminal>
+
+Profile `chan-mkdir.json` trong `~/masteva-k8/seccomp` vô hại và có thể giữ lại.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="`RuntimeDefault` chặn chính xác những syscall nào, và có làm gãy ứng dụng không?">
+
+Profile mặc định của containerd sinh từ cùng một danh sách với Docker: mặc định từ chối, cho phép khoảng hơn 300 syscall, trong đó một số chỉ được phép khi tiến trình có capability tương ứng (ví dụ `unshare`, `mount`, `setns` cần `CAP_SYS_ADMIN`). Bị chặn hẳn là nhóm hiếm khi ứng dụng thường cần: nạp module, `kexec_load`, `reboot`, `swapon`, `keyctl`, `add_key`, `acct`, `personality` với đa số giá trị. Ứng dụng web, JVM, Node.js, Go chạy bình thường. Thứ hay gãy là công cụ cần namespace (chạy build container trong container, một số sandbox của trình duyệt headless) và công cụ debug dùng `ptrace`. Với chúng, viết profile Localhost cho phép thêm đúng syscall cần, thay vì trả về `Unconfined`.
+
+</Reveal>
+
+<Reveal title="Vì sao Kubernetes không bật `RuntimeDefault` mặc định cho mọi pod?">
+
+Vì tương thích ngược. Trước khi có `seccompDefault`, pod không khai gì luôn chạy `Unconfined`; bật lọc cho mọi pod khi nâng cấp cụm có thể làm gãy ứng dụng đang chạy tốt mà không ai đổi gì. Dự án chọn để tính năng là tuỳ chọn của kubelet, GA ở 1.27, và để người vận hành bật theo từng nhóm node. Docker thì ngược lại: `docker run` áp profile mặc định từ đầu. Đây là lý do một image chạy an toàn dưới `docker run` lại có ít lớp bảo vệ hơn khi lên một cụm Kubernetes chưa cấu hình.
+
+</Reveal>
+
+<Reveal title="Cụm có node RHEL dùng SELinux thì AppArmor trong pod spec làm gì?">
+
+Trên node không có AppArmor, pod không khai AppArmor vẫn chạy bình thường, còn pod khai `Localhost` bị kubelet từ chối với lý do `AppArmor` như bước 4 cho thấy. Pod spec có `seLinuxOptions` cho phía SELinux; `baseline` giới hạn các `type` được phép (`container_t` và vài giá trị khác) để không ai tự gán nhãn cho mình quyền của máy chủ. Cụm trộn hai loại node cần nhãn node và `nodeSelector` (K5.1) cho workload dùng profile riêng, hoặc giữ mọi pod ở `RuntimeDefault` để chạy được ở cả hai.
+
+</Reveal>
+
+<Reveal title="Seccomp, AppArmor, capability, PSA: nếu chỉ có thời gian cho một việc, chọn việc nào?">
+
+PSA ở `baseline` cho cả cụm (K8.1): một thay đổi cấu hình, chặn cả nhóm leo quyền phổ biến nhất (`privileged`, `hostPath`, host namespace). Kế tiếp là `seccompDefault` trên node, vì nó áp cho cả pod không ai chịu sửa. Rồi mới tới `restricted` cho từng namespace và profile Localhost cho workload đặc biệt. Profile AppArmor tự viết cho từng ứng dụng tốn công bảo trì nhất; dành cho thành phần chạy mã không tin được (CI runner, công cụ xử lý file người dùng tải lên).
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết được profile seccomp và AppArmor hợp cú pháp, và hay sai ở: profile seccomp liệt kê `architectures` chỉ x86-64 nên trên node arm64 không khớp gì; dùng annotation `seccomp.security.alpha.kubernetes.io/pod` hay `container.apparmor.security.beta.kubernetes.io` đã bị thay; quên rằng profile phải có trên mọi node; dùng `deny` rồi không hiểu vì sao không có log; gặp lỗi thì khuyên `Unconfined`. Kiểm bằng cách của lab: `/proc/1/status` và `/proc/1/attr/current` trong pod, một lệnh lẽ ra phải bị chặn, và log kernel của node.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.5 dạy AppArmor, namespace và cgroup ở mức một máy Linux; K2.4 dạy capability và `/proc/1/status`. K4.1 dựng cụm kubeadm mà bước 4 rút gọn. K8.1 bắt buộc khai seccomp qua `restricted`; K8.6 dùng Falco quan sát chính những syscall mà seccomp lọc, nhưng để báo động thay vì chặn. D8.1 là công cụ chép profile xuống mọi node khi không dùng Security Profiles Operator.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k8.2.mastery-chon-lop">Với một workload cho trước, chọn được giữa `RuntimeDefault`, profile Localhost và AppArmor, và nói được mỗi lựa chọn chặn được kiểu tấn công nào.</Check>
+
+<Check id="k8.2.mastery-profile">Viết được profile seccomp cho một ứng dụng bằng cách chạy nó dưới `SCMP_ACT_LOG`, thu syscall từ log kernel rồi đổi sang chặn mặc định.</Check>
+
+<Check id="k8.2.mastery-van-hanh">Lên được kế hoạch đưa `seccompDefault` và profile AppArmor ra cả cụm nhiều node mà không làm gãy workload đang chạy, kể cả node mới thêm sau này.</Check>
+
+</Mastery>

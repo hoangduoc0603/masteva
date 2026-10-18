@@ -1,0 +1,935 @@
+---
+title: SLO, error budget và burn rate trên Prometheus
+description: Đi từ SLI tới SLO cho một service đang chạy, tính error budget theo số request, đo burn rate trên bảy cửa sổ từ 5 phút tới 3 ngày cùng cửa sổ 30 ngày, viết chính sách error budget, rồi sinh recording rule bằng Sloth thay vì tự viết tay; nạp ba ngày lịch sử vào Prometheus để cửa sổ dài có nghĩa, và tìm lại một sự cố cũ đã tiêu bao nhiêu budget.
+id: d16.1
+step: d16
+prerequisites: [d12.4, d5.2]
+topics: [d16.slo-error-budget]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    golang-image: 1.27.2-alpine
+    client_golang: 1.25.0
+    opentelemetry-go: 1.47.0
+    pyroscope-go: 1.4.0
+    prometheus: 3.15.0
+    sloth: 0.16.0
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biến câu "dịch vụ có ổn không" thành vài con số mà cả đội sản phẩm lẫn đội vận hành cùng đọc, và biến các con số đó thành quyết định. Học xong bài này, bạn giải thích được:
+
+- Vì sao SLO 99,9% cho phép đúng 43,2 phút sập hoàn toàn mỗi 30 ngày, và vì sao bài đếm budget bằng request chứ không bằng phút.
+- Vì sao cùng một dịch vụ, tỉ lệ lỗi 5 phút qua là 0% mà tỉ lệ lỗi 3 ngày qua vẫn cao hơn bình thường.
+- "Burn rate 6" nghĩa là gì, và nó cho bạn biết còn bao lâu thì hết budget.
+- Vì sao một Prometheus vừa dựng trả lời sai câu hỏi "3 ngày qua", và vì sao recording rule 30 ngày của Sloth chỉ có dữ liệu từ lúc nó được tạo.
+
+</Goal>
+
+<Knowledge>
+
+### Từ SLI tới SLO, ở quy mô một service thật
+
+D7.2 đã định nghĩa ba khái niệm bằng một file access log: **SLI** là số sự kiện tốt chia số sự kiện hợp lệ, **SLO** là mục tiêu cho SLI trong một cửa sổ thời gian, **error budget** là phần được phép hỏng, bằng 1 trừ SLO. Bài đó tính bằng tay để thấy từng phép chia. Ở đây bạn làm lại đúng các phép chia đó, nhưng liên tục, từ metric của Prometheus (D12.2, D12.3), cho mọi cửa sổ cùng lúc.
+
+Ba thay đổi khi đi từ "tính bằng tay" sang "vận hành thật":
+
+| | D7.2 | Bài này |
+|---|---|---|
+| Nguồn số liệu | Một file log, đọc một lần | Counter `http_requests_total` được scrape mỗi 5 giây |
+| Cửa sổ | Cả file | Bảy cửa sổ từ 5 phút tới 3 ngày (5 phút, 30 phút, 1 giờ, 2 giờ, 6 giờ, 1 ngày, 3 ngày), cộng cửa sổ 30 ngày, tính song song |
+| Định nghĩa | Một file `valid.jq` | Một file SLO, sinh ra recording rule; dashboard, alert, báo cáo cùng đọc |
+
+**Chọn SLI theo hành trình người dùng.** Một dịch vụ có nhiều việc; người dùng chỉ quan tâm vài việc chính, gọi là **hành trình quan trọng** (critical user journey): xem sản phẩm, đặt hàng, đăng nhập. Mỗi hành trình đáng có SLI riêng, vì gộp mọi thứ vào một tỉ lệ thì việc ít request (đặt hàng) bị việc nhiều request (xem sản phẩm, health check) pha loãng. Trong lab, SLI chỉ đếm request tới `/api/...`; `/healthz` là health check của load balancer, không phải người dùng (D7.2 đã giải thích vì sao loại nó khỏi mẫu số).
+
+Hai dạng SLI thường gặp, viết bằng PromQL:
+
+| SLI | Sự kiện xấu | Tổng | Cần gì ở metric |
+|---|---|---|---|
+| Availability | `sum(rate(http_requests_total{route=~"/api/.+", status=~"5.."}[5m]))` | `sum(rate(http_requests_total{route=~"/api/.+"}[5m]))` | Counter có label mã trả về |
+| Latency dưới 300 ms | Tổng trừ số quan sát trong bucket `le="0.3"` | `sum(rate(http_request_duration_seconds_count[5m]))` | Histogram có đúng một ngưỡng bucket bằng 0,3 (D12.3) |
+
+Ứng dụng mẫu của bài có bucket 0,3 cho histogram vì lý do đó. Lab chỉ dựng SLO availability để bài gọn; SLO latency viết cùng khuôn, chỉ đổi hai truy vấn.
+
+<Check id="d16.1.sli-hanh-trinh">Chọn được SLI cho một hành trình người dùng, viết được truy vấn sự kiện xấu và truy vấn tổng cho SLI availability và latency, và giải thích được vì sao không gộp mọi request của dịch vụ vào một tỉ lệ.</Check>
+
+### Error budget: đếm bằng request, đọc bằng phút
+
+SLO 99,9% trong 30 ngày nghĩa là trong mọi cửa sổ 30 ngày, ít nhất 99,9% request hợp lệ phải tốt. Phần còn lại, 0,1%, là error budget. Có hai cách quy đổi nó:
+
+```text
+ theo request:  budget = 0,001 × (số request hợp lệ trong 30 ngày)
+                lab: 16 request/giây × 2.592.000 giây × 0,001 ≈ 41.472 request lỗi được phép
+
+ theo thời gian (chỉ đúng khi traffic đều):
+                30 ngày × 0,001 = 43,2 phút sập hoàn toàn
+```
+
+| SLO trong 30 ngày | Budget | Sập hoàn toàn tương đương | Lỗi đều đặn thì hết budget sau |
+|---|---|---|---|
+| 99% | 1% | 7 giờ 12 phút | lỗi 10% liên tục: 3 ngày |
+| 99,5% | 0,5% | 3 giờ 36 phút | lỗi 5% liên tục: 3 ngày |
+| 99,9% | 0,1% | 43,2 phút | lỗi 1% liên tục: 3 ngày |
+| 99,99% | 0,01% | 4,3 phút | lỗi 0,1% liên tục: 3 ngày |
+
+Bài đếm bằng request vì nó đúng với số người bị ảnh hưởng: 10 phút sập lúc cao điểm tốn nhiều budget hơn 10 phút lúc 3 giờ sáng. Cách đọc bằng phút chỉ để con người hình dung.
+
+**Cửa sổ trượt.** SRE Workbook coi cửa sổ trượt 4 tuần (hoặc 30 ngày) là lựa chọn tốt cho phần lớn dịch vụ; cửa sổ theo tháng dương lịch hợp cho báo cáo và hợp đồng. Hệ quả của cửa sổ trượt: một sự cố "nằm" trong cửa sổ đúng 30 ngày rồi mới trôi ra ngoài; vì vậy sự cố hai ngày trước mà bạn nạp ở bước 3 vẫn nằm trong cửa sổ 30 ngày và vẫn tính vào budget ở bước 5.
+
+### Burn rate: budget đang cháy nhanh tới đâu
+
+**Burn rate** là tốc độ tiêu budget so với tốc độ "vừa đủ hết khi hết cửa sổ":
+
+```text
+ burn rate = tỉ lệ lỗi trong một cửa sổ đo / (1 − SLO)
+
+ SLO 99,9%:  lỗi 0,1%  → burn rate 1    → hết budget 30 ngày sau đúng 30 ngày
+             lỗi 1%    → burn rate 10   → hết sau 3 ngày
+             lỗi 100%  → burn rate 1000 → hết sau 43 phút
+ thời gian tới khi hết budget = cửa sổ SLO / burn rate
+```
+
+Burn rate đã chia cho budget, nên cùng một ngưỡng (ví dụ burn rate 14,4 trong 1 giờ, tức tiêu 2% budget) mang cùng một ý nghĩa cho mọi SLO có cửa sổ 30 ngày, dù mục tiêu là 99% hay 99,99%. Cửa sổ đo burn rate là một tham số riêng: burn rate 5 phút phản ứng nhanh nhưng giật, burn rate 3 ngày mượt nhưng chậm. Vì vậy công cụ sinh rule tính sẵn tỉ lệ lỗi cho nhiều cửa sổ; D16.2 ghép chúng thành alert.
+
+```text
+ lỗi 100% trong 2 phút, rồi hết            tỉ lệ lỗi trên từng cửa sổ, ngay sau sự cố
+ ──────────────────────────────────────    ─────────────────────────────────────────────
+  5m  ████████████████████ 40%             cửa sổ ngắn: phản ánh hiện tại, quên nhanh
+  1h  █ 3,3%                               cửa sổ dài: nhớ lâu, pha loãng sự cố ngắn
+  3d  ▏ 0,05%                              cửa sổ rất dài: gần như không thấy
+```
+
+<Check id="d16.1.budget-burn">Tính được error budget theo request và theo thời gian từ một SLO, định nghĩa được burn rate, và từ burn rate suy ra được thời gian tới khi hết budget.</Check>
+
+### Chính sách error budget
+
+Con số chỉ có ích khi đã thoả thuận trước nó dẫn tới việc gì. **Chính sách error budget** (error budget policy) là một văn bản ngắn, được đội sản phẩm, đội phát triển và đội vận hành cùng ký, nói rõ ai làm gì khi budget cạn. Phụ lục B của SRE Workbook có một bản mẫu; các điểm chính của bản đó:
+
+- Dịch vụ đạt SLO thì phát hành theo quy trình bình thường.
+- Vượt budget của 4 tuần trước đó thì dừng mọi thay đổi, trừ sửa lỗi ưu tiên cao nhất và bản vá bảo mật, cho tới khi dịch vụ quay lại trong SLO.
+- Một sự cố đơn lẻ tiêu hơn 20% budget của 4 tuần thì bắt buộc viết postmortem, kèm ít nhất một việc ưu tiên cao nhất để xử lý nguyên nhân gốc.
+- Có ngoại lệ ghi rõ: sự cố do mạng của cả công ty, do dịch vụ của đội khác (đội đó đã tự dừng phát hành), hoặc budget bị tiêu bởi người dùng ngoài phạm vi SLO (load test, pentest) thì đội không buộc phải dừng tính năng.
+- Bất đồng về cách tính budget thì đưa lên một người quyết định, trong bản mẫu là CTO.
+
+Bản mẫu nói rõ mục đích: chính sách không phải để phạt khi trượt SLO, mà để cho đội **quyền** dồn sức vào độ tin cậy khi số liệu cho thấy điều đó quan trọng hơn tính năng. Một bảng bậc thang như dưới đây là cách nhiều đội cụ thể hoá (các ngưỡng là ví dụ của bài):
+
+| Budget còn lại trong cửa sổ 30 ngày | Phát hành | Việc kèm theo |
+|---|---|---|
+| Trên 50% | Bình thường | Không |
+| 25% đến 50% | Bình thường, ưu tiên thay đổi nhỏ | Xem lại các sự cố đã tiêu budget |
+| 0% đến 25% | Chỉ thay đổi có kế hoạch lui (rollback) đã thử | Ưu tiên việc giảm rủi ro trong sprint |
+| Hết | Dừng tính năng, chỉ sửa lỗi và vá bảo mật | Postmortem, việc độ tin cậy lên đầu |
+
+Quy trình sự cố và postmortem là nội dung của D17. Bài này chỉ cần bạn đọc được budget để biết chính sách đang ở bậc nào.
+
+<Callout kind="production">
+
+Theo bản tóm tắt của Fastly, ngày 08/06/2021 một cấu hình hợp lệ do khách hàng đẩy lên đã kích hoạt một lỗi phần mềm nằm sẵn trong bản triển khai bắt đầu từ ngày 12/05, và khoảng 85% mạng của Fastly trả lỗi. Dòng thời gian (UTC): sự cố bắt đầu lúc 09:47, hệ giám sát của Fastly phát hiện lúc 09:48, và 95% mạng hoạt động bình thường lại trong vòng 49 phút kể từ lúc bắt đầu. Fastly cũng ghi các việc tiếp theo: triển khai bản sửa, làm postmortem toàn bộ quy trình phản ứng, và tìm hiểu vì sao lỗi không bị bắt ở khâu kiểm thử. Phép tính sau là của bài, không phải của Fastly: nếu coi khoảng 85% request lỗi suốt 49 phút, đó tương đương khoảng 42 phút sập hoàn toàn, gần trọn 43,2 phút mà SLO 99,9% cho phép trong 30 ngày. Một sự cố như vậy một mình đã đưa dịch vụ xuống bậc 0% tới 25% của bảng chính sách ở trên, sát mức hết, dù phát hiện chỉ sau một phút. Và lỗi đến từ một bản triển khai gần bốn tuần trước: rủi ro của mỗi lần thay đổi không lộ ra ngay, nên chính sách tính theo budget thực tế đã tiêu, không theo số lần phát hành.
+
+</Callout>
+
+<Check id="d16.1.policy">Viết được một chính sách error budget gồm ngưỡng, hành động, ngoại lệ và người quyết định, và giải thích được vì sao nó phải được thoả thuận trước sự cố.</Check>
+
+### SLO as code: Sloth, Pyrra, OpenSLO
+
+Một SLO đầy đủ trên Prometheus gồm hàng chục rule: tỉ lệ lỗi cho mỗi cửa sổ, vài chuỗi mô tả (mục tiêu, budget), và các alert của D16.2. Viết tay cho từng service thì sớm muộn sẽ lệch nhau. Cách thường làm là viết một file mô tả SLO ngắn rồi cho công cụ sinh rule:
+
+```text
+ slo.yaml (10–20 dòng)          sloth generate            rules/slo-shop.yml (hàng trăm dòng)
+ ─────────────────────   ─────────────────────────▶   ─────────────────────────────────────────
+ service, objective 99.9        kiểm cú pháp,            slo:sli_error:ratio_rate5m … rate3d (7 cửa sổ)
+ error_query, total_query       điền {{.window}}         slo:sli_error:ratio_rate30d
+ alerting (D16.2)               vào từng cửa sổ          slo:objective:ratio, slo:error_budget:ratio…
+                                                          alert burn rate (khi bật, D16.2)
+```
+
+| | Sloth | Pyrra | Viết tay |
+|---|---|---|---|
+| Đầu vào | YAML riêng (`prometheus/v1`), CRD trên Kubernetes, hoặc OpenSLO | CRD `ServiceLevelObjective` hoặc file | Không có |
+| Cách chạy | CLI sinh file; hoặc controller trên Kubernetes | Một binary gồm giao diện web, API và bộ sinh rule (đọc file hoặc theo dõi Kubernetes) | |
+| Cửa sổ | Mặc định cho SLO 30 ngày và 28 ngày; tự cấu hình được | Tỉ lệ theo cửa sổ của SLO: SLO 2 tuần thì các cửa sổ ngắn lại tương ứng | Tuỳ bạn |
+| Giao diện | Dashboard Grafana mẫu | Giao diện riêng xếp SLO theo budget còn lại | |
+| Hợp với | Đội muốn file rule nằm trong Git, review như code | Đội muốn một trang tổng quan SLO có sẵn | Một, hai SLO để học |
+
+**OpenSLO** là một đặc tả trung lập để mô tả SLO bằng YAML; Sloth đọc được nó. Lab dùng Sloth vì nó chỉ là một lệnh `docker run` sinh ra file, dễ thấy từng rule.
+
+Một điều về recording rule đã gặp ở D12.3: rule chỉ có dữ liệu từ lúc nó bắt đầu chạy. Sloth tính tỉ lệ 30 ngày (`ratio_rate30d`) bằng cách lấy trung bình các giá trị của rule 5 phút trong 30 ngày. Vì vậy một SLO mới tạo có "budget còn lại" tính trên vài phút, không phải 30 ngày, cho tới khi rule chạy đủ lâu. Bước 5 cho bạn thấy con số đó.
+
+<Check id="d16.1.slo-as-code">Giải thích được vì sao nên sinh rule SLO từ một file mô tả, so sánh được Sloth với Pyrra, và nêu được vì sao rule 30 ngày của một SLO mới tạo chưa phản ánh 30 ngày.</Check>
+
+### Cửa sổ dài cần dữ liệu dài
+
+Tỉ lệ lỗi "3 ngày qua" chỉ đúng khi Prometheus thật sự có 3 ngày dữ liệu. Một Prometheus vừa dựng, vừa mất volume, hay một service vừa ra đời thì không có; truy vấn `[3d]` vẫn chạy và trả về một con số tính trên vài phút đang có, không báo gì. Trong lab, bạn không chờ 3 ngày: bạn **nạp lịch sử** (backfill) bằng `promtool tsdb create-blocks-from openmetrics`, công cụ đọc một file ở định dạng OpenMetrics có kèm thời điểm của từng mẫu rồi ghi thành block của TSDB. Prometheus tự nhận block mới trong vòng khoảng một phút. Cách này cũng dùng ở production khi chuyển dữ liệu từ hệ thống khác sang. Tài liệu của Prometheus nêu một giới hạn liên quan: recording rule mới tạo không có dữ liệu cho quá khứ; muốn có thì phải tính lùi và nạp bằng `promtool tsdb create-blocks-from rules`.
+
+</Knowledge>
+
+<Resources>
+
+- [Implementing SLOs (The Site Reliability Workbook, chương 2)](https://sre.google/workbook/implementing-slos/): chọn SLI, cửa sổ đo, ví dụ tính từ số liệu load balancer.
+- [Example Error Budget Policy (The Site Reliability Workbook, phụ lục B)](https://sre.google/workbook/error-budget-policy/): bản mẫu chính sách error budget mà phần Kiến thức tóm tắt.
+- [Sloth](https://sloth.dev/): đặc tả `prometheus/v1`, các rule sinh ra và cách cấu hình cửa sổ.
+- [Storage: Backfilling from OpenMetrics format (Prometheus)](https://prometheus.io/docs/prometheus/latest/storage/#backfilling-from-openmetrics-format): `create-blocks-from openmetrics` và các giới hạn của backfill.
+- [Summary of June 8 outage (Fastly)](https://www.fastly.com/blog/summary-of-june-8-outage): bản tóm tắt sự cố trong callout; đọc dòng thời gian.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker Desktop hoặc Docker Engine 29 đang chạy, có `curl`, `jq`, `awk` (macOS có sẵn awk), máy có mạng. Lab tải image Go (khoảng 70 MB nén), distroless (khoảng 2 MB), Prometheus (khoảng 100 MB) và Sloth (khoảng 16 MB), cùng các module Go lúc build. Dùng cổng **9760** (shop) và **9761** (Prometheus), chỉ nghe trên `127.0.0.1`. Thư mục lab `~/masteva-d16`, dùng suốt chặng. Mọi khối lệnh từ bước 2 chạy trong `~/masteva-d16/slo`; nếu giữa chừng bạn mở terminal mới, chạy `cd ~/masteva-d16/slo` trước. Bạn không cần thư mục lab của D12: bài dựng lại một ứng dụng mẫu riêng. **Profile máy:** cụm của bài gồm bốn container và dùng khoảng 120 đến 180 MiB RAM; build image cần khoảng 1 GB RAM trong một, hai phút. Máy 8 GB với Docker VM 4 GB chạy thoải mái.
+
+### 1. Ứng dụng mẫu
+
+`shop` là ứng dụng Go của cả chặng, cùng ý tưởng với ứng dụng của D12.1 nhưng viết lại để phục vụ năm bài: metric RED, log JSON có `trace_id`, span OpenTelemetry, tiêm lỗi qua `POST /admin/fault`, và vài chỗ "cài sẵn" cho các bài sau. Một binary chạy nhiều vai, chọn bằng biến môi trường: `shop` (có `STOCK_URL`), `stock`, `loadgen` (bắn tải), `webhook` (in nguyên văn request nhận được, D16.2 dùng).
+
+Bạn không cần đọc hết 265 dòng ngay. Bản đồ của file: ba hàm quyết định số liệu của cả chặng là `instrument` (đếm mọi request vào metric và ghi một dòng log), `handle` (tạo độ trễ ngẫu nhiên và tiêm lỗi theo `/admin/fault`) và `api` (khai các route của từng vai). `loadgen` bắn tải; `main` chọn vai theo biến `MODE` và bật gửi span, gửi profile khi có biến môi trường tương ứng. Phần giải thích ngay sau khối lệnh đi qua từng chỗ đáng đọc.
+
+<Terminal where="mac" title="~/masteva-d16/app">
+
+```bash
+mkdir -p ~/masteva-d16/app && cd ~/masteva-d16/app
+cat > main.go <<'EOF'
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand/v2"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/grafana/pyroscope-go"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var (
+	service       = env("OTEL_SERVICE_NAME", "shop")
+	customerLabel = os.Getenv("CUSTOMER_LABEL") == "on" // "bản lỗi" của D16.3: gắn mã khách hàng vào metric
+	requests      = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_requests_total", Help: "Số request đã xử lý.",
+	}, labels("route", "status"))
+	duration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "http_request_duration_seconds", Help: "Thời gian xử lý request.",
+		Buckets: []float64{.01, .025, .05, .1, .3, .5, 1, 2.5},
+	}, labels("route"))
+	faultError, faultDelay atomic.Int64 // % request trả 500, số ms cộng thêm
+	client                 = &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport), Timeout: 3 * time.Second}
+	level                  = new(slog.LevelVar)
+	logger                 = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})).With("service", service)
+	catalog                = makeCatalog(5000)
+)
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func labels(names ...string) []string {
+	if customerLabel {
+		return append(names, "customer")
+	}
+	return names
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) { w.status = code; w.ResponseWriter.WriteHeader(code) }
+
+// instrument đo mọi request: counter, histogram và một dòng log JSON có trace_id.
+func instrument(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(sw, r)
+		route := "other"
+		if _, path, ok := strings.Cut(r.Pattern, " "); ok {
+			route = path // mẫu route đã khớp, không phải đường dẫn thật: cardinality có trần
+		}
+		sec := time.Since(start).Seconds()
+		c, h := []string{route, strconv.Itoa(sw.status)}, []string{route}
+		if customerLabel {
+			c, h = append(c, r.Header.Get("X-Customer-Id")), append(h, r.Header.Get("X-Customer-Id"))
+		}
+		requests.WithLabelValues(c...).Inc()
+		duration.WithLabelValues(h...).Observe(sec)
+		lv, traceID := slog.LevelInfo, trace.SpanContextFromContext(r.Context()).TraceID().String()
+		if sw.status >= 500 {
+			lv = slog.LevelError
+		}
+		logger.Log(r.Context(), lv, "request", "route", route, "status", sw.status,
+			"duration_ms", int(sec*1000), "trace_id", traceID)
+	})
+}
+
+// handle đăng ký một route có thời gian xử lý ngẫu nhiên; lỗi và độ trễ đặt qua /admin/fault.
+func handle(mux *http.ServeMux, pattern string, minMs, maxMs int, h http.HandlerFunc) {
+	mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		logger.Debug("handler start", "pattern", pattern, "remote", r.RemoteAddr)
+		time.Sleep(time.Duration(int64(minMs+rand.IntN(maxMs-minMs))+faultDelay.Load()) * time.Millisecond)
+		if rand.Int64N(100) < faultError.Load() {
+			http.Error(w, "injected fault", http.StatusInternalServerError)
+			return
+		}
+		h(w, r)
+	})
+}
+
+type item struct {
+	SKU   string `json:"sku"`
+	Name  string `json:"name"`
+	Price int    `json:"price"`
+}
+
+func makeCatalog(n int) []byte {
+	items := make([]item, n)
+	for i := range items {
+		items[i] = item{fmt.Sprintf("sku-%05d", i), fmt.Sprintf("Sản phẩm số %d", i), 10000 + i}
+	}
+	b, _ := json.Marshal(items)
+	return b
+}
+
+// loadCatalog đọc lại toàn bộ danh mục ở mỗi request thay vì giữ sẵn trong bộ nhớ.
+func loadCatalog() ([]item, error) {
+	var items []item
+	if err := json.Unmarshal(catalog, &items); err != nil {
+		return nil, fmt.Errorf("catalog: %w", err)
+	}
+	return items, nil
+}
+
+func api() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
+	if stock := os.Getenv("STOCK_URL"); stock != "" { // vai shop: bán hàng, gọi sang stock
+		handle(mux, "GET /api/products", 5, 25, func(w http.ResponseWriter, r *http.Request) {
+			items, err := loadCatalog()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprintf(w, `{"count":%d,"first":%q}`+"\n", len(items), items[0].SKU)
+		})
+		handle(mux, "GET /api/checkout", 20, 60, func(w http.ResponseWriter, r *http.Request) {
+			req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, stock+"/reserve", nil)
+			resp, err := client.Do(req)
+			if err != nil {
+				http.Error(w, "stock unavailable", http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				http.Error(w, "stock unavailable", http.StatusBadGateway)
+				return
+			}
+			fmt.Fprintln(w, `{"order":"created"}`)
+		})
+	} else { // vai stock: giữ hàng
+		handle(mux, "GET /reserve", 10, 40, func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintln(w, `{"reserved":true}`)
+		})
+	}
+	root := http.NewServeMux()
+	root.Handle("GET /metrics", promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{EnableOpenMetrics: true}))
+	root.HandleFunc("POST /admin/fault", func(w http.ResponseWriter, r *http.Request) {
+		e, _ := strconv.ParseInt(r.FormValue("error"), 10, 64)
+		d, _ := strconv.ParseInt(r.FormValue("delay"), 10, 64)
+		faultError.Store(e)
+		faultDelay.Store(d)
+		logger.Warn("fault injected", "error_percent", e, "delay_ms", d)
+		fmt.Fprintf(w, "error=%d%% delay=%dms\n", e, d)
+	})
+	root.Handle("/", otelhttp.NewHandler(instrument(mux), "http"))
+	return root
+}
+
+// serve chạy HTTP server ở :8080 tới khi ctx bị huỷ.
+func serve(ctx context.Context, h http.Handler) {
+	srv := &http.Server{Addr: ":8080", Handler: h, ReadHeaderTimeout: 5 * time.Second}
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		logger.Error("listen", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("listening", "addr", srv.Addr)
+	go srv.Serve(ln)
+	<-ctx.Done()
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(shutdown)
+}
+
+// loadgen bắn RPS request mỗi giây, mỗi request chọn ngẫu nhiên một đường dẫn trong PATHS.
+// Mặc định: 60% products, 20% checkout, 20% healthz (vai health check của load balancer).
+func loadgen(ctx context.Context) {
+	target := env("TARGET", "http://shop:8080")
+	paths := strings.Split(env("PATHS", "/api/products,/api/products,/api/products,/api/checkout,/healthz"), ",")
+	rps, _ := strconv.Atoi(env("RPS", "20"))
+	customers, _ := strconv.Atoi(env("CUSTOMERS", "0"))
+	if rps < 1 || rps > 1000 {
+		logger.Error("RPS phải là số nguyên từ 1 đến 1000")
+		os.Exit(1)
+	}
+	hc := &http.Client{Timeout: 2 * time.Second}
+	tick := time.NewTicker(time.Second / time.Duration(rps))
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		path := paths[rand.IntN(len(paths))]
+		go func() {
+			req, _ := http.NewRequest(http.MethodGet, target+path, nil)
+			if customers > 0 {
+				req.Header.Set("X-Customer-Id", fmt.Sprintf("c%05d", rand.IntN(customers)))
+			}
+			if resp, err := hc.Do(req); err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}()
+	}
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	if os.Getenv("LOG_LEVEL") == "debug" {
+		level.Set(slog.LevelDebug)
+	}
+	switch env("MODE", "api") {
+	case "loadgen":
+		loadgen(ctx)
+		return
+	case "webhook": // in nguyên văn body nhận được: vai receiver của Alertmanager
+		serve(ctx, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+			fmt.Println(r.URL.Path, strings.TrimSpace(string(body)))
+		}))
+		return
+	}
+	if url := os.Getenv("PYROSCOPE_URL"); url != "" { // D16.5: gửi profile CPU và bộ nhớ tới Pyroscope
+		if _, err := pyroscope.Start(pyroscope.Config{ApplicationName: service, ServerAddress: url,
+			ProfileTypes: []pyroscope.ProfileType{pyroscope.ProfileCPU, pyroscope.ProfileAllocSpace}}); err != nil {
+			logger.Error("pyroscope", "error", err)
+		}
+	}
+	var opts []sdktrace.TracerProviderOption
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" { // D16.4: gửi span tới Collector
+		exporter, err := otlptracehttp.New(ctx)
+		if err != nil {
+			logger.Error("otlp exporter", "error", err)
+			os.Exit(1)
+		}
+		opts = append(opts, sdktrace.WithBatcher(exporter))
+	}
+	tp := sdktrace.NewTracerProvider(opts...)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	serve(ctx, api())
+	flush, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tp.Shutdown(flush)
+}
+EOF
+cat > go.mod <<'EOF'
+module example.com/d16
+
+go 1.27
+
+require (
+	github.com/grafana/pyroscope-go v1.4.0
+	github.com/prometheus/client_golang v1.25.0
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
+	go.opentelemetry.io/otel v1.47.0
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.47.0
+	go.opentelemetry.io/otel/sdk v1.47.0
+	go.opentelemetry.io/otel/trace v1.47.0
+)
+EOF
+cat > Dockerfile <<'EOF'
+# syntax=docker/dockerfile:1
+FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
+WORKDIR /src
+COPY go.mod main.go ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod tidy && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app .
+
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+COPY --from=build /out/app /app
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/app"]
+EOF
+docker build -q -t d16-app:1.0.0 . > /dev/null && docker image ls d16-app --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d16-app:1.0.0  29.4MB
+```
+
+</Expected>
+
+Lần build đầu mất một, hai phút để tải module. Những chỗ cần đọc kỹ, vì chúng quyết định số liệu của cả chặng:
+
+- **Metric:** `http_requests_total{route,status}` và histogram `http_request_duration_seconds{route}`. `route` lấy từ **mẫu** mà `ServeMux` đã khớp (`/api/products`), không lấy đường dẫn thật, để số chuỗi có trần (D12.2). Histogram có ngưỡng 0,3 giây cho SLI latency.
+- **`/admin/fault`**: `error` là phần trăm request trả 500, `delay` là số mili giây cộng thêm. Đây là cách các bài tạo ra sự cố.
+- **Chỗ cài sẵn cho bài sau**, không dùng ở bài này: `CUSTOMER_LABEL=on` gắn mã khách hàng vào metric (một lỗi cardinality, D16.3); `LOG_LEVEL=debug` thêm một dòng log cho mỗi request (D16.4); `OTEL_EXPORTER_OTLP_ENDPOINT` bật gửi span (D16.4); `PYROSCOPE_URL` bật gửi profile (D16.5). Hàm `loadCatalog` có một vấn đề hiệu năng cố ý; D16.5 tìm ra nó bằng profiling, bạn chưa cần để ý.
+- Dockerfile theo D5.2: multi-stage, distroless, user thường. Để bài gọn, `go.sum` được sinh lúc build bằng `go mod tidy`; project thật commit `go.sum`.
+
+### 2. Dựng cụm
+
+Bốn container: `shop`, `stock`, `loadgen` bắn 20 request mỗi giây vào `shop` (60% `products`, 20% `checkout`, 20% `/healthz`), và Prometheus scrape mỗi 5 giây. Script `pq` gọi API truy vấn của Prometheus và in mỗi chuỗi một dòng, giống `pq` của D12.2.
+
+<Terminal where="mac" title="~/masteva-d16/slo">
+
+```bash
+mkdir -p ~/masteva-d16/slo/prometheus/rules && cd ~/masteva-d16/slo
+cat > prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: shop
+    static_configs:
+      - targets: ["shop:8080"]
+  - job_name: stock
+    static_configs:
+      - targets: ["stock:8080"]
+EOF
+cat > compose.yaml <<'EOF'
+name: d16-slo
+
+x-app: &app
+  image: d16-app:1.0.0
+  restart: unless-stopped
+
+services:
+  shop:
+    <<: *app
+    container_name: d16-shop
+    environment: { OTEL_SERVICE_NAME: shop, STOCK_URL: "http://stock:8080" }
+    ports: ["127.0.0.1:9760:8080"]
+  stock:
+    <<: *app
+    container_name: d16-stock
+    environment: { OTEL_SERVICE_NAME: stock }
+  loadgen:
+    <<: *app
+    container_name: d16-loadgen
+    environment: { MODE: loadgen, TARGET: "http://shop:8080", RPS: "20" }
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    container_name: d16-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports: ["127.0.0.1:9761:9090"]
+
+volumes:
+  prometheus-data:
+EOF
+cat > pq <<'EOF'
+#!/bin/sh
+curl -s localhost:9761/api/v1/query --data-urlencode "query=$1" | jq -r '
+  if .status != "success" then "LỖI: \(.error)"
+  else .data.result[] | "\(.metric | to_entries | map("\(.key)=\(.value)") | join(" "))  =>  \(.value[1] | tonumber | . * 1000 | round / 1000)"
+  end'
+EOF
+chmod +x pq
+docker compose up -d 2>&1 | grep -c Started
+for i in $(seq 30); do curl -sf localhost:9761/-/ready > /dev/null && break; sleep 2; done
+sleep 30
+./pq 'sum by (route) (rate(http_requests_total{job="shop"}[30s]))'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+4
+route=/api/checkout  =>  3.933
+route=/api/products  =>  9.415
+route=/healthz  =>  3.389
+```
+
+</Expected>
+
+Image Prometheus được ghim bằng `tag@digest` như D5.2: tag dễ đọc, digest bảo đảm đúng từng byte. Cờ `--storage.tsdb.path=/prometheus` đặt thư mục dữ liệu vào volume; bước 3 ghi block vào đúng chỗ này. Lệnh cuối cho thấy tải đã tới: trung bình 12 request mỗi giây vào `products`, 4 vào `checkout`, 4 vào `/healthz`. Cửa sổ 30 giây ngắn và mỗi request chọn route ngẫu nhiên, nên số của bạn dao động khá rộng quanh mức đó (ví dụ 9 tới 14 cho `products`).
+
+### 3. Prometheus mới chưa có quá khứ
+
+SLO tính trên cửa sổ tới 30 ngày. Hỏi Prometheus vừa dựng xem 3 ngày qua dịch vụ nhận bao nhiêu request:
+
+<Terminal where="mac">
+
+```bash
+./pq 'sum(increase(http_requests_total{job="shop", route=~"/api/.+"}[3d]))'
+```
+
+</Terminal>
+
+<Predict question="Traffic là 16 request mỗi giây vào /api/. Ba ngày như vậy là khoảng 4,1 triệu request. Prometheus trả về bao nhiêu?">
+
+```text
+  =>  1427.163
+```
+
+Vài trăm tới vài nghìn, tuỳ bạn đọc nhanh hay chậm, chứ không phải vài triệu: Prometheus chỉ có dữ liệu từ lúc bạn dựng nó vài phút trước, và truy vấn `[3d]` lặng lẽ tính trên phần đang có. Mọi tỉ lệ lỗi "3 ngày" lúc này thật ra là tỉ lệ của vài phút. Cùng chuyện xảy ra ở production khi Prometheus mất volume, hay khi một service mới vừa có metric: các cửa sổ dài trả lời như cửa sổ ngắn.
+
+</Predict>
+
+Giờ nạp ba ngày lịch sử, giả lập một dịch vụ đã chạy ổn với 12 và 4 request mỗi giây vào hai route, lỗi nền 0,02%, và **một sự cố** khoảng hai ngày trước: 15 phút lỗi 4%. Lệnh `awk` sinh file OpenMetrics, mỗi dòng một mẫu kèm thời điểm (giây Unix), mỗi phút một mẫu. Counter của mỗi chuỗi cộng dồn đúng như ứng dụng thật làm.
+
+Lịch sử phải **dừng trước mẫu đầu tiên mà Prometheus đã thu**. Lịch sử và dữ liệu thật dùng cùng tập label (`job="shop"`, `instance="shop:8080"`…), tức là cùng chuỗi; nếu hai bên cùng có mẫu trong một khoảng thời gian, counter sẽ nhảy qua lại giữa hàng triệu (lịch sử) và vài nghìn (dữ liệu thật), và mọi phép `rate` trên khoảng đó thành vô nghĩa. Tài liệu Prometheus (phần Backfilling) cảnh báo việc này: nạp dữ liệu vào khoảng thời gian của head block, phần 3 giờ gần nhất mà Prometheus vẫn đang ghi, là không an toàn. Lệnh đầu tiên của khối hỏi Prometheus mẫu sớm nhất trong head là lúc nào (`headStats.minTime`, mili giây), và lịch sử kết thúc trước mốc đó một phút. Phần lịch sử vẫn nằm trong 3 giờ gần nhất về thời gian, nhưng không chồng mẫu nào lên head; Prometheus 3 chấp nhận block có khoảng thời gian chồng lên nhau và gộp chúng khi compaction.
+
+Chỉ chạy khối này **một lần** (xem mục Gỡ lỗi nếu lỡ chạy hai lần).
+
+<Terminal where="mac">
+
+```bash
+HEAD_MIN=$(curl -s localhost:9761/api/v1/status/tsdb | jq '.data.headStats.minTime / 1000 | floor')
+echo "mẫu đầu tiên trong head: $(echo "$HEAD_MIN" | jq -r todate)"
+awk -v end="$((HEAD_MIN - 60))" 'BEGIN {
+  print "# HELP http_requests Số request đã xử lý."
+  print "# TYPE http_requests counter"
+  split("/api/products /api/checkout", route, " "); split("720 240", per_min, " ")
+  incident = end - 2 * 86400
+  for (r = 1; r <= 2; r++) for (s = 0; s <= 1; s++) {
+    n = 0
+    for (t = end - 3 * 86400; t <= end; t += 60) {
+      e = (t >= incident && t < incident + 900) ? 0.04 : 0.0002
+      n += per_min[r] * (s ? e : 1 - e)
+      printf "http_requests_total{job=\"shop\",instance=\"shop:8080\",route=\"%s\",status=\"%s\"} %d %d\n", route[r], (s ? "500" : "200"), n, t
+    }
+  }
+  print "# EOF"
+}' > prometheus/history.om
+wc -l < prometheus/history.om
+head -3 prometheus/history.om
+B0=$(curl -s localhost:9761/api/v1/status/tsdb/blocks | jq '.data.blocks | length')
+docker exec d16-prometheus promtool tsdb create-blocks-from openmetrics /etc/prometheus/history.om /prometheus | tail -2
+for i in $(seq 40); do [ "$(curl -s localhost:9761/api/v1/status/tsdb/blocks | jq '.data.blocks | length')" -gt "$B0" ] && break; sleep 5; done
+curl -s localhost:9761/api/v1/status/tsdb/blocks | jq '.data.blocks | length'
+./pq 'sum(increase(http_requests_total{job="shop", route=~"/api/.+"}[3d]))'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mẫu đầu tiên trong head: 2026-10-15T09:22:27Z
+   17287
+# HELP http_requests Số request đã xử lý.
+# TYPE http_requests counter
+http_requests_total{job="shop",instance="shop:8080",route="/api/products",status="200"} 719 1791796887
+01M4ZE5Q0G1TK9B8Z54PFY9B1Q  1792044027000  1792051167001  1h59m0.001s  480          4            4            1641
+01M4ZE5Q1FPWZAPAXZCSGYSJS7  1792051227000  1792056087001  1h21m0.001s  328          4            4            1451
+6
+  =>  4146347.012
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Dòng đầu là thời điểm (UTC) của mẫu sớm nhất Prometheus đã thu, tức lúc bạn dựng cụm ở bước 2; lịch sử kết thúc một phút trước đó.
+- File có 17.284 dòng mẫu cộng 3 dòng đầu cuối: 4 chuỗi (2 route × 2 mã trả về), mỗi chuỗi 4.321 mẫu, mỗi phút một mẫu. Dòng `# TYPE http_requests counter` khai **họ** metric theo OpenMetrics (D12.2 đã gặp tên không có `_total`); mỗi mẫu ghi tên chuỗi đầy đủ, đủ label `job` và `instance` như Prometheus tự gắn lúc scrape, giá trị, rồi thời điểm.
+- `promtool` chạy ngay trong container Prometheus (image có sẵn nó) và ghi block vào thư mục dữ liệu. Mỗi dòng in ra là một block tối đa 2 giờ, đủ tám cột: ULID, thời điểm đầu và cuối (mili giây Unix), độ dài, số mẫu, số chunk, số chuỗi, kích thước (byte). Prometheus không cần khởi động lại: nó quét thư mục dữ liệu định kỳ và nhận block mới, thường trong vòng một phút; vòng `for` chờ tới khi API liệt kê được block, tối đa khoảng 200 giây.
+- Số block Prometheus đang có là một số dương; Prometheus có thể đã gộp vài block nhỏ thành block lớn hơn, nên con số trên máy bạn có thể khác.
+- Truy vấn 3 ngày giờ ra hơn 4 triệu request. Số chính xác của bạn sẽ khác vài nghìn tuỳ lúc chạy, nhưng phải gần 4,1 triệu; nếu ra gấp mấy lần, xem mục Gỡ lỗi.
+
+Phần lịch sử chỉ là counter thô. Recording rule bạn sắp tạo không được tính lùi cho nó; như phần Kiến thức đã nói, đó là giới hạn của backfill.
+
+<Check id="d16.1.lab-backfill">Chỉ ra được bằng truy vấn rằng một Prometheus mới không trả lời đúng câu hỏi về cửa sổ dài, và nạp được lịch sử bằng `promtool tsdb create-blocks-from openmetrics` mà không khởi động lại Prometheus.</Check>
+
+### 4. SLO bằng Sloth
+
+File SLO mô tả đúng SLI ở phần Kiến thức: sự kiện xấu là request `/api/...` trả 5xx, tổng là mọi request `/api/...`. `{{.window}}` là chỗ Sloth điền từng cửa sổ. Phần alert tắt ở bài này; D16.2 bật nó.
+
+<Terminal where="mac">
+
+```bash
+cat > slo.yaml <<'EOF'
+version: "prometheus/v1"
+service: "shop"
+slos:
+  - name: "requests-availability"
+    objective: 99.9
+    description: "Request tới /api/ không trả 5xx."
+    sli:
+      events:
+        error_query: sum(rate(http_requests_total{job="shop", route=~"/api/.+", status=~"5.."}[{{.window}}])) or vector(0)
+        total_query: sum(rate(http_requests_total{job="shop", route=~"/api/.+"}[{{.window}}]))
+    alerting:
+      page_alert:
+        disable: true
+      ticket_alert:
+        disable: true
+EOF
+docker run --rm -v "$PWD:/work" ghcr.io/slok/sloth:v0.16.0@sha256:f0f0075b0d45c1cf684e92947508cc1d5bf573925f785f803a439b2306c8b9a5 \
+  generate -i /work/slo.yaml -o /work/prometheus/rules/slo-shop.yml 2>&1 | grep -c -i error
+grep -oE '(record|alert):' prometheus/rules/slo-shop.yml | sort | uniq -c
+sed -n '/ratio_rate1h$/,/sloth_window/p' prometheus/rules/slo-shop.yml
+docker exec d16-prometheus promtool check rules /etc/prometheus/rules/slo-shop.yml
+curl -s -X POST localhost:9761/-/reload -w 'reload: %{http_code}\n'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+  15 record:
+  - record: slo:sli_error:ratio_rate1h
+    expr: |
+      (sum(rate(http_requests_total{job="shop", route=~"/api/.+", status=~"5.."}[1h])) or vector(0))
+      /
+      (sum(rate(http_requests_total{job="shop", route=~"/api/.+"}[1h])))
+    labels:
+      sloth_id: shop-requests-availability
+      sloth_service: shop
+      sloth_slo: requests-availability
+      sloth_window: 1h
+Checking /etc/prometheus/rules/slo-shop.yml
+  SUCCESS: 15 rules found
+
+reload: 200
+```
+
+</Expected>
+
+- `grep -c -i error` đếm dòng có chữ "error" trong log của Sloth; `0` nghĩa là sinh rule không lỗi.
+- Dòng `15 record:` cho biết `slo.yaml` sinh ra 15 recording rule và chưa có alert nào: tám `slo:sli_error:ratio_rate…` (bảy cửa sổ từ 5 phút tới 3 ngày, cộng cửa sổ 30 ngày), và các chuỗi mô tả như `slo:objective:ratio`, `slo:error_budget:ratio`, `slo:period_error_budget_remaining:ratio`.
+- Rule cửa sổ 1 giờ là đúng phép chia của phần Kiến thức, kèm các label `sloth_*` để phân biệt SLO này với SLO khác. Phần `or vector(0)` ở tử số: khi chưa có request 5xx nào trong cửa sổ, chuỗi lỗi không tồn tại và phép chia ra rỗng (D12.3 đã gặp chuyện "không có dữ liệu khác 0"); `vector(0)` biến nó thành 0 để dashboard và burn rate luôn có số.
+
+Script `burn` in tỉ lệ lỗi và burn rate của bảy cửa sổ, đọc từ các recording rule vừa tạo:
+
+<Terminal where="mac">
+
+```bash
+cat > burn <<'EOF'
+#!/bin/sh
+for w in 5m 30m 1h 2h 6h 1d 3d; do
+  curl -s localhost:9761/api/v1/query --data-urlencode "query=slo:sli_error:ratio_rate$w{sloth_service=\"shop\"}" \
+    | jq -r --arg w "$w" '.data.result[0].value[1] // "NaN" | tonumber as $r
+        | "\($w)\tlỗi \($r * 100000 | round / 1000)%\tburn rate \($r / 0.001 * 100 | round / 100)"'
+done
+EOF
+chmod +x burn
+sleep 20
+./burn
+```
+
+</Terminal>
+
+<Predict question="Hiện tại không có lỗi nào. Sự cố 15 phút lỗi 4% đã xảy ra cách đây hai ngày. Cửa sổ nào thấy nó, và burn rate của cửa sổ đó là bao nhiêu?">
+
+```text
+5m	lỗi 0%	burn rate 0
+30m	lỗi 0.019%	burn rate 0.19
+1h	lỗi 0.018%	burn rate 0.18
+2h	lỗi 0.019%	burn rate 0.19
+6h	lỗi 0.02%	burn rate 0.2
+1d	lỗi 0.02%	burn rate 0.2
+3d	lỗi 0.034%	burn rate 0.34
+```
+
+- Sáu cửa sổ từ 5 phút tới 1 ngày không chứa sự cố, nên chỉ thấy lỗi nền. Cửa sổ 5 phút ra 0 vì phần lịch sử đã trôi ra khỏi nó và ứng dụng thật không có lỗi; các cửa sổ 30 phút đến 1 ngày còn chứa lịch sử lỗi nền 0,02%, tức burn rate 0,2.
+- Chỉ cửa sổ 3 ngày chứa sự cố: tỉ lệ lỗi gần gấp đôi mức nền, burn rate khoảng 0,34. Sự cố 15 phút bị pha loãng vào 3 ngày nên trông nhỏ; điều đó không có nghĩa nó rẻ, bước 5 tính nó tốn bao nhiêu budget.
+- Burn rate dưới 1 ở mọi cửa sổ: nếu mọi thứ giữ như hiện tại, budget 30 ngày sẽ không cạn.
+
+Con số chính xác ở các cửa sổ ngắn trên máy bạn có thể lệch một chút, vì khoảng trống vài phút giữa lúc lịch sử kết thúc và lúc Prometheus bắt đầu thu làm mẫu số của chúng nhỏ đi.
+
+</Predict>
+
+<Check id="d16.1.lab-sloth">Viết được file SLO cho Sloth, sinh và nạp được recording rule, và đọc được tỉ lệ lỗi cùng burn rate của từng cửa sổ, giải thích được vì sao chúng khác nhau.</Check>
+
+### 5. Sự cố cũ đã tiêu bao nhiêu budget
+
+Người làm báo cáo SLO hay phải trả lời hai câu: budget đã tiêu bao nhiêu, và tiêu vào đâu. Câu thứ hai trước: chia ba ngày thành từng giờ và xếp các giờ theo số request lỗi.
+
+<Terminal where="mac">
+
+```bash
+NOW=$(date +%s)
+curl -s localhost:9761/api/v1/query_range \
+  --data-urlencode 'query=sum(increase(http_requests_total{job="shop", route=~"/api/.+", status=~"5.."}[1h]))' \
+  --data-urlencode "start=$((NOW - 3 * 86400 + 3600))" --data-urlencode "end=$NOW" --data-urlencode step=3600 \
+  | jq -r '.data.result[0].values | sort_by(-(.[1] | tonumber)) | .[:3][] | "\(.[0] | todate)  \(.[1] | tonumber | round) request lỗi"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2026-10-13T09:29:20Z  321 request lỗi
+2026-10-13T10:29:20Z  244 request lỗi
+2026-10-12T11:29:20Z  12 request lỗi
+```
+
+</Expected>
+
+`query_range` chạy cùng truy vấn tại nhiều thời điểm cách nhau `step` (3.600 giây); mỗi điểm là số request lỗi trong một giờ kết thúc tại thời điểm đó. Hai giờ đứng đầu chứa sự cố cách đây hai ngày (thời điểm in theo UTC; giờ của bạn sẽ khác), vì 15 phút của nó có thể vắt qua ranh giới giữa hai giờ. Mọi giờ khác chỉ có khoảng 12 request lỗi nền. Đây là cách tìm "khoảnh khắc đã ăn budget" khi viết báo cáo.
+
+Giờ là câu thứ nhất. Budget 30 ngày tính theo request: lấy số request của 3 ngày nhân 10 để ước lượng 30 ngày, nhân 0,001.
+
+<Terminal where="mac">
+
+```bash
+T='sum(increase(http_requests_total{job="shop", route=~"/api/.+"}[3d]))'
+E='sum(increase(http_requests_total{job="shop", route=~"/api/.+", status=~"5.."}[3d]))'
+./pq "$T * 10 * 0.001"
+./pq "$E"
+./pq "$E / ($T * 10 * 0.001)"
+./pq 'slo:period_error_budget_remaining:ratio'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  =>  41463.448
+  =>  1401.308
+  =>  0.034
+__name__=slo:period_error_budget_remaining:ratio sloth_id=shop-requests-availability sloth_service=shop sloth_slo=requests-availability sloth_window=30d  =>  1
+```
+
+</Expected>
+
+- **Budget 30 ngày** khoảng 41.000 request lỗi, đúng phép tính ở phần Kiến thức.
+- **Đã tiêu** khoảng 1.400 request lỗi trong 3 ngày có dữ liệu: khoảng 830 từ lỗi nền và khoảng 576 từ sự cố (15 phút × 960 request mỗi phút × 4%). Tức khoảng 3,4% budget của cả tháng, trong đó sự cố chiếm gần một nửa dù chỉ dài 15 phút.
+- **Theo bảng chính sách** ở phần Kiến thức, budget còn hơn 96%: phát hành bình thường. Sự cố 15 phút chỉ tiêu khoảng 1,4% budget, xa ngưỡng 20% bắt buộc postmortem của bản mẫu SRE Workbook. Nếu nó kéo dài 4 giờ với cùng tỉ lệ lỗi, nó sẽ tiêu khoảng 22%: vượt ngưỡng đó.
+- **Dòng cuối** là con số Sloth tính sẵn: budget còn lại gần như 100%, vì `ratio_rate30d` của Sloth là trung bình của rule 5 phút, và rule đó mới chạy được vài phút, không có lịch sử. Sau 30 ngày chạy liên tục, hai cách tính mới gặp nhau. Khi một dashboard SLO mới dựng báo "budget còn 100%", đây là câu hỏi đầu tiên cần đặt.
+
+<Check id="d16.1.lab-budget">Tìm được khoảng thời gian đã tiêu nhiều budget nhất bằng `query_range`, tính được phần budget 30 ngày đã tiêu theo request, và đối chiếu được với một chính sách error budget.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`go: … dial tcp … i/o timeout` khi build:** bước `go mod tidy` cần ra `proxy.golang.org`. Chạy lại; cache mount giữ phần đã tải.
+- **Truy vấn 3 ngày ra gấp mấy lần 4,1 triệu, hoặc burn rate cửa sổ 1 giờ ra 0% ở bước 4:** khối nạp đã chạy hai lần, hoặc lịch sử chồng lên dữ liệu Prometheus đã thu. Chỉ nạp **một lần**. Muốn làm lại: `docker compose down -v` trong `~/masteva-d16/slo` (xoá volume dữ liệu của Prometheus), rồi chạy lại từ bước 2.
+- **Truy vấn 3 ngày vẫn ra vài nghìn sau bước 3:** Prometheus chưa nhận block. Xem `curl -s localhost:9761/api/v1/status/tsdb/blocks | jq '.data.blocks | length'`; nếu là 0 sau vài phút, kiểm `compose.yaml` có cờ `--storage.tsdb.path=/prometheus` không. Thiếu cờ đó, Prometheus dùng thư mục mặc định `data/` bên trong `/prometheus`, và block bạn ghi vào `/prometheus` bị bỏ qua.
+- **`promtool` báo `out of bounds` hay `invalid metric type`:** file OpenMetrics sai, thường do sửa lệnh `awk`. Mỗi chuỗi phải có mẫu tăng dần theo thời gian và file phải kết thúc bằng `# EOF`.
+- **`./burn` in `NaN`:** rule chưa có dữ liệu. Chờ thêm 10 giây; nếu vẫn vậy, `curl -s localhost:9761/api/v1/rules | jq -r '.data.groups[].rules[] | "\(.health) \(.name)"'` để xem rule có được nạp và có lỗi không.
+- **Sloth báo lỗi validation:** `objective` phải nằm trong khoảng 0 đến 100, và cả hai truy vấn phải có `{{.window}}`.
+
+</Callout>
+
+### Dọn dẹp
+
+D16.2 dùng tiếp cụm này và ba ngày lịch sử vừa nạp. Nếu nghỉ giữa chừng:
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu">
+
+```bash
+cd ~/masteva-d16/slo && docker compose stop
+```
+
+</Terminal>
+
+Lệnh dọn hẳn cả chặng nằm ở cuối D16.5.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Đếm budget theo request hay theo khoảng thời gian tốt?">
+
+Có hai trường phái. **Request-based** (bài này dùng): budget là số request xấu được phép; sự cố lúc cao điểm tốn nhiều hơn lúc vắng, đúng với số người bị ảnh hưởng. **Window-based**: chia thời gian thành các ô (ví dụ mỗi phút), một ô là "xấu" nếu SLI trong ô đó dưới ngưỡng, và SLO là tỉ lệ ô tốt. Cách thứ hai công bằng hơn với dịch vụ ít traffic, nơi một request lỗi lúc 3 giờ sáng có thể chiếm 50% một giờ; nhưng nó coi một phút lỗi 100% và một phút lỗi 2% như nhau. Cách Sloth tính `ratio_rate30d` (trung bình đều các tỉ lệ 5 phút) thực chất nghiêng về window-based: mỗi 5 phút nặng như nhau bất kể traffic. Chọn cách nào cũng được, miễn ghi rõ trong định nghĩa SLO và mọi báo cáo dùng cùng một cách.
+
+</Reveal>
+
+<Reveal title="SLO nên đặt bao nhiêu số 9?">
+
+Bắt đầu từ mức dịch vụ đang đạt và mức người dùng thật sự nhận ra, không từ con số đẹp. Mỗi số 9 thêm vào chia budget cho 10: 99,99% chỉ còn 4,3 phút sập mỗi tháng, ít hơn thời gian một người trực kịp mở laptop. Nó cũng phải nhỏ hơn độ tin cậy của mọi thứ bạn phụ thuộc: một dịch vụ dựa trên một database 99,95% không thể hứa 99,99%. SRE Workbook còn nêu một trường hợp đặc biệt: SLO quá thấp (ví dụ 90%) làm alert theo burn rate không bao giờ kêu được, vì kể cả sập hoàn toàn trong một giờ cũng không tiêu đủ 2% budget. D16.2 gặp lại bảng tham số đó.
+
+</Reveal>
+
+<Reveal title="Có cần SLO cho mọi service nội bộ không?">
+
+Không nhất thiết. SLO đắt về sự chú ý: mỗi SLO cần người sở hữu, chính sách, và người đọc báo cáo. Ưu tiên các hành trình người dùng cuối nhìn thấy, rồi tới các service mà nhiều đội phụ thuộc (đăng nhập, thanh toán, hàng đợi chung). Service nội bộ nhỏ thường chỉ cần alert theo triệu chứng của D12.4. Khi một đội phụ thuộc phàn nàn rằng service của bạn "hay chập chờn", đó là lúc viết SLO cho nó, cùng với đội đó.
+
+</Reveal>
+
+<Reveal title="Sự cố đã nằm trong budget thì có nên 'trừ' ra khỏi báo cáo không?">
+
+Chính sách mẫu của SRE Workbook không xoá sự cố khỏi số liệu; nó chỉ quy định **hành động** khác nhau theo nguyên nhân (sự cố do mạng cả công ty thì đội không buộc phải dừng tính năng). Xoá số liệu làm SLI xa rời trải nghiệm thật: người dùng không quan tâm lỗi do ai. Trường hợp duy nhất nên loại khỏi SLI là sự kiện không thuộc phạm vi ngay từ định nghĩa (load test, pentest có lịch, request của bot quét), và việc loại đó nên làm trong truy vấn SLI (label riêng cho traffic thử nghiệm), không phải sửa báo cáo sau.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết khá tốt file SLO cho Sloth và giải thích được các rule sinh ra, nên hãy nhờ nó dựng nháp từ mô tả "SLO 99,9% cho route X". Chỗ hay sai: quên `{{.window}}` trong truy vấn, đặt health check vào mẫu số, tính budget theo phút cho một SLI đếm theo request, nhầm burn rate với tỉ lệ lỗi, và coi "budget còn lại" của một SLO vừa tạo là đáng tin. Kiểm lại bằng cách của lab: `promtool check rules` cho file sinh ra, tự tính tay một cửa sổ bằng `./pq` rồi so với recording rule, và hỏi "Prometheus có đủ dữ liệu cho cửa sổ này chưa" trước khi tin con số 30 ngày.
+
+</Callout>
+
+<Callout kind="link">
+
+D7.2 định nghĩa SLI, SLO, error budget trên access log; bài này đưa chúng lên Prometheus. D12.3 dạy recording rule và cách đếm tỉ lệ request nhanh hơn một ngưỡng từ bucket của histogram, thứ SLI latency dựa vào. D16.2 bật alert theo burn rate trên chính các recording rule này. D17 dùng error budget để quyết định khi nào viết postmortem; D18 dùng SLO latency làm mục tiêu khi lập kế hoạch dung lượng.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d16.1.mastery-slo">Với một service cho trước, chọn được hành trình người dùng, viết được SLI availability và latency, đặt được SLO và cửa sổ, và bảo vệ được từng lựa chọn.</Check>
+
+<Check id="d16.1.mastery-budget">Từ số liệu Prometheus, tính được budget còn lại theo request và burn rate trên nhiều cửa sổ, và chỉ ra được khoảng thời gian đã tiêu budget nhiều nhất.</Check>
+
+<Check id="d16.1.mastery-policy">Soạn được chính sách error budget cho đội mình, và sinh được bộ recording rule SLO từ một file mô tả bằng Sloth.</Check>
+
+</Mastery>

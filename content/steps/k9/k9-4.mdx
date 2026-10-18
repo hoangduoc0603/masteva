@@ -1,0 +1,828 @@
+---
+title: "Đưa operator vào cụm: RBAC tối thiểu, webhook, nâng cấp và gỡ an toàn"
+description: Đóng image cho operator của K9.3, triển khai bằng cấu hình Kustomize của Kubebuilder, kiểm quyền bằng kubectl auth can-i, thêm validating webhook với cert-manager và thấy webhook chặn mọi lệnh ghi khi operator chết, nâng cấp operator mà quên một quyền RBAC, và gỡ operator mà không kéo theo CRD cùng mọi ứng dụng.
+id: k9.4
+step: k9
+prerequisites: [k9.3]
+topics: [k9.viet-operator]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    go: 1.27.1
+    kubebuilder: 4.16.0
+    controller-runtime: 0.25.2
+    cert-manager: 1.21.2
+    golang-image: 1.27.2-alpine
+    podinfo: 6.15.0
+---
+
+<Goal>
+
+K9.3 chạy operator trên máy bằng quyền admin. Trong cụm thật, nó chạy bằng một ServiceAccount với quyền cụ thể, bên cạnh ứng dụng của người khác, và được nâng cấp nhiều lần trong đời. Học xong bài này, bạn giải thích được:
+
+- Operator trong cụm làm được gì và **không** làm được gì, kiểm bằng lệnh chứ không bằng đọc YAML.
+- Vì sao một validating webhook chỉ vài chục dòng có thể làm mọi lệnh tạo `WebApp` lỗi ngay, hoặc sau tối đa 10 giây, và trên cụm khác, làm node `NotReady`.
+- Vì sao bản operator mới qua hết test vẫn chết trong cụm, và vì sao trong lúc nâng cấp có khoảng 15 giây không ai reconcile.
+- Vì sao lệnh gỡ operator mặc định của Kubebuilder là lệnh xoá mọi ứng dụng mà operator quản lý.
+
+</Goal>
+
+<Knowledge>
+
+### Từ code tới Deployment trong cụm
+
+```text
+ make docker-build      Dockerfile 2 tầng: golang (build) -> distroless/static:nonroot (chạy)
+        |                image chỉ có một binary, chạy user 65532, không shell
+        v
+ kind load / registry   cụm phải kéo được image
+        |
+        v
+ make deploy            kustomize build config/default | kubectl apply
+        |
+        v
+ namespace webapp-operator-system
+   ServiceAccount  webapp-operator-controller-manager
+   ClusterRole     webapp-operator-manager-role   <- config/rbac/role.yaml (sinh từ marker)
+   Role            leader-election-role            <- Lease, chỉ trong namespace của operator
+   Deployment      1 bản, --leader-elect, root fs chỉ đọc, giới hạn 128Mi
+   Service         metrics (HTTPS, cần token có quyền đọc /metrics)
+   CRD             webapps.apps.masteva.example    <- config/crd (chú ý ở bước 5)
+```
+
+`make deploy` áp **cả CRD lẫn controller lẫn RBAC** trong một lệnh. Tiện, và cũng là nguồn của hai cái bẫy cuối bài: nâng cấp áp RBAC mới cùng lúc với code mới, gỡ thì xoá luôn CRD.
+
+### RBAC tối thiểu, kiểm bằng `auth can-i`
+
+Kubebuilder sinh **ClusterRole**, vì controller watch `WebApp` và Deployment ở mọi namespace: cache của controller-runtime cần `list` và `watch` toàn cụm (K9.2). Quyền ghi cũng toàn cụm theo, vì RBAC không nói được "chỉ ghi Deployment do mình tạo". Ba cách thu hẹp, từ dễ tới khó:
+
+| Cách | Làm gì | Giá |
+|---|---|---|
+| Bỏ verb thừa | Không `delete` khi đã có garbage collector, không `*` | Không có; chỉ cần đọc code |
+| Giới hạn namespace | Cache chỉ watch vài namespace (`cache.Options.DefaultNamespaces`), marker RBAC có `namespace=…` để sinh Role thay ClusterRole | Phải biết trước danh sách namespace; thêm namespace là phải triển khai lại |
+| Tách operator | Mỗi đội một bản operator trong namespace của mình | Nhiều bản để nâng cấp, CRD vẫn dùng chung toàn cụm |
+
+Đọc YAML của ClusterRole dễ bỏ sót (aggregation, wildcard, binding ở chỗ khác). Hỏi thẳng API server bằng `kubectl auth can-i … --as=system:serviceaccount:<ns>:<sa>` (K2.3): nó trả lời đúng điều API server sẽ quyết định. K9.5 dùng cùng lệnh để đánh giá operator của người khác.
+
+<Check id="k9.4.rbac">Giải thích được vì sao operator watch toàn cụm cần ClusterRole, kể được ba cách thu hẹp quyền và cái giá của mỗi cách, và kiểm được quyền thật bằng `kubectl auth can-i --as`.</Check>
+
+### Webhook của operator
+
+K9.1 kết thúc ở giới hạn của CRD: luật CEL chỉ nhìn thấy chính object đang ghi. Operator `WebApp` có một lỗ hổng đúng ở đó: nếu đã có một Service tên `legacy` của đội khác, tạo `WebApp` tên `legacy` thì operator apply với `ForceOwnership` và **giành** lấy Service đó, đổi selector và cổng của nó. Muốn chặn, phải đọc object khác lúc tạo: việc của một **validating admission webhook**.
+
+```text
+ kubectl apply WebApp legacy
+    |
+    v
+ kube-apiserver --- admission --- POST https://webapp-operator-webhook-service.webapp-operator-system.svc:443/validate-...
+    |                                  |  (TLS: API server phải tin chứng chỉ của webhook)
+    |                                  v
+    |                           pod operator, cổng 9443: đọc Service "legacy" từ cache
+    |                           -> {allowed: false, message: "Service đã tồn tại..."}
+    v
+ trả lỗi cho người dùng, không ghi gì vào etcd
+```
+
+| Loại | Việc | Ví dụ trong operator |
+|---|---|---|
+| Validating | Cho qua hay từ chối | Trùng tên với object không thuộc về mình; tham chiếu tới Secret không tồn tại |
+| Mutating (defaulting) | Sửa object trước khi lưu | Mặc định phụ thuộc namespace hay object khác (mặc định đơn giản thì dùng `default` trong schema) |
+| Conversion | Chuyển giữa phiên bản CRD | K9.1 |
+
+Ba thứ phải đúng khi triển khai:
+
+- **TLS.** API server chỉ gọi webhook qua HTTPS và phải tin CA của nó. Kubebuilder dùng cert-manager: một `Issuer` tự ký cấp chứng chỉ cho Service của webhook, và cainjector của cert-manager chép CA vào trường `caBundle` của `ValidatingWebhookConfiguration`.
+- **`failurePolicy`.** `Fail` (mặc định của Kubebuilder và của Kubernetes): không gọi được webhook thì từ chối yêu cầu. `Ignore`: không gọi được thì cho qua, tức là kiểm tra biến mất đúng lúc hệ thống đang có sự cố.
+- **Phạm vi.** `rules` (loại tài nguyên, thao tác), `namespaceSelector`, `objectSelector`, `timeoutSeconds` (không khai thì mặc định của Kubernetes là 10 giây). Webhook của bài chỉ khớp `CREATE` và `UPDATE` của `webapps`, nên khi nó chết, chỉ việc ghi `WebApp` bị chặn. Webhook khớp `pods` của mọi namespace thì khi chết chặn cả việc tạo pod hệ thống.
+
+Chính sách chung cho cả cụm (cấm image `latest` ở mọi Deployment, bắt buộc label) không thuộc về webhook của operator; K8 dùng ValidatingAdmissionPolicy hoặc Kyverno cho việc đó.
+
+<Callout kind="production">
+
+Đội AWS Support viết [một bài về sự cố webhook trên Amazon EKS](https://repost.aws/articles/ARr5AEAlgSSh2sdX30gnMGDQ/managing-webhook-failures-on-amazon-eks) từ kinh nghiệm làm việc với nhiều khách hàng. Ví dụ trung tâm là AWS Load Balancer Controller, một controller đăng ký webhook với `failurePolicy: Fail`. Các kiểu hỏng họ liệt kê: tạo Ingress lỗi vì chứng chỉ của webhook đã hết hạn (`x509: certificate has expired or is not yet valid`); xoá Deployment rồi mà ReplicaSet và pod cũ vẫn chạy; controller trong `kube-controller-manager` kẹt vì cứ thử tạo pod mà webhook không trả lời; và DaemonSet `aws-node` (plugin CNI) không tạo được pod vì Service của webhook không tồn tại, khiến worker node `NotReady`.
+
+Cách họ đề xuất: theo dõi lỗi `failed calling webhook` trong log API server và metric `apiserver_admission_webhook_rejection_count`; khi đang có sự cố, xem endpoint của Service webhook, tạm đổi `failurePolicy` sang `Ignore`, và nếu vẫn kẹt thì lưu cấu hình webhook ra file rồi xoá nó.
+
+Điều bài này rút ra (của bài): webhook của operator là một phụ thuộc **đồng bộ** của API server, khác hẳn controller (chết thì chỉ ngừng reconcile, mọi thứ đang chạy vẫn chạy). Bước 3 của lab đo đúng sự khác biệt đó, và đọc cùng metric mà bài của AWS nhắc.
+
+</Callout>
+
+<Check id="k9.4.webhook">Giải thích được khi nào operator cần validating webhook thay vì luật CEL, ba thứ phải đúng khi triển khai webhook, và vì sao webhook chết nguy hiểm hơn controller chết.</Check>
+
+### Nâng cấp operator
+
+Một lần `make deploy` với image mới thay ba thứ cùng lúc: CRD, RBAC, Deployment. Những điều có thể sai:
+
+| Thay đổi | Rủi ro | Cách làm an toàn |
+|---|---|---|
+| Thêm trường tuỳ chọn vào CRD cùng phiên bản | Thấp: object cũ không có trường, code mới phải coi "vắng" là giá trị mặc định | Áp CRD trước, controller sau |
+| Đổi tên, đổi kiểu, bỏ trường | Object cũ không còn đọc được như cũ | Phiên bản mới cộng conversion và migrate (K9.1) |
+| Code mới watch hay ghi loại tài nguyên mới | Thiếu marker RBAC: envtest vẫn xanh vì test chạy bằng admin (K9.3), trong cụm thì cache không đồng bộ được | Test trên cụm thật với đúng ServiceAccount (e2e); kiểm bằng `auth can-i` |
+| Deployment của operator rollout | Bản mới chờ lease của bản cũ: khoảng trống không ai reconcile | Chấp nhận hoặc bật `LeaderElectionReleaseOnCancel` (Kubebuilder để tắt, kèm ghi chú vì sao) |
+| Webhook đổi | Trong lúc rollout, API server có thể gọi pod cũ hoặc mới | Webhook phải tương thích hai chiều trong một lần nâng cấp |
+
+Trong lúc operator không chạy (rollout, crash), ứng dụng vẫn chạy: Deployment, pod là object bình thường do controller của Kubernetes quản lý. Chỉ việc **đổi** chúng theo `WebApp` bị dừng lại. Với webhook `Fail` thì khác: việc ghi `WebApp` cũng dừng.
+
+### Gỡ operator
+
+`make undeploy` chạy `kustomize build config/default | kubectl delete -f -`: nó xoá mọi thứ `make deploy` đã tạo, **kể cả CRD**. Theo K9.1, xoá CRD xoá mọi `WebApp`; theo K9.2, garbage collector xoá mọi Deployment, Service, pod mà chúng sở hữu. Một lệnh "gỡ công cụ" thành lệnh "xoá mọi ứng dụng". Gỡ an toàn là xoá controller, RBAC, webhook, **giữ CRD**, và chỉ xoá CRD khi đã chủ động chuyển hay xoá từng object.
+
+<Check id="k9.4.nang-cap-go">Kể được các rủi ro khi nâng cấp một operator (CRD, RBAC, leader election, webhook) cùng cách làm an toàn cho từng cái, và giải thích được vì sao gỡ operator theo mặc định của Kubebuilder là xoá ứng dụng.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Dynamic Admission Control | Kubernetes](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/): `failurePolicy`, `timeoutSeconds`, `namespaceSelector`, `objectSelector`, và mục "Best practices and warnings".
+- [Role Based Access Control Good Practices | Kubernetes](https://kubernetes.io/docs/concepts/security/rbac-good-practices/): quyền nào nguy hiểm hơn vẻ ngoài (đọc Secret, tạo pod, `escalate`, `bind`, `impersonate`).
+- [The Kubebuilder Book](https://book.kubebuilder.io/): phần "Deploying cert-manager" và "Implementing defaulting/validating webhooks" của tutorial CronJob; phần "Metrics" về metrics có xác thực.
+- [Managing webhook failures on Amazon EKS (AWS re:Post)](https://repost.aws/articles/ARr5AEAlgSSh2sdX30gnMGDQ/managing-webhook-failures-on-amazon-eks): nguồn của callout, có cả cách theo dõi và cách gỡ kẹt.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k9-lab`, dự án `~/masteva-k9/k9-3/webapp-operator` ở cuối K9.3 (đã bỏ trường `lastReconcileTime`) và `WebApp` `shop` (3 bản sao) trong namespace `k9`. Dừng mọi bản operator đang chạy trên máy (Ctrl+C): bài này chạy operator trong cụm, hai bản cùng lúc sẽ giành nhau.
+
+**Profile máy.** Lúc nặng nhất (cert-manager ba pod, operator, 3 pod podinfo), node kind dùng khoảng 1,2 tới 1,5 GiB. Image build từ `golang:1.27.2-alpine` (khoảng 370 MB đĩa của Docker), Dockerfile của Kubebuilder tải lại module Go bên trong container, nên lần build đầu mất 2 tới 4 phút; mỗi lần build sau khoảng một phút. Bài build 4 image. Máy 8 GB: đặt Docker tối thiểu 4 GB và dừng mọi cụm khác.
+
+Mọi terminal dùng cho bài cần khối biến môi trường dưới. Biến `GO_IMG` là ảnh dùng để build operator, ghim theo `tag@digest` để mọi lần build dùng đúng một ảnh. Một vài khối sau định nghĩa thêm biến hay hàm (`SA`, `hoi`, `P`, `L`); nếu mở terminal mới giữa chừng, chạy lại khối định nghĩa chúng.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k9/kubeconfig
+export GOPATH=~/masteva-k9/go GOMODCACHE=~/masteva-k9/go/pkg/mod GOCACHE=~/masteva-k9/go/cache
+export PATH=~/masteva-k9/bin:$PATH
+export GO_IMG=golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d
+cd ~/masteva-k9/k9-3/webapp-operator
+kubectl config current-context
+kubectl -n k9 get wa,deploy -o custom-columns='KIND:.kind,NAME:.metadata.name,UID:.metadata.uid'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k9-lab
+KIND         NAME   UID
+WebApp       shop   7b1ecf0a-7c91-4d06-9e4d-a07d555e8987
+Deployment   shop   10e12fe5-f04f-4589-ab80-b2632d62f283
+```
+
+</Expected>
+
+Ghi lại hai UID: cuối bài, chúng phải còn nguyên.
+
+### 1. Đóng image và triển khai
+
+`make docker-build` dùng Dockerfile của Kubebuilder: tầng đầu build binary trong ảnh Go `${BASE_IMAGE}`, tầng sau chép binary vào `gcr.io/distroless/static:nonroot`. Mặc định `BASE_IMAGE` là `golang:1.26` (ảnh Debian, lớn hơn nhiều); bài ghi đè bằng `$GO_IMG` cho nhẹ và ghim cố định. Lệnh `sed` đầu khối ghim luôn ảnh distroless theo digest. Lệnh build **không** chạy `make generate`: sửa `api/` mà quên generate thì build trong container lỗi. Cụm kind không kéo được image chỉ có trên máy, nên `kind load` chép image vào node.
+
+<Terminal where="mac">
+
+```bash
+sed -i.bak 's|^FROM gcr.io/distroless/static:nonroot$|FROM gcr.io/distroless/static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3|' Dockerfile && grep '^FROM' Dockerfile | cut -c1-80
+make docker-build IMG=webapp-operator:0.1.0 BASE_IMAGE=$GO_IMG > /dev/null 2>&1 && echo image ok
+kind load docker-image webapp-operator:0.1.0 --name k9-lab > /dev/null 2>&1 && echo loaded
+make deploy IMG=webapp-operator:0.1.0 2>&1 | grep -E 'created|configured'
+kubectl -n webapp-operator-system rollout status deploy/webapp-operator-controller-manager --timeout=180s | tail -1
+kubectl -n webapp-operator-system get lease -o custom-columns='LEASE:.metadata.name,HOLDER:.spec.holderIdentity'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+FROM ${BASE_IMAGE} AS builder
+FROM gcr.io/distroless/static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659ecea
+image ok
+loaded
+namespace/webapp-operator-system created
+serviceaccount/webapp-operator-controller-manager created
+role.rbac.authorization.k8s.io/webapp-operator-leader-election-role created
+clusterrole.rbac.authorization.k8s.io/webapp-operator-manager-role created
+clusterrole.rbac.authorization.k8s.io/webapp-operator-metrics-auth-role created
+clusterrole.rbac.authorization.k8s.io/webapp-operator-metrics-reader created
+clusterrole.rbac.authorization.k8s.io/webapp-operator-webapp-admin-role created
+clusterrole.rbac.authorization.k8s.io/webapp-operator-webapp-editor-role created
+clusterrole.rbac.authorization.k8s.io/webapp-operator-webapp-viewer-role created
+rolebinding.rbac.authorization.k8s.io/webapp-operator-leader-election-rolebinding created
+clusterrolebinding.rbac.authorization.k8s.io/webapp-operator-manager-rolebinding created
+clusterrolebinding.rbac.authorization.k8s.io/webapp-operator-metrics-auth-rolebinding created
+service/webapp-operator-controller-manager-metrics-service created
+deployment.apps/webapp-operator-controller-manager created
+deployment "webapp-operator-controller-manager" successfully rolled out
+LEASE                      HOLDER
+e2338779.masteva.example   webapp-operator-controller-manager-8455d65d8c-f2ncp_8ff0f7ef-62f9-4630-8fd2-def3d18bb9bb
+```
+
+</Expected>
+
+CRD không có trong output vì nó không đổi so với lúc `make install` ở K9.3 (`kubectl` báo `unchanged`, bị lệnh `grep` lọc đi). Ba ClusterRole `webapp-admin-role`, `editor-role`, `viewer-role` không gán cho ai: Kubebuilder sinh sẵn để đội nền tảng cấp cho **người dùng** quyền tạo, sửa hay chỉ xem `WebApp` (K2.3). Tên Lease là `LeaderElectionID` mà Kubebuilder đặt sẵn trong `cmd/main.go`; `HOLDER` là tên pod operator cộng một mã ngẫu nhiên, nên trên máy bạn sẽ khác.
+
+### 2. Operator được làm gì
+
+Hỏi API server thay vì đọc YAML. Mỗi dòng in một câu hỏi và câu trả lời:
+
+<Terminal where="mac">
+
+```bash
+SA=system:serviceaccount:webapp-operator-system:webapp-operator-controller-manager
+hoi() { printf '%-52s %s\n' "$*" "$(kubectl auth can-i "$@" --as=$SA 2>&1)"; }
+hoi list deployments.apps --all-namespaces
+hoi patch deployments.apps -n kube-system
+hoi delete deployments.apps -n k9
+hoi get secrets -n k9
+hoi create pods -n k9
+hoi create webapps.apps.masteva.example -n k9
+hoi patch webapps.apps.masteva.example --subresource=status -n k9
+hoi create leases.coordination.k8s.io -n webapp-operator-system
+hoi create leases.coordination.k8s.io -n k9
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+list deployments.apps --all-namespaces               yes
+patch deployments.apps -n kube-system                yes
+delete deployments.apps -n k9                        no
+get secrets -n k9                                    no
+create pods -n k9                                    no
+create webapps.apps.masteva.example -n k9            no
+patch webapps.apps.masteva.example --subresource=status -n k9 yes
+create leases.coordination.k8s.io -n webapp-operator-system yes
+create leases.coordination.k8s.io -n k9              no
+```
+
+</Expected>
+
+Đọc từng dòng: operator sửa được Deployment ở **mọi** namespace, kể cả `kube-system` (cái giá của ClusterRole). Nó không xoá được gì, không đọc được Secret, không tạo được pod trực tiếp, không tạo được `WebApp`, chỉ sửa được status của chúng; Lease chỉ trong namespace của chính nó. So với một ClusterRole `*`, khi pod operator bị chiếm quyền, kẻ tấn công không đọc được Secret của cụm. Nhưng sửa được Deployment ở mọi nơi thì vẫn chạy được container tuỳ ý ở mọi namespace: đó là lý do K9.5 coi quyền ghi workload toàn cụm là quyền rất mạnh.
+
+Operator mới tiếp quản `shop` mà không đổi gì: cùng field manager `webapp-operator`, cùng nội dung apply.
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k9 get wa,deploy -o custom-columns='KIND:.kind,NAME:.metadata.name,UID:.metadata.uid'
+kubectl -n k9 get wa shop
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+KIND         NAME   UID
+WebApp       shop   7b1ecf0a-7c91-4d06-9e4d-a07d555e8987
+Deployment   shop   10e12fe5-f04f-4589-ab80-b2632d62f283
+NAME   IMAGE                                 DESIRED   READY   AVAILABLE   AGE
+shop   ghcr.io/stefanprodan/podinfo:6.15.0   3         3       True        6m59s
+```
+
+</Expected>
+
+<Check id="k9.4.lab-trien-khai">Đóng image, nạp vào kind và triển khai được operator bằng `make deploy`, rồi chứng minh bằng `kubectl auth can-i --as` những quyền operator có và không có.</Check>
+
+### 3. Validating webhook
+
+Sinh khung webhook. Kubebuilder tự bật webhook và cert-manager trong `config/default/kustomization.yaml`, và thêm phần đăng ký webhook vào `cmd/main.go`.
+
+<Terminal where="mac">
+
+```bash
+kubebuilder create webhook --group apps --version v1 --kind WebApp --programmatic-validation > /dev/null 2>&1
+find internal/webhook config/webhook config/certmanager -type f | sort
+grep -E '^- \.\./(webhook|certmanager)' config/default/kustomization.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+config/certmanager/certificate-metrics.yaml
+config/certmanager/certificate-webhook.yaml
+config/certmanager/issuer.yaml
+config/certmanager/kustomization.yaml
+config/certmanager/kustomizeconfig.yaml
+config/webhook/kustomization.yaml
+config/webhook/service.yaml
+internal/webhook/v1/webapp_webhook.go
+internal/webhook/v1/webapp_webhook_test.go
+internal/webhook/v1/webhook_suite_test.go
+- ../webhook
+- ../certmanager
+```
+
+</Expected>
+
+Thay file webhook bằng logic chặn trùng tên, và test của nó:
+
+<Terminal where="mac" title="~/masteva-k9/k9-3/webapp-operator/internal/webhook/v1/webapp_webhook.go">
+
+```bash
+cat > internal/webhook/v1/webapp_webhook.go <<'EOF'
+package v1
+
+import (
+	"context"
+	"fmt"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	webappv1 "example.com/webapp-operator/api/v1"
+)
+
+func SetupWebAppWebhookWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewWebhookManagedBy(mgr, &webappv1.WebApp{}).
+		WithValidator(&WebAppValidator{Client: mgr.GetClient()}).
+		Complete()
+}
+
+// +kubebuilder:webhook:path=/validate-apps-masteva-example-v1-webapp,mutating=false,failurePolicy=fail,sideEffects=None,groups=apps.masteva.example,resources=webapps,verbs=create;update,versions=v1,name=vwebapp-v1.kb.io,admissionReviewVersions=v1
+
+// WebAppValidator chặn WebApp trùng tên với Deployment hoặc Service đã có
+// mà không do WebApp nào quản lý: không chặn thì operator dùng ForceOwnership
+// giành lấy object của người khác. Luật CEL không làm được việc này vì nó
+// chỉ nhìn thấy chính object đang ghi.
+type WebAppValidator struct {
+	Client client.Reader
+}
+
+func (v *WebAppValidator) ValidateCreate(ctx context.Context, obj *webappv1.WebApp) (admission.Warnings, error) {
+	key := types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}
+	for _, c := range []struct {
+		kind string
+		obj  client.Object
+	}{{"Deployment", &appsv1.Deployment{}}, {"Service", &corev1.Service{}}} {
+		err := v.Client.Get(ctx, key, c.obj)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if owner := metav1.GetControllerOf(c.obj); owner == nil || owner.Kind != "WebApp" {
+			return nil, fmt.Errorf("%s %q đã tồn tại và không do WebApp quản lý; chọn tên khác", c.kind, obj.Name)
+		}
+	}
+	return nil, nil
+}
+
+func (v *WebAppValidator) ValidateUpdate(_ context.Context, _, _ *webappv1.WebApp) (admission.Warnings, error) {
+	return nil, nil
+}
+
+func (v *WebAppValidator) ValidateDelete(_ context.Context, _ *webappv1.WebApp) (admission.Warnings, error) {
+	return nil, nil
+}
+EOF
+cat > internal/webhook/v1/webapp_webhook_test.go <<'EOF'
+package v1
+
+import (
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	webappv1 "example.com/webapp-operator/api/v1"
+)
+
+var _ = Describe("WebApp Webhook", func() {
+	It("từ chối WebApp trùng tên với Service không do WebApp quản lý", func() {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 80}}},
+		}
+		Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+
+		v := &WebAppValidator{Client: k8sClient}
+		app := &webappv1.WebApp{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default"}}
+		_, err := v.ValidateCreate(ctx, app)
+		Expect(err).To(MatchError(ContainSubstring("không do WebApp quản lý")))
+
+		app.Name = "fresh"
+		Expect(v.ValidateCreate(ctx, app)).Error().NotTo(HaveOccurred())
+	})
+})
+EOF
+make test 2>&1 | grep -E '^(ok|FAIL)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ok  	example.com/webapp-operator/internal/controller	6.700s	coverage: 79.5% of statements
+ok  	example.com/webapp-operator/internal/webhook/v1	4.596s	coverage: 76.9% of statements
+```
+
+</Expected>
+
+Cài cert-manager (K6.2 đã dùng), rồi build và triển khai bản 0.2.0 có webhook. File manifest của cert-manager được tải về, so sha256 với giá trị ghim trong bài, và chỉ được áp khi khớp:
+
+<Terminal where="mac">
+
+```bash
+curl -sLo ../cert-manager-v1.21.2.yaml https://github.com/cert-manager/cert-manager/releases/download/v1.21.2/cert-manager.yaml
+echo "e03b668ec8675214af6b0a671699d088f2601fa3878e0dbe1b41d3feafd1879f  ../cert-manager-v1.21.2.yaml" | shasum -a 256 -c - \
+  && kubectl apply -f ../cert-manager-v1.21.2.yaml > /dev/null
+kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=300s > /dev/null && echo cert-manager ok
+make docker-build IMG=webapp-operator:0.2.0 BASE_IMAGE=$GO_IMG > /dev/null 2>&1 && echo image ok
+kind load docker-image webapp-operator:0.2.0 --name k9-lab > /dev/null 2>&1 && echo loaded
+make deploy IMG=webapp-operator:0.2.0 2>&1 | grep -E 'created|configured' | grep -E '^(service|deployment|certificate|issuer|validatingwebhook)'
+kubectl -n webapp-operator-system rollout status deploy/webapp-operator-controller-manager --timeout=180s | tail -1
+kubectl get validatingwebhookconfiguration webapp-operator-validating-webhook-configuration \
+  -o jsonpath='failurePolicy={.webhooks[0].failurePolicy} ops={.webhooks[0].rules[0].operations} timeout={.webhooks[0].timeoutSeconds}s caBundle={.webhooks[0].clientConfig.caBundle}' | cut -c1-90
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+../cert-manager-v1.21.2.yaml: OK
+cert-manager ok
+image ok
+loaded
+service/webapp-operator-webhook-service created
+deployment.apps/webapp-operator-controller-manager configured
+certificate.cert-manager.io/webapp-operator-metrics-certs created
+certificate.cert-manager.io/webapp-operator-serving-cert created
+issuer.cert-manager.io/webapp-operator-selfsigned-issuer created
+validatingwebhookconfiguration.admissionregistration.k8s.io/webapp-operator-validating-webhook-configuration created
+deployment "webapp-operator-controller-manager" successfully rolled out
+failurePolicy=Fail ops=["CREATE","UPDATE"] timeout=10s caBundle=LS0tLS1CRUdJTiBDRVJUSUZJQ0
+```
+
+</Expected>
+
+`caBundle` đã có: cainjector của cert-manager chép CA vào đó. Giờ thử webhook, rồi thử khi operator **không** chạy:
+
+<Callout kind="danger">
+
+Khối dưới scale operator về 0 bản: trong lúc đó mọi lệnh tạo, sửa `WebApp` trên cụm đều lỗi. Chỉ chạy trên `kind-k9-lab`.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k9/k9-3/legacy.yaml">
+
+```bash
+kubectl -n k9 create service clusterip legacy --tcp=80:8080
+cat > ../legacy.yaml <<'EOF'
+apiVersion: apps.masteva.example/v1
+kind: WebApp
+metadata:
+  name: legacy
+  namespace: k9
+spec:
+  image: ghcr.io/stefanprodan/podinfo:6.15.0
+EOF
+kubectl apply -f ../legacy.yaml
+kubectl -n webapp-operator-system scale deploy webapp-operator-controller-manager --replicas=0
+kubectl -n webapp-operator-system wait --for=delete pod -l control-plane=controller-manager --timeout=60s > /dev/null
+time (sed 's/name: legacy/name: blog/' ../legacy.yaml | kubectl apply -f -)
+kubectl -n k9 patch wa shop --type merge -p '{"spec":{"message":"Đổi khi webhook chết"}}'
+kubectl get --raw /metrics | grep '^apiserver_admission_webhook_rejection_count' | grep vwebapp
+kubectl -n webapp-operator-system scale deploy webapp-operator-controller-manager --replicas=1
+kubectl -n webapp-operator-system rollout status deploy/webapp-operator-controller-manager --timeout=180s | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+service/legacy created
+Error from server (Forbidden): error when creating "../legacy.yaml": admission webhook "vwebapp-v1.kb.io" denied the request: Service "legacy" đã tồn tại và không do WebApp quản lý; chọn tên khác
+deployment.apps/webapp-operator-controller-manager scaled
+Error from server (InternalError): error when creating "STDIN": Internal error occurred: failed calling webhook "vwebapp-v1.kb.io": failed to call webhook: Post "https://webapp-operator-webhook-service.webapp-operator-system.svc:443/validate-apps-masteva-example-v1-webapp?timeout=10s": dial tcp 10.96.129.140:443: connect: connection refused
+( sed 's/name: legacy/name: blog/' ../legacy.yaml | kubectl apply -f -; )  0.03s user 0.02s system 106% cpu 0.049 total
+Error from server (InternalError): Internal error occurred: failed calling webhook "vwebapp-v1.kb.io": failed to call webhook: Post "https://webapp-operator-webhook-service.webapp-operator-system.svc:443/validate-apps-masteva-example-v1-webapp?timeout=10s": dial tcp 10.96.129.140:443: connect: connection refused
+apiserver_admission_webhook_rejection_count{error_type="calling_webhook_error",name="vwebapp-v1.kb.io",operation="CREATE",rejection_code="503",type="validating"} 1
+apiserver_admission_webhook_rejection_count{error_type="calling_webhook_error",name="vwebapp-v1.kb.io",operation="UPDATE",rejection_code="503",type="validating"} 1
+apiserver_admission_webhook_rejection_count{error_type="no_error",name="vwebapp-v1.kb.io",operation="CREATE",rejection_code="403",type="validating"} 1
+deployment.apps/webapp-operator-controller-manager scaled
+deployment "webapp-operator-controller-manager" successfully rolled out
+```
+
+</Expected>
+
+Đọc output theo ba ý.
+
+**Webhook chặn đúng thứ CEL không chặn được.** Lệnh tạo `legacy` bị từ chối với thông báo của chính operator: Service `legacy` của người khác an toàn.
+
+**Operator về 0 thì mọi lệnh ghi `WebApp` lỗi**, kể cả lệnh sửa `shop` đang chạy. Lệnh tạo `blog` có thể lỗi ngay với `connection refused` như mẫu, hoặc treo đủ 10 giây (`timeoutSeconds`) rồi mới báo `context deadline exceeded`, tuỳ thời điểm bạn chạy; dòng `time` cho biết bạn gặp trường hợp nào. Cả hai là cùng một lỗi "không gọi được webhook", và trong trường hợp xấu, người dùng chờ trọn `timeoutSeconds` mới biết. Ứng dụng `shop` vẫn chạy suốt thời gian đó.
+
+**Metric của API server tách hai loại từ chối.** `no_error` với mã 403 là lần webhook từ chối có chủ đích; `calling_webhook_error` là lần không gọi được webhook. Loại thứ hai là thứ nên cảnh báo, như bài của AWS gợi ý.
+
+<Check id="k9.4.lab-webhook">Triển khai được validating webhook với cert-manager, cho thấy nó chặn đúng trường hợp CEL không chặn được, đo được hành vi khi operator chết với `failurePolicy: Fail`, và đọc được metric từ chối của API server.</Check>
+
+### 4. Nâng cấp với một quyền RBAC bị quên
+
+Bản 0.3.0 thêm một chuẩn mới cho mọi `WebApp`: NetworkPolicy chỉ mở cổng của ứng dụng (K2.4). Lập trình viên của operator thêm code và `Owns`, nhưng quên marker RBAC. Hai lệnh `perl` dưới chèn đoạn code vào Reconcile và dòng `Owns`:
+
+<Terminal where="mac">
+
+```bash
+perl -0pi -e 's|(\t// Chuẩn của đội nền tảng: ứng dụng prod)|\t// v0.3.0: chỉ mở cổng của ứng dụng (K2.4).\n\tnetpol := networkingv1ac.NetworkPolicy(app.Name, app.Namespace).\n\t\tWithLabels(lbl).WithOwnerReferences(owner).\n\t\tWithSpec(networkingv1ac.NetworkPolicySpec().\n\t\t\tWithPodSelector(metav1ac.LabelSelector().WithMatchLabels(lbl)).\n\t\t\tWithPolicyTypes("Ingress").\n\t\t\tWithIngress(networkingv1ac.NetworkPolicyIngressRule().\n\t\t\t\tWithPorts(networkingv1ac.NetworkPolicyPort().WithPort(intstr.FromInt32(app.Spec.Port)))))\n\tif err := r.Apply(ctx, netpol, fieldOwner, client.ForceOwnership); err != nil {\n\t\treturn ctrl.Result{}, fmt.Errorf("apply NetworkPolicy: %w", err)\n\t}\n$1|; s|(\t\tOwns\(&policyv1.PodDisruptionBudget\{\}\).\n)|$1\t\tOwns(&networkingv1.NetworkPolicy{}).\n|; s|(\tpolicyv1 "k8s.io/api/policy/v1"\n)|\tnetworkingv1 "k8s.io/api/networking/v1"\n$1|; s|(\tpolicyv1ac "k8s.io/client-go/applyconfigurations/policy/v1"\n)|\tnetworkingv1ac "k8s.io/client-go/applyconfigurations/networking/v1"\n$1|' internal/controller/webapp_controller.go
+make test 2>&1 | grep -E '^(ok|FAIL)'
+make docker-build IMG=webapp-operator:0.3.0 BASE_IMAGE=$GO_IMG > /dev/null 2>&1 && echo image ok
+kind load docker-image webapp-operator:0.3.0 --name k9-lab > /dev/null 2>&1 && echo loaded
+make deploy IMG=webapp-operator:0.3.0 2>&1 | grep -E 'configured'
+kubectl -n webapp-operator-system rollout status deploy/webapp-operator-controller-manager --timeout=180s | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ok  	example.com/webapp-operator/internal/controller	6.964s	coverage: 78.6% of statements
+ok  	example.com/webapp-operator/internal/webhook/v1	4.977s	coverage: 76.9% of statements
+image ok
+loaded
+deployment.apps/webapp-operator-controller-manager configured
+validatingwebhookconfiguration.admissionregistration.k8s.io/webapp-operator-validating-webhook-configuration configured
+deployment "webapp-operator-controller-manager" successfully rolled out
+```
+
+</Expected>
+
+Test xanh, rollout xong, pod `Running`. Khối dưới chờ pod mới giành được lease (tối đa 90 giây), rồi in hai thứ: các event dừng pod (`Killing`) và giành lease (`LeaderElection`) của namespace operator theo thứ tự thời gian, và dòng lỗi quyền trong log của pod mới.
+
+<Terminal where="mac">
+
+```bash
+P=$(kubectl -n webapp-operator-system get pods -l control-plane=controller-manager --sort-by=.metadata.creationTimestamp -o name | tail -1)
+L() { kubectl -n webapp-operator-system logs $P; }
+for i in $(seq 1 45); do L | grep -q 'Successfully acquired' && break; sleep 2; done
+kubectl -n webapp-operator-system get events --sort-by=.lastTimestamp -o custom-columns=TIME:.lastTimestamp,REASON:.reason,OBJ:.involvedObject.name | grep -E 'Killing|LeaderElection' | tail -2
+L | grep -m1 'failed to list \*v1.NetworkPolicy' | grep -o 'networkpolicies.networking.k8s.io is forbidden: .* at the cluster scope' | tr -d '\\'
+kubectl -n k9 get networkpolicy
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2026-10-15T05:22:47Z   Killing              webapp-operator-controller-manager-5cdb7444f7-99s7p
+2026-10-15T05:23:06Z   LeaderElection       e2338779.masteva.example
+networkpolicies.networking.k8s.io is forbidden: User "system:serviceaccount:webapp-operator-system:webapp-operator-controller-manager" cannot list resource "networkpolicies" in API group "networking.k8s.io" at the cluster scope
+No resources found in k9 namespace.
+```
+
+</Expected>
+
+Hai chuyện cùng lúc:
+
+- **Khoảng trống khi rollout.** Dòng `Killing` là lúc pod cũ (0.2.0) bị dừng; tới dòng `LeaderElection`, pod mới mới giành được lease. Giữa hai mốc đó không ai reconcile: 19 giây trong mẫu, thường khoảng 15 tới 20 giây trên máy bạn: gần bằng `LeaseDuration` 15 giây, cộng một nhịp thử của pod mới. Pod cũ bị tắt mà không nhả lease (`LeaderElectionReleaseOnCancel` tắt trong khung của Kubebuilder), nên pod mới phải chờ lease hết hạn, tính từ lần gia hạn cuối của pod cũ. Trước mốc `Killing`, pod mới đã chạy và đứng chờ, nhưng pod cũ vẫn giữ lease và vẫn reconcile, nên thời gian chờ đó không phải khoảng trống.
+- **Thiếu quyền.** Cache không `list` được NetworkPolicy, nên controller không bao giờ khởi động: không chỉ NetworkPolicy, mà `shop` cũng không còn được reconcile. Test envtest xanh vì client của test là admin. Controller-runtime chờ cache đồng bộ tối đa `CacheSyncTimeout`, mặc định 2 phút; quá hạn, manager trả lỗi và tiến trình thoát. Khối dưới chờ tới lúc đó (khoảng hai phút rưỡi) để bạn tự thấy.
+
+<Terminal where="mac">
+
+```bash
+for i in $(seq 1 120); do [ "$(kubectl -n webapp-operator-system get $P -o jsonpath='{.status.containerStatuses[0].restartCount}')" != 0 ] && break; sleep 2; done
+kubectl -n webapp-operator-system get $P -o jsonpath='restarts={.status.containerStatuses[0].restartCount}{"\n"}'
+kubectl -n webapp-operator-system logs $P --previous | grep 'Failed to run manager' | cut -f5 | cut -c1-80
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+restarts=1
+{"error": "failed to wait for webapp caches to sync kind source: *v1.Deployment:
+```
+
+</Expected>
+
+Pod khởi động lại, rồi sẽ lại chờ lease, lại chờ cache, lại thoát: `CrashLoopBackOff` sau vài vòng. Lỗi nói cache không đồng bộ được trong thời hạn (lệnh `cut` cắt bớt cuối dòng). Tên nguồn trong thông báo là nguồn nào đang chờ lúc hết hạn, nên trên máy bạn có thể là NetworkPolicy, Deployment hay Service; nguyên nhân thật vẫn là dòng `forbidden` ở trên.
+
+Sửa: thêm marker, sinh lại RBAC, triển khai 0.3.1. `make deploy` áp ClusterRole mới cùng lần.
+
+<Terminal where="mac">
+
+```bash
+perl -pi -e 's|^(// \+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,.*)$|$1\n// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch|' internal/controller/webapp_controller.go
+make manifests > /dev/null && yq '.rules[] | select(.apiGroups[0] == "networking.k8s.io") | .resources[0] + ": " + (.verbs | join(","))' config/rbac/role.yaml
+make docker-build IMG=webapp-operator:0.3.1 BASE_IMAGE=$GO_IMG > /dev/null 2>&1 && echo image ok
+kind load docker-image webapp-operator:0.3.1 --name k9-lab > /dev/null 2>&1 && echo loaded
+make deploy IMG=webapp-operator:0.3.1 2>&1 | grep -E 'clusterrole.rbac.*manager-role|deployment.apps'
+kubectl -n webapp-operator-system rollout status deploy/webapp-operator-controller-manager --timeout=180s | tail -1
+for i in $(seq 1 60); do kubectl -n k9 get networkpolicy shop > /dev/null 2>&1 && break; sleep 2; done
+kubectl -n k9 get networkpolicy
+kubectl -n k9 get wa,deploy -o custom-columns='KIND:.kind,NAME:.metadata.name,UID:.metadata.uid'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+networkpolicies: create,get,list,patch,update,watch
+image ok
+loaded
+clusterrole.rbac.authorization.k8s.io/webapp-operator-manager-role configured
+deployment.apps/webapp-operator-controller-manager configured
+deployment "webapp-operator-controller-manager" successfully rolled out
+NAME   POD-SELECTOR                                                               AGE
+shop   app.kubernetes.io/managed-by=webapp-operator,app.kubernetes.io/name=shop   0s
+KIND         NAME   UID
+WebApp       shop   7b1ecf0a-7c91-4d06-9e4d-a07d555e8987
+Deployment   shop   10e12fe5-f04f-4589-ab80-b2632d62f283
+```
+
+</Expected>
+
+Ba lần nâng cấp operator, hai lần thêm tính năng, một lần operator không chạy được; UID của `shop` và Deployment của nó vẫn như ở phần Chuẩn bị. Nâng cấp operator không đụng tới object nó quản lý, trừ khi chính code mới muốn đổi chúng.
+
+<Check id="k9.4.lab-nang-cap">Tái hiện được bản operator thiếu quyền RBAC vượt qua envtest nhưng không chạy được trong cụm, đọc được lỗi trong log, sửa bằng marker, và đo được khoảng thời gian không ai reconcile khi rollout operator.</Check>
+
+### 5. Gỡ operator mà không xoá ứng dụng
+
+Trước khi gỡ, xem `make undeploy` sẽ xoá những gì, bằng chế độ thử trên server (không xoá thật):
+
+<Terminal where="mac">
+
+```bash
+bin/kustomize build config/default | kubectl delete --dry-run=server -f - 2>&1 | grep -E 'customresourcedefinition|validatingwebhook|deployment.apps'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+customresourcedefinition.apiextensions.k8s.io "webapps.apps.masteva.example" deleted (server dry run)
+deployment.apps "webapp-operator-controller-manager" deleted from webapp-operator-system namespace (server dry run)
+validatingwebhookconfiguration.admissionregistration.k8s.io "webapp-operator-validating-webhook-configuration" deleted (server dry run)
+```
+
+</Expected>
+
+Dòng đầu là CRD: `make undeploy` sẽ xoá `shop`, rồi garbage collector xoá Deployment, Service, PDB, NetworkPolicy và pod của nó. Gỡ đúng là bỏ CRD ra khỏi danh sách xoá:
+
+<Callout kind="danger">
+
+Khối dưới gỡ operator: namespace `webapp-operator-system`, RBAC, webhook. CRD và mọi `WebApp` được giữ lại. Kiểm `kubectl config current-context` là `kind-k9-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+bin/kustomize build config/default | yq 'select(.kind != "CustomResourceDefinition")' | kubectl delete -f - 2>&1 | grep -E '^(namespace|validatingwebhook)'
+kubectl get crd webapps.apps.masteva.example -o name
+kubectl -n k9 get wa,deploy,pods
+kubectl -n k9 patch wa shop --type merge -p '{"spec":{"replicas":2}}'
+kubectl -n k9 get deploy shop -o jsonpath='deploy.spec.replicas={.spec.replicas}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k9-lab
+namespace "webapp-operator-system" deleted
+validatingwebhookconfiguration.admissionregistration.k8s.io "webapp-operator-validating-webhook-configuration" deleted
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example
+NAME                               IMAGE                                 DESIRED   READY   AVAILABLE   AGE
+webapp.apps.masteva.example/shop   ghcr.io/stefanprodan/podinfo:6.15.0   3         3       True        13m
+
+NAME                   READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/shop   3/3     3            3           13m
+
+NAME                        READY   STATUS    RESTARTS   AGE
+pod/shop-86754c6f78-48xsn   1/1     Running   0          13m
+pod/shop-86754c6f78-d4fsh   1/1     Running   0          13m
+pod/shop-86754c6f78-l2xd4   1/1     Running   0          13m
+webapp.apps.masteva.example/shop patched
+deploy.spec.replicas=3
+```
+
+</Expected>
+
+Operator đã đi, ứng dụng vẫn chạy đủ 3 pod. `WebApp` vẫn sửa được (webhook đã gỡ cùng operator), nhưng không ai đưa thay đổi xuống: Deployment vẫn 3. Đó là trạng thái "mồ côi" cần biết: theo K9.2, operator được cài lại sẽ LIST mọi `WebApp` và đưa Deployment về 2 ở lần reconcile đầu tiên (bài không chạy bước này). Tuổi pod vẫn tính từ K9.3: ba lần nâng cấp operator không khởi động lại pod nào của ứng dụng. Thứ tự gỡ cũng đáng để ý: gỡ Deployment của operator mà để lại `ValidatingWebhookConfiguration` thì mọi lệnh ghi `WebApp` lỗi như bước 3.
+
+<Check id="k9.4.lab-go">Chỉ ra được bằng dry-run rằng gỡ mặc định xoá CRD, gỡ được operator mà giữ CRD và ứng dụng, và giải thích được trạng thái của `WebApp` sau khi operator đã đi.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Pod operator `ErrImagePull` với `webapp-operator:0.x.0` | Quên `kind load`, hoặc nạp vào cụm khác | `kind load docker-image … --name k9-lab`; `docker exec k9-lab-control-plane crictl images \| grep webapp` |
+| `make docker-build` lỗi `undefined` trong `zz_generated.deepcopy.go` | Đổi `api/` mà chưa `make generate` | `make manifests generate` rồi build lại |
+| `make deploy` lỗi `no matches for kind "Certificate"` | Chưa cài cert-manager mà config đã bật webhook | Cài cert-manager như bước 3 |
+| Mọi lệnh tạo `WebApp` lỗi `failed calling webhook` | Pod operator chưa sẵn sàng, hoặc chứng chỉ chưa được cấp | `kubectl -n webapp-operator-system get pods,certificate`; xem `caBundle` của webhook |
+| Pod operator `Running` nhưng không gì được reconcile | Thiếu quyền, cache không đồng bộ; hoặc pod chưa giành được lease | Log: `forbidden`, `Attempting to acquire leader lease` |
+| Gỡ xong, tạo `WebApp` vẫn lỗi webhook | `ValidatingWebhookConfiguration` còn sót | `kubectl get validatingwebhookconfiguration`; xoá cái của operator |
+
+### Dọn dẹp
+
+K9.5 dùng tiếp cụm `k9-lab` nhưng cần chỗ cho một operator database. Khối dưới xoá `shop` (operator không còn; garbage collector vẫn xoá con của nó), Service `legacy`, CRD `WebApp`, và cert-manager.
+
+<Callout kind="danger">
+
+Khối dưới xoá ứng dụng `shop`, CRD `webapps.apps.masteva.example` và toàn bộ cert-manager. Chỉ chạy trên `kind-k9-lab`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k9 delete wa shop
+kubectl -n k9 delete service legacy
+kubectl delete crd webapps.apps.masteva.example
+kubectl delete -f ../cert-manager-v1.21.2.yaml > /dev/null 2>&1
+kubectl get ns cert-manager webapp-operator-system 2>&1 | tail -2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example "shop" deleted from k9 namespace
+service "legacy" deleted from k9 namespace
+customresourcedefinition.apiextensions.k8s.io "webapps.apps.masteva.example" deleted
+Error from server (NotFound): namespaces "cert-manager" not found
+Error from server (NotFound): namespaces "webapp-operator-system" not found
+```
+
+</Expected>
+
+Image `webapp-operator:0.x` còn trên Docker của máy; xoá bằng `docker rmi webapp-operator:0.1.0 webapp-operator:0.2.0 webapp-operator:0.3.0 webapp-operator:0.3.1` nếu không cần nữa.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao Kubebuilder để `LeaderElectionReleaseOnCancel` tắt, khi nó rút ngắn khoảng trống ở bước 4?">
+
+Nhả lease ngay khi nhận tín hiệu dừng chỉ an toàn nếu tiến trình **thật sự dừng mọi việc** ngay sau đó. Nếu sau khi nhả lease, code dọn dẹp của bạn còn ghi gì đó lên API server, bản mới đã giành lease và hai bản cùng ghi trong một khoảng ngắn. Comment trong `cmd/main.go` do Kubebuilder sinh ghi đúng điều kiện đó. Với operator mà mọi việc nằm trong Reconcile, bật nó là hợp lý: khoảng trống từ khoảng 15 giây xuống vài giây (K9.2 đã cho thấy khi tắt êm).
+
+</Reveal>
+
+<Reveal title="Có nên chạy 2 bản operator cho sẵn sàng cao?">
+
+Với controller: thêm bản chỉ rút ngắn khoảng trống khi một bản chết (bản dự phòng đã có cache, chỉ chờ lease); nó không tăng thông lượng, vì chỉ một bản làm việc. Với webhook: **có**, và đây mới là lý do chính. Webhook phục vụ ở mọi bản, không cần lease, và với `failurePolicy: Fail`, một bản duy nhất nghĩa là mỗi lần rollout hay node chết đều có lúc ghi `WebApp` lỗi. Hai bản cộng PodDisruptionBudget (K5.2) và trải trên hai node là cấu hình tối thiểu khi operator có webhook `Fail`.
+
+</Reveal>
+
+<Reveal title="Webhook nên `Fail` hay `Ignore`?">
+
+Hỏi: nếu kiểm tra này bị bỏ qua trong vài phút, điều tồi tệ nhất là gì? Với webhook của bài, bỏ qua nghĩa là có thể có một `WebApp` giành Service của người khác: `Fail` hợp lý, kèm hai bản và cảnh báo. Webhook chỉ để điền mặc định tiện lợi thì `Ignore`. Webhook chuyển đổi (conversion) không có lựa chọn: nó chết là object không đọc được. Dù chọn gì, giới hạn phạm vi bằng `rules`, `namespaceSelector` và không bao giờ để webhook của một operator khớp tài nguyên của `kube-system` hay của chính namespace operator, nếu không operator không tự khởi động lại được.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết logic validating webhook, viết marker RBAC còn thiếu khi đọc log `forbidden`, giải thích một cấu hình Kustomize của Kubebuilder.
+
+**AI hay sai ở đâu:** đề xuất `make undeploy` để "gỡ operator"; thêm `verbs=*` hoặc `resources=*` cho hết lỗi `forbidden`; đặt `failurePolicy: Ignore` để "sửa" webhook timeout mà không hỏi kiểm tra đó bảo vệ điều gì; quên cert-manager hoặc tự sinh chứng chỉ tay rồi quên gia hạn; dùng tên webhook struct cũ (`CustomValidator`) của bản Kubebuilder trước 4.16; và đẩy image lên Docker Hub thay vì nạp vào kind.
+
+**Cách kiểm tra:** `kubectl auth can-i --as=system:serviceaccount:…` cho từng quyền; `kubectl delete --dry-run=server` trước mọi lệnh gỡ; scale operator về 0 trên cụm thử để biết chuyện gì xảy ra khi nó chết.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.3 dạy RBAC và `auth can-i`; K2.4 dạy NetworkPolicy và SecurityContext; K5.2 dạy PDB cho chính operator. K6.2 dùng cert-manager. K9.1 dạy conversion và `storedVersions`, K9.3 sinh code và test. K8 là nơi dạy admission policy dùng chung cả cụm (ValidatingAdmissionPolicy, Kyverno), khác với webhook riêng của một operator. K9.5 dùng đúng các lệnh `auth can-i` và dry-run của bài này để đánh giá operator của người khác. D13 (GitOps) là chặng tiếp theo để đặt việc cài và nâng operator dưới Git.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k9.4.mastery-trien-khai">Đưa được một operator Kubebuilder vào cụm với quyền tối thiểu, chứng minh được quyền của nó bằng `auth can-i`, và lập luận được vì sao mỗi quyền là cần.</Check>
+
+<Check id="k9.4.mastery-van-hanh">Lập được quy trình nâng cấp và gỡ một operator tự viết mà không mất ứng dụng: thứ tự CRD, RBAC, controller, webhook; cách phát hiện bản mới thiếu quyền; cách gỡ giữ CRD.</Check>
+
+</Mastery>

@@ -1,0 +1,856 @@
+---
+title: Argo Rollouts, canary tự chấm điểm bằng metric
+description: Thay Deployment bằng Rollout để prod nhận bản mới theo từng nấc, cho AnalysisTemplate hỏi Prometheus tỉ lệ lỗi của riêng bản mới; một bản tốt đi hết các bước, một bản lỗi tự bị lui, và đếm số request lỗi người dùng thấy so với canary làm tay ở D6.3.
+id: d14.3
+step: d14
+prerequisites: [d14.2]
+topics: [d14.argo-rollouts]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    kind: 0.33.0
+    kubernetes: 1.37.0 (kindest/node)
+    kubectl: 1.37.1
+    argo-cd: 3.5.5
+    argo-rollouts: 1.10.1
+    prometheus: 3.15.0
+    gitea: 28.1.0
+    gitea-runner: 5.0.0
+---
+
+<Goal>
+
+Biến canary của D6.3, nơi một người đọc số rồi quyết định, thành một vòng tự động: tăng lưu lượng theo nấc, đo tỉ lệ lỗi của riêng bản mới, và tự lui khi số xấu. Học xong bài này, bạn giải thích được:
+
+- Vì sao một bản trả lỗi 1/3 số request chỉ làm hỏng vài chục request trước khi bị gỡ, và con số đó phụ thuộc vào bốn đại lượng nào.
+- Vì sao Argo CD vẫn báo `Synced` sau khi canary bị huỷ, và việc còn lại của con người là gì.
+- Vì sao canary không có lưu lượng phải bị coi là thất bại chứ không phải thành công.
+- Khi nào chọn canary, khi nào blue-green, và khi nào cần một bộ định tuyến lưu lượng thay vì chia theo số pod.
+
+</Goal>
+
+<Knowledge>
+
+### Rollout: một Deployment biết dừng giữa chừng
+
+Deployment (K1.1) chỉ có một kiểu đổi phiên bản: rolling update, chạy một mạch từ đầu tới cuối, dừng khi pod mới không sẵn sàng. Nó không biết "dừng ở 20% và chờ năm phút", càng không biết hỏi metric. **Argo Rollouts** thêm một controller và CRD `Rollout`: cùng `selector`, cùng pod `template` như Deployment, nhưng phần `strategy` là một danh sách **bước**.
+
+```text
+ Rollout: 5 replica, canary không có bộ định tuyến (chia theo số pod)
+
+ bước 0  setWeight: 20     stable ████ (4)   canary █ (1)      ┐
+ bước 1  pause: 60s        AnalysisRun nền bắt đầu: mỗi 10 giây hỏi Prometheus
+                           tỉ lệ 5xx của RIÊNG pod canary < 5% ?           │  một lần "không"
+ bước 2  setWeight: 60     stable ██ (2)     canary ███ (3)                ├─────────────▶ abort:
+ bước 3  pause: 30s                                                        │  canary về 0 pod,
+ xong    100%              canary thành stable ████ (5)                    ┘  stable đủ 5 pod
+```
+
+Trong lab, Service đứng trước cả hai nhóm pod, nên **trọng số chính là tỉ lệ số pod**: 20% của 5 replica là 1 pod canary. Cách này không cần thêm gì nhưng thô: muốn 1% thì cần 100 pod. Khi cần trọng số chính xác, Rollout điều khiển một **bộ định tuyến lưu lượng**:
+
+| | Chia theo số pod (lab) | Có bộ định tuyến |
+|---|---|---|
+| Ai chia lưu lượng | Service và kube-proxy, theo số endpoint | Gateway API (qua plugin), Istio, ALB, Traefik, NGINX Ingress (lưu ý: ingress-nginx đã ngừng phát triển)... |
+| Trọng số | Làm tròn theo số replica | Chính xác tới từng phần trăm, không phụ thuộc số pod |
+| Định tuyến theo header, cookie | Không | Có, ví dụ gửi mọi request của nhân viên vào canary |
+| Thêm gì | Không | Cấu hình `trafficRouting` và quyền cho controller sửa route |
+
+Bên dưới vẫn là cơ chế D6.3 làm tay: hai ReplicaSet (bản ổn định và bản canary) cùng nhận request, và một bên quyết định tỉ lệ.
+
+### AnalysisTemplate: phép đo quyết định đi tiếp hay lui
+
+**AnalysisTemplate** mô tả một phép đo: hỏi ai (Prometheus, Datadog, một Job, một URL web), hỏi gì, bao lâu một lần, và thế nào là đạt. Rollout tạo từ nó một **AnalysisRun** cho mỗi lần đổi phiên bản.
+
+| Trường | Trong lab | Ý nghĩa |
+|---|---|---|
+| `initialDelay` | `20s` | Chờ trước lần đo đầu, để canary kịp nhận request và Prometheus kịp thu vài mẫu |
+| `interval` | `10s` | Khoảng cách giữa hai lần đo |
+| `successCondition` | `len(result) > 0 && result[0] < 0.05` | Đạt khi có số liệu **và** tỉ lệ lỗi dưới 5% |
+| `failureLimit` | `0` (mặc định) | Số lần đo không đạt được tha thứ; 0 là trượt một lần là thua |
+| `args` | `canary-hash` lấy từ `podTemplateHashValue: Latest` | Mã ReplicaSet của bản mới, để truy vấn chỉ đo pod canary |
+
+**Mã ReplicaSet** (pod template hash) là chuỗi băm mà controller tính từ pod template và gắn lên mọi pod của một ReplicaSet qua nhãn `rollouts-pod-template-hash` (với Deployment là `pod-template-hash`); nó cũng là đoạn giữa trong tên pod, ví dụ `price-api-`**`7b67fd68b7`**`-2xk4p`. Bản ổn định và bản canary có hai mã khác nhau.
+
+Hai cách gắn phân tích vào Rollout: **phân tích nền** (`analysis` cạnh `steps`, chạy suốt từ một bước chỉ định tới khi xong; thua là huỷ ngay) và **bước phân tích** (một phần tử `analysis` trong `steps`, chặn bước kế tiếp tới khi có kết quả). Lab dùng phân tích nền bắt đầu từ bước 1, sau khi canary đã có pod.
+
+Ba chi tiết quyết định phép đo có đáng tin không:
+
+- **So canary với chính nó, không với cả hệ thống.** D6.3 đã thấy 3,3% lỗi toàn hệ thống che 32% lỗi của canary. Truy vấn trong lab lọc theo nhãn `rollouts_pod_template_hash` mà Prometheus gắn từ nhãn của pod.
+- **Không có số liệu là không đạt.** Không có request thì tỉ lệ lỗi là 0 chia 0, Prometheus trả `NaN`; `NaN < 0.05` là sai, nên Rollout coi là thua. Viết điều kiện kiểu `result[0] >= 0.95` cho tỉ lệ thành công cũng cho cùng kết quả an toàn, **miễn là chỉ khai `successCondition`** (khai thêm `failureCondition` thì `NaN` có thể ra kết quả không rõ ràng, xem ý kế tiếp). Viết `isNaN(result[0]) || ...` để "cho qua khi không có gì" là mở cửa cho đúng loại sự cố trong callout dưới.
+- **Kết quả không rõ ràng thì dừng chờ người.** Ngoài đạt và thua, phép đo có thể **inconclusive**: khi không khai điều kiện nào, hoặc khi khai cả `successCondition` lẫn `failureCondition` mà kết quả không khớp cái nào; `inconclusiveLimit` chỉ là số lần inconclusive được chịu. Khi AnalysisRun ra inconclusive, Rollout dừng ở bước hiện tại và chờ người quyết.
+
+<Callout kind="production">
+
+Ngày 11/04/2016, mọi instance của Google Compute Engine ở mọi vùng mất kết nối từ Internet trong 18 phút. Theo báo cáo sự cố của Google (giờ Thái Bình Dương):
+
+- 14:50: kỹ sư gỡ một dải IP không còn dùng khỏi cấu hình mạng; một lỗi về thời điểm làm hai file cấu hình không nhất quán. Phần mềm quản lý cấu hình được thiết kế để khi gặp lỗi thì giữ cấu hình tốt gần nhất, nhưng một lỗi chưa từng gặp khiến nó gỡ **mọi** dải IP của GCE và đẩy cấu hình thiếu đó đi.
+- Quy trình có sẵn bước canary: triển khai ở một site và kiểm site đó còn chạy đúng. Bước canary **đã kết luận đúng** rằng cấu hình mới không an toàn, nhưng một lỗi thứ hai khiến kết luận đó không được chuyển về tiến trình đẩy, nên việc triển khai dần vẫn tiếp tục.
+- 19:07: site cuối cùng ngừng quảng bá dải IP. 19:09: hơn 95% lưu lượng vào GCE bị mất. Kỹ sư lui các thay đổi cấu hình gần nhất; 19:27 hết sự cố.
+
+Việc khắc phục: báo cáo liệt kê 14 thay đổi kỹ thuật dự kiến, trong đó có giám sát trực tiếp việc giảm dung lượng hay dự phòng ngay cả khi hệ thống trông vẫn chạy.
+
+Phần của bài: phép đo canary chỉ có giá trị khi kết luận của nó **chặn** được bước kế tiếp, và mọi trạng thái không phải "đạt rõ ràng" (lỗi, thiếu số liệu, mất liên lạc) phải dẫn tới dừng. Bước 6 của lab thử đúng trường hợp thiếu số liệu.
+
+</Callout>
+
+<Check id="d14.3.rollout-analysis">Mô tả được một Rollout canary với các bước `setWeight`, `pause` và phân tích nền; giải thích được vì sao truy vấn phải lọc theo mã ReplicaSet của canary và vì sao thiếu số liệu phải bị coi là không đạt.</Check>
+
+### Blue-green trong Rollout
+
+Cùng CRD có chiến lược **blue-green**: dựng đủ replica của bản mới sau một Service **preview**, chạy kiểm thử hoặc phân tích lên đó, rồi đổi Service **active** sang bản mới một lần (D6.3 đã đo cái giá: mọi request đi vào bản mới cùng lúc).
+
+```yaml
+strategy:
+  blueGreen:
+    activeService: price-api            # người dùng gọi vào đây
+    previewService: price-api-preview   # chỉ người kiểm thử gọi vào
+    autoPromotionEnabled: false         # chờ lệnh promote, không tự đổi
+    prePromotionAnalysis:               # phải đạt trước khi đổi active
+      templates: [{ templateName: smoke-test }]
+    postPromotionAnalysis:              # thua sau khi đổi thì quay active về bản cũ
+      templates: [{ templateName: error-rate }]
+```
+
+| Chọn | Khi |
+|---|---|
+| Canary | Service nhận nhiều request, đo được theo phiên bản, chịu được hai bản cùng phục vụ |
+| Blue-green | Cần đổi "một phát" (hai bản không được trộn), cần kiểm thử bản mới bằng request thật trước khi mở cho người dùng, chấp nhận gấp đôi tài nguyên trong lúc đổi |
+
+### Rollout sống chung với HPA và với Argo CD
+
+**HPA** (K5.3) trỏ `scaleTargetRef` vào Rollout (`apiVersion: argoproj.io/v1alpha1`, `kind: Rollout`) như vào Deployment. Khi chia theo số pod, controller chia tổng số replica HPA đặt theo trọng số của bước hiện tại. Một cái bẫy được tài liệu nêu rõ: dùng chung một HPA thì canary rò bộ nhớ hay ngốn CPU kéo trung bình lên và làm **bản ổn định** cũng scale theo.
+
+**Argo CD** coi Rollout là một tài nguyên có health riêng:
+
+| Lúc | Rollout | Application trong Argo CD |
+|---|---|---|
+| Đang dừng ở bước `pause` | `Paused` | `Synced`, `Suspended` |
+| Đang tăng trọng số | `Progressing` | `Synced`, `Progressing` |
+| Xong | `Healthy` | `Synced`, `Healthy` |
+| Phân tích thua, bị huỷ | `Degraded` | `Synced`, `Degraded` |
+
+Dòng cuối là chỗ dễ hiểu nhầm nhất. Huỷ canary trả **cụm** về bản ổn định, nhưng **Git vẫn ghi bản mới**: spec của Rollout vẫn là bản mới, chỉ là controller từ chối đưa nó lên. Argo CD thấy cụm khớp Git nên báo `Synced`; health `Degraded` là lời nhắc rằng có người phải sửa Git, bằng `git revert` hay một bản sửa. Chưa sửa Git thì commit kế tiếp, kể cả một thay đổi vô hại, sẽ kéo theo bản lỗi đi thêm một vòng.
+
+Flagger, công cụ cùng loại đi với Flux, làm cùng việc theo cách khác: nó giữ nguyên Deployment của bạn và tự tạo bản sao cùng các Service, thay vì đòi đổi sang một CRD mới.
+
+<Check id="d14.3.bluegreen-hpa-argocd">Chọn được giữa canary và blue-green cho một tình huống, nói được cách HPA làm việc với Rollout cùng cái bẫy của nó, và đọc được trạng thái của Application khi Rollout đang dừng hay vừa bị huỷ.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Canary (Argo Rollouts)](https://argo-rollouts.readthedocs.io/en/stable/features/canary/): các bước, `setWeight`, `pause`, `setCanaryScale`, cách chia khi không có bộ định tuyến.
+- [Analysis & Progressive Delivery (Argo Rollouts)](https://argo-rollouts.readthedocs.io/en/stable/features/analysis/): phân tích nền và bước phân tích, `failureLimit`, xử lý `NaN` và kết quả rỗng, `dryRun`.
+- [BlueGreen (Argo Rollouts)](https://argo-rollouts.readthedocs.io/en/stable/features/bluegreen/): `activeService`, `previewService`, phân tích trước và sau khi đổi.
+- [HPA (Argo Rollouts)](https://argo-rollouts.readthedocs.io/en/stable/features/hpa-support/): HPA với từng chiến lược và các lưu ý khi canary bị huỷ.
+- [Google Compute Engine Incident #16007](https://status.cloud.google.com/incident/compute/16007): báo cáo gốc của vụ việc trong callout; đọc mục Root cause về bước canary.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D13.2. Nếu đã dừng lab ở cuối bài trước: chạy `docker start d13-lab-control-plane d13-gitea d13-registry`, chờ tới khi `curl -s localhost:9700/api/healthz` trả lời (khoảng nửa phút), rồi mới `docker start d13-runner` (runner bật trước Gitea sẽ thoát ngay vì không đăng ký được); chờ thêm khoảng một phút cho các pod trong cụm sẵn sàng, rồi `cd ~/masteva-d14 && . ./lab.sh`. Mỗi khối lệnh mở bằng `cd` tới đúng thư mục của nó, nên mở tab mới giữa chừng chỉ cần `cd ~/masteva-d14 && . ./lab.sh`. Lúc bắt đầu: ba Application `price-api-dev`, `-staging`, `-prod` đang `Synced`, `Healthy`; dev chạy bản build mới nhất, staging và prod chạy bản trước đó; runner `d13-runner` đang chạy. Máy có mạng: lab tải image Argo Rollouts (khoảng 40 MB nén), plugin `kubectl-argo-rollouts` chạy bằng image Docker (190 MB), Prometheus (khoảng 110 MB nén). Dùng thêm cổng **9709** (Prometheus). **Profile máy:** thêm khoảng 60 MiB cho controller của Argo Rollouts, 90 MiB cho Prometheus và 30 MiB cho các pod canary; cả lab khoảng 2,5 GiB theo `docker stats` lúc nặng nhất. Máy 8 GB chạy được nếu Docker VM có 4 GB và không chạy lab khác cùng lúc (ước từ số đo trên, chưa chạy thử trên máy 8 GB).
+
+### 1. Cài Argo Rollouts và Prometheus
+
+Khối đầu cài controller của Argo Rollouts, tạo kubeconfig nội bộ cho plugin rồi thêm hàm `rollouts` vào `lab.sh`. Số `15` là số object được áp; dòng cuối là phiên bản của plugin, chứng tỏ plugin chạy được và nói chuyện được với cụm.
+
+<Terminal where="mac" title="~/masteva-d14">
+
+```bash
+cd ~/masteva-d14 && . ./lab.sh
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts --server-side \
+  -f https://github.com/argoproj/argo-rollouts/releases/download/v1.10.1/install.yaml | grep -c serverside-applied
+kubectl -n argo-rollouts rollout status deployment argo-rollouts --timeout=300s | tail -1
+kind get kubeconfig --internal --name d13-lab > kubeconfig-internal && chmod 600 kubeconfig-internal
+cat >> lab.sh <<'EOF'
+rollouts() { docker run --rm --network kind -v "$HOME/masteva-d14/kubeconfig-internal":/kc:ro \
+  quay.io/argoproj/kubectl-argo-rollouts:v1.10.1@sha256:69b516dd38506237ba56e85fddbb610e71cb4491cc938d400881e6a602265eab \
+  --kubeconfig /kc "$@"; }
+EOF
+docker pull -q quay.io/argoproj/kubectl-argo-rollouts:v1.10.1@sha256:69b516dd38506237ba56e85fddbb610e71cb4491cc938d400881e6a602265eab >/dev/null
+. ./lab.sh && rollouts version | sed -n 1p
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/argo-rollouts created
+15
+deployment "argo-rollouts" successfully rolled out
+kubectl-argo-rollouts: v1.10.1+356117c
+```
+
+</Expected>
+
+Lệnh `docker pull -q` tải trước image của plugin (khoảng 190 MB) để lần gọi `rollouts` đầu tiên không in tiến trình tải. Như Argo CD, manifest cài đặt có CRD quá lớn cho `kubectl apply` kiểu thường, nên phải `--server-side`. Plugin `kubectl argo rollouts` có bản dựng sẵn cho macOS; lab chạy nó từ image Docker chính thức để không cài gì lên máy. Container của plugin nằm trên network `kind` nên dùng kubeconfig **nội bộ** (`--internal`), trỏ tới `d13-lab-control-plane:6443` thay vì cổng ngẫu nhiên trên `127.0.0.1`.
+
+Prometheus chỉ cần thu metric của các pod `price-api`. D12.2 đã dạy Prometheus với danh sách target viết sẵn; trong cụm, target đổi liên tục khi pod lên xuống, nên Prometheus tự hỏi API của Kubernetes. Khối dưới gồm Namespace, quyền đọc pod, cấu hình, Deployment và Service của Prometheus; số `7` in ra là số object vừa được tạo.
+
+<Terminal where="mac" title="~/masteva-d14/prometheus.yaml">
+
+```bash
+cd ~/masteva-d14
+cat > prometheus.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: { name: monitoring }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: prometheus, namespace: monitoring }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: prometheus-pods }
+rules:
+  - { apiGroups: [""], resources: [pods], verbs: [get, list, watch] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: prometheus-pods }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: prometheus-pods }
+subjects: [{ kind: ServiceAccount, name: prometheus, namespace: monitoring }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: prometheus, namespace: monitoring }
+data:
+  prometheus.yml: |
+    global: { scrape_interval: 5s }
+    scrape_configs:
+      - job_name: price-api
+        kubernetes_sd_configs: [{ role: pod }]
+        relabel_configs:
+          - { source_labels: [__meta_kubernetes_pod_label_app], regex: price-api, action: keep }
+          - { source_labels: [__meta_kubernetes_namespace], target_label: namespace }
+          - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
+          - { source_labels: [__meta_kubernetes_pod_label_rollouts_pod_template_hash], target_label: rollouts_pod_template_hash }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: prometheus, namespace: monitoring }
+spec:
+  selector: { matchLabels: { app: prometheus } }
+  template:
+    metadata: { labels: { app: prometheus } }
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.15.0
+          args: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.retention.time=2h]
+          ports: [{ containerPort: 9090 }]
+          volumeMounts: [{ name: config, mountPath: /etc/prometheus }]
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 512Mi } }
+      volumes: [{ name: config, configMap: { name: prometheus } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: prometheus, namespace: monitoring }
+spec:
+  type: NodePort
+  selector: { app: prometheus }
+  ports: [{ port: 9090, nodePort: 30709 }]
+EOF
+kubectl apply -f prometheus.yaml | grep -c created
+kubectl -n monitoring rollout status deployment prometheus --timeout=300s | tail -1
+for i in $(seq 1 60); do
+  [ "$(curl -s localhost:9709/api/v1/query --data-urlencode 'query=sum(up{job="price-api"})' | jq -r '.data.result[0].value[1] // 0')" = 6 ] && break
+  sleep 2
+done
+curl -s localhost:9709/api/v1/query --data-urlencode 'query=count by (namespace) (up{job="price-api"} == 1)' \
+  | jq -r '.data.result[] | "\(.metric.namespace): \(.value[1]) pod"' | sort
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+7
+deployment "prometheus" successfully rolled out
+price-dev: 1 pod
+price-prod: 3 pod
+price-staging: 2 pod
+```
+
+</Expected>
+
+Đọc phần cấu hình:
+
+- `kubernetes_sd_configs` với `role: pod`: Prometheus liệt kê mọi pod qua API của Kubernetes. Vì vậy nó cần ServiceAccount `prometheus` và ClusterRole cho phép `get`, `list`, `watch` pod.
+- Mỗi pod tìm được kèm một loạt nhãn tạm bắt đầu bằng `__meta_kubernetes_`, ví dụ `__meta_kubernetes_namespace`, `__meta_kubernetes_pod_name`, và mỗi nhãn của pod thành `__meta_kubernetes_pod_label_<tên>` (dấu `-` và `.` trong tên nhãn đổi thành `_`, nên nhãn `rollouts-pod-template-hash` thành `..._rollouts_pod_template_hash`). Nhãn tạm bị bỏ sau khi scrape, trừ khi được chép sang nhãn thật.
+- `relabel_configs` xử lý từng target: luật `action: keep` chỉ giữ pod có nhãn `app=price-api`; ba luật sau chép namespace, tên pod và mã ReplicaSet sang nhãn thật của mọi chuỗi.
+- Prometheus scrape cổng mà container khai trong `containerPort` (8080) ở đường dẫn mặc định `/metrics`.
+
+Prometheus là công cụ nền, lab cài bằng `kubectl apply`. Trong một hệ thống GitOps hoàn chỉnh, nó, Argo Rollouts và chính Argo CD cũng được quản bằng Application, thường là một app-of-apps "nền tảng" do đội platform giữ.
+
+### 2. Đổi Deployment thành Rollout
+
+Một pull request vào repo `deploy`: `base` đổi Deployment thành Rollout kèm AnalysisTemplate; dev và staging bỏ các bước (đổi phiên bản một mạch như rolling update); prod giữ canary và tăng lên 5 replica.
+
+<Callout kind="danger">
+
+Khi pull request này được merge, Argo CD tạo Rollout và xoá Deployment cũ trong cùng một lượt sync ở **cả ba môi trường**: vài giây đó có thể không có pod nào sẵn sàng và request vào cổng 9704 tới 9706 thất bại. Lab chấp nhận; với production, Rollout có trường `workloadRef` để mượn template của Deployment đang chạy và chuyển dần không gián đoạn.
+
+</Callout>
+
+<Terminal where="mac" title="deploy: price-api/base/rollout.yaml, analysis.yaml">
+
+```bash
+cd ~/masteva-d14/deploy && git switch -q -c rollout
+git mv price-api/base/deployment.yaml price-api/base/rollout.yaml
+cat > price-api/base/rollout.yaml <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: price-api
+spec:
+  replicas: 2
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels: { app: price-api }
+  template:
+    metadata:
+      labels: { app: price-api }
+    spec:
+      containers:
+        - name: price-api
+          image: d13-registry:5000/price-api
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: APP_ENV, value: lab }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+          lifecycle:
+            preStop: { sleep: { seconds: 3 } }
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+            limits: { memory: 64Mi }
+  strategy:
+    canary:
+      maxSurge: 1
+      maxUnavailable: 0
+      steps:
+        - setWeight: 20
+        - pause: { duration: 60s }
+        - setWeight: 60
+        - pause: { duration: 30s }
+      analysis:
+        templates: [{ templateName: error-rate }]
+        startingStep: 1
+        args:
+          - name: canary-hash
+            valueFrom: { podTemplateHashValue: Latest }
+EOF
+cat > price-api/base/analysis.yaml <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: error-rate
+spec:
+  args:
+    - name: canary-hash
+  metrics:
+    - name: error-rate
+      initialDelay: 20s
+      interval: 10s
+      failureLimit: 0
+      successCondition: len(result) > 0 && result[0] < 0.05
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc:9090
+          query: |
+            sum(rate(http_requests_total{rollouts_pod_template_hash="{{args.canary-hash}}",code=~"5.."}[1m]))
+            /
+            sum(rate(http_requests_total{rollouts_pod_template_hash="{{args.canary-hash}}"}[1m]))
+EOF
+printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources: [rollout.yaml, analysis.yaml, service.yaml]\n' \
+  > price-api/base/kustomization.yaml
+for e in dev staging prod; do
+  perl -pi -e 's/kind: Deployment/kind: Rollout/' price-api/envs/$e/kustomization.yaml
+done
+for e in dev staging; do
+  perl -0pi -e 's|(value: \w+ \}\n)(  - target: \{ kind: Service)|$1      - { op: remove, path: /spec/strategy/canary/steps }\n      - { op: remove, path: /spec/strategy/canary/analysis }\n$2|' \
+    price-api/envs/$e/kustomization.yaml
+done
+perl -pi -e 's|path: /spec/replicas, value: 3|path: /spec/replicas, value: 5|' price-api/envs/prod/kustomization.yaml
+cat price-api/envs/dev/kustomization.yaml
+kubectl kustomize price-api/envs/prod | grep -E '^kind:|  replicas:|image:|setWeight'
+git add -A && git commit -q -m "Đổi Deployment thành Rollout, canary có phân tích ở prod"
+pr "Đổi Deployment thành Rollout"
+for e in dev staging prod; do wait_app price-api-$e; done
+kubectl -n price-prod get rollout price-api
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: price-dev
+resources: [../../base]
+images:
+  - name: d13-registry:5000/price-api
+    digest: sha256:5664e1c31d285107a0fdc890f935945a082df639409b5f6acc2175df2e7e63d7
+patches:
+  - target: { kind: Rollout, name: price-api }
+    patch: |
+      - { op: replace, path: /spec/replicas, value: 1 }
+      - { op: replace, path: /spec/template/spec/containers/0/env/0/value, value: dev }
+      - { op: remove, path: /spec/strategy/canary/steps }
+      - { op: remove, path: /spec/strategy/canary/analysis }
+  - target: { kind: Service, name: price-api }
+    patch: |
+      - { op: replace, path: /spec/ports/0/nodePort, value: 30704 }
+kind: Service
+kind: AnalysisTemplate
+kind: Rollout
+  replicas: 5
+      - setWeight: 20
+      - setWeight: 60
+        image: d13-registry:5000/price-api@sha256:8e3e5b47b3a30c0ef73c9b9ef2f297682173af655ac6ce91b81e8aedace9ab52
+PR #9: Đổi Deployment thành Rollout
+run 12  verify: success
+binh: APPROVED
+merge PR #9: HTTP 200
+price-api-dev  rev=a3acd6d  sync=Synced  health=Healthy
+price-api-staging  rev=a3acd6d  sync=Synced  health=Healthy
+price-api-prod  rev=a3acd6d  sync=Synced  health=Healthy
+NAME        DESIRED   CURRENT   UP-TO-DATE   AVAILABLE   AGE
+price-api   5         5         5            5           11s
+```
+
+</Expected>
+
+Bốn chi tiết của pull request này:
+
+- **Overlay chỉ đổi `target` của patch.** Bộ biến đổi `images` của Kustomize áp cho mọi object có đường dẫn `spec/template/spec/containers[].image`, kể cả CRD như Rollout, nên dòng `digest:` trong overlay vẫn có tác dụng (dòng `image:` của bản render ở trên có `@sha256:…`). Nhưng có những tham chiếu bên trong Rollout mà Kustomize không biết; khối lệnh kế tiếp cho thấy một ví dụ.
+- `maxSurge: 1`, `maxUnavailable: 0` như rolling update của Deployment (K1.1): mỗi lần đổi số pod, tạo thêm tối đa một pod mới trước, không gỡ pod cũ nào khi pod mới chưa sẵn sàng.
+- Lần đầu tạo, Rollout không có bản ổn định nào để so, nên nó dựng đủ 5 pod ngay, không qua các bước.
+- Như đã cảnh báo trước khối lệnh, Argo CD tạo Rollout và xoá Deployment trong cùng lượt sync.
+
+Chỗ Kustomize không biết là **tên do generator sinh**. `configMapGenerator` (K3.1) gắn hash vào tên ConfigMap và sửa mọi chỗ tham chiếu tới nó, nhưng chỉ ở những đường dẫn Kustomize biết; với Deployment thì có, với Rollout thì không. Thử trong một thư mục nháp:
+
+<Terminal where="mac" title="~/masteva-d14/thu-generator">
+
+```bash
+mkdir -p ~/masteva-d14/thu-generator && cd ~/masteva-d14/thu-generator
+cat > rollout.yaml <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: { name: thu }
+spec:
+  template:
+    spec:
+      containers: [{ name: app, image: busybox:1.38.0 }]
+      volumes: [{ name: config, configMap: { name: cfg } }]
+EOF
+printf 'resources: [rollout.yaml]\nconfigMapGenerator:\n  - name: cfg\n    literals: [discount=10]\n' > kustomization.yaml
+kubectl kustomize . | grep 'name: cfg'
+curl -sL -o rollout-transform.yaml \
+  https://raw.githubusercontent.com/argoproj/argo-rollouts/v1.10.1/docs/features/kustomize/rollout-transform.yaml
+echo "b42855053fbd150cb5c176e77b754cad890fb0bee6c820e0e224c18720379166  rollout-transform.yaml" | shasum -a 256 -c \
+  && printf 'resources: [rollout.yaml]\nconfigurations: [rollout-transform.yaml]\nconfigMapGenerator:\n  - name: cfg\n    literals: [discount=10]\n' > kustomization.yaml \
+  && kubectl kustomize . | grep 'name: cfg'
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  name: cfg-2cct56g4hm
+          name: cfg
+rollout-transform.yaml: OK
+  name: cfg-2cct56g4hm
+          name: cfg-2cct56g4hm
+```
+
+</Expected>
+
+Trong mỗi lần render, dòng thụt ít (`name: cfg-…`) là tên của ConfigMap được sinh ra, dòng thụt sâu là tham chiếu bên trong Rollout. `shasum -c` kiểm file cấu hình tải về đúng bản dự án phát hành trước khi dùng nó. Không có cấu hình, ConfigMap mang tên có hash nhưng Rollout vẫn trỏ tới `cfg`, một ConfigMap không tồn tại: pod của Rollout sẽ kẹt ở `ContainerCreating`, và lúc render không có lỗi nào. File `rollout-transform.yaml` do dự án Argo Rollouts phát hành khai cho Kustomize các đường dẫn tham chiếu bên trong Rollout; thêm nó vào `configurations` thì tên được sửa đúng. File phải nằm trong thư mục của kustomization dùng nó (Kustomize không cho đọc file cấu hình ngoài thư mục đó), và nên được ghim theo phiên bản như lab. Rollout của lab không dùng generator nên chưa cần file này.
+
+<Check id="d14.3.lab-convert">Đổi được Deployment thành Rollout qua một pull request, và tái hiện được bẫy tên do `configMapGenerator` sinh không được cập nhật trong Rollout cùng cách sửa bằng cấu hình của Argo Rollouts.</Check>
+
+### 3. Một bản tốt đi hết các bước
+
+Thêm ba hàm: `load` gọi `/price` khoảng 20 lần mỗi giây và ghi mã HTTP cùng mã ReplicaSet đã trả lời (lấy từ tên pod); `share` tính trong mỗi khoảng 15 giây, phần trăm request do bản mới trả lời; `watch_rollout` in mỗi lần Rollout hay Application đổi trạng thái.
+
+<Terminal where="mac" title="Hàm đo">
+
+```bash
+cd ~/masteva-d14
+cat >> lab.sh <<'EOF'
+load() {   # load <cổng> <số request>: mỗi dòng "giây mã_HTTP mã_ReplicaSet"
+  local i out t0; t0=$(date +%s)
+  for i in $(seq 1 $2); do
+    out=$(curl -s -m 2 -w ' %{http_code}' "localhost:$1/price" | tr -d '\n')
+    echo "$(( $(date +%s) - t0 )) ${out##* } $(echo "$out" | sed -n 's/.*"host":"price-api-\([a-z0-9]*\)-.*/\1/p')"
+    sleep 0.03
+  done
+}
+share() {  # share <file> <mã ReplicaSet mới>: phần trăm request do bản mới trả lời, theo từng 15 giây
+  awk -v c="$2" '{b = int($1 / 15) * 15; n[b]++; if ($3 == c) k[b]++; if ($2 != 200) e[b]++}
+    END {for (b in n) printf "%3d-%3ds  %4d request  bản mới %3d%%  lỗi %d\n", b, b + 14, n[b], k[b] * 100 / n[b], e[b]}' "$1" | sort -n
+}
+watch_rollout() {  # watch_rollout <môi trường>: in mỗi lần đổi trạng thái, tới khi Rollout xong hoặc bị huỷ
+  local t0 prev cur started=0; t0=$(date +%s)
+  for i in $(seq 1 200); do
+    cur="rollout=$(kubectl -n price-$1 get rollout price-api -o json | jq -r \
+      '"\(.status.phase) bước=\(.status.currentStepIndex) pod_mới=\(.status.updatedReplicas // 0)/\(.spec.replicas)"') | argocd=$(kubectl -n argocd get application price-api-$1 -o json | jq -r '"\(.status.sync.status) \(.status.health.status)"')"
+    if [ "$cur" != "$prev" ]; then echo "$(( $(date +%s) - t0 ))s  $cur"; prev=$cur; fi
+    case "$cur" in rollout=Paused*|rollout=Progressing*) started=1 ;; esac
+    if [ $started = 1 ]; then case "$cur" in "rollout=Healthy"*"Synced Healthy"|"rollout=Degraded"*"Synced Degraded") return 0 ;; esac; fi
+    sleep 2
+  done
+}
+EOF
+. ./lab.sh
+```
+
+</Terminal>
+
+Thăng cấp bản build mới nhất của dev lên staging rồi prod, trong lúc `load` bắn vào prod. Khối này chạy khoảng ba phút: `load … &` chạy nền, `watch_rollout` in từng thay đổi trạng thái, và `wait` chờ `load` bắn xong rồi mới in bảng `share`.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/deploy
+./promote.sh dev staging && wait_run deploy && merge_pr $(newest_pr) && wait_app price-api-staging
+load 9706 3200 > ../good.txt &
+./promote.sh staging prod && wait_run deploy && merge_pr $(newest_pr)
+watch_rollout prod
+wait
+NEW=$(kubectl -n price-prod get rollout price-api -o jsonpath='{.status.currentPodHash}')
+share ../good.txt $NEW
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PR #10: staging: price-api sha256:5664e1c31d28 (từ dev)
+run 13  verify: success
+binh: APPROVED
+merge PR #10: HTTP 200
+price-api-staging  rev=e1a703a  sync=Synced  health=Healthy
+PR #11: prod: price-api sha256:5664e1c31d28 (từ staging)
+run 14  verify: success
+binh: APPROVED
+merge PR #11: HTTP 200
+0s  rollout=Healthy bước=4 pod_mới=5/5 | argocd=Synced Healthy
+2s  rollout=Progressing bước=0 pod_mới=1/5 | argocd=Synced Progressing
+4s  rollout=Paused bước=1 pod_mới=1/5 | argocd=Synced Suspended
+64s  rollout=Progressing bước=2 pod_mới=2/5 | argocd=Synced Progressing
+66s  rollout=Paused bước=3 pod_mới=3/5 | argocd=Synced Suspended
+96s  rollout=Progressing bước=4 pod_mới=4/5 | argocd=Synced Progressing
+98s  rollout=Progressing bước=4 pod_mới=5/5 | argocd=Synced Progressing
+100s  rollout=Healthy bước=4 pod_mới=5/5 | argocd=Synced Healthy
+  0- 14s   281 request  bản mới   9%  lỗi 0
+ 15- 29s   253 request  bản mới  18%  lỗi 0
+ 30- 44s   268 request  bản mới  20%  lỗi 0
+ 45- 59s   295 request  bản mới  21%  lỗi 0
+ 60- 74s   288 request  bản mới  29%  lỗi 0
+ 75- 89s   295 request  bản mới  63%  lỗi 0
+ 90-104s   299 request  bản mới  62%  lỗi 0
+105-119s   296 request  bản mới 100%  lỗi 0
+120-134s   291 request  bản mới 100%  lỗi 0
+135-149s   300 request  bản mới 100%  lỗi 0
+150-164s   295 request  bản mới 100%  lỗi 0
+165-179s    39 request  bản mới 100%  lỗi 0
+```
+
+</Expected>
+
+Số giây và phần trăm trên máy bạn sẽ lệch một chút. Dòng đầu (`0s rollout=Healthy bước=4`) là trạng thái cũ, trước khi Argo CD áp commit mới; các bước đánh số từ 0, nên `bước=4` nghĩa là đã qua cả bốn bước. Hai nửa của output kể cùng một chuyện từ hai phía:
+
+- **Phía controller:** dừng ở bước 1 (1 trên 5 pod là bản mới) suốt 60 giây, tăng lên 3 trên 5, dừng 30 giây, rồi thay hết. Trong lúc dừng, Argo CD báo `Suspended`; xuyên suốt, nó báo `Synced`.
+- **Phía người dùng:** phần trăm request do bản mới trả lời đi từ 0 lên khoảng 20%, khoảng 60%, rồi 100%, không một request lỗi. Những con số lửng (như 9% hay 29% ở output mẫu) là các khoảng 15 giây rơi vào giữa hai bước; số request mỗi khoảng cũng dao động theo độ bận của máy.
+
+Phân tích nền chạy suốt hai bước dừng và đạt ở mọi lần đo. Xem lại:
+
+<Terminal where="mac">
+
+```bash
+rollouts get rollout price-api -n price-prod --no-color | sed -n '1,9p'
+kubectl -n price-prod get analysisrun --sort-by=.metadata.creationTimestamp -o json | jq -r \
+  '.items[-1] | "\(.metadata.name)  \(.status.phase)  \([.status.metricResults[0].measurements[].value] | join(" "))"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Name:            price-api
+Namespace:       price-prod
+Status:          ✔ Healthy
+Strategy:        Canary
+  Step:          4/4
+  SetWeight:     100
+  ActualWeight:  100
+Images:          d13-registry:5000/price-api@sha256:5664e1c31d285107a0fdc890f935945a082df639409b5f6acc2175df2e7e63d7 (stable)
+Replicas:
+price-api-54dd688df7-2  Successful  [0] [0] [0] [0] [0] [0] [0] [0]
+```
+
+</Expected>
+
+Mỗi `[0]` là một lần đo: tỉ lệ lỗi của riêng các pod bản mới bằng 0. Khi Rollout xong, AnalysisRun được kết thúc và đánh dấu `Successful`.
+
+<Check id="d14.3.lab-good">Thăng cấp được một bản lên prod dưới dạng canary, theo dõi được các bước từ phía controller, Argo CD và người dùng, và đọc được kết quả từng lần đo của AnalysisRun.</Check>
+
+### 4. Một bản lỗi tự bị lui
+
+Giả lập bản phát hành có lỗi bằng công tắc `FAIL_EVERY=3` như D6.3 (cứ 3 request thì một request lỗi), để so được hai cách. Công tắc nằm trong overlay của prod, nên đổi nó cũng là đổi pod template và đi qua đúng các bước canary.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/deploy && git switch -q -c prod/fail
+perl -0pi -e 's|(value: prod \}\n)|$1      - { op: add, path: /spec/template/spec/containers/0/env/-, value: { name: FAIL_EVERY, value: "3" } }\n|' \
+  price-api/envs/prod/kustomization.yaml
+git commit -q -am "prod: bản có lỗi (FAIL_EVERY=3)"
+load 9706 1600 > ../bad.txt &
+pr "prod: bản có lỗi"
+watch_rollout prod
+wait
+NEW=$(kubectl -n price-prod get analysisrun --sort-by=.metadata.creationTimestamp -o json | jq -r '.items[-1].spec.args[0].value')
+share ../bad.txt $NEW
+awk '$2 != 200 {n++; if (!f) f = $1; l = $1} END {printf "%d request lỗi trên %d, trong khoảng giây %d tới %d\n", n, NR, f, l}' ../bad.txt
+kubectl -n price-prod get analysisrun --sort-by=.metadata.creationTimestamp -o json | jq -r \
+  '.items[-1] | "\(.status.phase): \(.status.message)  đo được \([.status.metricResults[0].measurements[].value] | join(" "))"'
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Predict question="Canary nhận khoảng 20% lưu lượng, và cứ 3 request vào nó thì 1 request lỗi. Phân tích chờ 20 giây rồi mới đo lần đầu, failureLimit là 0. Đoán số request lỗi người dùng thấy, trên khoảng 1.600 request bắn trong 80 giây.">
+
+```text
+PR #12: prod: bản có lỗi
+run 15  verify: success
+binh: APPROVED
+merge PR #12: HTTP 200
+0s  rollout=Healthy bước=4 pod_mới=5/5 | argocd=Synced Healthy
+2s  rollout=Progressing bước=0 pod_mới=1/5 | argocd=Synced Progressing
+4s  rollout=Paused bước=1 pod_mới=1/5 | argocd=Synced Suspended
+23s  rollout=Degraded bước=0 pod_mới=1/5 | argocd=Synced Suspended
+25s  rollout=Degraded bước=0 pod_mới=0/5 | argocd=Synced Degraded
+  0- 14s   271 request  bản mới   4%  lỗi 3
+ 15- 29s   291 request  bản mới  21%  lỗi 21
+ 30- 44s   290 request  bản mới   1%  lỗi 1
+ 45- 59s   296 request  bản mới   0%  lỗi 0
+ 60- 74s   307 request  bản mới   0%  lỗi 0
+ 75- 89s   145 request  bản mới   0%  lỗi 0
+25 request lỗi trên 1600, trong khoảng giây 11 tới 30
+Failed: Metric "error-rate" assessed Failed due to failed (1) > failureLimit (0)  đo được [0.3338420725747822]
+```
+
+Khoảng 15 đến 35 request. Con số trên máy bạn phụ thuộc tốc độ thật của `load` (máy bận thì chỉ được khoảng 10 request mỗi giây, ít request lỗi hơn) và lúc `load` bắt đầu so với lúc pod canary nhận request. Tất cả nằm trong một cửa sổ khoảng 20 giây. Phép tính ước lượng: 20 request mỗi giây × 20% vào canary × 1/3 lỗi × khoảng 20 giây tới lần đo đầu ≈ 27. Canary đo được tỉ lệ lỗi 0,33 ngay lần đầu, vượt 5%, `failureLimit` là 0 nên thua luôn; Rollout huỷ, đưa pod canary về 0, và từ giây kế tiếp không còn request lỗi nào. Không ai bấm gì.
+
+</Predict>
+
+Đặt cạnh D6.3, nơi cùng bản lỗi được thử bằng tay:
+
+| | D6.3 làm tay | Bài này |
+|---|---|---|
+| Lưu lượng vào bản lỗi | 10% | Khoảng 20% (1 trên 5 pod) |
+| Ai quyết định lui | Người chạy `judge` sau khi bắn xong 300 request | AnalysisRun, sau lần đo đầu |
+| Thời gian phát hiện | Bằng thời gian người đó phản ứng | Lần đo đầu chạy ngay khi hết `initialDelay` (20 giây): Rollout bị huỷ khoảng 20 tới 25 giây sau khi canary có pod |
+| Request lỗi | 10 trên 300 trong lab; ngoài đời tăng theo từng phút chờ người | Khoảng 15 tới 35, rồi dừng hẳn |
+
+Số request lỗi xấp xỉ **lưu lượng × trọng số canary × tỉ lệ lỗi của bản mới × thời gian phát hiện**. Lưu lượng và tỉ lệ lỗi bạn không chọn được. Trọng số (`setWeight`) và thời gian phát hiện (`initialDelay`, `interval`) thì có: trọng số nhỏ hơn thì ít người dùng gặp lỗi hơn nhưng canary cần lâu hơn mới đủ mẫu; `initialDelay` ngắn hơn và `interval` dày hơn thì phát hiện sớm hơn, nhưng đo trên quá ít request thì dễ huỷ nhầm một bản tốt. Ở 20 request mỗi giây, 20 giây cho canary khoảng 80 request, đủ để thấy 33% lỗi; không đủ để phân biệt 0,1% với 1% (D6.3 đã bàn chuyện cỡ mẫu).
+
+<Check id="d14.3.lab-abort">Tái hiện được một bản lỗi bị Rollout tự huỷ nhờ phân tích nền, đếm được số request lỗi người dùng thấy, và giải thích được con số đó bằng bốn đại lượng.</Check>
+
+### 5. Cụm đã lui, Git thì chưa
+
+Trước khi sửa gì, đọc trạng thái mà Argo CD và Rollout đang báo, và kiểm xem Git có còn chứa bản lỗi không (dòng `grep -c` in số dòng có `FAIL_EVERY`). Sau đó revert pull request lỗi qua đúng quy trình.
+
+<Terminal where="mac">
+
+```bash
+app_status price-api-prod
+kubectl -n price-prod get rollout price-api -o jsonpath='{.status.message}{"\n"}'
+grep -c FAIL_EVERY deploy/price-api/envs/prod/kustomization.yaml
+cd ~/masteva-d14/deploy && git switch -q -c prod/revert-fail && git revert --no-edit HEAD >/dev/null
+pr "Lui: prod bỏ bản có lỗi"
+wait_app price-api-prod && kubectl -n price-prod get rollout price-api -o jsonpath='{.status.phase}{"\n"}'
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+price-api-prod  rev=0b3542d  sync=Synced  health=Degraded
+RolloutAborted: Rollout aborted update to revision 3: Background analysis phase error/failed: Metric "error-rate" assessed Failed due to failed (1) > failureLimit (0)
+1
+PR #13: Lui: prod bỏ bản có lỗi
+run 16  verify: success
+binh: APPROVED
+merge PR #13: HTTP 200
+price-api-prod  rev=1dea0cf  sync=Synced  health=Healthy
+Healthy
+```
+
+</Expected>
+
+`Synced` cộng `Degraded`: cụm khớp Git (spec của Rollout đúng là bản có `FAIL_EVERY`), chỉ là controller đã từ chối đưa nó lên. Commit revert đưa spec về đúng pod template của bản ổn định, và Rollout nhận ra mình đã ở đó: không tạo canary nào, chuyển ngay sang `Healthy`. Đây là phần việc còn lại cho con người sau mỗi lần huỷ tự động, và nên nằm trong runbook: huỷ là đường lui của cụm, revert là đường lui của Git.
+
+### 6. Canary không có lưu lượng
+
+Lần này không bắn tải. Đổi một thứ vô hại ở prod: tăng giới hạn bộ nhớ.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/deploy && git switch -q -c prod/mem
+perl -pi -e 's|(value: prod \})|$1\n      - { op: replace, path: /spec/template/spec/containers/0/resources/limits/memory, value: 96Mi }|' \
+  price-api/envs/prod/kustomization.yaml
+git commit -q -am "prod: memory limit 96Mi"
+pr "prod: memory limit 96Mi"
+watch_rollout prod
+kubectl -n price-prod get analysisrun --sort-by=.metadata.creationTimestamp -o json | jq -r \
+  '.items[-1] | "\(.status.phase): đo được \([.status.metricResults[0].measurements[].value] | join(" "))"'
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Predict question="Bản mới chỉ đổi giới hạn bộ nhớ, hoàn toàn không có lỗi. Nhưng không có request nào gọi vào prod. Rollout đi hết các bước hay bị huỷ?">
+
+```text
+PR #14: prod: memory limit 96Mi
+run 17  verify: success
+binh: APPROVED
+merge PR #14: HTTP 200
+1s  rollout=Healthy bước=4 pod_mới=5/5 | argocd=Synced Healthy
+3s  rollout=Healthy bước=4 pod_mới=5/5 | argocd=OutOfSync Healthy
+5s  rollout=Paused bước=1 pod_mới=1/5 | argocd=Synced Suspended
+26s  rollout=Degraded bước=0 pod_mới=0/5 | argocd=Synced Degraded
+Failed: đo được [NaN]
+```
+
+Bị huỷ. Không có request thì tỉ lệ lỗi là 0 chia 0, Prometheus trả `NaN`, và `len(result) > 0 && result[0] < 0.05` không đúng. Một bản tốt bị chặn oan, và đó là lựa chọn có chủ đích: phép đo không chứng minh được gì thì không được coi là đã chứng minh bản mới tốt. Bước canary của Google năm 2016 kết luận đúng mà vẫn không chặn được; ở đây, ngay cả khi không có kết luận, cánh cửa vẫn đóng.
+
+</Predict>
+
+Ngoài đời, canary thiếu lưu lượng xảy ra ở service ít người dùng, lúc nửa đêm, hay ở một vùng nhỏ. Cách xử lý đúng là tạo đủ lưu lượng (một job gọi thử đều đặn, hoặc giữ canary lâu hơn), không phải nới điều kiện. Lab đã chứng minh xong; đưa bản này lên bằng cách bắn tải và cho Rollout thử lại, lệnh `retry` của plugin chạy lại từ đầu với cùng spec:
+
+<Terminal where="mac">
+
+```bash
+load 9706 2600 > /dev/null &
+rollouts retry rollout price-api -n price-prod
+watch_rollout prod
+wait
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+rollout 'price-api' retried
+0s  rollout=Progressing bước=0 pod_mới=1/5 | argocd=Synced Progressing
+2s  rollout=Paused bước=1 pod_mới=1/5 | argocd=Synced Suspended
+61s  rollout=Progressing bước=2 pod_mới=2/5 | argocd=Synced Progressing
+63s  rollout=Progressing bước=3 pod_mới=3/5 | argocd=Synced Progressing
+66s  rollout=Paused bước=3 pod_mới=3/5 | argocd=Synced Suspended
+93s  rollout=Progressing bước=4 pod_mới=4/5 | argocd=Synced Progressing
+95s  rollout=Healthy bước=4 pod_mới=5/5 | argocd=Synced Healthy
+```
+
+</Expected>
+
+`retry` là một thao tác trên cụm, không phải trên Git, và hợp lệ ở đây vì Git đã đúng: nó chỉ yêu cầu controller thử lại chính spec đang có trong Git.
+
+<Check id="d14.3.lab-nodata">Tái hiện được việc canary không có lưu lượng bị huỷ, giải thích được vì sao đó là hành vi đúng, và đưa được bản đó lên bằng cách tạo lưu lượng rồi thử lại.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Pod của Rollout kẹt ở `ContainerCreating` với `configmap "…" not found`:** Rollout tham chiếu một ConfigMap do generator sinh mà thiếu `rollout-transform.yaml` trong `configurations`, như khối thử ở bước 2. So `kubectl kustomize <thư mục> | grep 'name: '`.
+- **`wait_run` chờ hết hạn rồi in `verify: null`:** runner không chạy. `docker ps --filter name=d13-runner` không có dòng nào nghĩa là runner đã thoát, thường vì được bật trước Gitea; chạy `docker start d13-runner`.
+- **AnalysisRun `Error` với `connection refused` hoặc `no such host`:** Prometheus chưa chạy hoặc sai địa chỉ. Kiểm `kubectl -n monitoring get pods` và địa chỉ `prometheus.monitoring.svc:9090` trong `analysis.yaml`.
+- **Bản tốt ở bước 3 vẫn bị huỷ với `[NaN]`:** `load` chưa kịp chạy hoặc chạy vào sai cổng. Kiểm `head -3 ../good.txt`, rồi `rollouts retry rollout price-api -n price-prod` trong lúc có tải.
+- **`rollouts` báo `connection refused` tới `127.0.0.1`:** file `kubeconfig-internal` là kubeconfig thường. Tạo lại bằng `kind get kubeconfig --internal --name d13-lab`.
+- **`watch_rollout` không in gì thêm sau dòng đầu:** Argo CD chưa nhận commit. Xem `app_status price-api-prod` và webhook như D13.1.
+- **Dòng `[1] + done load …` xen vào output:** đó là thông báo của shell khi job nền kết thúc, không phải lỗi.
+
+</Callout>
+
+### Dọn dẹp
+
+D13.4 dùng tiếp Prometheus, Argo Rollouts và mọi thứ của các bài trước. Nếu nghỉ, dừng container như cuối D13.2. Khối xoá hẳn của chặng nằm cuối D13.1, thêm `docker rm -f d13-runner` và `docker volume rm d13-runner-data`.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nên đo những metric nào trong phân tích canary?">
+
+Bắt đầu từ triệu chứng người dùng thấy (D12.4): tỉ lệ lỗi và độ trễ của riêng canary. Thêm metric nghiệp vụ nếu có (tỉ lệ thanh toán thành công), vì một bản trả 200 với giá sai thì không metric HTTP nào thấy. So canary với bản ổn định **cùng lúc** thay vì với một ngưỡng tuyệt đối khi lưu lượng dao động mạnh: một truy vấn chia tỉ lệ lỗi của canary cho của stable bắt được bản mới tệ hơn 2 lần ngay cả lúc cả hệ thống đang có lỗi nền. Mỗi metric thêm vào là một cơ hội huỷ nhầm; `dryRun` cho phép chạy thử một metric mới vài tuần, ghi kết quả mà không ảnh hưởng quyết định, trước khi cho nó quyền huỷ.
+
+</Reveal>
+
+<Reveal title="Canary có bắt được lỗi chỉ lộ ra sau vài giờ không?">
+
+Không, nếu canary chỉ kéo dài hai phút như lab. Rò bộ nhớ, cache hết hạn, job theo giờ, chứng chỉ sắp hết hạn: các lỗi này cần thời gian nằm. Hai cách bổ sung: kéo dài bước dừng ở trọng số nhỏ (một giờ ở 5% rẻ hơn nhiều so với một giờ ở 100%), và thời gian nằm giữa các môi trường hay các cell (bake time, D13.4). Phân tích nền có `count: 0` chạy tới hết Rollout, nhưng khi Rollout xong thì nó dừng; giám sát sau đó là việc của alert (D12.4) và SLO (D16).
+
+</Reveal>
+
+<Reveal title="Migration database thì canary giúp được gì?">
+
+Rất ít. Canary chia **request**, không chia **dữ liệu**: migration chạy một lần trên database dùng chung, trước hay cùng lúc với pod canary đầu tiên, và lúc đó 100% dữ liệu đã đổi dạng. Đó là lý do D6.4 đòi mọi migration phải tương thích với cả bản cũ lẫn bản mới: khi canary bị huỷ, 80% pod ổn định vẫn đang đọc ghi trên schema mới. Rollout có thể chạy migration bằng một bước `analysis` với provider Job, nhưng nó không biến migration thành thứ lui được. D13.5 quay lại câu hỏi này dưới tên rollback hai chiều.
+
+</Reveal>
+
+<Reveal title="Vì sao không đặt failureLimit cao hơn cho chắc?">
+
+`failureLimit: 3` nghĩa là chịu ba lần đo xấu trước khi huỷ: với `interval` 10 giây, bản lỗi được phục vụ thêm khoảng 30 giây, và số request lỗi gần gấp đôi. Đổi lại, một lần tăng vọt ngẫu nhiên (một pod vừa khởi động chậm) không làm huỷ một bản tốt. Cách cân bằng hay dùng: giữ `failureLimit` thấp cho metric lỗi rõ ràng (5xx), dùng `consecutiveSuccessLimit` hoặc cửa sổ `rate` dài hơn để làm mượt, và cho metric nhiễu (độ trễ p99) một ngưỡng rộng hơn. Đo trên chính lịch sử của service: chạy phân tích ở chế độ `dryRun` trên các lần phát hành tốt để biết nó báo động nhầm bao nhiêu lần.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết AnalysisTemplate cho một metric cụ thể, chuyển một Deployment sang Rollout, hay ước lượng số request lỗi tối đa của một cấu hình canary là cách dùng tốt. AI hay sai ở chỗ: viết truy vấn tính tỉ lệ lỗi của cả service thay vì của riêng canary; viết điều kiện coi `NaN` hoặc kết quả rỗng là đạt; dùng `configMapGenerator` cho Rollout mà không thêm `rollout-transform.yaml`, hoặc ngược lại khẳng định Kustomize không ghim được digest cho Rollout; dùng `setWeight: 5` với 3 replica rồi tin là có 5% lưu lượng; và khuyên `kubectl argo rollouts promote` hay `undo` như thể Git không tồn tại. Kiểm lại như lab: bắn tải vào một bản cố tình lỗi, đếm request lỗi, và thử một lần không có tải để xem cổng kiểm đóng hay mở.
+
+</Callout>
+
+<Callout kind="link">
+
+D13.4 dùng cùng ý "đo rồi mới đi tiếp" cho nhiều cell và cho cấu hình, bằng sync wave và hook của Argo CD. D16 thay ngưỡng 5% cố định bằng error budget và burn rate. K11 (service mesh) cho trọng số chính xác và định tuyến theo header mà không cần đổi số pod. D12.3 là nền của mọi truy vấn trong bài: `rate`, chia hai vector, và vì sao 0 chia 0 ra `NaN`.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d14.3.mastery-design">Thiết kế được một Rollout canary cho một service cụ thể: số bước, trọng số, thời gian dừng, metric và điều kiện đạt, có tính tới lưu lượng thật và số request lỗi tối đa chấp nhận được.</Check>
+
+<Check id="d14.3.mastery-operate">Vận hành được một lần Rollout bị huỷ: đọc lý do trong AnalysisRun, sửa Git cho khớp, và quyết định khi nào dùng `retry`.</Check>
+
+<Check id="d14.3.mastery-choose">Nêu được tiêu chí chọn giữa canary chia theo số pod, canary có bộ định tuyến và blue-green cho một hệ thống cụ thể, cùng cái giá của từng lựa chọn (bài chỉ chạy lab với kiểu đầu).</Check>
+
+</Mastery>

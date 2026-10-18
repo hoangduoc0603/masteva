@@ -1,0 +1,918 @@
+---
+title: "Tự viết operator với Kubebuilder: API có kiểu, marker, envtest"
+description: Kubebuilder sinh khung cho một operator Go, biến marker trong code thành CRD và RBAC, và cho test với API server thật bằng envtest. Lab viết lại controller WebApp của K9.2 thành một operator có kiểu, thêm chuẩn bảo mật và PodDisruptionBudget cho ứng dụng prod, viết test, rồi tự gây và đo một vòng lặp reconcile vô tận.
+id: k9.3
+step: k9
+prerequisites: [k9.2]
+topics: [k9.viet-operator]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    go: 1.27.1
+    kubebuilder: 4.16.0
+    controller-runtime: 0.25.2
+    controller-tools: 0.22.0
+    envtest: 1.37.0
+    podinfo: 6.15.0
+---
+
+<Goal>
+
+K9.2 viết controller bằng tay: đọc `WebApp` như một map, tự viết CRD bằng YAML. Một operator thật cần kiểu Go cho API, CRD và RBAC sinh từ code để không lệch nhau, và test chạy được trong CI. Bài này dùng **Kubebuilder** cho cả ba. Học xong, bạn:
+
+- Đọc được cấu trúc một dự án Kubebuilder và biết file nào của mình, file nào được sinh.
+- Viết được API bằng struct Go với marker, sinh ra đúng CRD đã thiết kế tay ở K9.1.
+- Viết được test chạy với kube-apiserver và etcd thật bằng envtest, và biết envtest **không** kiểm được gì.
+- Giải thích được vì sao thêm một trường "cho dễ debug" vào status làm operator gọi API server hàng trăm lần mỗi giây, và đo được điều đó.
+
+</Goal>
+
+<Knowledge>
+
+### Kubebuilder, controller-runtime, Operator SDK
+
+| Công cụ | Là gì | Bài dùng bản |
+|---|---|---|
+| controller-runtime | Thư viện Go: manager, cache, workqueue, client (K9.2) | 0.25.2 |
+| controller-tools (`controller-gen`) | Đọc marker trong code, sinh CRD, RBAC, webhook config và hàm DeepCopy | 0.22.0 |
+| Kubebuilder | CLI sinh khung dự án, Makefile và cấu hình Kustomize để đóng gói | 4.16.0 (ứng với Kubernetes 1.37) |
+| envtest | Chạy kube-apiserver và etcd thật trên máy để test | 1.37.0 |
+| Operator SDK | CLI của dự án Operator Framework. Phần Go dùng chính plugin của Kubebuilder, thêm operator viết bằng Helm hoặc Ansible và công cụ đóng gói cho OLM (K9.5) | 1.42.3, không dùng trong bài |
+
+Với operator Go, chọn Kubebuilder hay Operator SDK không đổi code bạn viết. Chọn Operator SDK khi cần phát hành qua OLM hoặc muốn viết operator bằng Helm chart sẵn có.
+
+### Dự án Kubebuilder: phần của bạn và phần được sinh
+
+```text
+webapp-operator/
+  api/v1/webapp_types.go          CỦA BẠN: struct Go + marker  ──┐
+  api/v1/zz_generated.deepcopy.go SINH (make generate)          <─┤ controller-gen
+  internal/controller/                                            │ đọc marker
+    webapp_controller.go          CỦA BẠN: Reconcile + marker RBAC┤
+    webapp_controller_test.go     CỦA BẠN: test với envtest       │
+  config/crd/bases/*.yaml         SINH (make manifests)         <─┤
+  config/rbac/role.yaml           SINH (make manifests)         <─┘
+  config/default, manager, ...    Kustomize: đóng gói thành Deployment trong cụm (K9.4)
+  cmd/main.go                     khung: manager, metrics, leader election, probe
+  Makefile                        manifests, generate, test, run, docker-build, deploy
+```
+
+Quy tắc duy nhất: **không sửa tay file sinh ra**. CRD thiếu một luật thì thêm marker rồi `make manifests`; sửa tay YAML sẽ mất ở lần sinh sau, và quan trọng hơn, CRD lệch khỏi kiểu Go mà controller đang dùng.
+
+### Marker: CRD và RBAC sống cạnh code
+
+Marker là comment bắt đầu bằng `// +`. Bảng đối chiếu với CRD tay của K9.1:
+
+| Trong CRD K9.1 | Marker |
+|---|---|
+| `minimum: 0`, `maximum: 10`, `default: 1` | `+kubebuilder:validation:Minimum=0`, `…:Maximum=10`, `+kubebuilder:default=1` |
+| `enum: [dev, prod]` | `+kubebuilder:validation:Enum=dev;prod` |
+| `x-kubernetes-validations` | `+kubebuilder:validation:XValidation:rule="…",message="…"` |
+| `subresources.status`, `scale` | `+kubebuilder:subresource:status`, `+kubebuilder:subresource:scale:specpath=…` |
+| `additionalPrinterColumns` | `+kubebuilder:printcolumn:name="Image",type=string,JSONPath=…` |
+| `x-kubernetes-list-type: map` | `+listType=map`, `+listMapKey=type` |
+| (RBAC, K9.2 chạy bằng admin nên chưa cần) | `+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch` |
+
+Marker RBAC đặt cạnh hàm Reconcile để người sửa code thấy ngay quyền nào đang được xin. Operator trong bài **không xin quyền `delete`** với Deployment, Service: nó không bao giờ xoá chúng, garbage collector làm việc đó (K9.2). Quyền nhỏ nhất là quyền đủ cho code, không hơn; K9.4 thấy điều gì xảy ra khi thiếu, K9.5 thấy điều gì xảy ra khi thừa.
+
+Một chi tiết của kiểu Go: trường có `omitempty` mà bị bỏ trống thì không được gửi, API server điền `default`. Trường **không** có `omitempty`, như `replicas`, luôn được gửi, kể cả giá trị 0; client Go tạo `WebApp` mà quên đặt `Replicas` sẽ có 0 bản sao chứ không phải 1. Bài giữ `replicas` không `omitempty` vì 0 là giá trị hợp lệ (tắt ứng dụng). Ở bước 2 bạn còn gặp tag `omitzero` (có từ Go 1.24) trên `metadata` và `status`: nó bỏ trường khi trường bằng giá trị rỗng của kiểu, dùng được cả cho struct, chỗ `omitempty` không có tác dụng.
+
+<Check id="k9.3.kubebuilder">Chỉ ra được trong dự án Kubebuilder file nào tự viết, file nào sinh bởi `make manifests` và `make generate`, và viết được marker tương ứng với một ràng buộc CRD hay một quyền RBAC.</Check>
+
+### envtest: API server thật, không có gì khác
+
+envtest chạy hai tiến trình thật trên máy: `kube-apiserver` và `etcd`, cài CRD của bạn vào, rồi đưa cho test một client. Không có kubelet, không có `kube-controller-manager`, không có scheduler.
+
+| Kiểm được | Không kiểm được |
+|---|---|
+| Schema, mặc định và luật CEL của CRD: API server thật từ chối object sai | Pod chạy: không có kubelet, Deployment không bao giờ có pod sẵn sàng |
+| Reconcile tạo đúng object con, đúng owner reference, đúng trường | Garbage collection: không có `kube-controller-manager`, xoá chủ thì con vẫn nằm đó |
+| Server-side apply, conflict, subresource status | RBAC của operator: client của test có quyền admin, thiếu quyền vẫn xanh |
+| Webhook của operator (K9.4) | Hành vi trên cụm thật: mạng, image, nâng cấp |
+
+Vì vậy dự án Kubebuilder có hai tầng test: `make test` (envtest, nhanh, chạy ở mọi commit) và `make test-e2e` (dựng một cụm kind, triển khai operator thật). Bài này dùng tầng đầu; ở K9.4 bạn làm bằng tay việc của tầng thứ hai.
+
+`setup-envtest` tải binary của đúng phiên bản Kubernetes vào `bin/` của dự án và kiểm hash với danh mục phát hành của dự án controller-tools trước khi dùng.
+
+<Check id="k9.3.envtest">Kể được envtest chạy những gì, và ba thứ mà test xanh trên envtest không chứng minh được.</Check>
+
+### Lỗi hay gặp: vòng lặp reconcile vô tận
+
+Reconcile của K9.2 ghi status mỗi lần chạy. Lần ghi đó là một sự kiện trên chính object đang watch, nên ngay sau đó Reconcile chạy thêm một lần. Vòng lặp tự dừng nhờ một điều kiện: lần thứ hai tính ra **đúng** status cũ, API server thấy không có gì đổi, không có sự kiện mới.
+
+```text
+ Reconcile #1 -> ghi status {ready: 2}        -> sự kiện -> Reconcile #2
+ Reconcile #2 -> ghi status {ready: 2}        -> không đổi, không sự kiện -> dừng
+
+ Thêm status.lastReconcileTime = now():
+ Reconcile #1 -> ghi {ready: 2, t: 10:00:00.001} -> sự kiện -> Reconcile #2
+ Reconcile #2 -> ghi {ready: 2, t: 10:00:00.009} -> sự kiện -> Reconcile #3 -> ... mãi mãi
+```
+
+Mọi thứ đổi mỗi lần gọi mà không phản ánh thực tế đều phá điều kiện dừng: thời điểm, bộ đếm, danh sách lấy từ map không sắp xếp, `lastTransitionTime` đặt lại mỗi lần thay vì chỉ khi condition đổi trạng thái (hàm `meta.SetStatusCondition` lo việc này). Hai controller cùng sửa một trường theo hai cách (K9.2) cũng vậy. Vòng lặp không làm sai dữ liệu, nên không test nào đỏ; nó chỉ âm thầm biến operator thành nguồn tải lớn nhất của API server và etcd. Cách phát hiện duy nhất là **đo**: `controller_runtime_reconcile_total` phải đứng yên khi không ai sửa gì.
+
+Hai lỗi hay gặp khác của operator viết mới: thiếu quyền RBAC (test envtest xanh vì chạy bằng admin; K9.4 gặp trên cụm), và finalizer không được gỡ khi logic dọn dẹp lỗi (K9.1 đã thấy hậu quả).
+
+<Callout kind="production">
+
+Từ ngày 14 tới ngày 16/03/2026, một phần control plane của dịch vụ Kubernetes được quản lý của IONOS Cloud (vùng DE/FRA) chập chờn: theo [bài postmortem của họ](https://status.ionos.cloud/incidents/h9x5s66m4r28), các control plane bị ảnh hưởng định kỳ không tới được trong vài phút mỗi lần, nên deploy, scale và health check của khách hàng không tin cậy. Sự cố lan sang dịch vụ database, AI Model Hub và Container Registry của họ; postmortem công bố ngày 23/04.
+
+Họ nêu ba nguyên nhân cộng dồn trên một instance etcd dùng chung. Một: trên một instance etcd bị ảnh hưởng, ba cụm chiếm khoảng 64% toàn bộ dữ liệu, chủ yếu là báo cáo quét bảo mật và bản ghi kiểm tra policy, cùng nhiều object event và autoscaling. Hai: chu kỳ compaction không theo kịp tốc độ ghi, nên etcd tích lũy revision cũ và phình vượt cỡ bình thường. Ba: phân mảnh làm dung lượng cấp phát lớn hơn dữ liệu thật khoảng 40%, và cơ sở dữ liệu đã gần trần cứng, mức mà etcd chuyển sang chỉ đọc và cả control plane trên instance đó ngừng hẳn. Các lần nghẽn xảy ra trong chu kỳ bảo trì. Họ đã defrag (thu lại khoảng 3 tới 4 GiB mỗi instance), rút ngắn chu kỳ compaction, chuyển các cụm nhiều dữ liệu nhất sang etcd riêng, và lên kế hoạch quota theo khách hàng, kể cả giới hạn số khoá.
+
+Điều bài này rút ra (của bài, postmortem không nói về operator): trong Kubernetes, báo cáo quét bảo mật và kết quả kiểm tra policy thường là custom resource do một operator ghi. Mỗi lần ghi, kể cả ghi lại gần như cùng nội dung, là một revision mới trong etcd chờ compaction. Một operator ghi status trong vòng lặp vô tận, như bước 6 của lab, sinh đúng loại tải "tốc độ ghi vượt compaction" mà postmortem mô tả, dù dữ liệu của nó chỉ vài KB.
+
+</Callout>
+
+<Check id="k9.3.vong-lap">Giải thích được điều kiện để vòng ghi status rồi reconcile lại tự dừng, kể được ba thứ phá điều kiện đó, và nói được cách phát hiện bằng metric.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [The Kubebuilder Book](https://book.kubebuilder.io/): đọc phần "Tutorial: Building CronJob" để thấy một operator đầy đủ, rồi "Good Practices" về idempotent và vòng lặp.
+- [CRD Validation (Kubebuilder Book)](https://book.kubebuilder.io/reference/markers/crd-validation.html): danh sách đầy đủ marker sinh schema, gồm `XValidation`.
+- [Configuring EnvTest (Kubebuilder Book)](https://book.kubebuilder.io/reference/envtest): `setup-envtest`, biến `KUBEBUILDER_ASSETS`, và giới hạn của envtest.
+- [IONOS Cloud: MK8s Partial Connectivity Degradation to Control Planes](https://status.ionos.cloud/incidents/h9x5s66m4r28): nguồn của callout, đọc phần postmortem và danh sách việc khắc phục.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp cụm `k9-lab`. CRD `WebApp` của K9.1 có thể còn trên cụm; bước 4 thay nó bằng CRD sinh từ code. Namespace `k9` nên trống (cuối K9.2 đã xoá `web`).
+
+**Profile máy.** Node kind lên khoảng 0,9 tới 1,1 GiB ở cuối bài, với 3 pod podinfo. Kubebuilder là một binary khoảng 17 MB; `make test` tải binary envtest (kube-apiserver, etcd, kubectl) khoảng 170 MB vào thư mục dự án và chạy chúng trên máy (ngoài Docker) trong lúc test. Lần `make` đầu tiên cài `controller-gen` và `setup-envtest` bằng `go install`, mất vài phút. Máy 8 GB làm được. Bài chạy trên Mac Apple Silicon; trên Mac Intel hay Linux các bước giống hệt, chỉ tên file Kubebuilder tải về đổi theo `OS`, `ARCH`.
+
+Mọi terminal dùng cho bài cần khối biến môi trường dưới. `PATH` thêm `~/masteva-k9/bin`, nơi bài đặt Kubebuilder.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k9/kubeconfig
+export GOPATH=~/masteva-k9/go GOMODCACHE=~/masteva-k9/go/pkg/mod GOCACHE=~/masteva-k9/go/cache
+export PATH=~/masteva-k9/bin:$PATH
+mkdir -p ~/masteva-k9/bin ~/masteva-k9/k9-3/webapp-operator && cd ~/masteva-k9/k9-3/webapp-operator
+kubectl config current-context
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k9-lab
+```
+
+</Expected>
+
+### 1. Tải Kubebuilder và sinh khung
+
+Kubebuilder phát hành binary cho từng hệ điều hành kèm file `checksums.txt`. Khối dưới tải bản cho máy bạn, **kiểm sha256** rồi mới đặt vào thư mục lab; không khớp thì `mv` không chạy. Biến `OS` và `ARCH` chọn đúng file cho máy bạn: `darwin_arm64` cho Mac Apple Silicon, `darwin_amd64` cho Mac Intel, `linux_amd64` hay `linux_arm64` cho Linux.
+
+<Terminal where="mac">
+
+```bash
+V=4.16.0; OS=$(uname -s | tr A-Z a-z); ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+F=kubebuilder_${OS}_${ARCH}
+curl -sLo ~/masteva-k9/bin/$F https://github.com/kubernetes-sigs/kubebuilder/releases/download/v$V/$F
+(cd ~/masteva-k9/bin && curl -sL https://github.com/kubernetes-sigs/kubebuilder/releases/download/v$V/checksums.txt \
+  | grep " $F\$" | shasum -a 256 -c - && mv $F kubebuilder && chmod +x kubebuilder)
+kubebuilder version | head -2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kubebuilder_darwin_arm64: OK
+KubeBuilder:          v4.16.0
+Kubernetes:           1.37.0
+```
+
+</Expected>
+
+Sinh khung dự án và một API. `--domain` cộng `--group` thành nhóm `apps.masteva.example` của K9.1. Output của hai lệnh `kubebuilder` dài nên được ẩn; nếu danh sách file in ra cuối khối thiếu file nào, chạy lại lệnh `kubebuilder` tương ứng không có `> /dev/null 2>&1` để đọc lỗi.
+
+<Terminal where="mac">
+
+```bash
+kubebuilder init --domain masteva.example --repo example.com/webapp-operator > /dev/null 2>&1
+kubebuilder create api --group apps --version v1 --kind WebApp --resource --controller > /dev/null 2>&1
+go get sigs.k8s.io/controller-runtime@v0.25.2 k8s.io/api@v0.37.1 k8s.io/apimachinery@v0.37.1 k8s.io/client-go@v0.37.1 > /dev/null 2>&1
+go mod tidy
+grep -E 'controller-runtime|k8s.io/client-go|^go ' go.mod
+find api internal cmd -name '*.go' | sort
+grep -E '^(KUSTOMIZE|CONTROLLER_TOOLS)_VERSION' Makefile
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+go 1.26.0
+	k8s.io/client-go v0.37.1
+	sigs.k8s.io/controller-runtime v0.25.2
+api/v1/groupversion_info.go
+api/v1/webapp_types.go
+api/v1/zz_generated.deepcopy.go
+cmd/main.go
+internal/controller/suite_test.go
+internal/controller/webapp_controller.go
+internal/controller/webapp_controller_test.go
+KUSTOMIZE_VERSION ?= v5.8.1
+CONTROLLER_TOOLS_VERSION ?= v0.22.0
+```
+
+</Expected>
+
+Kubebuilder 4.16 sinh dự án với controller-runtime 0.25.0; lệnh `go get` nâng lên bản vá mới nhất 0.25.2 (bản K9.2 dùng). Dự án còn có `config/`, `Makefile`, `Dockerfile`, `test/e2e` và một file `AGENTS.md` hướng dẫn cho trợ lý AI.
+
+### 2. API có kiểu với marker
+
+Thay file kiểu do Kubebuilder sinh bằng `WebApp` của K9.1, viết bằng struct Go. Mọi ràng buộc của CRD tay giờ là marker.
+
+<Terminal where="mac" title="~/masteva-k9/k9-3/webapp-operator/api/v1/webapp_types.go">
+
+```bash
+cat > api/v1/webapp_types.go <<'EOF'
+package v1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+// WebAppSpec là trạng thái mong muốn của một WebApp.
+// +kubebuilder:validation:XValidation:rule="self.tier != 'prod' || self.replicas >= 2",message="tier prod cần ít nhất 2 replicas"
+type WebAppSpec struct {
+	// Image của ứng dụng, phải có tag cụ thể.
+	// +kubebuilder:validation:XValidation:rule="self.matches(':[A-Za-z0-9_][A-Za-z0-9._-]*$') && !self.endsWith(':latest')",message="image phải có tag cụ thể, không dùng latest"
+	// +required
+	Image string `json:"image"`
+
+	// Không omitempty: 0 là giá trị hợp lệ.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10
+	// +kubebuilder:default=1
+	// +optional
+	Replicas int32 `json:"replicas"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +kubebuilder:default=8080
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
+	// +kubebuilder:validation:MaxLength=200
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// +kubebuilder:validation:Enum=dev;prod
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="tier không đổi được sau khi tạo"
+	// +kubebuilder:default=dev
+	// +optional
+	Tier string `json:"tier,omitempty"`
+}
+
+// WebAppStatus là điều operator quan sát được.
+type WebAppStatus struct {
+	// +optional
+	Replicas int32 `json:"replicas,omitempty"`
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+	// +optional
+	Selector string `json:"selector,omitempty"`
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
+// +kubebuilder:resource:shortName=wa
+// +kubebuilder:printcolumn:name="Image",type=string,JSONPath=`.spec.image`
+// +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
+// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
+// +kubebuilder:printcolumn:name="Available",type=string,JSONPath=`.status.conditions[?(@.type=="Available")].status`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// WebApp is the Schema for the webapps API
+type WebApp struct {
+	metav1.TypeMeta `json:",inline"`
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitzero"`
+	// +required
+	Spec WebAppSpec `json:"spec"`
+	// +optional
+	Status WebAppStatus `json:"status,omitzero"`
+}
+
+// +kubebuilder:object:root=true
+
+// WebAppList contains a list of WebApp
+type WebAppList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitzero"`
+	Items           []WebApp `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(SchemeGroupVersion, &WebApp{}, &WebAppList{})
+		return nil
+	})
+}
+EOF
+make manifests generate > /dev/null
+CRD=config/crd/bases/apps.masteva.example_webapps.yaml
+yq '.spec.versions[0].schema.openAPIV3Schema.properties.spec | .properties.tier' $CRD
+yq '[.. | select(has("x-kubernetes-validations")) | .x-kubernetes-validations[].message]' $CRD
+yq '.spec.versions[0].subresources | keys' $CRD
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+default: dev
+enum:
+  - dev
+  - prod
+type: string
+x-kubernetes-validations:
+  - message: tier không đổi được sau khi tạo
+    rule: self == oldSelf
+- tier prod cần ít nhất 2 replicas
+- image phải có tag cụ thể, không dùng latest
+- tier không đổi được sau khi tạo
+- scale
+- status
+```
+
+</Expected>
+
+Ba luật CEL, mặc định, enum, hai subresource: cùng nội dung với CRD tay của K9.1, nhưng giờ CRD không thể lệch khỏi kiểu Go controller dùng. Nếu `make manifests` báo lỗi, đó thường là marker gõ sai: controller-gen in đúng dòng.
+
+### 3. Controller có kiểu
+
+Viết lại Reconcile của K9.2 với kiểu `webappv1.WebApp`. Ba thay đổi so với K9.2: thêm chuẩn bảo mật cho pod (chạy không phải root, root filesystem chỉ đọc, bỏ mọi capability, như K2.4 dạy); ứng dụng tier `prod` có thêm PodDisruptionBudget (K5.2); condition đi qua `meta.SetStatusCondition`, hàm chỉ đổi `lastTransitionTime` khi trạng thái của condition đổi. Marker RBAC đứng trên hàm.
+
+<Terminal where="mac" title="~/masteva-k9/k9-3/webapp-operator/internal/controller/webapp_controller.go">
+
+```bash
+cat > internal/controller/webapp_controller.go <<'EOF'
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
+	policyv1ac "k8s.io/client-go/applyconfigurations/policy/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	webappv1 "example.com/webapp-operator/api/v1"
+)
+
+const fieldOwner = client.FieldOwner("webapp-operator")
+
+type WebAppReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+// +kubebuilder:rbac:groups=apps.masteva.example,resources=webapps,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps.masteva.example,resources=webapps/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps.masteva.example,resources=webapps/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch
+
+func (r *WebAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	var app webappv1.WebApp
+	if err := r.Get(ctx, req.NamespacedName, &app); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	lbl := map[string]string{"app.kubernetes.io/name": app.Name, "app.kubernetes.io/managed-by": "webapp-operator"}
+	owner := metav1ac.OwnerReference().
+		WithAPIVersion(webappv1.GroupVersion.String()).WithKind("WebApp").
+		WithName(app.Name).WithUID(app.UID).
+		WithController(true).WithBlockOwnerDeletion(true)
+
+	if err := r.Apply(ctx, desiredDeployment(&app, lbl, owner), fieldOwner, client.ForceOwnership); err != nil {
+		return ctrl.Result{}, fmt.Errorf("apply Deployment: %w", err)
+	}
+	svc := corev1ac.Service(app.Name, app.Namespace).
+		WithLabels(lbl).WithOwnerReferences(owner).
+		WithSpec(corev1ac.ServiceSpec().WithSelector(lbl).
+			WithPorts(corev1ac.ServicePort().WithPort(80).WithTargetPort(intstr.FromInt32(app.Spec.Port))))
+	if err := r.Apply(ctx, svc, fieldOwner, client.ForceOwnership); err != nil {
+		return ctrl.Result{}, fmt.Errorf("apply Service: %w", err)
+	}
+	// Chuẩn của đội nền tảng: ứng dụng prod luôn có PodDisruptionBudget (K5.2).
+	if app.Spec.Tier == "prod" {
+		pdb := policyv1ac.PodDisruptionBudget(app.Name, app.Namespace).
+			WithLabels(lbl).WithOwnerReferences(owner).
+			WithSpec(policyv1ac.PodDisruptionBudgetSpec().
+				WithMinAvailable(intstr.FromInt32(1)).
+				WithSelector(metav1ac.LabelSelector().WithMatchLabels(lbl)))
+		if err := r.Apply(ctx, pdb, fieldOwner, client.ForceOwnership); err != nil {
+			return ctrl.Result{}, fmt.Errorf("apply PodDisruptionBudget: %w", err)
+		}
+	}
+
+	// Status: chỉ ghi điều quan sát được. SetStatusCondition giữ nguyên
+	// lastTransitionTime khi trạng thái của condition không đổi.
+	var deploy appsv1.Deployment
+	if err := r.Get(ctx, req.NamespacedName, &deploy); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	orig := app.DeepCopy()
+	app.Status.Replicas = deploy.Status.Replicas
+	app.Status.ReadyReplicas = deploy.Status.ReadyReplicas
+	app.Status.Selector = labels.SelectorFromSet(lbl).String()
+	app.Status.ObservedGeneration = app.Generation
+	cond := metav1.Condition{Type: "Available", Status: metav1.ConditionFalse, Reason: "Progressing",
+		ObservedGeneration: app.Generation,
+		Message:            fmt.Sprintf("%d/%d pod sẵn sàng", deploy.Status.ReadyReplicas, app.Spec.Replicas)}
+	if deploy.Status.ReadyReplicas == app.Spec.Replicas && deploy.Status.UpdatedReplicas == deploy.Status.Replicas {
+		cond.Status, cond.Reason = metav1.ConditionTrue, "AllReplicasReady"
+	}
+	meta.SetStatusCondition(&app.Status.Conditions, cond)
+	if err := r.Status().Patch(ctx, &app, client.MergeFrom(orig)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("patch status: %w", err)
+	}
+	log.V(1).Info("reconciled", "generation", app.Generation, "ready", deploy.Status.ReadyReplicas)
+	return ctrl.Result{}, nil
+}
+
+func desiredDeployment(app *webappv1.WebApp, lbl map[string]string, owner *metav1ac.OwnerReferenceApplyConfiguration) *appsv1ac.DeploymentApplyConfiguration {
+	return appsv1ac.Deployment(app.Name, app.Namespace).
+		WithLabels(lbl).WithOwnerReferences(owner).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(app.Spec.Replicas).
+			WithSelector(metav1ac.LabelSelector().WithMatchLabels(lbl)).
+			WithTemplate(corev1ac.PodTemplateSpec().WithLabels(lbl).
+				WithSpec(corev1ac.PodSpec().
+					WithSecurityContext(corev1ac.PodSecurityContext().WithRunAsNonRoot(true).WithRunAsUser(65532)).
+					WithContainers(corev1ac.Container().
+						WithName("app").WithImage(app.Spec.Image).
+						WithPorts(corev1ac.ContainerPort().WithContainerPort(app.Spec.Port)).
+						WithEnv(
+							corev1ac.EnvVar().WithName("PODINFO_PORT").WithValue(fmt.Sprint(app.Spec.Port)),
+							corev1ac.EnvVar().WithName("PODINFO_UI_MESSAGE").WithValue(app.Spec.Message)).
+						WithReadinessProbe(corev1ac.Probe().WithHTTPGet(
+							corev1ac.HTTPGetAction().WithPath("/readyz").WithPort(intstr.FromInt32(app.Spec.Port)))).
+						WithSecurityContext(corev1ac.SecurityContext().
+							WithAllowPrivilegeEscalation(false).
+							WithReadOnlyRootFilesystem(true).
+							WithCapabilities(corev1ac.Capabilities().WithDrop("ALL")))))))
+}
+
+func (r *WebAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&webappv1.WebApp{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
+		Named("webapp").
+		Complete(r)
+}
+EOF
+make manifests > /dev/null && go build ./... && echo build ok
+yq '.rules[] | (.apiGroups[0] | select(. != "") // "core") + " " + (.resources | join(",")) + ": " + (.verbs | join(","))' config/rbac/role.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+build ok
+core services: create,get,list,patch,update,watch
+apps deployments: create,get,list,patch,update,watch
+apps.masteva.example webapps: get,list,watch
+apps.masteva.example webapps/finalizers: update
+apps.masteva.example webapps/status: get,patch,update
+policy poddisruptionbudgets: create,get,list,patch,update,watch
+```
+
+</Expected>
+
+`config/rbac/role.yaml` sinh từ đúng sáu marker: không quyền `delete` nào, và với `WebApp`, operator chỉ đọc và sửa status. Quyền `update` trên `webapps/finalizers` không phải cho finalizer: owner reference có `blockOwnerDeletion: true` cần quyền đó khi cụm bật admission plugin `OwnerReferencesPermissionEnforcement` (OpenShift bật sẵn), nên Kubebuilder sinh sẵn marker này.
+
+podinfo chạy được với root filesystem chỉ đọc và user 65532 (bước 5 kiểm); image cần ghi file tạm sẽ lỗi với cấu hình này và cần thêm một volume `emptyDir`, ví dụ cho `/tmp`.
+
+<Check id="k9.3.lab-api-rbac">Viết được API có kiểu với marker sinh ra đúng CRD đã thiết kế, và đọc được `role.yaml` để chỉ ra operator có những quyền nào và vì sao không có `delete`.</Check>
+
+### 4. Test với envtest
+
+Test đầu tạo một `WebApp` tier `prod`, gọi thẳng `Reconcile` hai lần, rồi kiểm Deployment, owner reference, PDB, status. Test thứ hai kiểm luật CEL: API server thật trong envtest phải từ chối. Thay file test mà Kubebuilder sinh:
+
+<Terminal where="mac" title="~/masteva-k9/k9-3/webapp-operator/internal/controller/webapp_controller_test.go">
+
+```bash
+cat > internal/controller/webapp_controller_test.go <<'EOF'
+package controller
+
+import (
+	"context"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	webappv1 "example.com/webapp-operator/api/v1"
+)
+
+var _ = Describe("WebApp Controller", func() {
+	ctx := context.Background()
+	key := types.NamespacedName{Name: "shop", Namespace: "default"}
+
+	It("tạo Deployment, Service và PDB cho WebApp tier prod", func() {
+		app := &webappv1.WebApp{
+			ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
+			Spec:       webappv1.WebAppSpec{Image: "ghcr.io/stefanprodan/podinfo:6.15.0", Replicas: 2, Tier: "prod"},
+		}
+		Expect(k8sClient.Create(ctx, app)).To(Succeed())
+		Expect(app.Spec.Port).To(Equal(int32(8080)), "API server điền mặc định từ schema")
+
+		r := &WebAppReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		var deploy appsv1.Deployment
+		Expect(k8sClient.Get(ctx, key, &deploy)).To(Succeed())
+		Expect(*deploy.Spec.Replicas).To(Equal(int32(2)))
+		Expect(deploy.OwnerReferences).To(HaveLen(1))
+		Expect(deploy.OwnerReferences[0].Kind).To(Equal("WebApp"))
+		Expect(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{})).To(Succeed())
+
+		Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+		Expect(app.Status.ObservedGeneration).To(Equal(app.Generation))
+		Expect(app.Status.Conditions).To(ContainElement(HaveField("Type", "Available")))
+
+		// Gọi lại lần nữa: reconcile phải idempotent, không lỗi.
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("API server từ chối WebApp prod chỉ có 1 replica (luật CEL)", func() {
+		app := &webappv1.WebApp{
+			ObjectMeta: metav1.ObjectMeta{Name: "one", Namespace: "default"},
+			Spec:       webappv1.WebAppSpec{Image: "ghcr.io/stefanprodan/podinfo:6.15.0", Replicas: 1, Tier: "prod"},
+		}
+		err := k8sClient.Create(ctx, app)
+		Expect(err).To(MatchError(ContainSubstring("tier prod cần ít nhất 2 replicas")))
+	})
+})
+EOF
+make test 2>&1 | grep -E '^(ok|FAIL|---)|internal/controller|Setting up envtest'
+ls bin/k8s/*/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Setting up envtest binaries for Kubernetes version 1.37...
+ok  	example.com/webapp-operator/internal/controller	7.661s	coverage: 79.5% of statements
+etcd
+kube-apiserver
+kubectl
+```
+
+</Expected>
+
+Lần đầu `make test` mất vài phút (cài `setup-envtest`, tải binary envtest, biên dịch); các lần sau khoảng 10 tới 20 giây. Test chạy một kube-apiserver thật: chính nó điền `port: 8080` mặc định và từ chối object vi phạm luật CEL.
+
+<Predict question="Test đầu kiểm condition `Available` có mặt, không kiểm giá trị của nó. Nếu kiểm `Available=True`, test có qua không?">
+
+Không, và không bao giờ qua được trên envtest. Không có `kube-controller-manager` nên Deployment không có ReplicaSet; không có kubelet nên không có pod nào sẵn sàng. `deploy.Status.ReadyReplicas` mãi là 0, condition là `False` với lý do `Progressing`. Muốn kiểm luồng "ứng dụng chạy được thật", phải lên cụm thật (K9.4 hoặc `make test-e2e`).
+
+</Predict>
+
+<Check id="k9.3.lab-envtest">Viết và chạy được test envtest kiểm object con, owner reference, status và một luật CEL, và giải thích được vì sao test không thể kiểm pod sẵn sàng.</Check>
+
+### 5. Chạy operator trên máy với cụm thật
+
+`make install` cài CRD sinh ra lên cụm (thay CRD tay của K9.1, cùng tên). Chạy operator ở **Terminal 2**, với metrics HTTP ở cổng 9743 để bước 6 đo. Cờ `--metrics-secure=false` chỉ dùng khi chạy trên máy; trong cụm (K9.4), metrics đi qua HTTPS và cần quyền.
+
+<Terminal where="mac">
+
+```bash
+make install 2>&1 | tail -1
+go build -o bin/manager ./cmd/main.go && echo built
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example configured
+built
+```
+
+</Expected>
+
+Terminal 2 (khối biến môi trường ở phần Chuẩn bị trước):
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k9/k9-3/webapp-operator && bin/manager --metrics-bind-address=127.0.0.1:9743 --metrics-secure=false --health-probe-bind-address=127.0.0.1:9744
+```
+
+</Terminal>
+
+Terminal 1: tạo một `WebApp` tier `prod`.
+
+<Terminal where="mac" title="~/masteva-k9/k9-3/shop.yaml">
+
+```bash
+cat > ../shop.yaml <<'EOF'
+apiVersion: apps.masteva.example/v1
+kind: WebApp
+metadata:
+  name: shop
+  namespace: k9
+spec:
+  image: ghcr.io/stefanprodan/podinfo:6.15.0
+  replicas: 2
+  tier: prod
+  message: Cửa hàng
+EOF
+kubectl apply -f ../shop.yaml
+kubectl wait --for=condition=Available wa/shop --timeout=180s
+kubectl get wa,deploy,svc,pdb
+kubectl get wa shop -o jsonpath='{range .status.conditions[*]}{.type} {.status} {.reason} "{.message}" og={.observedGeneration}{"\n"}{end}'
+kubectl get pod -l app.kubernetes.io/name=shop -o jsonpath='{.items[0].spec.containers[0].securityContext}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/shop created
+webapp.apps.masteva.example/shop condition met
+NAME                               IMAGE                                 DESIRED   READY   AVAILABLE   AGE
+webapp.apps.masteva.example/shop   ghcr.io/stefanprodan/podinfo:6.15.0   2         2       True        5s
+
+NAME                   READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/shop   2/2     2            2           5s
+
+NAME           TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+service/shop   ClusterIP   10.96.43.218   <none>        80/TCP    5s
+
+NAME                              MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+poddisruptionbudget.policy/shop   1               N/A               1                     5s
+Available True AllReplicasReady "2/2 pod sẵn sàng" og=1
+{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}
+```
+
+</Expected>
+
+Đội ứng dụng khai 4 dòng `spec`; họ nhận Deployment có chuẩn bảo mật, Service, PDB, và một cột `AVAILABLE` đọc từ condition. Thử thêm một điều trước khi đo: `kubectl scale` dùng được với `WebApp` nhờ subresource `scale`, và operator đưa con số đó xuống Deployment.
+
+<Terminal where="mac">
+
+```bash
+kubectl scale wa shop --replicas=3
+kubectl wait --for=jsonpath='{.status.readyReplicas}'=3 wa/shop --timeout=120s
+kubectl get wa shop
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/shop scaled
+webapp.apps.masteva.example/shop condition met
+NAME   IMAGE                                 DESIRED   READY   AVAILABLE   AGE
+shop   ghcr.io/stefanprodan/podinfo:6.15.0   3         3       True        30s
+```
+
+</Expected>
+
+### 6. Gây vòng lặp vô tận, rồi đo
+
+Hàm `do_luong` in hai con số từ trang metrics của operator: tổng số lần reconcile thành công, và tổng số request `PATCH` mà client của operator đã gửi tới API server (metric `rest_client_requests_total` của client-go). Đo hai lần cách nhau 10 giây khi không ai sửa gì:
+
+<Terminal where="mac">
+
+```bash
+do_luong() { m=$(curl -s 127.0.0.1:9743/metrics); echo "reconcile=$(echo "$m" | grep '^controller_runtime_reconcile_total{controller="webapp",result="success"}' | awk '{print $2}') patch=$(echo "$m" | grep '^rest_client_requests_total' | grep 'method="PATCH"' | awk '{s+=$2} END {print s}')"; }
+do_luong; sleep 10; do_luong
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+reconcile=12 patch=48
+reconcile=12 patch=48
+```
+
+</Expected>
+
+Đứng yên: đúng như phải thế. Mỗi lần reconcile gửi 4 `PATCH` (ba lần apply object con, một lần patch status), dù không có gì đổi; server-side apply rẻ nhưng không miễn phí. Con số tuyệt đối trên máy bạn sẽ khác (nó đếm từ lúc operator khởi động); điều cần thấy là hai dòng **bằng nhau**.
+
+Giờ làm điều nhiều người làm "cho dễ debug": thêm vào status thời điểm của lần reconcile gần nhất. Dừng operator ở Terminal 2 (Ctrl+C). Hai lệnh `perl` dưới chèn một trường vào kiểu `WebAppStatus` và một lệnh gán vào Reconcile, giữ bản gốc ở file `.bak`:
+
+<Terminal where="mac">
+
+```bash
+perl -0pi.bak -e 's|(\t// \+listType=map)|\t// Lần reconcile gần nhất, "cho dễ debug".\n\t// +optional\n\tLastReconcileTime *metav1.MicroTime `json:"lastReconcileTime,omitempty"`\n\n$1|' api/v1/webapp_types.go
+perl -0pi.bak -e 's|(\tapp.Status.ObservedGeneration = app.Generation\n)|$1\tnow := metav1.NowMicro()\n\tapp.Status.LastReconcileTime = \&now\n|' internal/controller/webapp_controller.go
+git diff --no-index --stat internal/controller/webapp_controller.go.bak internal/controller/webapp_controller.go | tail -1
+make manifests generate > /dev/null && make install 2>&1 | tail -1 && go build -o bin/manager ./cmd/main.go && echo built
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ 1 file changed, 2 insertions(+)
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example configured
+built
+```
+
+</Expected>
+
+`MicroTime` giữ tới micro giây, nên mỗi lần gán là một giá trị khác. Chạy lại operator ở Terminal 2 (cùng lệnh bước 5).
+
+<Predict question="Không ai sửa `shop`. Operator mới sẽ reconcile bao nhiêu lần trong 10 giây?">
+
+Hàng trăm. Lần reconcile đầu tiên khi khởi động ghi `lastReconcileTime`; lần ghi đó là một sự kiện trên chính `shop`; lần reconcile kế tiếp ghi một thời điểm khác, lại một sự kiện. Không có gì phá được vòng này: không lỗi (nên không có backoff), không có ai sửa gì để mà gộp. Nó chạy nhanh nhất mà một worker và API server cho phép.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+do_luong; sleep 10; do_luong
+kubectl get wa shop -o jsonpath='{.status.lastReconcileTime}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+reconcile=646 patch=2584
+reconcile=1560 patch=6241
+2026-10-14T06:23:50.788691Z
+```
+
+</Expected>
+
+Lấy dòng sau trừ dòng trước: trong mẫu trên là 914 lần reconcile và 3.657 request `PATCH` trong 10 giây, tức khoảng 90 lần reconcile mỗi giây, cho **một** object mà không ai đụng tới. Trên máy bạn con số sẽ khác tuỳ tốc độ máy, thường cùng cỡ vài chục tới hơn một trăm lần mỗi giây; dù bao nhiêu, nó không về 0. Với 200 `WebApp`, mỗi object một vòng như thế (worker chỉ có một, nên chúng chia nhau cùng nhịp đó), API server vẫn nhận vài trăm lệnh ghi mỗi giây, mỗi lệnh một revision mới trong etcd. Không test nào ở bước 4 bắt được lỗi này.
+
+Sửa: bỏ hẳn trường đó. Thời điểm reconcile thuộc về log và metric, không thuộc về status. Dừng operator ở Terminal 2 (Ctrl+C), rồi:
+
+<Terminal where="mac">
+
+```bash
+mv api/v1/webapp_types.go.bak api/v1/webapp_types.go
+mv internal/controller/webapp_controller.go.bak internal/controller/webapp_controller.go
+make manifests generate > /dev/null && make install 2>&1 | tail -1 && go build -o bin/manager ./cmd/main.go && echo built
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example configured
+built
+```
+
+</Expected>
+
+Chạy lại operator ở Terminal 2, chờ vài giây rồi đo lại ở Terminal 1:
+
+<Terminal where="mac">
+
+```bash
+do_luong; sleep 10; do_luong
+kubectl get wa shop -o jsonpath='[{.status.lastReconcileTime}]{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+reconcile=2 patch=8
+reconcile=2 patch=8
+[]
+```
+
+</Expected>
+
+Hai lần reconcile khi khởi động, rồi đứng yên. Dòng cuối in cặp ngoặc rỗng: đọc `shop` không còn thấy `lastReconcileTime`, vì schema đã bỏ trường đó và API server cắt bỏ trường không có trong schema.
+
+<Check id="k9.3.lab-vong-lap">Tái hiện được vòng lặp reconcile vô tận do ghi status thay đổi mỗi lần, đo được tốc độ reconcile và số request bằng metric trước, trong và sau khi sửa.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `shasum` báo `FAILED` hoặc không in gì | Tải lỗi, hoặc tên file không có trong `checksums.txt` (kiến trúc lạ) | `uname -sm`; mở trang phát hành, so tên file |
+| `make manifests` báo lỗi marker | Gõ sai tên marker hoặc thiếu dấu nháy | controller-gen in tên file và dòng; so với Kubebuilder Book |
+| `make test` lỗi `unable to start control plane` hoặc treo | Binary envtest chưa tải xong, hoặc tiến trình envtest cũ còn chạy | `ls bin/k8s/*/`; tìm và dừng tiến trình `kube-apiserver`, `etcd` cũ của envtest |
+| Build lỗi `in.LastReconcileTime undefined` | Sửa kiểu mà chưa chạy `make generate` (hàm DeepCopy cũ) | `make manifests generate` sau mỗi lần sửa `api/` |
+| `bin/manager` báo `bind: address already in use` | Operator khác hoặc controller K9.2 còn chạy | Ctrl+C ở terminal đang chạy nó |
+| Pod `CreateContainerConfigError`: `runAsNonRoot` và user không phải số | Image khai `USER` bằng tên | Đặt `runAsUser` bằng số, như code của bài |
+
+### Dọn dẹp
+
+Dừng operator ở Terminal 2 (Ctrl+C). K9.4 dùng tiếp dự án `~/masteva-k9/k9-3/webapp-operator`, cụm, CRD và `WebApp` `shop`: không xoá gì. Nếu dừng chặng ở đây, dùng khối dọn dẹp ở cuối K9.1.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="`GenerationChangedPredicate` có chữa được vòng lặp ở bước 6 không?">
+
+Chữa được triệu chứng. Gắn predicate này vào `For(&webappv1.WebApp{})` thì sự kiện chỉ đổi `status` (không tăng `generation`) không còn kích Reconcile, nên lần ghi `lastReconcileTime` không gọi lại chính nó. Nhưng cái giá: đổi label, annotation của `WebApp` cũng không kích Reconcile nữa, và lỗi gốc vẫn còn, chỉ bị che. Một ghi chú khác: predicate trên `For` không chặn sự kiện từ object con đi qua `Owns`. Sửa đúng là làm cho status chỉ đổi khi thực tế đổi; predicate là tối ưu thêm khi đã biết rõ sự kiện nào không cần.
+
+</Reveal>
+
+<Reveal title="Dùng `r.Status().Patch` với `MergeFrom` hay `r.Status().Update`?">
+
+`Update` gửi cả status kèm `resourceVersion`: nếu object vừa đổi (rất hay xảy ra, vì chính operator vừa apply con và nhận sự kiện), API server trả conflict, Reconcile lỗi và chạy lại. Đúng nhưng ồn. `Patch` với `MergeFrom(orig)` gửi phần khác nhau giữa bản gốc và bản đã sửa, không kèm `resourceVersion`, nên không conflict; đổi lại, nếu hai bên cùng ghi một trường thì bên sau thắng. Với status mà chỉ operator ghi, patch là lựa chọn gọn. Lưu ý một chi tiết của merge patch: danh sách `conditions` bị thay nguyên khối, nên nếu có controller thứ hai cùng ghi condition vào object này, dùng server-side apply cho status (K9.2 làm vậy với `unstructured`; với kiểu Go, cần sinh apply configuration bằng controller-gen).
+
+</Reveal>
+
+<Reveal title="Vì sao không dùng `controllerutil.CreateOrUpdate` như nhiều hướng dẫn?">
+
+`CreateOrUpdate` đọc object (từ cache), chạy một hàm sửa, rồi `Update` cả object nếu có khác. Nó dễ hiểu và rất phổ biến trong tài liệu Kubebuilder. Hai điểm yếu: đọc từ cache có thể trễ nên hay gặp conflict, và `Update` ghi lại cả object nên giẫm lên trường mà controller khác (HPA, một mutating webhook) vừa đặt. Server-side apply chỉ khai trường mình sở hữu. Cả hai đều đúng nếu viết cẩn thận; bài chọn apply vì K3.1 và K9.2 đã xây nền cho nó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết marker cho một ràng buộc, viết test envtest cho một nhánh Reconcile, giải thích thông báo lỗi của controller-gen.
+
+**AI hay sai ở đâu:** dùng layout Kubebuilder cũ (`go/v3`, `controllers/` thay vì `internal/controller/`, `main.go` ở gốc); viết marker validation sai cú pháp hoặc đặt nhầm chỗ (marker cấp kiểu đặt trên trường); sửa tay file trong `config/crd/bases`; thêm `+kubebuilder:rbac` với `verbs=*` cho "chắc ăn"; ghi `lastUpdated`, bộ đếm, hay `metav1.Now()` vào status; viết test envtest chờ pod sẵn sàng hoặc chờ garbage collection; và quên `make generate` sau khi đổi kiểu.
+
+**Cách kiểm tra:** `make manifests` rồi đọc diff của `config/` sau mỗi thay đổi marker; `make test`; và luôn chạy operator trên cụm thật rồi đo `controller_runtime_reconcile_total` khi không ai sửa gì, như bước 6.
+
+</Callout>
+
+<Callout kind="link">
+
+K9.1 thiết kế CRD mà bài này sinh lại từ code; K9.2 viết controller tay với cùng logic. K2.4 dạy SecurityContext mà operator áp cho mọi pod; K5.2 dạy PodDisruptionBudget. K9.4 đóng image, triển khai operator vào cụm với RBAC vừa sinh, thêm webhook và nâng cấp; K9.5 nhìn từ phía người dùng operator có sẵn. D6 đặt `make test` vào pipeline CI. D12.2 thu metric của operator bằng Prometheus để cảnh báo vòng lặp như bước 6.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k9.3.mastery-tu-viet">Tự dựng được một operator bằng Kubebuilder cho một CRD của đội mình: API có kiểu với marker, Reconcile idempotent, RBAC tối thiểu sinh từ marker, test envtest.</Check>
+
+<Check id="k9.3.mastery-do">Trước khi phát hành operator, kiểm được bằng metric rằng nó không reconcile khi không có gì đổi, và tìm được nguyên nhân khi con số không đứng yên.</Check>
+
+</Mastery>

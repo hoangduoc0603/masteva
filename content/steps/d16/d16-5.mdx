@@ -1,0 +1,672 @@
+---
+title: Giám sát hệ thống giám sát và continuous profiling
+description: Liệt kê các cách hệ thống giám sát chết trong im lặng, dựng alert Watchdog luôn kêu cùng một dead man's switch đứng ngoài, tắt Alertmanager rồi Prometheus để đo bao lâu thì bên ngoài phát hiện và vì sao hai con số khác nhau; cảnh báo khi đường gửi thông báo hỏng qua một kênh dự phòng; rồi bật continuous profiling bằng Pyroscope, đọc flame graph và tìm ra hàm tốn CPU nhất của ứng dụng mẫu.
+id: d16.5
+step: d16
+prerequisites: [d16.2]
+topics: [d16.meta-monitoring, d16.profiling-lien-tuc]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    prometheus: 3.15.0
+    alertmanager: 0.34.1
+    python-image: 3.14.8-alpine
+    pyroscope: 2.4.0
+    pyroscope-go: 1.4.0
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biến sự im lặng của hệ thống giám sát thành một thứ đo được, và thêm tín hiệu thứ tư để trả lời câu "dòng code nào tốn". Học xong bài này, bạn giải thích được:
+
+- Vì sao Prometheus chết thì không alert nào báo rằng Prometheus đã chết, và một alert luôn kêu giải quyết điều đó thế nào.
+- Vì sao Alertmanager chết thì bên ngoài biết sau khoảng một phút rưỡi, còn Prometheus chết thì phải khoảng 4 tới 6 phút.
+- Vì sao alert "gửi thông báo thất bại" phải đi qua một đường khác với đường đang hỏng.
+- Đọc một flame graph thế nào để chỉ ra hàm nào ăn phần lớn CPU, mà không cần đoán.
+
+</Goal>
+
+<Knowledge>
+
+### Hệ thống giám sát chết trong im lặng
+
+D12.1 kể chuyện Equifax: thiết bị giám sát hỏng 19 tháng và không ai biết, vì một hệ thống giám sát hỏng trông giống hệt một hệ thống không có gì để báo. D12.4 kể chuyện Roblox: telemetry phụ thuộc chính hệ thống đang hỏng. Bài này biến những chuyện đó thành thứ đo và cảnh báo được. Trước hết, liệt kê các cách nó chết:
+
+| Thành phần hỏng | Hệ quả | Ai có thể báo |
+|---|---|---|
+| Một target không scrape được | Thiếu metric của target đó | Prometheus: `up == 0` (D12.2) |
+| Rule đánh giá lỗi (truy vấn sai, quá chậm) | Alert không bao giờ kêu | Prometheus: `prometheus_rule_evaluation_failures_total` tăng |
+| Prometheus không gửi được tới Alertmanager | Alert kêu nhưng không đi đâu | Prometheus: `prometheus_notifications_errors_total`, `prometheus_notifications_dropped_total` |
+| Alertmanager không gửi được tới kênh nhận (token hết hạn, URL đổi, dịch vụ chat sập) | Mọi thông báo mất | Alertmanager: `alertmanager_notifications_failed_total`, nhưng phải gửi qua kênh **khác** |
+| Đường ống telemetry rớt dữ liệu | Metric, log, trace thiếu một phần | Collector: `otelcol_exporter_send_failed_spans`, hàng đợi gần đầy (D12.6); Alloy: `loki_process_dropped_lines_total` (D16.4); remote write: `prometheus_remote_storage_*` (D16.3) |
+| **Prometheus chết** | Không rule nào chạy | **Không ai bên trong** |
+| **Alertmanager chết** | Không thông báo nào được gửi | **Không ai bên trong** |
+| Cả vùng mạng, cả cụm chứa hệ giám sát chết | Như hai dòng trên | **Không ai bên trong** |
+
+Ba dòng cuối có chung một tính chất: thứ cần báo động chính là thứ dùng để báo động. Không cấu hình nào **bên trong** hệ thống giải quyết được chúng; cần một thứ đứng ngoài.
+
+### Watchdog và dead man's switch
+
+Ý tưởng lấy từ thiết bị an toàn trên tàu hoả: người lái phải liên tục giữ một nút; buông tay thì tàu tự dừng. Đổi sang giám sát:
+
+```text
+ BÊN TRONG (failure domain của hệ giám sát)                     BÊN NGOÀI (hạ tầng khác)
+ Prometheus: alert Watchdog, expr vector(1), luôn firing
+      │  gửi lại cho Alertmanager mỗi phút
+      ▼
+ Alertmanager: route riêng cho Watchdog, repeat_interval ngắn
+      │  thông báo đều đặn ("heartbeat") mỗi ~30 giây
+      └──────────────────────────────────────────────────▶  dead man's switch
+                                                             nhận heartbeat → đặt lại đồng hồ
+                                                             quá TIMEOUT không nhận → BÁO ĐỘNG
+                                                             qua kênh của riêng nó (gọi điện, SMS)
+```
+
+Bất cứ mắt xích nào trên đường đó chết (Prometheus, Alertmanager, mạng, cấu hình route) thì heartbeat ngừng, và bên ngoài báo. Alert này thường có tên `Watchdog` (kube-prometheus-stack cài sẵn nó với đúng tên đó); runbook của dự án mô tả nó là alert để bảo đảm cả đường ống cảnh báo còn chạy, và khi nó **ngừng** kêu thì phải báo cho hệ thống bên ngoài. Dead man's switch có thể là dịch vụ thương mại, một tính năng của công cụ trực, hay một chương trình nhỏ bạn tự chạy ở nơi khác; lab viết một bản Python chưa tới 60 dòng để thấy rõ cơ chế.
+
+**Thời gian phát hiện không giống nhau cho mọi mắt xích.** Prometheus gửi mỗi alert đang firing kèm một hạn `endsAt`: trong mã nguồn bản 3.15, hạn đó bằng thời điểm đánh giá cộng 4 lần giá trị lớn hơn giữa `evaluation_interval` và `--rules.alert.resend-delay` (mặc định 1 phút), tức khoảng 4 phút. Alertmanager coi alert còn sống tới hạn đó dù không nhận thêm gì. Vì vậy:
+
+| Mắt xích chết | Heartbeat ngừng sau | Bên ngoài báo sau (TIMEOUT 90 giây) |
+|---|---|---|
+| Alertmanager | Ngay lập tức | Khoảng 90 giây |
+| Prometheus | Tới khoảng 4 phút (Alertmanager vẫn gửi tới khi alert hết hạn) | Khoảng 4 tới 6 phút |
+| Đường mạng từ Alertmanager tới bên ngoài | Ngay lập tức | Khoảng 90 giây |
+
+TIMEOUT phải lớn hơn vài lần nhịp heartbeat để một lần gửi trễ không gây báo nhầm, và đủ nhỏ để chấp nhận được: đó là thời gian tối đa bạn sống mà không có cảnh báo.
+
+<Check id="d16.5.watchdog">Liệt kê được các cách hệ thống giám sát hỏng cùng thứ có thể báo cho từng cách, giải thích được Watchdog với dead man's switch, và tính được vì sao Prometheus chết bị phát hiện chậm hơn Alertmanager chết.</Check>
+
+### Không chung failure domain
+
+**Failure domain** (vùng hỏng chung) là tập thành phần có thể chết cùng nhau vì chung một nguyên nhân: cùng máy, cùng cụm, cùng vùng mạng, cùng tài khoản cloud, cùng nhà cung cấp DNS. Hệ thống giám sát nằm chung failure domain với thứ nó giám sát thì chết đúng lúc cần nó nhất. Các mức tách, từ rẻ tới đắt:
+
+| Cách | Tách khỏi |
+|---|---|
+| Prometheus và Alertmanager chạy trên node pool riêng | Workload ăn hết RAM, CPU của node (trivago ở D16.3) |
+| Hai cặp Prometheus ở hai cụm theo dõi lẫn nhau (mỗi bên scrape và alert về bên kia) | Một cụm chết |
+| Dead man's switch và probe từ bên ngoài (blackbox exporter, dịch vụ kiểm tra từ Internet) đặt ở vùng hoặc nhà cung cấp khác | Cả vùng, cả mạng nội bộ |
+| Kênh nhận thông báo không phụ thuộc hạ tầng của mình | Hệ thống chat nội bộ chạy chung hạ tầng |
+
+<Callout kind="production">
+
+Theo bài tường trình của Slack về sự cố ngày 04/01/2021: buổi sáng giờ châu Mỹ, đội được gọi bởi **một dịch vụ giám sát bên ngoài** vì tỉ lệ lỗi đang tăng. Trong lúc bắt đầu điều tra, dịch vụ dashboard và cảnh báo của chính Slack ngừng hoạt động; việc điều tra bị cản trở vì thiếu dashboard và alert quen thuộc, các kỹ sư phải truy vấn thẳng vào backend lưu metric, vốn vẫn chạy, nhưng chậm hơn nhiều so với dùng dashboard có sẵn truy vấn. Họ cũng không dựng lại được dashboard vì dịch vụ cấp phát máy đang quá tải. Nguyên nhân gốc là AWS Transit Gateway nối các VPC của Slack bị quá tải trong ngày làm việc đầu năm. Bài viết giải thích dashboard và cảnh báo hỏng vì chúng chạy ở một VPC khác với database phía sau, nên phụ thuộc vào chính Transit Gateway đó; việc khắc phục là chạy chúng cùng VPC với database. Bài cũng viết Slack cố giữ công cụ giám sát độc lập với hạ tầng của Slack nhiều nhất có thể, để chúng không bỏ rơi đội đúng lúc cần nhất. Phần suy ra của bài: tín hiệu đầu tiên đến từ thứ đứng ngoài, và thứ hỏng là một phụ thuộc mạng mà hệ giám sát không có lý do gì để cần.
+
+</Callout>
+
+<Check id="d16.5.failure-domain">Chỉ ra được failure domain chung giữa hệ giám sát và hệ được giám sát trong một kiến trúc cho trước, và đề xuất được cách tách theo chi phí.</Check>
+
+### Continuous profiling
+
+**Profile** là một mẫu thống kê về nơi tiến trình tiêu tài nguyên: profiler lấy mẫu nhiều lần mỗi giây (với CPU của Go là khoảng 100 lần), mỗi lần ghi lại **stack** (chuỗi hàm đang gọi nhau) tại thời điểm đó, rồi đếm. Hàm xuất hiện trong nhiều mẫu là hàm tốn nhiều. **Continuous profiling** làm việc đó liên tục ở production với overhead thấp và gửi về một kho, như metric, để bạn hỏi "tuần trước, sau bản triển khai đó, hàm nào bắt đầu tốn CPU" thay vì phải tái hiện vấn đề.
+
+| Loại profile | Đo | Trả lời |
+|---|---|---|
+| CPU | Thời gian CPU theo stack | Dòng code nào làm máy bận |
+| Cấp phát (alloc) | Byte, số object được cấp phát | Ai tạo áp lực lên garbage collector |
+| Bộ nhớ đang dùng (inuse) | Byte còn sống | Ai giữ bộ nhớ, nghi rò rỉ ở đâu |
+| Goroutine, mutex, block | Số goroutine, thời gian chờ khoá | Vì sao tiến trình chậm mà CPU không cao |
+
+**Flame graph** là cách vẽ hàng nghìn stack trong một hình. Mỗi ô là một hàm; ô nằm trên ô gọi nó; **độ rộng** là phần mẫu có hàm đó trong stack. Trục ngang không phải thời gian.
+
+```text
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │ total: 100% mẫu                                                         │ ← đáy: gốc
+ ├──────────────────────────────────────────────────┬──────────────────────┤
+ │ net/http.(*conn).serve                     80%   │ runtime (GC…)   20%  │
+ ├──────────────────────────────────────────────────┤                      │
+ │ main.instrument.func1                      75%   │                      │
+ ├────────────────────────────────────┬─────────────┤                      │
+ │ main.loadCatalog              70%  │ time.Sleep… │                      │
+ ├────────────────────────────────────┤             │                      │
+ │ encoding/json.Unmarshal       70%  │             │                      │
+ ├──────┬──────┬──────┬───────────────┤             │                      │
+ │ ……   │ ……   │ ……   │ mallocgc …    │   ← các ô trên cùng là nơi CPU thật sự chạy (self)
+ └──────┴──────┴──────┴───────────────┴─────────────┴──────────────────────┘
+```
+
+Hai con số của mỗi hàm: **total** (mọi mẫu có hàm đó ở bất kỳ đâu trong stack, tức nó và mọi thứ nó gọi) và **self** (mẫu mà hàm đó nằm trên cùng, tức chính nó đang chạy). Cách đọc: tìm ô rộng nhất trong code của bạn (total cao), rồi nhìn lên trên để biết nó tiêu thời gian vào đâu. Hình trên chỉ minh hoạ; bước 6 đo trên ứng dụng thật.
+
+**Cách thu thập:**
+
+| Cách | Ví dụ | Ghi chú |
+|---|---|---|
+| SDK trong ứng dụng đẩy lên | `pyroscope-go` (lab dùng) | Thêm một thư viện; chạy được ở mọi nơi |
+| Bộ thu kéo endpoint profile của ứng dụng | Alloy kéo `/debug/pprof` của Go | Ứng dụng không cần biết kho profile ở đâu, giống mô hình pull của Prometheus |
+| eBPF ở mức node | Profiler của OpenTelemetry, Alloy | Không cần sửa ứng dụng; thấy được cả tiến trình không có SDK |
+
+**Nối profile với trace.** Một profile tổng hợp nói "hàm này tốn CPU", một trace nói "request này chậm ở span này". Pyroscope có **span profiles**: SDK gắn ID của span đang chạy vào từng mẫu profile, nên từ một span chậm trong Tempo có thể mở đúng phần profile của nó; tài liệu ghi rằng mặc định chỉ span gốc trong tiến trình được gắn, và Go là một trong các ngôn ngữ được hỗ trợ. OpenTelemetry cũng đang phát triển profiles thành một tín hiệu bên cạnh trace, metric và log. Lab chỉ dựng phần profile; nối với trace là phần đọc thêm.
+
+<Check id="d16.5.profiling">Giải thích được profile được lấy mẫu thế nào, phân biệt được total với self, đọc được một flame graph để tìm hàm tốn tài nguyên, và nêu được các cách thu thập profile.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Watchdog (kube-prometheus runbooks)](https://runbooks.prometheus-operator.dev/runbooks/general/watchdog/): ý nghĩa của alert luôn kêu và việc nối nó với một dead man's switch.
+- [Alerting rules (Prometheus)](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/): cú pháp rule; kết hợp với cờ `--rules.alert.resend-delay` để hiểu thời hạn của alert gửi sang Alertmanager.
+- [Flame graphs (Grafana Pyroscope documentation)](https://grafana.com/docs/pyroscope/latest/view-and-analyze-profile-data/flamegraphs/): cách đọc flame graph, total và self.
+- [Link tracing and profiling with span profiles (Grafana Pyroscope documentation)](https://grafana.com/docs/pyroscope/latest/configure-client/trace-span-profiles/): span profiles và giới hạn của nó.
+- [Slack's Outage on January 4th 2021 (Slack Engineering)](https://slack.engineering/slacks-outage-on-january-4th-2021/): bài tường trình trong callout; đọc đoạn về dịch vụ dashboard và cảnh báo.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D16.2: thư mục `~/masteva-d16/slo` có Prometheus, Alertmanager và `webhook`. Mọi khối lệnh trừ bước 2 chạy trong `~/masteva-d16/slo`; mở terminal mới thì `cd` vào đó trước. Dừng cụm của D16.3 và D16.4 nếu còn chạy. Lab tải image Python (khoảng 20 MB nén, đã có nếu bạn học D7.2) và Pyroscope (khoảng 51 MB). Dùng thêm cổng **9776** (dead man's switch) và **9777** (Pyroscope). **Profile máy:** cụm của D16.2 cộng dead man's switch (khoảng 15 MiB) và Pyroscope (khoảng 60 MiB lúc mới chạy, tăng dần theo lượng profile đã nhận): khoảng 200 đến 310 MiB. **Thời gian:** bước 4 chờ Prometheus "chết" được phát hiện, khoảng 6 phút.
+
+### 1. Prometheus tự giám sát, và các alert về chính nó
+
+Ghi lại `prometheus.yml` với hai job mới: Prometheus scrape chính nó và scrape Alertmanager. Thêm file rule `meta.yml` với hai alert: `Watchdog` luôn kêu, và `AlertmanagerNotificationsFailing` khi Alertmanager gửi thông báo thất bại. Cấu hình Alertmanager thêm hai route đứng **trước** route `page`: Watchdog đi tới dead man's switch với nhịp nhắc lại 30 giây, alert có `component="monitoring"` đi tới một kênh dự phòng.
+
+<Terminal where="mac" title="~/masteva-d16/slo">
+
+```bash
+cd ~/masteva-d16/slo
+docker compose up -d 2>&1 | grep -c -E 'Started|Running'
+cat > prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: shop
+    static_configs:
+      - targets: ["shop:8080"]
+  - job_name: stock
+    static_configs:
+      - targets: ["stock:8080"]
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+EOF
+cat > prometheus/rules/meta.yml <<'EOF'
+groups:
+  - name: meta-monitoring
+    rules:
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: "Luôn kêu: chứng minh đường Prometheus → Alertmanager → bên ngoài còn sống"
+      - alert: AlertmanagerNotificationsFailing
+        expr: sum by (integration) (rate(alertmanager_notifications_failed_total[1m])) > 0
+        for: 30s
+        labels:
+          severity: page
+          component: monitoring
+        annotations:
+          summary: "Alertmanager gửi thông báo qua {{ $labels.integration }} thất bại"
+EOF
+cat > alertmanager/alertmanager.yml <<'EOF'
+route:
+  receiver: ticket
+  group_by: [alertname, severity]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+  routes:
+    - matchers: ['alertname="Watchdog"']
+      receiver: deadman
+      group_wait: 0s
+      group_interval: 10s
+      repeat_interval: 30s
+    - matchers: ['component="monitoring"']
+      receiver: backup
+    - matchers: ['severity="page"']
+      receiver: page
+
+receivers:
+  - name: page
+    webhook_configs:
+      - url: http://webhook:8080/page
+  - name: ticket
+    webhook_configs:
+      - url: http://webhook:8080/ticket
+  - name: deadman
+    webhook_configs:
+      - url: http://d16-deadman:8080/heartbeat
+  - name: backup
+    webhook_configs:
+      - url: http://d16-deadman:8080/backup
+EOF
+docker exec d16-prometheus promtool check config /etc/prometheus/prometheus.yml | grep -E 'SUCCESS|FAILED'
+docker exec d16-alertmanager amtool check-config /etc/alertmanager/alertmanager.yml | head -1
+docker exec d16-alertmanager amtool config routes test --config.file=/etc/alertmanager/alertmanager.yml alertname=Watchdog severity=none
+docker exec d16-alertmanager amtool config routes test --config.file=/etc/alertmanager/alertmanager.yml alertname=AlertmanagerNotificationsFailing severity=page component=monitoring
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+6
+  SUCCESS: 3 rule files found
+ SUCCESS: /etc/prometheus/prometheus.yml is valid prometheus config file syntax
+  SUCCESS: 2 rules found
+  SUCCESS: 17 rules found
+  SUCCESS: 1 rules found
+Checking '/etc/alertmanager/alertmanager.yml'  SUCCESS
+deadman
+backup
+```
+
+</Expected>
+
+- `amtool config routes test` xác nhận Watchdog tới `deadman`, còn alert về chính hệ giám sát tới `backup`, dù nó mang `severity="page"`: Alertmanager đi theo route con **đầu tiên** khớp, nên thứ tự route là một phần của cấu hình.
+- Route Watchdog có ba tham số riêng: `group_wait: 0s` gửi ngay, `group_interval: 10s` và `repeat_interval: 30s` làm Alertmanager nhắc lại alert không đổi khoảng mỗi 30 giây. Mỗi lần nhắc là một heartbeat.
+- **Chưa nạp lại** Prometheus và Alertmanager ở bước này: hai receiver mới trỏ tới dead man's switch, thứ chỉ có ở bước 2. Nạp sớm thì Alertmanager gửi Watchdog vào một địa chỉ chưa tồn tại, đúng loại lỗi mà alert `AlertmanagerNotificationsFailing` được viết để bắt, và log của bước 2 sẽ lẫn các alert đó. `amtool` kiểm file trên đĩa nên không cần nạp lại.
+- `backup` trỏ tới cùng chương trình dead man's switch ở một đường dẫn khác, để lab gọn. Ở production đó là một kênh thật sự khác: một tài khoản công cụ trực khác, SMS, email qua nhà cung cấp khác.
+
+### 2. Dead man's switch ở bên ngoài
+
+Chương trình nhận heartbeat ở `/heartbeat`, ghi lại thời điểm nhận Watchdog gần nhất, và mỗi 5 giây kiểm tra: im lặng quá `TIMEOUT` giây thì in `BÁO ĐỘNG` (ở production là gọi điện, nhắn tin), có lại thì in `Watchdog đã quay lại`. Đường `/backup` in mọi alert nhận được. `GET /` trả về số giây từ heartbeat gần nhất, mã 503 nếu đã quá hạn.
+
+Nó chạy bằng `docker run`, **không** nằm trong `compose.yaml` của hệ giám sát: dừng hay dọn cụm giám sát không đụng tới nó. Lab gắn nó vào mạng của cụm để Alertmanager gọi được bằng tên; ở production nó nằm ở hạ tầng khác, Alertmanager gọi tới qua Internet.
+
+<Terminal where="mac" title="~/masteva-d16/deadman">
+
+```bash
+mkdir -p ~/masteva-d16/deadman && cd ~/masteva-d16/deadman
+cat > deadman.py <<'EOF'
+"""Dead man's switch: báo động khi NGỪNG nhận được alert Watchdog."""
+import json
+import os
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+TIMEOUT = int(os.environ.get("TIMEOUT", "90"))  # số giây im lặng tối đa
+last_beat = time.time()
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        global last_beat
+        size = min(int(self.headers.get("Content-Length", "0")), 1 << 20)
+        body = json.loads(self.rfile.read(size) or b"{}")
+        alerts = body.get("alerts", [])
+        if self.path == "/heartbeat":
+            if any(a["labels"].get("alertname") == "Watchdog" and a["status"] == "firing" for a in alerts):
+                last_beat = time.time()
+        else:  # /backup: kênh dự phòng cho alert về chính hệ giám sát
+            for a in alerts:
+                log(f"KÊNH DỰ PHÒNG: {a['status']} {a['labels'].get('alertname')}: {a['annotations'].get('summary', '')}")
+        self.send_response(200)
+        self.end_headers()
+
+    def do_GET(self):
+        age = int(time.time() - last_beat)
+        self.send_response(200 if age <= TIMEOUT else 503)
+        self.end_headers()
+        self.wfile.write(f"heartbeat cách đây {age} giây\n".encode())
+
+    def log_message(self, *args):
+        pass
+
+
+def watch():
+    alarm = False
+    while True:
+        time.sleep(5)
+        age = time.time() - last_beat
+        if age > TIMEOUT and not alarm:
+            alarm = True
+            log(f"BÁO ĐỘNG: {int(age)} giây không nhận được Watchdog")  # production: gọi điện, SMS…
+        elif age <= TIMEOUT and alarm:
+            alarm = False
+            log("Watchdog đã quay lại")
+
+
+threading.Thread(target=watch, daemon=True).start()
+log(f"deadman nghe ở :8080, báo động sau {TIMEOUT} giây im lặng")
+ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+EOF
+docker run -d --name d16-deadman --restart unless-stopped --network d16-slo_default -p 127.0.0.1:9776:8080 \
+  -v "$PWD/deadman.py:/app/deadman.py:ro" -e TIMEOUT=90 \
+  python:3.14.8-alpine@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72 python /app/deadman.py > /dev/null
+curl -s -X POST localhost:9761/-/reload -w 'prometheus reload: %{http_code}\n'
+curl -s -X POST localhost:9762/-/reload -w 'alertmanager reload: %{http_code}\n'
+sleep 45
+curl -s -w 'HTTP %{http_code}\n' localhost:9776/
+docker logs d16-deadman
+curl -s localhost:9762/metrics | grep -E '^alertmanager_notifications_total\{integration="webhook"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+prometheus reload: 200
+alertmanager reload: 200
+heartbeat cách đây 5 giây
+HTTP 200
+09:54:00 deadman nghe ở :8080, báo động sau 90 giây im lặng
+alertmanager_notifications_total{integration="webhook"} 4
+```
+
+</Expected>
+
+Dead man's switch chạy trước, rồi mới nạp lại cấu hình của bước 1. Heartbeat mới nhất cách từ vài giây tới tối đa khoảng 30 giây, mã 200: đường từ Prometheus qua Alertmanager tới bên ngoài đang sống. Log chỉ có dòng khởi động, vì chương trình chỉ in khi trạng thái **đổi**. Bộ đếm thông báo webhook của Alertmanager tăng đều mỗi 30 giây nhờ Watchdog. Giờ trên log là giờ UTC trong container.
+
+### 3. Alertmanager chết
+
+<Callout kind="danger">
+
+Bước 3, 4 và 5 lần lượt dừng Alertmanager, Prometheus và `webhook` để mô phỏng sự cố của chính hệ giám sát; mỗi bước bật lại thứ đã dừng ở cuối khối lệnh. Không dữ liệu nào bị xoá.
+
+</Callout>
+
+Dừng Alertmanager và chờ dead man's switch báo, tối đa 3 phút:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d16/slo
+S=$(date +%s); docker compose stop alertmanager 2>&1 | tail -1
+for i in $(seq 36); do docker logs d16-deadman 2>&1 | tail -1 | grep -q 'BÁO ĐỘNG' && break; sleep 5; done
+echo "phát hiện sau $(( $(date +%s) - S )) giây"; docker logs d16-deadman 2>&1 | tail -1
+docker compose start alertmanager 2>&1 | tail -1
+S=$(date +%s)
+for i in $(seq 36); do docker logs d16-deadman 2>&1 | tail -1 | grep -q 'quay lại' && break; sleep 5; done
+echo "hồi phục sau $(( $(date +%s) - S )) giây"; docker logs d16-deadman 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d16-alertmanager Stopped 
+phát hiện sau 56 giây
+09:56:11 BÁO ĐỘNG: 90 giây không nhận được Watchdog
+ Container d16-alertmanager Started 
+hồi phục sau 50 giây
+09:57:01 Watchdog đã quay lại
+```
+
+</Expected>
+
+- **Phát hiện** sau khoảng 55 đến 95 giây: TIMEOUT 90 giây tính từ heartbeat cuối, mà heartbeat cuối đến trước lúc dừng tối đa 30 giây. Bên trong cụm, không thứ gì báo được điều này: Prometheus vẫn chạy và vẫn đánh giá Watchdog, chỉ là không ai chuyển nó đi.
+- **Hồi phục** sau khoảng một phút: Alertmanager mới khởi động không có alert nào, và Prometheus chỉ gửi lại alert đang firing sau `--rules.alert.resend-delay` (1 phút) kể từ lần gửi trước.
+
+### 4. Prometheus chết
+
+<Terminal where="mac">
+
+```bash
+S=$(date +%s); docker compose stop prometheus 2>&1 | tail -1
+curl -s localhost:9762/api/v2/alerts | jq -r '.[] | select(.labels.alertname == "Watchdog") | "Watchdog trong Alertmanager: \(.status.state), hết hạn lúc \(.endsAt[11:19]) UTC"'
+date -u +'bây giờ: %H:%M:%S UTC'
+for i in $(seq 96); do docker logs d16-deadman 2>&1 | tail -1 | grep -q 'BÁO ĐỘNG' && break; sleep 5; done
+echo "phát hiện sau $(( $(date +%s) - S )) giây"; docker logs d16-deadman 2>&1 | tail -1
+docker compose start prometheus 2>&1 | tail -1
+for i in $(seq 36); do docker logs d16-deadman 2>&1 | tail -1 | grep -q 'quay lại' && break; sleep 5; done
+docker logs d16-deadman 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Predict question="Alertmanager vẫn sống. Bao lâu sau khi Prometheus dừng thì dead man's switch báo động?">
+
+```text
+ Container d16-prometheus Stopped 
+Watchdog trong Alertmanager: active, hết hạn lúc 10:00:57 UTC
+bây giờ: 09:57:39 UTC
+phát hiện sau 253 giây
+10:01:51 BÁO ĐỘNG: 93 giây không nhận được Watchdog
+ Container d16-prometheus Started 
+10:02:01 Watchdog đã quay lại
+```
+
+Lâu hơn nhiều so với bước 3: khoảng 4 tới 6 phút. Dòng thứ hai và thứ ba giải thích vì sao: alert Watchdog trong Alertmanager vẫn `active`, với hạn `endsAt` còn gần 4 phút nữa (4 lần `resend-delay` 1 phút tính từ lần Prometheus gửi cuối, như phần Kiến thức). Trong khoảng đó Alertmanager tiếp tục gửi heartbeat như chưa có gì; tới hạn, alert hết hiệu lực và Alertmanager gửi thông báo `resolved`, mà chương trình không tính là heartbeat. Đồng hồ 90 giây tính từ heartbeat cuối cùng trước lúc đó. Muốn phát hiện Prometheus chết nhanh hơn, cách thường làm là thêm một tín hiệu khác: một Prometheus thứ hai scrape nó và alert trên `up`, hoặc một probe từ bên ngoài gọi thẳng `/-/healthy` của nó.
+
+</Predict>
+
+<Check id="d16.5.lab-deadman">Dựng được Watchdog cùng một dead man's switch bên ngoài, đo được thời gian phát hiện khi Alertmanager chết và khi Prometheus chết, và giải thích được chênh lệch bằng hạn `endsAt` của alert.</Check>
+
+### 5. Đường gửi thông báo chết
+
+Lần này mọi thứ đều chạy, chỉ có nơi nhận `page` (`webhook`, vai hệ thống gọi người trực) chết, như một token Slack hết hạn. Tạo một alert thử mức `page` bằng `amtool` để có thứ cần gửi:
+
+<Terminal where="mac">
+
+```bash
+failed() { curl -s localhost:9762/metrics | awk '/^alertmanager_notifications_failed_total\{.*integration="webhook"/ { s += $NF } END { print s + 0 }'; }
+n0=$(docker logs d16-deadman 2>&1 | grep -c 'KÊNH DỰ PHÒNG'); f0=$(failed)
+echo "trước khi gây lỗi: $n0 dòng ở kênh dự phòng, $f0 lần gửi webhook thất bại"
+docker compose stop webhook 2>&1 | tail -1
+docker exec d16-alertmanager amtool --alertmanager.url=http://localhost:9093 alert add TestPage severity=page --annotation='summary="alert thử"'
+S=$(date +%s)
+for i in $(seq 36); do [ "$(docker logs d16-deadman 2>&1 | grep -c 'KÊNH DỰ PHÒNG')" -gt "$n0" ] && break; sleep 5; done
+echo "kênh dự phòng nhận sau $(( $(date +%s) - S )) giây"
+docker logs d16-deadman 2>&1 | grep 'KÊNH DỰ PHÒNG' | tail -1
+echo "lần gửi webhook thất bại trong lúc đó: $(( $(failed) - f0 ))"
+docker compose start webhook 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trước khi gây lỗi: 0 dòng ở kênh dự phòng, 0 lần gửi webhook thất bại
+ Container d16-webhook Stopped 
+kênh dự phòng nhận sau 91 giây
+10:04:02 KÊNH DỰ PHÒNG: firing AlertmanagerNotificationsFailing: Alertmanager gửi thông báo qua webhook thất bại
+lần gửi webhook thất bại trong lúc đó: 2
+ Container d16-webhook Started 
+```
+
+</Expected>
+
+Alertmanager thử gửi `TestPage` tới `webhook`, thất bại, thử lại nhiều lần, rồi tăng `alertmanager_notifications_failed_total`. Prometheus scrape bộ đếm đó (job `alertmanager` ở bước 1), alert `AlertmanagerNotificationsFailing` kêu sau `for: 30s`, và vì có `component="monitoring"` nó đi theo route `backup`, **không** qua đường đang hỏng. Tổng thời gian khoảng một tới hai phút: thời gian Alertmanager thử lại, cửa sổ `rate`, `for`, rồi `group_wait`. Khi `webhook` sống lại, Alertmanager gửi được `TestPage` ở lần thử kế tiếp; alert thử tự hết hạn sau khoảng 5 phút (`resolve_timeout` mặc định), vì `amtool alert add` không đặt thời điểm kết thúc. Khối lệnh đếm số dòng ở kênh dự phòng và số lần gửi thất bại **trước** khi gây lỗi, rồi chỉ tính phần tăng thêm, để không lẫn với những gì đã xảy ra trước đó.
+
+Nếu alert này đi qua route `page` như mọi alert `severity="page"` khác, nó sẽ được gửi tới đúng chỗ đang chết: thông báo "không gửi được thông báo" không bao giờ tới ai.
+
+<Check id="d16.5.lab-pipeline">Viết được alert về một thành phần của đường ống cảnh báo và định tuyến nó qua một kênh không phụ thuộc thành phần đó, và chứng minh được trên lab.</Check>
+
+### 6. Continuous profiling
+
+Thêm Pyroscope và bật biến `PYROSCOPE_URL` cho `shop`: ứng dụng mẫu đã có sẵn SDK `pyroscope-go` (bước 1 của D16.1), chỉ chờ biến này để gửi profile CPU và cấp phát bộ nhớ mỗi 15 giây.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d16/slo
+cat > compose.prof.yaml <<'EOF'
+services:
+  pyroscope:
+    image: grafana/pyroscope:2.4.0@sha256:b7e62699a27463aa3533efe3f88c320da594da495731fd6eabca6f44f92cdd7b
+    container_name: d16-pyroscope
+    ports: ["127.0.0.1:9777:4040"]
+  shop:
+    environment: { PYROSCOPE_URL: "http://pyroscope:4040" }
+EOF
+echo 'COMPOSE_FILE=compose.yaml:compose.alert.yaml:compose.prof.yaml' > .env
+docker compose up -d 2>&1 | grep -E '(pyroscope|shop) +(Started|Recreated)'
+for i in $(seq 30); do curl -sf localhost:9777/ready > /dev/null && break; sleep 3; done; curl -s localhost:9777/ready; echo
+sleep 90
+curl -s localhost:9777/querier.v1.QuerierService/LabelValues -H 'Content-Type: application/json' -d '{"name": "service_name"}'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d16-shop Recreated 
+ Container d16-pyroscope Started 
+ Container d16-shop Started 
+ready
+{"names":["pyroscope", "shop"]}
+```
+
+</Expected>
+
+Pyroscope đã nhận profile từ `shop`, cùng profile của chính nó (`pyroscope`). Mở `http://localhost:9777`, chọn `shop` và loại `process_cpu`: đó là flame graph của một phút rưỡi vừa qua. Phần kiểm bằng dòng lệnh dưới gọi API `render` (cùng dữ liệu với giao diện) và tính, cho mỗi hàm, phần trăm mẫu ở dạng total và self. Script `topfn` cộng các ô cùng tên trong flame graph; với hàm của chính ứng dụng, vốn không đệ quy, đó đúng là total.
+
+<Terminal where="mac">
+
+```bash
+cat > topfn <<'EOF'
+#!/bin/sh
+curl -sG localhost:9777/pyroscope/render \
+  --data-urlencode "query=process_cpu:cpu:nanoseconds:cpu:nanoseconds{service_name=\"shop\"}" \
+  --data-urlencode "from=now-${1:-1m}" --data-urlencode 'until=now' --data-urlencode 'format=json' \
+| jq -r '.flamebearer as $f
+  | [$f.levels[] | . as $l | range(0; length; 4) | {name: $f.names[$l[. + 3]], self: $l[. + 2], total: $l[. + 1]}]
+  | group_by(.name) | map({name: .[0].name, self: (map(.self) | add), total: (map(.total) | add)})
+  | "Hàm của ứng dụng, theo total:", (map(select(.name | startswith("main."))) | sort_by(-.total) | .[:5][]
+      | "  \(.total / $f.numTicks * 100 | round)%\t\(.name)"),
+    "Mọi hàm, theo self:", (sort_by(-.self) | .[:5][] | "  \(.self / $f.numTicks * 100 | round)%\t\(.name)")'
+EOF
+chmod +x topfn
+./topfn 1m
+```
+
+</Terminal>
+
+<Predict question="shop phục vụ products (60% request, vài chục mili giây mỗi cái, phần lớn là ngủ) và checkout (gọi sang stock). Hàm nào của ứng dụng chiếm nhiều CPU nhất?">
+
+```text
+Hàm của ứng dụng, theo total:
+  77%	main.instrument.func1
+  76%	main.handle.func1
+  75%	main.api.func2
+  75%	main.loadCatalog
+  2%	main.api.func3
+Mọi hàm, theo self:
+  12%	encoding/json/internal/jsonwire.ConsumeWhitespace
+  7%	encoding/json/internal/jsonwire.ConsumeSimpleString
+  6%	unicode/utf8.decodeRuneSlow
+  5%	encoding/json/internal/jsonwire.ConsumeStringResumable
+  5%	encoding/json/jsontext.(*decoderState).consumeValue
+```
+
+- Theo **total**, chuỗi hàm của ứng dụng là một đường thẳng: `instrument` bọc mọi request, `handle` bọc mọi route, `api.func2` là handler của `products`, và **`main.loadCatalog`** chiếm khoảng 70 đến 75% CPU của cả tiến trình. Handler của `checkout` (`api.func3`) chỉ khoảng 1 đến 2%: nó chủ yếu chờ `stock`, mà chờ thì không tốn CPU.
+- Theo **self**, không hàm nào của ứng dụng đứng đầu: CPU thật sự chạy trong các hàm của `encoding/json` (bản Go 1.27 dùng phần cài đặt bên trong của `encoding/json/v2`) và cấp phát bộ nhớ. Đó là lý do phải đọc cả hai cột: self chỉ chỗ máy bận, total chỉ ai trong code của bạn gây ra.
+- Đọc lại code ở bước 1 của D16.1: `loadCatalog` giải mã lại toàn bộ danh mục 5.000 sản phẩm ở **mỗi** request `products`, thay vì giải mã một lần lúc khởi động. Cách sửa là giữ kết quả trong bộ nhớ; profile cấp phát (`memory:alloc_space`) chỉ ra cùng hàm đó.
+
+Con số phần trăm của bạn sẽ khác vài điểm; thứ tự thì giống.
+
+</Predict>
+
+Không cần dashboard nào báo "CPU cao" để tìm ra điều này: CPU của `shop` chỉ vài phần trăm một nhân. Continuous profiling cho bạn câu trả lời trước khi nó thành vấn đề dung lượng (D18), và cho phép so profile trước và sau một bản triển khai.
+
+<Check id="d16.5.lab-profiling">Bật được continuous profiling cho một service Go, lấy được danh sách hàm theo total và self từ Pyroscope, và chỉ ra được hàm gây tốn CPU cùng cách sửa.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Dead man's switch báo động ngay sau khi chạy:** route Watchdog chưa có hiệu lực (Alertmanager chưa nạp lại) hoặc container `d16-deadman` không cùng mạng với Alertmanager. Kiểm `docker logs d16-alertmanager 2>&1 | grep -i deadman | tail -3`.
+- **`docker run … d16-deadman` báo tên đã tồn tại:** bạn chạy bước 2 lần thứ hai; dùng container cũ, hoặc xoá nó bằng lệnh ở phần Dọn dẹp rồi chạy lại.
+- **Bước 5 chờ hết 3 phút mà kênh dự phòng không nhận gì:** Prometheus chưa scrape Alertmanager; xem `curl -s localhost:9761/api/v1/targets | jq -r '.data.activeTargets[] | "\(.labels.job) \(.health)"'`.
+- **`./topfn` in `null` hay chia cho 0:** Pyroscope chưa có dữ liệu trong khoảng nhìn lại; chờ thêm 30 giây hoặc gọi `./topfn 5m`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu">
+
+```bash
+cd ~/masteva-d16/slo && docker compose stop
+docker stop d16-deadman
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Các lệnh dưới xoá toàn bộ lab của chặng D16: container `d16-deadman`, mọi container và volume của ba project Compose `d16-slo`, `d16-lt`, `d16-otel` (gồm metric đã nạp, bucket S3, trace và log), image `d16-app:1.0.0`, và thư mục `~/masteva-d16` cùng mọi file bạn đã viết trong năm bài. Dòng cuối xoá các image công cụ của chặng để lấy lại khoảng 2 GB đĩa; bỏ dòng đó, hoặc bỏ bớt tên, nếu bạn còn dùng chúng (`golang`, distroless và `python` cũng được dùng ở các chặng khác).
+
+</Callout>
+
+<Terminal where="mac" title="Dọn hẳn cả chặng">
+
+```bash
+docker rm -f d16-deadman
+for p in slo lt otel; do (cd ~/masteva-d16/$p && docker compose down -v); done
+docker rmi d16-app:1.0.0
+cd ~ && rm -rf ~/masteva-d16
+docker rmi prom/prometheus:v3.15.0 prom/alertmanager:v0.34.1 ghcr.io/slok/sloth:v0.16.0 quay.io/thanos/thanos:v0.42.4 chrislusf/seaweedfs:4.48 otel/opentelemetry-collector-contrib:0.162.0 grafana/tempo:3.1.0 grafana/loki:3.7.8 grafana/alloy:v1.20.1 grafana/pyroscope:2.4.0 python:3.14.8-alpine golang:1.27.2-alpine gcr.io/distroless/static-debian13:nonroot
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Ai giám sát dead man's switch?">
+
+Câu hỏi này không có điểm dừng nếu trả lời bằng thêm một tầng nữa, nên người ta dừng ở chỗ rủi ro đủ thấp: dead man's switch là một chương trình rất nhỏ, ít thay đổi, chạy ở nơi khác, và thường là dịch vụ của một bên thứ ba có SLO riêng. Hai thực hành giúp tin nó: thử định kỳ (mỗi tháng tắt Alertmanager ở môi trường thử, như bước 3, và xem có ai bị gọi không), và cho nó tự báo khi chính nó gặp lỗi khi gửi cảnh báo. Ở cuộc diễn tập sự cố của D17, "hệ giám sát chết" là một kịch bản nên có.
+
+</Reveal>
+
+<Reveal title="Alert về hệ giám sát có nên gọi người dậy không?">
+
+Tuỳ hậu quả. Mất toàn bộ khả năng cảnh báo (dead man's switch báo) là sự cố mức cao: trong lúc đó mọi sự cố khác đều vô hình, nên gọi người. Một target không scrape được, một rule lỗi, Collector bỏ vài phần trăm span thường là ticket trong giờ làm, trừ khi nó làm mù một SLO đang được dùng để gọi người. Nguyên tắc của D12.4 vẫn đúng: mỗi alert gọi người phải kèm một việc làm được ngay, và alert về hệ giám sát cũng cần runbook như mọi alert khác.
+
+</Reveal>
+
+<Reveal title="Profiling liên tục ở production có làm chậm ứng dụng không?">
+
+Có, nhưng ít, vì nó lấy mẫu chứ không đo mọi lời gọi: profiler CPU của Go ghi stack khoảng 100 lần mỗi giây. Profile bộ nhớ của Go cũng lấy mẫu (mặc định một mẫu cho mỗi khoảng 512 KB được cấp phát). Chi phí lớn hơn nằm ở phía kho: profile có nhiều chiều (mỗi stack là một chuỗi), nên giới hạn số label và thời gian lưu như với metric. Cách thận trọng: bật cho một phần instance, đo CPU và độ trễ trước và sau như mọi thay đổi khác, rồi mở rộng.
+
+</Reveal>
+
+<Reveal title="Đã có trace thì cần profile làm gì?">
+
+Trace nói một request mất thời gian ở **span** nào: gọi database, gọi service khác, hay xử lý trong service. Khi span chậm là "xử lý trong service" mà không có span con nào, trace dừng ở đó; profile đi tiếp xuống **hàm** nào trong span đó tốn CPU hay cấp phát bộ nhớ. Ngược lại, profile tổng hợp nói hàm nào tốn nhất cho **mọi** request, không nói request nào. Span profiles nối hai thứ: từ một span chậm mở đúng phần profile của nó. Với những vấn đề như lab vừa thấy (một hàm tốn CPU ở mọi request nhưng không làm request nào chậm tới mức đáng chú ý), profile là tín hiệu duy nhất chỉ ra nó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết alert Watchdog, cấu hình route cho dead man's switch, hay giải thích một flame graph bạn chụp lại: đều hợp. Chỗ hay sai: đặt route Watchdog sau route bắt `severity` khiến nó đi nhầm chỗ, để `repeat_interval` mặc định 4 giờ (heartbeat 4 giờ một lần thì TIMEOUT phải hơn 4 giờ), gửi alert "thông báo thất bại" qua chính kênh đang hỏng, cho rằng Prometheus chết bị phát hiện ngay như Alertmanager chết, và đọc flame graph như biểu đồ theo thời gian hoặc chỉ nhìn self mà bỏ qua total. Kiểm lại bằng chính lab: `amtool config routes test` cho từng loại alert, và tắt từng thành phần như bước 3 tới 5 để đo thời gian phát hiện thật.
+
+</Callout>
+
+<Callout kind="link">
+
+D12.1, D12.4 đặt vấn đề hệ giám sát im lặng (Equifax, Roblox) mà bài này giải quyết. D16.3 và D16.4 dựng các thành phần (Thanos, Collector hai tầng, Alloy) mà bảng ở phần Kiến thức chỉ ra cách giám sát. D17 đưa "hệ giám sát chết" vào diễn tập sự cố và runbook; D18 dùng load test để lập kế hoạch dung lượng, và D18.3 đọc flame graph của `perf` ở tầng hệ điều hành. SB12 dùng profiler của JVM theo cùng tư duy total và self cho ứng dụng Spring.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d16.5.mastery-meta">Với một hệ thống giám sát cho trước, liệt kê được các điểm có thể chết im lặng, và thiết kế được bộ alert cùng dead man's switch, kênh dự phòng để mỗi điểm đều có người biết khi nó chết.</Check>
+
+<Check id="d16.5.mastery-domain">Chỉ ra được phụ thuộc chung giữa hệ giám sát và hệ được giám sát, và đề xuất được cách tách phù hợp chi phí.</Check>
+
+<Check id="d16.5.mastery-profile">Dùng được continuous profiling để tìm hàm tốn tài nguyên trong một service, đọc đúng total và self, và kiểm được hiệu quả của bản sửa bằng profile trước và sau.</Check>
+
+</Mastery>

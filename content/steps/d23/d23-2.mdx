@@ -1,0 +1,726 @@
+---
+title: Quá tải, lỗi dây chuyền và load shedding ở biên
+description: Dựng chuỗi client, Envoy, service, database rồi làm database chậm 20 giây để thấy retry ở ba lớp nhân tải lên 18 lần và hệ không tự hồi dù database đã nhanh lại; sửa từng lớp bằng retry budget, hàng đợi có giới hạn bỏ việc đã quá hạn, và load shedding theo ưu tiên ở Envoy trả 503 kèm Retry-After, đo lại sau mỗi bước bằng Prometheus.
+id: d23.2
+step: d23
+prerequisites: [d23.1, d21.6]
+topics: [d23.qua-tai-loi-day-chuyen, d23.load-shedding-bien]
+status: verified
+verified:
+  date: 2026-10-18
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    envoy: 1.40.0
+    k6: 2.3.0
+    prometheus: 3.15.0
+    golang-image: 1.27.2-alpine
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biết một hệ đang chạy tốt sập thành hàng loạt thế nào khi chỉ một phụ thuộc chậm đi ít phút, vì sao nó không tự đứng dậy khi phụ thuộc đã khoẻ, và đặt các lớp phòng vệ để chuyện đó không xảy ra. Học xong bài này, bạn giải thích được:
+
+- Vì sao database chỉ chậm gấp 4 trong 20 giây mà service gọi nó tới 18 lần lưu lượng gốc.
+- Vì sao database xử lý đủ 190 truy vấn mỗi giây, hết công suất, mà không người dùng nào nhận được kết quả.
+- Vì sao giảm retry thôi chưa đủ để hệ tự hồi, và "bỏ việc đã quá hạn" cứu nó ra sao.
+- Vì sao từ chối nhanh một phần request ở biên (`503` kèm `Retry-After`) làm nhiều người dùng được phục vụ hơn là cố nhận hết.
+- Vì sao khi hồi phục sau sự cố lớn, các công ty chặn toàn bộ lưu lượng rồi mới mở dần.
+
+</Goal>
+
+<Knowledge>
+
+### Quá tải không chỉ là chậm: goodput
+
+D18.1 cho thấy trên trần, hàng đợi dài ra và độ trễ tăng theo thời gian. Câu hỏi của bài này là chuyện gì xảy ra **sau đó**, khi các thành phần phản ứng với độ trễ. Một khái niệm làm rõ mọi thứ:
+
+- **Throughput** (thông lượng): số việc hệ làm xong mỗi giây.
+- **Goodput**: số việc làm xong **mà vẫn còn người cần**. Một truy vấn chạy xong sau khi người gọi đã hết hạn chờ và bỏ đi là throughput, không phải goodput.
+
+Một hệ quá tải tệ nhất là hệ có throughput 100% và goodput 0%: mọi tài nguyên bận rộn phục vụ những người đã đi.
+
+### Năm cơ chế biến chậm thành sập
+
+**Lỗi dây chuyền** (cascading failure) là khi lỗi ở một phần làm tăng tải hoặc giảm năng lực của phần khác, và lan đi. Các cơ chế hay gặp:
+
+| Cơ chế | Diễn ra thế nào | Dấu hiệu |
+|---|---|---|
+| **Hàng đợi không giới hạn** | Phụ thuộc chậm, việc chờ chồng lên; tới lúc tới lượt thì người gọi đã bỏ đi | Độ trễ tăng đều theo thời gian, bộ nhớ tăng, throughput cao mà goodput thấp |
+| **Timeout trong dài hơn ngoài** | Lớp ngoài bỏ cuộc trước, lớp trong vẫn làm tiếp cho request đã chết (SB12.2 đã nêu quy tắc ngắn dần từ ngoài vào trong) | Log lớp trong toàn request "thành công" mà người dùng nhận lỗi |
+| **Retry nhân tải** (retry storm) | Mỗi lớp thử lại vài lần; số lần thử **nhân** với nhau qua các lớp | Tải vào phụ thuộc gấp nhiều lần lưu lượng người dùng |
+| **Thundering herd** ("đàn bò giẫm đạp") | Nhiều client cùng chờ một sự kiện rồi cùng lao vào một lúc: cache vừa hết hạn, service vừa khởi động lại, file vừa tải xong | Một đỉnh dựng đứng ngay lúc hồi phục, đánh sập lại phần vừa đứng dậy |
+| **Cạn tài nguyên kéo theo** | Request chờ lâu giữ bộ nhớ, thread, kết nối, port; tới lúc hết thì tiến trình chết (OOM kill) hoặc không mở được kết nối mới | Container bị OOM kill hàng loạt, `Cannot assign requested address` (D2.1) |
+
+Retry nhân tải là cơ chế dễ tính nhất. Client thử tối đa 3 lần, proxy ở biên thử 3 lần, service thử 4 lần với database: trong trường hợp xấu nhất mỗi thao tác của người dùng thành 3 × 3 × 4 = **36** truy vấn. Mỗi lớp nghĩ mình chỉ "thử lại cho chắc".
+
+```text
+ người dùng 100/s ──▶ biên (Envoy) ──▶ api ──▶ db (trần ~190/s)
+   thử 3 lần            thử 3 lần      thử tối đa 4 lần
+   300/s                tới 900/s      tới 3.600/s nếu mọi lần thử đều chạy hết
+                                       (lab đo được ~1.800/s vì hạn chót cắt bớt, xem bước 2)
+```
+
+<Callout kind="production">
+
+Theo bản báo cáo sau sự cố của Canva, ngày 12/11/2024 canva.com không dùng được từ 9:08 tới khoảng 10:00 UTC. Lúc 8:47 UTC một phiên bản mới của trình soạn thảo được triển khai; cùng lúc, đường mạng giữa hai điểm Singapore và Ashburn của Cloudflare bị mất gói (Cloudflare cho biết tới khoảng 66% lúc cao điểm), và một file JavaScript mất 20 phút mới tải xong. Cơ chế gộp request của CDN khiến hơn 270.000 request của người dùng cùng chờ trên một luồng tải; lúc 9:07 UTC file về, tất cả cùng hoàn tất, các trình duyệt cùng tải tiếp và tạo ra 1,5 triệu request mỗi giây vào API Gateway, gấp 3 lần đỉnh thường ngày: một thundering herd. Một lỗi hiệu năng trong thư viện telemetry (lấy khoá trên event loop) đã làm giảm sẵn năng lực mỗi task. Request dồn lại, load balancer mở thêm kết nối vào các task đang quá tải, bộ nhớ ngoài heap tăng, và OOM killer của Linux kết liễu mọi container trong 2 phút đầu; autoscaling không theo kịp, task mới bị quá tải ngay khi vừa được đánh dấu khoẻ. Canva hồi phục bằng cách thêm một luật firewall trên Cloudflare **chặn toàn bộ lưu lượng** lúc 9:29 UTC để task mới khởi động được, rồi mở lại dần, bắt đầu với người dùng ở Úc dưới giới hạn tốc độ chặt. Trong danh sách việc làm sau sự cố có thêm luật load shedding cho API Gateway, load test định kỳ, và runbook để chặn và mở lại lưu lượng từng phần. Nhận xét của bài: chuỗi này có ba cơ chế của bảng trên: thundering herd, cạn tài nguyên kéo theo, và các request chờ không giới hạn trên một luồng tải; cách hồi phục chính là "giảm tải mạnh rồi mở dần" của mục metastable bên dưới.
+
+</Callout>
+
+<Check id="d23.2.cascade">Kể được năm cơ chế của lỗi dây chuyền kèm dấu hiệu nhận biết, và tính được hệ số nhân tải khi nhiều lớp cùng retry.</Check>
+
+### Metastable: hệ không tự hồi
+
+Bài báo "Metastable Failures in Distributed Systems" (Bronson và cộng sự, HotOS 2021), viết từ kinh nghiệm một thập kỷ vận hành các hệ phân tán cỡ rất lớn, đặt tên cho kiểu hỏng khó chịu nhất: **trạng thái hỏng vẫn còn sau khi nguyên nhân kích hoạt đã hết**.
+
+```text
+  stable ──tải tăng──▶ vulnerable ──trigger──▶ metastable failure
+  (ổn định)            (vẫn khoẻ, hiệu quả     (goodput gần 0; một vòng
+                        cao, nhưng mong manh)   phản hồi giữ hệ ở lại đây)
+       ▲                                              │
+       └──── chỉ thoát khi có "cú đẩy" lớn: ──────────┘
+             giảm tải mạnh, khởi động lại, chặn lưu lượng
+```
+
+- **Trigger** (cú kích hoạt): database chậm vài chục giây, mạng chập chờn, một bản triển khai, cache bị xoá. Thứ gì cũng có thể là trigger; tìm và sửa trigger không ngăn được lần sau.
+- **Sustaining effect** (vòng tự duy trì): thứ giữ hệ ở trạng thái hỏng sau khi trigger hết, thường là **khuếch đại công việc**: retry, việc làm cho request đã chết, cache lạnh dồn tải xuống database.
+- Bài báo nhấn mạnh trạng thái **vulnerable** là trạng thái khoẻ: hệ có thể chạy ở đó hàng tháng, vì nó hiệu quả hơn. Ở lab, hệ chạy 100 thao tác mỗi giây trên trần khoảng 190, tức khoảng 53%, hoàn toàn khoẻ, và vẫn rơi vào metastable.
+
+Sự cố của AWS ở vùng US-EAST-1 ngày 07/12/2021 có dạng này; cách xếp nó vào loại metastable là của bài học, bản tóm tắt của AWS không dùng chữ đó. Theo bản tóm tắt, một hoạt động tự động tăng dung lượng gây ra làn sóng kết nối từ rất nhiều client trong mạng nội bộ, làm quá tải các thiết bị mạng nối hai mạng; độ trễ và lỗi tăng dẫn tới "even more connection attempts and retries", và tắc nghẽn kéo dài. AWS ghi rằng client của họ có cơ chế back-off được thiết kế cho đúng tình huống này, nhưng một lỗi tiềm ẩn khiến chúng không back-off đủ; tắc nghẽn chỉ cải thiện rõ khoảng sáu giờ sau, khi đội vận hành đã cô lập nguồn lưu lượng lớn, tắt bớt dịch vụ nặng và thêm năng lực mạng.
+
+<Check id="d23.2.metastable">Giải thích được metastable failure qua ba trạng thái, trigger và vòng tự duy trì, và vì sao sửa trigger không đủ.</Check>
+
+### Phòng vệ theo từng lớp
+
+| Lớp | Biện pháp | Vì sao |
+|---|---|---|
+| Mọi lớp | **Timeout ngắn dần từ ngoài vào trong**, và **truyền hạn chót** (deadline) xuống dưới | Lớp trong biết người gọi còn chờ bao lâu, không làm việc vô ích |
+| Một lớp duy nhất | **Retry có giới hạn**: chỉ cho lỗi tạm thời, chỉ ở **một** lớp (thường là lớp gần người dùng nhất có đủ thông tin), kèm **retry budget** | Budget giới hạn retry theo tỉ lệ request, ví dụ tối đa 20%: lúc bình thường gần như không ai chạm tới, lúc mọi thứ lỗi thì tải không nhân lên |
+| Client | **Exponential backoff có jitter** | Giãn khoảng chờ và trộn ngẫu nhiên để hàng nghìn client không thử lại cùng một khoảnh khắc (SB7.2 đã làm với Spring) |
+| Phụ thuộc | **Hàng đợi có giới hạn, bỏ việc đã quá hạn** | Hàng đợi ngắn giữ độ trễ chờ dưới hạn chót; việc đã quá hạn thì bỏ ngay, không tốn tài nguyên |
+| Biên | **Load shedding**: từ chối nhanh phần vượt năng lực, **theo ưu tiên**, trả `503` kèm `Retry-After` | Từ chối ở biên tốn gần 0; người bị từ chối biết chờ bao lâu; thao tác quan trọng được giữ |
+| Sản phẩm | **Graceful degradation** (xuống cấp êm): tắt phần phụ (gợi ý, đếm lượt xem, ảnh độ phân giải cao) khi quá tải | Giữ được chức năng chính thay vì mất tất cả |
+| Phục hồi | **Chặn rồi mở dần**, khởi động cache có kiểm soát | Tránh thundering herd lúc mọi thứ vừa đứng dậy |
+
+Bốn ghi chú:
+
+- **Circuit breaker** theo nghĩa của Resilience4j (SB7.2) ngắt hẳn lời gọi tới một phụ thuộc đang lỗi trong một khoảng thời gian; D9.6 đã dùng outlier detection của Envoy để loại một backend lỗi. Trong Envoy, mục `circuit_breakers` của cluster lại là **giới hạn đồng thời** (số kết nối, số request đang chạy, số retry đang chạy): khi vượt, Envoy trả `503` ngay với header `x-envoy-overloaded`. Bài này dùng nó để shedding.
+- **429 hay 503.** `429 Too Many Requests` nghĩa là **client** vượt hạn mức của nó (D9.1 đã đặt `limit_req_status 429`). `503 Service Unavailable` nghĩa là **server** đang quá tải tạm thời. Cả hai có thể kèm `Retry-After` (RFC 9110) để nói client chờ bao lâu. Shedding vì quá tải nên trả `503`, để alert theo tỉ lệ lỗi 5xx của D16 thấy hệ đang gặp vấn đề.
+- **Shed ở đâu.** Càng gần người dùng càng rẻ: biên từ chối một request trước khi nó tốn CPU, kết nối hay truy vấn nào. Nhưng biên không biết database đang chậm, nên giới hạn ở biên là giới hạn **đồng thời** (số request đang dở) chứ không phải số request mỗi giây: theo định luật Little của D18.1, khi phía sau chậm đi, cùng một trần đồng thời tự động cho qua ít request hơn mỗi giây. Nginx có `limit_conn` (D9.1) cho việc này theo kết nối; Envoy giới hạn theo request và theo mức ưu tiên của route.
+- **Hàng đợi có giới hạn ở biên với HAProxy.** D9.2 đã dùng `maxconn` trên dòng `server`: khi đủ số kết nối đó, request mới nằm chờ trong hàng đợi của server hoặc của backend thay vì dồn xuống backend. `timeout queue` là thời gian chờ tối đa trong hàng; theo tài liệu HAProxy 3.2, quá hạn thì request bị bỏ và client nhận `503`, và nếu không đặt thì nó lấy bằng `timeout connect`. Đặt `timeout queue` ngắn hơn hạn chót của client là cách "bỏ việc quá hạn" ngay ở biên, cùng ý với hàng đợi 8 chỗ của db ở bước 4; `maxqueue` giới hạn độ dài hàng đợi của một server (vượt thì request được chuyển sang server khác).
+
+<Check id="d23.2.defenses">Chọn được biện pháp phòng vệ cho từng lớp của một chuỗi service, giải thích được retry budget, và phân biệt được `429` với `503` khi shedding.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Addressing Cascading Failures (Site Reliability Engineering, chương 22)](https://sre.google/sre-book/addressing-cascading-failures/): các nguyên nhân, cách phòng bằng load shedding, retry, deadline, và cách xử lý khi đang xảy ra.
+- [Metastable Failures in Distributed Systems (HotOS 2021)](https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s11-bronson.pdf): bài báo định nghĩa metastable; mục 2 có ví dụ retry và mục 3 các biện pháp.
+- [Timeouts, retries, and backoff with jitter (Amazon Builders' Library)](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/): retry chỉ ở một lớp, token bucket cho retry, và vì sao cần jitter.
+- [Circuit breaking (Envoy)](https://www.envoyproxy.io/docs/envoy/v1.40.0/intro/arch_overview/upstream/circuit_breaking): các giới hạn của cluster, theo mức ưu tiên, và lời khuyên dùng retry budget.
+- [Canva incident report: API Gateway outage](https://www.canva.dev/blog/engineering/canva-incident-report-api-gateway-outage/): nguồn của callout; đọc phần mitigation và action items.
+- [Summary of the AWS Service Event in the Northern Virginia (US-EAST-1) Region](https://aws.amazon.com/message/12721/): nguồn của ví dụ metastable; đọc đoạn về kết nối, retry và back-off.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D18.1: có image `d18-app:1`, thư mục `~/masteva-d23` với `pq`, `k6/` và `prometheus/`. Nếu đã xoá, làm lại bước 0 và đoạn tạo `pq` ở bước 1 của D18.1. Bài kéo thêm image Envoy (khoảng 65 MB nén) và `alpine` (khoảng 4 MB, dùng để đếm kết nối). Dùng cổng **9780–9783** và **9790**, chỉ nghe trên `127.0.0.1`. Mọi khối lệnh chạy trong `~/masteva-d23`; nếu mở terminal mới giữa chừng, chạy `cd ~/masteva-d23` trước. Mọi thiết lập của từng bước nằm trong file `.env` mà Compose tự đọc, nên terminal mới không cần đặt lại biến nào.
+
+**Profile máy:** bốn container của hệ dùng khoảng 120–150 MiB RAM (Prometheus khoảng 45, Envoy khoảng 30, db và api mỗi cái 10–30 tuỳ hàng đợi dài hay ngắn), k6 thêm tới khoảng 90 MiB lúc giữ vài trăm VU; tổng dưới 250 MiB. db, api, Envoy mỗi cái giới hạn 1 CPU và dùng dưới một phần tư số đó ngay cả lúc retry storm. Máy 8 GB chạy thoải mái. Mỗi lượt kịch bản mất khoảng 1 phút 30 giây và năm lượt kịch bản nối tiếp nhau; trong lúc chờ, đọc phần giải thích của bước đó.
+
+### 1. Thêm biên và đặt cấu hình "như nhiều hệ đang chạy"
+
+Chuỗi của bài:
+
+```text
+ k6 (người dùng) ──▶ Envoy :9782 ──h2c──▶ api :9780 ──h2c──▶ db :9781
+```
+
+Cấu hình ban đầu là một tình huống minh hoạ nhưng không hiếm: mỗi lớp được đặt riêng, bởi người khác nhau, và lớp nào cũng hợp lý khi nhìn riêng.
+
+| Lớp | Timeout | Retry | Hàng đợi |
+|---|---|---|---|
+| Người dùng (k6) | 1 giây mỗi lần | Bấm lại ngay khi lỗi, tối đa 3 lần | |
+| Envoy | 0,3 giây mỗi lần thử, 0,9 giây cả request | 2 lần thử lại khi `5xx` hay mất kết nối; giới hạn retry của cluster bị nâng lên rất cao (ai đó từng thấy `upstream_rq_retry_overflow` và "sửa") | |
+| api | 0,2 giây mỗi lần gọi db, trong hạn chót Envoy gửi xuống | 3 lần gọi lại ngay | |
+| db | | | 2.000 chỗ, làm cả việc mà người gọi đã bỏ đi |
+
+Envoy gửi hạn chót xuống qua header `x-envoy-expected-rq-timeout-ms` (tài liệu router của Envoy mô tả header này; theo mã nguồn `router.cc` của Envoy, khi route có `per_try_timeout` thì giá trị là thời gian của một lần thử, 300 ms). api đọc header đó và gửi tiếp cho db dưới dạng `X-Deadline-Ms`; db hiện chưa dùng nó.
+
+<Terminal where="mac" title="~/masteva-d23/envoy/naive.yaml">
+
+```bash
+cd ~/masteva-d23 && mkdir -p envoy
+cat > envoy/naive.yaml <<'EOF'
+admin:
+  address: { socket_address: { address: 0.0.0.0, port_value: 9901 } }
+static_resources:
+  listeners:
+  - name: ingress
+    address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
+          route_config:
+            virtual_hosts:
+            - name: shop
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route:
+                  cluster: api
+                  timeout: 0.9s
+                  retry_policy:
+                    retry_on: "5xx,reset,connect-failure"
+                    num_retries: 2
+                    per_try_timeout: 0.3s
+  clusters:
+  - name: api
+    type: STRICT_DNS
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: { http2_protocol_options: {} }
+    load_assignment:
+      cluster_name: api
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: d18-api, port_value: 8080 } } }
+    circuit_breakers:
+      thresholds:
+      - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 100000 }
+EOF
+```
+
+</Terminal>
+
+D9.6 đã đọc cấu trúc listener, route, cluster của Envoy. Ba điểm mới: `retry_policy` của route, `circuit_breakers` của cluster (mặc định của Envoy là 1.024 kết nối, 1.024 request đang chờ, 1.024 request đang chạy và **3** retry đang chạy cùng lúc; ở đây cả bốn bị nâng lên 100.000), và `http2_protocol_options` để Envoy nói h2c với api.
+
+Vì sao mọi chặng nội bộ đều là HTTP/2: với HTTP/1.1, mỗi lần timeout phải đóng kết nối, và một retry storm hàng nghìn lần mỗi giây sẽ để lại hàng chục nghìn socket `TIME-WAIT`, chạm trần dải port nguồn (D2.1) và thêm một lớp lỗi dây chuyền nữa. Với HTTP/2, timeout chỉ huỷ một stream trên kết nối đang dùng chung. Lab chọn HTTP/2 để bạn thấy riêng hiệu ứng của retry và hàng đợi.
+
+Viết lại `compose.yaml` thêm Envoy, cho Prometheus thu metric của Envoy, và tạo `.env` với cấu hình ban đầu:
+
+<Terminal where="mac" title="~/masteva-d23/compose.yaml">
+
+```bash
+cat > compose.yaml <<'EOF'
+name: d18
+services:
+  db:
+    image: d18-app:1
+    container_name: d18-db
+    command: -role db -slots 4 -mean 20ms ${DB_FLAGS:-}
+    ports: ["127.0.0.1:9781:8080"]
+    cpus: 1
+    mem_limit: 256m
+  api:
+    image: d18-app:1
+    container_name: d18-api
+    command: -role api -db http://d18-db:8080 ${API_FLAGS:-}
+    ports: ["127.0.0.1:9780:8080"]
+    cpus: 1
+    mem_limit: 256m
+  edge:
+    image: envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de
+    container_name: d18-edge
+    command: ["-c", "/etc/envoy/${EDGE_CONFIG:-naive.yaml}", "--log-level", "warn"]
+    volumes: ["./envoy:/etc/envoy:ro"]
+    ports: ["127.0.0.1:9782:8080", "127.0.0.1:9783:9901"]
+    cpus: 1
+    mem_limit: 128m
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    container_name: d18-prom
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus",
+              "--storage.tsdb.retention.time=180d"]
+    volumes: ["./prometheus:/etc/prometheus:ro", "d18-prom-data:/prometheus"]
+    ports: ["127.0.0.1:9790:9090"]
+    mem_limit: 384m
+volumes:
+  d18-prom-data:
+    name: d18-prom-data
+networks:
+  default:
+    name: d18-net
+EOF
+cat > prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 2s
+scrape_configs:
+  - job_name: d18
+    static_configs:
+      - targets: ["d18-db:8080", "d18-api:8080"]
+  - job_name: edge
+    metrics_path: /stats/prometheus
+    static_configs:
+      - targets: ["d18-edge:9901"]
+EOF
+cat > .env <<'EOF'
+DB_FLAGS=
+API_FLAGS=-retries 3 -try-timeout 200ms
+EDGE_CONFIG=naive.yaml
+EOF
+docker compose up -d --force-recreate
+for i in $(seq 30); do curl -sf localhost:9790/-/ready > /dev/null && [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:9782/order)" = 200 ] && break; sleep 2; done
+curl -s -o /dev/null -w 'qua Envoy: %{http_code}\n' localhost:9782/order
+docker inspect d18-api --format '{{join .Args " "}}'
+sleep 4; ./pq 'up'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+qua Envoy: 200
+-role api -db http://d18-db:8080 -retries 3 -try-timeout 200ms
+__name__=up instance=d18-api:8080 job=d18  =>  1
+__name__=up instance=d18-db:8080 job=d18  =>  1
+__name__=up instance=d18-edge:9901 job=edge  =>  1
+```
+
+</Expected>
+
+Trước ba dòng này, `docker compose up` in trạng thái của bốn container (`Started` hoặc `Recreated`). Vòng `for` chờ Prometheus sẵn sàng và Envoy đã phân giải được tên `d18-api`: ngay sau khi khởi động, Envoy có thể trả `503` vài giây vì chưa có địa chỉ nào cho cluster. Dòng `docker inspect` xác nhận api nhận đúng cờ từ `.env`.
+
+### 2. Kịch bản: database chậm 20 giây
+
+Hai file. `k6/storm.js` đóng vai 100 người dùng mỗi giây, 80% đặt hàng (`/order`), 20% xem gợi ý (`/recommend`); biến `CLIENT` chọn kiểu người dùng: `naive` bấm lại ngay khi lỗi, tối đa 3 lần; `polite` chờ có jitter (hoặc theo `Retry-After`) và chỉ thử tối đa 2 lần. `scenario.sh` chạy k6 nền trong 80 giây, làm db chậm gấp 4 từ giây 15 tới giây 35 qua đường `/admin/slow`, và ở các mốc chụp năm con số từ Prometheus cùng số kết nối TCP từ api tới db. Số kết nối được đếm bằng `netstat` của một container `alpine` chạy chung mạng với db (`--network container:d18-db`), vì image của db không có công cụ nào.
+
+<Terminal where="mac" title="~/masteva-d23/k6/storm.js và scenario.sh">
+
+```bash
+cat > k6/storm.js <<'EOF'
+import http from 'k6/http';
+import { sleep } from 'k6';
+import { Counter } from 'k6/metrics';
+
+const ok = new Counter('ops_ok');
+const failed = new Counter('ops_failed');
+const POLITE = __ENV.CLIENT === 'polite';
+
+export const options = {
+  discardResponseBodies: true,
+  scenarios: {
+    users: { executor: 'constant-arrival-rate', rate: 100, timeUnit: '1s', duration: '80s',
+      preAllocatedVUs: 100, maxVUs: 400 },
+  },
+  thresholds: { 'ops_ok{path:/order}': ['count>=0'], 'ops_ok{path:/recommend}': ['count>=0'],
+    'ops_failed{path:/order}': ['count>=0'], 'ops_failed{path:/recommend}': ['count>=0'] },
+};
+
+// Một thao tác của người dùng: 80% đặt hàng, 20% xem gợi ý.
+export default function () {
+  const path = Math.random() < 0.8 ? '/order' : '/recommend';
+  const tries = POLITE ? 2 : 3;
+  for (let i = 0; i < tries; i++) {
+    const res = http.get(`http://d18-edge:8080${path}`, { timeout: '1s', tags: { path } });
+    if (res.status === 200) { ok.add(1, { path }); return; }
+    if (POLITE && i + 1 < tries) {
+      const ra = Number(res.headers['Retry-After']);
+      sleep(ra > 0 ? ra * (0.5 + Math.random()) : 0.2 + Math.random() * 0.8);
+    }
+  }
+  failed.add(1, { path });
+}
+
+export function handleSummary(data) {
+  const v = (n) => (data.metrics[n] ? data.metrics[n].values.count : 0);
+  let out = `k6: ${v('iterations')} thao tác, ${v('http_reqs')} lượt gửi, dropped ${v('dropped_iterations')}\n`;
+  for (const p of ['/order', '/recommend']) {
+    const a = v(`ops_ok{path:${p}}`), b = v(`ops_failed{path:${p}}`);
+    out += `  ${p.padEnd(10)} thành công ${a}/${a + b} (${((100 * a) / Math.max(a + b, 1)).toFixed(0)}%)\n`;
+  }
+  return { stdout: out };
+}
+EOF
+cat > scenario.sh <<'EOF'
+#!/bin/bash
+# 15 giây bình thường, 20 giây db chậm gấp 4, rồi 45 giây sau khi db nhanh lại.
+# k6 giữ 100 thao tác mỗi giây suốt 80 giây.
+set -u
+K6=grafana/k6:2.3.0@sha256:9c2dee7f8ed74d317e4027c06a10f169b625638189de8d4555d0b3486a5aeb34
+ALPINE=alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+API_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' d18-api)
+q() { curl -s localhost:9790/api/v1/query --data-urlencode "query=$1" | jq -r '(.data.result[0].value[1] // "0") | tonumber | floor'; }
+conns() { docker run --rm --network container:d18-db $ALPINE netstat -tn | grep -c "$API_IP:"; }
+snap() {
+  printf 'ok/s đặt hàng=%-3s gợi ý=%-3s | biên nhận/s=%-4s | api gọi db/s=%-5s | db xong/s=%-4s | hàng đợi db=%-4s | kết nối api→db=%s | %s\n' \
+    "$(q 'sum(rate(api_requests_total{path="/order",code="200"}[6s]))')" \
+    "$(q 'sum(rate(api_requests_total{path="/recommend",code="200"}[6s]))')" \
+    "$(q 'sum(rate(envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix="ingress"}[6s]))')" \
+    "$(q 'sum(rate(api_db_calls_total[6s]))')" \
+    "$(q 'sum(rate(db_queries_total{result="ok"}[6s]))')" "$(q 'db_waiting')" "$(conns)" "$1"
+}
+docker rm -f d18-k6 > /dev/null 2>&1
+docker run -d --name d18-k6 --network d18-net -v "$PWD/k6:/scripts:ro" -e CLIENT="${CLIENT:-naive}" \
+  $K6 run --quiet /scripts/storm.js > /dev/null || exit 1
+sleep 15; snap "t=15s, bình thường"
+curl -s 'localhost:9781/admin/slow?x=4' > /dev/null
+sleep 20; snap "t=35s, db chậm x4"
+curl -s 'localhost:9781/admin/slow?x=1' > /dev/null
+sleep 15; snap "t=50s, db nhanh lại 15s"
+sleep 30; snap "t=80s, db nhanh lại 45s"
+docker wait d18-k6 > /dev/null; docker logs d18-k6; docker rm d18-k6 > /dev/null
+sleep 5; snap "tải đã dừng 5s"
+EOF
+chmod +x scenario.sh
+./scenario.sh
+```
+
+</Terminal>
+
+<Predict question="Lưu lượng người dùng chỉ là 100 thao tác mỗi giây, khoảng một nửa trần của db. Khi db nhanh lại ở giây 35, hệ có trở về như ở giây 15 không?">
+
+```text
+ok/s đặt hàng=78  gợi ý=21  | biên nhận/s=99   | api gọi db/s=99    | db xong/s=99   | hàng đợi db=0    | kết nối api→db=1 | t=15s, bình thường
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=297  | api gọi db/s=1782  | db xong/s=53   | hàng đợi db=496  | kết nối api→db=2 | t=35s, db chậm x4
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=300  | api gọi db/s=1799  | db xong/s=200  | hàng đợi db=496  | kết nối api→db=2 | t=50s, db nhanh lại 15s
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=300  | api gọi db/s=1794  | db xong/s=208  | hàng đợi db=496  | kết nối api→db=2 | t=80s, db nhanh lại 45s
+k6: 7830 thao tác, 20428 lượt gửi, dropped 171
+  /order     thành công 1222/6222 (20%)
+  /recommend thành công 309/1608 (19%)
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=0    | api gọi db/s=0     | db xong/s=0    | hàng đợi db=0    | kết nối api→db=2 | tải đã dừng 5s
+```
+
+Không. Đọc theo từng mốc:
+
+- **t=15s**: mỗi thao tác thành một lượt qua biên và một truy vấn db. Hàng đợi trống.
+- **t=35s**, db chậm gấp 4 nên trần còn khoảng 48 truy vấn mỗi giây. Mọi thao tác bắt đầu lỗi; người dùng bấm lại, Envoy thử lại, api thử lại. Biên nhận 300 lượt mỗi giây (người dùng bấm 3 lần), api gọi db khoảng **1.800 lần mỗi giây: 18 lần** lưu lượng gốc. Không phải 36 lần như sơ đồ ở phần Kiến thức: hạn chót Envoy gửi xuống là 300 ms, mỗi lần api chờ db 200 ms, nên mỗi lượt thử của Envoy chỉ kịp 2 lần gọi db: 3 × 3 × 2 = 18.
+- **Vì sao hàng đợi db dừng ở 496 chứ không lên tới 2.000.** Máy chủ HTTP/2 của Go chạy tối đa 250 handler cùng lúc trên mỗi kết nối. Handler của db không để ý người gọi đã bỏ đi, nên giữ chỗ tới khi xong. Hàng đợi vì thế dừng ở 250 × số kết nối api mở tới db, trừ 4 truy vấn đang chạy: cột `kết nối api→db` cho thấy 2 kết nối, tức 2 × 250 − 4 = 496. Phần vượt chờ trong tầng HTTP/2 của db (chưa tới handler, nên chưa được tính vào hàng đợi) và bị bỏ khi api huỷ lời gọi.
+- **t=50s và t=80s**: db đã nhanh lại và làm việc hết công suất, khoảng 190 truy vấn mỗi giây, nhưng **không thao tác nào thành công**. Mỗi truy vấn được xử lý đã chờ trong hàng khoảng 500 / 190 ≈ 2,6 giây, lâu hơn mọi timeout phía trên, nên kết quả của nó không còn ai nhận. Throughput 100%, goodput 0%. Trigger đã hết từ 45 giây trước: đây là metastable.
+- **Tải đã dừng**: chỉ khi người dùng ngừng gửi, hàng đợi mới tan trong vài giây (cột `api gọi db/s` và `db xong/s` có thể còn khác 0 vì cửa sổ 6 giây của `rate` vẫn chứa những giây cuối). Ở production, đó là lúc bạn phải chặn lưu lượng như Canva.
+
+`dropped` là số thao tác k6 phải bỏ vì đã dùng hết 400 VU (người dùng ảo đang chờ trả lời và bấm lại); có lần k6 in thêm một dòng `level=warning msg="Insufficient VUs…"` báo điều đó. Khoảng 20% thao tác thành công là 15 giây đầu. Các số trên máy bạn sẽ khác vài phần trăm; hình dạng (nhân khoảng 18 lần, `ok/s` bằng 0 tới hết) thì lặp lại.
+
+</Predict>
+
+<Check id="d23.2.lab-storm">Tái hiện được retry storm và đo được hệ số nhân tải từ Prometheus, và chỉ ra được bằng số liệu rằng hệ vẫn hỏng sau khi trigger đã hết.</Check>
+
+### 3. Sửa lớp retry: một lớp, có budget
+
+Ba thay đổi, đúng theo bảng phòng vệ:
+
+- **api không retry nữa** (`-retries 0`): lớp gần database nhất không đủ thông tin để biết có nên thử lại.
+- **Envoy giữ retry nhưng có budget**: `retry_budget` của cluster cho phép số retry đang chạy tối đa 20% tổng số request đang chạy và đang chờ (tối thiểu 3). Khi có `retry_budget`, Envoy bỏ qua `max_retries`. Backoff có jitter là mặc định của Envoy (lần đầu chờ ngẫu nhiên 0–24 ms, tối đa 250 ms).
+- **Người dùng lịch sự hơn** (`CLIENT=polite`): một lần thử lại, chờ 0,2–1 giây ngẫu nhiên. Ngoài đời, đó là ứng dụng di động hay SDK của bạn.
+
+<Terminal where="mac">
+
+```bash
+sed -e 's/      - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 100000 }/      - retry_budget: { budget_percent: { value: 20 }, min_retry_concurrency: 3 }/' envoy/naive.yaml > envoy/budget.yaml
+diff envoy/naive.yaml envoy/budget.yaml
+cat > .env <<'EOF'
+DB_FLAGS=
+API_FLAGS=-retries 0
+EDGE_CONFIG=budget.yaml
+EOF
+docker compose up -d
+for i in $(seq 15); do [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:9782/order)" = 200 ] && break; sleep 1; done
+CLIENT=polite ./scenario.sh
+```
+
+</Terminal>
+
+<Predict question="Tải nhân lên ít đi bao nhiêu? Lần này hệ có tự hồi không?">
+
+```text
+43c43
+<       - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 100000 }
+---
+>       - retry_budget: { budget_percent: { value: 20 }, min_retry_concurrency: 3 }
+ok/s đặt hàng=84  gợi ý=16  | biên nhận/s=100  | api gọi db/s=100   | db xong/s=99   | hàng đợi db=0    | kết nối api→db=1 | t=15s, bình thường
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=201  | api gọi db/s=246   | db xong/s=47   | hàng đợi db=246  | kết nối api→db=1 | t=35s, db chậm x4
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=199  | api gọi db/s=245   | db xong/s=195  | hàng đợi db=246  | kết nối api→db=1 | t=50s, db nhanh lại 15s
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=190  | api gọi db/s=246   | db xong/s=188  | hàng đợi db=246  | kết nối api→db=1 | t=80s, db nhanh lại 45s
+k6: 7953 thao tác, 14361 lượt gửi, dropped 48
+  /order     thành công 1274/6331 (20%)
+  /recommend thành công 271/1622 (17%)
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=0    | api gọi db/s=0     | db xong/s=28   | hàng đợi db=0    | kết nối api→db=1 | tải đã dừng 5s
+```
+
+Hệ số nhân giảm từ khoảng 18 xuống khoảng **2,5**: người dùng gửi 2 lượt (lần đầu lỗi nên luôn bấm lại), Envoy thêm khoảng 20–25%. Hàng đợi db dừng ở 246 = 250 − 4: lần này api chỉ cần một kết nối tới db (cột `kết nối api→db`). Nhưng hệ **vẫn không tự hồi**: khoảng 245 truy vấn mỗi giây vẫn nhiều hơn trần khoảng 190, nên hàng đợi không bao giờ tan, và mọi việc db làm vẫn là việc cho người đã bỏ đi. Retry là vòng tự duy trì lớn nhất, nhưng không phải cái duy nhất: hàng đợi chứa toàn việc hết hạn cũng là một vòng.
+
+</Predict>
+
+<Check id="d23.2.lab-retry">Thay retry nhiều lớp bằng retry một lớp có budget, đo được hệ số nhân giảm, và giải thích được vì sao hệ vẫn chưa tự hồi.</Check>
+
+### 4. Sửa lớp phụ thuộc: hàng đợi ngắn, bỏ việc đã quá hạn
+
+db giờ chỉ cho 8 việc xếp hàng (vượt thì trả `503` ngay) và kiểm `X-Deadline-Ms` trước khi chạy: việc nào người gọi đã hết hạn chờ thì bỏ, không tốn một mili giây nào. Đó là hai dòng `if` trong hàm `query` của D18.1, bật bằng cờ. Tám chỗ vì theo Little, lúc bình thường 8 việc chờ trước bạn mất khoảng 8 × 20 / 4 = 40 ms, còn lúc db chậm gấp 4 là 160 ms, vẫn dưới hạn chót 300 ms mà Envoy gửi xuống.
+
+<Terminal where="mac">
+
+```bash
+cat > .env <<'EOF'
+DB_FLAGS=-queue 8 -drop-expired
+API_FLAGS=-retries 0
+EDGE_CONFIG=budget.yaml
+EOF
+docker compose up -d
+for i in $(seq 15); do [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:9782/order)" = 200 ] && break; sleep 1; done
+CLIENT=polite ./scenario.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ok/s đặt hàng=79  gợi ý=21  | biên nhận/s=100  | api gọi db/s=100   | db xong/s=100  | hàng đợi db=0    | kết nối api→db=1 | t=15s, bình thường
+ok/s đặt hàng=31  gợi ý=6   | biên nhận/s=174  | api gọi db/s=216   | db xong/s=51   | hàng đợi db=8    | kết nối api→db=1 | t=35s, db chậm x4
+ok/s đặt hàng=79  gợi ý=20  | biên nhận/s=99   | api gọi db/s=100   | db xong/s=99   | hàng đợi db=0    | kết nối api→db=1 | t=50s, db nhanh lại 15s
+ok/s đặt hàng=81  gợi ý=19  | biên nhận/s=93   | api gọi db/s=100   | db xong/s=100  | hàng đợi db=0    | kết nối api→db=1 | t=80s, db nhanh lại 45s
+k6: 8000 thao tác, 9443 lượt gửi, dropped 0
+  /order     thành công 5508/6410 (86%)
+  /recommend thành công 1355/1590 (85%)
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=0    | api gọi db/s=0     | db xong/s=0    | hàng đợi db=0    | kết nối api→db=1 | tải đã dừng 5s
+```
+
+</Expected>
+
+- **Trong lúc db chậm** (t=35s), khoảng 30–40 thao tác mỗi giây vẫn thành công: gần bằng trần khoảng 48 của db lúc đó. Con số chụp trong 6 giây này dao động giữa các lượt; con số ổn định hơn để so là tỉ lệ thành công của cả lượt ở cuối. Goodput gần bằng throughput, vì db không còn làm việc cho người đã đi. Nhiều lượt gọi db (cột "api gọi db/s") bị db từ chối ngay vì hàng đợi đầy, việc này gần như không tốn gì.
+- **Ngay khi db nhanh lại** (t=50s), hệ về trạng thái bình thường. Không còn hàng đợi việc chết để tiêu hoá, nên không còn vòng tự duy trì.
+- Cả lượt có khoảng 85% thao tác thành công, so với khoảng 20% ở bước 3. Phần thất bại nằm gọn trong 20 giây db chậm.
+
+<Check id="d23.2.lab-queue">Bật hàng đợi có giới hạn và bỏ việc quá hạn bằng hạn chót truyền xuống, và chứng minh bằng số liệu rằng hệ hồi ngay khi trigger hết, với goodput gần bằng trần trong lúc chậm.</Check>
+
+### 5. Sửa lớp biên: shedding theo ưu tiên, 503 kèm Retry-After
+
+Bước 4 bảo vệ được database, nhưng mọi request vẫn đi tới tận db mới bị từ chối, và đặt hàng với xem gợi ý bị đối xử như nhau. Giờ cho biên quyết định:
+
+- Route `/order` có `priority: HIGH`. Envoy theo dõi giới hạn của cluster **riêng cho từng mức ưu tiên**: đặt hàng được tối đa 8 request đang chạy, mọi thứ khác (mức `DEFAULT`) chỉ 1.
+- Request vượt giới hạn bị trả `503` ngay tại Envoy, không chạm tới api. `local_reply_config` thêm `Retry-After: 1` vào đúng các phản hồi đó: bộ lọc `response_flag_filter` với cờ `UO` (upstream overflow) chọn những request bị circuit breaker từ chối.
+- Người dùng `polite` đọc `Retry-After` và chờ khoảng 0,5–1,5 giây trước khi thử lại.
+
+Số 8 và 1 đến từ Little: lúc bình thường đặt hàng có khoảng 80 × 0,025 = 2 request đang chạy, gợi ý khoảng 0,5. Giới hạn 8 cho đặt hàng nhiều chỗ dư; giới hạn 1 cho gợi ý thì chật, và bạn sẽ thấy cái giá của nó.
+
+<Terminal where="mac" title="~/masteva-d23/envoy/shed.yaml">
+
+```bash
+cat > envoy/shed.yaml <<'EOF'
+admin:
+  address: { socket_address: { address: 0.0.0.0, port_value: 9901 } }
+static_resources:
+  listeners:
+  - name: ingress
+    address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress
+          local_reply_config:
+            mappers:
+            - filter: { response_flag_filter: { flags: ["UO"] } }
+              headers_to_add:
+              - header: { key: Retry-After, value: "1" }
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
+          route_config:
+            virtual_hosts:
+            - name: shop
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/order" }
+                route:
+                  cluster: api
+                  priority: HIGH
+                  timeout: 0.9s
+                  retry_policy:
+                    retry_on: "5xx,reset,connect-failure"
+                    num_retries: 2
+                    per_try_timeout: 0.3s
+              - match: { prefix: "/" }
+                route:
+                  cluster: api
+                  timeout: 0.9s
+                  retry_policy:
+                    retry_on: "5xx,reset,connect-failure"
+                    num_retries: 2
+                    per_try_timeout: 0.3s
+  clusters:
+  - name: api
+    type: STRICT_DNS
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: { http2_protocol_options: {} }
+    load_assignment:
+      cluster_name: api
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: d18-api, port_value: 8080 } } }
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_requests: 1
+        retry_budget: { budget_percent: { value: 20 }, min_retry_concurrency: 3 }
+      - priority: HIGH
+        max_requests: 8
+        retry_budget: { budget_percent: { value: 20 }, min_retry_concurrency: 3 }
+EOF
+sed -i '' 's/^EDGE_CONFIG=.*/EDGE_CONFIG=shed.yaml/' .env
+cat .env
+docker compose up -d
+for i in $(seq 15); do [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:9782/order)" = 200 ] && break; sleep 1; done
+CLIENT=polite ./scenario.sh
+curl -s localhost:9783/stats | grep -E 'cluster.api.upstream_rq_(active_overflow|retry_overflow):'
+```
+
+</Terminal>
+
+<Predict question="Trong 20 giây db chậm, đặt hàng và gợi ý sẽ được phục vụ khác nhau thế nào? Lúc bình thường thì sao?">
+
+```text
+DB_FLAGS=-queue 8 -drop-expired
+API_FLAGS=-retries 0
+EDGE_CONFIG=shed.yaml
+ok/s đặt hàng=80  gợi ý=17  | biên nhận/s=105  | api gọi db/s=97    | db xong/s=96   | hàng đợi db=0    | kết nối api→db=1 | t=15s, bình thường
+ok/s đặt hàng=44  gợi ý=4   | biên nhận/s=166  | api gọi db/s=52    | db xong/s=49   | hàng đợi db=7    | kết nối api→db=1 | t=35s, db chậm x4
+ok/s đặt hàng=81  gợi ý=16  | biên nhận/s=105  | api gọi db/s=98    | db xong/s=99   | hàng đợi db=0    | kết nối api→db=1 | t=50s, db nhanh lại 15s
+ok/s đặt hàng=79  gợi ý=17  | biên nhận/s=101  | api gọi db/s=97    | db xong/s=96   | hàng đợi db=0    | kết nối api→db=1 | t=80s, db nhanh lại 45s
+k6: 8001 thao tác, 9820 lượt gửi, dropped 0
+  /order     thành công 5640/6371 (89%)
+  /recommend thành công 1159/1630 (71%)
+ok/s đặt hàng=0   gợi ý=0   | biên nhận/s=0    | api gọi db/s=0     | db xong/s=0    | hàng đợi db=0    | kết nối api→db=1 | tải đã dừng 5s
+cluster.api.upstream_rq_active_overflow: 3016
+cluster.api.upstream_rq_retry_overflow: 4
+```
+
+- **Lúc db chậm**, đặt hàng giữ khoảng 30–45 thao tác thành công mỗi giây, gợi ý chỉ còn khoảng 3–5 (ở bước 4 khoảng 6–8). Con số chụp 6 giây dao động nhiều; so bằng tỉ lệ cả lượt: đặt hàng khoảng 89% (bước 4 khoảng 85%), gợi ý khoảng 71–72% (bước 4 khoảng 85%). Envoy dồn phần năng lực ít ỏi của db cho thao tác quan trọng.
+- **"api gọi db/s" bằng "db xong/s"**: biên đã chặn phần vượt trước khi nó tới api, nên db không phải từ chối gì. `upstream_rq_active_overflow` đếm số request Envoy đã shed (vài nghìn); `upstream_rq_retry_overflow` đếm số retry bị budget chặn; con số này dao động mạnh giữa các lượt.
+- **Cái giá**: ngay cả lúc bình thường, giới hạn 1 request đang chạy quá chật cho những lúc vài request gợi ý đến sát nhau. Dấu hiệu nằm ở cột "biên nhận/s": khoảng 101–107 thay vì 100 lúc bình thường, tức vài lượt mỗi giây là gợi ý bị shed rồi được gửi lại sau `Retry-After`. Nhờ thử lại, tỉ lệ thành công cả lượt của gợi ý vẫn khoảng 72%. Giới hạn shedding phải đặt từ số đo đồng thời thật (Little, cộng phần dao động), và kiểm lại bằng load test như D18.1.
+
+Số của bạn sẽ khác vài đơn vị; tỉ lệ ưu tiên giữa hai đường thì lặp lại.
+
+</Predict>
+
+Xem tận mắt phản hồi bị shed: làm db rất chậm (gấp 50, mỗi truy vấn trung bình 1 giây), gửi một request gợi ý chạy nền để chiếm chỗ duy nhất của mức `DEFAULT`, rồi gửi request thứ hai. zsh tương tác in thêm dòng `[1] 12345` khi đẩy lệnh `&` xuống nền và `[1]  + done …` khi nó xong; số PID trên máy bạn sẽ khác.
+
+<Terminal where="mac">
+
+```bash
+curl -s 'localhost:9781/admin/slow?x=50'
+curl -s -o /dev/null localhost:9782/recommend &
+sleep 0.05
+curl -s -D - -o /dev/null localhost:9782/recommend | grep -iE '^HTTP|retry-after|x-envoy-overloaded'
+wait
+curl -s 'localhost:9781/admin/slow?x=1'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+db chậm x50.0
+HTTP/1.1 503 Service Unavailable
+x-envoy-overloaded: true
+retry-after: 1
+db chậm x1.0
+```
+
+</Expected>
+
+Request thứ hai nhận `503` trong vài mili giây, với `x-envoy-overloaded` (Envoy tự thêm khi circuit breaker từ chối) và `retry-after: 1` (do `local_reply_config` thêm). Hiếm khi truy vấn ngẫu nhiên của request đầu xong trong chưa tới 50 ms; khi đó lệnh thứ hai in `HTTP/1.1 200 OK` hoặc `504` mà không có hai header kia: chạy lại khối lệnh.
+
+<Check id="d23.2.lab-shed">Cấu hình được shedding theo ưu tiên ở Envoy bằng giới hạn đồng thời từng mức, trả được `503` kèm `Retry-After`, và đo được thao tác ưu tiên cao được giữ lại khi phụ thuộc chậm cùng cái giá của giới hạn quá chật.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`qua Envoy: 503` ở bước 1, kéo dài quá 30 giây:** Envoy không phân giải được `d18-api`. Xem `docker logs d18-edge`; kiểm `docker compose ps` rằng `d18-api` đang chạy.
+- **Envoy thoát ngay với `Unable to parse JSON as proto` hoặc lỗi YAML:** file cấu hình bị lệch thụt đầu dòng khi dán. So lại với bài; YAML dùng dấu cách, không dùng tab.
+- **Mọi cột của `scenario.sh` là 0, kể cả ở t=15s:** Prometheus chưa thu được metric (xem `./pq 'up'`), hoặc container k6 không chạy được: `docker logs d18-k6` khi kịch bản đang chạy.
+- **Bước 2 không có `Insufficient VUs`, `dropped` bằng 0:** máy bạn đủ nhanh để k6 khởi tạo VU kịp; kết luận không đổi.
+- **db hay api bị khởi động lại giữa kịch bản** (`docker ps` thấy `Up` vài giây): container bị OOM kill vì hàng đợi quá dài; kiểm `docker inspect d18-db --format '{{.State.OOMKilled}}'`. Đó là cơ chế "cạn tài nguyên kéo theo" của phần Kiến thức; nâng `mem_limit` lên 384m nếu muốn quan sát riêng hiệu ứng retry.
+- **`sed: 1: ".env": invalid command code`:** trên macOS, `sed -i` phải có `''` ngay sau, như trong bài. Trên Linux thì ngược lại: bỏ `''`, nếu không GNU sed báo `sed: can't read …`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Lệnh `docker rm -f d18-k6` xoá container k6 nếu một lượt kịch bản bị ngắt giữa chừng (không có thì Docker báo `No such container`, bỏ qua). Lệnh `docker compose down` xoá bốn container và mạng `d18-net`; `-v` xoá luôn volume `d18-prom-data` (metric và lịch sử của D18.1). `docker rmi` xoá image ứng dụng. Lệnh cuối xoá thư mục lab cùng mọi file cấu hình. D18.3 không dùng các thứ này.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp">
+
+```bash
+cd ~/masteva-d23
+docker rm -f d18-k6
+docker compose down -v
+docker rmi d18-app:1
+cd ~ && rm -rf ~/masteva-d23
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không retry ở mọi lớp cho chắc?">
+
+Vì xác suất thành công không tăng theo số lớp, còn tải thì nhân theo số lớp. Retry giúp khi lỗi là ngẫu nhiên và độc lập: một gói tin mất, một pod vừa bị thay. Khi lỗi là do quá tải, lần thử lại gặp đúng tình trạng đó, chỉ thêm tải. Lớp nên retry là lớp có đủ ngữ cảnh: biết thao tác có idempotent không (gọi lại nhiều lần cho cùng kết quả, ví dụ không đặt hàng hai lần; SB7.2 đi sâu), biết hạn chót còn lại, và có budget chung cho nhiều request. Thường đó là proxy ở biên hoặc client SDK, không phải mọi service ở giữa. Amazon Builders' Library mô tả cùng nguyên tắc với một phép tính: chuỗi năm lớp, mỗi lớp thử 3 lần, nhân tải lên database 3⁵ = 243 lần. Khuyến nghị của họ là retry ở một điểm trong chuỗi, và giới hạn retry tại chỗ bằng token bucket: còn token thì được retry, hết token thì chỉ retry với một tốc độ cố định.
+
+</Reveal>
+
+<Reveal title="Bỏ việc quá hạn ở database thật làm thế nào?">
+
+Database không đọc header HTTP, nên hạn chót phải thành tham số của chính nó: PostgreSQL có `statement_timeout` (huỷ câu lệnh chạy quá thời gian đặt) và `lock_timeout` (thôi chờ khoá sau thời gian đặt), đặt được theo phiên hoặc theo transaction; pool kết nối có thời gian chờ lấy kết nối (`connectionTimeout` của HikariCP). Đặt chúng ngắn hơn hạn chót của request là một dạng "bỏ việc quá hạn". Ở tầng service, gRPC truyền deadline tự động qua mọi lời gọi; với HTTP, các công ty tự đặt một header như `X-Deadline-Ms` của lab hoặc dùng header của proxy như `x-envoy-expected-rq-timeout-ms`. Một kỹ thuật bổ sung mà bài báo về metastable nhắc tới: khi quá tải, phục vụ việc **mới nhất** trước (LIFO), vì việc cũ nhiều khả năng đã bị bỏ.
+
+</Reveal>
+
+<Reveal title="Giới hạn đồng thời cố định có đủ không, khi năng lực phía sau thay đổi?">
+
+Không hoàn toàn. Giới hạn 8 của lab đúng cho db lúc bình thường và hơi rộng lúc db chậm. Có hai hướng. Một là giới hạn **thích nghi**: đo độ trễ liên tục và tự hạ giới hạn khi độ trễ tăng; Envoy có filter `adaptive_concurrency`, thư viện như Netflix concurrency-limits làm việc này trong ứng dụng. Hai là nhìn **thời gian chờ** thay vì số lượng: bài báo về metastable nhắc tới cách đo độ trễ hàng đợi nhỏ nhất trong một cửa sổ trượt (ý của thuật toán CoDel) để phân biệt quá tải kéo dài với một đợt tăng ngắn, rồi mới đổi chính sách như bỏ retry, rút ngắn hàng đợi hay shed. Cả hai đều cần load test kiểm lại, vì một giới hạn tự chỉnh sai cũng là một trigger.
+
+</Reveal>
+
+<Reveal title="Sau sự cố, mở lại lưu lượng thế nào cho khỏi sập lần nữa?">
+
+Theo thứ tự: chặn hoặc giảm mạnh lưu lượng ở biên (luật firewall của CDN, giới hạn tốc độ thấp), chờ các thành phần khoẻ hẳn, làm ấm cache nếu cần, rồi mở theo nhóm nhỏ có thể quan sát được (một vùng, một phần trăm người dùng), mỗi bậc chờ metric ổn định rồi mới mở tiếp. Canva làm đúng như vậy, bắt đầu với người dùng ở Úc. Client nên có backoff có jitter **kể cả** sau khi nhận lỗi kết nối, để lúc mở lại không thành thundering herd. Viết sẵn runbook cho việc này (chặn ở đâu, mở theo bậc nào, xem metric nào) là việc của chặng D17.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI rất hay đề xuất "thêm retry với 3 lần thử" ở mọi lớp và "tăng timeout" khi thấy lỗi timeout: đúng hai thứ làm bước 2 sập. Khi nhờ AI viết cấu hình Envoy, kiểm tên trường theo tài liệu của đúng phiên bản (`retry_budget` nằm trong `circuit_breakers.thresholds`, không nằm trong `retry_policy`), và chạy `envoy --mode validate -c file.yaml` trước khi dùng. Khi nhờ AI phân tích sự cố, hỏi thêm: retry ở những lớp nào, nhân lên bao nhiêu lần, hàng đợi nằm ở đâu và có giới hạn không, việc nào đang được làm cho request đã hết hạn. Số liệu để trả lời lấy từ Prometheus như `scenario.sh`, không từ phỏng đoán của AI.
+
+</Callout>
+
+<Callout kind="link">
+
+D18.1 đo trần và đầu gối của chính hệ này. D9.1 dạy `limit_req`, `limit_conn` của Nginx cho giới hạn theo client; D9.6 dạy outlier detection của Envoy. SB7.2 làm retry, backoff, circuit breaker và giới hạn đồng thời bên trong ứng dụng Spring; SB12.2 đặt chuỗi timeout. Cố ý gây sự cố để kiểm các lớp phòng vệ này một cách có hệ thống là chủ đề game day và chaos engineering của chặng D17; kiến trúc giới hạn phạm vi ảnh hưởng (cell, shuffle sharding) thuộc chặng D21.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d23.2.mastery-diagnose">Từ metric của một sự cố quá tải, chỉ ra được trigger, vòng tự duy trì và lớp nào đang nhân tải, rồi đề xuất được cách thoát ra.</Check>
+
+<Check id="d23.2.mastery-design">Thiết kế được timeout, retry, hàng đợi và shedding cho một chuỗi nhiều lớp sao cho hệ tự hồi khi phụ thuộc nhanh lại, và kiểm được thiết kế đó bằng một kịch bản trigger có số đo.</Check>
+
+<Check id="d23.2.mastery-edge">Cấu hình được load shedding theo ưu tiên ở biên trả `503` kèm `Retry-After`, với giới hạn tính từ định luật Little và số đo.</Check>
+
+</Mastery>

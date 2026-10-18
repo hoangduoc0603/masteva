@@ -1,0 +1,644 @@
+---
+title: Triển khai theo wave, bake time, và config cũng là thay đổi
+description: Chia production thành ba cell, dùng sync wave và hook của Argo CD để thay đổi đi từng cell một, chờ một khoảng bake time và hỏi Prometheus trước khi sang cell kế; một thay đổi cấu hình xấu bị chặn ở wave đầu, và đo cái giá của việc auto-sync thử lại.
+id: d14.4
+step: d14
+prerequisites: [d14.3]
+topics: [d14.wave-bake-time, d14.config-la-thay-doi]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    kind: 0.33.0
+    kubernetes: 1.37.0 (kindest/node)
+    kubectl: 1.37.1
+    argo-cd: 3.5.5
+    prometheus: 3.15.0
+    curl-image: 8.22.0
+    busybox: 1.38.0
+    gitea: 28.1.0
+---
+
+<Goal>
+
+Đưa ý "đo rồi mới đi tiếp" của canary lên một tầng: không chỉ giữa hai phiên bản trong một nhóm pod, mà giữa các phần độc lập của production, và không chỉ cho image mà cho mọi thứ làm hệ thống đổi hành vi. Học xong bài này, bạn giải thích được:
+
+- Vì sao một thay đổi hỏng ở wave đầu chỉ làm hỏng một phần ba người dùng, và thứ gì quyết định độ dài của một wave.
+- Vì sao một cấu hình qua được mọi health check trong năm phút vẫn có thể hạ toàn cầu, và bake time chống lại điều đó tới đâu.
+- Vì sao một thay đổi cấu hình, một luật WAF hay một file dữ liệu sinh tự động phải đi cùng đường ống và cùng nhịp với code.
+- Vì sao bản revert của bạn có thể phải chờ vài phút sau lượt sync hỏng, và cách cấu hình để không phải chờ.
+
+</Goal>
+
+<Knowledge>
+
+### Wave: chia production thành từng phần
+
+Canary ở D13.3 chia **request** của một service trong một cụm. Hệ thống lớn có thêm một đơn vị lớn hơn: production được chia thành nhiều phần chạy độc lập (một vùng, một cụm, một nhóm khách hàng), mỗi phần có đủ các thành phần để phục vụ người dùng của nó. D21 gọi mỗi phần như vậy là một **cell** và dạy cách thiết kế; bài này chỉ dùng cell làm đơn vị triển khai.
+
+Triển khai theo **wave** là đưa một thay đổi tới từng nhóm cell một, nhóm sau chỉ bắt đầu khi nhóm trước đã chạy đủ lâu và khoẻ:
+
+```text
+ thay đổi ─▶ wave 1: cell-1 ─▶ bake ─▶ kiểm ─▶ wave 2: cell-2 ─▶ bake ─▶ kiểm ─▶ wave 3: cell-3
+              (nhỏ, rủi ro       │        │                                         (phần còn lại)
+               thấp nhất)        │        └─ không đạt: dừng tại đây, cell-2 và cell-3 không đổi
+                                 └─ chờ đủ lâu để lỗi chậm kịp lộ ra
+```
+
+Thứ tự wave đi từ nơi rẻ nhất khi hỏng tới nơi đắt nhất. Bài viết của AWS về triển khai tự động mô tả một mẫu: mỗi vùng bắt đầu bằng một máy (one-box) nhận không quá khoảng 10% request; wave 1 là một vùng ít lưu lượng, đi từng AZ hoặc từng cell; wave 2 là một vùng nhiều lưu lượng; các wave sau mở rộng sang nhiều vùng song song; mỗi bước có cảnh báo tự động kích hoạt lui. Wave đầu để phát hiện lỗi, các wave sau để đi cho xong, nên wave sau lớn hơn wave trước.
+
+**Bake time** là khoảng chờ sau khi một wave đã xong và khoẻ, trước khi chạy cổng kiểm quyết định wave sau. Nó tồn tại vì nhiều lỗi không lộ ra ngay: rò bộ nhớ, cache hết hạn, job chạy theo giờ, một nhánh code chỉ chạy khi gặp loại dữ liệu hiếm, một tiến trình xử lý bất đồng bộ crash vài phút sau. Bake quá ngắn thì cổng kiểm chỉ chứng minh "khởi động được"; quá dài thì một thay đổi đi hết production mất cả ngày, và đội bắt đầu tìm đường tắt.
+
+| Đặt bake time theo | Lý do |
+|---|---|
+| Lỗi chậm nhất bạn từng gặp | Bake ngắn hơn chu kỳ của job theo giờ thì không bao giờ thấy job đó chạy với bản mới. AWS mô tả mức tối thiểu điển hình: ít nhất một giờ sau mỗi one-box, ít nhất 12 giờ sau wave vùng đầu tiên |
+| Lưu lượng của wave | Wave nhận ít request cần chờ lâu hơn để đủ mẫu (D13.3 đã thấy canary không có lưu lượng); AWS đặt cả điều kiện kiểu "ít nhất 100 request vào API tạo mới" bên cạnh thời gian |
+| Giờ trong ngày | Bake lúc 3 giờ sáng chứng minh ít hơn bake lúc cao điểm |
+| Cái giá của việc dừng | Dừng giữa chừng để lại production ở hai phiên bản; mọi thứ phải chịu được điều đó |
+
+<Callout kind="production">
+
+Ngày 29/10/2025, Azure Front Door và Azure CDN gây timeout và lỗi phân giải DNS cho khách hàng và dịch vụ của Microsoft. Theo bản Post Incident Review của Microsoft, một chuỗi thay đổi cấu hình hợp lệ của khách hàng, thực hiện trên hai phiên bản khác nhau của control plane, sinh ra metadata không tương thích, và metadata đó kích hoạt một lỗi tiềm ẩn ở data plane. Dòng thời gian (UTC):
+
+- 15:35: thay đổi được tạo; 15:36: tới môi trường tiền production. Crash xảy ra trong lúc xử lý bất đồng bộ, nên tín hiệu sức khoẻ vẫn tốt, và sau khoảng năm phút cấu hình đi qua các lớp bảo vệ sang các nấc sau.
+- 15:39: cấu hình đã tới phần lớn các edge site. 15:41: ảnh hưởng bắt đầu ở tiền production. 15:43: hệ thống bảo vệ chặn mọi thay đổi mới. 15:45: ảnh hưởng lan tới mọi edge site.
+- Vì cấu hình xấu đã lan rộng với tín hiệu sức khoẻ tốt, bản "tốt gần nhất" (last known good) cũng đã bị cập nhật theo nó. Đội không lui về bản đó mà sửa tay để gỡ các cấu hình gây lỗi, rồi triển khai lại từ 17:40.
+- 00:05 ngày 30/10: ảnh hưởng được xác nhận đã khắc phục.
+
+Việc khắc phục Microsoft nêu: bắt buộc xử lý đồng bộ từng cấu hình trước các nấc production, thêm nấc triển khai với **bake time dài hơn**, và thêm một nấc "pre-canary" để thử cấu hình của khách hàng; họ cũng ghi rằng các nấc thêm vào làm việc lan truyền thay đổi chậm hơn.
+
+Phần của bài: wave chỉ bảo vệ được khi cổng kiểm giữa hai wave đo đúng thứ sẽ hỏng và chờ đủ lâu để nó kịp hỏng.
+
+</Callout>
+
+<Check id="d14.4.wave-bake">Giải thích được triển khai theo wave và bake time, kể được bốn yếu tố quyết định độ dài bake time, và chỉ ra được trong sự cố Azure Front Door vì sao các nấc triển khai không chặn được cấu hình xấu.</Check>
+
+### Sync wave và hook của Argo CD
+
+Argo CD có sẵn cơ chế xếp thứ tự trong **một** lượt sync. Mỗi tài nguyên mang annotation `argocd.argoproj.io/sync-wave` (mặc định 0, được phép âm). Argo CD áp tài nguyên theo thứ tự: pha (PreSync, Sync, PostSync), rồi wave từ nhỏ tới lớn, rồi loại tài nguyên (Namespace trước), rồi tên. Nó chỉ bắt đầu wave kế tiếp khi mọi tài nguyên của wave hiện tại đã khoẻ, và mặc định nghỉ thêm 2 giây giữa hai wave.
+
+**Hook** là tài nguyên (thường là Job) chỉ chạy ở một thời điểm của lượt sync, khai bằng annotation `argocd.argoproj.io/hook`:
+
+| Hook | Chạy khi | Thất bại thì |
+|---|---|---|
+| `PreSync` | Trước khi áp bất cứ manifest nào | Cả lượt sync dừng, bị đánh dấu thất bại |
+| `Sync` | Cùng pha với manifest, theo đúng wave của nó | Lượt sync thất bại, chạy hook `SyncFail` |
+| `PostSync` | Sau khi mọi tài nguyên đã khoẻ | Lượt sync bị đánh dấu thất bại |
+| `SyncFail` | Khi lượt sync thất bại | Không làm gì thêm |
+
+Ghép hai cơ chế lại được một đường ống wave ngay trong một Application: tài nguyên của cell-1 ở wave 1, một Job `Sync` hook ở wave 2 làm cổng kiểm (chờ bake time, hỏi Prometheus, thoát mã khác 0 nếu xấu), cell-2 ở wave 3, cổng kiểm ở wave 4, cell-3 ở wave 5. Cổng kiểm thất bại thì lượt sync dừng ở đó và các wave sau không được áp.
+
+Giới hạn của cách này: mọi wave nằm trong **một** Application và **một** cụm. Khi các cell là các cụm khác nhau, wave được dựng bằng nhiều Application (ApplicationSet với generator theo cụm, mỗi nhóm cụm một đợt) và một công cụ điều phối giữa chúng; đó là phần của K10. Cơ chế cổng kiểm thì giữ nguyên.
+
+<Check id="d14.4.argo-waves">Kể được thứ tự Argo CD áp tài nguyên trong một lượt sync, phân biệt được bốn loại hook chính, và dựng được trên giấy một đường ống ba wave có cổng kiểm chỉ bằng sync wave và hook.</Check>
+
+### Config cũng là thay đổi
+
+Phần lớn các sự cố lớn những năm gần đây không bắt đầu từ một bản build mới. Chúng bắt đầu từ một thay đổi **cấu hình** hay **dữ liệu điều khiển** (luật WAF, bảng định tuyến, chính sách quota, danh sách tính năng của mô hình, cấu hình của khách hàng) được đẩy ra toàn cầu trong vài giây, không qua nấc nào. Code có canary, có wave; cấu hình thường đi một đường riêng nhanh hơn, vì "chỉ là đổi một con số". D6.4 đã kể vụ Google Cloud 12/06/2025, khi một chính sách có trường rỗng lan ra mọi vùng trong vài giây.
+
+Hai cách đưa cấu hình tới ứng dụng, và mỗi cách cần một đường ống khác nhau:
+
+| | Cấu hình bất biến | Cấu hình động |
+|---|---|---|
+| Cách làm | ConfigMap mang hash trong tên (`configMapGenerator`, K3.1); đổi nội dung là đổi tên, kéo theo đổi pod template | Ứng dụng đọc lại file, gọi dịch vụ cấu hình hoặc cờ, nhận thay đổi khi đang chạy |
+| Một thay đổi trông như | Một lần triển khai: rolling, canary, wave | Một lần ghi dữ liệu: có hiệu lực ngay ở mọi nơi đọc nó |
+| Đi qua wave | Tự nhiên, như code | Chỉ khi hệ thống phân phối cấu hình tự chia nấc |
+| Lui | Lui commit, các pod quay về ConfigMap cũ | Ghi lại giá trị cũ, nếu còn biết nó là gì |
+| Hợp với | Hầu hết cấu hình của ứng dụng | Cờ tính năng, kill switch (D13.5), dữ liệu đổi nhiều lần mỗi giờ |
+
+Quy tắc của bài: **mọi thứ làm hệ thống đổi hành vi đều là thay đổi production**, và cần cùng ba thứ như code: được review trong pull request, được kiểm tự động trước khi merge (render được, giá trị trong khoảng cho phép, đúng schema), và lan ra theo nấc có bake time. Cấu hình động không thoát được quy tắc này; nó chỉ chuyển trách nhiệm chia nấc sang hệ thống phân phối cấu hình.
+
+Lab dùng cấu hình bất biến: `config.json` đi vào một ConfigMap có hash, nên mỗi lần đổi giá trị là một lần pod của từng cell được thay, theo đúng wave.
+
+<Check id="d14.4.config-change">So sánh được cấu hình bất biến với cấu hình động theo cách lan ra, cách đi qua wave và cách lui, và nêu được ba thứ một thay đổi cấu hình cần có như một thay đổi code.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Sync Phases and Waves (Argo CD)](https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/): thứ tự áp tài nguyên, các loại hook, chính sách xoá hook, độ trễ giữa hai wave.
+- [Automating safe, hands-off deployments (Amazon Builders' Library)](https://builder.aws.com/content/3ErTKQOTKc5NIw031UePBPxTQ6I/automating-safe-hands-off-deployments): cách AWS chia wave từ một máy tới nhiều vùng, bake time, tự lui theo cảnh báo và cửa sổ triển khai; đọc phần về các giai đoạn production.
+- [Automated Sync Policy (Argo CD)](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/): `retry` và `retry.refresh` của lượt sync tự động, liên quan trực tiếp tới bước 5 của lab.
+- [Azure status history: Azure Front Door, tracking ID YKYN-BWZ](https://azure.status.microsoft/en-us/status/history/?trackingId=YKYN-BWZ): bản Post Incident Review của vụ việc trong callout; đọc phần về vì sao cấu hình qua được các lớp bảo vệ và danh sách việc khắc phục.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D13.3. Nếu đã dừng lab ở cuối bài trước: chạy `docker start d13-lab-control-plane d13-gitea d13-registry`, chờ tới khi `curl -s localhost:9700/api/healthz` trả lời (khoảng nửa phút), rồi mới `docker start d13-runner` (runner bật trước Gitea sẽ thoát ngay vì không đăng ký được); chờ thêm khoảng một phút cho các pod trong cụm sẵn sàng, rồi `cd ~/masteva-d14 && . ./lab.sh`. Mỗi khối lệnh mở bằng `cd` tới đúng thư mục của nó, nên mở tab mới giữa chừng chỉ cần `cd ~/masteva-d14 && . ./lab.sh`. Lúc bắt đầu: Prometheus chạy trong namespace `monitoring`, ba môi trường `price-*` đang `Healthy`. Lab tải image `curlimages/curl:8.22.0` (khoảng 15 MB nén) cho Job cổng kiểm và `busybox:1.38.0` cho bộ tạo tải. **Profile máy:** thêm khoảng 60 MiB cho sáu pod của ba cell và bộ tạo tải; cả lab khoảng 2,9 GiB theo `docker stats`. Mỗi thay đổi đi qua ba wave mất khoảng hai phút vì có hai lần bake 45 giây. Máy 8 GB chạy được nếu Docker VM có 4 GB và không chạy lab khác cùng lúc (ước từ số đo trên, chưa chạy thử trên máy 8 GB).
+
+### 1. Ba cell và hai cổng kiểm trong repo
+
+Mỗi cell là một namespace chạy `price-api` với cấu hình đọc từ `config.json`. Cell dùng Deployment, không dùng Rollout, để bài chỉ tập trung vào wave giữa các cell; nhờ vậy `configMapGenerator` dùng bình thường, không cần `rollout-transform.yaml` của D13.3. `base` của cell có thêm ConfigMap `price-api-flags` mà D13.5 dùng.
+
+Khối đầu tạo thư mục `price-api/cells/` trên một nhánh mới: `base` (Deployment, Service, ConfigMap cờ, `config.json` và kustomization sinh ConfigMap cấu hình có hash), và ba thư mục `cell-1` tới `cell-3`. Mỗi cell là một overlay đặt namespace riêng và gắn annotation `sync-wave` bằng `commonAnnotations`: cell-1 ở wave 1, cell-2 ở wave 3, cell-3 ở wave 5. Khối không in gì.
+
+<Terminal where="mac" title="~/masteva-d14/deploy: base và ba cell">
+
+```bash
+cd ~/masteva-d14 && . ./lab.sh && cd ~/masteva-d14/deploy
+git switch -q -c cells-init && mkdir -p price-api/cells/base && cd price-api/cells
+cat > base/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: price-api
+spec:
+  replicas: 2
+  progressDeadlineSeconds: 60
+  selector:
+    matchLabels: { app: price-api }
+  template:
+    metadata:
+      labels: { app: price-api }
+    spec:
+      containers:
+        - name: price-api
+          image: d13-registry:5000/price-api
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: APP_ENV, value: prod }
+            - { name: CONFIG_FILE, value: /etc/price-api/config/config.json }
+            - { name: FLAG_FILE, value: /etc/price-api/flags/discount }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+          lifecycle:
+            preStop: { sleep: { seconds: 3 } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/price-api/config }
+            - { name: flags, mountPath: /etc/price-api/flags }
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+            limits: { memory: 64Mi }
+      volumes:
+        - { name: config, configMap: { name: price-api-config } }
+        - { name: flags, configMap: { name: price-api-flags } }
+EOF
+printf 'apiVersion: v1\nkind: Service\nmetadata:\n  name: price-api\nspec:\n  selector: { app: price-api }\n  ports: [{ port: 80, targetPort: 8080 }]\n' > base/service.yaml
+printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: price-api-flags\ndata:\n  discount: "on"\n' > base/flags.yaml
+echo '{ "discount_percent": 10 }' > base/config.json
+cat > base/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [deployment.yaml, service.yaml, flags.yaml]
+configMapGenerator:
+  - name: price-api-config
+    files: [config.json]
+EOF
+for n in 1 2 3; do
+  mkdir -p cell-$n
+  printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: price-cell-%s\n' $n > cell-$n/namespace.yaml
+  printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: price-cell-%s\nresources: [namespace.yaml, ../base]\ncommonAnnotations:\n  argocd.argoproj.io/sync-wave: "%s"\n' $n $((2 * n - 1)) > cell-$n/kustomization.yaml
+done
+```
+
+</Terminal>
+
+Khối thứ hai viết cổng kiểm: script `gate.sh` và hai Job dùng nó, `gate-1.yaml` ở wave 2 (sau cell-1) và `gate-2.yaml` ở wave 4 (sau cell-2). Mỗi Job mang annotation hook `Sync`, nên Argo CD chạy nó đúng ở wave của nó và chờ nó xong. Khối cũng không in gì.
+
+<Terminal where="mac" title="~/masteva-d14/deploy/price-api/cells: cổng kiểm">
+
+```bash
+cd ~/masteva-d14/deploy/price-api/cells
+cat > gate.sh <<'EOF'
+# gate.sh: chờ BAKE giây, rồi chỉ cho wave sau đi tiếp khi cell vừa đổi có lưu lượng và ít lỗi
+echo "bake $BAKE giây cho $CELL"; sleep "$BAKE"
+q() { curl -sf --get http://prometheus.monitoring.svc:9090/api/v1/query --data-urlencode "query=$1" \
+      | sed -n 's/.*"value":\[[^,]*,"\([^"]*\)".*/\1/p'; }
+RPS=$(q "sum(rate(http_requests_total{namespace=\"$CELL\"}[30s]))")
+ERR=$(q "sum(rate(http_requests_total{namespace=\"$CELL\",code=~\"5..\"}[30s])) / sum(rate(http_requests_total{namespace=\"$CELL\"}[30s]))")
+echo "$CELL: ${RPS:-không có số liệu} request/giây, tỉ lệ lỗi ${ERR:-không có số liệu}"
+if awk -v r="$RPS" -v e="$ERR" 'BEGIN { exit !(r + 0 >= 1 && e != "" && e != "NaN" && e + 0 < 0.05) }'; then
+  echo "QUA: wave sau được đi tiếp"
+else
+  echo "CHẶN: dừng ở $CELL"; exit 1
+fi
+EOF
+for n in 1 2; do
+cat > gate-$n.yaml <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gate-cell-$n
+  namespace: price-cell-$n
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/sync-wave: "$((2 * n))"
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: gate
+          image: curlimages/curl:8.22.0
+          env:
+            - { name: CELL, value: price-cell-$n }
+            - { name: BAKE, value: "45" }
+          command: [sh, /gate/gate.sh]
+          volumeMounts: [{ name: gate, mountPath: /gate }]
+      volumes: [{ name: gate, configMap: { name: gate-script } }]
+EOF
+done
+```
+
+</Terminal>
+
+Ba chi tiết đáng đọc trong `gate.sh`:
+
+- Cổng kiểm đòi **cả hai** điều kiện: có ít nhất 1 request mỗi giây, và tỉ lệ lỗi dưới 5%. Không có số liệu, hoặc Prometheus không trả lời, thì `RPS` rỗng và cổng kiểm đóng, cùng lý do như D13.3.
+- Truy vấn dùng cửa sổ `[30s]` và chạy sau 45 giây bake, nên số liệu chủ yếu đến từ pod mới của cell; pod cũ đã bị thay ở đầu wave.
+- Script lấy số từ JSON của Prometheus bằng `sed`, vì image `curlimages/curl` không có `jq`.
+
+`BeforeHookCreation`: lần sync sau xoá Job cũ rồi mới tạo Job mới, nên log của lần cổng kiểm gần nhất luôn còn để đọc.
+
+Khối thứ ba viết kustomization ở gốc thư mục `cells`: gom ba cell và hai Job, sinh ConfigMap `gate-script` chứa `gate.sh` cho hai namespace có cổng kiểm, và ghim digest đang chạy ở prod. Lệnh `yq` in bản render thành bảng ba cột: wave, loại object, namespace và tên. Sau đó khối thêm một dòng render thư mục `cells` vào `verify.sh` và mở pull request như mọi thay đổi khác.
+
+<Terminal where="mac" title="~/masteva-d14/deploy/price-api/cells: kustomization gốc và pull request">
+
+```bash
+cd ~/masteva-d14/deploy/price-api/cells
+cat > kustomization.yaml <<EOF
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [cell-1, gate-1.yaml, cell-2, gate-2.yaml, cell-3]
+configMapGenerator:
+  - name: gate-script
+    namespace: price-cell-1
+    files: [gate.sh]
+    options: { disableNameSuffixHash: true, annotations: { argocd.argoproj.io/sync-wave: "1" } }
+  - name: gate-script
+    namespace: price-cell-2
+    files: [gate.sh]
+    options: { disableNameSuffixHash: true, annotations: { argocd.argoproj.io/sync-wave: "3" } }
+images:
+  - name: d13-registry:5000/price-api
+    digest: $(awk '$1 == "digest:" {print $2}' ../envs/prod/kustomization.yaml)
+EOF
+kubectl kustomize . | yq -r 'select(.kind != null) | [.metadata.annotations["argocd.argoproj.io/sync-wave"], .kind, .metadata.namespace + "/" + .metadata.name] | join("  ")' | sort -n
+cd ~/masteva-d14/deploy
+perl -pi -e 's|^f\(\)|kustomize build price-api/cells > /tmp/cells.yaml \&\& echo "cells: render được \$(grep -c "^kind:" /tmp/cells.yaml) object"\n\nf()|' ci/verify.sh
+grep -n cells ci/verify.sh
+git add -A && git commit -q -m "Ba cell cho price-api, triển khai theo wave có cổng kiểm"
+pr "Ba cell cho price-api"
+job_log deploy verify | grep '^cells'
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1  ConfigMap  price-cell-1/gate-script
+1  ConfigMap  price-cell-1/price-api-config-fftf77bhk4
+1  ConfigMap  price-cell-1/price-api-flags
+1  Deployment  price-cell-1/price-api
+1  Namespace  /price-cell-1
+1  Service  price-cell-1/price-api
+2  Job  price-cell-1/gate-cell-1
+3  ConfigMap  price-cell-2/gate-script
+3  ConfigMap  price-cell-2/price-api-config-fftf77bhk4
+3  ConfigMap  price-cell-2/price-api-flags
+3  Deployment  price-cell-2/price-api
+3  Namespace  /price-cell-2
+3  Service  price-cell-2/price-api
+4  Job  price-cell-2/gate-cell-2
+5  ConfigMap  price-cell-3/price-api-config-fftf77bhk4
+5  ConfigMap  price-cell-3/price-api-flags
+5  Deployment  price-cell-3/price-api
+5  Namespace  /price-cell-3
+5  Service  price-cell-3/price-api
+9:kustomize build price-api/cells > /tmp/cells.yaml && echo "cells: render được $(grep -c "^kind:" /tmp/cells.yaml) object"
+PR #15: Ba cell cho price-api
+run 18  verify: success
+binh: APPROVED
+merge PR #15: HTTP 200
+cells: render được 19 object
+```
+
+</Expected>
+
+Bảng in ra chính là kế hoạch của một lượt sync: số đầu dòng là wave. Hai chi tiết của kustomization gốc:
+
+- ConfigMap `gate-script` dùng `disableNameSuffixHash: true` để giữ tên cố định, vì Job trỏ tới nó bằng đúng tên `gate-script`. Nó mang wave 1 và 3, cùng wave với cell của nó, để có sẵn trước khi Job ở wave 2 và 4 chạy.
+- `images` ở gốc áp digest cho cả ba cell một lần: ba cell luôn chạy cùng một bản, chỉ khác thời điểm nhận.
+
+Dòng `grep` cho thấy `verify.sh` giờ render cả thư mục `cells`, để một manifest hỏng trong đó cũng bị chặn ở pull request. Như đã nêu ở D13.2, chính thay đổi này của `verify.sh` cũng đi qua pull request và chỉ có người duyệt đứng chặn.
+
+### 2. Bộ tạo tải và Application của các cell
+
+Cổng kiểm cần lưu lượng thật, nên một Deployment nhỏ gọi đều vào cả ba cell, khoảng 8 request mỗi giây cho mỗi cell. Application `price-cells` có thêm `retry: { limit: 0 }`; bước 5 giải thích vì sao. Hàm `watch_cells` in một dòng mỗi khi lượt sync đổi trạng thái: số giây, pha của lượt sync, thông báo của Argo CD, và cột "cấu hình" cho biết mỗi cell đang dùng ConfigMap nào; `probe` gọi một request vào mỗi cell từ trong cụm.
+
+<Terminal where="mac" title="~/masteva-d14: loadgen.yaml, app-price-cells.yaml">
+
+```bash
+cd ~/masteva-d14
+cat > loadgen.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: loadgen, namespace: monitoring }
+spec:
+  selector: { matchLabels: { app: loadgen } }
+  template:
+    metadata: { labels: { app: loadgen } }
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: loadgen
+          image: busybox:1.38.0
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                for c in 1 2 3; do wget -q -T 1 -O /dev/null http://price-api.price-cell-$c/price; done
+                sleep 0.1
+              done
+          resources: { requests: { cpu: 20m, memory: 8Mi }, limits: { memory: 32Mi } }
+EOF
+cat > app-price-cells.yaml <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: price-cells
+  namespace: argocd
+spec:
+  project: price
+  source:
+    repoURL: http://d13-gitea:3000/an/deploy.git
+    targetRevision: main
+    path: price-api/cells
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: price-cell-1
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    retry: { limit: 0 }
+EOF
+cat >> lab.sh <<'EOF'
+watch_cells() {  # watch_cells: in mỗi lần lượt sync của price-cells đổi trạng thái, tới khi nó kết thúc ở commit mới nhất
+  local want t0 prev cur op; t0=$(date +%s)
+  want=$(git -C "$HOME/masteva-d14/deploy" rev-parse origin/main)
+  for i in $(seq 1 200); do
+    op=$(kubectl -n argocd get application price-cells -o json | jq -r \
+      '"\(.status.operationState.operation.sync.revision // "-") \(.status.operationState.phase // "-")"')
+    cur="${op#* }: $(kubectl -n argocd get application price-cells -o json | jq -r '.status.operationState.message // "" | .[0:58]') | cấu hình:"
+    for c in 1 2 3; do cur="$cur $(kubectl -n price-cell-$c get deployment price-api -o json 2>/dev/null \
+      | jq -r '.spec.template.spec.volumes[0].configMap.name[-4:]' 2>/dev/null || echo -)"; done
+    if [ "$cur" != "$prev" ]; then echo "$(( $(date +%s) - t0 ))s  $cur"; prev=$cur; fi
+    case "$op" in "$want Succeeded"|"$want Failed"|"$want Error") return 0 ;; esac
+    sleep 3
+  done
+}
+probe() {  # probe: một request vào mỗi cell, từ trong cụm
+  kubectl -n monitoring exec deploy/loadgen -- sh -c \
+    'for c in 1 2 3; do echo "cell-$c: $(wget -q -T 2 -O - http://price-api.price-cell-$c/price 2>&1 | head -c 70)"; done'
+}
+EOF
+. ./lab.sh
+kubectl apply -f loadgen.yaml -f app-price-cells.yaml
+watch_cells
+wait_app price-cells >/dev/null
+probe
+for n in 1 2; do kubectl -n price-cell-$n logs job/gate-cell-$n; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/loadgen created
+application.argoproj.io/price-cells created
+0s  -:  | cấu hình:
+3s  Running: waiting for healthy state of /Namespace/price-cell-1 | cấu hình: bhk4
+7s  Running: waiting for completion of hook batch/Job/gate-cell-1 | cấu hình: bhk4
+65s  Running: waiting for healthy state of /Namespace/price-cell-2 and 5 | cấu hình: bhk4 bhk4
+68s  Running: waiting for completion of hook batch/Job/gate-cell-2 | cấu hình: bhk4 bhk4
+114s  Succeeded: successfully synced (all tasks run) | cấu hình: bhk4 bhk4 bhk4
+cell-1: {"env":"prod","host":"price-api-5d57f7b7c5-fc6fh","price":1125000,"ver
+cell-2: {"env":"prod","host":"price-api-68d5bdfc45-d2xkc","price":1125000,"ver
+cell-3: {"env":"prod","host":"price-api-7998c65ff5-rvsfk","price":1125000,"ver
+bake 45 giây cho price-cell-1
+price-cell-1: 8.519808007679693 request/giây, tỉ lệ lỗi 0
+QUA: wave sau được đi tiếp
+bake 45 giây cho price-cell-2
+price-cell-2: 8.840353614144565 request/giây, tỉ lệ lỗi 0
+QUA: wave sau được đi tiếp
+```
+
+</Expected>
+
+Thông báo của Argo CD bị cắt cho vừa dòng. Cột "cấu hình" là bốn ký tự cuối của tên ConfigMap mà Deployment ở từng cell đang dùng: cell nào đã nhận thay đổi thì đổi chữ. Lần đầu, các cell xuất hiện lần lượt, cách nhau khoảng 55 giây (45 giây bake, cộng thời gian pod lên và 2 giây nghỉ giữa các wave). Giá 1.125.000 là 1.250.000 trừ 10%. Số request mỗi giây trong log cổng trên máy bạn sẽ khác.
+
+<Check id="d14.4.lab-waves">Dựng được một Application triển khai ba cell theo ba wave có hai cổng kiểm là Job hook, và đọc được thứ tự cùng kết quả từng cổng kiểm.</Check>
+
+### 3. Một thay đổi cấu hình tốt đi hết ba wave
+
+Đổi khuyến mãi từ 10% lên 15%, qua đúng quy trình pull request.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/deploy && git switch -q -c config/discount-15
+echo '{ "discount_percent": 15 }' > price-api/cells/base/config.json
+git commit -q -am "Khuyến mãi 15%" && pr "Khuyến mãi 15%"
+watch_cells
+wait_app price-cells >/dev/null
+probe
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PR #16: Khuyến mãi 15%
+run 19  verify: success
+binh: APPROVED
+merge PR #16: HTTP 200
+0s  Succeeded: successfully synced (all tasks run) | cấu hình: bhk4 bhk4 bhk4
+3s  Running:  | cấu hình: t2k4 bhk4 bhk4
+7s  Running: waiting for healthy state of /ConfigMap/price-api-config-f | cấu hình: t2k4 bhk4 bhk4
+10s  Running: waiting for deletion of hook batch/Job/gate-cell-1 | cấu hình: t2k4 bhk4 bhk4
+13s  Running: waiting for completion of hook batch/Job/gate-cell-1 | cấu hình: t2k4 bhk4 bhk4
+62s  Running: waiting for healthy state of apps/Deployment/price-api | cấu hình: t2k4 t2k4 bhk4
+65s  Running: waiting for deletion of hook batch/Job/gate-cell-2 | cấu hình: t2k4 t2k4 bhk4
+68s  Running: waiting for completion of hook batch/Job/gate-cell-2 | cấu hình: t2k4 t2k4 bhk4
+114s  Succeeded: successfully synced (all tasks run) | cấu hình: t2k4 t2k4 t2k4
+cell-1: {"env":"prod","host":"price-api-54ccc9446d-smhpr","price":1062500,"ver
+cell-2: {"env":"prod","host":"price-api-55d7876478-sr474","price":1062500,"ver
+cell-3: {"env":"prod","host":"price-api-7b8c68cd8d-z72v4","price":1062500,"ver
+```
+
+</Expected>
+
+Lượt sync kết thúc ngay khi wave cuối được apply, chưa chờ pod của cell-3 lên xong, nên trước `probe` có thêm `wait_app` chờ Application khoẻ. Một commit đổi một con số; Kustomize tính ra ConfigMap tên mới, Deployment của từng cell đổi theo, và từng cell được thay pod lần lượt, cách nhau một bake. Khoảng hai phút từ merge tới khi cell cuối nhận cấu hình mới: đó là cái giá của wave, trả cho mọi thay đổi, kể cả thay đổi tốt.
+
+### 4. Một thay đổi cấu hình xấu bị chặn ở wave đầu
+
+Ai đó gõ nhầm 150 thay cho 15. Giá thành số âm, và `price-api` trả 500 cho mọi request `/price` nhưng `/healthz` vẫn trả 200. Một kiểm tra khoảng giá trị trong `verify.sh` **lẽ ra đã** chặn được lỗi này ở pull request (xem Đào sâu); lab cố tình chưa thêm để bạn thấy lớp bảo vệ thứ hai.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/deploy && git switch -q -c config/discount-150
+echo '{ "discount_percent": 150 }' > price-api/cells/base/config.json
+git commit -q -am "Khuyến mãi 150%" && pr "Khuyến mãi (gõ nhầm 150)"
+watch_cells
+probe
+kubectl -n price-cell-1 logs job/gate-cell-1
+app_status price-cells
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Predict question="Cell-1 nhận cấu hình mới và mọi request vào nó trả 500. Pod vẫn sẵn sàng, Deployment vẫn khoẻ. Wave 2 và wave 3 có chạy không, và bao nhiêu phần người dùng bị ảnh hưởng?">
+
+```text
+PR #17: Khuyến mãi (gõ nhầm 150)
+run 20  verify: success
+binh: APPROVED
+merge PR #17: HTTP 200
+1s  Succeeded: successfully synced (all tasks run) | cấu hình: t2k4 t2k4 t2k4
+4s  Running:  | cấu hình: c65t t2k4 t2k4
+7s  Running: waiting for healthy state of /ConfigMap/price-api-config-f | cấu hình: c65t t2k4 t2k4
+11s  Running: waiting for deletion of hook batch/Job/gate-cell-1 | cấu hình: c65t t2k4 t2k4
+14s  Running: waiting for completion of hook batch/Job/gate-cell-1 | cấu hình: c65t t2k4 t2k4
+62s  Failed: one or more synchronization tasks completed unsuccessfully | cấu hình: c65t t2k4 t2k4
+cell-1: wget: server returned error: HTTP/1.1 500 Internal Server Error
+cell-2: {"env":"prod","host":"price-api-55d7876478-sr474","price":1062500,"ver
+cell-3: {"env":"prod","host":"price-api-7b8c68cd8d-z72v4","price":1062500,"ver
+bake 45 giây cho price-cell-1
+price-cell-1: 9.120000000000001 request/giây, tỉ lệ lỗi 1
+CHẶN: dừng ở price-cell-1
+price-cells  rev=3d2b28d  sync=OutOfSync  health=Healthy
+```
+
+Không. Health của Deployment ở cell-1 vẫn tốt (D13.2 đã thấy health không biết gì về request), nên wave 1 coi như xong; Job cổng kiểm đo được tỉ lệ lỗi 1 (tức 100%), thoát mã 1, và lượt sync thất bại ở wave 2. Cell-2 và cell-3 giữ cấu hình 15%. Một phần ba lưu lượng bị ảnh hưởng thay vì toàn bộ. Application báo `OutOfSync` (Git muốn cả ba cell nhận 150%, cụm mới có một) cộng `Healthy` (health chỉ đọc trạng thái của Deployment).
+
+</Predict>
+
+Không có Job cổng kiểm, Argo CD sẽ đưa con số 150 vào cả ba cell trong vài giây: Deployment nào cũng khoẻ. Cổng kiểm hỏi đúng câu "người dùng có đang nhận lỗi không" mới là thứ dừng được nó.
+
+<Check id="d14.4.lab-bad-config">Tái hiện được một thay đổi cấu hình xấu bị cổng kiểm chặn ở wave đầu trong khi health vẫn tốt, và chỉ ra được phạm vi ảnh hưởng cùng trạng thái sync, health của Application.</Check>
+
+### 5. Lui, và cái giá của việc thử lại
+
+Revert commit lỗi qua pull request, đo thời gian từ lúc mở pull request tới lúc cell-1 trả giá đúng trở lại, xem lượt sync của commit lui đi hết ba wave, rồi in giá trị `retry` mà Argo CD gắn cho lượt sync của hai Application.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/deploy && git switch -q -c config/revert-150
+git revert --no-edit HEAD >/dev/null
+t0=$(date +%s); pr "Lui: khuyến mãi 150%"
+for i in $(seq 1 60); do probe | grep -q 'cell-1: {"env"' && break; sleep 2; done
+echo "cell-1 phục vụ lại sau $(( $(date +%s) - t0 )) giây kể từ khi mở PR lui"
+watch_cells
+for a in price-api-prod price-cells; do echo "$a retry: $(kubectl -n argocd get application $a -o jsonpath='{.status.operationState.operation.retry}')"; done
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PR #18: Lui: khuyến mãi 150%
+run 21  verify: success
+binh: APPROVED
+merge PR #18: HTTP 200
+cell-1 phục vụ lại sau 10 giây kể từ khi mở PR lui
+0s  Running: waiting for healthy state of apps/Deployment/price-api | cấu hình: t2k4 t2k4 t2k4
+3s  Running: waiting for deletion of hook batch/Job/gate-cell-1 | cấu hình: t2k4 t2k4 t2k4
+6s  Running: waiting for completion of hook batch/Job/gate-cell-1 | cấu hình: t2k4 t2k4 t2k4
+55s  Running: waiting for deletion of hook batch/Job/gate-cell-2 | cấu hình: t2k4 t2k4 t2k4
+58s  Running: waiting for completion of hook batch/Job/gate-cell-2 | cấu hình: t2k4 t2k4 t2k4
+104s  Succeeded: successfully synced (all tasks run) | cấu hình: t2k4 t2k4 t2k4
+price-api-prod retry: {"limit":5}
+price-cells retry: {}
+```
+
+</Expected>
+
+Cell-1 về cấu hình 15% chỉ vài giây sau khi merge. Con số in ra trên máy bạn thường trong khoảng 10 tới 40 giây, phần lớn là thời gian chờ `verify`. Lượt sync sau đó vẫn đi đủ ba wave và hai lần bake, nhưng không đổi gì ở cell-2 và cell-3: chúng chưa bao giờ rời khỏi 15%.
+
+Con số đó chỉ đẹp nhờ dòng `retry: { limit: 0 }` ở bước 2. Application nào không khai `retry` thì lượt sync tự động của nó mang sẵn `retry.limit: 5`; dòng `retry` cuối khối trên in giá trị đó của hai Application để bạn so: `price-api-prod` (không khai) ra `{"limit":5}`, còn `price-cells` ra `{}`: `limit: 0` là giá trị rỗng nên không được in ra, và nghĩa là không thử lại. Nếu `price-cells` cũng để mặc định, đây là chuyện xảy ra sau khi cổng kiểm ở wave 2 thất bại:
+
+1. Argo CD chạy lại cả lượt sync hỏng thêm tối đa năm lần. Mỗi lần chạy lại Job cổng kiểm: khoảng 45 giây bake cộng 10 tới 15 giây để Job lên và hỏi Prometheus.
+2. Giữa các lần, nó nghỉ tăng gấp đôi: khoảng 10, 20, 40, 80, 160 giây.
+3. Commit lui đã merge vẫn phải chờ chuỗi đó hết, vì Argo CD chỉ bắt đầu lượt sync mới khi lượt cũ kết thúc.
+
+Cộng lại, cell-1 có thể tiếp tục trả lỗi thêm tới khoảng 10 phút sau khi bạn đã merge bản lui, tuỳ commit lui tới giữa chừng chuỗi thử lại ở đâu. Ba cách tránh: `retry: { limit: 0 }` như lab (cổng kiểm đã nói "không" thì thử lại cũng vô ích), `retry.refresh: true` để lượt thử lại chuyển sang commit mới nhất, hoặc huỷ tay bằng `argocd app terminate-op`. Với cổng kiểm có bake time, thử lại không bao giờ là mặc định đúng.
+
+<Check id="d14.4.lab-revert">Lui được một thay đổi cấu hình bị chặn ở wave đầu bằng pull request, đo được thời gian cell bị ảnh hưởng phục vụ lại, và tính được thời gian chờ thêm nếu Application để `retry` mặc định.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Cổng kiểm in `không có số liệu` và chặn cả thay đổi tốt:** bộ tạo tải chưa chạy, hoặc Prometheus chưa kịp thu pod mới của cell. Kiểm `kubectl -n monitoring get pods` và `probe`; tăng `BAKE` nếu máy chậm.
+- **Lượt sync đứng ở `waiting for completion of hook` quá vài phút:** pod của Job không kéo được image `curlimages/curl`. Xem `kubectl -n price-cell-1 describe job gate-cell-1`.
+- **`watch_cells` in `Failed` với thông báo nhắc `not permitted in project`:** AppProject `price` không cho tài nguyên đó. Namespace là tài nguyên cấp cụm duy nhất được phép (D13.2).
+- **Wave 1 dừng ở `waiting for healthy state of apps/Deployment` rồi `Failed` sau 60 giây:** pod mới không lên (thường là cấu hình hỏng làm ứng dụng thoát lúc khởi động). Xem `kubectl -n price-cell-1 logs deploy/price-api`; D13.5 tái hiện đúng tình huống này.
+- **Lui xong mà cell-1 vẫn trả 500 trong nhiều phút:** Application thiếu `retry: { limit: 0 }` và lượt sync hỏng đang thử lại. Kiểm `kubectl -n argocd get application price-cells -o jsonpath='{.status.operationState.retryCount}'`; huỷ bằng `argocd app terminate-op price-cells`.
+
+</Callout>
+
+### Dọn dẹp
+
+D13.5 dùng tiếp ba cell và bộ tạo tải. Nếu nghỉ, dừng các container như cuối D13.2; bộ tạo tải sẽ chạy lại khi cụm bật lên. Khối xoá hẳn của chặng nằm cuối D13.1.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Có nên kiểm giá trị cấu hình ở pull request khi đã có cổng kiểm bằng metric?">
+
+Có, và đó là lớp rẻ nhất: một dòng `jq -e '.discount_percent >= 0 and .discount_percent <= 90'` trong `verify.sh` chặn con số 150 trước khi nó chạm vào cell nào. Nhưng kiểm tĩnh chỉ bắt được lỗi bạn đã nghĩ tới. Vụ Azure Front Door bắt đầu từ những cấu hình **hợp lệ** từng cái một, chỉ hỏng khi kết hợp với nhau trên hai phiên bản control plane. Ba lớp bổ sung nhau: kiểm tĩnh trong pull request (schema, khoảng giá trị, render được), wave có bake time (lỗi lộ ra khi chạy với dữ liệu thật), và khả năng lui nhanh (lỗi lọt qua cả hai). Cloudflare, sau vụ 18/11/2025 (callout của D13.5), viết rằng sẽ kiểm file cấu hình do chính hệ thống của họ sinh ra kỹ như kiểm dữ liệu người dùng nhập vào.
+
+</Reveal>
+
+<Reveal title="Wave có giúp gì khi thay đổi làm hỏng thứ dùng chung giữa các cell?">
+
+Không. Wave chia **nơi chạy**, không chia **dữ liệu**. Một migration trên database dùng chung, một bản ghi DNS toàn cục, một luật trên CDN đứng trước mọi cell, một thay đổi quyền trong hệ thống định danh: tất cả có hiệu lực cho mọi cell cùng lúc, bất kể cell nào được triển khai trước. Đó là lý do kiến trúc cell (D21) cố tách cả dữ liệu và phụ thuộc theo cell, và vì sao thay đổi ở tầng dùng chung cần cơ chế nấc riêng (với DNS là TTL ngắn và đổi từng bản ghi; với database là expand/contract của D6.4).
+
+</Reveal>
+
+<Reveal title="Bake time 45 giây trong lab có ý nghĩa gì ở production?">
+
+Gần như không có, ngoài việc minh hoạ. Production thường bake từ vài chục phút tới vài giờ cho wave đầu, và rút ngắn dần ở các wave sau khi độ tin cậy tăng. Một số hệ thống còn đặt **cửa sổ triển khai**: bài viết của AWS mô tả việc chỉ cho triển khai bắt đầu trong khung giờ đã cấu hình, loại trừ ban đêm, ngày nghỉ và cuối tuần để luôn gọi được người trực khi cần cứu tay. Argo CD có **sync window** (khai trong AppProject) để chặn sync tự động theo lịch. Bake dài làm một thay đổi mất cả ngày để tới hết production; cách sống với điều đó là gom thay đổi ít hơn và nhỏ hơn, không phải bỏ bake.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết Job cổng kiểm gọi Prometheus, gắn sync wave cho một bộ manifest, hay liệt kê những thứ "không phải code" trong một hệ thống đang đổi hành vi mà không qua pipeline là cách dùng tốt. AI hay sai ở chỗ: viết cổng kiểm coi không có số liệu là đạt; đặt cổng kiểm là hook `PostSync` rồi tin rằng nó chặn được các wave trước nó; đặt `hook-delete-policy: HookSucceeded` cho Job cổng kiểm rồi mất luôn log của lần kiểm vừa qua (mặc định khi không khai là `BeforeHookCreation`, giữ log tới lần sync sau); để nguyên `retry` mặc định cho Application có cổng kiểm; và gộp mọi cell vào một wave vì "đã có canary rồi". Kiểm lại bằng cách đẩy một thay đổi cố tình xấu, như bước 4, và xem nó dừng ở đâu.
+
+</Callout>
+
+<Callout kind="link">
+
+D13.5 xử lý hai thứ wave không lo được: tắt nhanh một tính năng mà không cần triển khai lại, và bảo đảm bản cũ còn chạy được khi phải lui. D21 thiết kế cell và giới hạn blast radius, phần mà bài này chỉ mượn làm đơn vị triển khai. K10 dựng wave giữa nhiều cụm bằng ApplicationSet. D8.5 làm cùng ý với việc vá hệ điều hành theo lô bằng Ansible.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d14.4.mastery-plan">Thiết kế được kế hoạch wave cho một hệ thống nhiều cell hoặc nhiều vùng: thứ tự, độ lớn từng wave, bake time và cổng kiểm đo gì, có lý do cho từng con số.</Check>
+
+<Check id="d14.4.mastery-config">Liệt kê được các loại thay đổi cấu hình và dữ liệu điều khiển trong một hệ thống thật, và với mỗi loại, nói được nó đi qua review, kiểm tự động và wave ở đâu, hoặc vì sao chưa.</Check>
+
+<Check id="d14.4.mastery-operate">Vận hành được một lượt triển khai bị cổng kiểm chặn: đọc lý do, lui đúng cách, và cấu hình được Argo CD để đường lui không phải chờ lượt sync hỏng thử lại.</Check>
+
+</Mastery>

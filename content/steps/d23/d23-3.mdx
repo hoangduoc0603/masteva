@@ -1,0 +1,799 @@
+---
+title: Hiệu năng ở tầng hệ điều hành và mạng
+description: Đo trước khi chỉnh, trên một VM Ubuntu 26.04. Dùng perf và flame graph chỉ ra hàm Python ăn hơn 90% CPU, đo độ trễ đĩa theo độ sâu hàng đợi bằng fio, tạo đường mạng 50 ms có mất gói bằng tc netem để so cubic với bbr bằng iperf3, rồi làm tràn hàng đợi accept, cạn port nguồn và cạn file descriptor để đọc đúng triệu chứng của từng thứ trong ss, nstat và thông báo lỗi.
+id: d23.3
+step: d23
+prerequisites: [d23.1, d1.5, d2.1]
+topics: [d23.hieu-nang-os-mang]
+status: verified
+verified:
+  date: 2026-10-18
+  os: Ubuntu 26.04 LTS (VM Lima trên macOS 14.4.1)
+  tools:
+    lima: 2.2.0
+    linux: 7.0.0-28-generic
+    perf: 7.0.14
+    fio: "3.41"
+    iperf3: "3.20"
+    iproute2: 6.19.0
+    python: 3.14.4
+    flamegraph: commit 41fee1f
+---
+
+<Goal>
+
+Khi trần của hệ nằm dưới ứng dụng, trong kernel, bạn cần biết đo cái gì và chỉnh cái gì, và quan trọng hơn là cái gì **không** nên chỉnh. Học xong bài này, bạn giải thích được:
+
+- Vì sao "CPU 100%" chưa phải là chẩn đoán, và `perf` cộng flame graph chỉ ra đúng hàm nào trong vài giây, kể cả trong một chương trình Python.
+- Vì sao cùng một ổ đĩa vừa cho 15 nghìn vừa cho hơn 200 nghìn IOPS, và con số nào đúng với database của bạn.
+- Vì sao một kết nối qua đường 200 Mbit/s, trễ 50 ms chỉ còn vài tới vài chục Mbit/s khi mất 1% gói với cubic, và bbr làm khác đi thế nào.
+- Ba lỗi "không kết nối được" trông giống nhau nhưng nguyên nhân khác hẳn: hàng đợi accept đầy, cạn port nguồn, cạn file descriptor, và mỗi lỗi để lại dấu vết ở đâu.
+- sysctl nào đáng chỉnh khi có số đo, và vì sao nhiều danh sách "tối ưu Linux" trên mạng là mê tín.
+
+</Goal>
+
+<Knowledge>
+
+### Phương pháp trước công cụ
+
+D1.4 đã dạy chẩn đoán có thứ tự và bộ lệnh 60 giây; D12.3 đã dạy USE (utilization, saturation, errors cho từng tài nguyên). Ở tầng này, ba quy tắc quan trọng hơn mọi công cụ:
+
+1. **Đo trước khi chỉnh, và ghi lại mốc.** Không có con số "trước" thì không có cách nào biết thay đổi giúp hay hại.
+2. **Mỗi lần đổi một thứ**, đo lại cùng điều kiện. Đổi ba sysctl cùng lúc rồi thấy nhanh hơn thì bạn không biết cái nào có tác dụng, và có thể một trong ba đang làm chậm.
+3. **Tìm tài nguyên bão hoà trước, rồi mới hỏi vì sao.** Brendan Gregg gọi cách làm ngược lại là "streetlight anti-method": dùng công cụ mình quen thay vì công cụ hợp với vấn đề.
+
+| Tài nguyên | Mức dùng | Bão hoà (phải chờ) | Lỗi | Công cụ của bài |
+|---|---|---|---|---|
+| CPU | `us`, `sy` của `vmstat` | Cột `r` lớn hơn số CPU, PSI cpu, `st` | | `perf`, flame graph |
+| Bộ nhớ | `free`, `available` | `si`, `so` (swap), PSI memory | OOM kill trong `dmesg` | `free`, `/proc/meminfo` |
+| Đĩa | `%util` của `iostat` | `aqu-sz`, độ trễ `await` | Lỗi I/O trong `dmesg` | `fio` |
+| Mạng | Băng thông so với đường truyền | Retransmit, hàng đợi qdisc | Gói bị drop | `iperf3`, `ss`, `nstat`, `tc` |
+| Hạn mức của kernel | Số port, fd, kết nối đang dùng | Hàng đợi accept | `EADDRNOTAVAIL`, `EMFILE`, `ListenOverflows` | `ss -s`, `nstat`, `ulimit` |
+
+### CPU: perf, flame graph, steal time, context switch
+
+**`perf`** là profiler của chính kernel Linux. `perf record -F 99 -g -- <lệnh>` lấy mẫu tiến trình của lệnh đó 99 lần mỗi giây (thêm `-a` thì lấy mẫu mọi CPU), mỗi lần ghi lại stack (chuỗi hàm đang gọi nhau) ở thời điểm đó; hàm xuất hiện trong nhiều mẫu là hàm tốn nhiều CPU. Tần số 99 chứ không phải 100 để không trùng nhịp với các timer chạy đúng 100 lần mỗi giây. Ưu điểm so với profiler trong ứng dụng: không cần sửa hay khởi động lại chương trình, và thấy cả thời gian trong kernel.
+
+D16.5 đã dạy đọc **flame graph**: mỗi ô là một hàm, ô trên được gọi bởi ô dưới, độ rộng là tỉ lệ mẫu. Ở đây bạn tự tạo nó từ `perf` bằng hai script của Brendan Gregg: `stackcollapse-perf.pl` gộp mỗi stack thành một dòng kèm số mẫu, `flamegraph.pl` vẽ SVG.
+
+Hai điều riêng của máy ảo và ngôn ngữ thông dịch:
+
+- **Sự kiện phần cứng.** Trên máy thật, `perf` lấy mẫu theo bộ đếm chu kỳ CPU (`cycles`). Nhiều máy ảo, trong đó có VM của Lima trên Mac, không đưa bộ đếm phần cứng vào khách; `perf` tự lùi về sự kiện phần mềm, đo bằng đồng hồ của kernel (`cpu-clock` hay `task-clock`). Kết quả flame graph vẫn đúng, nhưng các số đo như số lệnh mỗi chu kỳ (IPC) hay cache miss thì không có.
+- **Python và các runtime có JIT.** `perf` chỉ thấy hàm C của trình thông dịch. Từ Python 3.12, cờ `-X perf` cho trình thông dịch ghi thêm tên hàm Python vào chỗ `perf` đọc được, nên stack hiện `py::dedupe:/…/hot.py`. JVM cần công cụ riêng (async-profiler; SB12.1 dùng JFR).
+
+**Steal time** (`st` trong `vmstat`, `top`) là thời gian CPU ảo của bạn sẵn sàng chạy nhưng hypervisor đang cho máy ảo khác dùng CPU thật. Trên cloud, `st` cao kéo dài nghĩa là "hàng xóm ồn" hoặc loại máy có CPU burstable đã hết credit: ứng dụng chậm đi mà mọi số đo bên trong máy trông bình thường.
+
+**Context switch** là lúc kernel đổi tiến trình đang chạy trên một CPU. Loại tự nguyện (voluntary) xảy ra khi tiến trình chờ I/O hoặc khoá; loại không tự nguyện khi nó bị giành CPU vì hết lượt. Hàng chục nghìn context switch mỗi giây trên mỗi CPU thường nghĩa là quá nhiều thread tranh nhau ít CPU, hoặc tranh khoá. `perf stat -e context-switches` hoặc cột `cs` của `vmstat` cho bạn con số.
+
+<Callout kind="production">
+
+GitHub kể trong bài "Debugging network stalls on Kubernetes" (11/2019) một sự cố mà công cụ quen thuộc không giải thích được: ứng dụng trên các cụm Kubernetes của họ thỉnh thoảng thấy độ trễ "tới và hơn 100 ms" trên kết nối, gây timeout và retry ở phía sau, kể cả với truy vấn MySQL chỉ mất vài mili giây phía server. Đội loại trừ từng lớp (NAT của kube-proxy, TCP, rồi chiều gửi) và thấy gói **nhận** nằm chờ trong hàng đợi của card mạng rồi mới được luồng `ksoftirqd` xử lý dồn. Họ dùng `perf record` 999 lần mỗi giây trên đúng CPU đó và thấy ngay trước các lần kẹt là `cadvisor` đang đọc file `memory.stat` của cgroup; tự `cat` file đó mất khoảng 0,15 giây, toàn bộ là thời gian trong kernel. Nguyên nhân: trên kernel 4.9 họ đang chạy, việc tính `memory.stat` chậm khi có nhiều cgroup "zombie" của container đã thoát mà cache chưa được thu hồi. Họ xác nhận bằng cách xoá cache dentry và inode (bài viết nói rõ đó là kiểm chứng, không phải cách sửa), tạm thời drain và khởi động lại các node bị ảnh hưởng, rồi nâng kernel lên bản mới hơn (4.19 trở lên) có cải thiện cho `memory.stat`. Nhận xét của bài học: CPU của các máy còn dư, nên mọi số đo "mức dùng" đều đẹp; chỉ khi lấy mẫu stack đúng lúc có vấn đề, kẻ gây chuyện mới lộ ra.
+
+</Callout>
+
+<Check id="d23.3.method-cpu">Kể được ba quy tắc đo trước khi chỉnh, giải thích được `perf` lấy mẫu thế nào và vì sao trong VM nó dùng sự kiện phần mềm, và nói được steal time với context switch cho biết điều gì.</Check>
+
+### Bộ nhớ và đĩa: page cache, swap, NUMA, độ sâu hàng đợi
+
+**Page cache.** Kernel dùng RAM rảnh để giữ nội dung file vừa đọc hoặc ghi. Đọc lại file đó lấy từ RAM, nhanh hơn đĩa nhiều bậc. D1.4 đã phân biệt `free` với `available`: phần `buff/cache` trả lại được cho ứng dụng khi cần, nên "RAM gần hết" trên một máy chạy lâu thường là tốt. Database dựa nhiều vào page cache (PostgreSQL có bộ đệm riêng `shared_buffers` nhưng vẫn đọc qua page cache), nên giới hạn bộ nhớ của container chạy database phải chừa chỗ cho nó.
+
+**Swap.** Khi thiếu RAM, kernel đẩy trang ít dùng ra đĩa. Một lần truy cập trang đã bị đẩy ra tốn thời gian của một lần đọc đĩa thay vì vài trăm nano giây, nên service nhạy độ trễ bị swap thường chậm đi theo kiểu khó đoán. Dấu hiệu là cột `si`, `so` của `vmstat` khác 0 liên tục. `vm.swappiness` chỉnh mức kernel ưu tiên đẩy trang của tiến trình so với bỏ page cache; đặt nó về 0 ở mọi nơi là một trong những "mẹo" ở bảng cuối bài, không phải quy tắc.
+
+**NUMA** (Non-Uniform Memory Access). Máy chủ nhiều socket CPU có RAM gắn với từng socket; CPU đọc RAM của socket mình nhanh hơn RAM của socket kia. `lscpu` và `numactl --hardware` cho biết máy có mấy node NUMA. Một tiến trình bị lập lịch chạy ở socket này mà dữ liệu nằm ở socket kia sẽ chậm hơn mà không có số đo nào báo "lỗi"; database lớn và JVM heap lớn thường được ghim vào một node. VM của lab và đa số máy ảo nhỏ trên cloud chỉ có một node, nên bài chỉ dừng ở khái niệm.
+
+**Đĩa: IOPS và độ trễ là hai con số khác nhau.** Ổ SSD, NVMe và đĩa mạng xử lý được nhiều yêu cầu song song. Định luật Little của D18.1 nối ba con số: **IOPS = số yêu cầu đang chờ (queue depth) ÷ độ trễ mỗi yêu cầu**. Tăng queue depth thì IOPS tăng, nhưng độ trễ **mỗi** yêu cầu cũng tăng. Con số IOPS quảng cáo đo ở queue depth 32 hay 64; database ghi WAL tuần tự và chờ từng lần ghi chạy ở queue depth gần 1, nên con số đúng với nó là độ trễ ở QD1. `fio` đo được cả hai, với `--direct=1` để đi vòng qua page cache.
+
+**I/O scheduler.** Mỗi thiết bị khối có một bộ lập lịch (`/sys/block/<đĩa>/queue/scheduler`). NVMe thường dùng `none` (thiết bị tự xếp lịch tốt hơn kernel); `mq-deadline` hợp với đĩa chậm hoặc chia sẻ. Đổi scheduler hiếm khi là việc đầu tiên nên làm.
+
+<Check id="d23.3.memory-disk">Giải thích được page cache, swap và NUMA ảnh hưởng độ trễ thế nào, và dùng được định luật Little để nối IOPS, queue depth với độ trễ khi đọc kết quả `fio`.</Check>
+
+### Mạng: BDP và thuật toán tắc nghẽn
+
+**BDP** (bandwidth-delay product, tích băng thông và độ trễ) là lượng dữ liệu "đang bay" trên đường truyền để lấp đầy nó: 200 Mbit/s × 50 ms = 10 Mbit, tức khoảng 1,25 MB. TCP chỉ gửi tối đa một **cửa sổ** dữ liệu chưa được xác nhận; cửa sổ bị chặn bởi bộ đệm nhận và gửi của socket. Bộ đệm nhỏ hơn BDP thì thông lượng tối đa xấp xỉ bộ đệm ÷ RTT, bất kể đường truyền rộng bao nhiêu. Linux tự điều chỉnh bộ đệm trong khoảng `net.ipv4.tcp_rmem` và `tcp_wmem` (ba số: nhỏ nhất, mặc định, lớn nhất); kernel tự chọn giá trị lớn nhất theo lượng RAM: trong VM 2 GiB của lab là khoảng 15 MB cho `tcp_rmem` và 4 MB cho `tcp_wmem`, đủ cho đa số đường trong một vùng. Đường dài, băng thông lớn (sao lưu xuyên lục địa, đồng bộ giữa hai trung tâm dữ liệu) mới cần nâng.
+
+**Thuật toán tắc nghẽn** (congestion control) quyết định TCP gửi nhanh tới đâu.
+
+| | cubic (mặc định của Linux) | bbr |
+|---|---|---|
+| Dựa vào | Mất gói: coi mỗi gói mất là dấu hiệu tắc, giảm cửa sổ | Mô hình đường truyền: đo băng thông và RTT nhỏ nhất, gửi theo nhịp tương ứng |
+| Đường có mất gói ngẫu nhiên (Wi-Fi, di động, đường dài) | Thông lượng tụt mạnh dù đường còn trống | Ít bị ảnh hưởng hơn nhiều |
+| Hàng đợi ở router (bufferbloat) | Đẩy dữ liệu tới khi hàng đợi đầy, RTT phình to | Cố giữ hàng đợi ngắn, RTT gần mức nền |
+| Lưu ý | | Có thể giành băng thông của luồng cubic chạy chung; chỉ là thuật toán của **bên gửi**, nên đổi trên server là đủ |
+
+bbr có sẵn trong kernel Ubuntu dưới dạng module `tcp_bbr`. Đổi bằng `net.ipv4.tcp_congestion_control` cho cả namespace mạng, hoặc cho từng socket (iperf3 có cờ `-C`). bbr phát huy trên đường Internet có mất gói ngẫu nhiên và hàng đợi sâu; giữa các máy trong cùng một trung tâm dữ liệu ít mất gói, khác biệt nhỏ hơn nhiều. Lab đo cả hai trên cùng một đường để bạn thấy khác biệt ở chỗ nào.
+
+`tc netem` (network emulator) của kernel thêm độ trễ, mất gói, giới hạn băng thông vào một card mạng: cách rẻ nhất để có "đường xuyên lục địa" trong một VM.
+
+<Check id="d23.3.network">Tính được BDP của một đường truyền và giải thích được vì sao bộ đệm nhỏ giới hạn thông lượng; so sánh được cubic với bbr trên đường mất gói và về độ dài hàng đợi.</Check>
+
+### Hàng đợi và giới hạn của kernel
+
+Ba lỗi kết nối này hay bị nhầm với nhau, vì từ phía ứng dụng trông đều là "không kết nối được":
+
+| | Hàng đợi accept đầy | Cạn port nguồn | Cạn file descriptor |
+|---|---|---|---|
+| Xảy ra ở | Bên **nghe** (server) | Bên **gọi đi** (client, proxy) | Bất kỳ tiến trình nào |
+| Cơ chế | Kernel hoàn tất bắt tay rồi xếp kết nối vào hàng chờ `accept()`; ứng dụng không `accept()` kịp, hàng đầy | Mỗi kết nối tới cùng một (IP, port) đích chiếm một port nguồn trong `ip_local_port_range`, kể cả lúc ở `TIME-WAIT` (D2.1) | Mỗi socket, file là một fd; giới hạn `RLIMIT_NOFILE` (`ulimit -n`, `LimitNOFILE=` của systemd) |
+| Client thấy | `connect()` **chờ rồi timeout** (kernel bỏ gói SYN mới), không phải `refused` | `Cannot assign requested address` (`EADDRNOTAVAIL`) ngay lập tức | `Too many open files` (`EMFILE`) |
+| Bằng chứng | `ss -lnt`: `Recv-Q` của socket LISTEN bằng `Send-Q` + 1; `nstat`: `TcpExtListenOverflows`, `TcpExtListenDrops` tăng | `ss -s`: nhiều kết nối tới cùng đích; lỗi trong log ứng dụng | `/proc/<pid>/limits`, `ls /proc/<pid>/fd \| wc -l` |
+| Sửa gốc | Ứng dụng `accept()` nhanh hơn, thêm worker; rồi mới nâng `backlog` | Dùng lại kết nối (keepalive, pool); thêm IP nguồn hoặc đích | Nâng giới hạn có chủ đích; tìm rò fd |
+
+Độ dài hàng đợi accept là tham số `backlog` của `listen()`, nhưng kernel cắt nó ở `net.core.somaxconn` (mặc định 4096 từ Linux 5.4). D9.1 đã gặp tham số `backlog=` của Nginx; nâng nó mà không nâng `somaxconn` thì không có tác dụng, và nâng `somaxconn` mà ứng dụng vẫn gọi `listen(128)` cũng vậy.
+
+Giới hạn thứ tư hay gặp trên máy làm NAT, load balancer hay node Kubernetes: **bảng conntrack**. D2.4 đã nêu triệu chứng: khi số kết nối được theo dõi chạm `net.netfilter.nf_conntrack_max`, kernel bỏ gói của kết nối **mới** và ghi `nf_conntrack: table full, dropping packet` vào `dmesg`. Đo bằng `conntrack -C` so với giới hạn. Bài không làm đầy conntrack trong lab: giới hạn đó là của cả máy, và làm đầy nó trong VM cũng chặn luôn kết nối SSH mà Lima dùng để điều khiển VM.
+
+### sysctl nào đáng chỉnh, cái nào là mê tín
+
+| sysctl | Chỉnh khi | Đừng chỉnh vì |
+|---|---|---|
+| `net.core.somaxconn` | Đo thấy `ListenOverflows` tăng và ứng dụng đã gọi `listen` với backlog lớn | "Mọi hướng dẫn đều đặt 65535" |
+| `net.ipv4.ip_local_port_range` | Proxy hoặc NAT mở rất nhiều kết nối ra cùng đích, đã bật keepalive mà vẫn thiếu | Che lỗi ứng dụng mở kết nối mới cho mỗi request |
+| `net.ipv4.tcp_rmem`, `tcp_wmem` (số cuối) | Đường dài, băng thông lớn, đo được thông lượng bằng bộ đệm ÷ RTT | Đường trong một vùng đã đủ |
+| `net.ipv4.tcp_congestion_control=bbr` | Phục vụ người dùng qua Internet, di động; đo được mất gói | Mạng nội bộ ít mất gói; chạy chung với luồng cubic quan trọng |
+| `net.netfilter.nf_conntrack_max` | `dmesg` có `table full`, máy làm NAT hoặc node Kubernetes | |
+| `fs.file-max`, `LimitNOFILE` | Tiến trình phục vụ nhiều kết nối cần nhiều fd hơn 1024 | |
+| `net.ipv4.tcp_tw_recycle` | | Đã bị xoá khỏi kernel từ 4.12 (D2.1); hướng dẫn nào còn nhắc là đã cũ |
+| `vm.swappiness=0` ở mọi máy | | Không tắt swap mà đổi cách kernel chọn thứ để thu hồi; quyết định theo workload |
+| `vm.drop_caches` trong cron | | Xoá page cache làm chậm mọi thứ ngay sau đó; "RAM rảnh" không phải mục tiêu |
+| Danh sách 30 sysctl chép từ blog | | Vi phạm quy tắc "mỗi lần đổi một thứ", và nhiều giá trị là của kernel cũ hoặc phần cứng khác |
+
+D1.5 đã nhắc: phần lớn `net.*` là của **từng namespace mạng**, nên đặt trên node không tới được container hay pod; `vm.*`, `fs.*` là của cả máy. Lab dùng đúng tính chất này để thu nhỏ dải port nguồn trong một namespace mà không ảnh hưởng phần còn lại của VM.
+
+<Check id="d23.3.kernel-limits">Phân biệt được hàng đợi accept đầy, cạn port nguồn và cạn file descriptor qua triệu chứng phía client và bằng chứng trong `ss`, `nstat`, và chọn được sysctl đáng chỉnh dựa trên số đo.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Linux perf Examples (Brendan Gregg)](https://www.brendangregg.com/perf.html): các lệnh `perf` theo tình huống, sự kiện phần cứng và phần mềm, lấy mẫu stack.
+- [Python support for the Linux perf profiler](https://docs.python.org/3.14/howto/perf_profiling.html): `-X perf`, biến `PYTHONPERFSUPPORT`, và chế độ `perf_jit` khi trình thông dịch không có frame pointer.
+- [fio documentation](https://fio.readthedocs.io/en/latest/fio_doc.html): ý nghĩa `iodepth`, `direct`, `ioengine`, và các mục `clat` trong kết quả.
+- [IP Sysctl (Linux kernel documentation)](https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html): mọi `net.ipv4.*` của bài, kèm giá trị mặc định.
+- [tc-netem(8)](https://man7.org/linux/man-pages/man8/tc-netem.8.html): `delay`, `loss`, `rate` và giới hạn hàng đợi của netem.
+- [Debugging network stalls on Kubernetes (GitHub Blog)](https://github.blog/engineering/debugging-network-stalls-on-kubernetes/): nguồn của callout; đọc phần dùng `perf record` để tìm ra `cadvisor`.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** máy có Lima 2.2 (D0.1) và mạng. Bài tạo một VM riêng `d18-vm` (Ubuntu 26.04, 2 CPU, 2 GiB RAM, 20 GiB đĩa) và cài `iperf3`, `fio`, `perf` bằng `apt` (tải vài chục MB). Mọi thí nghiệm mạng chạy giữa hai network namespace trong cùng VM, giống D2.1, nên không cần VM thứ hai.
+
+**Profile máy:** bên trong VM, lab dùng khoảng 300 MiB RAM, cộng khoảng 600 MiB page cache sau bước đĩa; trên Mac, tiến trình của VM chiếm khoảng 0,6–1 GiB, tối đa 2 GiB. Trước khi bật, kiểm `memory_pressure | tail -1` báo trống từ 30% trở lên; máy 8 GB nên tắt Docker Desktop trong lúc làm bài. iperf3 và fio ăn trọn một CPU của VM trong vài giây mỗi lần.
+
+**Số đo trong VM khác máy thật thế nào:** ổ đĩa của VM là một file trên SSD của Mac, nên `fio` đo cả lớp ảo hoá và cache của macOS: số IOPS cao bất thường, độ trễ thấp bất thường so với đĩa mạng trên cloud. Mạng giữa hai namespace là bộ nhớ của một kernel, nhanh hàng chục Gbit/s; `tc netem` mới là thứ tạo ra đường truyền giống thật. CPU không có bộ đếm phần cứng. Hãy đọc **tỉ lệ** và **hình dạng** của kết quả, không chép con số tuyệt đối sang production.
+
+### 0. Dựng VM và cài công cụ
+
+<Terminal where="mac">
+
+```bash
+memory_pressure | tail -1
+limactl start --name d18-vm --cpus 2 --memory 2 --disk 20 --plain --tty=false template:ubuntu-26.04
+limactl shell d18-vm
+```
+
+</Terminal>
+
+Lệnh `limactl start` mất vài phút ở lần đầu (tải image Ubuntu) và in nhiều dòng log; dòng cuối có chữ `READY`. Nếu nó báo lỗi, đọc dòng `level=fatal`. Từ đây, các khối `vm` chạy trong shell của VM; khối `mac` chạy ở một tab Terminal khác trên Mac. Nếu bạn thoát VM hay mở terminal mới giữa chừng, vào lại bằng `limactl shell d18-vm` rồi `cd` tới thư mục của bước đang làm (`~/masteva-d23/cpu`, `disk` hoặc `net`); hai namespace vẫn còn cho tới khi bạn dọn hoặc khởi động lại VM, còn các server chạy nền có thể đã dừng theo shell cũ: nếu bước sau báo không kết nối được, chạy lại dòng khởi động server của bước đó.
+
+<Terminal where="vm">
+
+```bash
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 fio linux-tools-$(uname -r) linux-tools-common
+mkdir -p ~/masteva-d23 && cd ~/masteva-d23
+uname -r; perf --version; fio --version; iperf3 --version | head -1
+sudo perf stat -e cycles,instructions,cpu-clock -- sleep 1 2>&1 | grep -E 'cycles|instructions|cpu-clock'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+7.0.0-28-generic
+perf version 7.0.14
+fio-3.41
+iperf 3.20 (cJSON 1.7.15)
+   <not supported>      cycles
+   <not supported>      instructions
+              1.20 msec cpu-clock
+```
+
+</Expected>
+
+Trước các dòng này, `apt-get` in khoảng một trăm dòng của dpkg và `needrestart` (dịch vụ nào cần khởi động lại) dù có `-qq`; bỏ qua. Gói `linux-tools-common` có thể lên bản mới hơn kernel đang chạy; `perf` vẫn dùng được. `linux-tools-$(uname -r)` là gói `perf` khớp đúng kernel đang chạy; nếu `apt` báo không tìm thấy gói, kernel của VM vừa được nâng: khởi động lại VM rồi chạy lại. Hai dòng `<not supported>` xác nhận điều phần Kiến thức đã nói: VM không có bộ đếm phần cứng, và mọi phép `perf` sau dùng sự kiện phần mềm.
+
+Tải hai script vẽ flame graph, ghim theo commit và kiểm sha256 trước khi cho chạy. Kho FlameGraph không công bố checksum, nên giá trị dưới là sha256 của đúng commit đó; nếu không khớp, `chmod` không chạy và bạn dừng lại tìm hiểu.
+
+<Terminal where="vm">
+
+```bash
+mkdir -p ~/masteva-d23/cpu && cd ~/masteva-d23/cpu
+C=41fee1f99f9276008b7cd112fca19dc3ea84ac32
+for f in stackcollapse-perf.pl flamegraph.pl; do curl -sSfLO https://raw.githubusercontent.com/brendangregg/FlameGraph/$C/$f; done
+cat > SHA256SUMS <<'EOF'
+74faa47a29d8df07cb06731dfd8bb94dc4c165b9d811ac6b4c9449eea2ac25d8  stackcollapse-perf.pl
+088f82e6848a4f12a56e1e8e8170ee6761fccf12e5615cd64630f6b087c99ea7  flamegraph.pl
+EOF
+sha256sum -c SHA256SUMS && chmod +x stackcollapse-perf.pl flamegraph.pl
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+stackcollapse-perf.pl: OK
+flamegraph.pl: OK
+```
+
+</Expected>
+
+### 1. CPU: tìm hàm nóng bằng perf và flame graph
+
+Một chương trình "xử lý đơn hàng" theo lô: tạo 6.000 đơn, bỏ đơn trùng `id`, mã hoá JSON; chạy lặp trong số giây truyền vào rồi in số lô đã xong. Nó có một chỗ chậm cố ý mà bạn sẽ tìm bằng số đo, không bằng đọc code. Khối lệnh chạy chương trình ở nền (`&`) cùng lúc với `vmstat`. Với mọi lệnh `&` trong bài, bash tương tác in thêm dòng dạng `[1] 12345` khi bắt đầu, và `[1]+  Done …` hoặc `[1]+  Terminated …` khi tiến trình xong hay bị dừng; số PID trên máy bạn sẽ khác, và kết quả mẫu bỏ các dòng này.
+
+<Terminal where="vm" title="~/masteva-d23/cpu/hot.py">
+
+```bash
+cat > hot.py <<'EOF'
+import json, sys, time
+
+def make_orders(n):
+    return [{"id": i % 3000, "sku": f"SKU-{i % 97}", "qty": i % 5 + 1} for i in range(n)]
+
+def dedupe(orders):
+    seen, out = [], []
+    for o in orders:
+        if o["id"] not in seen:
+            seen.append(o["id"])
+            out.append(o)
+    return out
+
+def encode(orders):
+    return json.dumps(orders)
+
+def handle_batch():
+    return len(encode(dedupe(make_orders(6000))))
+
+end = time.time() + float(sys.argv[1])
+n = 0
+while time.time() < end:
+    handle_batch()
+    n += 1
+print(f"{n} lô")
+EOF
+python3 hot.py 5 & vmstat 1 4; wait
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+procs -----------memory---------- ---swap-- -----io---- -system-- -------cpu-------
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu
+ 3  0      0 1161948  17436 591960    0    0  2978   677  181    1  1  1 98  0  0  0
+ 1  0      0 1151300  17436 591960    0    0     0     8 1055   38 50  0 50  0  0  0
+ 1  0      0 1151300  17436 592040    0    0     0     0 1036   31 50  0 50  0  0  0
+ 1  0      0 1151300  17436 592040    0    0     0     0 1028   35 50  0 50  0  0  0
+153 lô
+```
+
+</Expected>
+
+USE cho CPU: một tiến trình chạy (`r` bằng 1), `us` 50% là trọn một trong hai CPU, `sy` gần 0 (gần như không gọi kernel), `st` bằng 0 (hypervisor không lấy CPU của VM), `cs` vài chục mỗi giây. Dòng đầu của `vmstat` là trung bình từ lúc khởi động, bỏ qua. Kết luận của USE: tài nguyên bão hoà là CPU, trong user space. Câu hỏi tiếp theo là **hàm nào**. Số lô trên máy bạn sẽ khác tuỳ tốc độ CPU.
+
+<Terminal where="vm">
+
+```bash
+sudo perf record -F 99 -g -o perf.data -- python3 -X perf hot.py 10
+sudo perf evlist -i perf.data
+sudo perf script -i perf.data 2>/dev/null | ./stackcollapse-perf.pl > out.folded
+./flamegraph.pl --title "hot.py" out.folded > flame.svg
+awk '{n = $NF; t += n; if ($0 ~ /py::dedupe/) d += n; if ($0 ~ /py::encode/) e += n; if ($0 ~ /py::make_orders/) m += n}
+  END {printf "dedupe %.0f%%, encode %.0f%%, make_orders %.0f%% tổng thời gian CPU\n", 100*d/t, 100*e/t, 100*m/t}' out.folded
+```
+
+</Terminal>
+
+<Predict question="Theo bạn, trong ba hàm make_orders, dedupe, encode, hàm nào tốn CPU nhất? json.dumps thường là nghi phạm đầu tiên.">
+
+```text
+304 lô
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.238 MB perf.data (992 samples) ]
+task-clock:ppp
+dedupe 94%, encode 2%, make_orders 3% tổng thời gian CPU
+```
+
+`perf evlist` cho biết sự kiện đã lấy mẫu: `task-clock`, đồng hồ CPU của chính tiến trình, vì không có `cycles`. Khoảng 990 mẫu là 99 mẫu mỗi giây trong 10 giây. **Hơn 90%** thời gian nằm trong `dedupe`, không phải JSON: `o["id"] not in seen` với `seen` là list phải duyệt cả list mỗi lần, nên chi phí tăng theo bình phương số đơn. Lệnh `awk` cộng số trên mỗi dòng của file gộp stack (mỗi dòng là một stack kèm trọng số ở cột cuối) theo hàm Python xuất hiện trong stack, giống cách flame graph tính độ rộng.
+
+</Predict>
+
+Mở flame graph trên Mac, ở tab Terminal của Mac. `limactl copy` chép file từ VM ra (đường dẫn bên VM tính từ thư mục home của VM):
+
+<Terminal where="mac">
+
+```bash
+limactl copy d18-vm:masteva-d23/cpu/flame.svg /tmp/d18-flame.svg
+open /tmp/d18-flame.svg
+```
+
+</Terminal>
+
+Trình duyệt mở một hình ngọn lửa. Ô rộng gần hết chiều ngang ở tầng trên `py::handle_batch` là `py::dedupe`; rê chuột để xem tỉ lệ, bấm vào một ô để phóng to. Các ô dạng `0x…` là hàm C của trình thông dịch không có ký hiệu gỡ lỗi; muốn thấy tên của chúng, cài gói debug symbol của Python.
+
+Sửa đúng một thứ, `seen` thành `set` (kiểm tra thuộc tập hợp trong thời gian gần như hằng số), rồi đo lại cùng điều kiện:
+
+<Terminal where="vm">
+
+```bash
+sed -i 's/    seen, out = \[\], \[\]/    seen, out = set(), []/; s/            seen.append(o\["id"\])/            seen.add(o["id"])/' hot.py
+grep -n 'seen' hot.py
+python3 hot.py 5
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+7:    seen, out = set(), []
+9:        if o["id"] not in seen:
+10:            seen.add(o["id"])
+2285 lô
+```
+
+</Expected>
+
+Từ khoảng 150 lên khoảng 2.200 lô trong 5 giây, gấp khoảng 15 lần, bằng một dòng sửa. Nếu bạn đã thử "tối ưu" `json.dumps` trước (đổi thư viện JSON, thêm worker), bạn chỉ lấy lại được tối đa khoảng 2% thời gian CPU.
+
+<Check id="d23.3.lab-perf">Dùng được `vmstat` để xác định CPU là tài nguyên bão hoà, rồi `perf record` và flame graph để chỉ ra hàm nóng của một chương trình Python, sửa và đo lại cùng điều kiện.</Check>
+
+### 2. Đĩa: queue depth, độ trễ và page cache
+
+Đo đọc ngẫu nhiên khối 4 KB, đi vòng page cache (`--direct=1`), ở queue depth 1 rồi 32, mỗi lượt 10 giây. Lần chạy đầu `fio` tạo file thử 512 MB.
+
+<Terminal where="vm">
+
+```bash
+mkdir -p ~/masteva-d23/disk && cd ~/masteva-d23/disk
+for qd in 1 32; do
+  fio --name=qd$qd --filename=fio.dat --size=512M --rw=randread --bs=4k --direct=1 --ioengine=libaio \
+      --iodepth=$qd --runtime=10 --time_based --output-format=json > qd$qd.json
+  jq -r --arg qd $qd '.jobs[0].read | "QD\($qd): IOPS=\(.iops | floor) mean=\(.lat_ns.mean / 1000 | floor)us p50=\(.clat_ns.percentile["50.000000"] / 1000 | floor)us p99=\(.clat_ns.percentile["99.000000"] / 1000 | floor)us"' qd$qd.json
+done
+cat /sys/block/vda/queue/scheduler
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+QD1: IOPS=25610 mean=38us p50=20us p99=171us
+QD32: IOPS=205282 mean=155us p50=150us p99=288us
+none [mq-deadline]
+```
+
+</Expected>
+
+Đọc bằng Little: ở QD1, IOPS ≈ 1 ÷ thời gian trung bình của một lần đọc (`mean`, gồm cả thời gian gửi yêu cầu). Ở QD32, IOPS ≈ 32 ÷ `mean`: IOPS tăng khoảng 10–15 lần, nhưng độ trễ **mỗi** lần đọc cũng tăng nhiều lần: yêu cầu xếp hàng trong thiết bị. Một database chờ từng lần ghi đồng bộ sống ở dòng QD1; một job phân tích đọc song song sống ở dòng QD32. Số tuyệt đối trên máy bạn sẽ khác nhiều tuỳ SSD của Mac và lúc chạy, và như đã nói ở phần Chuẩn bị, chúng tốt hơn hẳn đĩa mạng trên cloud (thường vài trăm µs tới vài ms ở QD1). Dòng cuối: VM dùng `mq-deadline` (trong ngoặc vuông) cho đĩa ảo `vda`.
+
+Giờ thấy page cache: xoá cache (chỉ để đo; đừng làm thế trên production), đọc cả file hai lần, xem `buff/cache` và tốc độ:
+
+<Terminal where="vm">
+
+```bash
+sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+free -m | sed -n 1,2p
+dd if=fio.dat of=/dev/null bs=1M 2>&1 | tail -1
+free -m | sed -n 2p
+dd if=fio.dat of=/dev/null bs=1M 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+               total        used        free      shared  buff/cache   available
+Mem:            1949         324        1597           0         102        1625
+536870912 bytes (537 MB, 512 MiB) copied, 0.12021 s, 4.5 GB/s
+Mem:            1949         329        1073           0         621        1620
+536870912 bytes (537 MB, 512 MiB) copied, 0.0188514 s, 30 GB/s
+```
+
+</Expected>
+
+Sau lần đọc đầu, `buff/cache` tăng khoảng 520 MB (cả file) còn `available` gần như không đổi: page cache dùng RAM rảnh nhưng vẫn tính là "dùng được". Lần đọc thứ hai không chạm đĩa, nhanh hơn vài lần (trong VM thường khoảng 2–10 lần, đổi nhiều giữa các lượt), vì lần đọc "lạnh" đầu tiên trong VM thật ra vẫn được cache của macOS phía dưới giúp. Với đĩa thật hay đĩa mạng trên cloud, khoảng cách lớn hơn nhiều. Đây là lý do một database vừa khởi động lại chạy chậm trong vài phút đầu (cache lạnh), và lý do load test ở D18.1 phải tính tới cache ấm hay lạnh.
+
+<Check id="d23.3.lab-disk">Đo được IOPS và độ trễ đọc ngẫu nhiên ở hai queue depth bằng `fio`, giải thích kết quả bằng định luật Little, và chỉ ra được tác dụng của page cache bằng `free` và thời gian đọc.</Check>
+
+### 3. Mạng: BDP, cubic và bbr trên đường 50 ms
+
+Dựng hai "máy" bằng network namespace nối với nhau bằng một cặp veth, như D2.1, rồi chạy server iperf3 ở `d18b`:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns add d18a && sudo ip netns add d18b
+sudo ip link add veth-a netns d18a type veth peer name veth-b netns d18b
+sudo ip -n d18a addr add 10.18.0.1/24 dev veth-a && sudo ip -n d18b addr add 10.18.0.2/24 dev veth-b
+for ns in d18a d18b; do sudo ip -n $ns link set lo up; done
+sudo ip -n d18a link set veth-a up && sudo ip -n d18b link set veth-b up
+sudo ip netns exec d18b iperf3 -s -D
+sudo modprobe tcp_bbr && sysctl net.ipv4.tcp_available_congestion_control
+sudo ip netns exec d18a iperf3 -c 10.18.0.2 -t 5 | grep -E 'sender|receiver'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+net.ipv4.tcp_available_congestion_control = reno cubic bbr
+[  5]   0.00-5.00   sec  64.4 GBytes   111 Gbits/sec    0            sender
+[  5]   0.00-5.00   sec  64.4 GBytes   111 Gbits/sec                  receiver
+```
+
+</Expected>
+
+Không có giới hạn nào, hai namespace "nói chuyện" với nhau hàng chục Gbit/s qua bộ nhớ: không giống mạng nào cả. `modprobe tcp_bbr` nạp module bbr để nó hiện trong danh sách thuật toán. Giờ biến veth của `d18a` thành một đường 200 Mbit/s, trễ 50 ms (chiều đi), rồi đo. netem gắn ở chiều **gửi** của máy chạy iperf3 client cho gọn; trang man `tc-netem` (mục LIMITATIONS) ghi rằng vì cơ chế TSQ (TCP Small Queues), muốn kết quả TCP sát thực tế thì netem nên đặt ở chiều nhận của máy nhận, nên hãy coi các con số dưới là minh hoạ. Các phép đo: mặc định, với cửa sổ bị ép còn 256 KB, và với cả hai thuật toán trong lúc `ping` chạy song song để đo RTT khi đường đang bận.
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec d18a tc qdisc add dev veth-a root netem delay 50ms rate 200mbit
+sudo ip netns exec d18a ping -c 3 -q 10.18.0.2 | tail -1
+sudo ip netns exec d18a iperf3 -c 10.18.0.2 -t 8 -w 256K | grep sender
+for cc in cubic bbr; do
+  sudo ip netns exec d18a ping -i 0.2 -c 40 -q 10.18.0.2 > /tmp/ping-$cc.txt &
+  sudo ip netns exec d18a iperf3 -c 10.18.0.2 -t 8 -C $cc | grep sender
+  wait; echo "  RTT khi đang truyền ($cc): $(tail -1 /tmp/ping-$cc.txt)"
+done
+```
+
+</Terminal>
+
+<Predict question="BDP của đường này là bao nhiêu? Với cửa sổ 256 KB, thông lượng tối đa khoảng bao nhiêu? Và trong lúc đường bận, RTT của cubic và bbr có giống nhau không?">
+
+```text
+rtt min/avg/max/mdev = 57.305/58.640/60.212/1.198 ms
+[  5]   0.00-8.00   sec  50.2 MBytes  52.7 Mbits/sec    0            sender
+[  5]   0.00-8.00   sec   175 MBytes   184 Mbits/sec    0            sender
+  RTT khi đang truyền (cubic): rtt min/avg/max/mdev = 50.332/143.460/267.779/60.318 ms, pipe 2
+[  5]   0.00-8.00   sec   177 MBytes   185 Mbits/sec    0            sender
+  RTT khi đang truyền (bbr): rtt min/avg/max/mdev = 50.295/116.867/155.621/35.365 ms
+```
+
+- **RTT nền khoảng 50–60 ms**: 50 ms của netem cộng vài mili giây độ trễ hẹn giờ của VM (netem bị giới hạn bởi độ mịn của bộ hẹn giờ kernel, theo trang man); con số đổi giữa các lượt.
+- **BDP** = 200 Mbit/s × 0,055 s ≈ 1,4 MB. Với `-w 256K`, cửa sổ bị chặn ở vài trăm KB (kernel cho bộ đệm gấp đôi giá trị bạn xin, một phần dành cho cấu trúc quản lý), và thông lượng chỉ khoảng 45–55 Mbit/s: thông lượng nhân RTT cho khoảng 330–370 KB đang bay, đúng bằng cái cửa sổ đó. Đường rộng 200 mà chỉ dùng hơn một phần tư, không gói nào mất.
+- **Không mất gói**, bbr ổn định quanh 170–180 Mbit/s; cubic dao động nhiều hơn giữa các lượt, từ khoảng 130 tới 190.
+- **RTT khi đường bận** thường khác rõ: với cubic, `ping` phải chờ trung bình khoảng 90–220 ms, có lúc hơn 400 ms, vì cubic đẩy dữ liệu tới khi hàng đợi của netem đầy (bufferbloat). bbr thường giữ RTT trung bình thấp hơn, khoảng 60–120 ms tuỳ lượt. Với người dùng, đó là khác biệt giữa một trang web phản hồi nhanh và một trang ì ạch trong lúc ai đó đang tải file trên cùng đường.
+
+Số của bạn sẽ dao động giữa các lượt, nhiều nhất ở thông lượng của cubic và ở RTT. Thường thì RTT của cubic cao hơn hẳn; nếu lượt đầu cho kết quả ngược lại, chạy lại khối lệnh. Lý do: ở pha Startup, bbr tăng tốc độ gửi gấp đôi mỗi vòng để dò băng thông, tự tạo một hàng đợi rồi mới sang pha Drain để xả nó (theo bản đặc tả bbr của IETF; module `tcp_bbr` của Linux là phiên bản đầu của bbr nhưng có cùng hai pha), nên trong vài giây đầu bbr cũng có thể đẩy RTT lên.
+
+</Predict>
+
+Thêm 1% mất gói ngẫu nhiên, như một đường di động hay Wi-Fi kém, và đo lại hai thuật toán:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec d18a tc qdisc change dev veth-a root netem delay 50ms rate 200mbit loss 1%
+for cc in cubic bbr; do sudo ip netns exec d18a iperf3 -c 10.18.0.2 -t 10 -C $cc | grep sender; done
+sudo ip netns exec d18a tc qdisc del dev veth-a root
+sudo ip netns pids d18b | xargs -r sudo kill
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[  5]   0.00-10.00  sec  13.6 MBytes  11.4 Mbits/sec  110            sender
+[  5]   0.00-10.00  sec   218 MBytes   183 Mbits/sec  1591            sender
+```
+
+</Expected>
+
+Dòng đầu là cubic: chỉ vài tới vài chục Mbit/s tuỳ lượt (khoảng 4 tới 30), một phần nhỏ của đường truyền, vì mỗi gói mất bị coi là tắc nghẽn và cửa sổ bị cắt, và trên đường 50 ms cửa sổ phục hồi rất chậm. Dòng hai là bbr: khoảng 170–180 Mbit/s dù số gói phải gửi lại (cột `Retr`) nhiều hơn, vì bbr không coi mất gói lẻ tẻ là tắc. Đây là trường hợp bbr đáng bật. Hai lệnh cuối gỡ netem khỏi veth và dừng server iperf3: `ip netns pids d18b` liệt kê mọi tiến trình đang chạy trong namespace `d18b`, và các bước sau dùng cùng cách này để dừng server của mình.
+
+<Check id="d23.3.lab-network">Dựng được đường truyền có độ trễ, băng thông và mất gói bằng `tc netem`, đo được giới hạn của cửa sổ theo BDP, và so sánh được cubic với bbr về thông lượng khi mất gói và RTT khi đường bận.</Check>
+
+### 4. Hàng đợi accept đầy
+
+Một server cố ý **không** gọi `accept()`, với backlog 8, đóng vai ứng dụng bị treo hoặc quá chậm. Client mở 20 kết nối, mỗi kết nối chờ tối đa 1 giây.
+
+<Terminal where="vm">
+
+```bash
+mkdir -p ~/masteva-d23/net && cd ~/masteva-d23/net
+cat > slow_accept.py <<'EOF'
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("10.18.0.2", int(sys.argv[1])))
+s.listen(int(sys.argv[2]))
+time.sleep(3600)
+EOF
+cat > many_conn.py <<'EOF'
+import socket, sys
+host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+socks, errors = [], {}
+for i in range(n):
+    try:
+        s = socket.socket()
+        s.settimeout(1)
+        s.connect((host, port))
+        socks.append(s)
+    except OSError as e:
+        msg = e.strerror or str(e)
+        errors[msg] = errors.get(msg, 0) + 1
+print(f"mở được {len(socks)}/{n} kết nối; lỗi: {errors}")
+EOF
+sudo ip netns exec d18b python3 slow_accept.py 8080 8 &
+sleep 1
+sudo ip netns exec d18b nstat -n
+sudo ip netns exec d18a python3 many_conn.py 10.18.0.2 8080 20
+sudo ip netns exec d18b ss -lnt 'sport = :8080'
+sudo ip netns exec d18b nstat TcpExtListenOverflows TcpExtListenDrops
+```
+
+</Terminal>
+
+<Predict question="Server không accept nhưng kernel vẫn bắt tay thay nó. Bao nhiêu kết nối thành công, và những kết nối còn lại báo lỗi gì: refused hay timed out?">
+
+```text
+mở được 9/20 kết nối; lỗi: {'timed out': 11}
+State  Recv-Q Send-Q Local Address:Port Peer Address:Port
+LISTEN 9      8          10.18.0.2:8080      0.0.0.0:*
+#kernel
+TcpExtListenOverflows           12                 0.0
+TcpExtListenDrops               12                 0.0
+```
+
+- **9 kết nối thành công**, không phải 8: kernel cho hàng đợi chứa `backlog + 1`. Chúng nằm trong hàng đợi accept, đã bắt tay xong, chờ ứng dụng nhận.
+- **11 kết nối còn lại timed out**, không phải refused: khi hàng đầy, kernel lặng lẽ bỏ gói SYN mới, client gửi lại SYN theo chu kỳ rồi hết 1 giây. Đó là triệu chứng "chậm ở bước bắt tay" của D9.1, khác hẳn `Connection refused` (không ai nghe port, D2.1).
+- `ss -lnt`: với socket ở trạng thái LISTEN, `Recv-Q` là số kết nối đang trong hàng đợi accept, `Send-Q` là độ dài tối đa. `Recv-Q` bằng `Send-Q` + 1 nghĩa là hàng đầy.
+- `nstat -n` ở đầu khối đặt mốc, nên `nstat` sau cho số tăng thêm: mỗi lần SYN bị bỏ được đếm vào `ListenOverflows` và `ListenDrops`; con số lớn hơn 11 vì client gửi lại SYN.
+
+</Predict>
+
+Backlog bạn xin không phải lúc nào cũng là backlog bạn có. Dừng server cũ, chạy server mới xin backlog 100.000:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns pids d18b | xargs -r sudo kill
+sudo ip netns exec d18b python3 slow_accept.py 8081 100000 &
+sleep 1
+sudo ip netns exec d18b ss -lnt 'sport = :8081'
+sudo ip netns exec d18b sysctl net.core.somaxconn
+sudo ip netns pids d18b | xargs -r sudo kill
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+State  Recv-Q Send-Q Local Address:Port Peer Address:Port
+LISTEN 0      4096       10.18.0.2:8081      0.0.0.0:*
+net.core.somaxconn = 4096
+```
+
+</Expected>
+
+`Send-Q` bằng 4096, không phải 100.000: kernel cắt ở `somaxconn` của namespace đó. Nâng backlog trong cấu hình ứng dụng mà quên `somaxconn` thì không có tác dụng.
+
+<Check id="d23.3.lab-backlog">Tái hiện được hàng đợi accept đầy, chỉ ra được triệu chứng timed out phía client, đọc được `Recv-Q`, `Send-Q` và `ListenOverflows`, và thấy được backlog bị cắt ở `somaxconn`.</Check>
+
+### 5. Cạn port nguồn và cạn file descriptor
+
+Thu dải port nguồn của `d18a` còn 100 port. Lệnh `sysctl` chạy **trong** namespace `d18a`, nên phần còn lại của VM không bị ảnh hưởng (D1.5). Server ở `d18b` nhận và giữ mọi kết nối trên hai port 9001 và 9002.
+
+<Terminal where="vm">
+
+```bash
+cat > hold_server.py <<'EOF'
+import socket, sys, threading, time
+def serve(port):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("10.18.0.2", port))
+    s.listen(4096)
+    held = []
+    while True:
+        c, _ = s.accept()
+        held.append(c)
+for p in sys.argv[1:]:
+    threading.Thread(target=serve, args=(int(p),), daemon=True).start()
+time.sleep(3600)
+EOF
+sudo ip netns exec d18b python3 hold_server.py 9001 9002 &
+sleep 1
+sudo ip netns exec d18a sysctl -w net.ipv4.ip_local_port_range="40000 40099"
+sudo ip netns exec d18a python3 many_conn.py 10.18.0.2 9001 150
+sudo ip netns exec d18a python3 many_conn.py 10.18.0.2 9001 150
+sudo ip netns exec d18a ss -tan | awk 'NR > 1 {print $1}' | sort | uniq -c
+sudo ip netns exec d18a python3 many_conn.py 10.18.0.2 9002 150
+```
+
+</Terminal>
+
+<Predict question="Lần chạy đầu mở được bao nhiêu kết nối? Chương trình thoát là đóng hết kết nối của nó; lần chạy thứ hai, ngay sau đó, mở được bao nhiêu? Còn tới cổng 9002?">
+
+```text
+net.ipv4.ip_local_port_range = 40000 40099
+mở được 100/150 kết nối; lỗi: {'Cannot assign requested address': 50}
+mở được 0/150 kết nối; lỗi: {'Cannot assign requested address': 150}
+    100 FIN-WAIT-2
+mở được 100/150 kết nối; lỗi: {'Cannot assign requested address': 50}
+```
+
+- **Lần đầu, đúng 100 kết nối**, rồi `Cannot assign requested address` ngay lập tức, không chờ: client không còn port nguồn nào để tạo kết nối mới tới `10.18.0.2:9001`. CPU, RAM, server đều còn thừa.
+- **Lần hai, 0 kết nối**: đóng không có nghĩa là trả port ngay. Bên đóng trước giữ port cho tới khi kết nối đi hết vòng đời (D2.1). Ở đây server không bao giờ đóng phía nó, nên 100 socket phía client nằm ở `FIN-WAIT-2`, không còn tiến trình nào sở hữu, tới khi hết `net.ipv4.tcp_fin_timeout` (mặc định 60 giây). Với HTTP thật, bên đóng trước thường đi tới `TIME-WAIT`, cũng 60 giây. Lệnh `ss -tan | awk … | uniq -c` đếm số socket theo trạng thái; có thể kèm vài dòng `TIME-WAIT` từ các bước trước.
+- **100 kết nối tới 9002**: port nguồn được giữ theo **bộ bốn** (IP nguồn, port nguồn, IP đích, port đích). Cùng 100 port đó dùng lại được cho một đích khác. Đây là lý do proxy cạn port khi gửi mọi thứ tới **một** backend, và lý do thêm IP backend (hoặc IP nguồn) là một cách sửa.
+
+Trên production, cách sửa đúng là dùng lại kết nối (D9.1 bật keepalive tới backend); nới dải port chỉ mua thêm thời gian.
+
+</Predict>
+
+Port được trả khi các socket `FIN-WAIT-2` hết hạn, khoảng 60–66 giây sau khi chúng được tạo. Vòng chờ dưới đếm chúng mỗi 5 giây (tối đa 150 giây) rồi thử lại tới 9001:
+
+<Terminal where="vm">
+
+```bash
+for i in $(seq 30); do [ "$(sudo ip netns exec d18a ss -Htan state fin-wait-2 | wc -l)" -eq 0 ] && break; sleep 5; done
+echo "đã chờ thêm $(( (i - 1) * 5 )) giây"
+sudo ip netns exec d18a python3 many_conn.py 10.18.0.2 9001 150
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+đã chờ thêm 0 giây
+mở được 100/150 kết nối; lỗi: {'Cannot assign requested address': 50}
+```
+
+</Expected>
+
+Nếu bạn đã dành hơn một phút đọc phần giải thích ở trên, các socket đã hết hạn và vòng chờ thoát ngay (0 giây); nếu chạy ngay sau khối trước, nó chờ khoảng một phút (60 giây của `tcp_fin_timeout` cộng vài giây). Sau đó 100 kết nối lại mở được.
+
+Cuối cùng, giới hạn file descriptor của chính tiến trình. Trả dải port về mặc định để giới hạn port không chen vào, rồi hạ giới hạn fd bằng `ulimit -n 64` cho một shell con và mọi thứ nó chạy:
+
+<Terminal where="vm">
+
+```bash
+sudo ip netns exec d18a sysctl -w net.ipv4.ip_local_port_range="32768 60999"
+sudo ip netns exec d18a bash -c 'ulimit -n 64; python3 many_conn.py 10.18.0.2 9001 100'
+sudo ip netns pids d18b | xargs -r sudo kill
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+net.ipv4.ip_local_port_range = 32768 60999
+mở được 61/100 kết nối; lỗi: {'Too many open files': 39}
+```
+
+</Expected>
+
+61 = 64 − 3: ba fd đầu là stdin, stdout, stderr. Lỗi đến ngay ở lệnh `socket()`, trước cả khi chạm mạng. Với dịch vụ chạy bằng systemd, giới hạn này đặt bằng `LimitNOFILE=` trong unit (D9.1 đã nhắc); D9.1 đã thấy Nginx báo cùng lỗi này với worker có 1024 fd. Dòng cuối dừng server. Nếu bạn chạy khối này khi dải port còn hẹp và port tới 9001 còn bị giữ, lỗi bạn thấy sẽ là `Cannot assign requested address` chứ không phải `Too many open files`: khi hai giới hạn chồng nhau, thông báo lỗi chỉ cho thấy cái chạm trước.
+
+<Check id="d23.3.lab-ports-fd">Tái hiện được cạn port nguồn và cạn file descriptor, chỉ ra được port bị giữ sau khi đóng và được giữ theo bộ bốn, và phân biệt được hai lỗi qua thông báo.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`E: Unable to locate package linux-tools-7.0.0-…`:** kernel đang chạy cũ hơn kernel `apt` biết. `sudo apt-get install -y linux-generic`, thoát VM, `limactl stop d18-vm` rồi `limactl start d18-vm`, cài lại.
+- **`perf record` báo `Access to performance monitoring and observability operations is limited`:** bạn quên `sudo`; Ubuntu đặt `kernel.perf_event_paranoid` là 4.
+- **Flame graph toàn ô `[unknown]` hoặc `0x…`, không có `py::`:** thiếu `-X perf`, hoặc Python cũ hơn 3.12.
+- **`RTNETLINK answers: File exists` ở bước 3:** namespace hay veth đã có từ lần chạy trước. Chạy khối dọn namespace ở mục Dọn dẹp rồi làm lại.
+- **`iperf3: error - unable to connect to server`:** server iperf3 trong `d18b` chưa chạy (sau khi dọn namespace nó cũng bị dừng). Chạy lại `sudo ip netns exec d18b iperf3 -s -D`.
+- **Bước 5 lần chạy đầu đã mở được 0 kết nối:** port của một lần chạy trước còn bị giữ; chạy vòng chờ `FIN-WAIT-2` ở cuối bước 5 rồi chạy lại khối.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Khối dưới dừng server, xoá hai namespace (cùng veth, netem và sysctl riêng của chúng) và xoá vĩnh viễn thư mục lab trong VM.
+
+</Callout>
+
+<Terminal where="vm" title="Dọn trong VM">
+
+```bash
+sudo ip netns pids d18b | xargs -r sudo kill
+sudo ip netns del d18a; sudo ip netns del d18b
+rm -rf ~/masteva-d23
+exit
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Dừng VM">
+
+```bash
+limactl stop d18-vm
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Khối dưới xoá vĩnh viễn VM `d18-vm` cùng đĩa của nó và file flame graph trên Mac. Chỉ chạy khi không cần VM nữa.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn VM">
+
+```bash
+limactl delete d18-vm
+rm -f /tmp/d18-flame.svg
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không bật bbr cho mọi máy trong trung tâm dữ liệu?">
+
+Vì lợi ích lớn nhất của bbr đến từ đường có mất gói ngẫu nhiên và hàng đợi sâu, hai thứ hiếm trong mạng nội bộ được thiết kế tốt; ở đó cubic đã lấp đầy đường. Rủi ro thì có thật: luồng bbr và luồng cubic chạy chung một đường nghẽn không chia băng thông đều nhau, nên đổi một nửa đội máy có thể làm nửa kia chậm đi. Cách làm hợp lý: bật trên máy phục vụ người dùng qua Internet (edge, CDN, API công khai), đo trước và sau bằng metric phía client như thời gian tải, và giữ nguyên trong mạng nội bộ trừ khi có số đo ngược lại.
+
+</Reveal>
+
+<Reveal title="Ứng dụng báo timeout khi kết nối. Làm sao biết là backlog đầy, mạng mất gói hay firewall chặn?">
+
+Đi từ phía server. `ss -lnt` trên server: `Recv-Q` của socket LISTEN bằng hoặc vượt `Send-Q` thì hàng đợi accept đầy, và `nstat` cho thấy `ListenOverflows` tăng. Nếu hàng đợi trống, `tcpdump` trên server xem SYN có tới không: không tới thì vấn đề nằm trên đường (firewall `drop` ở D2.4, route, security group); tới mà không có SYN-ACK trả lời thì xem firewall trên chính máy và `ListenDrops`. Với dịch vụ chạy trên Kubernetes, thêm một bước: bảng conntrack của node (`dmesg`, `conntrack -C`). Ba bước này mất vài phút và phân biệt được cả ba khả năng.
+
+</Reveal>
+
+<Reveal title="Trong container, perf có dùng được không?">
+
+Được, với điều kiện. `perf` cần quyền mà container mặc định không có (`CAP_PERFMON` hoặc `CAP_SYS_ADMIN`, cùng `perf_event_paranoid` của **node**, vì đó là sysctl của cả kernel), và cần thấy file thực thi cùng ký hiệu của tiến trình bên trong container. Cách thường dùng: chạy `perf` trên node, chỉ định PID của tiến trình trong container (`perf record -p <pid>`), hoặc dùng profiler eBPF chạy liên tục ở mức node như D16.5 đã nhắc. Trên Kubernetes, `kubectl debug node/<tên>` cho một shell trên node để làm việc này, nếu chính sách của cụm cho phép.
+
+</Reveal>
+
+<Reveal title="Có nên nâng ip_local_port_range lên 1024–65535 cho chắc?">
+
+Nâng giúp được proxy mở rất nhiều kết nối ra, nhưng có hai cái giá. Dải port nguồn có thể đè lên port mà dịch vụ khác trên máy cần nghe (ví dụ một exporter ở 9100): khi port đó đang bị một kết nối đi ra chiếm, dịch vụ không khởi động được. Và nó che vấn đề: dải gấp đôi chỉ kéo dài thời gian tới lúc cạn gấp đôi nếu ứng dụng vẫn mở một kết nối cho mỗi request. Ưu tiên theo thứ tự: dùng lại kết nối, thêm đích (nhiều IP backend), thêm IP nguồn, rồi mới nới dải và dành riêng port cần nghe bằng `net.ipv4.ip_local_reserved_ports`.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI rất sẵn lòng đưa ra "20 sysctl tối ưu hiệu năng Linux", trộn tham số đã bị xoá (`tcp_tw_recycle`), tham số chỉ có nghĩa với phần cứng cũ và giá trị không có lý do. Đừng áp danh sách đó. Thay vào đó, đưa cho AI số đo cụ thể (dòng `nstat`, `ss -s`, kết quả `fio`, đoạn `perf report`) và hỏi nó giải thích; rồi kiểm từng tham số được đề xuất trong tài liệu `ip-sysctl` của kernel và bằng một thí nghiệm "đổi một thứ, đo lại" như các bước của lab. AI cũng hay nhầm `Recv-Q` của socket LISTEN với `Recv-Q` của kết nối đang mở (byte chưa đọc); đối chiếu với `man ss`.
+
+</Callout>
+
+<Callout kind="link">
+
+D1.4 và D1.5 là nền của bài này (USE bằng tay, sysctl theo namespace, cgroup); D2.1 giải thích bắt tay TCP, `TIME-WAIT` và lỗi kết nối; D9.1 gặp cùng các giới hạn ở Nginx dưới tải. D12.3 đưa USE thành metric của node_exporter, D16.5 thu profile liên tục. D18.1 và D18.2 làm việc ở tầng trên: trần và quá tải của cả hệ. Hiệu năng bên trong JVM (GC, JIT, thread, JFR) là phần của SB12 ở roadmap Spring Boot.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d23.3.mastery-diagnose">Từ triệu chứng "chậm" hoặc "không kết nối được", chọn được tài nguyên cần kiểm theo USE và công cụ tương ứng, và chỉ ra được nguyên nhân bằng số đo trước khi đổi cấu hình.</Check>
+
+<Check id="d23.3.mastery-profile">Tự profile được một tiến trình đang chạy bằng `perf` và flame graph, và đọc được kết quả cả khi không có bộ đếm phần cứng.</Check>
+
+<Check id="d23.3.mastery-tune">Quyết định được một sysctl mạng có đáng chỉnh không dựa trên phép đo trước và sau, và giải thích được vì sao một danh sách tối ưu chung chung là có hại.</Check>
+
+</Mastery>

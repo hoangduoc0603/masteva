@@ -1,0 +1,841 @@
+---
+title: Tail sampling, Collector hai tầng, chi phí và vòng đời log
+description: So sánh head sampling với tail sampling, dựng OpenTelemetry Collector hai tầng agent và gateway, thấy trace bị cắt khi chia tải theo vòng tròn rồi sửa bằng load-balancing exporter định tuyến theo trace ID, giữ 100% trace lỗi và chậm cùng 5% phần còn lại, đo trace và span vào ra; rồi đo lượng log thật của một service, lọc log debug và health check, lấy mẫu log INFO bằng Alloy, đặt thời gian lưu theo loại và ước lượng chi phí.
+id: d16.4
+step: d16
+prerequisites: [d16.1]
+topics: [d16.tail-sampling, d16.chi-phi-log]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    otel-collector-contrib: 0.162.0
+    tempo: 3.1.0
+    loki: 3.7.8
+    alloy: 1.20.1
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Giữ đúng phần dữ liệu có giá trị, với chi phí biết trước. Học xong bài này, bạn giải thích được:
+
+- Vì sao lấy mẫu 5% ngay từ service đầu tiên bỏ mất 95% trace lỗi, và giữ trace lỗi thì phải trả giá gì.
+- Vì sao hai Collector gateway chạy song song có thể làm phần lớn trace chậm bị thiếu một nửa, dù mỗi Collector đều làm đúng việc.
+- Một service 20 request mỗi giây sinh bao nhiêu GB log mỗi ngày, và phần nào trong đó không ai đọc.
+- Vì sao một log có mật khẩu hay địa chỉ IP là vấn đề về thời gian lưu, không chỉ về bảo mật.
+
+</Goal>
+
+<Knowledge>
+
+### Head sampling và tail sampling
+
+D12.1 và D12.6 đã giới thiệu **head sampling**: SDK ở service đầu tiên quyết định giữ hay bỏ một trace ngay khi tạo span gốc, ghi quyết định vào cờ của `traceparent`, các service sau làm theo. Nó rẻ: trace bị bỏ không tốn gì ở bất kỳ đâu. Nhưng nó quyết định khi chưa biết request sẽ ra sao.
+
+**Tail sampling** quyết định **sau** khi đã thấy cả trace: Collector giữ mọi span của một trace trong bộ nhớ một lúc (`decision_wait`), rồi áp chính sách lên toàn bộ trace.
+
+| | Head sampling | Tail sampling |
+|---|---|---|
+| Quyết định lúc | Span đầu tiên được tạo | Sau `decision_wait`, khi đã có đủ span |
+| Dựa vào | Xác suất, đôi khi thuộc tính của request đến | Mọi thứ trong trace: lỗi, thời lượng, thuộc tính bất kỳ |
+| Giữ 100% trace lỗi | Không thể (chưa biết lỗi) | Có |
+| Chi phí | Gần như 0: trace bị bỏ không được gửi | Mọi span vẫn phải sinh, gửi tới Collector và nằm trong bộ nhớ chờ quyết định |
+| Điều kiện | Không | Mọi span của một trace phải tới **cùng một** Collector |
+
+Hai cách kết hợp được: head sampling ở mức vừa phải để chặn chi phí từ gốc (ví dụ giữ 20%), rồi tail sampling trên phần còn lại để chọn trace đáng giữ. Lab dùng tail sampling với SDK giữ 100%.
+
+**Processor `tail_sampling`** nhận một danh sách **policy**; một trace được giữ nếu **bất kỳ** policy nào nói giữ. Ba policy của lab:
+
+| Policy | Loại | Giữ khi |
+|---|---|---|
+| `loi` | `status_code` | Có ít nhất một span trạng thái `ERROR` |
+| `cham` | `latency` | Từ span bắt đầu sớm nhất tới span kết thúc muộn nhất dài quá 300 ms |
+| `con-lai` | `probabilistic` | Một hàm băm của trace ID rơi vào 5%: cùng trace ID thì mọi Collector quyết định giống nhau |
+
+### Collector hai tầng
+
+D12.6 phân biệt Collector kiểu **agent** (cạnh ứng dụng, mỗi máy hoặc mỗi node một bản) và **gateway** (một cụm dùng chung). Hệ thống lớn có cả hai: agent nhận span từ ứng dụng trên máy đó, gateway áp chính sách chung. Tail sampling chạy ở gateway, và vì gateway có nhiều bản, xuất hiện một điều kiện mà một Collector đơn lẻ không có:
+
+```text
+ SAI: agent chia span cho gateway theo vòng tròn (round robin, theo từng lần gửi)
+   shop  ── span A1, A2 của trace A ──▶ agent ──▶ gateway-1: thấy A1, A2 (chậm 420 ms) → GIỮ
+   stock ── span A3 của trace A    ──▶ agent ──▶ gateway-2: chỉ thấy A3 (25 ms)     → BỎ
+   Tempo nhận trace A thiếu span của stock
+
+ ĐÚNG: load-balancing exporter băm trace ID để chọn gateway
+   mọi span của trace A ──▶ gateway-1 (luôn luôn)    mọi span của trace B ──▶ gateway-2
+```
+
+**Load-balancing exporter** (`loadbalancing`, có trong bản contrib) làm việc đó: với mỗi span, nó băm trace ID (hoặc tên service, tuỳ `routing_key`) để chọn một gateway, và lấy danh sách gateway từ DNS, từ danh sách tĩnh, hoặc từ Kubernetes. Khi số gateway thay đổi (thêm bản, một bản chết), một phần trace được chuyển sang gateway khác và có thể bị cắt trong chốc lát; đó là cái giá của việc co giãn tầng gateway.
+
+Bộ nhớ của gateway tỉ lệ với số trace đang chờ quyết định: traffic (trace mỗi giây) nhân `decision_wait`. `num_traces` (mặc định 50.000) là số trace tối đa giữ trong bộ nhớ. Và gateway giữ trạng thái nên khởi động lại là mất các trace đang chờ.
+
+<Check id="d16.4.tail-sampling">So sánh được head sampling với tail sampling, giải thích được vì sao tail sampling nhiều bản cần định tuyến theo trace ID, và ước được bộ nhớ gateway cần theo traffic và `decision_wait`.</Check>
+
+### Log tốn tiền theo cái gì
+
+D12.1 đã đo: log tăng theo traffic, metric thì không. Ở quy mô lớn, log thường là khoản lớn nhất của cả hệ thống quan sát, và nó tốn ở ba chỗ:
+
+```text
+ khối lượng nhận (GB/ngày) ──▶ xử lý lúc nhận (CPU, index) ──▶ lưu (GB × số ngày giữ) ──▶ truy vấn (quét)
+        ▲                                                        ▲
+   giảm ở đây rẻ nhất                                       chọn thời gian lưu theo loại
+```
+
+Bốn cách giảm, theo thứ tự nên làm:
+
+| Cách | Ví dụ | Mất gì |
+|---|---|---|
+| Không ghi | Tắt log mức DEBUG ở production; không log health check | Không mất gì nếu không ai đọc nó |
+| Lọc ở bộ thu | `stage.drop` của Alloy, processor `filter` của Collector | Dòng bị bỏ không còn ở đâu cả |
+| Lấy mẫu | Giữ mọi ERROR và WARN, 10% INFO thành công | Không còn từng dòng của mọi request; trace id ở dòng còn lại vẫn dẫn tới trace |
+| Lưu ngắn hơn, rẻ hơn | Mặc định 7 ngày, ERROR 30 ngày, log kiểm toán 1 năm trên object storage | Không truy vấn được dữ liệu đã quá hạn |
+
+Lấy mẫu log khác tail sampling ở một điểm: mỗi dòng được quyết định độc lập, nên một request có thể mất dòng log ở service này và còn ở service kia. Vì thế lấy mẫu chỉ nên áp cho dòng không có giá trị riêng lẻ (INFO của request thành công), còn dòng lỗi giữ hết.
+
+**Thời gian lưu theo loại** dùng lại cơ chế của D12.5 (`retention_period` cho mặc định, `retention_stream` theo label). Ước lượng dung lượng cần lưu là phép nhân:
+
+```text
+ dung lượng = (byte mỗi giây của loại đó) × 86.400 × (số ngày giữ) × (hệ số nén của kho log)
+ ví dụ: 7,4 KB/giây × 86.400 ≈ 0,64 GB/ngày; giữ 30 ngày ≈ 19 GB trước nén
+```
+
+Chi phí tiền thì nhân tiếp với giá lưu của nơi bạn dùng (đĩa, object storage, dịch vụ có quản lý), cộng chi phí nhận nếu là dịch vụ tính theo GB nhận vào. Hệ số nén phụ thuộc dữ liệu: log JSON lặp nhiều tên trường thường nén tốt; hãy đo trên dữ liệu của mình thay vì dùng con số chung.
+
+**Phân tầng nóng và lạnh.** Elasticsearch và OpenSearch có vòng đời index (ILM, ISM) chuyển index cũ từ node đĩa nhanh sang node đĩa rẻ rồi xoá; Loki đã lưu trên object storage ngay từ đầu nên "lạnh" là mặc định, chỉ cache là nóng. Log phải giữ lâu vì quy định (Nghị định 333/2026 ở D12.5) thường đi một đường riêng: stream riêng, có cấu trúc cố định, ghi lên object storage có khoá chống xoá.
+
+### Log có dữ liệu cá nhân
+
+Dữ liệu cá nhân trong log (địa chỉ IP, email, số điện thoại, token, và tệ nhất là mật khẩu) biến mỗi bản sao của log thành một chỗ phải bảo vệ: kho log, bản sao lưu, file cục bộ trên máy, kênh chat mà ai đó dán một đoạn log vào. Thời gian lưu dài nhân rủi ro đó lên. Ba lớp:
+
+- **Ở ứng dụng:** không ghi; che trước khi ghi. SB8.1 (roadmap Spring Boot) dạy phía code: log JSON có cấu trúc, gắn mã request vào từng dòng, và không ghi mật khẩu, token hay nội dung request đầy đủ.
+- **Ở bộ thu:** `stage.replace` của Alloy hay processor `transform`, `redaction` của Collector che theo mẫu (ví dụ địa chỉ IP thành `x.x.x.x`) trước khi log rời máy.
+- **Ở kho:** thời gian lưu ngắn cho log ứng dụng, và quy trình xoá theo yêu cầu (D12.5 nhắc API xoá của Loki).
+
+Dòng log `handler start` của ứng dụng mẫu ghi `remote` là địa chỉ IP và cổng của client. Trong lab đó là IP nội bộ của container; ở production, đó là IP của người dùng.
+
+<Callout kind="production">
+
+Ngày 21/03/2019, Facebook công bố rằng trong một đợt rà soát bảo mật định kỳ hồi tháng 01, họ phát hiện mật khẩu của một số người dùng được lưu ở dạng đọc được trong các hệ thống lưu trữ dữ liệu nội bộ, dù hệ thống đăng nhập được thiết kế để che mật khẩu. Bài viết ước tính sẽ thông báo cho hàng trăm triệu người dùng Facebook Lite, hàng chục triệu người dùng Facebook khác và hàng chục nghìn người dùng Instagram; Facebook nói các mật khẩu này chưa bao giờ hiện ra với ai ngoài công ty, và chưa thấy dấu hiệu bị lạm dụng hay truy cập trái phép từ bên trong. Bản cập nhật ngày 18/04/2019 viết rằng họ tìm thấy thêm **log** chứa mật khẩu Instagram ở dạng đọc được, và ước tính sự việc ảnh hưởng tới hàng triệu người dùng Instagram. Phần suy ra của bài: một dòng log ghi nguyên văn request là đủ để mật khẩu đi vào mọi nơi log đi tới; lọc ở bộ thu và thời gian lưu ngắn không thay được việc không ghi, nhưng giới hạn được số chỗ và số ngày mà một sai sót như vậy tồn tại.
+
+</Callout>
+
+<Check id="d16.4.log-cost">Kể được bốn cách giảm chi phí log theo thứ tự nên làm, ước lượng được dung lượng lưu từ tốc độ log và thời gian giữ, và nêu được ba lớp xử lý dữ liệu cá nhân trong log.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Tail Sampling Processor (opentelemetry-collector-contrib)](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor): các loại policy, `decision_wait`, `num_traces`, và phần nói về việc cần mọi span của một trace ở cùng một Collector.
+- [Load Balancing Exporter (opentelemetry-collector-contrib)](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/loadbalancingexporter): `routing_key`, các resolver DNS, tĩnh, Kubernetes, và hành vi khi danh sách backend đổi.
+- [Sampling (OpenTelemetry)](https://opentelemetry.io/docs/concepts/sampling/): head sampling và tail sampling, ưu nhược của từng cách.
+- [loki.process (Grafana Alloy documentation)](https://grafana.com/docs/alloy/latest/reference/components/loki/loki.process/): `stage.drop`, `stage.match`, `stage.sampling`, `stage.replace`.
+- [Keeping Passwords Secure (Meta)](https://about.fb.com/news/2019/03/keeping-passwords-secure/): bài công bố trong callout, gồm bản cập nhật tháng 04/2019.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã build image `d16-app:1.0.0` ở bước 1 của D16.1. Dừng cụm của các bài trước nếu còn chạy (`docker compose stop` trong `~/masteva-d16/slo` và `~/masteva-d16/lt`). Lab tải image Collector contrib (khoảng 100 MB nén), Tempo (khoảng 34 MB), Loki (khoảng 41 MB) và Alloy (khoảng 195 MB). Dùng cổng **9766** (shop), **9767** (stock), **9770** (Tempo), **9771** đến **9773** (metric của ba Collector), **9774** (Loki), **9775** (giao diện Alloy). **Profile máy:** cụm trace (bước 1 đến 5) dùng khoảng 500 MiB; thêm Loki và Alloy ở bước 6 lên khoảng 0,75 đến 1,25 GiB, trong đó Tempo nặng nhất (300 đến 450 MiB, có trần 640 MiB), rồi tới Alloy (khoảng 130 đến 320 MiB) và Loki (khoảng 90 đến 220 MiB). Mọi khối lệnh chạy trong `~/masteva-d16/otel`; mở terminal mới thì `cd ~/masteva-d16/otel` trước. Máy 8 GB với Docker VM 4 GB chạy được nếu không còn cụm nào khác.
+
+### 1. Hai tầng Collector, chia tải theo vòng tròn
+
+Dựng `shop` và `stock` gửi span tới một agent; agent chuyển cho hai gateway; gateway chạy tail sampling rồi gửi cho Tempo. Bản đầu tiên của agent dùng cách mà nhiều người nghĩ tới trước: exporter OTLP thường, trỏ tới tên DNS `gateway` (cả hai gateway cùng mang tên này nhờ `aliases` của Compose), với bộ cân bằng tải `round_robin` của gRPC.
+
+<Terminal where="mac" title="~/masteva-d16/otel">
+
+```bash
+mkdir -p ~/masteva-d16/otel/otelcol ~/masteva-d16/otel/tempo && cd ~/masteva-d16/otel
+cat > otelcol/agent.yaml <<'EOF'
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 150
+    spike_limit_mib: 30
+
+exporters:
+  otlp_grpc/gateway:
+    endpoint: dns:///gateway:4317
+    balancer_name: round_robin
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [otlp_grpc/gateway]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+EOF
+cat > otelcol/gateway.yaml <<'EOF'
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 150
+    spike_limit_mib: 30
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 20000
+    policies:
+      - name: loi
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: cham
+        type: latency
+        latency: { threshold_ms: 300 }
+      - name: con-lai
+        type: probabilistic
+        probabilistic: { sampling_percentage: 5 }
+  batch:
+    timeout: 1s
+
+exporters:
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp_grpc/tempo]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+EOF
+cat > tempo/tempo.yaml <<'EOF'
+server:
+  http_listen_port: 3200
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+usage_report:
+  reporting_enabled: false
+EOF
+cat > compose.yaml <<'EOF'
+name: d16-otel
+
+x-app: &app
+  image: d16-app:1.0.0
+  restart: unless-stopped
+x-otelcol: &otelcol
+  image: otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6
+  restart: unless-stopped
+  volumes: ["./otelcol:/etc/otelcol:ro"]
+
+services:
+  shop:
+    <<: *app
+    container_name: d16-otel-shop
+    environment: { OTEL_SERVICE_NAME: shop, STOCK_URL: "http://stock:8080", OTEL_EXPORTER_OTLP_ENDPOINT: "http://agent:4318", LOG_LEVEL: debug }
+    ports: ["127.0.0.1:9766:8080"]
+  stock:
+    <<: *app
+    container_name: d16-otel-stock
+    environment: { OTEL_SERVICE_NAME: stock, OTEL_EXPORTER_OTLP_ENDPOINT: "http://agent:4318", LOG_LEVEL: debug }
+    ports: ["127.0.0.1:9767:8080"]
+  loadgen:
+    <<: *app
+    container_name: d16-otel-loadgen
+    environment: { MODE: loadgen, TARGET: "http://shop:8080", RPS: "20" }
+  agent:
+    <<: *otelcol
+    container_name: d16-agent
+    command: ["--config=/etc/otelcol/agent.yaml"]
+    ports: ["127.0.0.1:9771:8888"]
+    depends_on: [gateway-1, gateway-2]
+  gateway-1:
+    <<: *otelcol
+    container_name: d16-gateway-1
+    command: ["--config=/etc/otelcol/gateway.yaml"]
+    networks: { default: { aliases: [gateway] } }
+    ports: ["127.0.0.1:9772:8888"]
+  gateway-2:
+    <<: *otelcol
+    container_name: d16-gateway-2
+    command: ["--config=/etc/otelcol/gateway.yaml"]
+    networks: { default: { aliases: [gateway] } }
+    ports: ["127.0.0.1:9773:8888"]
+  tempo:
+    image: grafana/tempo:3.1.0@sha256:3076b8dcdfb32fd6bc5ccef85e7b7313e6199b9cb84366257fc17ecb696db5fd
+    container_name: d16-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    environment: { GOMEMLIMIT: 300MiB }
+    mem_limit: 640m
+    volumes: ["./tempo:/etc/tempo:ro", "tempo-data:/var/tempo"]
+    ports: ["127.0.0.1:9770:3200"]
+
+volumes:
+  tempo-data:
+EOF
+for f in agent gateway; do
+  docker run --rm -v "$PWD/otelcol:/etc/otelcol:ro" otel/opentelemetry-collector-contrib:0.162.0 validate --config=/etc/otelcol/$f.yaml && echo "$f: hợp lệ"
+done
+docker compose up -d 2>&1 | grep -c Started
+for i in $(seq 30); do [ "$(curl -s localhost:9770/ready)" = "ready" ] && break; sleep 3; done; curl -s localhost:9770/ready; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+agent: hợp lệ
+gateway: hợp lệ
+7
+ready
+```
+
+</Expected>
+
+- **Agent** nhận OTLP/HTTP từ ứng dụng (cổng 4318, đúng biến `OTEL_EXPORTER_OTLP_ENDPOINT` của ứng dụng mẫu) và chuyển nguyên cho gateway. `dns:///gateway:4317` bảo gRPC hỏi DNS lấy mọi địa chỉ của `gateway`; `round_robin` gửi lần lượt từng lời gọi tới từng địa chỉ. gRPC chỉ hỏi lại DNS khi kết nối lỗi, nên agent phải khởi động **sau** hai gateway (`depends_on`), nếu không nó có thể chỉ biết một địa chỉ.
+- **Gateway** là chỗ có `tail_sampling`, đặt sau `memory_limiter` và trước `batch` theo thứ tự D12.6 đã giải thích. `decision_wait: 10s`: trace được giữ trong bộ nhớ 10 giây kể từ span đầu tiên tới, rồi mới quyết định. `num_traces: 20000` là trần số trace chờ.
+- **Ứng dụng** bật `LOG_LEVEL: debug` từ giờ để có log cho bước 6; nó không ảnh hưởng trace.
+- **Tempo** có trần bộ nhớ như Grafana ở D12.4: `mem_limit` là giới hạn của container, `GOMEMLIMIT` bảo bộ thu gom rác của Go giữ heap dưới mức đó để tự kiềm chế trước khi chạm trần. Alloy ở bước 6 có trần tương tự. Bạn tự xem mỗi thành phần đang dùng bao nhiêu bằng `docker stats --no-stream`; cột `MEM USAGE / LIMIT` cho thấy cả trần.
+- Tempo cần 15 đến 30 giây để `ready`.
+
+### 2. Bao nhiêu trace vào, bao nhiêu ra
+
+Script `ts` đọc metric của hai gateway và Tempo hai lần cách nhau một khoảng (mặc định 60 giây) rồi in phần chênh: số trace gateway đã quyết định, số được giữ, số được giữ theo từng policy (một trace có thể khớp nhiều policy), và số span agent nhận so với số span Tempo nhận.
+
+<Terminal where="mac">
+
+```bash
+cat > ts <<'EOF'
+#!/bin/sh
+snap() {
+  { for p in 9772 9773; do curl -s localhost:$p/metrics; done; curl -s localhost:9771/metrics | sed 's/^/AGENT /'; curl -s localhost:9770/metrics | sed 's/^/TEMPO /'; } | awk '
+    /^otelcol_processor_tail_sampling_global_count_traces_sampled/ { if (/sampled="true"/) k += $NF; else d += $NF }
+    /^otelcol_processor_tail_sampling_count_traces_sampled/ && /sampled="true"/ {
+      if (/policy="loi"/) l += $NF; if (/policy="cham"/) c += $NF; if (/policy="con-lai"/) r += $NF }
+    /^AGENT otelcol_receiver_accepted_spans/ { ai += $NF }
+    /^TEMPO tempo_distributor_spans_received_total/ { ti += $NF }
+    END { printf "%d %d %d %d %d %d %d\n", k, d, l, c, r, ai, ti }'
+}
+W=${1:-60}
+set -- $(snap); k=$1 d=$2 l=$3 c=$4 r=$5 ai=$6 ti=$7
+sleep "$W"
+set -- $(snap)
+awk -v k=$(($1 - k)) -v d=$(($2 - d)) -v l=$(($3 - l)) -v c=$(($4 - c)) -v r=$(($5 - r)) -v ai=$(($6 - ai)) -v ti=$(($7 - ti)) -v w="$W" 'BEGIN {
+  printf "trong %d giây: %d trace được quyết định, giữ %d (%.1f%%)  |  loi=%d cham=%d con-lai=%d\n", w, k + d, k, (k + d) ? 100 * k / (k + d) : 0, l, c, r
+  printf "span: agent nhận %d, Tempo nhận %d (%.1f%%)\n", ai, ti, ai ? 100 * ti / ai : 0 }'
+EOF
+chmod +x ts
+sleep 20
+./ts
+for p in 9772 9773; do curl -s localhost:$p/metrics | awk -v p=$p '/^otelcol_receiver_accepted_spans/ { print "gateway ở cổng " p ": đã nhận " $NF " span" }'; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+trong 60 giây: 1405 trace được quyết định, giữ 84 (6.0%)  |  loi=0 cham=0 con-lai=84
+span: agent nhận 1617, Tempo nhận 102 (6.3%)
+gateway ở cổng 9772: đã nhận 1872 span
+gateway ở cổng 9773: đã nhận 272 span
+```
+
+</Expected>
+
+Mỗi giây có 20 request, mỗi request một trace (`checkout` có 3 span qua hai service, `products` và `/healthz` có 1 span). Với chia tải vòng tròn, một trace `checkout` có thể bị đếm hai lần, mỗi gateway một phần, nên số "trace được quyết định" nhỉnh hơn 1.200 mỗi phút. Hai dòng cuối cho thấy hai gateway nhận số span rất chênh nhau: vòng tròn chia theo **lời gọi**, không theo span hay trace. Giả thuyết: lời gọi của `shop` (nhiều span) và của `stock` (ít span) gần như luôn rơi vào hai gateway khác nhau. Bước 3 kiểm giả thuyết đó. Không có lỗi hay request chậm, nên chỉ policy `con-lai` giữ, quanh 5% (con số in ra lệch vài phần mười tuỳ phút đo, và cao hơn một chút vì trace bị đếm hai lần); số span tới Tempo cũng quanh mức đó. Đây là lời hứa của tail sampling: lưu khoảng một phần hai mươi, mà không bỏ trace nào đáng xem. Bước sau kiểm lời hứa đó.
+
+### 3. Trace chậm bị cắt
+
+Cho `shop` chậm thêm 400 ms trong một phút: mọi trace `checkout` lúc này dài hơn 300 ms, nên policy `cham` phải giữ hết. Sau đó lấy danh sách trace `checkout` chậm từ Tempo, mở từng trace theo ID và đếm nó có span của những service nào.
+
+<Terminal where="mac">
+
+```bash
+cat > slow-traces <<'EOF'
+#!/bin/sh
+curl -sG localhost:9770/api/search --data-urlencode 'q={ resource.service.name = "shop" && name = "GET /api/checkout" && duration > 300ms }' \
+  --data-urlencode "start=$1" --data-urlencode "end=$2" --data-urlencode limit=10000 | jq -r '.traces[].traceID' \
+  | while read id; do
+      curl -s "localhost:9770/api/traces/$id" | jq -r '[.batches[].resource.attributes[] | select(.key == "service.name") | .value.stringValue] | unique | join("+")'
+    done | sort | uniq -c
+EOF
+chmod +x slow-traces
+S=$(date +%s)
+curl -s -X POST 'localhost:9766/admin/fault?delay=400'
+sleep 60
+curl -s -X POST localhost:9766/admin/fault
+E=$(date +%s)
+sleep 40
+./slow-traces $S $((E + 30))
+```
+
+</Terminal>
+
+<Predict question="Khoảng 240 request checkout chậm, policy cham giữ mọi trace chậm. Bao nhiêu trace trong Tempo có đủ span của cả shop lẫn stock?">
+
+```text
+error=0% delay=400ms
+error=0% delay=0ms
+ 242 shop
+  11 shop+stock
+```
+
+Chỉ một phần nhỏ. Phần lớn trace chậm trong Tempo chỉ có span của `shop`; span của `stock` đã bị bỏ. Lý do đúng như sơ đồ ở phần Kiến thức: `shop` và `stock` gửi span trong hai lời gọi riêng, chia tải vòng tròn đưa hai lời gọi đó tới hai gateway khác nhau; gateway thấy span của `shop` (420 ms) quyết định giữ, gateway chỉ thấy span của `stock` (dưới 50 ms) quyết định bỏ, và policy `con-lai` cũng bỏ vì trace ID đó không rơi vào 5%. Không gateway nào làm sai; hệ thống thì sai. Tỉ lệ trace đủ trên máy bạn sẽ khác, vì nó phụ thuộc thứ tự hai service gửi span, nhưng luôn xa 100%.
+
+Vòng `while read` đọc từng trace ID một dòng; mỗi lần gọi `/api/traces/<id>` Tempo trả về mọi span nó có của trace đó, nên đây là cách đếm chắc chắn nhất. `sleep 40` chờ `decision_wait` và lô cuối tới Tempo.
+
+</Predict>
+
+### 4. Định tuyến theo trace ID
+
+Thay exporter của agent bằng `loadbalancing`: băm trace ID, hỏi DNS để biết các gateway, gửi mọi span của một trace tới cùng một gateway. Rồi làm lại đúng phép thử của bước 3.
+
+<Terminal where="mac">
+
+```bash
+cat > otelcol/agent.yaml <<'EOF'
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 150
+    spike_limit_mib: 30
+
+exporters:
+  loadbalancing:
+    routing_key: traceID
+    protocol:
+      otlp:
+        tls:
+          insecure: true
+    resolver:
+      dns:
+        hostname: gateway
+        port: "4317"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [loadbalancing]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+EOF
+docker run --rm -v "$PWD/otelcol:/etc/otelcol:ro" otel/opentelemetry-collector-contrib:0.162.0 validate --config=/etc/otelcol/agent.yaml && echo "agent: hợp lệ"
+docker compose restart agent 2>&1 | grep -c Started
+sleep 15
+S=$(date +%s)
+curl -s -X POST 'localhost:9766/admin/fault?delay=400'
+sleep 60
+curl -s -X POST localhost:9766/admin/fault
+E=$(date +%s)
+sleep 40
+./slow-traces $S $((E + 30))
+curl -s localhost:9771/metrics | grep -E '^otelcol_loadbalancer_num_backends'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+agent: hợp lệ
+1
+error=0% delay=400ms
+error=0% delay=0ms
+ 254 shop+stock
+otelcol_loadbalancer_num_backends{resolver="dns"} 2
+```
+
+</Expected>
+
+Mọi trace chậm giờ có đủ hai service. Dòng cuối là metric của chính exporter: nó đang biết 2 gateway, lấy từ DNS. Khi bạn thêm gateway thứ ba (trên Kubernetes thường là headless Service), con số này tăng và một phần trace được chuyển sang gateway mới.
+
+### 5. Lỗi được giữ hết
+
+Cho `stock` trả lỗi 10% trong một phút và đo lại vào ra:
+
+<Terminal where="mac">
+
+```bash
+curl -s -X POST 'localhost:9767/admin/fault?error=10'
+./ts 60
+curl -s -X POST localhost:9767/admin/fault
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+error=10% delay=0ms
+trong 60 giây: 1201 trace được quyết định, giữ 77 (6.4%)  |  loi=19 cham=0 con-lai=59
+span: agent nhận 1685, Tempo nhận 131 (7.8%)
+error=0% delay=0ms
+```
+
+</Expected>
+
+Mỗi phút có khoảng 240 request `checkout`, 10% lỗi ở `stock` tức tối đa khoảng 24 trace lỗi; policy `loi` giữ khoảng 15 đến 30 trong cửa sổ đo (lỗi ngẫu nhiên nên con số dao động), thường ít hơn một chút vì lỗi bắt đầu cùng lúc với cửa sổ, mà mỗi trace chỉ được quyết định 10 giây sau span đầu tiên. Tổng số trace giữ tăng lên khoảng 6 đến 7%. Với head sampling 5%, chỉ khoảng một trong số chúng còn lại. Số trace được quyết định giờ quanh 1.200 mỗi phút, đúng số request, vì mỗi trace chỉ tới một gateway. Tỉ lệ span tới Tempo cao hơn tỉ lệ trace được giữ vì trace lỗi đều là `checkout`, loại có nhiều span nhất.
+
+<Check id="d16.4.lab-tail">Dựng được Collector hai tầng có tail sampling, chứng minh được bằng số đếm rằng chia tải vòng tròn cắt trace còn load-balancing exporter thì không, và đo được tỉ lệ trace, span vào ra theo từng policy.</Check>
+
+### 6. Log thật tốn bao nhiêu
+
+Thêm Loki và Alloy như D12.5, chỉ thu log của `shop` và `stock`. Loki có hai thời gian lưu: mặc định 7 ngày, log `ERROR` 30 ngày. Script `lograte` đọc metric của Loki hai lần cách nhau 60 giây và in tốc độ nhận theo từng nhóm thời gian lưu.
+
+<Terminal where="mac">
+
+```bash
+mkdir -p loki alloy
+cat > loki/loki.yaml <<'EOF'
+auth_enabled: false
+server:
+  http_listen_port: 3100
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+schema_config:
+  configs:
+    - from: 2026-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+limits_config:
+  retention_period: 168h
+  retention_stream:
+    - selector: '{level="ERROR"}'
+      priority: 1
+      period: 720h
+  discover_service_name: []
+  shard_streams:
+    enabled: false
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+analytics:
+  reporting_enabled: false
+EOF
+cat > alloy/config.alloy <<'EOF'
+discovery.docker "app" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=d16-otel"]
+  }
+}
+
+discovery.relabel "app" {
+  targets = discovery.docker.app.targets
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "shop|stock"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "app" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.app.output
+  forward_to = [loki.process.app.receiver]
+}
+
+loki.process "app" {
+  stage.json {
+    expressions = { level = "level", route = "route" }
+  }
+  stage.labels {
+    values = { level = "" }
+  }
+  forward_to = [loki.write.loki.receiver]
+}
+
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+EOF
+cat > compose.logs.yaml <<'EOF'
+services:
+  loki:
+    image: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
+    container_name: d16-loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes: ["./loki:/etc/loki:ro", "loki-data:/loki"]
+    ports: ["127.0.0.1:9774:3100"]
+  alloy:
+    image: grafana/alloy:v1.20.1@sha256:2aa2099af76c0098d4af7a4d6e48f86cb66dc1a000222ad927a1c67c6542d13f
+    container_name: d16-alloy
+    command: [run, --server.http.listen-addr=0.0.0.0:12345, --storage.path=/var/lib/alloy/data, /etc/alloy/config.alloy]
+    environment: { GOMEMLIMIT: 300MiB }
+    mem_limit: 640m
+    volumes: ["./alloy:/etc/alloy:ro", "/var/run/docker.sock:/var/run/docker.sock:ro", "alloy-data:/var/lib/alloy/data"]
+    ports: ["127.0.0.1:9775:12345"]
+    depends_on: [loki]
+
+volumes:
+  loki-data:
+  alloy-data:
+EOF
+echo 'COMPOSE_FILE=compose.yaml:compose.logs.yaml' > .env
+cat > lograte <<'EOF'
+#!/bin/sh
+snap() { curl -s localhost:9774/metrics | awk '/^loki_distributor_(bytes|lines)_received_total/ && /is_internal_stream="false"/ {
+  if ($1 ~ /bytes/) { match($1, /retention_hours="[0-9]+"/); r = substr($1, RSTART + 17, RLENGTH - 18); b[r] += $2 } else l += $2 }
+  END { printf "%d %d %d\n", l, b["168"], b["720"] }'; }
+set -- $(snap); l=$1 b7=$2 b30=$3
+sleep 60
+set -- $(snap)
+awk -v l=$(($1 - l)) -v b7=$(($2 - b7)) -v b30=$(($3 - b30)) 'BEGIN {
+  printf "%.1f dòng/giây  %.1f KB/giây  ≈ %.2f GB/ngày\n", l / 60, (b7 + b30) / 60 / 1024, (b7 + b30) / 60 * 86400 / 1e9
+  printf "  giữ 7 ngày:  %.2f GB/ngày → %.1f GB cần lưu\n", b7 / 60 * 86400 / 1e9, b7 / 60 * 86400 / 1e9 * 7
+  printf "  giữ 30 ngày: %.3f GB/ngày → %.2f GB cần lưu\n", b30 / 60 * 86400 / 1e9, b30 / 60 * 86400 / 1e9 * 30 }'
+EOF
+chmod +x lograte
+docker compose up -d 2>&1 | grep -E '(loki|alloy) +Started'
+for i in $(seq 30); do [ "$(curl -s localhost:9774/ready)" = "ready" ] && break; sleep 3; done; curl -s localhost:9774/ready; echo
+curl -s -X POST 'localhost:9767/admin/fault?error=10'
+sleep 30
+./lograte
+curl -s -X POST localhost:9767/admin/fault
+docker logs d16-otel-shop 2>&1 | grep '"level":"DEBUG"' | tail -1
+docker logs d16-otel-shop 2>&1 | grep '"route":"/api/products"' | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d16-loki Started 
+ Container d16-alloy Started 
+ready
+error=10% delay=0ms
+43.6 dòng/giây  7.3 KB/giây  ≈ 0.65 GB/ngày
+  giữ 7 ngày:  0.64 GB/ngày → 4.5 GB cần lưu
+  giữ 30 ngày: 0.010 GB/ngày → 0.31 GB cần lưu
+error=0% delay=0ms
+{"time":"2026-10-15T07:38:26.55193892Z","level":"DEBUG","msg":"handler start","service":"shop","pattern":"GET /api/checkout","remote":"172.24.0.2:46550"}
+{"time":"2026-10-15T07:38:26.620980753Z","level":"INFO","msg":"request","service":"shop","route":"/api/products","status":200,"duration_ms":19,"trace_id":"cecc8025477a0f834a3ffbbc5b92b23d"}
+```
+
+</Expected>
+
+`lograte` đo ở **phía nhận**: metric `loki_distributor_bytes_received_total` của Loki, có label `retention_hours` cho biết mỗi byte thuộc nhóm giữ bao lâu. Đó là con số mà một dịch vụ log tính tiền. Trong lúc đo, `stock` trả lỗi 10% để có log `ERROR`.
+
+Hai dòng cuối là mẫu của hai loại log: dòng `DEBUG` (`handler start`, ghi cả địa chỉ IP và cổng của bên gọi) và dòng `INFO` cho mỗi request; giờ, IP và trace id của bạn sẽ khác. Ở 20 request mỗi giây, hai service ghi khoảng 44 dòng mỗi giây: mỗi request `products` hay `checkout` sinh một dòng `DEBUG` và một dòng `INFO` ở `shop`, `checkout` thêm hai dòng nữa ở `stock`, và `/healthz` một dòng `INFO`. Tức khoảng 0,6 đến 0,7 GB mỗi ngày cho hai service nhỏ, và giữ 7 ngày là khoảng 4,5 GB chưa nén. Khối lượng tăng tuyến tính theo traffic: gấp trăm lần là khoảng 65 GB mỗi ngày.
+
+### 7. Bỏ thứ không ai đọc
+
+Sửa `loki.process` của Alloy: bỏ mọi dòng `DEBUG`, bỏ log của `/healthz`, và với dòng `INFO` chỉ giữ 10%. Dòng `ERROR` và `WARN` giữ hết. Alloy nạp lại cấu hình qua `POST /-/reload` mà không khởi động lại.
+
+<Terminal where="mac">
+
+```bash
+perl -0pi -e 's|  stage.labels \{\n    values = \{ level = "" \}\n  \}\n|  stage.drop {\n    source              = "level"\n    value               = "DEBUG"\n    drop_counter_reason = "debug"\n  }\n  stage.drop {\n    source              = "route"\n    value               = "/healthz"\n    drop_counter_reason = "healthz"\n  }\n  stage.labels {\n    values = { level = "" }\n  }\n  stage.match {\n    selector = "{level=\\"INFO\\"}"\n    stage.sampling {\n      rate                = 0.1\n      drop_counter_reason = "info-sampled"\n    }\n  }\n|' alloy/config.alloy
+sed -n '/^loki.process/,/^}/p' alloy/config.alloy
+curl -s -X POST localhost:9775/-/reload -w '\nreload: %{http_code}\n'
+curl -s -X POST 'localhost:9767/admin/fault?error=10'
+sleep 30
+./lograte
+curl -s -X POST localhost:9767/admin/fault
+curl -s localhost:9775/metrics | grep '^loki_process_dropped_lines_total' | sed -E 's/.*reason="([^"]+)".* /\1 /'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+loki.process "app" {
+  stage.json {
+    expressions = { level = "level", route = "route" }
+  }
+  stage.drop {
+    source              = "level"
+    value               = "DEBUG"
+    drop_counter_reason = "debug"
+  }
+  stage.drop {
+    source              = "route"
+    value               = "/healthz"
+    drop_counter_reason = "healthz"
+  }
+  stage.labels {
+    values = { level = "" }
+  }
+  stage.match {
+    selector = "{level=\"INFO\"}"
+    stage.sampling {
+      rate                = 0.1
+      drop_counter_reason = "info-sampled"
+    }
+  }
+  forward_to = [loki.write.loki.receiver]
+}
+config reloaded
+reload: 200
+error=10% delay=0ms
+2.4 dòng/giây  0.4 KB/giây  ≈ 0.04 GB/ngày
+  giữ 7 ngày:  0.03 GB/ngày → 0.2 GB cần lưu
+  giữ 30 ngày: 0.012 GB/ngày → 0.37 GB cần lưu
+error=0% delay=0ms
+debug 1801
+healthz 366
+info-sampled 1582
+```
+
+</Expected>
+
+- Ba stage chạy theo thứ tự viết: `stage.drop` so một trường đã tách ở `stage.json` với một giá trị và bỏ dòng khớp; `stage.match` chỉ áp các stage bên trong cho dòng có label `level="INFO"`, và `stage.sampling` giữ ngẫu nhiên 10% trong số đó.
+- Khối lượng giảm khoảng 95%. Nhóm giữ 30 ngày (dòng `ERROR`) không bị đụng tới; con số của nó dao động giữa hai lần đo vì lỗi ngẫu nhiên và cửa sổ đo lệch nhau vài giây. Phần còn lại vẫn giữ cùng tỉ lệ khi traffic tăng.
+- `loki_process_dropped_lines_total` đếm số dòng bị bỏ theo `reason`: con số nên đưa lên dashboard, vì một stage `drop` viết sai có thể lặng lẽ bỏ cả log lỗi.
+
+Một dòng log bị bỏ ở bộ thu thì không còn ở đâu nữa. Lấy mẫu INFO 10% nghĩa là khi khách hàng báo một request thành công nhưng hiển thị sai, bạn chỉ có 10% cơ hội thấy dòng log của nó; trace (nếu được giữ) và metric bù lại một phần. Quyết định đó cần được ghi trong tài liệu của đội, không chỉ trong file cấu hình.
+
+<Check id="d16.4.lab-log">Đo được tốc độ log ở phía nhận theo từng nhóm thời gian lưu, giảm được khối lượng bằng drop và sampling ở bộ thu, và giải thích được mỗi cách đã bỏ đi thông tin gì.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`validate` báo không biết `loadbalancing`:** bạn dùng bản Collector core; exporter này chỉ có trong contrib.
+- **`./slow-traces` in rỗng:** Tempo chưa có trace trong khoảng thời gian đó, hoặc tìm kiếm của Tempo chưa thấy trace mới (thường cần nửa phút tới một phút, D12.6 đã gặp). Chạy lại dòng `./slow-traces` sau 30 giây với cùng `S` và `E`.
+- **`./ts` in số âm:** một gateway hoặc agent vừa khởi động lại giữa hai lần đọc nên counter về 0. Chạy lại.
+- **`lograte` in 0 dòng/giây:** Alloy chưa thấy container; mở `http://localhost:9775` xem component nào `unhealthy`, hoặc `docker logs d16-alloy 2>&1 | grep -i error | tail -3`.
+- **`reload` của Alloy trả 400:** file `.alloy` sai cú pháp, thường do lệnh `perl` chạy hai lần. Alloy giữ cấu hình cũ; mở file sửa tay rồi gọi lại.
+
+</Callout>
+
+### Dọn dẹp
+
+Bài sau không dùng cụm này:
+
+<Terminal where="mac" title="Tạm dừng, giữ dữ liệu">
+
+```bash
+cd ~/masteva-d16/otel && docker compose stop
+```
+
+</Terminal>
+
+Lệnh dọn hẳn cả chặng nằm ở cuối D16.5.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="decision_wait nên đặt bao lâu?">
+
+Đủ dài để span cuối cùng của phần lớn trace kịp tới: thời lượng của request dài nhất bạn quan tâm, cộng độ trễ gửi của SDK (mặc định gửi theo lô mỗi vài giây) và của agent. Đặt quá ngắn thì span tới muộn, sau khi trace đã được quyết định và dữ liệu của nó đã rời bộ nhớ. Span đó chỉ đi theo quyết định cũ nếu bạn bật `decision_cache` (mặc định kích thước 0, tức tắt); README của processor khuyên đặt cache này lớn hơn nhiều so với `num_traces` khi dùng. Đặt quá dài thì bộ nhớ gateway tăng tuyến tính: 1.000 trace mỗi giây với `decision_wait` 30 giây là 30.000 trace nằm chờ. Trace của job chạy nhiều phút hay request bất đồng bộ qua hàng đợi không hợp với tail sampling theo thời gian; chúng cần head sampling hoặc policy riêng.
+
+</Reveal>
+
+<Reveal title="Có nên làm tail sampling ở mỗi agent cho khỏi cần gateway không?">
+
+Chỉ đúng khi mọi span của một trace sinh ra trên cùng một máy, gần như không bao giờ đúng với hệ thống nhiều service. Agent trên máy của `shop` không thấy span của `stock` chạy ở máy khác, nên quyết định của nó dựa trên một mảnh trace, đúng lỗi của bước 3. Agent hợp để làm những việc cục bộ: gắn thuộc tính của máy và pod, lọc, che dữ liệu nhạy cảm, đệm khi mạng chập chờn. Quyết định cần nhìn cả trace để ở gateway.
+
+</Reveal>
+
+<Reveal title="Tail sampling làm hỏng metric sinh từ span không?">
+
+Có, nếu sinh metric **sau** khi lấy mẫu. Connector `spanmetrics` tính RED từ span; đặt nó sau `tail_sampling` thì metric chỉ đếm 5% trace bình thường cộng mọi trace lỗi, nên tỉ lệ lỗi tính ra cao gấp nhiều lần thực tế. Đặt nó ở pipeline nhận đủ span (ở agent, hoặc ở gateway trước `tail_sampling`). Nguyên tắc chung: mọi thứ cần đếm phải đếm trước khi lấy mẫu; ứng dụng mẫu tự đếm metric trong code nên không gặp vấn đề này.
+
+</Reveal>
+
+<Reveal title="Log nên lọc ở bộ thu hay để ứng dụng tự ghi ít đi?">
+
+Ở ứng dụng là rẻ nhất: dòng không ghi thì không tốn CPU để định dạng, không tốn đĩa cục bộ, không tốn mạng. Nhưng thay đổi ở ứng dụng cần một lần triển khai và đội sở hữu đồng ý; bộ thu cho đội nền tảng một cái van dùng ngay được khi một service bất ngờ ghi gấp mười lần. Thực tế dùng cả hai: chuẩn hoá mức log và log có cấu trúc ở ứng dụng (SB8.1), và một lớp lọc, lấy mẫu, giới hạn tốc độ ở bộ thu như lưới an toàn. Kho log cũng có giới hạn tốc độ nhận theo tenant, như giới hạn label của Loki ở D12.5.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI dựng cấu hình Collector hai tầng và pipeline Alloy khá nhanh. Chỗ hay sai: dùng exporter OTLP thường thay cho `loadbalancing` ở agent, đặt `tail_sampling` ở agent, quên rằng `probabilistic` của tail sampling băm theo trace ID (nên kết quả giống nhau giữa các gateway) còn sampling của log thì không, đặt `spanmetrics` sau tail sampling, viết `stage.drop` không có `drop_counter_reason` nên không biết đã bỏ gì, và ước tính dung lượng log mà không đo. Kiểm lại: `otelcol validate`, đếm trace đủ hay thiếu như bước 3, và đo bằng metric của kho log như `lograte` trước và sau mỗi thay đổi.
+
+</Callout>
+
+<Callout kind="link">
+
+D12.6 dựng Collector một tầng và Tempo; D12.5 dựng Loki, Alloy và thời gian lưu theo stream. D16.3 làm việc tương tự cho metric: giữ gì, ở đâu, bao lâu. D16.5 đặt alert lên chính đường ống này (span bị bỏ, hàng đợi đầy). D23 nhìn tổng chi phí của hệ thống quan sát dưới góc FinOps; D24 đặt log có dữ liệu cá nhân trong bức tranh tuân thủ.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d16.4.mastery-pipeline">Thiết kế được đường ống trace hai tầng có tail sampling cho một hệ thống nhiều service, chọn được policy, `decision_wait`, cách định tuyến và ước được tài nguyên cho gateway.</Check>
+
+<Check id="d16.4.mastery-log-budget">Đo được lượng log của một service, đề xuất được bộ quy tắc lọc, lấy mẫu và thời gian lưu theo loại, và ước được dung lượng, chi phí trước và sau.</Check>
+
+<Check id="d16.4.mastery-pii">Chỉ ra được trường dữ liệu cá nhân trong log của một service (như trường `remote` của dòng `DEBUG` trong lab) và nêu được cách xử lý nó ở ứng dụng, ở bộ thu và ở kho.</Check>
+
+</Mastery>

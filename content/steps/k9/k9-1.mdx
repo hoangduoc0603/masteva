@@ -1,0 +1,964 @@
+---
+title: "CRD: thêm một loại tài nguyên vào API của Kubernetes"
+description: API server mở rộng thế nào, một CRD gồm những gì (schema, mặc định, luật CEL, cột in, subresource), nhiều phiên bản được lưu và phục vụ ra sao, và vì sao xoá một CRD là xoá mọi object của nó. Lab tự viết CRD WebApp, bị từ chối vì dữ liệu sai, nâng lên phiên bản thứ hai và nhìn tận etcd.
+id: k9.1
+step: k9
+prerequisites: [k3.1]
+topics: [k9.crd]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    yq: 4.54.1
+    jq: 1.8.2
+---
+
+<Goal>
+
+K7.4 dùng CloudNativePG và gặp ngay mười một `kind` mới: `Cluster`, `Backup`, `ScheduledBackup`… Chúng không có sẵn trong Kubernetes; operator thêm chúng vào API bằng **CRD**. Chặng K9 đi từ phía người viết operator: bài này thiết kế loại tài nguyên, K9.2 viết controller cho nó, K9.3 và K9.4 đóng gói thành operator, K9.5 quay lại phía người dùng operator của người khác. Học xong bài này, bạn giải thích được:
+
+- Vì sao một `kind` mới lập tức dùng được với `kubectl`, RBAC, watch, server-side apply mà không cần viết dòng code nào.
+- Vì sao `kubectl apply` từ chối một trường gõ sai, còn một công cụ khác lại bỏ nó đi, chỉ kèm một dòng cảnh báo dễ bị lờ đi, hoặc không báo gì.
+- Vì sao sửa `status` bằng `kubectl patch` báo `no change`, và vì sao `metadata.generation` không tăng khi bạn thêm annotation.
+- Vì sao nâng một CRD lên bản mới bị từ chối với lỗi `must remain in spec.versions until a storage migration…`, lỗi đã chặn việc nâng cấp Gateway API trên cụm thật.
+- Vì sao một object hay một CRD đứng mãi sau lệnh `kubectl delete`.
+
+</Goal>
+
+<Knowledge>
+
+### Hai cách thêm API: CRD và aggregated API
+
+Mọi thứ trong Kubernetes là object đi qua API server (K1.1). Muốn thêm một loại object mới, có hai đường:
+
+```text
+ kubectl / controller
+        |
+        v
+ +---------------------------------------------------------------+
+ | kube-apiserver: xác thực -> RBAC -> admission -> kiểm hợp lệ  |
+ |                                                               |
+ |  /apis/apps/v1/...               (có sẵn)  ----------------+  |
+ |  /apis/apps.masteva.example/...  (CRD)     ----------------+--+--> etcd
+ |  /apis/metrics.k8s.io/...        (aggregated) --+          |  |
+ +-------------------------------------------------+----------+--+
+                                                   |
+                                                   v
+                                    API server riêng của bạn (Deployment
+                                    trong cụm, tự lo lưu trữ, tự lo watch)
+```
+
+| | CRD (CustomResourceDefinition) | Aggregated API |
+|---|---|---|
+| Bạn viết gì | Một object YAML mô tả `kind` mới | Cả một API server, đăng ký bằng object `APIService` |
+| Ai lưu dữ liệu | API server chính, vào etcd của cụm | API server của bạn, nơi nào cũng được (hoặc không lưu) |
+| Có sẵn miễn phí | `kubectl`, RBAC, watch, server-side apply, audit, `kubectl explain`, kiểm hợp lệ bằng schema và CEL | Phải tự làm phần lớn |
+| Dùng khi | Gần như mọi trường hợp: cấu hình khai báo mà controller đọc | Dữ liệu không nên nằm trong etcd hoặc phải tính khi được hỏi. Ví dụ `metrics.k8s.io` của metrics-server (K5.3): số đo CPU tính tại chỗ, không lưu |
+| Rủi ro | Mọi object nằm trong etcd chung của cụm | API server của bạn chết thì mọi lệnh liệt kê nhóm API đó lỗi |
+
+Bài này và cả chặng chỉ dùng CRD. Một CRD mới không làm gì cả: nó chỉ dạy API server nhận, kiểm và lưu một loại object. Phải có **controller** đọc object đó và làm việc thật (K9.2). CRD cộng controller, đóng gói kèm kiến thức vận hành, là **operator** (K7.4).
+
+<Check id="k9.1.crd-va-aggregated">Phân biệt được CRD và aggregated API theo nơi lưu dữ liệu và những gì có sẵn, và giải thích được vì sao tạo xong CRD vẫn chưa có gì chạy.</Check>
+
+### Cấu trúc một CRD
+
+Bài thiết kế `WebApp`: đội nền tảng muốn đội ứng dụng chỉ khai image, số bản sao, cổng, rồi phần còn lại (Deployment, Service, chuẩn bảo mật) do operator lo. File CRD đầy đủ ở bước 1 của lab; các phần chính:
+
+| Trường | Ví dụ | Ý nghĩa |
+|---|---|---|
+| `metadata.name` | `webapps.apps.masteva.example` | Bắt buộc đúng dạng `<plural>.<group>` |
+| `spec.group` | `apps.masteva.example` | Tên miền bạn kiểm soát, để không đụng tên với operator khác (`.example` dành cho ví dụ). Nhóm kết thúc bằng `k8s.io` hay `kubernetes.io` dành cho dự án Kubernetes |
+| `spec.scope` | `Namespaced` | Thứ thuộc về một đội, một ứng dụng. `Cluster` cho thứ toàn cụm (như Node, StorageClass). Không đổi được sau khi tạo |
+| `spec.names` | `kind: WebApp`, `plural: webapps`, `shortNames: [wa]` | Tên dùng trong YAML, trong URL và trong `kubectl` |
+| `spec.versions[]` | `v1alpha1` | Mỗi phiên bản có `served`, `storage`, `schema`, `subresources`, `additionalPrinterColumns`. Đúng một phiên bản có `storage: true` |
+
+### Schema, mặc định và luật CEL
+
+Từ `apiextensions.k8s.io/v1`, mọi CRD phải có **schema có cấu trúc** (structural schema): mỗi trường khai rõ kiểu. Schema làm ba việc, theo thứ tự một yêu cầu ghi đi qua API server:
+
+```text
+ YAML gửi lên
+   |
+   v
+ (1) giải mã    trường không có trong schema: kubectl mặc định yêu cầu "strict" -> từ chối;
+                client không yêu cầu strict -> trường đó bị cắt bỏ (pruning), kèm Warning;
+                client yêu cầu Ignore (--validate=ignore) -> cắt bỏ, không báo gì
+   |            điền giá trị mặc định (default) cho trường bị bỏ trống
+   v
+ mutating admission (webhook hoặc admission policy, chặng K8)
+   |
+   v
+ (2) kiểm hợp lệ theo schema   kiểu, minimum/maximum, enum, maxLength, pattern, required
+   |
+   v
+ (3) luật CEL                  x-kubernetes-validations: so trường này với trường kia,
+   |                           so giá trị mới với giá trị cũ
+   v
+ validating admission -> ghi etcd
+```
+
+**CEL** (Common Expression Language) là ngôn ngữ biểu thức ngắn, chạy ngay trong API server. Ba luật của `WebApp`:
+
+| Luật | Đặt ở | Biểu thức | Schema thường có làm được không |
+|---|---|---|---|
+| Image phải có tag, không phải `latest` | `spec.image` | `self.matches(':[A-Za-z0-9_][A-Za-z0-9._-]*$') && !self.endsWith(':latest')` | `pattern` làm được nửa đầu, không viết được thông báo lỗi dễ hiểu |
+| Tier `prod` cần ít nhất 2 bản sao | `spec` | `self.tier != 'prod' \|\| self.replicas >= 2` | Không: liên quan hai trường |
+| Tier không đổi sau khi tạo | `spec.tier` | `self == oldSelf` | Không: phải so với giá trị cũ |
+
+- `self` là giá trị của trường đặt luật; `oldSelf` là giá trị trước khi sửa. Luật có `oldSelf` gọi là **transition rule**, chỉ chạy khi cập nhật.
+- API server ước lượng **chi phí** của mỗi luật lúc bạn tạo CRD, và từ chối luật có thể chạy quá lâu (ví dụ duyệt một danh sách không có `maxItems`). Khai `maxLength`, `maxItems` để luật được nhận.
+- **Ratcheting** (ổn định từ Kubernetes 1.33): khi bạn siết luật, object cũ đang vi phạm vẫn sửa được những trường khác; chỉ trường vi phạm mà bị đổi mới bị kiểm. Siết luật vì thế không làm hỏng object đang có, nhưng cũng không sửa chúng. Transition rule (luật có `oldSelf`) không được ratchet: nó luôn được kiểm khi cập nhật.
+- Kiểm tra trong CRD chỉ nhìn thấy **chính object đang ghi**. Luật cần đọc object khác ("tên này đã có Service chưa") phải dùng webhook (K9.4) hoặc chính sách admission (K8).
+
+<Check id="k9.1.schema-cel">Kể được thứ tự giải mã, mặc định, kiểm theo schema, luật CEL khi ghi một object, giải thích được pruning và strict, và viết được luật CEL so hai trường hoặc so giá trị mới với giá trị cũ.</Check>
+
+### Cột in, subresource status và scale
+
+**additionalPrinterColumns** quyết định `kubectl get webapps` in gì, bằng JSONPath vào object. Không có chúng, bạn chỉ thấy `NAME` và `AGE`.
+
+**Subresource `status`** tách object thành hai cổng ghi:
+
+| | `/webapps/web` | `/webapps/web/status` |
+|---|---|---|
+| Ai ghi | Người dùng, GitOps (D13) | Controller |
+| Trường được đổi | Mọi thứ **trừ** `status` (status gửi kèm bị bỏ qua) | **Chỉ** `status` |
+| `metadata.generation` | Tăng khi `spec` đổi; không tăng khi chỉ đổi label, annotation | Không tăng |
+| Quyền RBAC | `webapps` | `webapps/status` |
+
+Hai lợi ích. Người dùng không vô tình ghi đè trạng thái controller quan sát được, và controller không vô tình ghi đè `spec`. Và `generation` chỉ tăng khi ý định đổi: controller ghi `status.observedGeneration` bằng `generation` nó vừa xử lý, nên ai cũng biết status đang nói về bản `spec` nào (K9.2).
+
+**Subresource `scale`** chỉ cho API server biết số bản sao nằm ở đâu (`specReplicasPath`, `statusReplicasPath`, `labelSelectorPath`). Đổi lại, `kubectl scale` và HorizontalPodAutoscaler (K5.3) dùng được với `WebApp` như với Deployment.
+
+<Check id="k9.1.subresource">Giải thích được subresource `status` tách quyền ghi thế nào, khi nào `generation` tăng, và subresource `scale` cho phép công cụ nào làm việc với CRD.</Check>
+
+### Nhiều phiên bản: phục vụ, lưu trữ, chuyển đổi
+
+API ổn định thì không đổi tuỳ tiện: có người đang dùng `v1alpha1`. Một CRD vì thế phục vụ nhiều phiên bản cùng lúc, nhưng mỗi object trong etcd chỉ được ghi ở **một** phiên bản: phiên bản mang `storage: true` **tại lúc object được ghi**.
+
+```text
+ spec.versions: v1alpha1 (served)   v1 (served, storage)
+
+ etcd:  /registry/apps.masteva.example/webapps/k9/web    {"apiVersion": ".../v1alpha1", ...}   ghi trước khi đổi
+        /registry/apps.masteva.example/webapps/k9/web-2  {"apiVersion": ".../v1", ...}         ghi sau khi đổi
+
+ status.storedVersions: [v1alpha1, v1]   <- mọi phiên bản TỪNG được dùng để ghi; API server chỉ thêm, không tự bớt
+
+ GET .../v1/webapps/web  ->  đọc bản v1alpha1 trong etcd, chuyển sang v1 rồi trả về
+```
+
+**Conversion** là bước chuyển giữa các phiên bản khi đọc và ghi:
+
+| `strategy` | Làm gì | Dùng khi |
+|---|---|---|
+| `None` (mặc định) | Chỉ thay chuỗi `apiVersion`, các trường giữ nguyên | Hai phiên bản có schema giống nhau, ví dụ nâng `v1alpha1` lên `v1` khi API đã ổn định |
+| `Webhook` | API server gọi một HTTPS endpoint (thường nằm trong operator) để chuyển | Đổi tên, đổi cấu trúc trường. Webhook chết là mọi lệnh đọc, ghi object không cùng phiên bản lưu đều lỗi |
+
+Đổi phiên bản lưu không ghi lại object cũ. Chúng nằm nguyên ở `v1alpha1` cho tới khi có ai ghi lại. Muốn gỡ hẳn `v1alpha1`, phải:
+
+1. Ghi lại mọi object để chúng được lưu ở `v1`. Kubernetes có sẵn **StorageVersionMigration** (`storagemigration.k8s.io/v1`, bật sẵn trên cụm 1.37 của lab; cụm cũ hơn có thể phải bật feature gate `StorageVersionMigrator`): bạn tạo một object, controller trong `kube-controller-manager` ghi lại từng object rồi tự bỏ phiên bản cũ khỏi `storedVersions`.
+2. Đặt `served: false` cho `v1alpha1` một thời gian, để client cũ lộ ra (lỗi 404) trong khi còn đường lui.
+3. Xoá `v1alpha1` khỏi `spec.versions`. API server từ chối bước này chừng nào `v1alpha1` còn trong `storedVersions`.
+
+Trong thời gian chuyển, đặt `deprecated: true` và `deprecationWarning` cho phiên bản cũ: mọi lệnh dùng nó nhận cảnh báo, kể cả `kubectl`.
+
+<Callout kind="production">
+
+Gateway API v1.2.0 (phát hành ngày 03/10/2024) ngừng phục vụ phiên bản `v1alpha2` của `GRPCRoute` và `ReferenceGrant`. [Release notes của dự án](https://github.com/kubernetes-sigs/gateway-api/releases/tag/v1.2.0) viết rằng nếu cài CRD mới gặp lỗi, nhiều khả năng là `v1alpha2` vẫn còn trong `storedVersions`, trường mà theo nguyên văn họ "không tự được dọn". Quy trình họ đưa ra: kiểm `storedVersions`, ghi lại từng `ReferenceGrant` và `GRPCRoute` (bằng cách patch một annotation) để chúng được lưu ở phiên bản mới, rồi mới patch `status.storedVersions` của CRD. Họ cũng nhắc một bẫy khác: manifest của bạn đã viết `v1` chưa đủ, controller của implementation vẫn có thể đang gọi `v1alpha2`.
+
+[Bài trong kho kiến thức của Broadcom](https://knowledge.broadcom.com/external/article/433502/gateway-api-packageinstall-fails-reconci.html) ghi lại đúng lỗi này trên sản phẩm VMware vSphere Kubernetes Service: khi nâng cấp cụm, gói Gateway API không reconcile được, việc nâng cấp đứng lại, với thông báo `status.storedVersions[0]: Invalid value: "v1alpha2": missing from spec.versions`. Cách sửa trong bài là patch `storedVersions` chỉ còn `v1beta1` rồi để gói reconcile tiếp.
+
+Điều bài này rút ra (của bài, không phải của hai nguồn): cách sửa của Broadcom bỏ qua bước ghi lại object mà release notes yêu cầu. Nếu còn object đang nằm ở `v1alpha2` trong etcd mà phiên bản đó bị xoá khỏi CRD, API server không còn cách đọc chúng. Bước 4 của lab gặp đúng lỗi này rồi đi đường đúng: migrate trước, xoá sau.
+
+</Callout>
+
+<Check id="k9.1.phien-ban">Giải thích được `served`, `storage`, `storedVersions`, conversion `None` và `Webhook`, và kể được ba bước để gỡ hẳn một phiên bản cũ của CRD.</Check>
+
+### Xoá: finalizer, và xoá CRD là xoá tất cả
+
+Lệnh `delete` không xoá ngay một object có **finalizer**. Finalizer là một chuỗi trong `metadata.finalizers`, mang nghĩa "có người cần dọn việc trước khi object biến mất".
+
+```text
+ kubectl delete wa web
+   |
+   v
+ finalizers rỗng?  -- có -->  xoá khỏi etcd
+   | không
+   v
+ API server đặt metadata.deletionTimestamp, object vẫn còn, vẫn đọc được, vẫn sửa được spec,
+ nhưng KHÔNG thêm được finalizer mới
+   |
+   v
+ controller giữ finalizer thấy deletionTimestamp -> dọn việc của nó (xoá tài nguyên ngoài cụm,
+ huỷ đăng ký...) -> gỡ tên mình khỏi finalizers
+   |
+   v
+ finalizers rỗng -> xoá khỏi etcd
+```
+
+Controller giữ finalizer đã bị gỡ, đang chết, hoặc có lỗi, thì object đứng mãi. Gỡ finalizer bằng tay thì object biến mất, nhưng việc dọn dẹp mà finalizer bảo vệ **không** xảy ra. K1.3 đã nêu chuyện pod kẹt `Terminating` vì đúng lý do này.
+
+Xoá **CRD** thì API server xoá **mọi object** của loại đó trong mọi namespace, rồi mới xoá CRD. Bản thân CRD mang finalizer `customresourcecleanup.apiextensions.k8s.io` để làm việc này; chỉ một object có finalizer chưa gỡ cũng giữ CRD ở trạng thái đang xoá. Nếu các object đó là chủ (owner) của Deployment, Service (K9.2), garbage collector xoá luôn những thứ đó. Vì thế Helm không nâng cấp và không xoá CRD trong thư mục `crds/` (K3.2), và K9.4 sẽ thấy lệnh gỡ operator mặc định của Kubebuilder kéo theo CRD.
+
+<Check id="k9.1.finalizer">Kể được điều xảy ra khi xoá một object có finalizer, vì sao gỡ finalizer bằng tay là nguy hiểm, và điều xảy ra khi xoá một CRD còn object.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Custom Resources | Kubernetes](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/): khi nào dùng CRD, khi nào dùng aggregated API, và bảng so sánh tính năng đầy đủ.
+- [Extend the Kubernetes API with CustomResourceDefinitions](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/): đọc kỹ "Specifying a structural schema", "Field pruning", "Defaulting" và "Validation rules" (CEL, cost budget, ratcheting).
+- [Versions in CustomResourceDefinitions](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/): conversion `None` và `Webhook`, và mục "Upgrade existing objects to a new stored version".
+- [Migrate Kubernetes Objects Using Storage Version Migration](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/storage-version-migration/): object `StorageVersionMigration` bước 4 của lab dùng.
+- [Gateway API v1.2.0 release notes](https://github.com/kubernetes-sigs/gateway-api/releases/tag/v1.2.0): nguồn của callout, mục "Upgrades".
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài dựng cụm kind `k9-lab` một node, dùng cho cả chặng K9. Cần Docker, kind 0.33, kubectl 1.37, `jq` và `yq` (D0.2).
+
+**Profile máy.** Cuối bài, node kind dùng khoảng 0,65 tới 0,9 GiB RAM của Docker; bài không kéo image ứng dụng nào. Máy 8 GB chạy thoải mái. Các bài sau của chặng cần tối đa khoảng 1,4 GiB (K9.4).
+
+Mọi terminal dùng cho chặng cần dòng `export KUBECONFIG=~/masteva-k9/kubeconfig`, để kind ghi cấu hình vào thư mục lab thay vì `~/.kube/config`. Nếu giữa bài bạn mở terminal mới, chạy lại `export KUBECONFIG=~/masteva-k9/kubeconfig` và `cd ~/masteva-k9/k9-1`; từ bước 4 trở đi, chạy lại cả khối định nghĩa hàm `etcd_ver`.
+
+Khối dưới viết file cấu hình kind (một node, image Kubernetes 1.37.0 ghim theo digest), tạo cụm, chờ node sẵn sàng, rồi tạo namespace `k9` và đặt nó làm namespace mặc định của kubeconfig này, để các lệnh sau không cần `-n k9`. Lệnh `kind create cluster` mất khoảng một phút. Output của nó được ẩn cho gọn; nếu nó lỗi, khối in một dòng nhắc bạn chạy lại lệnh đó không ẩn output để đọc lý do.
+
+<Terminal where="mac" title="~/masteva-k9/kind.yaml">
+
+```bash
+export KUBECONFIG=~/masteva-k9/kubeconfig
+mkdir -p ~/masteva-k9/k9-1 && cd ~/masteva-k9
+cat > kind.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k9-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+EOF
+kind create cluster --config kind.yaml > /dev/null 2>&1 || echo "kind create cluster lỗi: chạy lại 'kind create cluster --config kind.yaml' để xem lý do"
+kubectl wait --for=condition=Ready node --all --timeout=180s
+kubectl create namespace k9
+kubectl config set-context --current --namespace k9
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k9-lab-control-plane condition met
+namespace/k9 created
+Context "kind-k9-lab" modified.
+```
+
+</Expected>
+
+### 1. Viết CRD đầu tiên
+
+File dưới là CRD `WebApp` phiên bản `v1alpha1`, đủ những phần ở mục Kiến thức: schema có kiểu, mặc định, ba luật CEL, cột in, hai subresource. Phần `status` khai sẵn `conditions` dạng danh sách có khoá `type` (`x-kubernetes-list-type: map`), để K9.2 dùng.
+
+<Terminal where="mac" title="~/masteva-k9/k9-1/webapp-crd.yaml">
+
+```bash
+cd ~/masteva-k9/k9-1
+cat > webapp-crd.yaml <<'EOF'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: webapps.apps.masteva.example
+spec:
+  group: apps.masteva.example
+  scope: Namespaced
+  names:
+    kind: WebApp
+    plural: webapps
+    singular: webapp
+    shortNames: [wa]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+        scale:
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.replicas
+          labelSelectorPath: .status.selector
+      additionalPrinterColumns:
+        - { name: Image, type: string, jsonPath: .spec.image }
+        - { name: Desired, type: integer, jsonPath: .spec.replicas }
+        - { name: Ready, type: integer, jsonPath: .status.readyReplicas }
+        - { name: Age, type: date, jsonPath: .metadata.creationTimestamp }
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [image]
+              x-kubernetes-validations:
+                - rule: "self.tier != 'prod' || self.replicas >= 2"
+                  message: "tier prod cần ít nhất 2 replicas"
+              properties:
+                image:
+                  type: string
+                  description: Image của ứng dụng, phải có tag cụ thể.
+                  x-kubernetes-validations:
+                    - rule: "self.matches(':[A-Za-z0-9_][A-Za-z0-9._-]*$') && !self.endsWith(':latest')"
+                      message: "image phải có tag cụ thể, không dùng latest"
+                replicas:
+                  type: integer
+                  minimum: 0
+                  maximum: 10
+                  default: 1
+                port:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  default: 8080
+                message:
+                  type: string
+                  maxLength: 200
+                tier:
+                  type: string
+                  enum: [dev, prod]
+                  default: dev
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: "tier không đổi được sau khi tạo"
+            status:
+              type: object
+              properties:
+                replicas: { type: integer }
+                readyReplicas: { type: integer }
+                selector: { type: string }
+                observedGeneration: { type: integer, format: int64 }
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: { type: string }
+                      status: { type: string, enum: ["True", "False", "Unknown"] }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string, format: date-time }
+EOF
+kubectl apply -f webapp-crd.yaml
+kubectl wait --for=condition=Established crd/webapps.apps.masteva.example --timeout=60s
+kubectl api-resources --api-group=apps.masteva.example
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example created
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example condition met
+NAME      SHORTNAMES   APIVERSION                      NAMESPACED   KIND
+webapps   wa           apps.masteva.example/v1alpha1   true         WebApp
+```
+
+</Expected>
+
+Điều kiện `Established` nghĩa là API server đã mở đường dẫn `/apis/apps.masteva.example/v1alpha1/...`. Giờ tạo một `WebApp` chỉ khai image và lời chào:
+
+<Terminal where="mac" title="~/masteva-k9/k9-1/web.yaml">
+
+```bash
+cat > web.yaml <<'EOF'
+apiVersion: apps.masteva.example/v1alpha1
+kind: WebApp
+metadata:
+  name: web
+spec:
+  image: ghcr.io/stefanprodan/podinfo:6.15.0
+  message: Xin chào từ K9.1
+EOF
+kubectl apply -f web.yaml
+kubectl get webapps
+kubectl get wa web -o jsonpath='{.spec}{"\n"}'
+kubectl get pods
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/web created
+NAME   IMAGE                                 DESIRED   READY   AGE
+web    ghcr.io/stefanprodan/podinfo:6.15.0   1                 0s
+{"image":"ghcr.io/stefanprodan/podinfo:6.15.0","message":"Xin chào từ K9.1","port":8080,"replicas":1,"tier":"dev"}
+No resources found in k9 namespace.
+```
+
+</Expected>
+
+Ba điều. `replicas`, `port`, `tier` được điền từ `default` của schema: object trong etcd đã có chúng. Cột `READY` trống vì chưa ai ghi `status`. Và không có pod nào: CRD chỉ lưu ý định, chưa có controller nào đọc nó.
+
+### 2. Dữ liệu sai bị chặn ở đâu
+
+Khối dưới gửi bốn object sai, mỗi cái vấp một tầng khác nhau trong sơ đồ ở phần Kiến thức, rồi thử đổi `tier` của `web`. Mọi lệnh đều phải lỗi; điều cần đọc là **lỗi đến từ tầng nào**.
+
+<Terminal where="mac">
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: apps.masteva.example/v1alpha1
+kind: WebApp
+metadata: { name: sai-1 }
+spec:
+  image: ghcr.io/stefanprodan/podinfo:6.15.0
+  colour: red
+EOF
+kubectl apply -f - <<'EOF'
+apiVersion: apps.masteva.example/v1alpha1
+kind: WebApp
+metadata: { name: sai-2 }
+spec:
+  image: nginx
+  replicas: "ba"
+EOF
+kubectl apply -f - <<'EOF'
+apiVersion: apps.masteva.example/v1alpha1
+kind: WebApp
+metadata: { name: sai-3 }
+spec:
+  image: nginx:latest
+  replicas: 20
+EOF
+kubectl apply -f - <<'EOF'
+apiVersion: apps.masteva.example/v1alpha1
+kind: WebApp
+metadata: { name: sai-4 }
+spec:
+  image: ghcr.io/stefanprodan/podinfo:6.15.0
+  tier: prod
+EOF
+kubectl patch wa web --type merge -p '{"spec":{"tier":"prod","replicas":2}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Error from server (BadRequest): error when creating "STDIN": WebApp in version "v1alpha1" cannot be handled as a WebApp: strict decoding error: unknown field "spec.colour"
+The WebApp "sai-2" is invalid: 
+* spec.replicas: Invalid value: "string": spec.replicas in body must be of type integer: "string"
+* .spec.replicas: Invalid value: 0: .spec.replicas accessor error: ba is of the type string, expected int64
+* <nil>: Invalid value: null: some validation rules were not checked because the object was invalid; correct the existing errors to complete validation
+The WebApp "sai-3" is invalid: 
+* spec.replicas: Invalid value: 20: spec.replicas in body should be less than or equal to 10
+* spec.image: Invalid value: "nginx:latest": image phải có tag cụ thể, không dùng latest
+The WebApp "sai-4" is invalid: spec: Invalid value: tier prod cần ít nhất 2 replicas
+The WebApp "web" is invalid: spec.tier: Invalid value: "prod": tier không đổi được sau khi tạo
+```
+
+</Expected>
+
+Đọc từng dòng theo sơ đồ ở phần Kiến thức:
+
+- `sai-1` dừng ở bước giải mã: `kubectl` gửi yêu cầu kèm chế độ strict, nên trường lạ là lỗi.
+- `sai-2` sai kiểu. Dòng thứ hai (`accessor error`) đến từ subresource `scale`: API server đọc `specReplicasPath` (`.spec.replicas`) và đòi một số nguyên. Dòng cuối đáng chú ý: khi một trường **sai kiểu** (hoặc vi phạm `enum`, `required`, `maxLength`, `maxItems`), API server bỏ qua toàn bộ luật CEL, nên image `nginx` thiếu tag chưa bị báo. Sửa xong kiểu, bạn mới thấy lỗi tiếp theo.
+- `sai-3` vi phạm `maximum`, loại lỗi không chặn CEL, nên bạn thấy lỗi schema và lỗi CEL của image cùng lúc.
+- `sai-4` vấp luật đặt ở `spec`, so hai trường. `replicas` được điền mặc định 1 trước khi luật chạy.
+- Lệnh `patch` trên `web` vấp transition rule: dù kèm `replicas: 2` cho hợp lệ, `tier` không đổi được.
+
+<Predict question="Gửi lại `sai-1` (trường `colour` gõ sai) nhưng với `--validate=ignore`, như một công cụ không yêu cầu strict. Object được tạo không, và `colour` đi đâu?">
+
+Object được tạo, và `colour` biến mất không một lời báo: API server **cắt bỏ** (prune) mọi trường không có trong schema. Client không nói gì về chế độ kiểm tra thì API server dùng mặc định `Warn`: vẫn cắt bỏ, nhưng trả một dòng `Warning: unknown field`, mà nhiều công cụ không in ra; `--validate=warn` của `kubectl` cho bạn thấy dòng đó. Strict là lựa chọn của client, không phải của CRD; controller viết bằng Go hay một công cụ GitOps cũ có thể gửi không kèm strict. Gõ sai tên trường trong một manifest như thế nghĩa là cấu hình bạn tưởng đã đặt không hề tồn tại.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl apply --validate=ignore -f - <<'EOF'
+apiVersion: apps.masteva.example/v1alpha1
+kind: WebApp
+metadata: { name: cat-bo }
+spec:
+  image: ghcr.io/stefanprodan/podinfo:6.15.0
+  colour: red
+EOF
+kubectl get wa cat-bo -o jsonpath='{.spec}{"\n"}'
+kubectl delete wa cat-bo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/cat-bo created
+{"image":"ghcr.io/stefanprodan/podinfo:6.15.0","port":8080,"replicas":1,"tier":"dev"}
+webapp.apps.masteva.example "cat-bo" deleted from k9 namespace
+```
+
+</Expected>
+
+<Check id="k9.1.lab-validation">Tái hiện được lỗi ở từng tầng (strict, kiểu, schema, CEL, transition rule), giải thích được vì sao luật CEL không chạy khi kiểu đã sai, và thấy được trường lạ bị cắt bỏ khi client không yêu cầu strict.</Check>
+
+### 3. explain, status, scale và generation
+
+Schema cũng là tài liệu: `kubectl explain` đọc nó. Lệnh `sed` chỉ cắt bỏ mấy dòng đầu (`GROUP`, `KIND`, `VERSION`) của output cho gọn.
+
+<Terminal where="mac">
+
+```bash
+kubectl explain webapp.spec.image | sed -n '/^FIELD/,$p'
+kubectl explain webapp.spec --recursive | sed -n '/^FIELDS/,$p'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+FIELD: image <string>
+
+
+DESCRIPTION:
+    Image của ứng dụng, phải có tag cụ thể.
+    
+
+FIELDS:
+  image	<string> -required-
+  message	<string>
+  port	<integer>
+  replicas	<integer>
+  tier	<string>
+  enum: dev, prod
+```
+
+</Expected>
+
+Giờ ghi `status` từ hai cổng: lần đầu qua cổng chính như một người dùng bình thường, lần sau qua subresource `status` như một controller. Sau mỗi lần sửa, khối lệnh in lại `generation` để bạn thấy nó tăng ở lần nào:
+
+<Terminal where="mac">
+
+```bash
+kubectl get wa web -o jsonpath='generation={.metadata.generation}{"\n"}'
+kubectl patch wa web --type merge -p '{"status":{"readyReplicas":5}}'
+kubectl get wa web -o jsonpath='status={.status}{"\n"}'
+kubectl patch wa web --subresource=status --type merge -p '{"status":{"readyReplicas":1,"replicas":1,"selector":"app=web"}}'
+kubectl get wa web -o jsonpath='generation={.metadata.generation} status={.status}{"\n"}'
+kubectl annotate wa web ghi-chu=thu-nghiem
+kubectl get wa web -o jsonpath='generation={.metadata.generation}{"\n"}'
+kubectl scale wa web --replicas=3
+kubectl get wa web -o jsonpath='generation={.metadata.generation} replicas={.spec.replicas}{"\n"}'
+kubectl get --raw /apis/apps.masteva.example/v1alpha1/namespaces/k9/webapps/web/scale | jq -c '{kind, spec, status}'
+kubectl get wa
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+generation=1
+webapp.apps.masteva.example/web patched (no change)
+status=
+webapp.apps.masteva.example/web patched
+generation=1 status={"readyReplicas":1,"replicas":1,"selector":"app=web"}
+webapp.apps.masteva.example/web annotated
+generation=1
+webapp.apps.masteva.example/web scaled
+generation=2 replicas=3
+{"kind":"Scale","spec":{"replicas":3},"status":{"replicas":1,"selector":"app=web"}}
+NAME   IMAGE                                 DESIRED   READY   AGE
+web    ghcr.io/stefanprodan/podinfo:6.15.0   3         1       25s
+```
+
+</Expected>
+
+- Patch `status` qua cổng chính: `no change`. API server bỏ `status` khỏi yêu cầu trước khi so, nên không có gì đổi.
+- Qua `--subresource=status`: được ghi, và `generation` vẫn 1.
+- Thêm annotation: `generation` vẫn 1. Đổi `spec.replicas` bằng `kubectl scale`: lên 2.
+- `/scale` trả một object `Scale` của `autoscaling/v1`, đọc từ đúng ba đường dẫn khai trong CRD. HPA (K5.3) nói chuyện với `WebApp` qua cổng này.
+- Cột `READY` giờ có số, vì status đã có `readyReplicas`.
+
+<Check id="k9.1.lab-status-scale">Ghi được status qua subresource, chỉ ra được ghi status qua cổng chính bị bỏ qua, và chứng minh được bằng lệnh khi nào `generation` tăng.</Check>
+
+### 4. Thêm phiên bản `v1` và gỡ `v1alpha1`
+
+API đã dùng ổn, đội nền tảng nâng nó lên `v1`. Schema không đổi, nên conversion `None` là đủ. Lệnh `yq` dưới tạo file CRD mới từ file cũ: `v1alpha1` thôi làm phiên bản lưu và mang cảnh báo; `v1` là bản sao của nó, làm phiên bản lưu.
+
+<Terminal where="mac" title="~/masteva-k9/k9-1/webapp-crd-v1.yaml">
+
+```bash
+yq '.spec.versions[0].storage = false
+  | .spec.versions[0].deprecated = true
+  | .spec.versions[0].deprecationWarning = "apps.masteva.example/v1alpha1 WebApp sắp bị gỡ; dùng apps.masteva.example/v1"
+  | .spec.versions += [.spec.versions[0] | .name = "v1" | .storage = true | del(.deprecated) | del(.deprecationWarning)]' \
+  webapp-crd.yaml > webapp-crd-v1.yaml
+yq '.spec.versions[] | [.name, "served=" + (.served|tostring), "storage=" + (.storage|tostring)] | join(" ")' webapp-crd-v1.yaml
+kubectl apply -f webapp-crd-v1.yaml
+for i in $(seq 1 30); do kubectl api-resources --api-group=apps.masteva.example | grep -q 'example/v1 ' && break; sleep 1; done
+kubectl get crd webapps.apps.masteva.example -o jsonpath='{.status.storedVersions}{"\n"}'
+kubectl get wa web -o jsonpath='{.apiVersion}{"\n"}'
+kubectl get webapps.v1alpha1.apps.masteva.example web -o jsonpath='{.apiVersion}{"\n"}'
+sed 's|/v1alpha1|/v1|; s|name: web|name: web-2|' web.yaml | kubectl apply -f -
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+v1alpha1 served=true storage=false
+v1 served=true storage=true
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example configured
+["v1alpha1","v1"]
+apps.masteva.example/v1
+Warning: apps.masteva.example/v1alpha1 WebApp sắp bị gỡ; dùng apps.masteva.example/v1
+apps.masteva.example/v1alpha1
+webapp.apps.masteva.example/web-2 created
+```
+
+</Expected>
+
+Vòng `for` chờ API server cập nhật **discovery**, danh sách nhóm và phiên bản mà `kubectl` hỏi trước mỗi lệnh. Discovery được cập nhật sau khi CRD được ghi chứ không cùng lúc, nên một lệnh `kubectl get wa` chạy ngay sau `apply` có thể vẫn dùng `v1alpha1`; vòng chờ thường thoát trong một hai giây. Đọc output: `storedVersions` giờ có cả hai phiên bản. `kubectl get wa` mặc định dùng `v1`, phiên bản ưu tiên mới. Hỏi rõ `webapps.v1alpha1…` vẫn được, kèm cảnh báo. Cùng một object `web`, hai cách đọc.
+
+Nhưng trong etcd, `web` đang ở phiên bản nào? Hàm `etcd_ver` dưới đọc thẳng etcd bằng `etcdctl` có sẵn trong pod etcd của kind, rồi in trường `apiVersion` của bản ghi. Đây là thao tác chỉ đọc, chỉ làm trên cụm lab.
+
+<Terminal where="mac">
+
+```bash
+etcd_ver() {
+  kubectl -n kube-system exec etcd-k9-lab-control-plane -- etcdctl \
+    --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key \
+    get "/registry/apps.masteva.example/webapps/k9/$1" --print-value-only \
+    | jq -r '"\(.metadata.name): \(.apiVersion)"'
+}
+etcd_ver web
+etcd_ver web-2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web: apps.masteva.example/v1alpha1
+web-2: apps.masteva.example/v1
+```
+
+</Expected>
+
+Đúng như sơ đồ: đổi phiên bản lưu không đụng tới `web`. Giờ thử đường tắt: xoá thẳng `v1alpha1` khỏi `spec.versions`, không migrate và không sửa `storedVersions`:
+
+<Predict question="Xoá `v1alpha1` khỏi `spec.versions` khi `web` vẫn nằm trong etcd ở `v1alpha1`. API server nhận không?">
+
+Không. `v1alpha1` còn trong `status.storedVersions`, và API server từ chối mọi CRD thiếu một phiên bản đang có trong danh sách đó, kèm thông báo nói rõ phải làm gì: migrate cho tới khi không còn dữ liệu ở `v1alpha1` và bỏ nó khỏi `storedVersions`. Đây là lỗi đã chặn việc nâng cấp Gateway API trong callout.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+yq 'del(.spec.versions[0])' webapp-crd-v1.yaml | kubectl apply -f -
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+The CustomResourceDefinition "webapps.apps.masteva.example" is invalid: status.storedVersions[0]: Invalid value: "v1alpha1": missing from spec.versions; v1alpha1 was previously a storage version, and must remain in spec.versions until a storage migration ensures no data remains persisted in v1alpha1 and removes v1alpha1 from status.storedVersions
+```
+
+</Expected>
+
+Đi đường đúng: tạo một `StorageVersionMigration` cho `webapps`, chờ nó xong, rồi đọc lại etcd và `storedVersions`.
+
+<Terminal where="mac" title="~/masteva-k9/k9-1/migrate.yaml">
+
+```bash
+cat > migrate.yaml <<'EOF'
+apiVersion: storagemigration.k8s.io/v1
+kind: StorageVersionMigration
+metadata:
+  name: webapps-to-v1
+spec:
+  resource:
+    group: apps.masteva.example
+    resource: webapps
+EOF
+kubectl apply -f migrate.yaml
+kubectl wait --for=condition=Succeeded storageversionmigration/webapps-to-v1 --timeout=120s
+etcd_ver web
+etcd_ver web-2
+kubectl get crd webapps.apps.masteva.example -o jsonpath='{.status.storedVersions}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+storageversionmigration.storagemigration.k8s.io/webapps-to-v1 created
+storageversionmigration.storagemigration.k8s.io/webapps-to-v1 condition met
+web: apps.masteva.example/v1
+web-2: apps.masteva.example/v1
+["v1"]
+```
+
+</Expected>
+
+Controller migrate đã ghi lại `web` ở `v1` và tự bỏ `v1alpha1` khỏi `storedVersions`; không cần patch status bằng tay như quy trình trong release notes của Gateway API. Hai bước còn lại: ngừng phục vụ `v1alpha1` để client cũ lộ ra, rồi xoá hẳn. File CRD cuối cùng lưu ở `~/masteva-k9/webapp-crd.yaml` cho K9.2.
+
+<Terminal where="mac" title="~/masteva-k9/webapp-crd.yaml">
+
+```bash
+yq '.spec.versions[0].served = false' webapp-crd-v1.yaml | kubectl apply -f -
+for i in $(seq 1 30); do kubectl get webapps.v1alpha1.apps.masteva.example web > /dev/null 2>&1 || break; sleep 1; done
+kubectl get webapps.v1alpha1.apps.masteva.example web
+yq 'del(.spec.versions[0])' webapp-crd-v1.yaml > ../webapp-crd.yaml
+kubectl apply -f ../webapp-crd.yaml
+kubectl get crd webapps.apps.masteva.example -o jsonpath='{.spec.versions[*].name} {.status.storedVersions}{"\n"}'
+kubectl get wa
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example configured
+Error from server (NotFound): the server could not find the requested resource (get webapps.apps.masteva.example web)
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example configured
+v1 ["v1"]
+NAME    IMAGE                                 DESIRED   READY   AGE
+web     ghcr.io/stefanprodan/podinfo:6.15.0   3         1       2m
+web-2   ghcr.io/stefanprodan/podinfo:6.15.0   1                 40s
+```
+
+</Expected>
+
+Client nào còn gọi `v1alpha1` giờ nhận 404, trong khi object vẫn nguyên: đó là lúc phát hiện và sửa client trước khi xoá hẳn. Production để khoảng giữa hai bước này đủ lâu, ít nhất qua một chu kỳ phát hành của mọi client.
+
+<Check id="k9.1.lab-phien-ban">Thêm được phiên bản mới với conversion `None`, chứng minh được bằng etcd rằng object cũ vẫn ở phiên bản cũ, tái hiện được lỗi `storedVersions` và gỡ được phiên bản cũ đúng thứ tự bằng StorageVersionMigration.</Check>
+
+### 5. Object kẹt vì finalizer
+
+Gắn vào `web-2` một finalizer mà không controller nào giữ, rồi xoá:
+
+<Terminal where="mac">
+
+```bash
+kubectl patch wa web-2 --type merge -p '{"metadata":{"finalizers":["apps.masteva.example/don-dep"]}}'
+kubectl delete wa web-2 --wait=false
+kubectl get wa web-2 -o jsonpath='deletionTimestamp={.metadata.deletionTimestamp} finalizers={.metadata.finalizers}{"\n"}'
+kubectl get wa
+kubectl patch wa web-2 --type merge -p '{"spec":{"replicas":2}}'
+kubectl patch wa web-2 --type json -p '[{"op":"add","path":"/metadata/finalizers/-","value":"them/moi"}]'
+kubectl delete wa web-2 --timeout=5s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/web-2 patched
+webapp.apps.masteva.example "web-2" deleted from k9 namespace
+deletionTimestamp=2026-10-14T06:40:12Z finalizers=["apps.masteva.example/don-dep"]
+NAME    IMAGE                                 DESIRED   READY   AGE
+web     ghcr.io/stefanprodan/podinfo:6.15.0   3         1       2m20s
+web-2   ghcr.io/stefanprodan/podinfo:6.15.0   1                 60s
+webapp.apps.masteva.example/web-2 patched
+The WebApp "web-2" is invalid: metadata.finalizers: Forbidden: no new finalizers can be added if the object is being deleted, found new finalizers []string{"them/moi"}
+webapp.apps.masteva.example "web-2" deleted from k9 namespace
+error: timed out waiting for the condition on webapps/web-2
+```
+
+</Expected>
+
+Thời điểm trong `deletionTimestamp` và cột `AGE` trên máy bạn sẽ khác. `kubectl delete` báo `deleted`, nhưng object vẫn đó. Nó đã có `deletionTimestamp`, vẫn sửa được `spec`, không nhận finalizer mới, và lần `delete` thứ hai chờ hết 5 giây. Khác với pod, `kubectl get` không in chữ `Terminating` cho custom resource: phải đọc `deletionTimestamp` mới biết object đang chờ xoá.
+
+Ở đây không có tài nguyên nào thật sự cần dọn, nên gỡ finalizer bằng tay là đúng:
+
+<Terminal where="mac">
+
+```bash
+kubectl patch wa web-2 --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+kubectl get wa web-2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/web-2 patched
+Error from server (NotFound): webapps.apps.masteva.example "web-2" not found
+```
+
+</Expected>
+
+<Check id="k9.1.lab-finalizer">Tái hiện được một object kẹt vì finalizer, đọc được `deletionTimestamp` và `finalizers`, giải thích được vì sao `kubectl get` không báo `Terminating`, và gỡ được finalizer khi chắc chắn không còn gì cần dọn.</Check>
+
+### 6. Xoá CRD
+
+<Callout kind="danger">
+
+Bước này xoá CRD `webapps.apps.masteva.example` và **mọi** object `WebApp` trong mọi namespace. Trên cụm thật, lệnh tương tự xoá cấu hình của mọi đội đang dùng loại tài nguyên đó. Kiểm `kubectl config current-context` in ra `kind-k9-lab` trước khi chạy.
+
+</Callout>
+
+Tạo lại một object thứ hai, gắn finalizer vào `web`, rồi xoá CRD:
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+sed 's|/v1alpha1|/v1|; s|name: web|name: web-3|' web.yaml | kubectl apply -f -
+kubectl patch wa web --type merge -p '{"metadata":{"finalizers":["apps.masteva.example/don-dep"]}}'
+kubectl delete crd webapps.apps.masteva.example --wait=false
+for i in $(seq 1 30); do kubectl get wa web-3 > /dev/null 2>&1 || break; sleep 1; done
+kubectl get crd webapps.apps.masteva.example -o jsonpath='finalizers={.metadata.finalizers}{"\n"}{range .status.conditions[?(@.type=="Terminating")]}{.type}={.status} {.reason}{"\n"}{end}'
+kubectl get wa
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k9-lab
+webapp.apps.masteva.example/web-3 created
+webapp.apps.masteva.example/web patched
+customresourcedefinition.apiextensions.k8s.io "webapps.apps.masteva.example" deleted
+finalizers=["customresourcecleanup.apiextensions.k8s.io"]
+Terminating=True InstanceDeletionInProgress
+NAME   IMAGE                                 DESIRED   READY   AGE
+web    ghcr.io/stefanprodan/podinfo:6.15.0   3         1       3m
+```
+
+</Expected>
+
+`web-3` đã bị xoá cùng CRD; `web` còn vì finalizer, và chính nó giữ CRD ở trạng thái đang xoá. Gỡ finalizer, chờ CRD biến mất, rồi cài lại CRD cuối cùng của bước 4 cho K9.2:
+
+<Terminal where="mac">
+
+```bash
+kubectl patch wa web --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+kubectl wait --for=delete crd/webapps.apps.masteva.example --timeout=60s
+kubectl apply -f ../webapp-crd.yaml
+kubectl wait --for=condition=Established crd/webapps.apps.masteva.example --timeout=60s
+kubectl get wa
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+webapp.apps.masteva.example/web patched
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example condition met
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example created
+customresourcedefinition.apiextensions.k8s.io/webapps.apps.masteva.example condition met
+No resources found in k9 namespace.
+```
+
+</Expected>
+
+CRD mới tạo lại không mang theo object cũ nào. Không có cách "hoàn tác" xoá CRD ngoài khôi phục từ bản sao lưu (D20).
+
+<Check id="k9.1.lab-xoa-crd">Chứng minh được xoá CRD xoá mọi object của nó, và một object có finalizer giữ CRD ở trạng thái đang xoá.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Tạo CRD lỗi `metadata.name: Invalid value … must be spec.names.plural+"."+spec.group` | Tên CRD không khớp `plural.group` | Đặt `metadata.name` đúng `webapps.apps.masteva.example` |
+| Tạo CRD lỗi về `structural schema` hoặc thiếu `type` | Một trường trong schema thiếu `type` | Khai `type` cho mọi trường; trường tự do thật thì thêm `x-kubernetes-preserve-unknown-fields: true` |
+| Tạo CRD lỗi `estimated rule cost exceeds budget` | Luật CEL duyệt chuỗi hoặc danh sách không giới hạn độ dài | Thêm `maxLength`, `maxItems` cho trường mà luật dùng |
+| `kubectl get wa` báo `the server doesn't have a resource type` ngay sau khi tạo CRD | Discovery chưa cập nhật, hoặc CRD chưa `Established` | `kubectl wait --for=condition=Established crd/…` rồi chạy lại |
+| StorageVersionMigration không lên `Succeeded` | Một object không ghi lại được (ví dụ vi phạm luật mới) | `kubectl get storageversionmigration webapps-to-v1 -o yaml` xem `conditions` |
+
+### Dọn dẹp
+
+K9.2 dùng tiếp cụm `k9-lab`, namespace `k9` và file `~/masteva-k9/webapp-crd.yaml`. Nếu dừng chặng ở đây:
+
+<Callout kind="danger">
+
+Khối lệnh dưới xoá cụm `k9-lab` cùng thư mục lab `~/masteva-k9`, gồm mọi file bài này tạo.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm và thư mục lab">
+
+```bash
+kind delete cluster --name k9-lab
+rm -rf ~/masteva-k9
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Khi nào cần conversion webhook thay vì `None`?">
+
+Khi hai phiên bản khác nhau về **cấu trúc**, không chỉ về tên phiên bản. Ví dụ `v2` đổi `message` thành `greeting`, hay gộp `image` thành `image.repository` và `image.tag`. Với `None`, API server chỉ thay `apiVersion`: object lưu ở `v1` có `message`, đọc qua `v2` thì trường đó không có trong schema `v2` và bị cắt bỏ, dữ liệu mất trên đường đi. Webhook chuyển đổi phải chạy được theo cả hai chiều và không mất thông tin (chuyển `v1 → v2 → v1` phải ra đúng bản gốc), nên các dự án thường cất trường không có chỗ ở phiên bản kia vào annotation. Cái giá vận hành: webhook là một service trong cụm; nó chết thì mọi lệnh đọc object không ở phiên bản lưu đều lỗi, kể cả lệnh của garbage collector và của `kubectl delete namespace`. Kubebuilder sinh khung cho việc này bằng `kubebuilder create webhook --conversion`; chặng này không dùng tới.
+
+</Reveal>
+
+<Reveal title="Có nên để mọi thứ vào CRD, kể cả dữ liệu lớn hay thay đổi liên tục?">
+
+Không. Mỗi object nằm trong etcd chung với cả cụm. etcd đặt trần cho một yêu cầu ghi (mặc định khoảng 1,5 MiB) và cho tổng dung lượng của cả cơ sở dữ liệu. Mỗi lần ghi tạo một revision mới cho tới lần compaction kế tiếp, và mọi controller đang watch loại đó nhận một sự kiện. Kết quả quét, log, số đo theo giây thuộc về hệ thống lưu trữ khác; CRD giữ ý định và trạng thái tóm tắt. K9.3 có một sự cố thật vì đúng chuyện này.
+
+</Reveal>
+
+<Reveal title="`x-kubernetes-list-type: map` ở `conditions` để làm gì?">
+
+Nó nói với API server rằng danh sách này là một tập phần tử phân biệt bằng khoá `type`, không phải một mảng nguyên khối. Server-side apply (K3.1) nhờ đó theo dõi quyền sở hữu **từng phần tử**: controller A sở hữu condition `Available`, controller B sở hữu `Degraded`, hai bên apply mà không ghi đè nhau. Không có nó, danh sách được coi là `atomic`: ai apply sau thay cả danh sách. API server cũng từ chối hai phần tử cùng `type`.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết khung CRD từ một mô tả, viết luật CEL cho một ràng buộc giữa nhiều trường, giải thích một thông báo lỗi validation dài.
+
+**AI hay sai ở đâu:** viết `apiextensions.k8s.io/v1beta1` (đã bị gỡ từ Kubernetes 1.22) với `validation` ở cấp CRD thay vì `schema` trong từng phiên bản; quên `type` làm schema không có cấu trúc; viết luật CEL dùng hàm không có trong thư viện của Kubernetes, hoặc dùng `oldSelf` ở trường có thể vắng mặt; khuyên "xoá phiên bản cũ khỏi CRD" hay "patch storedVersions" mà bỏ bước migrate; và gợi ý gỡ finalizer để "sửa" object kẹt mà không hỏi việc dọn dẹp nào đang bị bỏ.
+
+**Cách kiểm tra:** `kubectl apply --dry-run=server -f crd.yaml` bắt lỗi schema và chi phí CEL ngay khi tạo CRD; với mỗi luật, viết một object hợp lệ và một object vi phạm rồi `kubectl apply --dry-run=server` cả hai; với mọi thay đổi phiên bản, kiểm `status.storedVersions` trước và sau.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.1 dạy object, `spec`, `status` và vòng điều khiển ở mức người dùng; K3.1 dạy server-side apply và field manager; K3.2 giải thích vì sao Helm không nâng cấp, không xoá CRD trong `crds/`. K7.4 dùng một operator với mười một CRD. K9.2 viết controller cho `WebApp`; K9.3 sinh chính CRD này từ code Go bằng Kubebuilder; K9.4 thêm webhook của operator. K8 dùng CEL ở chỗ khác: ValidatingAdmissionPolicy. K4.5 sao lưu etcd, nơi mọi custom resource nằm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k9.1.mastery-thiet-ke">Tự thiết kế được CRD cho một loại tài nguyên của đội mình: chọn group và scope, viết schema có mặc định, luật CEL cho ràng buộc giữa các trường và trường không được đổi, cột in và hai subresource.</Check>
+
+<Check id="k9.1.mastery-phien-ban">Lập được kế hoạch nâng một CRD đang dùng từ phiên bản này sang phiên bản khác mà không mất object và không làm hỏng client, và giải thích được từng bước bằng `storedVersions`.</Check>
+
+<Check id="k9.1.mastery-xoa">Nhìn một object hay một CRD đang kẹt khi xoá, tìm được finalizer nào đang giữ và quyết định được có nên gỡ nó không.</Check>
+
+</Mastery>

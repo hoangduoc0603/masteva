@@ -1,0 +1,850 @@
+---
+title: Admission policy - ValidatingAdmissionPolicy, MutatingAdmissionPolicy và Kyverno
+description: Viết chính sách riêng cho cụm - image phải ghim phiên bản và từ registry được phép, chỉ nhóm nền tảng được đổi nhãn Pod Security, namespace mới tự có nhãn - bằng policy CEL chạy ngay trong API server; rồi cài Kyverno cho phần API server không làm được (sinh tài nguyên, quét nền, PolicyReport) và đo cái giá của một webhook nằm trên đường đi của mọi yêu cầu.
+id: k8.3
+step: k8
+prerequisites: [k8.1]
+topics: [k8.admission-policy]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    kyverno: 1.19.1
+    kyverno-chart: 3.9.1
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+PSA (K8.1) chỉ biết ba mức cố định. Mỗi tổ chức còn có luật riêng: image phải từ registry nội bộ, không dùng `:latest`, mọi Deployment phải có nhãn đội sở hữu, namespace mới phải có NetworkPolicy chặn mặc định. Học xong, bạn:
+
+- Viết được ValidatingAdmissionPolicy bằng CEL, cho chạy ở chế độ cảnh báo trước rồi mới chặn, và dùng tham số để đổi luật mà không sửa policy.
+- Viết được MutatingAdmissionPolicy tự điền giá trị, và giải thích được vì sao nó chạy trước PSA.
+- Biết khi nào cần Kyverno thay cho policy có sẵn của Kubernetes, và loại policy nào của Kyverno còn dùng được từ bản 1.20.
+- Giải thích được vì sao một policy engine chết có thể làm cả cụm không tạo được Deployment, và vì sao trong một trường hợp khác nó lại lặng lẽ cho mọi thứ đi qua.
+
+</Goal>
+
+<Knowledge>
+
+### Chuỗi admission
+
+K8.1 đã đặt PSA vào đường đi của một yêu cầu. Nhìn kỹ hơn, phần admission có hai pha, mỗi pha có cả plugin có sẵn, policy viết bằng CEL và webhook:
+
+```text
+ yêu cầu ghi (create, update, delete)
+   |
+   v
+ xác thực -> RBAC
+   |
+   v
+ MUTATING admission  (được sửa object)
+   |  plugin có sẵn: ServiceAccount, DefaultStorageClass, LimitRanger...
+   |  MutatingAdmissionPolicy (CEL, chạy trong API server)
+   |  mutating webhook (gọi HTTPS ra một Service)
+   |  (có thể chạy lại một lượt nếu một mutation làm thay đổi kết quả của cái khác)
+   v
+ kiểm schema của object
+   v
+ VALIDATING admission  (chỉ được nói có hoặc không, chạy song song)
+   |  plugin có sẵn: PodSecurity (K8.1), ResourceQuota (K5.5)...
+   |  ValidatingAdmissionPolicy (CEL, trong API server)
+   |  validating webhook (Kyverno, Gatekeeper, webhook của operator K9.4)
+   v
+ etcd
+```
+
+Hệ quả của thứ tự: mutation luôn chạy trước validation. Một policy tự điền `seccompProfile` cho pod sẽ làm pod đó qua được PSA `restricted`; một webhook kiểm image nhìn thấy image **sau khi** mọi mutation đã sửa nó.
+
+**Webhook** (K9.4 đi sâu phía operator) là một Service HTTPS mà API server gọi đồng bộ cho mỗi yêu cầu khớp luật của nó. Nó chạy mã tuỳ ý, đọc được dữ liệu ngoài, nhưng là một phụ thuộc mạng của API server. **Admission policy** (ValidatingAdmissionPolicy, MutatingAdmissionPolicy) là biểu thức **CEL** (Common Expression Language, ngôn ngữ biểu thức nhỏ, không có vòng lặp vô hạn, chạy được trong thời gian giới hạn) mà API server tự đánh giá, không có tiến trình nào khác:
+
+| | Admission policy (CEL) | Webhook (Kyverno, Gatekeeper, tự viết) |
+|---|---|---|
+| Chạy ở đâu | Trong API server | Pod riêng, API server gọi qua mạng |
+| Thêm độ trễ | Micro giây | Một lượt HTTPS, tới `timeoutSeconds` (mặc định 10 giây) |
+| Hỏng thì sao | Lỗi biểu thức: theo `failurePolicy` của policy | Pod chết, mạng lỗi, chứng chỉ hết hạn: theo `failurePolicy` của webhook |
+| Nhìn thấy gì | Object, object cũ, thông tin người gửi, tham số, namespace của object, câu hỏi RBAC (`authorizer`) | Mọi thứ, kể cả gọi API khác, registry, dịch vụ ngoài |
+| Làm được | Chặn, cảnh báo, ghi audit, sửa object | Thêm: sinh tài nguyên khác, quét lại tài nguyên đã có, kiểm chữ ký image (K8.4) |
+
+Quy tắc thực dụng: luật nào viết được bằng CEL trên chính object thì viết bằng admission policy; chỉ dùng webhook cho phần CEL không làm được.
+
+<Check id="k8.3.chuoi-admission">Vẽ lại được hai pha mutating và validating cùng vị trí của plugin có sẵn, policy CEL và webhook; giải thích được vì sao mutation chạy trước PSA quan trọng; so sánh được admission policy với webhook về độ trễ, cách hỏng và khả năng.</Check>
+
+### ValidatingAdmissionPolicy
+
+GA từ Kubernetes 1.30. Một luật gồm hai object:
+
+- **`ValidatingAdmissionPolicy`**: luật. `matchConstraints` chọn loại tài nguyên và thao tác; `matchConditions` lọc thêm bằng CEL (ví dụ bỏ qua yêu cầu của nhóm nào đó); `variables` đặt tên cho biểu thức dùng lại; `validations` là các biểu thức phải ra `true`, kèm `message` hoặc `messageExpression`; `paramKind` khai loại object chứa tham số; `failurePolicy` nói làm gì khi **chính policy lỗi** (biểu thức lỗi lúc chạy, thiếu tham số…).
+- **`ValidatingAdmissionPolicyBinding`**: áp luật vào đâu (`matchResources` theo namespace hay nhãn), với tham số nào (`paramRef`), và làm gì khi vi phạm (`validationActions`).
+
+`validationActions` là chỗ triển khai an toàn, tương tự ba chế độ của PSA:
+
+| Giá trị | Vi phạm thì |
+|---|---|
+| `Warn` | Cho qua, trả dòng `Warning:` về kubectl |
+| `Audit` | Cho qua, ghi chú thích vào audit log (K8.5) |
+| `Deny` | Từ chối. Không đi cùng `Warn` (đã có lỗi trả về) |
+
+Trong biểu thức có các biến: `object` và `oldObject` (khi update), `request` (ai gửi, thao tác gì: `request.userInfo.groups`), `params`, `namespaceObject`, `authorizer` (hỏi RBAC "người này có quyền X không").
+
+Tách policy và binding cho phép một luật áp nhiều cách: cùng luật "image từ registry được phép", namespace của đội A dùng tham số liệt kê registry của đội A, bản thử nghiệm ở chế độ `Warn`, bản production ở `Deny`.
+
+### MutatingAdmissionPolicy
+
+GA từ Kubernetes 1.36 (alpha 1.32, beta 1.34). Cùng khuôn policy và binding, thay `validations` bằng `mutations`. Mỗi mutation là một biểu thức CEL trả về:
+
+- `ApplyConfiguration`: một object rút gọn được gộp vào object gốc theo luật của server-side apply (K3.1). Dễ đọc, hợp để đặt giá trị mặc định.
+- `JSONPatch`: danh sách thao tác JSON Patch, cho trường hợp phải xoá hay chèn vào giữa danh sách.
+
+`reinvocationPolicy: IfNeeded` cho phép chạy lại policy nếu một mutation khác sau nó đổi object. Ví dụ quen thuộc: điền mặc định cho pod, gắn nhãn cho namespace mới, thêm toleration. Trước 1.36, những việc này cần một mutating webhook.
+
+<Check id="k8.3.vap-map">Kể được các phần của một ValidatingAdmissionPolicy và binding, phân biệt được `failurePolicy` với `validationActions`, và nêu được khi nào dùng MutatingAdmissionPolicy cùng hai kiểu `patchType` của nó.</Check>
+
+### Kyverno: khi nào cần, và loại policy nào
+
+**Kyverno** (dự án CNCF) là một policy engine chạy dưới dạng webhook. Nó viết luật bằng YAML và CEL, và làm được những việc admission policy có sẵn không làm:
+
+- **Sinh tài nguyên** (`GeneratingPolicy`): namespace mới có ngay NetworkPolicy chặn mặc định, ResourceQuota, RoleBinding.
+- **Quét nền** và **PolicyReport**: đánh giá lại tài nguyên **đã có** trong cụm theo luật mới và ghi kết quả thành object `PolicyReport` mỗi namespace. VAP chỉ xét lúc có yêu cầu ghi.
+- **Kiểm chữ ký image** (`ImageValidatingPolicy`, K8.4), gọi registry lúc admission.
+- **Ngoại lệ** từng tài nguyên (`PolicyException`) và **CLI** để chạy thử policy trong CI trước khi tới cụm.
+
+Kyverno 1.19 (08/2026) có hai thế hệ policy. Thế hệ CEL thuộc nhóm API `policies.kyverno.io/v1` (ổn định từ 1.18): `ValidatingPolicy`, `MutatingPolicy`, `GeneratingPolicy`, `DeletingPolicy`, `ImageValidatingPolicy`, mỗi loại có bản theo namespace. Thế hệ cũ `ClusterPolicy`/`Policy` (`kyverno.io/v1`, các rule `validate`, `mutate`, `generate`, `verifyImages` viết bằng pattern và JMESPath) bị **deprecated ở 1.19 và dự kiến bị gỡ ở 1.20** (khoảng 11/2026); tạo hay sửa chúng ở 1.19 trả về cảnh báo. Phần lớn ví dụ Kyverno trên mạng và trong câu trả lời của AI là thế hệ cũ: đừng chép vào cụm mới.
+
+Kyverno chạy bốn controller: **admission controller** (nhận webhook; bắt buộc), **background controller** (sinh tài nguyên, mutate tài nguyên đã có), **reports controller** (quét nền, ghi PolicyReport), **cleanup controller** (xoá theo lịch). Webhook do admission controller tự đăng ký và tự cập nhật theo policy đang có: không có policy nào chạm tới Pod thì API server không gọi Kyverno khi tạo Pod.
+
+| Cần | Chọn |
+|---|---|
+| Chặn hoặc cảnh báo dựa trên chính object và tham số | ValidatingAdmissionPolicy |
+| Điền mặc định, gắn nhãn | MutatingAdmissionPolicy (từ 1.36) |
+| Mức bảo mật pod chuẩn | PSA |
+| Sinh tài nguyên, báo cáo tài nguyên đã có, kiểm chữ ký image, ngoại lệ từng tài nguyên | Kyverno |
+| Đã có OPA và Rego ở nơi khác trong tổ chức | Gatekeeper (cùng vai với Kyverno, viết bằng Rego) |
+
+<Check id="k8.3.kyverno">Kể được bốn việc Kyverno làm mà admission policy có sẵn không làm, phân biệt được policy thế hệ CEL với `ClusterPolicy` cũ và mốc gỡ bỏ của nó, và chọn được công cụ cho một yêu cầu cho trước.</Check>
+
+### Cái giá của webhook
+
+Webhook nằm trên đường đi đồng bộ của API server, nên nó có hai cách hỏng, cả hai đều tệ:
+
+| `failurePolicy` | Webhook không trả lời thì | Rủi ro |
+|---|---|---|
+| `Fail` | Từ chối yêu cầu, sau tối đa `timeoutSeconds` | Policy engine chết là không ai tạo được tài nguyên mà nó canh, kể cả pod thay thế khi node hỏng. Nếu nó canh cả namespace của chính nó, nó không tự lên lại được |
+| `Ignore` | Cho qua | Luật biến mất đúng lúc hệ thống có sự cố, không ai được báo |
+
+Những cách giảm rủi ro được dùng trên production:
+
+- **Loại trừ namespace hệ thống** bằng `namespaceSelector` theo nhãn `kubernetes.io/metadata.name` (nhãn API server tự gắn, người dùng không giả được). Chart Kyverno mặc định loại `kube-system` và namespace của chính Kyverno.
+- **Chạy nhiều bản sao** (Kyverno khuyên từ 2 trở lên cho admission controller), kèm PDB (K5.2) và priority cao (K5.2).
+- **Thu hẹp phạm vi**: một webhook chỉ khớp `deployments` thì khi chết không chặn việc tạo pod của ReplicaSet đang có.
+- **Theo dõi** metric `apiserver_admission_webhook_rejection_count` và độ trễ webhook của API server (D12.2).
+
+Kyverno có thêm một hành vi cần biết: khi Deployment admission controller bị xoá hoặc scale về 0, pod cuối cùng **tự xoá mọi webhook** của Kyverno trước khi tắt (mã nguồn: hàm `IsGoingDown` kiểm `deletionTimestamp` và `replicas == 0`). Thiết kế đó để gỡ Kyverno không làm treo cụm, và có nghĩa là "tạm tắt Kyverno" bằng scale về 0 là tắt luôn mọi luật. Ngược lại, khi pod chết bất ngờ hay treo, webhook còn nguyên và `failurePolicy: Fail` có hiệu lực. Bước 6 của lab đo cả hai.
+
+<Check id="k8.3.rui-ro">Giải thích được hai cách hỏng của webhook theo `failurePolicy`, kể được các cách giảm rủi ro, và nói được Kyverno làm gì với webhook của nó khi bị scale về 0.</Check>
+
+<Callout kind="production">
+
+Tháng 12/2020, dự án Kubernetes [công bố CVE-2020-8554](https://github.com/kubernetes/kubernetes/issues/97076): người có quyền tạo hoặc sửa Service có thể đặt `spec.externalIPs` thành một địa chỉ IP bất kỳ và chặn lưu lượng mà các pod trong cụm gửi tới địa chỉ đó; người có quyền sửa `status` của Service kiểu LoadBalancer làm được điều tương tự. Thông báo ghi đây là lỗi thiết kế, ảnh hưởng mọi phiên bản Kubernetes, và **không có bản vá**: không sửa được nếu không đổi hành vi mà người dùng đang dựa vào. Cách giảm thiểu dự án đưa ra là chặn bằng admission: một webhook riêng (`externalip-webhook`) hoặc một policy Gatekeeper giới hạn ai được đặt `externalIPs`; với IP của LoadBalancer, không cấp quyền `patch` trên `services/status` cho người dùng. Để phát hiện, họ khuyên rà các Service đang dùng `externalIPs` (ít Service dùng trường này) và để ý các sự kiện audit người dùng sửa `status` của Service.
+
+Điều rút ra (của bài): admission policy không chỉ để áp quy ước nội bộ; có những lỗ hổng mà cách xử lý chính thức **là** một admission policy. Từ 1.30, luật đó viết được bằng một ValidatingAdmissionPolicy vài dòng thay cho một webhook phải vận hành; mục Đào sâu có một bản.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [Validating Admission Policy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/): các biến trong CEL, tham số, `validationActions`, `failurePolicy`, kiểm kiểu (`status.typeChecking`).
+- [Mutating Admission Policy](https://kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/): `ApplyConfiguration` và `JSONPatch`, `reinvocationPolicy`.
+- [Dynamic Admission Control](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/): webhook, `failurePolicy`, `timeoutSeconds`, phần "Best practices and warnings" về tránh deadlock.
+- [Kyverno: Policy Types Overview](https://kyverno.io/docs/policy-types/overview/): các loại policy CEL, lịch deprecated và gỡ bỏ `ClusterPolicy`; trang [Installation](https://kyverno.io/docs/installation/) mục "Security vs Operability".
+- [CVE-2020-8554: Man in the middle using LoadBalancer or ExternalIPs](https://github.com/kubernetes/kubernetes/issues/97076): nguồn của callout, đọc phần Mitigations và Detection.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng cụm `k8-lab` của K8.1 (cấu hình PSA mặc định `baseline`). Nếu đã xoá cụm ở K8.2, tạo lại bằng khối đầu tiên dưới đây; nếu cụm đang chạy, lệnh `kind create cluster` thất bại vì cụm đã tồn tại; output của nó được ẩn nên bạn không thấy gì, và các lệnh sau dùng cụm đang có.
+
+**Profile máy.** Cuối bài, node kind dùng khoảng 1,3 tới 1,5 GiB RAM của Docker (theo `docker stats`), trong đó Kyverno (ba controller) chiếm khoảng 500 tới 700 MiB. Lab tải chart Kyverno (khoảng 800 KB) và bốn image của Kyverno (mỗi image khoảng 40 MB). Máy 8 GB chạy được.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k8/kubeconfig
+cd ~/masteva-k8 && kind create cluster --config kind.yaml > /dev/null 2>&1; kubectl wait --for=condition=Ready node --all --timeout=180s
+mkdir -p ~/masteva-k8/k8-3 && cd ~/masteva-k8/k8-3
+kubectl create namespace team-a
+kubectl label namespace team-a masteva.dev/policy=on pod-security.kubernetes.io/warn=baseline
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k8-lab-control-plane condition met
+namespace/team-a created
+namespace/team-a labeled
+```
+
+</Expected>
+
+Nhãn `masteva.dev/policy=on` là thứ binding ở bước 1 chọn. Nhãn `warn=baseline` tắt các dòng cảnh báo `restricted` của PSA cho output gọn.
+
+### 1. ValidatingAdmissionPolicy: image ghim phiên bản, từ registry được phép
+
+Luật: mọi container trong Deployment phải có tag cụ thể (không `:latest`, không thiếu tag) hoặc digest, và image phải từ một registry trong danh sách. Danh sách là **tham số**, nằm trong một ConfigMap ở namespace `policy-params`, để đội nền tảng đổi danh sách mà không sửa policy.
+
+<Terminal where="mac" title="~/masteva-k8/k8-3/image-policy.yaml">
+
+```bash
+cat > image-policy.yaml <<'EOF'
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: image-ghim-phien-ban
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  variables:
+    - name: images
+      expression: "object.spec.template.spec.containers.map(c, c.image)"
+  validations:
+    - expression: >-
+        variables.images.all(i, i.contains('@sha256:') ||
+          (i.lastIndexOf(':') > i.lastIndexOf('/') && !i.endsWith(':latest')))
+      messageExpression: "'image phải có tag cụ thể hoặc digest, không dùng latest: ' + variables.images.join(', ')"
+    - expression: "variables.images.all(i, params.data.registries.split(',').exists(r, i.startsWith(r + '/')))"
+      messageExpression: "'image phải từ registry được phép: ' + params.data.registries"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: image-ghim-phien-ban
+spec:
+  policyName: image-ghim-phien-ban
+  validationActions: [Warn, Audit]
+  paramRef:
+    name: registry-cho-phep
+    namespace: policy-params
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        masteva.dev/policy: "on"
+EOF
+kubectl create namespace policy-params
+kubectl -n policy-params create configmap registry-cho-phep --from-literal=registries=registry.k8s.io,k8-registry:5000
+kubectl apply -f image-policy.yaml
+sleep 2
+kubectl -n team-a create deployment web --image=nginx
+kubectl -n team-a create deployment pause --image=registry.k8s.io/pause:3.10
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/policy-params created
+configmap/registry-cho-phep created
+validatingadmissionpolicy.admissionregistration.k8s.io/image-ghim-phien-ban created
+validatingadmissionpolicybinding.admissionregistration.k8s.io/image-ghim-phien-ban created
+Warning: Validation failed for ValidatingAdmissionPolicy 'image-ghim-phien-ban' with binding 'image-ghim-phien-ban': image phải có tag cụ thể hoặc digest, không dùng latest: nginx
+Warning: Validation failed for ValidatingAdmissionPolicy 'image-ghim-phien-ban' with binding 'image-ghim-phien-ban': image phải từ registry được phép: registry.k8s.io,k8-registry:5000
+deployment.apps/web created
+deployment.apps/pause created
+```
+
+</Expected>
+
+`nginx` vi phạm cả hai luật: thiếu tag (container runtime hiểu là `:latest`) và không có tên registry (runtime hiểu là `docker.io/library/nginx`). Ở chế độ `Warn`, Deployment vẫn được tạo. Biểu thức tag so vị trí dấu `:` cuối với dấu `/` cuối, để `k8-registry:5000/app` (dấu `:` của cổng) không bị nhầm là có tag. `sleep 2` vì API server nạp policy và binding mới bất đồng bộ, thường dưới một giây.
+
+Giai đoạn `Warn`/`Audit` là lúc đội ứng dụng sửa manifest. Khi audit log không còn vi phạm, chuyển binding sang `Deny`:
+
+<Terminal where="mac">
+
+```bash
+kubectl patch validatingadmissionpolicybinding image-ghim-phien-ban --type=merge -p '{"spec":{"validationActions":["Deny","Audit"]}}'
+sleep 2
+kubectl -n team-a create deployment web2 --image=nginx:1.29
+kubectl -n team-a set image deployment/pause pause=registry.k8s.io/pause:latest
+kubectl -n team-a create deployment web3 --image=registry.k8s.io/e2e-test-images/agnhost:2.66.1 -- /agnhost netexec
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+validatingadmissionpolicybinding.admissionregistration.k8s.io/image-ghim-phien-ban patched
+error: failed to create deployment: deployments.apps "web2" is forbidden: ValidatingAdmissionPolicy 'image-ghim-phien-ban' with binding 'image-ghim-phien-ban' denied request: image phải từ registry được phép: registry.k8s.io,k8-registry:5000
+error: failed to patch image update to pod template: deployments.apps "pause" is forbidden: ValidatingAdmissionPolicy 'image-ghim-phien-ban' with binding 'image-ghim-phien-ban' denied request: image phải có tag cụ thể hoặc digest, không dùng latest: registry.k8s.io/pause:latest
+deployment.apps/web3 created
+```
+
+</Expected>
+
+Luật áp cả cho `UPDATE`: Deployment `pause` đã có từ trước không đổi được sang `:latest`. Deployment `web` tạo lúc còn `Warn` vẫn nằm đó: admission chỉ xét lúc có yêu cầu ghi, không quét lại thứ đã có. Bước 5 cho thấy Kyverno làm phần quét đó.
+
+<Check id="k8.3.lab-vap">Viết được một ValidatingAdmissionPolicy có tham số, cho chạy `Warn` rồi chuyển sang `Deny` chỉ bằng cách sửa binding, và giải thích được vì sao Deployment tạo trước đó không bị ảnh hưởng.</Check>
+
+### 2. Khoá nhãn Pod Security
+
+K8.1 đã nêu: ai sửa được nhãn namespace là tự gỡ được PSA. Policy dưới cấm mọi thay đổi trên nhãn `pod-security.kubernetes.io/*` (thêm, sửa, xoá) trừ khi người gửi thuộc nhóm `masteva:nen-tang`. Nó so tập nhãn PSA của object cũ (`oldObject`) và object mới; `matchConditions` bỏ qua hẳn yêu cầu của nhóm nền tảng.
+
+<Terminal where="mac" title="~/masteva-k8/k8-3/khoa-nhan-psa.yaml">
+
+```bash
+cat > khoa-nhan-psa.yaml <<'EOF'
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: khoa-nhan-psa
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["namespaces"]
+  matchConditions:
+    - name: ngoai-nhom-nen-tang
+      expression: "!('masteva:nen-tang' in request.userInfo.groups)"
+  variables:
+    - name: psaCu
+      expression: >-
+        has(oldObject.metadata.labels) ? oldObject.metadata.labels.filter(k, k.startsWith('pod-security.kubernetes.io/'))
+          .map(k, k + '=' + oldObject.metadata.labels[k]) : []
+    - name: psaMoi
+      expression: >-
+        has(object.metadata.labels) ? object.metadata.labels.filter(k, k.startsWith('pod-security.kubernetes.io/'))
+          .map(k, k + '=' + object.metadata.labels[k]) : []
+  validations:
+    - expression: "variables.psaCu.all(x, x in variables.psaMoi) && variables.psaMoi.all(x, x in variables.psaCu)"
+      messageExpression: "'chỉ nhóm masteva:nen-tang được đổi nhãn pod-security.kubernetes.io/*, ' + request.userInfo.username + ' không thuộc nhóm này'"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: khoa-nhan-psa
+spec:
+  policyName: khoa-nhan-psa
+  validationActions: [Deny]
+EOF
+kubectl apply -f khoa-nhan-psa.yaml
+kubectl create clusterrole sua-namespace --verb=get,list,patch,update --resource=namespaces
+kubectl create clusterrolebinding sua-namespace --clusterrole=sua-namespace --user=an --user=binh
+sleep 2
+kubectl label namespace team-a pod-security.kubernetes.io/enforce=privileged --as=an
+kubectl label namespace team-a masteva.dev/owner=an --as=an
+kubectl label namespace team-a pod-security.kubernetes.io/audit=restricted --as=binh --as-group=masteva:nen-tang
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+validatingadmissionpolicy.admissionregistration.k8s.io/khoa-nhan-psa created
+validatingadmissionpolicybinding.admissionregistration.k8s.io/khoa-nhan-psa created
+clusterrole.rbac.authorization.k8s.io/sua-namespace created
+clusterrolebinding.rbac.authorization.k8s.io/sua-namespace created
+Error from server (Forbidden): namespaces "team-a" is forbidden: ValidatingAdmissionPolicy 'khoa-nhan-psa' with binding 'khoa-nhan-psa' denied request: chỉ nhóm masteva:nen-tang được đổi nhãn pod-security.kubernetes.io/*, an không thuộc nhóm này
+namespace/team-a labeled
+namespace/team-a labeled
+```
+
+</Expected>
+
+`an` và `binh` có cùng quyền RBAC `patch namespaces`; RBAC không phân biệt được "sửa nhãn nào". Policy làm phần đó: `an` gắn được nhãn thường nhưng không đụng được nhãn PSA; `binh`, đi kèm nhóm `masteva:nen-tang`, thì được. K2.3 đã dùng `--as` với `auth can-i` để hỏi quyền; ở đây `--as` và `--as-group` (gọi chung là **impersonation**) gửi **yêu cầu thật** dưới danh tính khác: bạn, với quyền admin, đóng vai người dùng đó. Trên cụm thật, nhóm đến từ hệ thống đăng nhập (OIDC) chứ không do người dùng tự khai.
+
+Policy này chỉ xét `UPDATE`. Người tạo được namespace có thể tạo namespace mới với nhãn `privileged` ngay từ đầu; bước kế tiếp đóng một nửa khe đó, mục Đào sâu bàn nửa còn lại.
+
+<Check id="k8.3.lab-khoa-nhan">Viết được policy dùng `oldObject`, `request.userInfo` và `matchConditions` để giới hạn ai được đổi một nhóm nhãn, và thử được nó bằng impersonation.</Check>
+
+### 3. MutatingAdmissionPolicy: namespace mới tự có nhãn PSA
+
+Trên cụm managed, bạn không đặt được mặc định PSA cho cả cụm (K8.1). Policy dưới làm thay: namespace được tạo mà chưa có nhãn `enforce` sẽ được gắn `enforce=baseline` ghim `v1.37` và `warn=restricted`. Nó chạy ở pha mutating, trước PSA và trước mọi validation.
+
+<Terminal where="mac" title="~/masteva-k8/k8-3/psa-mac-dinh.yaml">
+
+```bash
+cat > psa-mac-dinh.yaml <<'EOF'
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: psa-mac-dinh
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["namespaces"]
+  matchConditions:
+    - name: chua-co-enforce
+      expression: "!has(object.metadata.labels) || !('pod-security.kubernetes.io/enforce' in object.metadata.labels)"
+  mutations:
+    - patchType: ApplyConfiguration
+      applyConfiguration:
+        expression: >
+          Object{
+            metadata: Object.metadata{
+              labels: {
+                "pod-security.kubernetes.io/enforce": "baseline",
+                "pod-security.kubernetes.io/enforce-version": "v1.37",
+                "pod-security.kubernetes.io/warn": "restricted"
+              }
+            }
+          }
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: psa-mac-dinh
+spec:
+  policyName: psa-mac-dinh
+EOF
+kubectl apply -f psa-mac-dinh.yaml
+sleep 2
+kubectl create namespace team-b
+kubectl get namespace team-b -o json | jq -c '.metadata.labels'
+kubectl create namespace team-c --dry-run=client -o yaml \
+  | yq '.metadata.labels."pod-security.kubernetes.io/enforce" = "restricted"' | kubectl apply -f -
+kubectl get namespace team-c -o json | jq -c '.metadata.labels'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mutatingadmissionpolicy.admissionregistration.k8s.io/psa-mac-dinh created
+mutatingadmissionpolicybinding.admissionregistration.k8s.io/psa-mac-dinh created
+namespace/team-b created
+{"kubernetes.io/metadata.name":"team-b","pod-security.kubernetes.io/enforce":"baseline","pod-security.kubernetes.io/enforce-version":"v1.37","pod-security.kubernetes.io/warn":"restricted"}
+namespace/team-c created
+{"kubernetes.io/metadata.name":"team-c","pod-security.kubernetes.io/enforce":"restricted"}
+```
+
+</Expected>
+
+`team-b` không khai gì và nhận đủ ba nhãn. `team-c` đã tự khai `restricted` nên `matchConditions` bỏ qua nó: mutation chỉ điền chỗ trống, không ghi đè lựa chọn chặt hơn. `ApplyConfiguration` gộp nhãn vào map có sẵn thay vì thay cả map, nên nhãn `kubernetes.io/metadata.name` mà API server tự gắn vẫn còn.
+
+<Check id="k8.3.lab-map">Viết được MutatingAdmissionPolicy kiểu `ApplyConfiguration` điền giá trị mặc định có điều kiện, và chỉ ra được nó không ghi đè giá trị đã khai.</Check>
+
+### 4. Cài Kyverno
+
+Chart Kyverno 3.9.1 (Kyverno 1.19.1) tải dạng `.tgz`, so sha256 với giá trị trong `index.yaml` chính thức của kho chart, và chỉ cài khi khớp. Tắt cleanup controller (bài không dùng) để tiết kiệm RAM. Mất khoảng một tới hai phút, chủ yếu để kéo image.
+
+<Terminal where="mac">
+
+```bash
+curl -fsSLO https://kyverno.github.io/kyverno/kyverno-3.9.1.tgz
+SUM=$(curl -fsSL https://kyverno.github.io/kyverno/index.yaml | yq '.entries.kyverno[] | select(.version == "3.9.1") | .digest')
+echo "index: $SUM"
+if echo "$SUM  kyverno-3.9.1.tgz" | shasum -a 256 -c; then
+  helm install kyverno ./kyverno-3.9.1.tgz -n kyverno --create-namespace \
+    --set cleanupController.enabled=false --wait --timeout 5m 2>&1 | grep -E '^(STATUS|Error)'
+fi
+kubectl -n kyverno get deployments
+kubectl get namespace kyverno -o json | jq -c '.metadata.labels'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+index: 7b7fe51a431b5b133b0ce7eb9dcb222b6a37fb967c163223cf480054ad14d752
+kyverno-3.9.1.tgz: OK
+STATUS: deployed
+NAME                            READY   UP-TO-DATE   AVAILABLE   AGE
+kyverno-admission-controller    1/1     1            1           85s
+kyverno-background-controller   1/1     1            1           85s
+kyverno-reports-controller      1/1     1            1           85s
+{"kubernetes.io/metadata.name":"kyverno","name":"kyverno","pod-security.kubernetes.io/enforce":"baseline","pod-security.kubernetes.io/enforce-version":"v1.37","pod-security.kubernetes.io/warn":"restricted"}
+```
+
+</Expected>
+
+Dòng cuối là nhãn của namespace `kyverno` mà `helm --create-namespace` vừa tạo: MutatingAdmissionPolicy ở bước 3 đã gắn nhãn PSA cho nó như cho mọi namespace mới, dù người tạo là Helm chứ không phải bạn. Pod của Kyverno đạt `baseline` nên vẫn chạy; nếu một chart cần quyền cao hơn, bạn sẽ gặp lỗi PSA ngay lúc cài, và cách xử lý là tạo namespace với nhãn phù hợp trước (như Falco ở K8.6).
+
+`index.yaml` và file `.tgz` cùng nằm trên một máy chủ, nên phép so này bắt được file hỏng hay bị thay trên đường tải, không bắt được kho chart bị chiếm; chữ ký số mới chống được trường hợp đó (D14, K8.4). Một bản sao cho admission controller là đủ cho lab; production cần từ 2 trở lên (bước 6 cho thấy vì sao).
+
+### 5. ValidatingPolicy ở chế độ Audit, PolicyReport và GeneratingPolicy
+
+Hai policy Kyverno. `can-nhan-doi` yêu cầu Deployment có nhãn `masteva.dev/team`, ở chế độ `Audit` và có quét nền: nó không chặn ai, chỉ báo cáo, kể cả cho Deployment đã có từ trước. `chan-ingress-mac-dinh` sinh một NetworkPolicy chặn mọi lưu lượng vào cho mỗi namespace mới (trừ namespace bắt đầu bằng `kube-`).
+
+<Terminal where="mac" title="~/masteva-k8/k8-3/kyverno-policies.yaml">
+
+```bash
+cat > kyverno-policies.yaml <<'EOF'
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: can-nhan-doi
+spec:
+  validationActions: [Audit]
+  evaluation:
+    background:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  validations:
+    - expression: "has(object.metadata.labels) && 'masteva.dev/team' in object.metadata.labels"
+      message: "Deployment phải có nhãn masteva.dev/team"
+---
+apiVersion: policies.kyverno.io/v1
+kind: GeneratingPolicy
+metadata:
+  name: chan-ingress-mac-dinh
+spec:
+  evaluation:
+    synchronize:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["namespaces"]
+  matchConditions:
+    - name: khong-phai-he-thong
+      expression: "!object.metadata.name.startsWith('kube-')"
+  variables:
+    - name: ns
+      expression: "object.metadata.name"
+    - name: downstream
+      expression: >-
+        [
+          {
+            "kind": dyn("NetworkPolicy"),
+            "apiVersion": dyn("networking.k8s.io/v1"),
+            "metadata": dyn({"name": "chan-ingress-mac-dinh", "namespace": string(variables.ns)}),
+            "spec": dyn({"podSelector": dyn({}), "policyTypes": dyn(["Ingress"])})
+          }
+        ]
+  generate:
+    - expression: generator.Apply(variables.ns, variables.downstream)
+EOF
+kubectl apply -f kyverno-policies.yaml
+kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true validatingpolicy/can-nhan-doi --timeout=60s
+kubectl create namespace team-d
+for i in $(seq 1 30); do kubectl -n team-d get networkpolicy chan-ingress-mac-dinh > /dev/null 2>&1 && break; sleep 1; done
+kubectl -n team-d get networkpolicy
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+validatingpolicy.policies.kyverno.io/can-nhan-doi created
+generatingpolicy.policies.kyverno.io/chan-ingress-mac-dinh created
+validatingpolicy.policies.kyverno.io/can-nhan-doi condition met
+namespace/team-d created
+NAME                    POD-SELECTOR   AGE
+chan-ingress-mac-dinh   <none>         0s
+```
+
+</Expected>
+
+NetworkPolicy xuất hiện sau namespace một hai giây: Kyverno nhận webhook lúc tạo namespace, ghi một yêu cầu sinh (UpdateRequest), và background controller tạo tài nguyên bất đồng bộ. Với `synchronize`, xoá NetworkPolicy này thì Kyverno tạo lại.
+
+Giờ xem báo cáo. Reports controller quét các Deployment đã có trong cụm theo `can-nhan-doi` và ghi một `PolicyReport` cho mỗi tài nguyên được đánh giá. Lần quét đầu mất tới vài chục giây; vòng chờ dừng khi số báo cáo bằng số Deployment trong cụm:
+
+<Terminal where="mac">
+
+```bash
+for i in $(seq 1 60); do [ "$(kubectl get policyreport -A --no-headers 2>/dev/null | wc -l)" -ge "$(kubectl get deployment -A --no-headers | wc -l)" ] && break; sleep 2; done
+kubectl get policyreport -A -o custom-columns=NAMESPACE:.metadata.namespace,KIND:.scope.kind,NAME:.scope.name,PASS:.summary.pass,FAIL:.summary.fail
+kubectl -n team-a get policyreport -o json | jq -r '.items[0].results[0] | "\(.policy): \(.result) - \(.message)"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAMESPACE            KIND         NAME                            PASS   FAIL
+kube-system          Deployment   coredns                         0      1
+kyverno              Deployment   kyverno-admission-controller    0      1
+kyverno              Deployment   kyverno-background-controller   0      1
+kyverno              Deployment   kyverno-reports-controller      0      1
+local-path-storage   Deployment   local-path-provisioner          0      1
+team-a               Deployment   web                             0      1
+team-a               Deployment   web3                            0      1
+team-a               Deployment   pause                           0      1
+can-nhan-doi: fail - Deployment phải có nhãn masteva.dev/team
+```
+
+</Expected>
+
+Thứ tự dòng và thời điểm xuất hiện có thể khác. Báo cáo có cả `kube-system` và `kyverno`: quét nền không bị giới hạn bởi `namespaceSelector` của webhook. Đây là thứ VAP không có: một danh sách vi phạm của **những gì đang chạy**, để đội nền tảng biết bật `Deny` thì ai sẽ gãy. Trên cụm thật, PolicyReport thường được đẩy lên dashboard (Policy Reporter, hoặc metric của reports controller trên Prometheus).
+
+<Check id="k8.3.lab-kyverno">Cài được Kyverno từ chart đã kiểm checksum, viết được một ValidatingPolicy chế độ Audit có quét nền và một GeneratingPolicy, và đọc được PolicyReport của tài nguyên đã có.</Check>
+
+### 6. Khi Kyverno không trả lời
+
+Webhook Kyverno đang đăng ký cho hai loại tài nguyên, mỗi loại một `failurePolicy`:
+
+<Terminal where="mac">
+
+```bash
+kubectl get validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg -o json \
+  | jq -r '.webhooks[] | "\(.failurePolicy)\t\(.timeoutSeconds)s\t\([.rules[].resources[]] | join(","))\t\(.name)"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Ignore	10s	namespaces	gpol.validate.kyverno.svc-ignore-finegrained-chan-ingress-mac-dinh
+Fail	10s	deployments	vpol.validate.kyverno.svc-fail
+```
+
+</Expected>
+
+Kyverno chỉ đăng ký những gì policy cần: Deployment (cho `can-nhan-doi`, `Fail` theo mặc định) và Namespace (cho GeneratingPolicy, `Ignore`). Không có Pod. Giờ làm cho Kyverno treo mà không chết: gửi tín hiệu `SIGSTOP` tới tiến trình admission controller (tìm PID bằng `crictl` trong node, K4.7), để webhook vẫn đăng ký nhưng không ai trả lời. Đó là triệu chứng của một policy engine quá tải hay kẹt.
+
+<Predict question="Trong lúc Kyverno treo, bạn tạo một Deployment, một Pod và một Namespace. Cái nào thành công, cái nào lỗi, mỗi lệnh mất bao lâu?">
+
+Deployment lỗi sau 10 giây (`Fail`, hết `timeoutSeconds`). Pod thành công ngay: không có webhook nào khớp Pod. Namespace thành công nhưng mất 10 giây (`Ignore`: chờ hết hạn rồi cho qua), và lúc đó chưa có NetworkPolicy nào được sinh cho nó.
+
+</Predict>
+
+<Callout kind="danger">
+
+Khối dưới làm treo admission controller của Kyverno: trong lúc đó mọi lệnh tạo Deployment trong cụm chờ 10 giây rồi lỗi. Kiểm `kubectl config current-context` ra `kind-k8-lab`; nếu khối dừng giữa chừng, chạy `kill -CONT` như mục Gỡ lỗi.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+PID=$(docker exec k8-lab-control-plane sh -c 'crictl inspect -o go-template --template "{{.info.pid}}" $(crictl ps -q --name "^kyverno$")')
+docker exec k8-lab-control-plane kill -STOP "$PID"
+time (kubectl -n team-a create deployment treo --image=registry.k8s.io/pause:3.10 2>&1 | cut -c1-170)
+time (kubectl -n team-a run pod-thuong --image=registry.k8s.io/pause:3.10 2>&1)
+time (kubectl create namespace team-e 2>&1)
+kubectl -n team-e get networkpolicy 2>&1
+docker exec k8-lab-control-plane kill -CONT "$PID"
+for i in $(seq 1 30); do kubectl -n team-e get networkpolicy chan-ingress-mac-dinh > /dev/null 2>&1 && break; sleep 1; done
+kubectl -n team-e get networkpolicy 2>&1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+error: failed to create deployment: Internal error occurred: failed calling webhook "vpol.validate.kyverno.svc-fail": failed to call webhook: Post "https://kyverno-svc.ky
+( kubectl -n team-a create deployment treo --image=registry.k8s.io/pause:3.10)  0.02s user 0.02s system 0% cpu 10.054 total
+pod/pod-thuong created
+( kubectl -n team-a run pod-thuong --image=registry.k8s.io/pause:3.10 2>&1; )  0.04s user 0.03s system 54% cpu 0.115 total
+namespace/team-e created
+( kubectl create namespace team-e 2>&1; )  0.03s user 0.02s system 0% cpu 10.062 total
+No resources found in team-e namespace.
+NAME                    POD-SELECTOR   AGE
+chan-ingress-mac-dinh   <none>         1s
+```
+
+</Expected>
+
+Ba dòng `total` cho đúng điều đã đoán: khoảng 10 giây, gần 0, khoảng 10 giây (số lẻ trên máy bạn sẽ khác). Trong lúc Kyverno treo, namespace `team-e` tồn tại mà không có NetworkPolicy: với `Ignore`, luật "namespace mới phải có NetworkPolicy chặn mặc định" không được áp, và không có lỗi nào báo điều đó. NetworkPolicy chỉ xuất hiện sau `kill -CONT`, vì tiến trình bị treo vẫn giữ yêu cầu webhook đã nhận và xử lý nó khi chạy lại, dù API server đã bỏ cuộc từ trước. Nếu yêu cầu không tới được Kyverno (pod chết, mạng lỗi) thì không có lần sinh nào khác: policy không bật `generateExisting`, nên Kyverno không quay lại xét namespace đã có. Với `Fail`, mọi pipeline triển khai trong cụm đứng trong cùng khoảng thời gian.
+
+Cách "tạm tắt" Kyverno mà nhiều người nghĩ tới đầu tiên là scale về 0:
+
+<Callout kind="danger">
+
+Khối dưới tắt admission controller của Kyverno: trong lúc đó mọi luật Kyverno trong cụm ngừng có hiệu lực. Kiểm `kubectl config current-context` ra `kind-k8-lab`; nếu khối dừng giữa chừng, chạy `kubectl -n kyverno scale deployment kyverno-admission-controller --replicas=1`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl -n kyverno scale deployment kyverno-admission-controller --replicas=0
+kubectl -n kyverno wait --for=delete pod -l app.kubernetes.io/component=admission-controller --timeout=90s > /dev/null
+kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration 2>&1
+kubectl -n team-a create deployment khong-ai-kiem --image=nginx:latest 2>&1 | head -1 | cut -c1-120
+kubectl -n kyverno scale deployment kyverno-admission-controller --replicas=1
+kubectl -n kyverno rollout status deployment kyverno-admission-controller --timeout=120s | tail -1
+for i in $(seq 1 30); do kubectl get validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg > /dev/null 2>&1 && break; sleep 2; done
+kubectl get validatingwebhookconfiguration --no-headers | wc -l | tr -d ' '
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/kyverno-admission-controller scaled
+No resources found
+error: failed to create deployment: deployments.apps "khong-ai-kiem" is forbidden: ValidatingAdmissionPolicy 'image-ghim-
+deployment.apps/kyverno-admission-controller scaled
+deployment "kyverno-admission-controller" successfully rolled out
+5
+```
+
+</Expected>
+
+Pod cuối cùng của admission controller xoá **mọi** webhook của Kyverno trước khi tắt: `No resources found`. Từ lúc đó tới khi Kyverno lên lại, không luật Kyverno nào được áp. Deployment `khong-ai-kiem` vẫn bị chặn, nhưng bởi ValidatingAdmissionPolicy của bước 1, thứ chạy trong API server và không phụ thuộc pod nào. Đó là lý do đặt luật quan trọng nhất ở VAP khi viết được, và chỉ để cho webhook phần còn lại.
+
+<Check id="k8.3.lab-webhook-hong">Tái hiện được webhook treo với `failurePolicy` `Fail` và `Ignore`, đo được độ trễ của từng trường hợp, và chứng minh được scale Kyverno về 0 gỡ mọi webhook của nó trong khi VAP vẫn hoạt động.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| VAP không chặn gì | Binding thiếu hoặc `matchResources` không khớp namespace; `paramRef` trỏ sai và `parameterNotFoundAction: Allow` | `kubectl get validatingadmissionpolicybinding -o yaml`; `kubectl get ns <ns> --show-labels` |
+| Mọi Deployment ở mọi namespace bị chặn với `failed to find params` | `parameterNotFoundAction: Deny` mà ConfigMap tham số bị xoá | `kubectl -n policy-params get configmap` |
+| Biểu thức CEL sai mà policy vẫn tạo được | API server chỉ kiểm kiểu sau khi tạo | `kubectl get validatingadmissionpolicy <tên> -o jsonpath='{.status.typeChecking}'` |
+| `kubectl apply` policy Kyverno báo `deprecated` | Đang dùng `ClusterPolicy` (`kyverno.io/v1`) | Viết lại bằng loại policy `policies.kyverno.io/v1` |
+| Không có PolicyReport | Reports controller chưa quét xong, hoặc `evaluation.background.enabled` không bật | `kubectl -n kyverno logs deploy/kyverno-reports-controller \| tail` |
+| Sau bước 6, mọi lệnh tạo Deployment treo 10 giây | Quên `kill -CONT` | Chạy lại `docker exec k8-lab-control-plane kill -CONT "$PID"` (hoặc xoá pod admission controller để nó được tạo lại) |
+
+### Dọn dẹp
+
+K8.4 dùng tiếp Kyverno trong cụm này. Xoá các policy, namespace và RBAC của bài:
+
+<Callout kind="danger">
+
+Xoá namespace xoá mọi thứ bên trong. Kiểm `kubectl config current-context` ra `kind-k8-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k8/k8-3 && kubectl config current-context
+kubectl delete -f kyverno-policies.yaml -f psa-mac-dinh.yaml -f khoa-nhan-psa.yaml -f image-policy.yaml
+kubectl delete clusterrolebinding sua-namespace && kubectl delete clusterrole sua-namespace
+kubectl delete namespace team-a team-b team-c team-d team-e policy-params --wait=false
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k8-lab
+validatingpolicy.policies.kyverno.io "can-nhan-doi" deleted
+generatingpolicy.policies.kyverno.io "chan-ingress-mac-dinh" deleted
+mutatingadmissionpolicy.admissionregistration.k8s.io "psa-mac-dinh" deleted
+mutatingadmissionpolicybinding.admissionregistration.k8s.io "psa-mac-dinh" deleted
+validatingadmissionpolicy.admissionregistration.k8s.io "khoa-nhan-psa" deleted
+validatingadmissionpolicybinding.admissionregistration.k8s.io "khoa-nhan-psa" deleted
+validatingadmissionpolicy.admissionregistration.k8s.io "image-ghim-phien-ban" deleted
+validatingadmissionpolicybinding.admissionregistration.k8s.io "image-ghim-phien-ban" deleted
+clusterrolebinding.rbac.authorization.k8s.io "sua-namespace" deleted
+clusterrole.rbac.authorization.k8s.io "sua-namespace" deleted
+namespace "team-a" deleted
+namespace "team-b" deleted
+namespace "team-c" deleted
+namespace "team-d" deleted
+namespace "team-e" deleted
+namespace "policy-params" deleted
+```
+
+</Expected>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Viết VAP cho CVE-2020-8554 thế nào?">
+
+Luật cần nói: "chỉ nhóm nền tảng được đặt `spec.externalIPs` trên Service". Một bản tối thiểu:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata: { name: cam-external-ips }
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - { apiGroups: [""], apiVersions: ["v1"], operations: ["CREATE", "UPDATE"], resources: ["services"] }
+  matchConditions:
+    - { name: ngoai-nhom-nen-tang, expression: "!('masteva:nen-tang' in request.userInfo.groups)" }
+  validations:
+    - expression: "!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0"
+      message: "spec.externalIPs chỉ dành cho nhóm nền tảng (CVE-2020-8554)"
+```
+
+Cộng một binding `Deny`. Nếu cụm không cần `externalIPs` cho ai, Kubernetes có sẵn admission plugin `DenyServiceExternalIPs` (bật bằng cờ của API server) làm đúng việc đó mà không cần viết gì. Phía `status.loadBalancer` không cần policy: nó là subresource `services/status`, kiểm bằng RBAC.
+
+</Reveal>
+
+<Reveal title="Đóng khe tạo namespace với nhãn `privileged` ra sao?">
+
+Bước 2 chỉ xét `UPDATE`. Thêm `CREATE` vào `matchConstraints`, rồi ở `CREATE` yêu cầu tập nhãn PSA phải trùng đúng tập mà MutatingAdmissionPolicy của bước 3 điền (hoặc chặt hơn). Vì mutation chạy trước validation, một namespace tạo không nhãn sẽ đi qua (đã được điền `baseline`), còn namespace tự khai `privileged` bị chặn. Biểu thức cần phân biệt hai thao tác: `request.operation == 'CREATE'`. Cách đơn giản hơn ở nhiều tổ chức: chỉ đội nền tảng có quyền tạo namespace, đội ứng dụng xin namespace qua GitOps (D13) hay một nền tảng tự phục vụ.
+
+</Reveal>
+
+<Reveal title="Vì sao Kyverno chuyển từ pattern sang CEL?">
+
+Theo trang tổng quan của Kyverno, lý do là tương thích với hướng của chính Kubernetes: từ 1.30 API server đã tự chạy CEL trong VAP, và Kyverno muốn policy viết một lần chạy được ở cả hai nơi. ValidatingPolicy có tuỳ chọn `autogen` sinh ra một ValidatingAdmissionPolicy tương đương: luật chạy trong API server, không qua webhook, nhưng vẫn được Kyverno quản lý và báo cáo. Hệ quả cho người vận hành: kỹ năng viết CEL ở bước 1 tới 3 dùng thẳng cho Kyverno, và policy cũ viết bằng JMESPath cần một kế hoạch chuyển đổi trước khi lên Kyverno 1.20 (Kyverno có hướng dẫn chuyển đổi sang CEL trong tài liệu).
+
+</Reveal>
+
+<Reveal title="Có nên để policy engine canh cả namespace `kube-system`?">
+
+Chart Kyverno mặc định loại `kube-system` khỏi webhook vì lý do vận hành: nếu Kyverno chặn được việc tạo pod CoreDNS hay CNI, một sự cố của Kyverno kéo theo sự cố của cả mạng cụm, và Kyverno có thể không tự lên lại được. Đổi lại, kẻ có quyền tạo pod trong `kube-system` không bị policy nào canh. Cách cân bằng thường dùng: giữ loại trừ ở webhook, siết quyền ghi vào `kube-system` bằng RBAC (K2.3), dùng VAP (không có webhook nào để chết) cho vài luật bắt buộc áp cả ở đó, và dựa vào quét nền để **thấy** vi phạm trong `kube-system` dù không chặn.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết policy Kyverno rất nhanh, gần như luôn ở dạng `ClusterPolicy` với `validate.pattern`: thế hệ sắp bị gỡ. Yêu cầu rõ "Kyverno 1.19, `policies.kyverno.io/v1`, ValidatingPolicy bằng CEL", và đối chiếu tên trường với trang tài liệu. Với VAP, AI hay quên rằng `has()` cần cho trường tuỳ chọn (biểu thức lỗi lúc chạy thì `failurePolicy: Fail` chặn mọi thứ), viết so khớp tag `:latest` bằng `contains(':')` nên nhầm cổng registry, và đặt `failurePolicy: Ignore` "cho an toàn". Kiểm bằng cách của lab: `status.typeChecking`, một manifest vi phạm và một manifest hợp lệ ở chế độ `Warn`, rồi mới `Deny`.
+
+</Callout>
+
+<Callout kind="link">
+
+K8.1 là nền: PSA, ba chế độ và nhãn namespace mà bước 2, 3 bảo vệ và điền. K2.3 dạy RBAC và impersonation; K5.5 dạy ResourceQuota, một validating plugin có sẵn khác. K9.4 đi sâu phía operator: webhook tự viết, chứng chỉ và `failurePolicy`. K8.4 dùng Kyverno để kiểm chữ ký image; K8.5 đọc chú thích `Audit` của VAP trong audit log. D13 là nơi policy được quản lý như mã và đưa vào cụm; D15 nối policy trong cụm với quét IaC và tuân thủ ở mức tổ chức.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k8.3.mastery-chon-cong-cu">Với một danh sách luật của tổ chức, xếp được từng luật vào PSA, VAP, MAP hay Kyverno, có lý do về khả năng và rủi ro vận hành.</Check>
+
+<Check id="k8.3.mastery-trien-khai">Đưa được một luật mới vào cụm đang chạy theo trình tự Warn, Audit, đọc báo cáo, sửa workload, rồi Deny, mà không làm gãy triển khai nào.</Check>
+
+<Check id="k8.3.mastery-van-hanh-webhook">Thiết kế được cách chạy một policy engine dạng webhook trên production: số bản sao, loại trừ namespace, `failurePolicy` cho từng loại luật, theo dõi, và quy trình xử lý khi nó treo.</Check>
+
+</Mastery>

@@ -1,0 +1,682 @@
+---
+title: Audit log và CIS Kubernetes Benchmark
+description: Bật audit log cho API server với một policy vừa đủ - ghi ai đổi quyền, ai đọc Secret, ai exec vào pod, nhưng không bao giờ ghi nội dung Secret - rồi dùng jq lần ra một chuỗi hành động; chạy kube-bench để chấm cụm theo CIS Kubernetes Benchmark, đọc FAIL nào đáng sửa, và sửa hai mục có giá trị thật là mã hoá Secret trong etcd và tắt profiling.
+id: k8.5
+step: k8
+prerequisites: [k8.1, d13.5]
+topics: [k8.audit-log, k8.cis-benchmark]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    etcd: 3.7.0
+    kube-bench: v0.16.0
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+Admission (K8.1 tới K8.4) chặn điều được biết trước là sai. Bài này lo hai câu hỏi còn lại của một cụm production: **sau sự cố, ai đã làm gì**, và **cụm có đang cấu hình theo chuẩn được công nhận không**. Học xong, bạn:
+
+- Viết được audit policy cân bằng giữa đủ dấu vết và dung lượng, và giải thích được vì sao thứ tự rule quyết định một Secret có bị ghi nguyên văn vào log hay không.
+- Lần được trong audit log: ai đọc một Secret (kể cả qua impersonation), ai exec vào pod, ai tạo một ClusterRoleBinding cho quyền admin.
+- Chạy được kube-bench, đọc kết quả, phân biệt mục nào là đặc thù của kind, mục nào đáng sửa trên cụm thật.
+- Bật được mã hoá Secret trong etcd và chứng minh điều đó bằng cách đọc thẳng etcd.
+
+</Goal>
+
+<Knowledge>
+
+### Audit log ghi gì
+
+Mỗi yêu cầu tới API server có thể sinh một **audit event**: một dòng JSON ghi ai (`user`, `groups`, `impersonatedUser`), từ đâu (`sourceIPs`, `userAgent`), làm gì (`verb`, `objectRef` gồm namespace, resource, tên, subresource), kết quả (`responseStatus.code`), và chú thích từ các bước kiểm quyền và admission (`annotations`: RBAC cho phép theo binding nào, PSA vi phạm gì, VAP ở chế độ `Audit`). Mặc định audit log **tắt**; bật bằng hai cờ của API server: `--audit-policy-file` (ghi gì) và `--audit-log-path` (ghi vào đâu).
+
+Một yêu cầu đi qua các **stage**, mỗi stage có thể sinh một event:
+
+| Stage | Khi nào |
+|---|---|
+| `RequestReceived` | Vừa nhận, chưa xử lý. Thường bỏ (`omitStages`) vì trùng với event sau |
+| `ResponseStarted` | Đã gửi header, chưa xong body. Chỉ có với yêu cầu chạy lâu: `watch`, `exec`, `port-forward` |
+| `ResponseComplete` | Xong. Event chính của hầu hết yêu cầu |
+| `Panic` | API server panic khi xử lý |
+
+**Audit policy** là danh sách rule. Mỗi event được so với các rule **theo thứ tự**, rule khớp **đầu tiên** quyết định mức ghi:
+
+| Mức | Ghi |
+|---|---|
+| `None` | Không ghi |
+| `Metadata` | Ai, cái gì, kết quả; không có body |
+| `Request` | Thêm body của yêu cầu (object người dùng gửi lên) |
+| `RequestResponse` | Thêm body của phản hồi |
+
+Vì rule đầu tiên thắng, rule cho Secret phải đứng **trước** rule chung "ghi body của mọi thao tác ghi". Đảo ngược, lệnh `kubectl create secret` sẽ ghi nguyên giá trị Secret (chỉ được mã hoá base64) vào file log, nơi thường được đẩy sang hệ thống log tập trung với quyền đọc rộng hơn nhiều so với quyền đọc Secret trong cụm. Cùng lý do áp cho ConfigMap (hay chứa cấu hình nhạy cảm) và `TokenReview`, `serviceaccounts/token` (body chứa token).
+
+Một policy thực dụng đi từ trên xuống: bỏ những gì ồn và vô ích (health check, `watch` của thành phần hệ thống, lease, event); Secret, ConfigMap, token ở `Metadata`; `exec`, `attach`, `port-forward` ở `Metadata`; thay đổi RBAC ở `RequestResponse` (muốn biết chính xác quyền gì được cấp); mọi thao tác ghi khác ở `Request`; còn lại `Metadata`.
+
+<Check id="k8.5.audit-policy">Kể được bốn mức và các stage của audit, giải thích được vì sao thứ tự rule quyết định Secret có bị ghi body hay không, và sắp được một policy theo thứ tự hợp lý.</Check>
+
+### Backend, dung lượng, và đọc log
+
+Hai **backend** gửi event đi:
+
+- **Log**: ghi file JSON trên node control plane. Xoay vòng bằng `--audit-log-maxsize` (MB mỗi file), `--audit-log-maxbackup` (số file cũ giữ lại), `--audit-log-maxage` (số ngày). Một agent log (Alloy, D12.5) đọc file và đẩy về kho tập trung.
+- **Webhook**: API server gửi event theo lô tới một dịch vụ HTTP (cấu hình bằng file kubeconfig qua `--audit-webhook-config-file`). Không phụ thuộc đĩa của node, nhưng dịch vụ nhận chậm thì event bị dồn trong bộ đệm của API server.
+
+Audit log có giá: tài liệu Kubernetes ghi audit làm API server dùng thêm bộ nhớ vì phải giữ ngữ cảnh của mỗi yêu cầu, và log ở mức `Request` cho mọi thao tác ghi trên một cụm bận dễ lên hàng GB mỗi ngày. Mức `None` cho `get`/`list`/`watch` của thành phần hệ thống là rule tiết kiệm nhiều nhất. Trên cụm managed, bạn không sửa được policy: EKS, GKE, AKS mỗi nơi có policy riêng và đẩy event về dịch vụ log của họ (phải bật, và trả tiền theo dung lượng).
+
+Ba câu hỏi điều tra hay gặp và trường trả lời chúng:
+
+| Câu hỏi | Lọc theo |
+|---|---|
+| Ai đọc Secret `db`? | `objectRef.resource == "secrets"`, `objectRef.name`, `verb == "get"`; người thật có thể nằm ở `user` và danh tính được dùng ở `impersonatedUser` |
+| Ai exec vào pod nào, chạy lệnh gì? | `objectRef.subresource == "exec"`; lệnh nằm trong `requestURI` (`?command=…`), không có output |
+| Ai cấp quyền admin? | `objectRef.apiGroup == "rbac.authorization.k8s.io"`, `verb == "create"`; `requestObject.roleRef` và `subjects` (cần mức `Request` trở lên) |
+
+<Check id="k8.5.doc-log">Phân biệt được backend log và webhook cùng cách xoay vòng file, ước lượng được thứ gì làm audit log phình, và chỉ ra được trường nào trả lời câu hỏi "ai đọc Secret", "ai exec", "ai cấp quyền".</Check>
+
+### CIS Kubernetes Benchmark và kube-bench
+
+**CIS Kubernetes Benchmark** (Center for Internet Security) là danh sách khuyến nghị cấu hình cho cụm, viết theo từng dải phiên bản Kubernetes. Mỗi mục có mô tả, lý do, cách kiểm và cách sửa, và được xếp loại:
+
+| Phân loại | Ý nghĩa |
+|---|---|
+| Level 1 | Thực dụng, ít ảnh hưởng chức năng; nên áp cho mọi cụm |
+| Level 2 | Phòng thủ sâu hơn, có thể ảnh hưởng chức năng hoặc vận hành |
+| Automated | Kiểm được bằng máy (cờ có mặt, quyền file) |
+| Manual | Cần người đánh giá (ví dụ "mã hoá được cấu hình phù hợp") |
+
+Các phần chính: 1 Control plane (file cấu hình, API server, controller manager, scheduler), 2 etcd, 3 cấu hình control plane (xác thực, audit), 4 worker node (kubelet), 5 policy (RBAC, Pod Security, NetworkPolicy, Secret).
+
+**kube-bench** (Aqua Security) chạy các bài kiểm của benchmark trên một node: đọc tham số của tiến trình (`ps`), file cấu hình, quyền file. Nó chạy như một Job với `hostPID: true` và các thư mục của node mount vào, nên namespace của nó cần `privileged` (K8.1). Kết quả mỗi mục là `PASS`, `FAIL`, `WARN` (thường là mục Manual, cần người xem) hoặc `INFO`.
+
+Ba điều cần biết trước khi đọc kết quả:
+
+- **Phiên bản.** kube-bench 0.16.0 (08/2026) có bộ kiểm mới nhất là `cis-1.12`, ánh xạ tới Kubernetes 1.32–1.34. Với 1.37, bạn chỉ định `--benchmark cis-1.12` và chấp nhận vài mục có thể không còn khớp hoàn toàn.
+- **"or as appropriate".** Nhiều mục ghi một con số kèm "hoặc phù hợp" (`--audit-log-maxage` 30 ngày). kube-bench so với con số; giá trị của bạn có lý do (dung lượng đĩa, đã có kho log tập trung) thì `FAIL` đó là chấp nhận được, kèm ghi chú.
+- **Ai sở hữu node.** Trên kind, nhiều mục phần 1 và 4 nói về file của container node mà kind tạo, không phải thứ bạn vận hành. Trên cụm managed, control plane không thuộc về bạn: dùng benchmark riêng (`eks-…`, `gke-…`, `aks-…`) chỉ có phần node và policy.
+
+<Check id="k8.5.cis">Kể được cấu trúc và cách phân loại của CIS Kubernetes Benchmark, giải thích được kube-bench chạy thế nào và vì sao cần quyền của node, và nêu được ba lưu ý khi đọc kết quả.</Check>
+
+### Mã hoá Secret trong etcd
+
+K4.5 đã chỉ ra Secret nằm ở `/registry/secrets/<namespace>/<tên>` trong etcd, mặc định không mã hoá: ai có bản snapshot etcd hay đọc được đĩa của etcd là đọc được mọi Secret. CIS mục 1.2.27 và 1.2.28 yêu cầu bật **encryption at rest**: API server mã hoá object trước khi ghi vào etcd, theo file `EncryptionConfiguration` truyền qua `--encryption-provider-config`.
+
+| Provider | Đánh giá trong tài liệu Kubernetes |
+|---|---|
+| `identity` | Không mã hoá (mặc định) |
+| `aescbc` | Không khuyến nghị (CBC dễ bị tấn công padding oracle) |
+| `aesgcm` | Nhanh, nhưng phải xoay khoá thường xuyên |
+| `secretbox` | Mạnh, khoá 32 byte; khoá nằm trong file trên node control plane |
+| `kms` v2 | Mạnh nhất: khoá thật nằm trong KMS ngoài cụm, API server chỉ giữ khoá dữ liệu tạm |
+
+Provider đầu danh sách dùng để **mã hoá**; mọi provider trong danh sách được thử khi **giải mã**, nên giữ `identity` ở cuối để còn đọc được dữ liệu cũ. Bật mã hoá không mã hoá lại dữ liệu đã có: phải ghi lại từng Secret (`kubectl get secrets -A -o json | kubectl replace -f -`). Với `secretbox`, khoá nằm cạnh etcd trên cùng node control plane, nên nó chống được snapshot hay đĩa etcd bị lộ riêng lẻ, không chống được kẻ đã chiếm node đó; KMS là bước tiếp theo, thuộc D15.
+
+<Callout kind="production">
+
+Ngày 21/04/2023, Aqua Security [công bố chiến dịch "RBAC Buster"](https://www.aquasec.com/blog/leveraging-kubernetes-rbac-to-backdoor-clusters/) mà họ ghi được trên một honeypot Kubernetes. Lối vào là một API server cấu hình sai, nhận yêu cầu không xác thực từ người dùng ẩn danh có quyền. Kẻ tấn công liệt kê Secret và tài nguyên trong `kube-system`, xoá một số Deployment mà nhóm nghiên cứu cho là của đối thủ đào coin khác, rồi tạo một ClusterRole gần như quyền admin, một ServiceAccount `kube-controller` trong `kube-system`, và một ClusterRoleBinding tên `system:controller:kube-controller`, cái tên mà bài viết mô tả là trông như của hệ thống. Cuối cùng họ tạo một DaemonSet chạy image `kuberntesio/kube-controller:1.0.1` (sai chính tả của tài khoản `kubernetesio`) để đào Monero trên mọi node. Khoá AWS mà nhóm nghiên cứu cài sẵn trong cụm bị thử dùng ngay trong ngày. Aqua tìm thấy dấu vết của cùng kẻ tấn công trên 60 cụm khác đang mở ra Internet; image được kéo 14.399 lần trong khoảng năm tháng.
+
+Đối chiếu của bài: lối vào là đúng thứ CIS mục 1.2.1 (`--anonymous-auth`) và phần 5.1 (RBAC tối thiểu) kiểm. Dấu vết để lại là đúng các câu hỏi ở bảng trên: `list secrets`, `delete deployments`, `create clusterrolebindings`, với `user.username` là `system:anonymous`. Một audit policy ghi RBAC ở `RequestResponse` cho thấy cả `roleRef` lẫn `subjects` của binding, thứ một cái tên "trông như hệ thống" không che được. Bước 2 của lab tái hiện phần dấu vết đó.
+
+</Callout>
+
+</Knowledge>
+
+<Resources>
+
+- [Auditing](https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/): stage, mức, thứ tự rule, backend log và webhook, ví dụ policy.
+- [kube-apiserver Audit Configuration (v1)](https://kubernetes.io/docs/reference/config-api/apiserver-audit.v1/): đủ trường của `Policy` và của một audit event, dùng khi viết truy vấn `jq`.
+- [CIS Kubernetes Benchmarks](https://www.cisecurity.org/benchmark/kubernetes): trang tải benchmark (cần đăng ký miễn phí); [kube-bench](https://github.com/aquasecurity/kube-bench) cho cách chạy và ánh xạ phiên bản.
+- [Encrypting Confidential Data at Rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/): bảng provider, thứ tự provider, ghi lại dữ liệu cũ và xoay khoá.
+- [Aqua: First-Ever Attack Leveraging Kubernetes RBAC to Backdoor Clusters](https://www.aquasec.com/blog/leveraging-kubernetes-rbac-to-backdoor-clusters/): nguồn của callout.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài tạo lại cụm `k8-lab` với audit log, giữ cấu hình PSA của K8.1. Kyverno của K8.3, K8.4 mất theo cụm cũ; các bài sau không cần nó.
+
+**Profile máy.** Node kind khoảng 0,7 tới 0,9 GiB RAM của Docker. Lab tải image kube-bench (khoảng 50 MB). File audit log tăng khoảng 1 tới 3 MB trong suốt bài.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá cụm `k8-lab` cùng mọi thứ trong nó. Các file trong `~/masteva-k8` vẫn còn.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-k8/kubeconfig
+kind delete cluster --name k8-lab
+```
+
+</Terminal>
+
+### 1. Cụm có audit log
+
+Policy đi từ trên xuống đúng như mục Kiến thức. Comment trong file đánh số từng nhóm rule.
+
+<Terminal where="mac" title="~/masteva-k8/apiserver/audit-policy.yaml">
+
+```bash
+mkdir -p ~/masteva-k8/audit ~/masteva-k8/k8-5 && cd ~/masteva-k8
+cat > apiserver/audit-policy.yaml <<'EOF'
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  # 1. Ồn và vô ích cho điều tra
+  - level: None
+    nonResourceURLs: ["/healthz*", "/livez*", "/readyz*", "/version", "/openapi*"]
+  - level: None
+    users: ["system:kube-proxy", "system:kube-scheduler", "system:kube-controller-manager", "system:apiserver"]
+    verbs: ["get", "list", "watch"]
+  - level: None
+    userGroups: ["system:nodes"]
+    verbs: ["get", "list", "watch"]
+  - level: None
+    resources:
+      - { group: "coordination.k8s.io", resources: ["leases"] }
+      - { group: "", resources: ["events"] }
+  # 2. Secret, ConfigMap, token: chỉ metadata, không bao giờ body
+  - level: Metadata
+    resources:
+      - { group: "", resources: ["secrets", "configmaps", "serviceaccounts/token"] }
+      - { group: "authentication.k8s.io", resources: ["tokenreviews"] }
+  # 3. Vào bên trong pod
+  - level: Metadata
+    resources:
+      - { group: "", resources: ["pods/exec", "pods/attach", "pods/portforward"] }
+  # 4. Đổi quyền: ghi cả yêu cầu lẫn phản hồi
+  - level: RequestResponse
+    resources:
+      - { group: "rbac.authorization.k8s.io" }
+  # 5. Mọi thao tác ghi khác: body của yêu cầu
+  - level: Request
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+  # 6. Còn lại
+  - level: Metadata
+EOF
+```
+
+</Terminal>
+
+Cấu hình cụm như K8.1, thêm năm cờ audit và một chỗ gắn thư mục log: `audit` trên máy bạn được gắn vào `/var/log/kubernetes/audit` của node, rồi vào pod API server, nên bạn đọc log bằng `jq` ngay trên máy. Xoay vòng đặt nhỏ (20 MB, 3 file, 7 ngày) cho hợp một máy học.
+
+<Terminal where="mac" title="~/masteva-k8/kind.yaml">
+
+```bash
+cat > kind.yaml <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k8-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraMounts:
+      - hostPath: $HOME/masteva-k8/apiserver
+        containerPath: /etc/kubernetes/masteva
+        readOnly: true
+      - hostPath: $HOME/masteva-k8/seccomp
+        containerPath: /var/lib/kubelet/seccomp/profiles
+        readOnly: true
+      - hostPath: $HOME/masteva-k8/audit
+        containerPath: /var/log/kubernetes/audit
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            - name: admission-control-config-file
+              value: /etc/kubernetes/masteva/admission.yaml
+            - name: audit-policy-file
+              value: /etc/kubernetes/masteva/audit-policy.yaml
+            - name: audit-log-path
+              value: /var/log/kubernetes/audit/audit.log
+            - name: audit-log-maxsize
+              value: "20"
+            - name: audit-log-maxbackup
+              value: "3"
+            - name: audit-log-maxage
+              value: "7"
+          extraVolumes:
+            - name: masteva
+              hostPath: /etc/kubernetes/masteva
+              mountPath: /etc/kubernetes/masteva
+              readOnly: true
+              pathType: Directory
+            - name: audit-log
+              hostPath: /var/log/kubernetes/audit
+              mountPath: /var/log/kubernetes/audit
+              readOnly: false
+              pathType: DirectoryOrCreate
+EOF
+kind create cluster --config kind.yaml > /dev/null 2>&1 || echo "kind create cluster lỗi: chạy lại 'kind create cluster --config kind.yaml' để xem lý do"
+kubectl wait --for=condition=Ready node --all --timeout=180s
+ls ~/masteva-k8/audit
+jq -r '.user.username' ~/masteva-k8/audit/audit.log | sort | uniq -c | sort -rn | head -5
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/k8-lab-control-plane condition met
+audit.log
+ 212 system:apiserver
+  72 kubernetes-admin
+  58 system:kube-controller-manager
+  46 system:node:k8-lab-control-plane
+  10 system:serviceaccount:kube-system:deployment-controller
+```
+
+</Expected>
+
+Số đếm và thứ tự trên máy bạn sẽ khác, tuỳ lúc bạn chạy lệnh. Ngay khi cụm vừa lên, log đã có vài trăm event: API server (`system:apiserver`) tạo các role, binding và namespace mặc định lúc khởi động, `kubeadm` (danh tính `kubernetes-admin`) tạo cấu hình ban đầu, kubelet của node đăng ký và cập nhật trạng thái. Event của `system:kube-controller-manager` còn lại toàn là thao tác ghi; các lệnh đọc của nó đã bị rule nhóm 1 bỏ.
+
+### 2. Một chuỗi hành động, rồi lần ra
+
+Khối dưới làm vài việc mà một cuộc điều tra hay phải tìm lại: tạo Secret, cho một ServiceAccount quyền đọc nó rồi đọc **dưới danh tính đó** (K2.3 đã dùng `--as` với `auth can-i` để hỏi quyền; ở đây `--as` gửi yêu cầu thật dưới danh tính khác, gọi là impersonation), exec vào một pod, và giả lập phần cuối của RBAC Buster: user `an` được cấp quyền admin, rồi `an` tạo một ClusterRoleBinding mang tên "trông như hệ thống".
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k8/k8-5
+kubectl create namespace pay
+kubectl -n pay create secret generic db --from-literal=password=s3cr3t-2026
+kubectl -n pay create serviceaccount ci
+kubectl -n pay create role doc-secret --verb=get --resource=secrets
+kubectl -n pay create rolebinding ci-doc-secret --role=doc-secret --serviceaccount=pay:ci
+kubectl -n pay get secret db -o jsonpath='{.data.password}' --as=system:serviceaccount:pay:ci | base64 -d; echo
+kubectl -n pay run sh --image=busybox:1.38.0 --restart=Never -- sleep 3600 2>&1 | grep -v '^Warning'
+kubectl -n pay wait --for=condition=Ready pod/sh --timeout=60s
+kubectl -n pay exec sh -- cat /etc/hostname
+kubectl create clusterrolebinding an-admin --clusterrole=cluster-admin --user=an
+kubectl create clusterrolebinding system:controller:kube-controller --clusterrole=cluster-admin \
+  --serviceaccount=kube-system:default --as=an
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/pay created
+secret/db created
+serviceaccount/ci created
+role.rbac.authorization.k8s.io/doc-secret created
+rolebinding.rbac.authorization.k8s.io/ci-doc-secret created
+s3cr3t-2026
+pod/sh created
+pod/sh condition met
+sh
+clusterrolebinding.rbac.authorization.k8s.io/an-admin created
+clusterrolebinding.rbac.authorization.k8s.io/system:controller:kube-controller created
+```
+
+</Expected>
+
+Câu hỏi thứ nhất: ai đã đọc Secret `db`?
+
+<Terminal where="mac">
+
+```bash
+jq -c 'select(.objectRef.resource == "secrets" and .objectRef.name == "db")
+  | {verb, user: .user.username, as: .impersonatedUser.username, ip: .sourceIPs[0], code: .responseStatus.code, level}' \
+  ~/masteva-k8/audit/audit.log
+grep -c 's3cr3t-2026\|czNjcjN0LTIwMjY=' ~/masteva-k8/audit/audit.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"verb":"create","user":"kubernetes-admin","as":null,"ip":"172.20.0.1","code":201,"level":"Metadata"}
+{"verb":"get","user":"kubernetes-admin","as":"system:serviceaccount:pay:ci","ip":"172.20.0.1","code":200,"level":"Metadata"}
+0
+```
+
+</Expected>
+
+Lệnh `grep` cuối in `0`: giá trị Secret, ở dạng gốc lẫn base64, không có trong log, vì rule nhóm 2 (`Metadata`) đứng trước rule nhóm 5 (`Request`). Event `get` cho thấy cả hai danh tính: người thật (`kubernetes-admin`, tức chứng chỉ admin của bạn) và danh tính được mượn (`ci`). Nếu chỉ nhìn quyền RBAC, bạn sẽ kết luận "chỉ `ci` đọc được Secret này"; audit log cho biết ai thật sự đứng sau. `sourceIPs` là địa chỉ của máy bạn nhìn từ network của kind (địa chỉ trên máy bạn tuỳ dải mạng `kind` của Docker); trên cụm thật đó là IP của client hoặc của load balancer phía trước API server.
+
+Câu hỏi thứ hai và thứ ba: ai exec vào đâu, chạy gì; ai cấp quyền admin cho ai.
+
+<Terminal where="mac">
+
+```bash
+jq -c 'select(.objectRef.subresource == "exec") | {stage, user: .user.username, pod: (.objectRef.namespace + "/" + .objectRef.name), uri: .requestURI}' \
+  ~/masteva-k8/audit/audit.log
+jq -c 'select(.objectRef.resource == "clusterrolebindings" and .verb == "create" and (.user.username | startswith("system:") | not))
+  | {user: .user.username, as: .impersonatedUser.username, name: .objectRef.name, role: .requestObject.roleRef.name,
+     subjects: [.requestObject.subjects[]? | .kind + ":" + .name], code: .responseStatus.code}' \
+  ~/masteva-k8/audit/audit.log | tail -2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"stage":"ResponseStarted","user":"kubernetes-admin","pod":"pay/sh","uri":"/api/v1/namespaces/pay/pods/sh/exec?command=cat&command=%2Fetc%2Fhostname&container=sh&stderr=true&stdout=true"}
+{"stage":"ResponseComplete","user":"kubernetes-admin","pod":"pay/sh","uri":"/api/v1/namespaces/pay/pods/sh/exec?command=cat&command=%2Fetc%2Fhostname&container=sh&stderr=true&stdout=true"}
+{"user":"kubernetes-admin","as":null,"name":"an-admin","role":"cluster-admin","subjects":["User:an"],"code":201}
+{"user":"kubernetes-admin","as":"an","name":"system:controller:kube-controller","role":"cluster-admin","subjects":["ServiceAccount:default"],"code":201}
+```
+
+</Expected>
+
+`exec` là yêu cầu chạy lâu nên có hai event (`ResponseStarted` khi phiên mở, `ResponseComplete` khi đóng); lệnh nằm trong `requestURI`, còn những gì gõ trong một shell tương tác thì không, vì audit chỉ thấy yêu cầu mở phiên. Phần đó cần công cụ quan sát lúc chạy (K8.6). Hai dòng cuối kể lại cả chuỗi: ai cấp quyền cho `an`, rồi `an` tạo binding có tên giống hệ thống nhưng `roleRef` là `cluster-admin` và subject là ServiceAccount `default` của `kube-system`. Lệnh lọc bỏ các user bắt đầu bằng `system:` để không lẫn với binding mà `kubeadm` và API server tạo lúc dựng cụm; `tail -2` giữ hai dòng của bài.
+
+Audit log còn là nơi chế độ `audit` của PSA (K8.1) ghi vi phạm:
+
+<Terminal where="mac">
+
+```bash
+jq -r 'select(.annotations["pod-security.kubernetes.io/audit-violations"] != null)
+  | "\(.objectRef.namespace)/\(.objectRef.name): \(.annotations["pod-security.kubernetes.io/audit-violations"][0:90])"' \
+  ~/masteva-k8/audit/audit.log
+ls -lh ~/masteva-k8/audit/audit.log | awk '{print $5}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pay/sh: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (containe
+1.1M
+```
+
+</Expected>
+
+Đây là danh sách mà đội nền tảng cần trước khi nâng mức `enforce` của cả cụm: pod nào, namespace nào, vi phạm gì, ai tạo (trường `user` của cùng event). Dung lượng file trên máy bạn sẽ khác chút ít; để ý nó tăng thế nào khi bạn làm tiếp các bước sau.
+
+<Check id="k8.5.lab-audit">Bật được audit log cho cụm kind với policy có thứ tự đúng, và dùng `jq` trả lời được: ai đọc Secret (kể cả qua impersonation), ai exec vào pod nào, ai tạo ClusterRoleBinding nào với role và subject gì; chứng minh được giá trị Secret không nằm trong log.</Check>
+
+### 3. Chấm cụm bằng kube-bench
+
+Lấy `job.yaml` từ đúng tag v0.16.0 của kube-bench, đổi image sang bản ghim digest và chỉ định benchmark `cis-1.12` cùng các phần cần chạy, rồi chạy trong namespace `kube-bench` ở mức `privileged` (Job cần `hostPID` và nhiều `hostPath`).
+
+<Terminal where="mac" title="~/masteva-k8/k8-5/job.yaml">
+
+```bash
+cd ~/masteva-k8/k8-5
+curl -fsSL https://raw.githubusercontent.com/aquasecurity/kube-bench/v0.16.0/job.yaml -o job.yaml
+yq -i '.spec.template.spec.containers[0].image = "docker.io/aquasec/kube-bench:v0.16.0@sha256:75506f222d1eb6ce2a751a5533bdc0a3b54c898e2e49e7751d0ee22cfb862679"
+  | .spec.template.spec.containers[0].command = ["kube-bench", "run", "--benchmark", "cis-1.12", "--targets", "master,etcd,node,policies"]' job.yaml
+kubectl create namespace kube-bench
+kubectl label namespace kube-bench pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/warn=privileged
+kubectl -n kube-bench apply -f job.yaml
+kubectl -n kube-bench wait --for=condition=complete job/kube-bench --timeout=300s
+kubectl -n kube-bench logs job/kube-bench > ket-qua-1.txt
+grep -A4 '^== Summary total' ket-qua-1.txt
+grep '^\[FAIL\]' ket-qua-1.txt
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/kube-bench created
+namespace/kube-bench labeled
+job.batch/kube-bench created
+job.batch/kube-bench condition met
+== Summary total ==
+64 checks PASS
+11 checks FAIL
+51 checks WARN
+0 checks INFO
+[FAIL] 1.1.12 Ensure that the etcd data directory ownership is set to etcd:etcd (Automated)
+[FAIL] 1.2.5 Ensure that the --kubelet-certificate-authority argument is set as appropriate (Automated)
+[FAIL] 1.2.15 Ensure that the --profiling argument is set to false (Automated)
+[FAIL] 1.2.17 Ensure that the --audit-log-maxage argument is set to 30 or as appropriate (Automated)
+[FAIL] 1.2.18 Ensure that the --audit-log-maxbackup argument is set to 10 or as appropriate (Automated)
+[FAIL] 1.2.19 Ensure that the --audit-log-maxsize argument is set to 100 or as appropriate (Automated)
+[FAIL] 1.2.30 Ensure that the --service-account-extend-token-expiration parameter is set to false (Automated)
+[FAIL] 1.3.2 Ensure that the --profiling argument is set to false (Automated)
+[FAIL] 1.4.1 Ensure that the --profiling argument is set to false (Automated)
+[FAIL] 4.1.1 Ensure that the kubelet service file permissions are set to 600 or more restrictive (Automated)
+[FAIL] 4.1.9 If the kubelet config.yaml configuration file is being used validate permissions set to 600 or more restrictive (Automated)
+```
+
+</Expected>
+
+Job mất khoảng nửa phút tới một phút (kéo image lần đầu). Đọc mười một dòng `FAIL` theo ba nhóm:
+
+| Nhóm | Mục | Đánh giá |
+|---|---|---|
+| Đặc thù của kind | 1.1.12 (chủ sở hữu thư mục etcd, node kind không có user `etcd`), 4.1.1, 4.1.9 (quyền file kubelet trong image node của kind) | Thuộc về cách kind đóng gói node. Trên cụm kubeadm tự dựng (K4.1), sửa bằng `chown`/`chmod` trong bước chuẩn bị node |
+| "Or as appropriate" | 1.2.17 tới 1.2.19 (xoay vòng audit log) | `FAIL` vì bước 1 đặt 7 ngày, 3 file, 20 MB. Hợp lý nếu log được đẩy về kho tập trung; ghi chú lý do thay vì "sửa" |
+| Đáng xem trên cụm thật | 1.2.15, 1.3.2, 1.4.1 (`--profiling`), 1.2.5 (API server kiểm chứng chỉ kubelet), 1.2.30 (token ServiceAccount gia hạn) | `--profiling` mở endpoint `/debug/pprof` lộ chi tiết nội bộ; 1.2.5 cần kubelet có chứng chỉ serving do CA của cụm ký |
+
+Nhiều mục quan trọng nằm ở `WARN` vì là Manual, ví dụ 1.2.27 và 1.2.28 về mã hoá dữ liệu trong etcd. Đọc cả phần `WARN`, không chỉ đếm `FAIL`.
+
+<Check id="k8.5.lab-kube-bench">Chạy được kube-bench như một Job với benchmark chỉ định, đọc được tổng kết và các `FAIL`, và xếp được từng `FAIL` vào nhóm đặc thù môi trường, chấp nhận có lý do, hay cần sửa.</Check>
+
+### 4. Sửa hai mục: mã hoá Secret và tắt profiling
+
+Trên cụm kubeadm, cách sửa mà benchmark ghi là "sửa file `/etc/kubernetes/manifests/kube-apiserver.yaml`": kubelet thấy file đổi và tạo lại static pod API server (K4.1). Làm đúng như vậy trong node kind. File `EncryptionConfiguration` đặt vào thư mục `apiserver` đã được gắn sẵn vào pod API server, nên không cần thêm volume.
+
+Trước hết, Secret `db` đang nằm trong etcd thế nào. `etcdctl` có sẵn trong pod etcd; hàm `etcd_get` đọc thẳng một key, bỏ qua API server:
+
+<Terminal where="mac">
+
+```bash
+etcd_get() { kubectl -n kube-system exec etcd-k8-lab-control-plane -- etcdctl \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key get "$1" --print-value-only; }
+etcd_get /registry/secrets/pay/db | head -c 3; echo
+etcd_get /registry/secrets/pay/db | strings | grep s3cr3t
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k8s
+s3cr3t-2026
+```
+
+</Expected>
+
+Ba byte đầu `k8s` là tiền tố của định dạng protobuf mà Kubernetes dùng để lưu object; ngay trong đó, mật khẩu nằm nguyên văn. Giờ tạo khoá `secretbox` ngẫu nhiên 32 byte, viết cấu hình, và thêm hai cờ vào manifest:
+
+<Callout kind="danger">
+
+Sửa manifest API server làm API server khởi động lại; cụm không nhận lệnh trong khoảng nửa phút tới một phút. File `encryption.yaml` chứa khoá giải mã mọi Secret: mất file là mất Secret đã mã hoá, lộ file là lộ chúng. Trên cụm thật, sao lưu khoá cùng bản sao lưu etcd (K4.5), nhưng ở nơi khác.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-k8/apiserver/encryption.yaml">
+
+```bash
+cat > ~/masteva-k8/apiserver/encryption.yaml <<EOF
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources: ["secrets"]
+    providers:
+      - secretbox:
+          keys:
+            - name: khoa-2026-10
+              secret: $(head -c 32 /dev/urandom | base64)
+      - identity: {}
+EOF
+chmod 600 ~/masteva-k8/apiserver/encryption.yaml
+docker exec k8-lab-control-plane sed -i \
+  's|^    - kube-apiserver$|    - kube-apiserver\n    - --encryption-provider-config=/etc/kubernetes/masteva/encryption.yaml\n    - --profiling=false|' \
+  /etc/kubernetes/manifests/kube-apiserver.yaml
+for i in $(seq 1 90); do
+  kubectl -n kube-system get pod kube-apiserver-k8-lab-control-plane -o yaml 2>/dev/null | grep -q encryption-provider-config \
+    && kubectl get --raw /readyz > /dev/null 2>&1 && break
+  sleep 2
+done
+kubectl get --raw /readyz; echo
+etcd_get /registry/secrets/pay/db | head -c 34 | LC_ALL=C tr -c '[:print:]' '.'; echo
+kubectl get secrets -A -o json | kubectl replace -f - > /dev/null
+etcd_get /registry/secrets/pay/db | head -c 34 | LC_ALL=C tr -c '[:print:]' '.'; echo
+kubectl -n pay get secret db -o jsonpath='{.data.password}' | base64 -d; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ok
+k8s.....v1..Secret........db....pa
+k8s:enc:secretbox:v1:khoa-2026-10:
+s3cr3t-2026
+```
+
+</Expected>
+
+Vòng chờ dừng khi pod API server mới (mang cờ mới) đã lên và trả lời `/readyz`; nó thường mất 30 tới 60 giây. Sau đó Secret `db` **vẫn chưa mã hoá**: mã hoá chỉ áp cho lần ghi kế tiếp. `kubectl replace` ghi lại mọi Secret, và giờ key trong etcd bắt đầu bằng `k8s:enc:secretbox:v1:khoa-2026-10:`, phần sau là dữ liệu mã hoá. Qua API server, Secret vẫn đọc ra bình thường. Lệnh `tr` thay byte không in được bằng dấu chấm (`LC_ALL=C` để `tr` coi dữ liệu là byte thô; với locale UTF-8 mặc định của Terminal nó báo `Illegal byte sequence`), để bạn thấy 34 byte đầu của giá trị trước và sau: trước là protobuf đọc được (`v1`, `Secret`, `db`, `pay`), sau là tiền tố cho biết provider và tên khoá.
+
+Chạy lại kube-bench để xác nhận:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k8/k8-5
+kubectl -n kube-bench delete job kube-bench
+kubectl -n kube-bench apply -f job.yaml
+kubectl -n kube-bench wait --for=condition=complete job/kube-bench --timeout=300s
+kubectl -n kube-bench logs job/kube-bench > ket-qua-2.txt
+grep -E '^\[(PASS|FAIL|WARN)\] 1\.2\.(15|27|28) ' ket-qua-2.txt
+grep -A4 '^== Summary total' ket-qua-2.txt
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+job.batch "kube-bench" deleted from kube-bench namespace
+job.batch/kube-bench created
+job.batch/kube-bench condition met
+[PASS] 1.2.15 Ensure that the --profiling argument is set to false (Automated)
+[PASS] 1.2.27 Ensure that the --encryption-provider-config argument is set as appropriate (Manual)
+[PASS] 1.2.28 Ensure that encryption providers are appropriately configured (Manual)
+== Summary total ==
+67 checks PASS
+10 checks FAIL
+49 checks WARN
+0 checks INFO
+```
+
+</Expected>
+
+Ba mục chuyển sang `PASS`. Sửa manifest trực tiếp chỉ là nửa việc: lần `kubeadm upgrade` tiếp theo (K4.3) sinh lại manifest từ cấu hình kubeadm và xoá hai cờ này. Trên cụm thật, thêm chúng vào `ClusterConfiguration` (với kind, vào `kubeadmConfigPatches` của `kind.yaml`) để lần dựng hay nâng cấp sau vẫn giữ.
+
+<Check id="k8.5.lab-ma-hoa">Bật được mã hoá Secret trong etcd bằng `secretbox`, chứng minh bằng `etcdctl` trước và sau khi ghi lại Secret, sửa được `--profiling`, và xác nhận lại bằng kube-bench; giải thích được vì sao sửa manifest trực tiếp chưa đủ.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Không có file `audit.log` sau khi tạo cụm | Thư mục `~/masteva-k8/audit` chưa có lúc tạo cụm, hoặc sai `audit-policy.yaml` làm API server không lên | `docker exec k8-lab-control-plane ls /var/log/kubernetes/audit`; `crictl logs` của API server (K4.7) |
+| `jq` báo `parse error` | Đang đọc đúng lúc API server ghi dở một dòng | Chạy lại lệnh |
+| Truy vấn Secret ra rỗng | Rule `None` hay rule khác đứng trước bắt mất event | Đọc lại thứ tự rule; thử `grep '"secrets"' audit.log \| tail -1` |
+| Job kube-bench `Pending` hay bị từ chối | Namespace không ở mức `privileged` | `kubectl get ns kube-bench --show-labels` |
+| API server không lên lại sau bước 4 | Lệnh `sed` không khớp, hoặc `encryption.yaml` sai | `docker exec k8-lab-control-plane crictl ps -a --name kube-apiserver`; sửa file rồi chờ kubelet thử lại |
+| `kubectl replace` báo conflict | Một Secret bị đổi giữa lúc đọc và ghi | Chạy lại lệnh; nó chỉ ghi lại nội dung hiện có |
+
+### Dọn dẹp
+
+K8.6 dùng tiếp cụm này. Xoá những gì bài tạo trong cụm:
+
+<Callout kind="danger">
+
+Kiểm `kubectl config current-context` ra `kind-k8-lab` trước khi xoá.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl delete clusterrolebinding an-admin system:controller:kube-controller
+kubectl delete namespace pay kube-bench --wait=false
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k8-lab
+clusterrolebinding.rbac.authorization.k8s.io "an-admin" deleted
+clusterrolebinding.rbac.authorization.k8s.io "system:controller:kube-controller" deleted
+namespace "pay" deleted
+namespace "kube-bench" deleted
+```
+
+</Expected>
+
+Mã hoá Secret và cờ `--profiling` vẫn bật trên cụm cho tới khi bạn tạo lại cụm từ `kind.yaml`. File `encryption.yaml` chứa khoá thật của lab; nó chỉ bảo vệ cụm lab, xoá cùng thư mục lab ở cuối chặng.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Audit log có thể bị kẻ tấn công xoá không?">
+
+Với backend log, file nằm trên node control plane: ai có root ở node đó xoá hay sửa được. Đó là lý do đẩy event đi càng sớm càng tốt (agent đọc file, hoặc backend webhook) về một kho mà quyền ghi tách khỏi quyền quản trị cụm. Kẻ chỉ có quyền Kubernetes, không có quyền vào node, không tắt được audit từ API: policy và cờ nằm trong cấu hình của API server. Trên cụm managed, log nằm ở dịch vụ của nhà cung cấp, và quyền xoá nó là quyền IAM của tài khoản cloud.
+
+</Reveal>
+
+<Reveal title="Muốn biết ai đã `get` một Secret, sao không ghi body ở mức `RequestResponse` cho chắc?">
+
+Vì body phản hồi của `get secret` **chính là** Secret. Mức `Metadata` đã đủ trả lời "ai, lúc nào, Secret nào, thành công không". Câu hỏi "nội dung Secret lúc đó là gì" không thuộc về audit log; nếu cần lịch sử giá trị thì dùng hệ quản lý secret có phiên bản (D15). Cùng logic áp cho `list secrets`: một lệnh `list` trả mọi Secret của namespace, và kẻ tấn công hay dùng `list` thay `get` (RBAC Buster làm đúng vậy), nên truy vấn điều tra phải lọc cả `verb == "list"`.
+
+</Reveal>
+
+<Reveal title="CIS benchmark, kube-bench, Kubescape, Pod Security Admission: chồng chéo không?">
+
+Chúng nhìn những tầng khác nhau. CIS benchmark là danh sách khuyến nghị, chủ yếu về cấu hình của thành phần cụm (cờ, file, quyền) và một phần policy. kube-bench kiểm phần đó trên từng node. Kubescape và các công cụ cùng loại kiểm thêm tài nguyên trong cụm theo nhiều khung (CIS, NSA/CISA), gần với PolicyReport của K8.3. PSA và admission policy chặn lúc tạo. Một quy trình hợp lý: kube-bench sau mỗi lần dựng hay nâng cấp cụm, PolicyReport hay công cụ quét tài nguyên chạy liên tục, admission chặn những gì đã thống nhất là cấm.
+
+</Reveal>
+
+<Reveal title="Xoay khoá `secretbox` thế nào?">
+
+Theo tài liệu Kubernetes: thêm khoá mới vào danh sách nhưng ở vị trí thứ hai, khởi động lại mọi API server (để tất cả đều giải mã được bằng khoá mới); đưa khoá mới lên đầu, khởi động lại lần nữa (giờ mã hoá bằng khoá mới); ghi lại mọi Secret; rồi mới gỡ khoá cũ. Thiếu bước khởi động lại đầu tiên trên cụm nhiều control plane (K4.2), một API server có thể ghi bằng khoá mà API server khác chưa biết. Cờ `--encryption-provider-config-automatic-reload=true` cho API server tự đọc lại file mỗi phút khi nó đổi, bỏ được các lần khởi động lại; metric `apiserver_encryption_config_controller_automatic_reload_last_timestamp_seconds` cho biết lúc cấu hình mới có hiệu lực.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết audit policy và truy vấn `jq` nhanh. Chỗ hay sai: đặt rule `Request` cho mọi `create` lên trước rule Secret; ghi `RequestResponse` cho mọi thứ "để đủ thông tin" làm log phình và chứa Secret; dùng tên trường không tồn tại (kiểu `objectRef.resourceName`) hay quên `impersonatedUser`; với kube-bench, đề xuất "sửa" mọi `FAIL` kể cả mục đặc thù môi trường, hoặc chọn provider `aescbc` cho mã hoá. Kiểm như bài: tạo Secret rồi `grep` giá trị trong log, đọc etcd bằng `etcdctl`, và chạy lại kube-bench sau khi sửa.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.3 dạy RBAC và đã dùng `--as` với `auth can-i`; K4.1 dạy static pod và manifest mà bước 4 sửa; K4.3 là nơi `kubeadm upgrade` sinh lại manifest; K4.5 chỉ ra Secret nằm trong etcd và dạy sao lưu, nơi khoá mã hoá phải đi kèm. K8.1 là nguồn của chú thích `audit-violations`; K8.3 dạy chế độ `Audit` của VAP ghi vào cùng log. D12.5 đẩy file log về Loki. K8.6 thấy những gì audit log không thấy: lệnh gõ bên trong một phiên `exec`. D15 dùng KMS cho mã hoá và nối audit log vào quy trình tuân thủ.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k8.5.mastery-policy">Viết được audit policy cho một cụm production, giải thích được từng rule và thứ tự của chúng, và ước lượng được dung lượng log theo mỗi ngày.</Check>
+
+<Check id="k8.5.mastery-dieu-tra">Từ audit log, dựng lại được dòng thời gian của một sự cố như RBAC Buster: ai vào, đọc gì, tạo quyền gì, dưới danh tính nào.</Check>
+
+<Check id="k8.5.mastery-cis">Chạy được CIS benchmark cho một cụm tự dựng, lập được danh sách mục cần sửa, mục chấp nhận có lý do và mục không áp dụng, và đưa phần sửa vào cấu hình kubeadm để không mất khi nâng cấp.</Check>
+
+</Mastery>

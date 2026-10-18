@@ -1,0 +1,999 @@
+---
+title: Nguyên tắc GitOps và Argo CD
+description: Chuyển từ pipeline đẩy lệnh vào cụm sang một agent trong cụm tự kéo trạng thái mong muốn từ Git; dựng Gitea, kind và Argo CD, rồi xem Argo CD phát hiện một lần sửa tay, tự trả về, và lui một commit xấu bằng git revert.
+id: d14.1
+step: d14
+prerequisites: [d7.3, k3.1]
+topics: [d14.nguyen-tac-gitops, d14.argo-cd-flux]
+status: verified
+verified:
+  date: 2026-10-15
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    kind: 0.33.0
+    kubernetes: 1.37.0 (kindest/node)
+    kubectl: 1.37.1
+    argo-cd: 3.5.5
+    gitea: 28.1.0
+    registry: 3.1.2
+    go-image: 1.27.2-alpine
+    jq: 1.8.2
+---
+
+<Goal>
+
+Hiểu GitOps như một cách phân quyền và một vòng điều khiển, không chỉ là "để YAML trong Git". Học xong bài này, bạn giải thích được:
+
+- Vì sao pipeline không nên cầm credential của cụm, và mô hình kéo (pull) dời quyền triển khai sang đâu.
+- Vì sao một người `kubectl edit` trên production lúc nửa đêm thì sáng hôm sau cụm vẫn đúng như Git, và những thay đổi tay nào Argo CD **không** nhìn thấy.
+- Vì sao Argo CD báo `Synced` trong khi bản mới không chạy nổi, và hai trục trạng thái `sync`, `health` khác nhau ở đâu.
+- Vì sao lui một bản lỗi bằng `git revert` chứ không bằng `kubectl rollout undo`.
+
+</Goal>
+
+<Knowledge>
+
+### Ai cầm chìa khoá của production
+
+Ở D6.3, job triển khai chạy `deploy.sh` ngay trên máy đích. Cách đó gọi là **push**: pipeline cầm credential của nơi chạy và đẩy thay đổi vào. Trên Kubernetes, push nghĩa là runner có một kubeconfig đủ quyền `kubectl apply` vào production. **GitOps** đảo chiều: một agent chạy **trong cụm** tự kéo (pull) trạng thái mong muốn từ Git và làm cho cụm giống thế.
+
+```text
+ Push (D6.3)                                   Pull (GitOps)
+
+ commit ─▶ pipeline ─▶ image ─▶ registry       commit ─▶ pipeline ─▶ image ─▶ registry
+              │                                             │
+              │ kubectl apply                               │ git push: đổi một dòng
+              │ (kubeconfig của cụm nằm                     ▼
+              ▼  trong kho secret của CI)            [ repo cấu hình ]
+           [ cụm ]                                          ▲
+                                                            │ kéo về, chỉ cần quyền đọc
+                                                     agent trong [ cụm ]: so sánh, apply, lặp lại
+```
+
+| | Push từ pipeline | Pull từ cụm |
+|---|---|---|
+| Credential của cụm nằm ở | Kho secret của hệ CI; job nào được cấp cũng đọc được (D6.5) | Trong cụm, không rời cụm |
+| Pipeline cần quyền gì | Ghi vào cụm, thường rất rộng | Ghi vào một repo Git |
+| Cụm phải mở gì ra ngoài | API server cho runner gọi vào | Không gì; cụm gọi ra Git và registry |
+| Có người sửa tay trên cụm | Không ai biết cho tới lần triển khai sau ghi đè | Agent thấy lệch trong vài giây |
+| "Production đang chạy gì" đọc ở đâu | Lịch sử các lần chạy pipeline | Một commit |
+| Dựng lại cụm đã mất | Chạy lại từng pipeline, đúng thứ tự | Trỏ agent vào repo |
+
+Pull không xoá rủi ro mà dời nó sang chỗ dễ canh hơn:
+
+- **Quyền triển khai trở thành quyền merge.** Ai merge được vào repo cấu hình là người triển khai được lên production. Bảo vệ nhánh, review bắt buộc và nhật ký của Git (D4.2) trở thành hàng rào của production.
+- **Agent trong cụm có quyền rất rộng.** Argo CD cài mặc định cho controller của nó mọi quyền trên mọi tài nguyên của cụm. D13.2 thu hẹp phạm vi của từng ứng dụng bằng AppProject.
+- **Secret không được nằm trong Git ở dạng đọc được.** Git chỉ chứa tham chiếu hoặc bản đã mã hoá; các cách làm (External Secrets, Vault) thuộc D15.
+
+<Callout kind="production">
+
+Ngày 04/01/2023, CircleCI khuyến cáo **mọi khách hàng xoay các secret** đã lưu trên nền tảng và coi như chúng đã bị truy cập. Theo báo cáo sự cố của hãng: ngày 16/12/2022, laptop của một kỹ sư bị nhiễm malware mà phần mềm diệt virus không phát hiện; kẻ tấn công lấy được một phiên SSO còn hiệu lực (đã qua 2FA), và vì kỹ sư này có quyền tạo token truy cập production, chúng vào được một phần hệ thống production. Ngày 22/12, chúng lấy đi dữ liệu từ một số database, gồm biến môi trường, token và khoá của khách hàng. Dữ liệu được mã hoá khi lưu, nhưng khoá mã hoá bị trích từ một tiến trình đang chạy. Hãng chỉ biết khi một khách hàng báo hoạt động lạ trên GitHub OAuth ngày 29/12, rồi phải thu hồi toàn bộ Project API token và xoay GitHub OAuth token cho khách hàng. Một trong các khuyến nghị của báo cáo là dùng OIDC token thay cho credential sống lâu lưu trong CircleCI. Phần của bài: kho secret của hệ CI là nơi gom credential của mọi môi trường, nên một lần lộ là lộ tất cả. D6.5 thay credential sống lâu bằng OIDC; mô hình kéo đi thêm một bước, là **không đưa credential của cụm cho pipeline nữa**.
+
+</Callout>
+
+### Bốn nguyên tắc
+
+Nhóm OpenGitOps của CNCF chốt định nghĩa GitOps trong bốn nguyên tắc (bản 1.0.0):
+
+| Nguyên tắc | Nghĩa là | Vi phạm trông thế nào |
+|---|---|---|
+| **Khai báo** (declarative) | Trạng thái mong muốn viết ra dưới dạng "cái gì", không phải chuỗi lệnh "làm thế nào" | Script `kubectl scale`, `helm upgrade --set` gõ tay |
+| **Có phiên bản, bất biến** (versioned and immutable) | Trạng thái mong muốn nằm ở nơi giữ trọn lịch sử, không sửa đè | Tag image `latest`; nhánh bị force-push |
+| **Kéo tự động** (pulled automatically) | Agent tự lấy trạng thái mong muốn từ nguồn | Pipeline `kubectl apply` vào cụm |
+| **Đối chiếu liên tục** (continuously reconciled) | Agent liên tục quan sát trạng thái thật và kéo nó về trạng thái mong muốn | Apply một lần lúc triển khai rồi thôi |
+
+Hai nguyên tắc đầu bạn đã có từ K3.1 (manifest, Kustomize) và D4 (Git). Hai nguyên tắc sau là phần mới, và là thứ tách GitOps khỏi "CI/CD có YAML trong Git". D11.4 đã cho thấy cái giá của việc thiếu đối chiếu liên tục: drift chỉ lộ ra khi có người chạy `plan`. Controller của Kubernetes (K1.1) vốn làm đúng việc này cho từng object; GitOps thêm một vòng nữa ở tầng trên, giữa Git và cụm.
+
+<Check id="d14.1.push-pull">So sánh được push với pull theo nơi giữ credential, quyền của pipeline, cổng cụm phải mở và khả năng thấy thay đổi tay; nói được pull dời rủi ro sang đâu, và kể được bốn nguyên tắc của OpenGitOps.</Check>
+
+### Argo CD: Application và vòng đối chiếu
+
+**Argo CD** là agent GitOps phổ biến nhất cho Kubernetes. Đơn vị làm việc của nó là **Application**, một object nối ba thứ: **nguồn** (repo, nhánh hoặc commit, thư mục), **đích** (cụm, namespace) và **chính sách đồng bộ**.
+
+```text
+                 ┌────────────────────────── cụm ──────────────────────────────┐
+  repo Git       │  repo-server              application-controller            │
+ ┌─────────┐ kéo │ ┌──────────────┐ manifest ┌───────────────────────────────┐ │
+ │ deploy  │◀────┼─│ clone, render│─────────▶│ so sánh: Git  ≟  cụm          │ │
+ │ (main)  │     │ │ (YAML, Helm, │ mong muốn│   khác  ─▶ OutOfSync           │ │
+ └─────────┘     │ │  Kustomize)  │          │   sync  ─▶ apply phần khác     │ │
+      ▲          │ └──────────────┘          │ theo dõi object ─▶ health      │ │
+      │ webhook  │  argocd-server: API, giao diện, nhận webhook                │ │
+      └──────────┼─ "có commit mới" (chỉ là lời báo; Argo CD vẫn tự kéo)       │ │
+                 └──────────────────────────────────────────────────────────────┘
+```
+
+Mỗi Application có **hai trục trạng thái độc lập**, và phần lớn nhầm lẫn khi vận hành Argo CD đến từ việc trộn hai trục này:
+
+| Trục | Trả lời câu hỏi | Giá trị |
+|---|---|---|
+| **Sync** | Cụm có giống Git không | `Synced`, `OutOfSync`, `Unknown` (không đọc được Git) |
+| **Health** | Thứ đang chạy có khoẻ không | `Healthy`, `Progressing`, `Degraded`, `Suspended`, `Missing` |
+
+`Synced` cộng `Degraded` nghĩa là cụm đúng như Git, và Git sai. Health được tính theo từng loại object: Deployment khoẻ khi rollout xong, không khoẻ khi quá `progressDeadlineSeconds` (K1.1). Nó không biết request có trả lỗi hay không; việc đó cần metric, và là phần của D13.3.
+
+Ba công tắc của chính sách đồng bộ, cả ba **tắt theo mặc định**:
+
+| Công tắc | Tắt | Bật |
+|---|---|---|
+| `automated` | Chỉ báo `OutOfSync`, chờ người bấm sync | Tự sync khi Git đổi |
+| `selfHeal` | Cụm bị sửa tay thì chỉ báo `OutOfSync` | Tự sync lại khi cụm lệch khỏi Git; lần đầu gần như ngay, các lần sửa tay sau trên cùng commit giãn dần tới 5 phút |
+| `prune` | Object bị xoá khỏi Git vẫn nằm lại trên cụm | Xoá khỏi Git là xoá khỏi cụm |
+
+Argo CD biết Git đổi bằng hai đường. Mặc định nó **hỏi lại** Git mỗi 120 giây cộng tối đa 60 giây lệch ngẫu nhiên (`timeout.reconciliation` trong ConfigMap `argocd-cm`). Muốn nhanh hơn thì Git gọi **webhook** báo "có commit mới"; Argo CD nghe xong vẫn tự kéo, nên webhook hỏng thì hệ thống chậm lại chứ không sai.
+
+Ba giới hạn nên biết trước khi tin vào chữ `Synced`:
+
+- **Argo CD chỉ so những trường có trong Git.** Thêm một trường mà manifest không nhắc tới (một label, một giới hạn CPU) thì nó không coi là lệch. Bước 6 cho thấy tận mắt.
+- **Sync không phải giao dịch.** Một commit đổi năm object, object thứ ba bị API server từ chối thì hai object đầu đã được apply.
+- **Trường do controller khác quản thì đừng khai trong Git.** HPA (K5.3) ghi `spec.replicas`; nếu Git cũng khai `replicas`, `selfHeal` và HPA giành nhau. Bỏ dòng đó khỏi manifest, hoặc khai `ignoreDifferences` cho `/spec/replicas` trong Application.
+
+<Check id="d14.1.argo-model">Mô tả được Application gồm những gì, phân biệt được trạng thái sync với health và đọc được tổ hợp `Synced` cộng `Degraded`, kể được ba công tắc `automated`, `selfHeal`, `prune` và hai đường Argo CD biết Git đổi.</Check>
+
+### Lui là một commit
+
+Trong GitOps, production là hình chiếu của nhánh chính, nên lui một thay đổi cũng là một thay đổi trên Git:
+
+| Cách lui | Chuyện gì xảy ra |
+|---|---|
+| `git revert <commit>` rồi push | Git và cụm cùng quay về; lịch sử ghi ai lui, lúc nào, lui cái gì |
+| `kubectl rollout undo` | Cụm lệch khỏi Git; `selfHeal` đưa bản lỗi trở lại sau vài giây |
+| `argocd app rollback` | Argo CD apply lại một revision cũ, nhưng lệnh bị từ chối khi `automated` đang bật, và Git vẫn chứa bản lỗi |
+
+`git revert` cũng đi qua review và pipeline như mọi commit, nên đường lui nhanh hay chậm phụ thuộc hai thứ đó. D13.2 đo đường lui qua pull request; D13.5 bàn những thứ `git revert` không lui nổi.
+
+### Argo CD hay Flux
+
+**Flux** là agent GitOps thứ hai của CNCF, cùng mức trưởng thành (graduated). Hai công cụ cùng làm bốn nguyên tắc trên và khác nhau ở cách đóng gói:
+
+| | Argo CD 3.5 | Flux 2.9 |
+|---|---|---|
+| Đơn vị khai báo | `Application` (nguồn và đích trong một object), `AppProject`, `ApplicationSet` | Nguồn riêng (`GitRepository`, `OCIRepository`), cách áp riêng (`Kustomization`, `HelmRelease`) |
+| Thành phần | API server kèm giao diện web, repo-server, application-controller, Redis | Các controller rời (source, kustomize, helm, notification), không kèm giao diện |
+| Helm | Chỉ dùng `helm template` để render rồi tự quản vòng đời; `helm list` không thấy release | helm-controller chạy install, upgrade, rollback thật của Helm; cấu hình được việc tự rollback khi upgrade hỏng (`remediation`) |
+| Sửa tay trên cụm | Thấy ngay, báo `OutOfSync`; chỉ tự trả về khi bật `selfHeal` | Kustomization ghi đè trường lệch ở mỗi `interval`; muốn giữ một trường thì khai JSON pointer trong `.spec.ignore` của Kustomization (khác `.spec.ignore` của GitRepository, là danh sách file bỏ qua), hoặc dùng annotation `kustomize.toolkit.fluxcd.io/ssa: IfNotPresent` |
+| Xoá object đã bỏ khỏi Git | `prune`, tắt theo mặc định | `prune`, trường bắt buộc khai |
+| Thứ tự áp | Sync wave và hook trong một Application (D13.4) | `dependsOn` giữa các Kustomization |
+| Phân quyền | RBAC và SSO riêng của Argo CD, `AppProject` | RBAC của Kubernetes: Kustomization chạy dưới ServiceAccount khai trong `serviceAccountName`; không khai thì mặc định dùng quyền rộng của controller (trừ khi bật `--default-service-account`) |
+| Tự cập nhật tag image vào Git | Dự án phụ (argocd-image-updater) | Thành phần tuỳ chọn của chính Flux (image-reflector và image-automation controller) |
+
+Chọn theo người dùng và tổ chức, vì hai bên đều làm tốt phần lõi:
+
+- **Argo CD** hợp khi nhiều đội ứng dụng cần **nhìn**: giao diện cho thấy cây object, diff, lịch sử, và có phân quyền theo đội.
+- **Flux** hợp khi đội platform muốn các controller nhỏ, cấu hình hoàn toàn bằng CRD, bám sát RBAC của Kubernetes, và dùng Helm đúng như Helm.
+
+Chặng này dùng Argo CD cho mọi lab. Cột Flux trong bảng dựa trên tài liệu chính thức của Flux 2.9; nếu đội của bạn chọn Flux, các nguyên tắc và bẫy trong chặng vẫn giữ nguyên, chỉ khác tên object và lệnh.
+
+<Check id="d14.1.argo-vs-flux">So sánh được Argo CD với Flux theo đơn vị khai báo, cách xử lý Helm, cách phản ứng với thay đổi tay và mô hình phân quyền, và nêu được tình huống hợp với từng công cụ.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [OpenGitOps: GitOps Principles](https://opengitops.dev/): bốn nguyên tắc, mỗi nguyên tắc một câu; trang ngắn, đọc hết.
+- [Automated Sync Policy (Argo CD)](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/): ngữ nghĩa chính xác của `automated`, `prune`, `selfHeal`, và khi nào Argo CD **không** sync lại.
+- [Webhook Configuration (Argo CD)](https://argo-cd.readthedocs.io/en/stable/operator-manual/webhook/): cấu hình webhook và secret cho từng loại máy chủ Git.
+- [Kustomization (Flux)](https://fluxcd.io/flux/components/kustomize/kustomizations/): `interval`, `prune`, `dependsOn`, `serviceAccountName`; đọc để đối chiếu với Application của Argo CD.
+- [CircleCI Jan 4, 2023 security incident report](https://circleci.com/blog/jan-4-2023-incident-report/): báo cáo gốc của vụ việc trong callout; đọc dòng thời gian và phần khuyến nghị cho khách hàng.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D0.2 (kind, kubectl), D6.1 (Gitea trong Docker) và K3.1. Docker Desktop hoặc Docker Engine 29 đang chạy, có `kind`, `kubectl`, `git`, `curl`, `jq`, `yq` (D13.4 dùng), `openssl`, máy có mạng: lab tải image Argo CD (khoảng 190 MB nén), Redis, và dùng lại image Gitea, registry, Go của chặng D6. Dùng các cổng **9700** (Gitea), **9701** (registry), **9702** (giao diện Argo CD), **9703** (service), đều chỉ nghe trên `127.0.0.1`. **Profile máy:** cuối bài cả lab dùng khoảng 1,9 GiB RAM theo `docker stats` (node kind 1,7 GiB, trong đó Argo CD khoảng 300 MiB và API server khoảng 650 MiB; Gitea và registry 240 MiB). Máy 8 GB chạy được nếu Docker VM có 4 GB và không chạy lab khác cùng lúc (ước từ số đo trên, chưa chạy thử trên máy 8 GB).
+
+Thư mục lab tên `masteva-d14` theo mã nội bộ của chặng; container và cụm mang tiền tố `d13-` theo tên chặng D13. Hai tên cùng chỉ một lab.
+
+Cụm và các repo của bài được dùng tiếp tới hết chặng D13. Mỗi khối lệnh mở bằng `cd` tới thư mục của nó. Từ bước 3 trở đi, nếu mở tab mới, chạy `cd ~/masteva-d14 && . ./lab.sh` trước. Trước bước 3 (chưa có `lab.sh`) chỉ cần `cd ~/masteva-d14 && export KUBECONFIG=~/masteva-d14/kubeconfig`.
+
+### 1. Cụm kind, Gitea và registry trên một mạng
+
+Khác D6, Git và registry giờ phải gọi được **từ trong cụm**: Argo CD kéo repo, node kéo image. kind đặt các node vào network Docker tên `kind`; đưa Gitea và registry vào cùng network thì pod phân giải được tên `d13-gitea`, `d13-registry` qua DNS của Docker.
+
+Khối đầu tạo cụm một node. `KUBECONFIG` trỏ vào file riêng của lab, để lệnh `kubectl` trong tab này không đụng tới cụm khác trong `~/.kube/config`.
+
+<Terminal where="mac" title="~/masteva-d14">
+
+```bash
+mkdir -p ~/masteva-d14/certs.d/d13-registry:5000 && cd ~/masteva-d14
+export KUBECONFIG=~/masteva-d14/kubeconfig
+cat > certs.d/d13-registry:5000/hosts.toml <<'EOF'
+server = "http://d13-registry:5000"
+
+[host."http://d13-registry:5000"]
+  capabilities = ["pull", "resolve"]
+EOF
+cat > kind.yaml <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: d13-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraMounts:
+      - hostPath: $HOME/masteva-d14/certs.d
+        containerPath: /etc/containerd/certs.d
+        readOnly: true
+    extraPortMappings:
+$(for p in 2 3 4 5 6 7 8 9; do echo "      - { containerPort: 3070$p, hostPort: 970$p, listenAddress: 127.0.0.1 }"; done)
+EOF
+kind create cluster --config kind.yaml 2>&1 | grep 'Set kubectl'
+kubectl wait --for=condition=Ready node --all --timeout=120s
+kubectl -n kube-system rollout status deployment coredns --timeout=120s | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Set kubectl context to "kind-d13-lab"
+node/d13-lab-control-plane condition met
+deployment "coredns" successfully rolled out
+```
+
+</Expected>
+
+Hai chỗ trong `kind.yaml` khác D0.2:
+
+- `extraMounts` gắn thư mục `certs.d` vào node. File `hosts.toml` trong đó bảo containerd kéo image của `d13-registry:5000` qua HTTP thường; thiếu nó, node đòi HTTPS và báo `http: server gave HTTP response to HTTPS client`. Cụm thật dùng registry có TLS (D9.4) và không cần file này.
+- `extraPortMappings` mở sẵn tám cổng 9702 tới 9709 của máy vào NodePort 30702 tới 30709 của node, dùng dần trong chặng.
+
+Dòng cuối chờ CoreDNS (DNS của cụm) sẵn sàng, vì các pod ở khối thứ ba phân giải tên qua nó. Khối thứ hai chạy Gitea và registry trên network `kind`:
+
+<Terminal where="mac" title="~/masteva-d14">
+
+```bash
+cd ~/masteva-d14
+SUBNET=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' | grep -v : | head -1)
+docker run -d --name d13-gitea --network kind -p 127.0.0.1:9700:3000 \
+  -e GITEA__security__INSTALL_LOCK=true \
+  -e GITEA__security__ALLOWED_HOST_LIST="$SUBNET" \
+  -e GITEA__server__ROOT_URL=http://d13-gitea:3000/ \
+  -e GITEA__database__DB_TYPE=sqlite3 \
+  -e GITEA__service__DISABLE_REGISTRATION=true \
+  -v d13-gitea-data:/data gitea/gitea:28.1.0 >/dev/null
+docker run -d --name d13-registry --network kind -p 127.0.0.1:9701:5000 \
+  -v d13-registry-data:/var/lib/registry registry:3.1.2 >/dev/null
+for i in $(seq 1 60); do curl -sf localhost:9700/api/healthz >/dev/null && break; sleep 1; done
+curl -s localhost:9700/api/v1/version; echo
+curl -s localhost:9701/v2/_catalog
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"version":"28.1.0"}
+{"repositories":[]}
+```
+
+</Expected>
+
+Hai dòng là Gitea và registry trả lời từ phía máy bạn. `ALLOWED_HOST_LIST`: Gitea 28 mặc định chặn webhook gửi tới địa chỉ mạng riêng. Bước 8 cần Gitea gọi vào node kind, nên lab cho phép đúng dải địa chỉ của network `kind` (biến `SUBNET`).
+
+Khối thứ ba kiểm cùng hai dịch vụ đó **từ trong cụm**, bằng một pod chạy một lần rồi thôi:
+
+<Terminal where="mac">
+
+```bash
+kubectl run thu --image=busybox:1.38.0 --restart=Never -- \
+  sh -c 'wget -q -O - http://d13-gitea:3000/api/v1/version; echo; wget -q -O - http://d13-registry:5000/v2/_catalog' >/dev/null
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/thu --timeout=120s >/dev/null
+kubectl logs thu && kubectl delete pod thu >/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"version":"28.1.0"}
+{"repositories":[]}
+```
+
+</Expected>
+
+Hai dòng là log của pod thử `thu`: từ trong cụm, nó gọi được Gitea và registry bằng tên. Lệnh cuối xoá pod thử đã chạy xong. Nếu dòng đầu là `wget: bad address`, xem mục Gỡ lỗi.
+
+### 2. Service và hai phiên bản image
+
+`price-api` của chặng này là bản viết lại gọn hơn của D6, chỉ dùng thư viện chuẩn. Nó đã có sẵn ba thứ các bài sau cần: `/metrics` đếm request theo mã HTTP (D13.3), cấu hình đọc từ file JSON lúc khởi động (D13.4) và một cờ đọc lại mỗi giây (D13.5). Bài này chỉ dùng `/price` và `/healthz`.
+
+<Terminal where="mac" title="~/masteva-d14/price-api/main.go">
+
+```bash
+mkdir -p ~/masteva-d14/price-api && cd ~/masteva-d14/price-api
+cat > main.go <<'EOF'
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+var version = "dev" // ghi đè lúc build: -ldflags "-X main.version=..."
+
+// Config là cấu hình nghiệp vụ, đọc một lần lúc khởi động từ file JSON.
+type Config struct {
+	DiscountPercent int `json:"discount_percent"`
+}
+
+func loadConfig(path string) (cfg Config) {
+	if path == "" {
+		return cfg
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("không mở được cấu hình: %v", err)
+	}
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields() // khoá lạ là lỗi, để gõ sai tên khoá không bị lặng lẽ bỏ qua
+	if err := dec.Decode(&cfg); err != nil {
+		log.Fatalf("cấu hình không hợp lệ: %v", err)
+	}
+	return cfg
+}
+
+var discountOn atomic.Bool // cờ vận hành: đọc lại từ file mỗi giây, không cần khởi động lại
+
+func watchFlag(path string) {
+	for {
+		b, _ := os.ReadFile(path)
+		discountOn.Store(strings.TrimSpace(string(b)) != "off")
+		time.Sleep(time.Second)
+	}
+}
+
+func main() {
+	cfg := loadConfig(os.Getenv("CONFIG_FILE"))
+	failEvery, _ := strconv.ParseInt(os.Getenv("FAIL_EVERY"), 10, 64) // chỉ để lab giả lập bản lỗi
+	discountOn.Store(true)
+	go watchFlag(os.Getenv("FLAG_FILE"))
+	host, _ := os.Hostname()
+	var served, ok, failed atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("GET /price", func(w http.ResponseWriter, r *http.Request) {
+		n := served.Add(1)
+		price := 1250000
+		if discountOn.Load() {
+			price = price * (100 - cfg.DiscountPercent) / 100
+		}
+		if (failEvery > 0 && n%failEvery == 0) || price < 0 {
+			failed.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"error": "không tính được giá", "version": version, "host": host})
+			return
+		}
+		ok.Add(1)
+		json.NewEncoder(w).Encode(map[string]any{
+			"price": price, "version": version, "env": os.Getenv("APP_ENV"), "host": host,
+		})
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "# TYPE http_requests_total counter\nhttp_requests_total{code=\"200\"} %d\n", ok.Load())
+		fmt.Fprintf(w, "http_requests_total{code=\"500\"} %d\n", failed.Load())
+		fmt.Fprintf(w, "# TYPE app_info gauge\napp_info{version=%q} 1\n", version)
+	})
+	srv := &http.Server{Addr: ":8080", Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	log.Printf("price-api %s (%s) listening on :8080, discount %d%%", version, os.Getenv("APP_ENV"), cfg.DiscountPercent)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	<-stop
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+}
+EOF
+printf 'module example.com/price-api\n\ngo 1.27\n' > go.mod
+cat > Dockerfile <<'EOF'
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine AS build
+WORKDIR /src
+COPY go.mod *.go ./
+ARG TARGETOS TARGETARCH VERSION=dev
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/price-api .
+
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+COPY --from=build /out/price-api /price-api
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/price-api"]
+EOF
+printf '*\n!go.mod\n!*.go\n' > .dockerignore
+```
+
+</Terminal>
+
+Đọc nhanh code: `/healthz` luôn trả `ok` (dùng cho readiness probe), `/price` trả giá kèm phiên bản, môi trường và tên pod, `/metrics` in hai bộ đếm request theo mã HTTP. Biến môi trường `FAIL_EVERY=N` là công tắc chỉ để lab giả lập một bản lỗi: cứ N request thì một request trả 500, giống D6.3. `/price` cũng trả 500 khi giá tính ra âm; các bài sau dùng nhánh này để giả lập cấu hình sai. Dockerfile build hai tầng như D5.2, ảnh nền distroless được ghim theo digest.
+
+Build hai phiên bản và đẩy lên registry. Bài này build tay để tập trung vào phía cụm; D13.2 giao lại việc đó cho pipeline.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/price-api
+for v in 1.0.0 1.1.0; do
+  docker build -q --build-arg VERSION=$v -t localhost:9701/price-api:$v . >/dev/null
+  docker push -q localhost:9701/price-api:$v
+done
+curl -s localhost:9701/v2/price-api/tags/list
+cd ~/masteva-d14
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+localhost:9701/price-api:1.0.0
+localhost:9701/price-api:1.1.0
+{"name":"price-api","tags":["1.0.0","1.1.0"]}
+```
+
+</Expected>
+
+Máy bạn đẩy lên `localhost:9701`, node kéo về qua `d13-registry:5000`: hai tên của cùng một registry, nhìn từ hai phía.
+
+### 3. Repo cấu hình và một tài khoản chỉ đọc
+
+Trạng thái mong muốn nằm trong repo `deploy`, tách khỏi mã nguồn của service (D13.2 giải thích vì sao tách). Lab có hai danh tính: **an** là người viết manifest, và **argocd** là tài khoản máy, chỉ có quyền **đọc** repo.
+
+<Terminal where="mac" title="~/masteva-d14/lab.sh">
+
+```bash
+cd ~/masteva-d14
+for u in an argocd; do
+  docker exec -u git d13-gitea gitea admin user create --username $u \
+    --email $u@example.com --random-password --must-change-password=false 2>/dev/null | tail -1
+done
+{
+  echo "AN_TOKEN=$(docker exec -u git d13-gitea gitea admin user generate-access-token \
+    -u an -t lab --scopes write:repository,write:user --raw 2>/dev/null)"
+  echo "ARGOCD_TOKEN=$(docker exec -u git d13-gitea gitea admin user generate-access-token \
+    -u argocd -t pull --scopes read:repository --raw 2>/dev/null)"
+  echo "WEBHOOK_SECRET=$(openssl rand -hex 16)"
+} > gitea.env
+chmod 600 gitea.env
+cat > lab.sh <<'EOF'
+export KUBECONFIG=$HOME/masteva-d14/kubeconfig
+. "$HOME/masteva-d14/gitea.env"
+G=http://localhost:9700/api/v1
+api_an()   { curl -s -H "Authorization: token $AN_TOKEN" -H 'Content-Type: application/json' "$@"; }
+an_git()   { git -c http.extraHeader="Authorization: token $AN_TOKEN" "$@"; }
+argocd()   { kubectl -n argocd exec argocd-application-controller-0 -- argocd --core "$@"; }
+app_status() {  # app_status <app>: commit đang so, trạng thái sync và health
+  kubectl -n argocd get application "$1" -o json | jq -r \
+    '"\(.metadata.name)  rev=\(.status.sync.revision[0:7])  sync=\(.status.sync.status)  health=\(.status.health.status)"'
+}
+wait_app() {    # wait_app <app> [health]: chờ app Synced ở commit mới nhất của main, sync xong, và đạt health (mặc định Healthy)
+  local want st seen=0
+  want=$(git -C "$HOME/masteva-d14/deploy" rev-parse origin/main)
+  for i in $(seq 1 120); do
+    st=$(kubectl -n argocd get application "$1" -o json | jq -r '"\(.status.sync.revision) \(.status.sync.status) \(.status.health.status) \(.status.operationState.phase) \(.status.reconciledAt >= .status.operationState.finishedAt)"')
+    if [ "$st" = "$want Synced ${2:-Healthy} Succeeded true" ]; then seen=$((seen + 1)); else seen=0; fi
+    if [ "$seen" -ge 2 ]; then app_status "$1"; return 0; fi
+    sleep 2
+  done
+  echo "QUÁ HẠN sau 240 giây:"; app_status "$1"; return 1
+}
+EOF
+. ./lab.sh
+api_an -X POST -d '{"name":"deploy","private":true,"default_branch":"main"}' $G/user/repos | jq -c '{full_name, private}'
+api_an -o /dev/null -w "argocd được đọc repo deploy: HTTP %{http_code}\n" \
+  -X PUT -d '{"permission":"read"}' $G/repos/an/deploy/collaborators/argocd
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+New user 'an' has been successfully created!
+New user 'argocd' has been successfully created!
+{"full_name":"an/deploy","private":true}
+argocd được đọc repo deploy: HTTP 204
+```
+
+</Expected>
+
+Các hàm trong `lab.sh` dùng suốt chặng: `api_an` gọi API của Gitea và `an_git` chạy `git` bằng token của an; `argocd` chạy CLI của Argo CD (bước 4 giải thích); `app_status` in một dòng trạng thái của một Application; `wait_app` chờ tới khi Application đã sync tới commit mới nhất của nhánh `main` và đạt health mong muốn, tối đa 4 phút. File `gitea.env` giữ các token và quyền đọc của nó chỉ dành cho bạn (`chmod 600`).
+
+Manifest đầu tiên là một Deployment và một Service viết thẳng bằng YAML:
+
+<Terminal where="mac" title="~/masteva-d14/deploy">
+
+```bash
+mkdir -p ~/masteva-d14/deploy/price-api && cd ~/masteva-d14/deploy
+cat > price-api/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: price-api
+spec:
+  replicas: 2
+  progressDeadlineSeconds: 30
+  selector:
+    matchLabels: { app: price-api }
+  template:
+    metadata:
+      labels: { app: price-api }
+    spec:
+      containers:
+        - name: price-api
+          image: d13-registry:5000/price-api:1.0.0
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: APP_ENV, value: lab }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+          lifecycle:
+            preStop: { sleep: { seconds: 3 } }
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+            limits: { memory: 64Mi }
+EOF
+cat > price-api/service.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: price-api
+spec:
+  type: NodePort
+  selector: { app: price-api }
+  ports: [{ port: 80, targetPort: 8080, nodePort: 30703 }]
+EOF
+git init -q -b main .
+git config user.name "An Nguyen" && git config user.email an@example.com
+git add -A && git commit -q -m "price-api 1.0.0, 2 replica"
+git remote add origin http://localhost:9700/an/deploy.git
+an_git push -q -u origin main
+git log --oneline
+git -c http.extraHeader="Authorization: token $ARGOCD_TOKEN" push origin main:thu-ghi 2>&1 | grep -E 'denied|rejected|403|error:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ab33f13 price-api 1.0.0, 2 replica
+fatal: unable to access 'http://localhost:9700/an/deploy.git/': The requested URL returned error: 403
+```
+
+</Expected>
+
+Mã commit của bạn sẽ khác. Lệnh cuối thử đẩy bằng token của `argocd` và bị Gitea từ chối với mã 403: thứ credential duy nhất rời khỏi Gitea để vào cụm là một token **chỉ đọc một repo**. `preStop` ngủ 3 giây là nhịp chờ mà D6.3 đã giải thích: pod bị rút khỏi Service và nhận `SIGTERM` cùng lúc, nên cần chậm một nhịp trước khi đóng. `progressDeadlineSeconds: 30` để bước 9 thấy rollout hỏng sau nửa phút thay vì 10 phút mặc định.
+
+<Check id="d14.1.lab-repo">Dựng được kho Git và registry mà cụm gọi tới được, và tạo được tài khoản máy chỉ có quyền đọc repo cấu hình, chứng minh bằng một lần push bị từ chối.</Check>
+
+### 4. Cài Argo CD
+
+Argo CD phát hành một file manifest cho mỗi phiên bản. File chứa các CRD rất lớn. `kubectl apply` kiểu thường lưu toàn bộ object vào annotation `kubectl.kubernetes.io/last-applied-configuration`, mà annotation của một object tối đa 256 KB, nên phải dùng `--server-side` (K3.1 đã giải thích server-side apply). Số in ra sau lệnh apply là số object được áp.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14
+kubectl create namespace argocd
+kubectl apply -n argocd --server-side \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.5/manifests/install.yaml | grep -c serverside-applied
+kubectl -n argocd scale deployment argocd-dex-server argocd-notifications-controller --replicas=0 >/dev/null
+kubectl -n argocd patch configmap argocd-cmd-params-cm --type merge -p '{"data":{"server.insecure":"true"}}' >/dev/null
+kubectl -n argocd patch service argocd-server --type merge \
+  -p '{"spec":{"type":"NodePort","ports":[{"name":"http","port":80,"targetPort":8080,"nodePort":30702}]}}' >/dev/null
+kubectl -n argocd patch secret argocd-secret --type merge \
+  -p "{\"stringData\":{\"webhook.gogs.secret\":\"$WEBHOOK_SECRET\"}}" >/dev/null
+kubectl -n argocd rollout restart deployment argocd-server >/dev/null
+kubectl -n argocd rollout status deployment argocd-server --timeout=600s | tail -1
+kubectl -n argocd wait --for=condition=Available deployment --all --timeout=600s >/dev/null
+kubectl -n argocd rollout status statefulset argocd-application-controller --timeout=600s | tail -1
+kubectl -n argocd create secret generic repo-deploy \
+  --from-literal=type=git --from-literal=url=http://d13-gitea:3000/an/deploy.git \
+  --from-literal=username=argocd --from-literal=password="$ARGOCD_TOKEN" >/dev/null
+kubectl -n argocd label secret repo-deploy argocd.argoproj.io/secret-type=repository >/dev/null
+argocd repo list -o json | jq -c '.[] | {repo, type, state: .connectionState.status}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/argocd created
+59
+deployment "argocd-server" successfully rolled out
+partitioned roll out complete: 1 new pods have been updated...
+{"repo":"http://d13-gitea:3000/an/deploy.git","type":"git","state":"Successful"}
+```
+
+</Expected>
+
+Lần đầu mất khoảng một phút để node kéo image. Những gì khối lệnh làm ngoài việc cài:
+
+- Tắt `dex` (đăng nhập SSO) và `notifications`: lab không dùng, bớt được khoảng 60 MiB.
+- `server.insecure` cho `argocd-server` nói HTTP thường, và Service đổi sang NodePort 30702: giao diện mở được ở `http://localhost:9702`, và Gitea gọi được webhook ở bước 8. Ngoài đời, Gateway đứng trước (K2.2) lo HTTPS, và giao diện đăng nhập qua SSO.
+- `webhook.gogs.secret`: Argo CD không có bộ xử lý riêng cho Gitea. Gitea vốn tách ra từ Gogs và gửi kèm các header kiểu Gogs (`X-Gogs-Event`, `X-Gogs-Signature`), còn Argo CD kiểm header Gogs trước header GitHub (ghi chú trong [mã nguồn `util/webhook/webhook.go`](https://github.com/argoproj/argo-cd/blob/v3.5.5/util/webhook/webhook.go)), nên webhook loại `gitea` ở bước 8 được Argo CD đọc như webhook Gogs. Nó chỉ được nhận khi chữ ký HMAC, tức mã băm của nội dung tính bằng một khoá bí mật chung, khớp với secret này.
+- Bốn lệnh cuối cho Argo CD biết cách đọc repo: credential là một Secret mang nhãn `secret-type: repository`, chứa token chỉ đọc của bước 3. `Successful` nghĩa là repo-server đã kết nối được tới Gitea.
+- Hàm `argocd` trong `lab.sh` chạy CLI có sẵn trong pod của controller, ở chế độ `--core`: CLI nói chuyện thẳng với API của Kubernetes thay vì đăng nhập vào `argocd-server`. Nhờ vậy lab không cần cài gì lên máy và không cần mật khẩu admin. Trên hệ thống thật, bạn cài CLI và `argocd login` qua SSO.
+
+### 5. Application đầu tiên, sync bằng tay
+
+<Terminal where="mac" title="~/masteva-d14/app-price-api.yaml">
+
+```bash
+cd ~/masteva-d14
+cat > app-price-api.yaml <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: price-api
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: http://d13-gitea:3000/an/deploy.git
+    targetRevision: main
+    path: price-api
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: price
+  syncPolicy:
+    syncOptions: [CreateNamespace=true]
+EOF
+kubectl apply -f app-price-api.yaml
+for i in $(seq 1 30); do [ "$(kubectl -n argocd get application price-api -o jsonpath='{.status.sync.status}')" = OutOfSync ] && break; sleep 1; done
+app_status price-api
+kubectl get namespace price 2>&1 | tail -1
+argocd app diff price-api 2>/dev/null | grep -E '^=====|^> (kind|  name:|  replicas|        image)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+application.argoproj.io/price-api created
+price-api  rev=ab33f13  sync=OutOfSync  health=Missing
+Error from server (NotFound): namespaces "price" not found
+===== /Service price/price-api ======
+> kind: Service
+>   name: price-api
+===== apps/Deployment price/price-api ======
+> kind: Deployment
+>   name: price-api
+>   replicas: 2
+>         image: d13-registry:5000/price-api:1.0.0
+```
+
+</Expected>
+
+Application chưa có `automated`, nên Argo CD chỉ **báo**: Git có hai object, cụm chưa có gì (`OutOfSync`, `Missing`). `argocd app diff` in phần khác nhau, ở đây là toàn bộ hai object. Chế độ này có ích khi tiếp nhận một hệ thống đang chạy: trỏ Argo CD vào, đọc diff, chưa cho nó sửa gì. Giờ bấm sync:
+
+<Terminal where="mac">
+
+```bash
+argocd app sync price-api | grep -E '^(Sync Status:|Phase:|Message:|GROUP|apps|   +[A-Z])'
+wait_app price-api
+curl -s localhost:9703/price
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Sync Status:        Synced to main (ab33f13)
+Phase:              Succeeded
+Message:            successfully synced (all tasks run)
+GROUP  KIND        NAMESPACE  NAME       STATUS   HEALTH       HOOK  MESSAGE
+       Namespace              price      Running  Synced             namespace/price created
+       Service     price      price-api  Synced   Healthy            service/price-api created
+apps   Deployment  price      price-api  Synced   Progressing        deployment.apps/price-api created
+price-api  rev=ab33f13  sync=Synced  health=Healthy
+{"env":"lab","host":"price-api-7cf584bf6d-5hg62","price":1250000,"version":"1.0.0"}
+```
+
+</Expected>
+
+Ở bảng kết quả của lệnh sync, Deployment là `Synced` cộng `Progressing`: Git đã được apply, pod còn đang lên. Hai trục tách nhau ngay từ lần đầu; `wait_app` chờ tới khi cả hai cùng đạt. Bạn chưa gõ `kubectl apply` nào cho service; thứ bạn làm là đẩy một commit và khai một Application.
+
+<Check id="d14.1.lab-first-sync">Cài được Argo CD, khai được credential chỉ đọc cho repo, tạo được một Application ở chế độ sync tay, đọc được diff trước khi sync và hai trục trạng thái sau khi sync.</Check>
+
+### 6. Sửa tay trên cụm
+
+Giả sử lúc sự cố, một người trực sửa thẳng trên cụm bốn thứ: tăng replica, đổi image, thêm giới hạn CPU, gắn một label.
+
+<Terminal where="mac">
+
+```bash
+kubectl -n price scale deployment price-api --replicas=4
+kubectl -n price set image deployment/price-api price-api=d13-registry:5000/price-api:1.1.0
+kubectl -n price set resources deployment/price-api --limits=cpu=500m
+kubectl -n price label deployment price-api owner=an
+kubectl -n price rollout status deployment price-api --timeout=120s | tail -1
+for i in $(seq 1 30); do [ "$(app_status price-api | cut -d' ' -f5-)" = "sync=OutOfSync  health=Healthy" ] && break; sleep 1; done
+app_status price-api
+argocd app diff price-api 2>/dev/null | grep -E '^[<>]'
+```
+
+</Terminal>
+
+<Predict question="Bốn thay đổi tay: replicas, image, giới hạn CPU, label. argocd app diff in ra mấy chỗ khác nhau?">
+
+```text
+deployment.apps/price-api scaled
+deployment.apps/price-api image updated
+deployment.apps/price-api resource requirements updated
+deployment.apps/price-api labeled
+deployment "price-api" successfully rolled out
+price-api  rev=ab33f13  sync=OutOfSync  health=Healthy
+<   replicas: 4
+>   replicas: 2
+<         image: d13-registry:5000/price-api:1.1.0
+>         image: d13-registry:5000/price-api:1.0.0
+```
+
+Hai. `replicas` và `image` có trong manifest ở Git, nên Argo CD thấy chúng lệch. Giới hạn CPU và label là trường **Git không nhắc tới**, nên với Argo CD chúng không tồn tại. Cùng tinh thần với K3.1: người viết manifest chỉ sở hữu những trường mình khai. Thay đổi tay kiểu "thêm" vì thế sống sót qua mọi lần sync, cho tới khi có người đưa trường đó vào Git.
+
+</Predict>
+
+Lệnh `argocd app diff` trả mã thoát 1 khi có khác biệt, dùng được làm bước kiểm trong script (lab bỏ dòng báo mã thoát bằng `2>/dev/null`). Application vẫn `Healthy`: bốn pod của bản 1.1.0 đang chạy tốt, chỉ là không ai duyệt chúng.
+
+<Check id="d14.1.lab-drift">Tái hiện được việc Argo CD phát hiện thay đổi tay trên trường có trong Git và bỏ qua trường không có trong Git, và giải thích được vì sao.</Check>
+
+### 7. Bật tự động: cụm tự quay về Git
+
+Bật cả ba công tắc cho Application, chờ Argo CD đưa cụm về đúng Git, rồi sửa tay một lần nữa và đo bao lâu thì thay đổi đó bị đảo lại. Để ý xem trường nào được trả về và trường nào ở lại.
+
+<Terminal where="mac">
+
+```bash
+kubectl -n argocd patch application price-api --type merge \
+  -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
+for i in $(seq 1 30); do [ "$(kubectl -n argocd get application price-api -o jsonpath='{.status.sync.status}')" = Synced ] && break; sleep 1; done
+kubectl -n price rollout status deployment price-api --timeout=120s | tail -1
+kubectl -n price get deployment price-api -o json | jq -c '{replicas: .spec.replicas,
+  image: .spec.template.spec.containers[0].image, limits: .spec.template.spec.containers[0].resources.limits, labels: .metadata.labels}'
+t0=$(date +%s); kubectl -n price scale deployment price-api --replicas=5
+for i in $(seq 1 30); do [ "$(kubectl -n price get deployment price-api -o jsonpath='{.spec.replicas}')" = 2 ] && break; sleep 1; done
+echo "replicas về 2 sau $(( $(date +%s) - t0 )) giây"
+kubectl -n argocd get application price-api -o json | jq -c '.status.operationState | {phase, automated: .operation.initiatedBy.automated}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+application.argoproj.io/price-api patched
+deployment "price-api" successfully rolled out
+{"replicas":2,"image":"d13-registry:5000/price-api:1.0.0","limits":{"cpu":"500m","memory":"64Mi"},"labels":{"owner":"an"}}
+deployment.apps/price-api scaled
+replicas về 2 sau 1 giây
+{"phase":"Succeeded","automated":true}
+```
+
+</Expected>
+
+Vừa bật `selfHeal`, Argo CD kéo `replicas` và `image` về giá trị trong Git: đó là lần tự sửa đầu tiên, vì cụm còn lệch từ bước 6. Giới hạn CPU và label vẫn nằm đó, đúng như bước 6 dự báo. Lần sửa tay thứ hai sống được khoảng một tới ba giây trên máy bạn: ở Argo CD 3.5.5, các lần tự sửa liên tiếp trên **cùng một commit** chờ giãn dần theo cấp số nhân 2, 6, 18, 54, 162 giây, tối đa 300 giây (khoá `controller.self.heal.*` trong ConfigMap `argocd-cmd-params-cm`, giá trị mặc định khai ở [mã nguồn của controller](https://github.com/argoproj/argo-cd/blob/v3.5.5/cmd/argocd-application-controller/commands/argocd_application_controller.go)), nên lần này nó chờ khoảng 2 giây (lệnh đo theo giây nguyên nên có thể in 1). Trang `auto_sync` trong phần Tài liệu còn ghi 5 giây; hành vi của bản 3.5.5 là backoff như trên. Người trực thấy cụm "không tự sửa nữa" sau vài lần giằng co thì đó là backoff, không phải Argo CD hỏng. Từ giờ, muốn đổi số replica thì đổi trong Git.
+
+Hệ quả cần nói với cả đội trước khi bật `selfHeal` ở production: **mọi thao tác cứu hoả bằng `kubectl` trên trường có trong Git đều bị đảo lại sau vài giây**. Người trực phải biết hai lối đi hợp lệ: đổi qua Git, hoặc tạm tắt `automated` của đúng Application đó (một thay đổi nhìn thấy được, ghi lại được) rồi bật lại sau.
+
+<Check id="d14.1.lab-selfheal">Bật được `automated` với `selfHeal`, đo được thời gian một thay đổi tay bị đảo lại, và nói được người trực phải làm gì khác đi khi `selfHeal` đang bật.</Check>
+
+### 8. Webhook: từ vài phút xuống vài giây
+
+Không có webhook, Argo CD chỉ thấy commit mới ở lần hỏi Git kế tiếp: tối đa 120 giây cộng 60 giây lệch ngẫu nhiên (phần Kiến thức), nên một lần push có thể mất tới vài phút mới được triển khai. Khối dưới khai webhook ở Gitea để nó báo ngay khi có push, rồi đẩy bản 1.1.0 và đo thời gian từ lúc push tới lúc Application khoẻ. Địa chỉ webhook là `http://d13-lab-control-plane:30702/api/webhook`: Gitea nằm trên network `kind` nên gọi được node bằng tên container của nó, và cổng 30702 là NodePort của `argocd-server` (bước 4).
+
+<Terminal where="mac">
+
+```bash
+api_an -X POST $G/repos/an/deploy/hooks -d "{\"type\":\"gitea\",\"active\":true,\"events\":[\"push\"],
+  \"config\":{\"url\":\"http://d13-lab-control-plane:30702/api/webhook\",\"content_type\":\"json\",\"secret\":\"$WEBHOOK_SECRET\"}}" \
+  | jq -c '{id, events, active}'
+cd ~/masteva-d14/deploy
+perl -pi -e 's/price-api:1\.0\.0/price-api:1.1.0/' price-api/deployment.yaml
+git commit -q -am "price-api 1.1.0"
+t0=$(date +%s); an_git push -q origin main
+wait_app price-api; echo "từ push tới Healthy: $(( $(date +%s) - t0 )) giây"
+curl -s localhost:9703/price
+kubectl -n argocd logs deployment/argocd-server --since=2m | grep -c 'refreshing app from webhook'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"id":1,"events":["push"],"active":true}
+price-api  rev=5779a32  sync=Synced  health=Healthy
+từ push tới Healthy: 4 giây
+{"env":"lab","host":"price-api-6d8dc699bc-svt2r","price":1250000,"version":"1.1.0"}
+1
+```
+
+</Expected>
+
+Một commit đổi một dòng, và dưới 10 giây sau bản 1.1.0 phục vụ (số giây trên máy bạn sẽ khác, phần lớn là thời gian rolling update). Dòng cuối đếm trong log của `argocd-server` số lần nó làm mới Application vì webhook: phải là 1. Nếu là 0, webhook chưa tới nơi và Argo CD đang chờ lượt hỏi định kỳ; xem phần gỡ lỗi.
+
+### 9. Commit xấu, và lui bằng `git revert`
+
+an đẩy một commit trỏ tới tag `1.2.0`, một tag chưa ai build, kèm một ConfigMap mới. Khối lệnh chờ tới khi Application báo `Degraded`, rồi đếm pod theo ReplicaSet, gọi thử service và đọc ConfigMap mới.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/deploy
+perl -pi -e 's/price-api:1\.1\.0/price-api:1.2.0/' price-api/deployment.yaml
+cat > price-api/notes.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: price-api-notes
+data:
+  owner: team-pricing
+EOF
+git add -A && git commit -q -m "price-api 1.2.0"
+an_git push -q origin main
+wait_app price-api Degraded
+kubectl -n price get pods --no-headers | awk '{print $1, $2, $3}' | sed 's/-[a-z0-9]* / /' | sort | uniq -c
+curl -s localhost:9703/price
+kubectl -n price get configmap price-api-notes -o jsonpath='{.data}{"\n"}'
+```
+
+</Terminal>
+
+<Predict question="Tag 1.2.0 không có trong registry. Argo CD báo trạng thái sync gì, health gì, và người dùng đang gọi cổng 9703 thấy gì?">
+
+```text
+price-api  rev=a6a52e0  sync=Synced  health=Degraded
+   2 price-api-6d8dc699bc 1/1 Running
+   1 price-api-95686cc64 0/1 ErrImagePull
+{"env":"lab","host":"price-api-6d8dc699bc-svt2r","price":1250000,"version":"1.1.0"}
+{"owner":"team-pricing"}
+```
+
+`Synced` và `Degraded`. Argo CD đã làm đúng việc của nó: cụm giống hệt Git, kể cả ConfigMap mới. Thứ sai là Git. Người dùng vẫn nhận bản 1.1.0, vì rolling update của Deployment không gỡ pod cũ khi pod mới chưa sẵn sàng (K1.1); Argo CD không cứu ở đây, nó chỉ báo. Health chuyển sang `Degraded` sau 30 giây, đúng `progressDeadlineSeconds`: Deployment báo quá hạn tiến độ, và Argo CD đọc điều đó thành `Degraded` (pod mới có thể hiện `ImagePullBackOff` thay cho `ErrImagePull`).
+
+</Predict>
+
+Lui bằng một commit đảo ngược:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d14/deploy
+git revert --no-edit HEAD >/dev/null
+git log --oneline | head -3
+t0=$(date +%s); an_git push -q origin main
+wait_app price-api; echo "từ push tới Healthy: $(( $(date +%s) - t0 )) giây"
+kubectl -n price get pods --no-headers | awk '{print $2, $3}' | sort | uniq -c
+kubectl -n price get configmap price-api-notes 2>&1 | tail -1
+argocd app history price-api | awk 'NR > 2 {print $1, $NF}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+842e6b3 Revert "price-api 1.2.0"
+a6a52e0 price-api 1.2.0
+5779a32 price-api 1.1.0
+price-api  rev=842e6b3  sync=Synced  health=Healthy
+từ push tới Healthy: 5 giây
+   2 1/1 Running
+Error from server (NotFound): configmaps "price-api-notes" not found
+0 (ab33f13)
+1 (5779a32)
+2 (a6a52e0)
+3 (842e6b3)
+```
+
+</Expected>
+
+Vài giây sau khi push, cụm quay về đúng trạng thái của commit `price-api 1.1.0`. ConfigMap biến mất vì `prune` đang bật: nó không còn trong Git nên bị xoá khỏi cụm. Lịch sử của Application có đủ bốn lần triển khai, mỗi lần gắn với một commit; `git log` cho biết ai, vì sao. Không ai chạm vào cụm.
+
+`prune` cũng là công tắc nguy hiểm nhất trong ba công tắc: một commit xoá nhầm thư mục là một lệnh xoá hàng loạt được thi hành trung thành. Argo CD có một chốt chặn sẵn là từ chối sync tự động khi Git **không còn object nào** (muốn cho phép phải đặt `allowEmpty`), nhưng không chặn việc xoá gần hết. Hàng rào thật nằm ở review của repo cấu hình (D13.2).
+
+<Check id="d14.1.lab-revert">Tái hiện được trạng thái `Synced` cộng `Degraded` bằng một commit xấu, lui được bằng `git revert`, và giải thích được vì sao ConfigMap bị xoá theo.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **Pod `ErrImagePull` với `http: server gave HTTP response to HTTPS client`:** node không đọc được `hosts.toml`. Kiểm `docker exec d13-lab-control-plane cat /etc/containerd/certs.d/d13-registry:5000/hosts.toml`; nếu trống, thư mục `~/masteva-d14/certs.d` chưa có lúc tạo cụm, phải tạo lại cụm.
+- **`argocd repo list` báo `Failed` hoặc Application `Unknown` với `ComparisonError`:** Argo CD không đọc được repo. Kiểm Secret `repo-deploy` có đúng URL `http://d13-gitea:3000/an/deploy.git` và nhãn `secret-type=repository`, và `argocd` đã là collaborator của repo.
+- **Bước 8 in `0` ở dòng cuối và mất vài phút mới `Synced`:** webhook không tới. Xem `docker logs d13-gitea 2>&1 | grep -i deliver | tail -2`; dòng `denied by egress policy` nghĩa là Gitea thiếu `ALLOWED_HOST_LIST` (bước 1). Dòng `missing X-Gogs-Signature` trong log của `argocd-server` nghĩa là secret hai bên không khớp.
+- **`wait_app` in `QUÁ HẠN`:** in trạng thái bằng `argocd app get price-api` và đọc mục `Message`. Lỗi hay gặp là YAML hỏng trong commit vừa đẩy: sửa bằng một commit mới.
+- **`kind create cluster` báo cổng đã dùng:** một lab khác đang giữ cổng trong dải 9702 tới 9709. Dừng lab đó, hoặc xem `docker ps --format '{{.Names}} {{.Ports}}' | grep 970`.
+- **Bước 1 in `wget: bad address 'd13-gitea:3000'`:** pod chạy khi DNS của cụm chưa sẵn sàng, hoặc container `d13-gitea` không nằm trên network `kind`. Kiểm `docker inspect d13-gitea --format '{{json .NetworkSettings.Networks}}' | grep -c kind`, rồi chạy lại ba dòng `kubectl run`, `kubectl wait`, `kubectl logs`.
+
+</Callout>
+
+### Dọn dẹp
+
+D13.2 dùng tiếp toàn bộ: cụm, Gitea, registry, Argo CD và hai repo. Nếu nghỉ giữa chừng, dừng các container để trả RAM; dữ liệu nằm trong volume và trong container node nên còn nguyên. Bật lại bằng `docker start d13-lab-control-plane d13-gitea d13-registry`, chờ khoảng một phút cho các pod của Argo CD sẵn sàng, rồi `cd ~/masteva-d14 && . ./lab.sh`.
+
+<Terminal where="mac" title="Dừng (giữ dữ liệu)">
+
+```bash
+docker stop d13-gitea d13-registry d13-lab-control-plane
+```
+
+</Terminal>
+
+<Callout kind="danger">
+
+Khối dưới xoá hẳn cụm, mọi repo trong Gitea, mọi image trong registry và thư mục lab. Chỉ chạy khi bạn không làm tiếp chặng D13. Kiểm `kubectl config current-context` in `kind-d13-lab` trước khi xoá cụm.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn">
+
+```bash
+kind delete cluster --name d13-lab
+docker rm -f d13-gitea d13-registry
+docker volume rm d13-gitea-data d13-registry-data
+rm -rf ~/masteva-d14
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Argo CD có mọi quyền trên cụm. Nó bị chiếm thì sao, và giảm rủi ro thế nào?">
+
+Bản cài mặc định gắn cho `argocd-application-controller` một ClusterRole cho phép mọi thao tác trên mọi tài nguyên, tương đương cluster-admin. Kẻ chiếm được controller, hoặc chiếm được quyền ghi vào một repo mà Argo CD tin, có cả cụm. Các lớp giảm rủi ro, từ dễ tới khó: bảo vệ nhánh của repo cấu hình như bảo vệ production (review bắt buộc, không force-push); dùng `AppProject` để mỗi Application chỉ được triển khai vào namespace của nó và không được tạo tài nguyên cấp cụm (D13.2); không mở `argocd-server` ra Internet và bật SSO; với cụm nhiều tenant, cài Argo CD ở chế độ namespace để nó chỉ có quyền trong các namespace được giao. Mô hình kéo không làm quyền biến mất; nó gom quyền về một chỗ nằm trong cụm, nơi bạn canh được.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết manifest Application, giải thích một thông báo `ComparisonError`, hay chuyển một script `kubectl apply` thành cấu trúc repo GitOps là cách dùng tốt. AI hay sai ở chỗ: bật `automated` kèm `prune` và `selfHeal` ngay trong ví dụ đầu tiên mà không nói hệ quả; viết `targetRevision: HEAD` rồi coi như đã ghim phiên bản; khai `replicas` trong manifest của một Deployment đang có HPA; đề xuất `argocd app rollback` cho Application đang bật tự động; và mô tả mặc định của Argo CD 2.x đã đổi ở 3.x (ví dụ theo dõi object bằng label, nay là annotation). Kiểm lại như lab: `argocd app diff` trước khi sync, và tự sửa tay một trường để xem công cụ phản ứng đúng như AI mô tả không.
+
+</Callout>
+
+<Callout kind="link">
+
+D13.2 đặt nhiều môi trường vào repo `deploy`, giao việc đổi phiên bản cho pipeline và pull request, và giới hạn quyền của từng Application bằng AppProject. D13.3 thêm thứ `health` không thấy: tỉ lệ lỗi của request, bằng Argo Rollouts và Prometheus. D11.4 là bài đối chiếu: drift của hạ tầng do OpenTofu quản, nơi không có agent nào tự kéo về. Vòng reconcile của controller, cơ chế nằm dưới cả Kubernetes lẫn Argo CD, là một chủ đề của K9.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d14.1.mastery-explain">Giải thích được cho một đồng đội vì sao chuyển từ `kubectl apply` trong pipeline sang Argo CD: credential nào biến mất khỏi CI, quyền triển khai chuyển về đâu, và điều gì xảy ra với thay đổi tay.</Check>
+
+<Check id="d14.1.mastery-operate">Đọc được trạng thái của một Application (sync, health, diff, lịch sử), chỉ ra được cụm lệch Git ở đâu, và quyết định được nên sync, nên sửa Git hay nên tạm tắt tự động.</Check>
+
+<Check id="d14.1.mastery-rollback">Lui được một thay đổi xấu bằng `git revert`, và nói được vì sao `kubectl rollout undo` không dùng được khi `selfHeal` đang bật.</Check>
+
+</Mastery>
