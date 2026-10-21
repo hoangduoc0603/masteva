@@ -89,8 +89,9 @@ function TopicPanel({ topic, progress, roadmapId, lang }: { topic: TopicDetail; 
         <ul className="rm-lessons">
           {topic.lessons.map((lesson) => (
             <li key={lesson.id}>
-              <a className="rm-lesson" href={`/${lang}${lesson.path}`}>
+              <a className="rm-lesson" href={`/${lang}${lesson.path}`} target="_blank" rel="noopener">
                 <span className="rm-lesson-t">{lesson.title}</span>
+                <span className="sr-only">{t.roadmap.newTabSr}</span>
                 <span className="rm-lesson-n">
                   {format(t.roadmap.itemCount, { done: lesson.items.filter((id) => progress.items[id]).length, total: lesson.items.length })}
                 </span>
@@ -111,8 +112,9 @@ function TopicPanel({ topic, progress, roadmapId, lang }: { topic: TopicDetail; 
           <ul className="rm-res">
             {topic.resources.map((r) => (
               <li key={r.url}>
-                <a href={r.url} rel="noopener">
+                <a href={r.url} target="_blank" rel="noopener">
                   <span className="rm-res-t">{r.title}</span>
+                  <span className="sr-only">{t.roadmap.newTabSr}</span>
                   <span className="rm-res-host">{new URL(r.url).hostname}</span>
                   {r.note ? <span className="rm-res-note">{r.note}</span> : null}
                 </a>
