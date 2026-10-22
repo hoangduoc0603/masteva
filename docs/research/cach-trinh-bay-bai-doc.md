@@ -28,7 +28,7 @@ Ngày nghiên cứu: 22/10/2026. Đầu vào cho ticket 03 (chuẩn bài đọc 
 3. **Trước một cơ chế nhiều bước, giới thiệu riêng từng thành phần.** Biết tên và đặc điểm của các thành phần trước giúp người học hiểu cơ chế tốt hơn (pre-training d = 0,78) ([Mayer 2024][mayer2024]; [Mayer 2002][mayer2002]).
 4. **Output đặt ngay sau code; nhãn đặt ngay trên sơ đồ; chữ không kể lại những gì hình đã nói.** Đây là ba hiệu ứng split-attention, spatial contiguity và redundancy ([Sweller 2019][sweller2019]; [Mayer 2024][mayer2024]).
 5. **Nêu sai lầm thường gặp theo kiểu refutation**: nêu quan niệm sai, nói rõ là sai, rồi giải thích cơ chế. Phần mang hiệu quả là giải thích cơ chế: trong Kendeou 2014, chỉ giải thích đã hiệu quả ngang bác bỏ kèm giải thích. Nêu quan niệm sai vẫn đáng giữ vì nó cho người đọc biết đoạn này sửa đúng điều họ đang nghĩ **[suy luận]** ([Tippett 2010][tippett2010]; [Kendeou 2014][kendeou2014]).
-6. **Không có lab thì phải có truy xuất (retrieval).** Tự kiểm tra là kỹ thuật có bằng chứng mạnh nhất. Đọc lại và tô đậm có hiệu quả thấp ([Roediger 2006][roediger2006]; [Dunlosky 2013][dunlosky2013]; [IES 2007][ies]). Đề xuất: vài chỗ "Đoán trước" trong bài và 3–5 "câu hỏi ôn" có đáp án ẩn ở cuối phần Kiến thức. Đây là việc cần chủ dự án quyết.
+6. **Không có lab thì phải có truy xuất (retrieval).** Tự kiểm tra là kỹ thuật có bằng chứng mạnh nhất. Đọc lại và tô đậm có hiệu quả thấp ([Roediger 2006][roediger2006]; [Dunlosky 2013][dunlosky2013]; [IES 2007][ies]). Đề xuất ban đầu: vài chỗ "Đoán trước" trong bài và 3–5 "câu hỏi ôn" có đáp án ẩn ở cuối phần Kiến thức. **Chủ dự án đã quyết (22/10/2026): không thêm câu hỏi ôn**; bài đọc giữ đúng ba phần như spec, chỉ dùng các chỗ "Đoán trước" trong bài.
 7. **Đoạn văn 2–5 câu, câu mở nêu ý chính, một ý một câu.** Các style guide gần như thống nhất điểm này ([Google][g-para]; [Kubernetes][k8s]; [Microsoft][ms-scan]).
 8. **Callout dùng ít.** Thông tin người đọc cần để hiểu không đặt trong callout. Không để hai callout liền nhau ([Google notices][gs-notice]).
 9. **Giọng trò chuyện, xưng "bạn"** giúp người học vận dụng tốt hơn (personalization d = 1,00), nhưng hiệu ứng nhỏ dần ở bài học dài ([Mayer 2024][mayer2024]; [Ginns 2013][ginns2013]). Tránh "dễ dàng", "đơn giản", "chỉ cần" ([Kubernetes][k8s] cấm "just", "simply", "easy"; danh sách tiếng Việt là **[suy luận]**).
@@ -126,7 +126,7 @@ Kết luận của tổng quan lớn nhất ([Dunlosky 2013][dunlosky2013], đ�
 
 | Kỹ thuật | Mức hữu ích theo Dunlosky 2013 | Áp vào bài đọc |
 |---|---|---|
-| Tự kiểm tra (practice testing) | Cao | Câu hỏi ôn, đoán trước |
+| Tự kiểm tra (practice testing) | Cao | Đoán trước (câu hỏi ôn đã bỏ, xem 8.2) |
 | Học giãn cách (distributed practice) | Cao | Bài sau gọi lại bài trước; ngân hàng câu hỏi phỏng vấn |
 | Elaborative interrogation, self-explanation | Trung bình | Câu nhắc "vì sao" tại chỗ khó |
 | Interleaved practice | Trung bình | Không áp trong một bài đọc |
@@ -135,7 +135,7 @@ Kết luận của tổng quan lớn nhất ([Dunlosky 2013][dunlosky2013], đ�
 | # | Khuyến nghị | Lý do | Nguồn |
 |---|---|---|---|
 | 8.1 | **Đoán trước:** trước 1–3 output gây bất ngờ trong bài, hỏi người học đoán kết quả ("Trước khi xem kết quả, bạn đoán vòng lặp in gì?"). Đáp án và giải thích đặt ngay sau. | Bắt người học đoán trước làm họ ngạc nhiên hơn khi đáp án khác dự đoán, từ đó chú ý và ghi nhớ đáp án đúng tốt hơn. Hiệu quả gắn với việc xử lý phản hồi ngay sau dự đoán **[nghiên cứu, abstract]**. Chuẩn hiện có đã có "Đoán trước" cho lab. | [Brod 2021][brod2021] |
-| 8.2 | **Câu hỏi ôn** (cần chủ dự án quyết, xem mục 2): cuối phần Kiến thức có 3–5 câu hỏi dạng "vì sao" hoặc "điều gì xảy ra nếu", người học tự trả lời rồi mở đáp án. Không có ô đánh dấu, không trắc nghiệm. Không đặt tên "Tự kiểm tra" vì trùng nhãn ô đánh dấu của bài lab. | Kiểm tra làm nhớ lâu hơn đọc lại: sau 2 ngày và 1 tuần, nhóm tự kiểm tra nhớ nhiều hơn hẳn, dù nhóm đọc lại tự tin hơn **[nghiên cứu, abstract]**. Tự kiểm tra cũng hơn lập concept map, kể cả với câu hỏi suy luận **[nghiên cứu, abstract]**. Kiểm tra dạng nhớ lại (recall) cho lợi ích lớn hơn dạng nhận diện **[nghiên cứu, abstract]**. IES xếp "dùng quiz để ôn lại nội dung chính" và "hỏi câu hỏi giải thích sâu" ở mức bằng chứng "strong" **[nghiên cứu]**. | [Roediger 2006][roediger2006]; [Karpicke & Blunt 2011][karpicke2011]; [Rowland 2014][rowland2014]; [Adesope 2017][adesope2017]; [IES 2007][ies] |
+| 8.2 | ~~**Câu hỏi ôn**~~ (không áp dụng: chủ dự án đã quyết không thêm, 22/10/2026; giữ dòng này để lưu bằng chứng): cuối phần Kiến thức có 3–5 câu hỏi dạng "vì sao" hoặc "điều gì xảy ra nếu", người học tự trả lời rồi mở đáp án. Không có ô đánh dấu, không trắc nghiệm. Không đặt tên "Tự kiểm tra" vì trùng nhãn ô đánh dấu của bài lab. | Kiểm tra làm nhớ lâu hơn đọc lại: sau 2 ngày và 1 tuần, nhóm tự kiểm tra nhớ nhiều hơn hẳn, dù nhóm đọc lại tự tin hơn **[nghiên cứu, abstract]**. Tự kiểm tra cũng hơn lập concept map, kể cả với câu hỏi suy luận **[nghiên cứu, abstract]**. Kiểm tra dạng nhớ lại (recall) cho lợi ích lớn hơn dạng nhận diện **[nghiên cứu, abstract]**. IES xếp "dùng quiz để ôn lại nội dung chính" và "hỏi câu hỏi giải thích sâu" ở mức bằng chứng "strong" **[nghiên cứu]**. | [Roediger 2006][roediger2006]; [Karpicke & Blunt 2011][karpicke2011]; [Rowland 2014][rowland2014]; [Adesope 2017][adesope2017]; [IES 2007][ies] |
 | 8.3 | **Tự giải thích:** ở 1–2 chỗ khó nhất bài, thêm một câu nhắc người học tự giải thích trước khi đọc tiếp ("Thử tự trả lời: vì sao `hasNext()` trả `false` ở đây?"). Không nhắc ở mọi mục. | Meta-analysis 69 hệ số: câu nhắc tự giải thích có hiệu quả g = 0,55 **[nghiên cứu, abstract]**. Người học giỏi tự tạo nhiều lời giải thích khi đọc ví dụ mẫu **[nghiên cứu, abstract]**. Câu nhắc chỉ có lợi khi tổng tải còn trong khả năng xử lý **[nghiên cứu]**, vì vậy chỉ dùng ít **[suy luận]**. | [Bisra 2018][bisra2018]; [Chi 1989][chi1989]; [Sweller 2019][sweller2019] |
 | 8.4 | Một hai câu chốt ở cuối mục dài giúp người đọc thấy ý chính, nhưng không thay được việc tự nhớ lại. Không khuyên người học đọc lại hay tự tóm tắt như cách ôn chính. | Tóm tắt là tín hiệu giúp nhớ phần được nhấn **[nghiên cứu, abstract]**. Đọc lại và tóm tắt có mức hữu ích thấp **[nghiên cứu, abstract]**. | [Lorch 1989][lorch1989]; [Dunlosky 2013][dunlosky2013] |
 | 8.5 | **Giãn cách giữa các bài:** callout "Liên hệ bài khác" nói rõ bài sau dùng lại điều gì; khi viết bài sau, nhắc lại ngắn kiến thức cũ thay vì giả định người học còn nhớ. | Meta-analysis 839 phép đo: khoảng cách ôn tốt nhất tăng theo khoảng thời gian cần nhớ **[nghiên cứu, abstract]**. IES: giãn cách việc học (bằng chứng "moderate") **[nghiên cứu]**. Một bài đọc đơn lẻ không giãn cách được nên phải làm ở cấp roadmap **[suy luận]**. | [Cepeda 2006][cepeda2006]; [IES 2007][ies] |
@@ -146,7 +146,7 @@ Kết luận của tổng quan lớn nhất ([Dunlosky 2013][dunlosky2013], đ�
 | Mức | Nội dung | Ghi chú |
 |---|---|---|
 | Tối thiểu (không đổi khung) | Mục tiêu dạng câu hỏi; 1–3 chỗ "Đoán trước"; câu chốt cuối mục dài | Viết bằng văn và khối có sẵn, không cần component mới |
-| Đề xuất | Thêm 3–5 "câu hỏi ôn" có đáp án ẩn (`<details>` hoặc component riêng) ở cuối `<Knowledge>`, trước "Khi làm cùng AI" | Không phải `<Check>`, không tính tiến độ. Cần kiểm `content:check` có cho phép không. Chủ dự án quyết |
+| Đã bỏ | Thêm 3–5 "câu hỏi ôn" có đáp án ẩn ở cuối `<Knowledge>` | Chủ dự án quyết không thêm (22/10/2026). Bài đọc áp dụng mức tối thiểu |
 | Không nên | Ô đánh dấu từng ý; trắc nghiệm nhiều lựa chọn | Spec đã bỏ ô đánh dấu; recall hơn recognition |
 
 ### Nhóm 9. Callout
@@ -202,7 +202,7 @@ Chuẩn hiện có: `docs/content-standard.md` §2.2, §3, §3.1 (đọc ngày 2
 | §3.1 Lời dẫn trước khối lệnh, cách đọc output sau | MDN, Google, Nasehi 2012 (3.3) | **Giữ, bổ sung** | Output ngay dưới code với câu "Kết quả:"; output 1–2 dòng ghi bằng comment; phần lược bỏ dùng comment, không dùng `...` (3.2, 3.4) |
 | §3.1 Lượt đọc như người học | Curse of knowledge (10.6) | **Giữ** | Thêm vào checklist duyệt: kiểm từng khối code có output và câu đọc output chưa |
 | §2.4 "Đoán trước" (chỉ ở lab) | Prediction (Brod 2021) | **Bổ sung vào bài đọc** | 1–3 chỗ mỗi bài, ở output gây bất ngờ |
-| §2.5 Đào sâu (hỏi–đáp ẩn), §2.6 Dấu hiệu nắm chắc: bị bỏ ở bài đọc | Bỏ là mất kênh truy xuất, kỹ thuật có bằng chứng mạnh nhất (8.2) | **Bổ sung (cần quyết)** | 3–5 "Câu hỏi ôn" có đáp án ẩn cuối `<Knowledge>`, không ô đánh dấu. Spec chép câu hỏi đào sâu sang nguồn riêng, không hiển thị trên trang; câu hỏi ôn là bộ mới, ngắn, viết cho người vừa đọc xong bài, nên không đụng nguồn đó. Đổi nhỏ này cần chủ dự án duyệt vì spec bỏ hẳn phần hỏi–đáp ở bài đọc |
+| §2.5 Đào sâu (hỏi–đáp ẩn), §2.6 Dấu hiệu nắm chắc: bị bỏ ở bài đọc | Bỏ là mất kênh truy xuất, kỹ thuật có bằng chứng mạnh nhất (8.2) | **Giữ spec (đã quyết)** | Đề xuất 3–5 câu hỏi ôn có đáp án ẩn đã bị bỏ: chủ dự án quyết bài đọc giữ đúng ba phần (22/10/2026). Truy xuất trong bài chỉ còn 1–3 chỗ "Đoán trước" (8.1) |
 | Spec user story 19: mục lục chỉ liệt kê ba phần | Microsoft: tài liệu dài cần mục lục tới đề mục con (7.6) | **Đổi (cần quyết)** | Mục lục hiện ba phần, và lồng các `###` của Kiến thức dưới mục "Kiến thức". Nếu đổi thì E2E trong Testing Decisions của spec ("mục lục ba mục") cũng phải đổi theo. Nếu giữ spec thì ít nhất Kiến thức cần đề mục rõ để người đọc tự lướt |
 | Chưa có quy định độ dài bài | Ginns 2013: ranh giới 35 phút (2.6) | **Bổ sung** | Ghi thành gợi ý, không thành quy định: bài cần hơn khoảng 30–40 phút đọc thì cân nhắc tách **[suy luận]** (xem 2.6) |
 | Chưa có ranh giới với tra cứu | Diátaxis: explanation không nuốt reference (1.7) | **Bổ sung** | Bảng method chỉ giữ cái cần cho lập luận; tra cứu đầy đủ trỏ Javadoc ở Tài liệu |
@@ -231,9 +231,6 @@ Chuẩn hiện có: `docs/content-standard.md` §2.2, §3, §3.1 (đọc ngày 2
 
 ### <Khái niệm 2> ... (cùng khung; khái niệm sau được dựa vào khái niệm trước)
 
-### Câu hỏi ôn                  ← cần chủ dự án duyệt (mục 2)
-  3–5 câu "vì sao / điều gì xảy ra nếu", đáp án ẩn, không ô đánh dấu.
-
 <Callout kind="ai">   Khi làm cùng AI: nhờ AI làm gì, AI hay sai ở đâu, cách kiểm lại.
 <Callout kind="link"> Liên hệ bài khác: bài nào dùng lại kiến thức này, dùng thế nào.
 
@@ -254,7 +251,6 @@ Không phải khái niệm nào cũng cần đủ chín bước. Bước bắt b
 | TreeSet tin vào compare, không tin equals | Callout production hiện có ("Hàng bán chạy" mất sản phẩm) dời lên làm tình huống mở | `TreeSet` với comparator theo doanh số; `add` trả `false`; `size()` in 2 thay vì 3 | Vì sao: cây chỉ có phép so sánh, không có `equals` | Cách sửa: tiêu chí phân định cuối là khoá duy nhất, kèm output |
 | Optional: kết quả có thể vắng mặt | `Map.get` trả `null`, bên gọi quên kiểm thì có NPE (nối với J5.1) | `findBySku` trả `Optional`; output của `orElseThrow` | Bảng method hiện có | Quan niệm sai: "`orElse(x)` chỉ tính `x` khi rỗng". Output cho thấy `x` luôn được tính, so với `orElseGet`. Javadoc ghi `Optional` chủ yếu dùng làm kiểu trả về của method; dùng cho field hay tham số là quy ước phổ biến nên tránh, không phải điều Javadoc cấm |
 | Collection bất biến: view khác bản sao | Đưa list ra ngoài bằng `unmodifiableList` mà dữ liệu vẫn đổi | Sửa `source` rồi in `view` và `copy`; output cho thấy `view` đổi, `copy` giữ nguyên | Giữ sơ đồ source/view/copy hiện có, thêm caption | Quan niệm sai: "`unmodifiableList` làm dữ liệu không đổi". Thêm: bất biến là nông (shallow); thứ tự của `Set.of` đổi giữa các lần chạy |
-| Câu hỏi ôn (nếu duyệt) | — | — | — | Ví dụ câu hỏi: "Vì sao `TreeSet` có thể có ít phần tử hơn số lần `add` thành công mà không có exception?", "Khi nào `List.copyOf` ném `NullPointerException`?" |
 
 Cuối bài giữ callout `ai` và `link` theo spec.
 
