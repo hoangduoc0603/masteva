@@ -9,6 +9,7 @@
 | [product-vision.md](product-vision.md) | Tên, giá trị hứa hẹn, phạm vi nội dung và ngôn ngữ, persona, 7 giá trị cốt lõi, mô hình kinh doanh, metric, lộ trình phát triển, quyết định đã chốt |
 | [features.md](features.md) | Tính năng theo module (ROADMAP, LESSON, LAB, PROJECT, PROGRESS, REVIEW, I18N…), yêu cầu phi chức năng, quy tắc, ngoài phạm vi, tiêu chí nghiệm thu, quyết định còn mở |
 | [content-standard.md](content-standard.md) | Khung 6 phần của bài học, quy tắc viết, quy trình kiểm chứng, bản quyền, quy tắc dịch, dàn ý mẫu D1.1 |
+| [research/cach-trinh-bay-bai-doc.md](research/cach-trinh-bay-bai-doc.md) | Nghiên cứu cách trình bày bài đọc kỹ thuật (Diátaxis, style guide, tải nhận thức, học qua ví dụ), đối chiếu với chuẩn nội dung (22/10/2026); đầu vào cho chuẩn bài đọc |
 | [architecture.md](architecture.md) | **Kiến trúc đã duyệt**: tổng quan hệ thống, cấu trúc repo, mô hình nội dung, đa ngôn ngữ, tiến độ, tìm kiếm, CI, bảo mật, triển khai, kiểm thử, ADR |
 | [design-direction.md](design-direction.md) | **Định hướng thiết kế đã chốt** (Sổ tay kỹ sư): tính cách, màu, chữ, bố cục trong Fumadocs, component bài học và roadmap, thứ tự áp dụng |
 | [superpowers/specs/](superpowers/specs/), [superpowers/plans/](superpowers/plans/) | Spec và kế hoạch cũ (03–09/10/2026); spec mới nằm trong `.scratch/` |
