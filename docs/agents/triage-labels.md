@@ -1,6 +1,6 @@
 # Triage Labels
 
-Các skill nói theo năm vai trò triage chuẩn. File này ánh xạ từng vai trò sang chuỗi thật dùng trong tracker của repo (dòng `Status:` của file issue trong `.scratch/`).
+Các skill nói theo năm vai trò triage chuẩn. File này ánh xạ từng vai trò sang chuỗi thật dùng trong tracker của repo (dòng `**Status:**` của file issue trong `.scratch/`). Ngoài năm vai trò còn trạng thái `done` cho ticket đã xong (xem `issue-tracker.md`).
 
 | Label trong mattpocock/skills | Label trong tracker | Nghĩa                                       |
 | ----------------------------- | ------------------- | ------------------------------------------- |

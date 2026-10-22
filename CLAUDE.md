@@ -2,7 +2,19 @@
 
 Phần bổ sung cho `../CLAUDE.md`. Masteva là web học cho lập trình viên nói chung, không chỉ backend; tiếng Việt là ngôn ngữ mặc định, sẽ đa ngôn ngữ. Kiến trúc nằm ở `docs/architecture.md`, đọc trước khi sửa code.
 
-**Bắt đầu mỗi session bằng việc đọc `docs/status.md`** để biết dự án đang ở đâu và bước tiếp theo là gì. Cập nhật file đó khi xong một mốc.
+## Cách làm việc
+
+Dự án theo luồng của bộ skill engineering (mattpocock-skills). Trạng thái dự án nằm ở tracker: các ticket trong `.scratch/` và dòng `**Status:**` của từng ticket. Không còn file tiến độ tổng; `docs/archive/status-den-2026-10-22.md` là bản lưu trữ, không cập nhật.
+
+- **Đầu session:** liệt kê ticket còn mở (`grep -rL "^\*\*Status:\*\* done" .scratch/*/issues/*.md`); ticket không bị chặn, số nhỏ nhất làm trước.
+- **Ý tưởng mới:** `/grill-with-docs` → `/to-spec` → `/to-tickets` trong cùng một cửa sổ hội thoại, rồi `/clear` và `/implement` từng ticket (hoặc `/implement-spec` cho cả spec).
+- **Việc phát sinh, lỗi, góp ý:** ghi thành ticket `needs-triage` trong `.scratch/`, xử lý bằng `/triage`. Lỗi khó tái hiện: `/diagnosing-bugs`.
+- **Ticket nội dung** (viết hoặc sửa bài): không áp TDD. Nghiệm thu bằng `pnpm content:check`, `pnpm build`, chạy thật mọi đoạn code và lệnh trong bài, và một lượt đọc với vai người học (lần đầu học chủ đề). `/code-review` chấm trục Standards theo `docs/content-standard.md`.
+- Chỉ commit, push, deploy khi được yêu cầu rõ. Người dùng thích tài liệu gọn, có bảng; không thích bị giao bài hay phải gửi lại output.
+
+## Git và deploy
+
+Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva` (alias SSH `github.com-personal`). **Push lên `master` là tự deploy** bằng Workers Builds (ADR-010). Cache của Impeccable (`hook.cache.json`, `live/`) nằm trong `.gitignore`; bản critique trong `.impeccable/critique/` được commit.
 
 ## Stack riêng của project
 
@@ -49,11 +61,11 @@ Với thay đổi chỉ ở nội dung, tối thiểu chạy `pnpm content:check
 
 ### Issue tracker
 
-Issue là file markdown trong `.scratch/<feature>/` của repo. Xem `docs/agents/issue-tracker.md`.
+Issue là file markdown trong `.scratch/<feature>/` của repo, đóng bằng `**Status:** done`. Xem `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-Dùng 5 vai trò mặc định (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), ghi ở dòng `Status:`. Xem `docs/agents/triage-labels.md`.
+Dùng 5 vai trò mặc định (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), ghi ở dòng `**Status:**`. Xem `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

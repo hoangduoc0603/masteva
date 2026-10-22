@@ -1,6 +1,6 @@
-# Tiến độ Masteva
+# Tiến độ Masteva (lưu trữ, đến 22/10/2026)
 
-Cập nhật lần cuối: 22/10/2026. File này giúp một session mới biết dự án đang ở đâu; cập nhật mỗi khi xong một mốc.
+> **Bản lưu trữ, không cập nhật nữa.** Từ 22/10/2026 dự án theo luồng spec → ticket → implement; việc cần làm nằm trong `.scratch/` (xem `CLAUDE.md`, mục "Cách làm việc"). Các mục "Bước tiếp theo", "Chưa làm" và phần việc của "Vấn đề đã biết" đã chuyển thành ticket trong `.scratch/backlog/issues/`; các số đo và ghi chú kiểm chứng bên dưới giữ lại để tra cứu.
 
 ## Đã xong
 
