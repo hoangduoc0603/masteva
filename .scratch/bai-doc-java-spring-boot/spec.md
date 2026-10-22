@@ -36,7 +36,7 @@ Trong lúc viết lại từng chặng, các khoảng trống của chặng đó
 16. As a người học, I want chủ đề trên sơ đồ roadmap thành "đã xong" khi mọi bài của chủ đề đã học xong và "đang học" khi mới xong một phần, so that sơ đồ phản ánh đúng tiến độ.
 17. As a người học, I want nút "Học tiếp" dẫn tới bài đọc kế tiếp chưa học xong, so that tôi không phải tự tìm.
 18. As a người học, I want trạng thái tôi tự đặt cho chủ đề (đã biết, bỏ qua, chưa học) vẫn thắng trạng thái tính từ bài, so that hành vi quen thuộc không đổi.
-19. As a người học, I want mục lục bài chỉ liệt kê ba phần của bài đọc, so that mục lục khớp với nội dung.
+19. As a người học, I want mục lục bài đọc liệt kê ba phần của bài, với các đề mục con của phần kiến thức lồng ngay dưới mục Kiến thức, so that mục lục khớp với nội dung và tôi nhảy thẳng tới khái niệm cần ôn trong một bài dài.
 20. As a người học DevOps hoặc Kubernetes, I want bài lab giữ nguyên 6 phần và các ô đánh dấu từng bước, so that việc làm lab theo từng bước không bị ảnh hưởng.
 21. As a người học Spring Boot, I want một bài về tự xây xác thực (đăng ký, đăng nhập, tự phát JWT, refresh token rotation và phát hiện token bị dùng lại) kèm giải thích khi nào nên chuyển sang IdP, so that tôi hiểu cách nhiều dự án thực tế đang làm và vì sao Masteva khuyên dùng Keycloak.
 22. As a người học Spring Boot, I want học Swagger/springdoc ở bài REST của SB1, so that tôi tài liệu hoá API như hằng ngày đi làm; và J10.3 không còn hứa một nội dung không tồn tại.
@@ -63,7 +63,7 @@ Trong lúc viết lại từng chặng, các khoảng trống của chặng đó
 
 **Dạng bài**
 - Frontmatter mỗi bài có trường dạng bài, bắt buộc, hai giá trị: bài đọc và bài lab. Mọi bài DevOps và Kubernetes hiện có được khai báo là bài lab trong cùng thay đổi.
-- Hằng số khung bài tách thành hai khung theo dạng bài: bài đọc là Goal → Knowledge → Resources; bài lab giữ Goal → Knowledge → Resources → Practice → DeepDive → Mastery. Component phần bài và mục lục bài dùng khung theo dạng bài của bài đang hiển thị.
+- Hằng số khung bài tách thành hai khung theo dạng bài: bài đọc là Goal → Knowledge → Resources; bài lab giữ Goal → Knowledge → Resources → Practice → DeepDive → Mastery. Component phần bài và mục lục bài dùng khung theo dạng bài của bài đang hiển thị. Mục lục bài đọc lồng các đề mục `###` của bài dưới mục Kiến thức (đề mục `###` của bài đọc chỉ nằm trong phần kiến thức); mục lục bài lab giữ sáu mục.
 
 **Kiểm tra cấu trúc**
 - Phần trích xuất và kiểm tra cấu trúc bài nhận thêm dạng bài. Với bài đọc: đúng ba phần theo thứ tự, không có `<Check>` nào; mã mục duy nhất của bài là `<mã bài>.done`, do hệ thống sinh ra chứ tác giả không viết. Với bài lab: giữ nguyên quy tắc hiện tại.
@@ -108,7 +108,7 @@ Trong lúc viết lại từng chặng, các khoảng trống của chặng đó
 
 - Test kiểm hành vi quan sát được qua giao diện công khai, không kiểm chi tiết cài đặt. Chủ dự án đã duyệt hai chỗ kiểm thử, đều là chỗ đã có test:
   1. **Kiểm tra cấu trúc bài** (unit, cùng nhóm test kiểm tra nội dung hiện có): đầu vào là nội dung bài và dạng bài; đầu ra là lỗi và mã mục. Các trường hợp: bài đọc đúng ba phần thì hợp lệ và có đúng một mã `<mã bài>.done`; bài đọc sai thứ tự hoặc thiếu phần thì lỗi; bài đọc có `<Check>` thì lỗi; bài lab vẫn phải đủ 6 phần đúng thứ tự; bài thiếu khai báo dạng bài thì lỗi.
-  2. **Trang bài đọc** (E2E, cùng bộ E2E luồng học hiện có): trang có ba phần và mục lục ba mục; bấm "Đã học xong bài", tải lại vẫn giữ; chủ đề của bài thành "đã xong" trên trang roadmap; bấm lại thì bỏ đánh dấu. Các E2E hiện có dựa vào việc tích mục trong bài Java phải chuyển sang bài lab (DevOps/Kubernetes) hoặc sang nút "Đã học xong bài".
+  2. **Trang bài đọc** (E2E, cùng bộ E2E luồng học hiện có): trang có ba phần; mục lục có ba mục của ba phần, các đề mục `###` của phần kiến thức lồng ngay sau mục Kiến thức và trỏ tới đề mục nằm trong phần đó; bấm "Đã học xong bài", tải lại vẫn giữ; chủ đề của bài thành "đã xong" trên trang roadmap; bấm lại thì bỏ đánh dấu. Các E2E hiện có dựa vào việc tích mục trong bài Java phải chuyển sang bài lab (DevOps/Kubernetes) hoặc sang nút "Đã học xong bài".
 - Không viết test mới cho mô hình tiến độ (không đổi; đã có test tally và trạng thái chủ đề) và cho việc xoá mã cũ khỏi file khoá (một lần; `content:check` chạy qua là đủ).
 - Theo `CLAUDE.md`, TDD bắt buộc cho phần kiểm tra nội dung: viết test ở chỗ kiểm thử 1 trước khi đổi code.
 - Ticket viết lại bài không có test tự động; nghiệm thu theo quy định ticket nội dung trong `CLAUDE.md`: `pnpm content:check`, `pnpm build`, chạy thật mọi đoạn code và output trong bài, một lượt đọc với vai người học lần đầu gặp chủ đề. Thay đổi code kết thúc bằng `pnpm verify` xanh.

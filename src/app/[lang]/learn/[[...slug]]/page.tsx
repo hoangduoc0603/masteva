@@ -55,7 +55,7 @@ export default async function LessonPage(props: PageProps<'/[lang]/learn/[[...sl
   const staleTranslation = !showingFallback && lang !== DEFAULT_LANGUAGE && page.data.source !== sourceHash;
 
   return (
-    <DocsPage toc={sectionToc(t, page.data.kind)} breadcrumb={{ enabled: false }}>
+    <DocsPage toc={sectionToc(t, page.data.kind, page.data.toc)} breadcrumb={{ enabled: false }}>
       {context ? (
         <nav className="ls-crumb" aria-label={t.lesson.breadcrumb}>
           <a href={`/${lang}/roadmaps/${context.roadmap.id}`}>{context.roadmap.title}</a>

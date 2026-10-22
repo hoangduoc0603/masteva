@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import type { TOCItemType } from 'fumadocs-core/toc';
 import { LESSON_FRAMES, LESSON_SECTIONS, type LessonKind, type SectionName } from '@/lib/content/constants';
 import type { Messages } from '@/lib/messages';
 
@@ -12,13 +13,17 @@ export const SECTION_ANCHORS: Record<SectionName, string> = {
   Mastery: 'mastery',
 };
 
-/** Mục lục bài theo khung của dạng bài: ba mục với bài đọc, sáu mục với bài lab. */
-export function sectionToc(t: Messages, kind: LessonKind) {
-  return LESSON_FRAMES[kind].map((name) => ({
-    title: t.lesson.sections[name],
-    url: `#${SECTION_ANCHORS[name]}`,
-    depth: 2,
-  }));
+/**
+ * Mục lục bài theo khung của dạng bài: ba mục với bài đọc, sáu mục với bài lab.
+ * Bài đọc lồng các đề mục `###` của bài (`headings`, mục lục Fumadocs sinh từ MDX) dưới mục Kiến thức;
+ * theo chuẩn bài đọc, đề mục `###` chỉ nằm trong phần Kiến thức.
+ */
+export function sectionToc(t: Messages, kind: LessonKind, headings: readonly TOCItemType[] = []): TOCItemType[] {
+  return LESSON_FRAMES[kind].flatMap((name) => {
+    const item = { title: t.lesson.sections[name], url: `#${SECTION_ANCHORS[name]}`, depth: 2 };
+    if (kind !== 'reading' || name !== 'Knowledge') return [item];
+    return [item, ...headings.filter((heading) => heading.depth === 3)];
+  });
 }
 
 /**

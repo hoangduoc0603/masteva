@@ -13,4 +13,4 @@
 - [ ] Mô tả roadmap Java và Spring Boot ghi danh sách cố ý không dạy kèm lý do: Bazel, Javalin, Play, EBean, TestNG, Cucumber, Log4j2/TinyLog, JSP
 - [ ] `pnpm content:check` xanh
 
-**Quyết định từ ticket 01 (22/10/2026):** không thêm phần câu hỏi ôn; bài đọc giữ đúng ba phần như spec, việc truy xuất trong bài chỉ dùng 1–3 chỗ "Đoán trước" ở output gây bất ngờ. Đề xuất mục lục lồng đề mục con của phần kiến thức (khác user story 19) vẫn chờ chủ dự án quyết; xem `docs/research/cach-trinh-bay-bai-doc.md` mục 2.
+**Quyết định từ ticket 01 (22/10/2026):** không thêm phần câu hỏi ôn; bài đọc giữ đúng ba phần như spec, việc truy xuất trong bài chỉ dùng 1–3 chỗ "Đoán trước" ở output gây bất ngờ. Mục lục bài đọc lồng các đề mục `###` của phần kiến thức dưới mục Kiến thức (đã làm trong code); chuẩn bài đọc cần ghi: đề mục `###` chỉ đặt trong phần kiến thức, mỗi khái niệm một `###`, đề mục dạng cụm danh từ hoặc câu nêu điều rút ra (nghiên cứu, khuyến nghị 7.1–7.2).

@@ -11,4 +11,4 @@
 - [x] Đối chiếu khuyến nghị với khung phần kiến thức hiện có trong chuẩn nội dung (cái gì → vì sao → cơ chế → khi nào dùng → sai ở đâu) và giọng văn hướng dẫn người học; chỉ ra chỗ giữ, chỗ đổi
 - [x] Mỗi khuyến nghị có trích dẫn nguồn
 
-**Kết quả:** `docs/research/cach-trinh-bay-bai-doc.md`. Hai đề xuất lệch spec: (1) thêm 3–5 "câu hỏi ôn" có đáp án ẩn cuối phần kiến thức — chủ dự án quyết **không thêm** (22/10/2026), bài đọc giữ đúng ba phần, chỉ dùng các chỗ "Đoán trước" trong bài; (2) mục lục lồng các đề mục con của phần kiến thức (user story 19) — còn chờ quyết ở ticket 03.
+**Kết quả:** `docs/research/cach-trinh-bay-bai-doc.md`. Hai đề xuất lệch spec: (1) thêm 3–5 "câu hỏi ôn" có đáp án ẩn cuối phần kiến thức — chủ dự án quyết **không thêm** (22/10/2026), bài đọc giữ đúng ba phần, chỉ dùng các chỗ "Đoán trước" trong bài; (2) mục lục lồng các đề mục `###` của phần kiến thức dưới mục Kiến thức — chủ dự án **duyệt** (22/10/2026); đã sửa user story 19, E2E trang bài đọc và mục lục của bài đọc.

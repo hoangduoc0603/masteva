@@ -118,7 +118,7 @@ Mỗi dòng gồm khuyến nghị (làm được ngay), lý do và nguồn. Mã 
 | 7.3 | Sau mỗi đề mục có lời dẫn; không đặt hai đề mục liền nhau; không có mục con đơn lẻ. | MDN và Google đều quy định như vậy **[hướng dẫn]**. | [MDN][mdn]; [Google headings][gs-head] |
 | 7.4 | Dùng tín hiệu nhất quán: Mục tiêu liệt kê các câu hỏi bài trả lời; đề mục; chữ đậm cho thuật ngữ ở lần đầu; 1–2 câu chốt ở cuối mục dài. | Tổng quan về tín hiệu trong văn bản: gần như mọi loại tín hiệu (tiêu đề, đề mục, xem trước, tóm tắt, dấu chữ) giúp nhớ thông tin được nhấn, còn thông tin không được nhấn thì thường không đổi **[nghiên cứu, abstract]**. | [Lorch 1989][lorch1989]; [Mayer 2024][mayer2024] |
 | 7.5 | Mỗi `###` là một khúc đọc trọn vẹn, kết thúc ở một điểm dừng tự nhiên. Khúc sau được dựa vào khúc trước, nhưng không cắt ngang một ý giữa hai khúc. | Segmenting: chia bài thành các đoạn người học tự điều nhịp thì học tốt hơn một khối liền (d = 0,67) **[nghiên cứu]**. Nghiên cứu đo trên bài multimedia; văn bản vốn đã do người đọc tự điều nhịp và không trôi qua như lời nói, nên áp vào bài đọc là **[suy luận]**. | [Mayer 2024][mayer2024]; [Sweller 2019][sweller2019] |
-| 7.6 | Bài dài cần mục lục tới cấp đề mục khái niệm (`###` trong Kiến thức). | Microsoft: tài liệu dài đọc trên mạng phải có mục lục link tới đề mục con **[hướng dẫn]**. Điểm này **khác** user story 19 của spec ("mục lục chỉ liệt kê ba phần"); xem mục 2. | [Microsoft scannable][ms-scan]; [Write the Docs][wtd] |
+| 7.6 | Bài dài cần mục lục tới cấp đề mục khái niệm (`###` trong Kiến thức). | Microsoft: tài liệu dài đọc trên mạng phải có mục lục link tới đề mục con **[hướng dẫn]**. Chủ dự án đã duyệt (22/10/2026); user story 19 của spec đã sửa theo, xem mục 2. | [Microsoft scannable][ms-scan]; [Write the Docs][wtd] |
 
 ### Nhóm 8. Giúp nhớ lâu khi không có lab
 
@@ -203,7 +203,7 @@ Chuẩn hiện có: `docs/content-standard.md` §2.2, §3, §3.1 (đọc ngày 2
 | §3.1 Lượt đọc như người học | Curse of knowledge (10.6) | **Giữ** | Thêm vào checklist duyệt: kiểm từng khối code có output và câu đọc output chưa |
 | §2.4 "Đoán trước" (chỉ ở lab) | Prediction (Brod 2021) | **Bổ sung vào bài đọc** | 1–3 chỗ mỗi bài, ở output gây bất ngờ |
 | §2.5 Đào sâu (hỏi–đáp ẩn), §2.6 Dấu hiệu nắm chắc: bị bỏ ở bài đọc | Bỏ là mất kênh truy xuất, kỹ thuật có bằng chứng mạnh nhất (8.2) | **Giữ spec (đã quyết)** | Đề xuất 3–5 câu hỏi ôn có đáp án ẩn đã bị bỏ: chủ dự án quyết bài đọc giữ đúng ba phần (22/10/2026). Truy xuất trong bài chỉ còn 1–3 chỗ "Đoán trước" (8.1) |
-| Spec user story 19: mục lục chỉ liệt kê ba phần | Microsoft: tài liệu dài cần mục lục tới đề mục con (7.6) | **Đổi (cần quyết)** | Mục lục hiện ba phần, và lồng các `###` của Kiến thức dưới mục "Kiến thức". Nếu đổi thì E2E trong Testing Decisions của spec ("mục lục ba mục") cũng phải đổi theo. Nếu giữ spec thì ít nhất Kiến thức cần đề mục rõ để người đọc tự lướt |
+| Spec user story 19: mục lục chỉ liệt kê ba phần | Microsoft: tài liệu dài cần mục lục tới đề mục con (7.6) | **Đổi (đã quyết)** | Chủ dự án duyệt (22/10/2026): mục lục hiện ba phần, các `###` của Kiến thức lồng dưới mục "Kiến thức". User story 19 và E2E trang bài đọc của spec đã sửa theo |
 | Chưa có quy định độ dài bài | Ginns 2013: ranh giới 35 phút (2.6) | **Bổ sung** | Ghi thành gợi ý, không thành quy định: bài cần hơn khoảng 30–40 phút đọc thì cân nhắc tách **[suy luận]** (xem 2.6) |
 | Chưa có ranh giới với tra cứu | Diátaxis: explanation không nuốt reference (1.7) | **Bổ sung** | Bảng method chỉ giữ cái cần cho lập luận; tra cứu đầy đủ trỏ Javadoc ở Tài liệu |
 

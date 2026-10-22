@@ -254,7 +254,7 @@ test('luồng Java: Học tiếp vào bài J1.1', async ({ page }) => {
 const READING = '/vi/learn/j5/j5-3';
 const READING_TOPIC = 'j5.optional';
 
-test('bài đọc: ba phần và mục lục ba mục; Đã học xong bài còn sau tải lại, làm chủ đề thành đã xong, bấm lại thì bỏ', async ({ page }, testInfo) => {
+test('bài đọc: ba phần, mục lục lồng đề mục của Kiến thức; Đã học xong bài còn sau tải lại, làm chủ đề thành đã xong, bấm lại thì bỏ', async ({ page }, testInfo) => {
   await page.goto(READING);
   expect(await page.locator('[data-section]').evaluateAll((els) => els.map((el) => el.getAttribute('data-section')))).toEqual([
     'Goal',
@@ -263,7 +263,27 @@ test('bài đọc: ba phần và mục lục ba mục; Đã học xong bài còn
   ]);
   const mobile = testInfo.project.name === 'mobile';
   if (mobile) await page.locator('[data-toc-popover-trigger]').click();
-  await expect(page.locator(mobile ? '[data-toc-popover] a' : '#nd-toc a')).toHaveText(['Mục tiêu', 'Kiến thức', 'Tài liệu']);
+  // Mục lục: ba phần, các đề mục ### của phần Kiến thức lồng ngay dưới mục Kiến thức.
+  const tocLinks = page.locator(mobile ? '[data-toc-popover] a' : '#nd-toc a');
+  await expect(tocLinks.first()).toHaveText('Mục tiêu');
+  const toc = await tocLinks.evaluateAll((els) => els.map((el) => ({ text: el.textContent, id: el.getAttribute('href')!.slice(1) })));
+  expect([toc[0], toc[1], toc.at(-1)]).toEqual([
+    { text: 'Mục tiêu', id: 'goal' },
+    { text: 'Kiến thức', id: 'knowledge' },
+    { text: 'Tài liệu', id: 'resources' },
+  ]);
+  const nested = toc.slice(2, -1).map((item) => item.id);
+  expect(nested.length).toBeGreaterThan(0);
+  // Mỗi mục lồng trỏ tới một h3 nằm trong phần Kiến thức.
+  const targets = await page.evaluate(
+    (ids) =>
+      ids.map((id) => {
+        const el = document.getElementById(id);
+        return `${el?.tagName}:${el?.closest('[data-section]')?.getAttribute('data-section')}`;
+      }),
+    nested,
+  );
+  expect(targets).toEqual(nested.map(() => 'H3:Knowledge'));
   if (mobile) await page.keyboard.press('Escape');
 
   const progress = page.getByTestId('lesson-progress');
