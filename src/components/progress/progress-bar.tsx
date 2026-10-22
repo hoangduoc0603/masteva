@@ -4,6 +4,7 @@ import { useProgress, useReplacements } from '@/lib/progress/use-progress';
 import { useMessages } from '@/components/messages-provider';
 import { format } from '@/lib/format';
 import { cn } from '@/lib/cn';
+import type { LessonKind } from '@/lib/content/constants';
 
 export function Bar({ done, total, label, className }: { done: number; total: number; label: string; className?: string }) {
   const ratio = total === 0 ? 0 : done / total;
@@ -24,20 +25,31 @@ export function Bar({ done, total, label, className }: { done: number; total: nu
   );
 }
 
-/** Tiến độ của một bài, hiện ở đầu trang bài học. */
-export function LessonProgress({ items, replacements }: { items: string[]; replacements: Record<string, string> }) {
+/**
+ * Tiến độ của một bài, hiện ở đầu trang bài học.
+ * Bài đọc chỉ có một mục nên hiện "Đã học xong"/"Chưa học xong" thay cho "Đã xong n/m mục".
+ */
+export function LessonProgress({
+  items,
+  kind,
+  replacements,
+}: {
+  items: string[];
+  kind: LessonKind;
+  replacements: Record<string, string>;
+}) {
   useReplacements(replacements);
   const { progress, persistent } = useProgress();
   const t = useMessages();
   const { done, total } = tally(progress, items);
   if (total === 0) return null;
+  const finished = done === total ? t.lesson.finished : t.lesson.notFinished;
+  const label = kind === 'reading' ? finished : format(t.lesson.progress, { done, total });
   return (
     <div className="not-prose flex flex-col gap-1.5" data-testid="lesson-progress">
       <div className="flex items-center gap-3">
-        <Bar done={done} total={total} label={format(t.lesson.progress, { done, total })} className="flex-1" />
-        <span className="text-xs tabular-nums text-fd-muted-foreground">
-          {format(t.lesson.progress, { done, total })}
-        </span>
+        <Bar done={done} total={total} label={label} className="flex-1" />
+        <span className="text-xs tabular-nums text-fd-muted-foreground">{label}</span>
       </div>
       {!persistent ? <PersistWarning /> : null}
     </div>

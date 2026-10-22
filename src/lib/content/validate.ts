@@ -1,13 +1,25 @@
 import type { IdsLock } from './schema';
-import { LESSON_SECTIONS, checkIdPattern } from './schema';
+import { LESSON_FRAMES, checkIdPattern, doneItemId, type LessonKind } from './schema';
 import type { ExtractedLesson } from './extract';
 
-/** Kiểm tra khung 6 phần và mã mục của một bài (bản gốc hoặc bản dịch). */
-export function validateLessonStructure(lessonId: string, extracted: ExtractedLesson): string[] {
+/**
+ * Kiểm tra khung bài theo dạng bài và trả về mã mục của bài (bản gốc hoặc bản dịch).
+ * Bài lab: mã mục là các `<Check>`. Bài đọc: không có `<Check>`, mã mục duy nhất là `<mã bài>.done`.
+ */
+export function validateLessonStructure(
+  lessonId: string,
+  kind: LessonKind | undefined,
+  extracted: ExtractedLesson,
+): { errors: string[]; itemIds: string[] } {
   const errors: string[] = [];
-  const expected = LESSON_SECTIONS.join(' → ');
+  if (!kind) return { errors: ['Thiếu dạng bài (kind: reading hoặc lab) trong frontmatter'], itemIds: [] };
+  const expected = LESSON_FRAMES[kind].join(' → ');
   if (extracted.sections.join(' → ') !== expected) {
     errors.push(`Khung bài phải đúng thứ tự ${expected}; đang có: ${extracted.sections.join(' → ') || '(trống)'}`);
+  }
+  if (kind === 'reading') {
+    if (extracted.checkIds.length + extracted.invalidChecks > 0) errors.push('Bài đọc không được có <Check>');
+    return { errors, itemIds: [doneItemId(lessonId)] };
   }
   if (extracted.invalidChecks > 0) {
     errors.push(`${extracted.invalidChecks} <Check> thiếu id dạng chuỗi cố định`);
@@ -20,7 +32,7 @@ export function validateLessonStructure(lessonId: string, extracted: ExtractedLe
       errors.push(`Mã mục "${id}" phải có dạng ${lessonId}.<slug>`);
     }
   }
-  return errors;
+  return { errors, itemIds: extracted.checkIds };
 }
 
 /** Bản dịch không được có mã mục không tồn tại ở bản gốc. */

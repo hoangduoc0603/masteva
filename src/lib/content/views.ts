@@ -23,7 +23,7 @@ export interface LessonInput {
   slug: string;
   path: string;
   title: string;
-  checkIds: string[];
+  itemIds: string[];
   topics: string[];
 }
 
@@ -172,7 +172,7 @@ function indexContent(input: ViewInput) {
     id: l.id,
     title: l.title,
     path: l.path,
-    items: l.checkIds,
+    items: l.itemIds,
     code: `${input.steps.get(l.stepId)?.code ?? l.stepId.toUpperCase()}.${pageOrder(l) + 1}`,
   });
   const ordered = [...input.lessons].sort((a, b) => a.stepId.localeCompare(b.stepId) || pageOrder(a) - pageOrder(b));

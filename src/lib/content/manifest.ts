@@ -84,7 +84,7 @@ export function getLessonContext(lessonId: string, lang: string): LessonContext 
 }
 
 export function getLessonItems(lessonId: string): string[] {
-  return loadLessons().find((l) => l.id === lessonId)?.checkIds ?? [];
+  return loadLessons().find((l) => l.id === lessonId)?.itemIds ?? [];
 }
 
 export function getReplacements(): Record<string, string> {

@@ -12,6 +12,8 @@ import { getMDXComponents } from '@/components/mdx';
 import { sectionToc } from '@/components/lesson/sections';
 import { LessonStatusBadge } from '@/components/lesson/lesson-meta';
 import { LessonProgress } from '@/components/progress/progress-bar';
+import { LessonDone } from '@/components/lesson/lesson-done';
+import { doneItemId } from '@/lib/content/constants';
 
 export const dynamicParams = false;
 
@@ -53,7 +55,7 @@ export default async function LessonPage(props: PageProps<'/[lang]/learn/[[...sl
   const staleTranslation = !showingFallback && lang !== DEFAULT_LANGUAGE && page.data.source !== sourceHash;
 
   return (
-    <DocsPage toc={sectionToc(t)} breadcrumb={{ enabled: false }}>
+    <DocsPage toc={sectionToc(t, page.data.kind)} breadcrumb={{ enabled: false }}>
       {context ? (
         <nav className="ls-crumb" aria-label={t.lesson.breadcrumb}>
           <a href={`/${lang}/roadmaps/${context.roadmap.id}`}>{context.roadmap.title}</a>
@@ -90,10 +92,11 @@ export default async function LessonPage(props: PageProps<'/[lang]/learn/[[...sl
           </Callout>
         ) : null}
         {staleTranslation ? <Callout type="warning">{t.lesson.staleTranslation}</Callout> : null}
-        <LessonProgress items={getLessonItems(page.data.id)} replacements={getReplacements()} />
+        <LessonProgress items={getLessonItems(page.data.id)} kind={page.data.kind} replacements={getReplacements()} />
       </div>
       <DocsBody className="ms-lesson">
         <MDX components={getMDXComponents(t, { a: createRelativeLink(source, page) })} />
+        {page.data.kind === 'reading' ? <LessonDone id={doneItemId(page.data.id)} /> : null}
       </DocsBody>
     </DocsPage>
   );

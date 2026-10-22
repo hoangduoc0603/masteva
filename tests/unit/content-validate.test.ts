@@ -38,18 +38,44 @@ describe('extractLesson', () => {
 });
 
 describe('validateLessonStructure', () => {
-  const ok = { sections: [...LESSON_SECTIONS], checkIds: ['d1.1.a', 'd1.1.b'], invalidChecks: 0, links: [] };
+  const lab = { sections: [...LESSON_SECTIONS], checkIds: ['d1.1.a', 'd1.1.b'], invalidChecks: 0, links: [] };
+  const reading = { sections: ['Goal', 'Knowledge', 'Resources'], checkIds: [], invalidChecks: 0, links: [] };
 
-  it('accepts a well-formed lesson', () => {
-    expect(validateLessonStructure('d1.1', ok)).toEqual([]);
+  it('accepts a reading lesson with three sections and gives it the single item <lesson>.done', () => {
+    expect(validateLessonStructure('j5.3', 'reading', reading)).toEqual({ errors: [], itemIds: ['j5.3.done'] });
+  });
+
+  it('accepts a well-formed lab lesson and keeps its check ids as items', () => {
+    expect(validateLessonStructure('d1.1', 'lab', lab)).toEqual({ errors: [], itemIds: ['d1.1.a', 'd1.1.b'] });
   });
 
   it('rejects missing or misordered sections', () => {
-    expect(validateLessonStructure('d1.1', { ...ok, sections: ['Goal', 'Practice', 'Knowledge'] })).toHaveLength(1);
+    expect(validateLessonStructure('d1.1', 'lab', { ...lab, sections: ['Goal', 'Practice', 'Knowledge'] }).errors).toHaveLength(1);
+  });
+
+  it('rejects a reading lesson whose sections are misordered, missing, or include lab sections', () => {
+    for (const sections of [['Knowledge', 'Goal', 'Resources'], ['Goal', 'Knowledge'], [...LESSON_SECTIONS]]) {
+      expect(validateLessonStructure('j5.3', 'reading', { ...reading, sections }).errors).toEqual([
+        `Khung bài phải đúng thứ tự Goal → Knowledge → Resources; đang có: ${sections.join(' → ')}`,
+      ]);
+    }
+  });
+
+  it('rejects a reading lesson that has <Check>, with or without an id', () => {
+    expect(validateLessonStructure('j5.3', 'reading', { ...reading, checkIds: ['j5.3.a'] }).errors).toEqual(['Bài đọc không được có <Check>']);
+    expect(validateLessonStructure('j5.3', 'reading', { ...reading, invalidChecks: 1 }).errors).toEqual(['Bài đọc không được có <Check>']);
+  });
+
+  it('still requires all six sections of a lab lesson', () => {
+    expect(validateLessonStructure('d1.1', 'lab', { ...lab, sections: ['Goal', 'Knowledge', 'Resources'] }).errors).toHaveLength(1);
+  });
+
+  it('rejects a lesson without a kind', () => {
+    expect(validateLessonStructure('d1.1', undefined, lab).errors).toEqual(['Thiếu dạng bài (kind: reading hoặc lab) trong frontmatter']);
   });
 
   it('rejects duplicate ids and ids from another lesson', () => {
-    const errors = validateLessonStructure('d1.1', { ...ok, checkIds: ['d1.1.a', 'd1.1.a', 'd1.2.b', 'd1.1.Bad'] });
+    const { errors } = validateLessonStructure('d1.1', 'lab', { ...lab, checkIds: ['d1.1.a', 'd1.1.a', 'd1.2.b', 'd1.1.Bad'] });
     expect(errors.join('\n')).toMatch(/trùng: d1\.1\.a/);
     expect(errors.join('\n')).toMatch(/d1\.2\.b/);
     expect(errors.join('\n')).toMatch(/d1\.1\.Bad/);

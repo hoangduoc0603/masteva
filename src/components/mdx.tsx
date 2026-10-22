@@ -15,11 +15,24 @@ export function getMDXComponents(t: Messages = getMessages('vi'), components?: M
   }
   return {
     ...defaultMdxComponents,
+    table: LessonTable,
     ...createSectionComponents(t),
     ...createBlockComponents(t),
     Check: LessonCheck,
     ...components,
   } satisfies MDXComponents;
+}
+
+/**
+ * Như bảng mặc định của Fumadocs, nhưng khung cuộn ngang nhận focus để người dùng bàn phím
+ * cuộn được bảng rộng trên mobile (axe: scrollable-region-focusable).
+ */
+function LessonTable(props: ComponentProps<'table'>) {
+  return (
+    <div className="relative overflow-auto prose-no-margin my-6" tabIndex={0}>
+      <table {...props} />
+    </div>
+  );
 }
 
 export function useMDXComponents(components?: MDXComponents) {

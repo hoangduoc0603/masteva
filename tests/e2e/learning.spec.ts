@@ -242,21 +242,47 @@ test('khung chi tiết chưa có bài vẫn có hướng đi tiếp', async ({ p
   await expect(jdk.locator('.rm-res a')).toHaveCount(3);
 });
 
-test('luồng Java: Học tiếp vào bài J1.1, tích mục làm chủ đề thành đang học', async ({ page }) => {
+test('luồng Java: Học tiếp vào bài J1.1', async ({ page }) => {
   await page.goto('/vi/roadmaps/java');
   const cta = page.getByTestId('continue');
   await expect(cta).toHaveAttribute('href', '/vi/learn/j1/j1-1');
+  await expect(chip(page, 'j1.jdk-lts').locator('.rm-chip-b')).toHaveText('Bài');
   await cta.click();
   await expect(page).toHaveURL(/\/vi\/learn\/j1\/j1-1/);
-  // Sau chuyển trang phía trình duyệt, ô tích có thể đã hiện nhưng React chưa gắn handler: chờ rồi mới bấm.
-  await page.waitForFunction(() => {
-    const box = document.querySelector('[data-check-id="j1.1.lab-compile-run"]');
-    return box !== null && Object.keys(box).some((key) => key.startsWith('__reactProps'));
-  });
-  await page.locator('[data-check-id="j1.1.lab-compile-run"]').check();
+});
+
+const READING = '/vi/learn/j5/j5-3';
+const READING_TOPIC = 'j5.optional';
+
+test('bài đọc: ba phần và mục lục ba mục; Đã học xong bài còn sau tải lại, làm chủ đề thành đã xong, bấm lại thì bỏ', async ({ page }, testInfo) => {
+  await page.goto(READING);
+  expect(await page.locator('[data-section]').evaluateAll((els) => els.map((el) => el.getAttribute('data-section')))).toEqual([
+    'Goal',
+    'Knowledge',
+    'Resources',
+  ]);
+  const mobile = testInfo.project.name === 'mobile';
+  if (mobile) await page.locator('[data-toc-popover-trigger]').click();
+  await expect(page.locator(mobile ? '[data-toc-popover] a' : '#nd-toc a')).toHaveText(['Mục tiêu', 'Kiến thức', 'Tài liệu']);
+  if (mobile) await page.keyboard.press('Escape');
+
+  const progress = page.getByTestId('lesson-progress');
+  const done = page.getByRole('button', { name: 'Đã học xong bài' });
+  await expect(progress).toContainText('Chưa học xong');
+  await done.click();
+  await expect(done).toHaveAttribute('aria-pressed', 'true');
+  await expect(progress).toContainText('Đã học xong');
+  await page.reload();
+  await expect(done).toHaveAttribute('aria-pressed', 'true');
   await page.goto('/vi/roadmaps/java');
-  await expect(chip(page, 'j1.jdk-lts')).toHaveAttribute('data-st', 'learning');
-  await expect(chip(page, 'j1.jdk-lts').locator('.rm-chip-b')).toHaveText('Bài');
+  await expect(chip(page, READING_TOPIC)).toHaveAttribute('data-st', 'done');
+
+  await page.goto(READING);
+  await done.click();
+  await expect(done).toHaveAttribute('aria-pressed', 'false');
+  await expect(progress).toContainText('Chưa học xong');
+  await page.goto('/vi/roadmaps/java');
+  await expect(chip(page, READING_TOPIC)).toHaveAttribute('data-st', 'todo');
 });
 
 test('nút Vào học không dời chỗ khi bắt đầu học', async ({ page }) => {
@@ -264,8 +290,9 @@ test('nút Vào học không dời chỗ khi bắt đầu học', async ({ page 
   const card = page.locator('.rm-next');
   await expect(card).toHaveAttribute('data-state', 'new');
   const before = await page.getByTestId('continue').boundingBox();
-  await page.goto('/vi/learn/j1/j1-1');
-  await page.locator('[data-check-id="j1.1.lab-compile-run"]').check();
+  await page.goto(READING);
+  await page.getByRole('button', { name: 'Đã học xong bài' }).click();
+  await expect(page.getByRole('button', { name: 'Đã học xong bài' })).toHaveAttribute('aria-pressed', 'true');
   await page.goto('/vi/roadmaps/java');
   await expect(card).toHaveAttribute('data-state', 'learning');
   const after = await page.getByTestId('continue').boundingBox();
@@ -303,7 +330,7 @@ test('đóng khung khi chủ đề bị ẩn (ẩn mục bỏ qua) không làm m
 });
 
 test('nút Sao chép nằm trong thanh tiêu đề Terminal', async ({ page }) => {
-  await page.goto('/vi/learn/j1/j1-1');
+  await page.goto(LESSON);
   const head = page.locator('.ms-term-head').first();
   const button = page.locator('.ms-term').first().getByRole('button', { name: 'Sao chép' });
   const [h, b] = [await head.boundingBox(), await button.boundingBox()];
@@ -509,7 +536,7 @@ test('mobile: không cuộn ngang, có thanh Học tiếp ở đáy', async ({ p
 test('không có lỗi truy cập nghiêm trọng, sáng và tối', async ({ page }) => {
   for (const scheme of ['light', 'dark'] as const) {
     await page.emulateMedia({ colorScheme: scheme });
-    for (const url of [LESSON, '/vi', '/vi/roadmaps/java', '/vi/projects/neobank']) {
+    for (const url of [LESSON, READING, '/vi', '/vi/roadmaps/java', '/vi/projects/neobank']) {
       await page.goto(url);
       expect(await seriousViolations(page), `${url} (${scheme})`).toEqual([]);
     }

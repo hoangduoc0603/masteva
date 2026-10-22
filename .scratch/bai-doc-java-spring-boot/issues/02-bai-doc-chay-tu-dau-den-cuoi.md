@@ -4,13 +4,13 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Frontmatter mỗi bài có trường dạng bài bắt buộc (bài đọc hoặc bài lab); mọi bài DevOps và Kubernetes khai báo là bài lab
-- [ ] Kiểm tra cấu trúc theo dạng bài, viết test trước (TDD): bài đọc đúng ba phần theo thứ tự và không có `<Check>`; bài lab đủ 6 phần như cũ; bài thiếu dạng bài thì lỗi
-- [ ] Bài đọc có đúng một mã mục `<mã bài>.done` do hệ thống sinh; mã này được khoá, kiểm bản dịch và đưa vào manifest như mọi mã mục khác
-- [ ] Trang bài đọc: ba phần đánh số, mục lục ba mục, nút "Đã học xong bài" bật tắt mục `.done` qua kho tiến độ hiện có, trạng thái ở thanh tiến độ đầu bài
-- [ ] J5.3 cắt tạm thành bài đọc; mã mục cũ của J5.3 xoá thẳng khỏi danh sách `ids` của file khoá mã (ADR-0011)
-- [ ] E2E mới: trang bài đọc có ba phần và mục lục ba mục; bấm "Đã học xong bài", tải lại vẫn giữ; chủ đề thành "đã xong" trên trang roadmap; bấm lại thì bỏ
-- [ ] Các E2E đang tích mục trong bài Java chuyển sang bài lab hoặc sang nút "Đã học xong bài"
-- [ ] `pnpm verify` xanh
+- [x] Frontmatter mỗi bài có trường dạng bài bắt buộc (bài đọc hoặc bài lab); mọi bài DevOps và Kubernetes khai báo là bài lab
+- [x] Kiểm tra cấu trúc theo dạng bài, viết test trước (TDD): bài đọc đúng ba phần theo thứ tự và không có `<Check>`; bài lab đủ 6 phần như cũ; bài thiếu dạng bài thì lỗi
+- [x] Bài đọc có đúng một mã mục `<mã bài>.done` do hệ thống sinh; mã này được khoá, kiểm bản dịch và đưa vào manifest như mọi mã mục khác
+- [x] Trang bài đọc: ba phần đánh số, mục lục ba mục, nút "Đã học xong bài" bật tắt mục `.done` qua kho tiến độ hiện có, trạng thái ở thanh tiến độ đầu bài
+- [x] J5.3 cắt tạm thành bài đọc; mã mục cũ của J5.3 xoá thẳng khỏi danh sách `ids` của file khoá mã (ADR-0011)
+- [x] E2E mới: trang bài đọc có ba phần và mục lục ba mục; bấm "Đã học xong bài", tải lại vẫn giữ; chủ đề thành "đã xong" trên trang roadmap; bấm lại thì bỏ
+- [x] Các E2E đang tích mục trong bài Java chuyển sang bài lab hoặc sang nút "Đã học xong bài"
+- [x] `pnpm verify` xanh

@@ -1,8 +1,6 @@
 import type { ReactNode } from 'react';
-import { LESSON_SECTIONS } from '@/lib/content/constants';
+import { LESSON_FRAMES, LESSON_SECTIONS, type LessonKind, type SectionName } from '@/lib/content/constants';
 import type { Messages } from '@/lib/messages';
-
-type SectionName = (typeof LESSON_SECTIONS)[number];
 
 /** Neo cố định của từng phần, dùng cho mục lục. */
 export const SECTION_ANCHORS: Record<SectionName, string> = {
@@ -14,8 +12,9 @@ export const SECTION_ANCHORS: Record<SectionName, string> = {
   Mastery: 'mastery',
 };
 
-export function sectionToc(t: Messages) {
-  return LESSON_SECTIONS.map((name) => ({
+/** Mục lục bài theo khung của dạng bài: ba mục với bài đọc, sáu mục với bài lab. */
+export function sectionToc(t: Messages, kind: LessonKind) {
+  return LESSON_FRAMES[kind].map((name) => ({
     title: t.lesson.sections[name],
     url: `#${SECTION_ANCHORS[name]}`,
     depth: 2,
@@ -23,8 +22,9 @@ export function sectionToc(t: Messages) {
 }
 
 /**
- * Tạo 6 component khung bài (content-standard §2) gắn với chữ giao diện của ngôn ngữ đang xem.
- * Tiêu đề phần do component sinh ra, tác giả không tự viết.
+ * Tạo các component khung bài (content-standard §2) gắn với chữ giao diện của ngôn ngữ đang xem.
+ * Tiêu đề phần do component sinh ra, tác giả không tự viết. Ba phần đầu đứng cùng vị trí trong khung
+ * bài đọc và khung bài lab, nên số thứ tự theo `LESSON_SECTIONS` đúng cho cả hai dạng bài.
  */
 export function createSectionComponents(t: Messages): Record<SectionName, (props: { children?: ReactNode }) => ReactNode> {
   const make = (name: SectionName, index: number) =>

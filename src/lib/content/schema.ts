@@ -1,8 +1,13 @@
 import { z } from 'zod';
-import { LESSON_STATUSES, LEVELS, TOPIC_KINDS, TRACKS, type LessonStatus } from './constants';
+import { LESSON_KINDS, LESSON_STATUSES, LEVELS, TOPIC_KINDS, TRACKS, type LessonStatus } from './constants';
 
 export {
+  LESSON_FRAMES,
+  LESSON_KINDS,
   LESSON_SECTIONS,
+  doneItemId,
+  type LessonKind,
+  type SectionName,
   LESSON_STATUSES,
   LEVELS,
   TOPIC_KINDS,
@@ -57,6 +62,8 @@ export type Topic = z.infer<typeof topicSchema>;
 export const lessonFields = {
   id: z.string().regex(lessonIdPattern),
   step: z.string().min(1),
+  /** Dạng bài, bắt buộc (ADR-0011). */
+  kind: z.enum(LESSON_KINDS),
   prerequisites: z.array(z.string()).default([]),
   /** Chủ đề trên sơ đồ mà bài này bao phủ (spec §4.3). */
   topics: z.array(z.string().regex(topicIdPattern)).min(1),

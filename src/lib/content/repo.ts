@@ -59,7 +59,8 @@ export interface LessonEntry {
   /** Đường dẫn không kèm ngôn ngữ, ví dụ `/learn/d1/d1-1`. */
   path: string;
   title: string;
-  checkIds: string[];
+  /** Mã mục của bài: các `<Check>` của bài lab, hoặc `<mã bài>.done` của bài đọc. */
+  itemIds: string[];
   /** Chủ đề trên sơ đồ mà bài bao phủ. */
   topics: string[];
   /** Hash nội dung bản gốc, để bản dịch ghi lại nó dựa vào phiên bản nào. */
@@ -145,6 +146,8 @@ interface ParsedLesson {
   file: LessonFile;
   frontmatter: z.infer<typeof lessonFrontmatterSchema> | null;
   extracted: ExtractedLesson;
+  /** Mã mục theo dạng bài: các `<Check>` của bài lab, hoặc `<mã bài>.done` của bài đọc. */
+  itemIds: string[];
   errors: string[];
 }
 
@@ -154,7 +157,11 @@ function parseLesson(file: LessonFile): ParsedLesson {
   const errors = parsed.success
     ? []
     : parsed.error.issues.map((i) => `Frontmatter "${i.path.join('.')}": ${i.message}`);
-  return { file, frontmatter: parsed.success ? parsed.data : null, extracted: extractLesson(body, LESSON_SECTIONS), errors };
+  const frontmatter = parsed.success ? parsed.data : null;
+  const extracted = extractLesson(body, LESSON_SECTIONS);
+  if (!frontmatter) return { file, frontmatter, extracted, itemIds: [], errors };
+  const structure = validateLessonStructure(frontmatter.id, frontmatter.kind, extracted);
+  return { file, frontmatter, extracted, itemIds: structure.itemIds, errors: [...errors, ...structure.errors] };
 }
 
 let lessonsCache: LessonEntry[] | undefined;
@@ -163,14 +170,14 @@ export function loadLessons(): LessonEntry[] {
   lessonsCache ??= loadLessonFiles()
     .filter((f) => f.lang === DEFAULT_LANG)
     .map((f) => {
-      const { frontmatter, extracted } = parseLesson(f);
+      const { frontmatter, itemIds } = parseLesson(f);
       return {
         id: frontmatter?.id ?? f.slug.replace(/-/g, '.'),
         stepId: f.stepId,
         slug: f.slug,
         path: `/learn/${f.stepId}/${f.slug}`,
         title: frontmatter?.title ?? f.slug,
-        checkIds: extracted.checkIds,
+        itemIds,
         topics: frontmatter?.topics ?? [],
         sourceHash: hashContent(f.raw),
       };
@@ -196,8 +203,8 @@ export function checkContent(): ContentReport {
   const currentIds = new Set<string>();
 
   for (const lesson of parsed.filter((p) => p.file.lang === DEFAULT_LANG)) {
-    sourceIdsBySlug.set(`${lesson.file.stepId}/${lesson.file.slug}`, lesson.extracted.checkIds);
-    for (const id of lesson.extracted.checkIds) currentIds.add(id);
+    sourceIdsBySlug.set(`${lesson.file.stepId}/${lesson.file.slug}`, lesson.itemIds);
+    for (const id of lesson.itemIds) currentIds.add(id);
   }
 
   for (const lesson of parsed) {
@@ -214,13 +221,12 @@ export function checkContent(): ContentReport {
       report(`chưa được liệt kê trong "pages" của meta.json`);
     }
 
-    validateLessonStructure(fm.id, lesson.extracted).forEach(report);
     validateInternalLinks(lesson.extracted.links, lessonPaths).forEach(report);
 
     if (lesson.file.lang !== DEFAULT_LANG) {
       const sourceIds = sourceIdsBySlug.get(`${lesson.file.stepId}/${lesson.file.slug}`);
       if (!sourceIds) report('bản dịch không có bản gốc tiếng Việt');
-      else validateTranslation(sourceIds, lesson.extracted.checkIds).forEach(report);
+      else validateTranslation(sourceIds, lesson.itemIds).forEach(report);
     }
   }
 

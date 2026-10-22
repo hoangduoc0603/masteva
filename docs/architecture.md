@@ -92,8 +92,8 @@ Quy tắc phụ thuộc:
 | Roadmap | `java`, `spring-boot`, `devops`, `kubernetes`, `microservices` | Tên, mô tả, màu (`track`), ba cấp (Nền tảng, Middle, Senior) mỗi cấp có mục tiêu và danh sách chặng; bước nên học trước từ roadmap khác (`recommended`) | Chỉ tham chiếu tới chặng, không chứa bài |
 | Bước (chặng) | `d1` | Tên, mã hiển thị (`code`, ví dụ `D1`, `SB3`, `K2`), nhánh, bước tiên quyết, chủ đề trên sơ đồ, liên kết sang chặng của roadmap khác, danh sách bài; `optional` cho chặng tuỳ chọn | Mỗi chặng thuộc đúng một roadmap. Mã hiển thị khai báo trong `meta.json`, độc lập với định danh (chặng `j12` có mã `SB3`); mã bài tính từ mã chặng và thứ tự bài (`SB3.2`). `content:check` báo lỗi khi nội dung nhắc mã chặng không tồn tại hoặc số bài vượt số bài của chặng ([spec 2026-10-09](superpowers/specs/2026-10-09-tach-roadmap-spring-boot-design.md) §5) |
 | Chủ đề | `j5.generics` | Tên, loại (`core`, `pick` kèm `options`, `opt`), mô tả ngắn, chủ đề nên học trước, đọc thêm | Nút trên sơ đồ; bài khai báo chủ đề mình bao phủ bằng frontmatter `topics` |
-| Bài học | `d1.1` | Metadata (mục 5.2) và nội dung 6 phần | File MDX |
-| Mục đánh dấu | `d1.1.exit-code` | Một ý kiến thức, một bước thực hành hoặc một tiêu chí | Khai báo bằng component trong MDX |
+| Bài học | `d1.1` | Metadata (mục 5.2) và nội dung theo dạng bài: bài đọc 3 phần, bài lab 6 phần (mục 5.3) | File MDX |
+| Mục đánh dấu | `d1.1.exit-code` | Một ý kiến thức, một bước thực hành hoặc một tiêu chí | Bài lab khai báo bằng component trong MDX; bài đọc có đúng một mục `<mã bài>.done` do hệ thống sinh (ADR-0011) |
 | Dự án | `neobank` | Bài toán, kiến trúc mục tiêu, các mốc | |
 | Mốc dự án | `neobank.ledger` | Tên, các chặng hoặc chủ đề cần học (`needs`) từ mọi roadmap | Trang roadmap hiện "Dùng ở dự án" từ dữ liệu này |
 
@@ -107,6 +107,7 @@ Kiểm tra bằng schema Zod mở rộng từ `pageSchema` của Fumadocs. Build
 |---|---|---|
 | `id` | Có | Mã bài, ví dụ `d1.1` |
 | `step` | Có | Mã bước chứa bài |
+| `kind` | Có | Dạng bài: `reading` (bài đọc) hoặc `lab` (bài lab), ADR-0011 |
 | `title`, `description` | Có | Dùng cho trang, SEO, tìm kiếm |
 | `prerequisites` | Không | Danh sách mã bài hoặc mã bước tiên quyết |
 | `status` | Có | `draft`, `verified` hoặc `outdated` |
@@ -114,9 +115,12 @@ Kiểm tra bằng schema Zod mở rộng từ `pageSchema` của Fumadocs. Build
 | `outdatedNote` | Khi `status = outdated` | Phần nào có thể đã cũ |
 | `source` | Chỉ ở bản dịch | Phiên bản bản gốc mà bản dịch dựa vào (hash nội dung bản gốc) |
 
-### 5.3 Khung 6 phần là component
+### 5.3 Khung bài là component
 
-Mỗi bài dùng đúng 6 component theo thứ tự: `<Goal>`, `<Knowledge>`, `<Resources>`, `<Practice>`, `<DeepDive>`, `<Mastery>`.
+Khung bài theo dạng bài (`LESSON_FRAMES` trong `src/lib/content/constants.ts`):
+
+- **Bài lab:** đúng 6 component theo thứ tự `<Goal>`, `<Knowledge>`, `<Resources>`, `<Practice>`, `<DeepDive>`, `<Mastery>`.
+- **Bài đọc:** đúng 3 component `<Goal>`, `<Knowledge>`, `<Resources>`, không có `<Check>`. Mục lục chỉ có ba mục; cuối bài có nút "Đã học xong bài" bật tắt mục `<mã bài>.done`, đầu bài hiện "Đã học xong"/"Chưa học xong".
 
 Các component phụ trong bài:
 
@@ -134,7 +138,7 @@ Lý do dùng component thay cho tiêu đề Markdown: vừa kiểm soát đượ
 
 Đáp ứng BR-003 (không làm mất tiến độ người học) và FR-PROGRESS-007.
 
-- Mã mục được **viết tường minh** trong MDX, không suy ra từ vị trí.
+- Mã mục của bài lab được **viết tường minh** trong MDX, không suy ra từ vị trí. Mã `<mã bài>.done` của bài đọc do hệ thống sinh, nhưng được khoá, kiểm bản dịch và đưa vào manifest như mọi mã mục khác.
 - Mã chủ đề (`topics`) và mã mốc dự án (`milestones`) cũng được khoá trong cùng file, dùng chung `replacements`.
 - `content/ids.lock.json` liệt kê mọi mã đã từng phát hành, kèm mã thay thế nếu mục đã bị gộp hoặc đổi tên.
 - **Khi build:**
