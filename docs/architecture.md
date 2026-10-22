@@ -275,6 +275,8 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 
 ## 14. Quyết định kiến trúc (ADR)
 
+Bảng này giữ ADR-001…010. ADR mới, từ ADR-011, là file riêng trong `docs/adr/` (xem `docs/agents/domain.md`).
+
 | Mã | Quyết định | Lý do | Đánh đổi | Trạng thái |
 |---|---|---|---|---|
 | ADR-001 | Fumadocs trên Next.js | Cần giao diện tuỳ biến sâu và tính năng ứng dụng ở G3–G4; tìm kiếm tiếng Việt tuỳ chỉnh được | Nặng hơn Starlight; phải tự làm thông báo chưa dịch và khung terminal | Đã chấp nhận (03/10/2026) |

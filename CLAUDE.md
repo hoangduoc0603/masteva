@@ -45,6 +45,20 @@ pnpm verify
 
 Với thay đổi chỉ ở nội dung, tối thiểu chạy `pnpm content:check` và `pnpm build`.
 
+## Agent skills
+
+### Issue tracker
+
+Issue là file markdown trong `.scratch/<feature>/` của repo. Xem `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Dùng 5 vai trò mặc định (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), ghi ở dòng `Status:`. Xem `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` ở gốc (tạo khi cần), ADR mới trong `docs/adr/` đánh số từ 0011 (ADR-001…010 ở `docs/architecture.md` §14). Xem `docs/agents/domain.md`.
+
 <!-- BEGIN:nextjs-agent-rules -->
 
 # This is NOT the Next.js you know
