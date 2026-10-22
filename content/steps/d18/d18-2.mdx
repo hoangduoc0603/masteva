@@ -1,0 +1,985 @@
+---
+title: Điều phối lưu lượng trong mesh
+description: Thêm waypoint cho một namespace ambient, chia lưu lượng 90/10 rồi 50/50 và theo header bằng HTTPRoute, đặt timeout, tiêm độ trễ và lỗi bằng VirtualService, đo retry của mesh nhân tải lên backend gấp 4 rồi 12 lần và chặn lại bằng retry budget, rồi để outlier detection loại một pod hỏng, đo mọi bước bằng fortio và bộ đếm của waypoint.
+id: d18.2
+step: d18
+prerequisites: [d18.1, d23.2, d21.6]
+topics: [d18.dieu-phoi-luu-luong]
+status: verified
+verified:
+  date: 2026-10-19
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.36.1
+    istio: 1.31.2
+    gateway-api: 1.6.3 (standard)
+    fortio: 1.75.3
+    curl-image: 8.22.0
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+K11.1 dừng ở tầng 4: mã hoá, danh tính, ai được nối tới ai. Bài này thêm tầng 7 để mesh điều khiển từng request HTTP giữa các service, và đo cái giá khi điều khiển sai. Học xong, bạn giải thích được:
+
+- Khi nào namespace ambient cần waypoint, và request đi qua nó thế nào.
+- Vì sao cùng một Service, không có waypoint thì chia lưu lượng theo kết nối và số pod, có waypoint thì chia đúng 90/10 theo request.
+- Vì sao HTTPRoute làm được chia lưu lượng và timeout nhưng tiêm lỗi lại phải dùng VirtualService, và vì sao không được dùng cả hai cho một Service.
+- Vì sao bật retry ở mesh làm backend đang hỏng nhận gấp 4 lần request, gấp 12 lần khi client cũng retry, và retry budget đưa con số về gần 1.
+- Vì sao một pod trả `503` cho mọi request chỉ làm hỏng vài request đầu khi có outlier detection.
+
+</Goal>
+
+<Knowledge>
+
+### Waypoint: proxy tầng 7 cho một namespace
+
+ztunnel chỉ hiểu TCP. Mọi thứ cần đọc request HTTP (chia theo tỉ lệ, theo header, retry khi gặp `503`, timeout từng request, chính sách theo đường dẫn) cần một Envoy. Ở ambient, Envoy đó là **waypoint**: một Deployment do istiod dựng khi bạn tạo một object `Gateway` với `gatewayClassName: istio-waypoint`.
+
+```text
+ client ─► ztunnel node A ══HBONE══► waypoint (Envoy) ══HBONE══► ztunnel node B ─► pod web-v1
+                                       │                                         (hoặc web-v2)
+                                       ├ chọn route: HTTPRoute hay VirtualService
+                                       ├ chọn backend theo trọng số, header
+                                       ├ timeout, retry, tiêm lỗi
+                                       └ cân bằng tải theo request, loại pod hỏng
+```
+
+Ba điều cần nhớ:
+
+- Waypoint chỉ được dùng khi **đích** được gắn label `istio.io/use-waypoint=<tên waypoint>` (trên namespace, Service hoặc pod). Waypoint thuộc về phía **nhận**: nó áp chính sách của service đích, bất kể client là ai.
+- Mặc định waypoint chỉ nhận traffic gửi tới **Service** (`istio.io/waypoint-for: service`). Gọi thẳng IP pod thì đi vòng qua waypoint.
+- ztunnel của pod đích giờ thấy kết nối đến từ **danh tính của waypoint**, không còn danh tính của client. K11.3 cho thấy điều này làm hỏng một AuthorizationPolicy cũ thế nào.
+
+<Check id="d18.2.waypoint">Vẽ được đường đi của request khi có waypoint, nói được label nào bật waypoint cho một namespace, và giải thích được vì sao gọi thẳng IP pod thì không qua waypoint.</Check>
+
+### Hai bộ API cấu hình tầng 7
+
+Istio có hai cách khai báo luật tầng 7, và ở ambient hai cách đó không ngang nhau:
+
+| Việc | Gateway API (`HTTPRoute`, kênh standard) | API riêng của Istio | Ở ambient 1.31 |
+|---|---|---|---|
+| Chia theo trọng số, theo header, theo đường dẫn | `backendRefs[].weight`, `matches` | `VirtualService` | HTTPRoute là cách được khuyên dùng (beta) |
+| Timeout | `rules[].timeouts.request` | `VirtualService.http[].timeout` | Cả hai |
+| Retry | `rules[].retry` chỉ có ở kênh experimental | `VirtualService.http[].retries` | Cụm dùng kênh standard thì cấu hình retry bằng VirtualService |
+| Tiêm lỗi (delay, abort) | Không có | `VirtualService.http[].fault` | Chỉ VirtualService |
+| Giới hạn kết nối, outlier detection, retry budget | Không có | `DestinationRule.trafficPolicy` | `DestinationRule`, dùng chung với cả hai |
+
+Tài liệu Istio ghi `VirtualService` ở ambient còn ở mức **alpha**, và **không được dùng `VirtualService` cùng `HTTPRoute` cho cùng một Service**: kết quả không xác định. Lab đi theo đúng quy tắc đó: chia lưu lượng bằng HTTPRoute, rồi xoá HTTPRoute trước khi chuyển Service sang VirtualService để tiêm lỗi và cấu hình retry. `DestinationRule` là cấu hình cho cụm backend (cluster của Envoy, D9.6), không phải luật định tuyến, nên đi kèm được cả hai.
+
+HTTPRoute trong mesh gắn vào **Service** chứ không vào một Gateway: `parentRefs` trỏ tới `kind: Service`. Gateway API gọi cách dùng này là **GAMMA** (Gateway API for Mesh Management and Administration). Cấu trúc rule giống hệt K2.2: `matches`, `filters`, `backendRefs`.
+
+<Check id="d18.2.hai-api">Chọn được API đúng cho từng việc (chia lưu lượng, timeout, retry, tiêm lỗi, outlier detection) ở ambient, và giải thích được vì sao không dùng VirtualService và HTTPRoute cho cùng một Service.</Check>
+
+### Canary và định tuyến theo header
+
+Không có waypoint, ztunnel chọn pod cho từng **kết nối** giữa các pod của Service: ba pod (hai v1, một v2) cho tỉ lệ khoảng 2/1, không chỉnh được, và client giữ kết nối lâu thì mọi request của nó dính một pod. Có waypoint, Envoy chọn cho từng **request**, theo trọng số bạn đặt, không phụ thuộc số pod. Đây là điều kiện để làm canary chính xác: 1% lưu lượng cho bản mới mà không cần 100 pod.
+
+Định tuyến theo header cho phép nhóm nhỏ (nhân viên, khách hàng thử nghiệm) luôn vào bản mới: rule có `matches` cụ thể hơn thắng rule không điều kiện, như K2.2.
+
+D13.3 đã dùng Argo Rollouts làm canary theo số pod và nhắc tới "bộ định tuyến lưu lượng". Mesh chính là một bộ định tuyến như vậy: Argo Rollouts sửa trọng số trong HTTPRoute (qua plugin Gateway API) hoặc trong VirtualService ở mỗi bước, và AnalysisTemplate đọc tỉ lệ lỗi của riêng bản canary từ metric `istio_requests_total` mà waypoint xuất (nhãn `destination_version`, `response_code`). Bài này chỉnh trọng số bằng tay để thấy cơ chế; tự động hoá là việc của Rollouts.
+
+### Timeout và retry ở mesh
+
+D18.2 (chặng D18 của roadmap DevOps) đã dạy retry nhân tải qua nhiều lớp, retry budget và load shedding với Envoy cấu hình bằng tay: mỗi lớp retry vài lần thì số lần gọi nhân với nhau, và một trần retry theo tỉ lệ request (retry budget) chặn vòng nhân đó. Trong mesh, Envoy được istiod cấu hình, và vài mặc định của Istio cần biết:
+
+| Thiết lập | Mặc định của Envoy khi tự cấu hình (D18.2) | Istio sinh cho waypoint |
+|---|---|---|
+| Timeout của route | 15 giây | `0s`: **không giới hạn**, nếu bạn không đặt |
+| Retry mặc định | Không có | 2 lần, cho `connect-failure`, `refused-stream`, `unavailable`, `cancelled`; **không** retry khi backend trả `503` |
+| Số retry đang chạy cùng lúc tới một cluster (`max_retries`) | 3 | 2^32-1, tức gần như không giới hạn |
+| Retry budget | Không có | Không có, trừ khi đặt `retryBudget` trong DestinationRule |
+
+Bước 4 và bước 6 của lab đọc thẳng các giá trị này trong cấu hình xDS của waypoint.
+
+Hệ quả: ngay khi bạn thêm `retries: {attempts: 3, retryOn: 5xx}` vào VirtualService, mỗi request tới backend đang hỏng thành 4 lần gọi, và không còn trần nào chặn số retry đồng thời. Nếu client cũng retry 3 lần, mỗi thao tác của người dùng thành 3 × 4 = 12 lần gọi. Đó đúng là retry chồng lớp của D18.2, chỉ khác là lớp retry thứ hai nằm trong hạ tầng, đội ứng dụng có khi không biết nó tồn tại.
+
+**Retry budget** của Envoy giới hạn số retry **đang chạy cùng lúc** theo tỉ lệ với số request đang chạy (cộng đang chờ): `percent: 20` nghĩa là khi có 16 request đang dở thì cho tối đa khoảng 3 retry cùng lúc; `minRetryConcurrency` là số retry luôn được phép kể cả khi rất ít request. Lúc bình thường gần như không ai chạm tới trần; lúc mọi request đều lỗi, phần lớn retry bị từ chối và tải lên backend chỉ nhích hơn tải gốc một chút. Request bị từ chối retry trả ngay lỗi gốc cho client.
+
+Quy tắc của D18.2 vẫn đúng trong mesh: retry ở **một** lớp, có budget, chỉ cho request idempotent (lặp lại không gây tác dụng phụ). Mesh không biết `POST /payments` có lặp lại an toàn không; `retryOn: 5xx` áp cho mọi method.
+
+<Callout kind="production">
+
+**GitHub, 17/08/2026.** Theo [báo cáo khả dụng tháng 8/2026](https://github.blog/news-insights/company-news/github-availability-report-august-2026/) của GitHub, sự cố bắt đầu lúc 13:40 UTC. Một đỉnh lưu lượng mới đẩy load balancer của một datacenter vượt giới hạn; một sidecar của service mesh chạm **giới hạn đồng thời** (concurrency limit) và không được tăng thêm. Request dồn lại, vài node load balancer cạn giới hạn luồng mạng, làm hỏng đường xác thực dùng chung, kéo theo lỗi và chậm ở issues, pull request, REST và GraphQL API, Actions, Copilot, đăng nhập và webhook. Lúc cao điểm, 56,07% request vào các dịch vụ bị ảnh hưởng thất bại hoặc chậm; khoảng 29 nghìn tổ chức gặp ít nhất một request lỗi, tổng cộng khoảng 4,8 triệu request. Một lỗi retry tiềm ẩn ở client khuếch đại mạnh lưu lượng vào một endpoint xác thực nội bộ và làm chậm việc hồi phục của Copilot Token Service. Báo cáo kết luận điểm yếu cốt lõi là sidecar không tăng quy mô, cộng với hành vi retry, và client không bị giới hạn đủ để một sự cố cục bộ không khuếch đại thành quá tải rộng. Đội vận hành chuyển một phần lưu lượng sang datacenter khác, **giảm retry ở gateway**, dừng tiến trình load balancer trên các node bão hoà, chặn các request gây retry vào endpoint bị nặng nhất, rồi mở lại lưu lượng dần. Việc cần làm sau sự cố gồm: sửa chính sách autoscaling để tính cả giới hạn đồng thời của sidecar chứ không chỉ service chính, rà các giới hạn request, đồng thời và scaling của mesh, và rà giới hạn retry, backoff ở gateway và client.
+
+Nhận xét của bài: báo cáo không nêu tên phần mềm mesh hay con số giới hạn. Bài học áp dụng cho mọi mesh: proxy cạnh ứng dụng có giới hạn riêng (kết nối, request đồng thời, CPU) mà autoscaler và dashboard của ứng dụng không thấy; và retry ở nhiều lớp biến một chỗ nghẽn thành quá tải. Bước 6 tái hiện phần retry ở quy mô nhỏ.
+
+</Callout>
+
+<Check id="d18.2.retry-mesh">Kể được mặc định timeout, retry và `max_retries` mà Istio sinh cho waypoint, tính được số lần gọi backend khi client và mesh cùng retry, và giải thích được retry budget giới hạn cái gì.</Check>
+
+### Circuit breaking, outlier detection và tiêm lỗi
+
+`DestinationRule.trafficPolicy` là nơi đặt các thiết lập cluster của Envoy mà D9.6 và D18.2 đã viết bằng tay:
+
+| Trường của DestinationRule | Thành phần Envoy | Tác dụng |
+|---|---|---|
+| `connectionPool.tcp.maxConnections`, `connectionPool.http.http2MaxRequests`, `http1MaxPendingRequests`, `maxRetries` | `circuit_breakers` của cluster | Giới hạn kết nối, request đang chạy, request chờ, retry đang chạy; vượt thì trả `503` ngay. Đây là "circuit breaking" theo nghĩa của Envoy: trần đồng thời |
+| `retryBudget` | `circuit_breakers.retry_budget` | Trần retry theo tỉ lệ request |
+| `outlierDetection` | `outlier_detection` | Loại tạm một pod trả lỗi liên tiếp khỏi vòng cân bằng tải |
+
+**Outlier detection** (D9.6 đã dạy với Envoy cấu hình bằng tay) là phát hiện pod hỏng **thụ động**: proxy không hỏi thăm pod, mà đếm kết quả của chính các request thật nó chuyển đi. Sau `consecutive5xxErrors` lỗi liên tiếp từ một pod, Envoy loại pod đó khỏi vòng chọn trong `baseEjectionTime` × số lần đã bị loại, rồi thả lại; `maxEjectionPercent` giới hạn tỉ lệ pod bị loại cùng lúc. Khác D9.6 một điểm: Istio mặc định tắt panic threshold (`minHealthPercent: 0`), nên khi mọi pod bị loại thì Envoy trả `503` thay vì chia cho cả pod hỏng; muốn có panic thì đặt `minHealthPercent`.
+
+**Tiêm lỗi** (fault injection) cho waypoint tự làm chậm (`delay`) hoặc tự trả lỗi (`abort`) cho một phần request, **trước** khi chuyển tới backend. Backend không bị đụng tới. Mục đích là kiểm phía gọi: client có timeout không, có fallback không, có retry tới mức làm sập hệ không. Luôn giới hạn lỗi tiêm vào bằng điều kiện (một header chỉ đội kiểm thử gửi, một tỉ lệ nhỏ) và gỡ ngay sau khi thử.
+
+<Check id="d18.2.dr-fault">Ghép được từng trường của DestinationRule với thành phần Envoy tương ứng, và giải thích được tiêm lỗi kiểm cái gì và vì sao phải giới hạn nó bằng điều kiện.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Configure waypoint proxies (Istio)](https://istio.io/latest/docs/ambient/usage/waypoint/): dựng waypoint, `use-waypoint`, `waypoint-for`, và yêu cầu traffic phải qua waypoint.
+- [Use Layer 7 features (Istio)](https://istio.io/latest/docs/ambient/usage/l7-features/): loại route và policy nào chạy ở waypoint, mức ổn định của từng loại, cảnh báo về VirtualService ở ambient.
+- [Gateway API for Service Mesh](https://gateway-api.sigs.k8s.io/concepts/gamma/): HTTPRoute gắn vào Service cho traffic trong mesh.
+- [Destination Rule (Istio)](https://istio.io/latest/docs/reference/config/networking/destination-rule/): `connectionPool`, `outlierDetection`, `retryBudget` và giá trị mặc định của từng trường.
+- [Fault Injection (Istio)](https://istio.io/latest/docs/tasks/traffic-management/fault-injection/): ví dụ delay và abort làm lộ một lỗi timeout trong ứng dụng.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Cụm `k11-lab` của K11.1 đang chạy, có Istio 1.31.2 ambient và bộ CRD Gateway API kênh standard. Bài **chỉ dùng lại cụm, `istioctl` trong `~/masteva-d18/bin`**; không dùng namespace nào của K11.1. Nếu đã xoá cụm, làm lại bước 1 của K11.1.
+- Đã học D18.2 (retry storm, retry budget) và D9.6 (outlier detection).
+- **Profile máy:** bài thêm năm pod fortio nhỏ, một pod curl và một waypoint (khoảng 35 MiB). Ba node kind cần tổng cộng khoảng 1,7 tới 2,7 GiB RAM ở cuối bài (đo bằng `docker stats`). Máy 8 GB: Docker Desktop 4 GB, không chạy cụm khác cùng lúc.
+
+Mọi khối lệnh chạy trong `~/masteva-d18`. **Nếu mở terminal mới giữa chừng**, chạy lại:
+
+<Terminal where="mac" title="Terminal mới">
+
+```bash
+cd ~/masteva-d18
+export KUBECONFIG=~/masteva-d18/kubeconfig
+```
+
+</Terminal>
+
+### 1. Hai phiên bản, chưa có waypoint
+
+Namespace `k11-tl` vào mesh ngay khi tạo (label `istio.io/dataplane-mode` nằm trong manifest). Trong đó:
+
+- `web-v1` (2 pod) và `web-v2` (1 pod): fortio server. Tham số `-echo-server-default-params "header=x-version:v1"` bảo fortio thêm header `x-version: v1` vào mọi response không có query string, để bạn biết request đã vào phiên bản nào. Cả ba pod có label `app: web`.
+- Ba Service: `web` chọn mọi pod `app: web`; `web-v1`, `web-v2` chọn riêng từng phiên bản (HTTPRoute cần Service riêng cho từng đích).
+- `client`: pod `curl` để gửi từng request. `tai`: pod fortio để tạo tải.
+
+<Terminal where="mac" title="~/masteva-d18/tl.yaml">
+
+```bash
+cd ~/masteva-d18
+cat > tl.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k11-tl
+  labels: {istio.io/dataplane-mode: ambient}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web-v1, namespace: k11-tl}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: web, version: v1}}
+  template:
+    metadata: {labels: {app: web, version: v1}}
+    spec:
+      containers:
+        - name: fortio
+          image: fortio/fortio:1.75.3
+          args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled",
+                 "-echo-server-default-params", "header=x-version:v1"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web-v2, namespace: k11-tl}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: web, version: v2}}
+  template:
+    metadata: {labels: {app: web, version: v2}}
+    spec:
+      containers:
+        - name: fortio
+          image: fortio/fortio:1.75.3
+          args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled",
+                 "-echo-server-default-params", "header=x-version:v2"]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: k11-tl}
+spec:
+  selector: {app: web}
+  ports: [{name: http, port: 80, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web-v1, namespace: k11-tl}
+spec:
+  selector: {app: web, version: v1}
+  ports: [{name: http, port: 80, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web-v2, namespace: k11-tl}
+spec:
+  selector: {app: web, version: v2}
+  ports: [{name: http, port: 80, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: client, namespace: k11-tl, labels: {app: client}}
+spec:
+  containers:
+    - {name: curl, image: "curlimages/curl:8.22.0", command: ["sleep", "infinity"]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: tai, namespace: k11-tl, labels: {app: tai}}
+spec:
+  containers:
+    - name: fortio
+      image: fortio/fortio:1.75.3
+      args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled"]
+EOF
+kubectl apply -f tl.yaml > /dev/null
+kubectl -n k11-tl wait --for=condition=Ready pod --all --timeout=180s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/client condition met
+pod/tai condition met
+pod/web-v1-66bd5ff779-5hjkw condition met
+pod/web-v1-66bd5ff779-fx25v condition met
+pod/web-v2-79875c5bbf-cjhpj condition met
+```
+
+</Expected>
+
+Gửi 30 request tới Service `web` và đếm header `x-version`. Mỗi lệnh `curl` mở một kết nối mới, nên ztunnel chọn pod 30 lần:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k11-tl exec client -- sh -c 'for i in $(seq 30); do curl -s -D - -o /dev/null web/ | grep -i x-version; done' | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  22 X-Version: v1
+   8 X-Version: v2
+```
+
+</Expected>
+
+Không có waypoint, tỉ lệ đi theo số pod: hai pod v1, một pod v2, nên trung bình khoảng 2/1. Với 30 request, chạy lại bạn sẽ thấy những con số dao động khá rộng, như 19/11, 22/8 hay 26/4. Muốn 90/10 thì phải có 9 pod v1 cho mỗi pod v2; muốn 99/1 thì 99 pod. Header in hoa (`X-Version`) vì fortio viết như vậy và không có proxy tầng 7 nào chạm vào response.
+
+### 2. Thêm waypoint
+
+Waypoint là một object `Gateway` lớp `istio-waypoint`. `istioctl waypoint apply` sinh được object này, nhưng bài viết YAML để thêm một annotation: `proxy.istio.io/config` bảo Envoy của waypoint giữ thêm vài bộ đếm theo cluster (số lần gọi backend, số retry, số lần loại pod). Istio mặc định chỉ xuất một nhóm nhỏ bộ đếm để tiết kiệm bộ nhớ; bước 6 và 7 cần các bộ đếm này để đo.
+
+<Terminal where="mac" title="~/masteva-d18/waypoint.yaml">
+
+```bash
+cat > waypoint.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: waypoint
+  namespace: k11-tl
+  labels:
+    istio.io/waypoint-for: service
+  annotations:
+    proxy.istio.io/config: |
+      proxyStatsMatcher:
+        inclusionRegexps: [".*upstream_rq_(total|retry|retry_overflow|503)$", ".*outlier_detection.*"]
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+kubectl apply -f waypoint.yaml
+kubectl -n k11-tl wait --for=condition=Programmed gateway/waypoint --timeout=120s
+kubectl -n k11-tl rollout status deploy/waypoint --timeout=120s
+kubectl label namespace k11-tl istio.io/use-waypoint=waypoint
+./bin/istioctl ztunnel-config services | grep -E 'NAMESPACE|k11-tl'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+gateway.gateway.networking.k8s.io/waypoint created
+gateway.gateway.networking.k8s.io/waypoint condition met
+deployment "waypoint" successfully rolled out
+namespace/k11-tl labeled
+NAMESPACE    SERVICE NAME                SERVICE VIP  WAYPOINT ENDPOINTS
+k11-tl       waypoint                    10.96.159.34 None     1/1
+k11-tl       web                         10.96.97.172 waypoint 3/3
+k11-tl       web-v1                      10.96.67.111 waypoint 2/2
+k11-tl       web-v2                      10.96.69.97  waypoint 1/1
+```
+
+</Expected>
+
+istiod thấy `Gateway`, dựng Deployment `waypoint` và Service cùng tên. Sau khi namespace có label `istio.io/use-waypoint`, ztunnel ghi ba Service `web*` dùng waypoint (cột `WAYPOINT`). VIP trên máy bạn sẽ khác.
+
+Ba script dùng cho các bước sau. `dem.sh` in các bộ đếm của waypoint cho hai cluster `web-v1`, `web-v2`. `tai.sh` chạy fortio từ pod `tai` và tóm tắt kết quả thành một dòng: mã trả về, số request mỗi giây, và độ trễ ở phân vị 50, 90, 99 (`-allow-initial-errors` để fortio không dừng khi vài request đầu lỗi). `cho-xds.sh` chờ tới khi waypoint thật sự nhận cấu hình mới: sau mỗi `kubectl apply`, istiod cần một hai giây để dịch YAML và đẩy xDS xuống Envoy, và không có trạng thái nào trên object Kubernetes báo việc đó xong. Script hỏi thẳng cấu hình đang chạy trong waypoint (route của Service `web`, cluster `web-v1`, hoặc danh sách endpoint của nó) mỗi giây, tối đa 30 giây, cho tới khi thấy chuỗi bạn truyền vào.
+
+<Terminal where="mac" title="~/masteva-d18/dem.sh, tai.sh và cho-xds.sh">
+
+```bash
+cat > dem.sh <<'EOF'
+#!/bin/sh
+# Bộ đếm của waypoint cho web-v1, web-v2 (cộng dồn từ lúc waypoint khởi động)
+kubectl -n k11-tl exec deploy/waypoint -- pilot-agent request GET stats 2>/dev/null \
+  | grep -E '\|web-v[12]\.k11-tl\.svc\.cluster\.local;\.(upstream_rq_(total|retry|retry_overflow)|outlier_detection\.ejections_(active|enforced_total)):' \
+  | sed -E 's/^cluster\.inbound-vip\|80\|http\|(web-v[12])\.k11-tl\.svc\.cluster\.local;\./\1 /'
+EOF
+cat > tai.sh <<'EOF'
+#!/bin/sh
+# Chạy fortio load từ pod tai với các tham số truyền vào, in một dòng tóm tắt
+kubectl -n k11-tl exec tai -- fortio load -quiet -allow-initial-errors -json - "$@" 2>/dev/null \
+  | jq -c '{ma: .RetCodes, qps: (.ActualQPS | floor)} +
+      ([.DurationHistogram.Percentiles[] | {("p\(.Percentile)"): "\(.Value * 1000 | round)ms"}] | add)'
+EOF
+cat > cho-xds.sh <<'EOF'
+#!/bin/sh
+# Dùng: ./cho-xds.sh route|cluster|endpoint '<chuỗi cần thấy>'
+# Chờ tối đa 30 giây tới khi cấu hình đang chạy trong waypoint chứa chuỗi đó
+W=$(kubectl -n k11-tl get pod -l gateway.networking.k8s.io/gateway-name=waypoint -o jsonpath='{.items[0].metadata.name}')
+for i in $(seq 30); do
+  case "$1" in
+    route) ./bin/istioctl proxy-config route "$W.k11-tl" --name 'inbound-vip|80|http|web.k11-tl.svc.cluster.local' -o json ;;
+    cluster) ./bin/istioctl proxy-config cluster "$W.k11-tl" -o json | jq '.[] | select(.name | test("web-v1"))' ;;
+    endpoint) ./bin/istioctl proxy-config endpoint "$W.k11-tl" --cluster 'inbound-vip|80|http|web-v1.k11-tl.svc.cluster.local' ;;
+  esac | grep -q -- "$2" && { echo "waypoint đã nhận cấu hình mới"; exit 0; }
+  sleep 1
+done
+echo "hết 30 giây mà waypoint chưa có '$2'"; exit 1
+EOF
+chmod +x dem.sh tai.sh cho-xds.sh
+```
+
+</Terminal>
+
+Lúc này `./dem.sh` chưa in gì: Envoy chỉ tạo bộ đếm của một cluster khi có request đầu tiên đi qua nó.
+
+### 3. Chia 90/10, 50/50 và theo header
+
+HTTPRoute gắn vào Service `web` (`parentRefs` là `kind: Service`), chia giữa hai Service phiên bản theo trọng số 90/10. Sau khi apply, khối lệnh đọc `status` của route rồi gửi 200 request.
+
+<Terminal where="mac" title="~/masteva-d18/route-90-10.yaml">
+
+```bash
+cat > route-90-10.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: k11-tl}
+spec:
+  parentRefs:
+    - {group: "", kind: Service, name: web, port: 80}
+  rules:
+    - backendRefs:
+        - {name: web-v1, port: 80, weight: 90}
+        - {name: web-v2, port: 80, weight: 10}
+EOF
+kubectl apply -f route-90-10.yaml
+./cho-xds.sh route '"weight": 90'
+kubectl -n k11-tl get httproute web -o yaml | yq '.status.parents[0].conditions[] | [.type, .status] | join(" | ")'
+kubectl -n k11-tl exec client -- sh -c 'for i in $(seq 200); do curl -s -D - -o /dev/null web/ | grep -i x-version; done' | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/web created
+waypoint đã nhận cấu hình mới
+Accepted | True
+ResolvedRefs | True
+ResolvedWaypoints | True
+ 176 x-version: v1
+  24 x-version: v2
+```
+
+</Expected>
+
+- `ResolvedWaypoints=True` là điều kiện riêng của Istio, báo Service cha đã có waypoint để thực thi route. Route trong mesh chỉ có tác dụng với traffic đi qua waypoint; đây là chỗ kiểm đầu tiên khi route không chạy.
+- 200 request chia xấp xỉ 90/10 dù vẫn là ba pod như bước 1. Mỗi request được chọn ngẫu nhiên theo trọng số, nên chạy lại bạn sẽ thấy 183/17, 185/15…
+- Header giờ viết thường (`x-version`): response đã đi qua Envoy của waypoint, và Envoy đưa tên header HTTP/1.1 về chữ thường.
+
+Tăng lên 50/50 và thêm một rule: request có header `x-nhom: beta` luôn vào v2. Gửi 200 request thường và 5 request có header:
+
+<Terminal where="mac" title="~/masteva-d18/route-50-50.yaml">
+
+```bash
+cat > route-50-50.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: k11-tl}
+spec:
+  parentRefs:
+    - {group: "", kind: Service, name: web, port: 80}
+  rules:
+    - matches:
+        - headers: [{name: x-nhom, value: beta}]
+      backendRefs:
+        - {name: web-v2, port: 80}
+    - backendRefs:
+        - {name: web-v1, port: 80, weight: 50}
+        - {name: web-v2, port: 80, weight: 50}
+EOF
+kubectl apply -f route-50-50.yaml
+./cho-xds.sh route 'x-nhom'
+kubectl -n k11-tl exec client -- sh -c 'for i in $(seq 200); do curl -s -D - -o /dev/null web/ | grep -i x-version; done' | sort | uniq -c
+kubectl -n k11-tl exec client -- sh -c 'for i in $(seq 5); do curl -s -D - -o /dev/null -H "x-nhom: beta" web/ | grep -i x-version; done' | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/web configured
+waypoint đã nhận cấu hình mới
+  99 x-version: v1
+ 101 x-version: v2
+   5 x-version: v2
+```
+
+</Expected>
+
+Đổi tỉ lệ là sửa một con số, không thêm bớt pod nào. Năm request có header vào v2 cả năm. Lưu ý: v2 chỉ có một pod mà nhận một nửa lưu lượng; trên production, tăng trọng số phải đi cùng tăng số pod của bản mới (HPA ở K5.3 làm việc đó), nếu không pod đó quá tải.
+
+<Check id="d18.2.lab-chia">Dựng được waypoint bằng object `Gateway` và kiểm được Service đã dùng nó, viết được HTTPRoute gắn vào Service để chia lưu lượng theo trọng số và theo header, đọc được điều kiện `ResolvedWaypoints`, và đo được tỉ lệ thật bằng một vòng `curl`.</Check>
+
+### 4. Timeout ở mesh
+
+fortio nhận tham số `delay` trong query string để tự làm chậm response (tối đa 1,5 giây theo mặc định của fortio). Đặt timeout 500 ms cho rule chia 50/50, giữ rule `beta` không có timeout, rồi gửi một request chậm 1 giây theo mỗi rule:
+
+<Terminal where="mac" title="~/masteva-d18/route-timeout.yaml">
+
+```bash
+cat > route-timeout.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: k11-tl}
+spec:
+  parentRefs:
+    - {group: "", kind: Service, name: web, port: 80}
+  rules:
+    - matches:
+        - headers: [{name: x-nhom, value: beta}]
+      backendRefs:
+        - {name: web-v2, port: 80}
+    - backendRefs:
+        - {name: web-v1, port: 80, weight: 50}
+        - {name: web-v2, port: 80, weight: 50}
+      timeouts:
+        request: 500ms
+EOF
+kubectl apply -f route-timeout.yaml
+./cho-xds.sh route '0.500s'
+kubectl -n k11-tl exec client -- curl -s -w ' | %{http_code} sau %{time_total}s\n' 'web/echo?delay=1s'
+kubectl -n k11-tl exec client -- curl -s -o /dev/null -w 'beta: %{http_code} sau %{time_total}s\n' -H 'x-nhom: beta' 'web/echo?delay=1s'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io/web configured
+waypoint đã nhận cấu hình mới
+upstream request timeout | 504 sau 0.506582s
+beta: 200 sau 1.003893s
+```
+
+</Expected>
+
+Request thường bị waypoint cắt ở 0,5 giây, client nhận `504` với nội dung `upstream request timeout`: chữ của Envoy, không phải của ứng dụng. Request `beta` không có timeout nên chờ đủ 1 giây. Thời gian trên máy bạn lệch vài mili-giây.
+
+Không đặt `timeouts` thì sao? Đọc thẳng cấu hình xDS mà istiod gửi cho waypoint, cho route của Service `web`. Ngay sau mỗi lần đổi route, waypoint còn giữ bản cấu hình cũ trong lúc drain (khoảng 45 giây, thời gian drain mặc định của proxy Istio), nên lệnh có thể trả hai bản cùng tên, và thứ tự hai bản không cố định. Vòng lặp đầu khối chờ tới khi chỉ còn một bản, tức bản mới, rồi mới in. (`cho-xds.sh` không gặp vấn đề này vì nó chỉ hỏi "đã có chuỗi mới chưa", ở bất kỳ bản nào.)
+
+<Terminal where="mac">
+
+```bash
+W=$(kubectl -n k11-tl get pod -l gateway.networking.k8s.io/gateway-name=waypoint -o jsonpath='{.items[0].metadata.name}')
+for i in $(seq 90); do
+  n=$(./bin/istioctl proxy-config route $W.k11-tl --name 'inbound-vip|80|http|web.k11-tl.svc.cluster.local' -o json | jq length)
+  [ "$n" = 1 ] && break
+  sleep 1
+done
+./bin/istioctl proxy-config route $W.k11-tl --name 'inbound-vip|80|http|web.k11-tl.svc.cluster.local' -o json \
+  | jq '.[0].virtualHosts[0].routes[] | {match: .match.headers[0].name, timeout: .route.timeout,
+        retry: .route.retryPolicy.retryOn, so_lan: .route.retryPolicy.numRetries, ma: .route.retryPolicy.retriableStatusCodes}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{
+  "match": "x-nhom",
+  "timeout": "0s",
+  "retry": "connect-failure,refused-stream,unavailable,cancelled,retriable-status-codes",
+  "so_lan": 2,
+  "ma": null
+}
+{
+  "match": null,
+  "timeout": "0.500s",
+  "retry": "connect-failure,refused-stream,unavailable,cancelled,retriable-status-codes",
+  "so_lan": 2,
+  "ma": null
+}
+```
+
+</Expected>
+
+Rule `beta` có `timeout: 0s`: với Envoy nghĩa là **không giới hạn**. Một backend treo sẽ giữ request mãi, cho tới khi client tự bỏ. Cả hai route có sẵn chính sách retry mặc định của Istio: 2 lần, cho lỗi kết nối và stream bị từ chối. `retriable-status-codes` có mặt nhưng danh sách mã (`ma`) là `null`, nên `503` từ backend **không** được retry. Bước 6 bật retry cho `5xx`.
+
+<Check id="d18.2.lab-timeout">Đặt được timeout cho một rule của HTTPRoute, phân biệt được `504` của proxy với lỗi của ứng dụng, và đọc được timeout cùng chính sách retry mặc định trong cấu hình xDS của waypoint.</Check>
+
+### 5. Tiêm độ trễ và lỗi
+
+Tiêm lỗi chỉ có ở VirtualService. Theo quy tắc ở phần Kiến thức, **xoá HTTPRoute trước**, rồi tạo VirtualService cho cùng Service `web`. Lỗi chỉ áp cho request có header `x-thu-loi: co`: 30% bị chậm thêm 1 giây, 10% nhận `503` ngay tại waypoint. Request khác đi thẳng tới `web-v1`.
+
+<Callout kind="danger">
+
+Khối dưới xoá HTTPRoute `web` trong namespace `k11-tl` của cụm lab. Kiểm `kubectl config current-context` trả `kind-k11-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-d18/vs-fault.yaml">
+
+```bash
+kubectl -n k11-tl delete httproute web
+cat > vs-fault.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: web, namespace: k11-tl}
+spec:
+  hosts: [web.k11-tl.svc.cluster.local]
+  http:
+    - match:
+        - headers:
+            x-thu-loi: {exact: co}
+      fault:
+        delay: {fixedDelay: 1s, percentage: {value: 30}}
+        abort: {httpStatus: 503, percentage: {value: 10}}
+      route:
+        - destination: {host: web-v1.k11-tl.svc.cluster.local}
+    - route:
+        - destination: {host: web-v1.k11-tl.svc.cluster.local}
+EOF
+kubectl apply -f vs-fault.yaml
+./cho-xds.sh route 'envoy.filters.http.fault'
+./tai.sh -c 4 -qps 20 -t 20s -H 'x-thu-loi: co' http://web/echo
+./tai.sh -c 4 -qps 20 -t 10s http://web/echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+httproute.gateway.networking.k8s.io "web" deleted from k11-tl namespace
+virtualservice.networking.istio.io/web created
+waypoint đã nhận cấu hình mới
+{"ma":{"200":228,"503":24},"qps":12,"p50":"2ms","p75":"1003ms","p90":"1010ms","p99":"1014ms","p99.9":"1014ms"}
+{"ma":{"200":200},"qps":19,"p50":"3ms","p75":"4ms","p90":"5ms","p99":"8ms","p99.9":"8ms"}
+```
+
+</Expected>
+
+Lượt tải có header: khoảng 10% `503` (thường 15 tới 40 lỗi trong 200 tới 310 request), và từ phân vị 75 trở lên độ trễ nhảy lên khoảng 1 giây, đúng phần 30% bị làm chậm. Số request mỗi giây tụt từ 20 xuống khoảng 10 tới 15: fortio dùng 4 kết nối, mỗi kết nối phải chờ xong request chậm mới gửi request kế, đúng như một client thật có số kết nối giới hạn. Lượt không có header không bị gì.
+
+Đây là cách dùng tiêm lỗi: hỏi "nếu `web` chậm 1 giây thì service gọi nó còn phục vụ được bao nhiêu request mỗi giây, có hết giờ không, có retry ồ ạt không" mà không cần làm hỏng `web` thật.
+
+<Check id="d18.2.lab-fault">Tiêm được độ trễ và lỗi cho một phần request có điều kiện header bằng VirtualService, đọc được ảnh hưởng lên mã trả về, phân vị độ trễ và thông lượng, và giải thích được vì sao phải xoá HTTPRoute trước.</Check>
+
+### 6. Retry ở mesh nhân tải, rồi chặn lại
+
+Script `chenh.sh` dưới đọc hai bộ đếm của waypoint cho cluster `web-v1` (số lần gọi backend, số lần retry), chạy lệnh bạn truyền vào, đọc lại và in phần chênh lệch: trong lúc lệnh chạy, backend thật sự nhận bao nhiêu request.
+
+<Terminal where="mac" title="~/masteva-d18/chenh.sh">
+
+```bash
+cat > chenh.sh <<'EOF'
+#!/bin/sh
+# Chạy lệnh truyền vào; in số lần waypoint gọi web-v1 và số retry trong lúc lệnh chạy
+doc() {
+  kubectl -n k11-tl exec deploy/waypoint -- pilot-agent request GET stats 2>/dev/null \
+    | grep -E "\|web-v1\.k11-tl\.svc\.cluster\.local;\.upstream_rq_$1: " | awk '{print $2}'
+}
+t0=$(doc total); r0=$(doc retry); o0=$(doc retry_overflow)
+"$@"
+t1=$(doc total); r1=$(doc retry); o1=$(doc retry_overflow)
+echo "=> backend web-v1 nhận $((t1 - t0)) request; retry: $((r1 - r0)); retry bị budget chặn: $((o1 - o0))"
+EOF
+chmod +x chenh.sh
+```
+
+</Terminal>
+
+Đổi VirtualService: bỏ tiêm lỗi, bật retry 3 lần cho mọi `5xx`. Tình huống: `web-v1` đang hỏng hẳn. Tham số `status=503` bảo fortio trả `503` cho mọi request. Khối dưới gửi 20 request, mỗi request client chỉ gửi một lần:
+
+<Terminal where="mac" title="~/masteva-d18/vs-retry.yaml">
+
+```bash
+cat > vs-retry.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata: {name: web, namespace: k11-tl}
+spec:
+  hosts: [web.k11-tl.svc.cluster.local]
+  http:
+    - route:
+        - destination: {host: web-v1.k11-tl.svc.cluster.local}
+      retries:
+        attempts: 3
+        retryOn: 5xx
+EOF
+kubectl apply -f vs-retry.yaml
+./cho-xds.sh route '"retryOn": "5xx"'
+./chenh.sh kubectl -n k11-tl exec client -- sh -c \
+  'for i in $(seq 20); do curl -s -o /dev/null -w "%{http_code}\n" "web/echo?status=503"; done | sort | uniq -c'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+virtualservice.networking.istio.io/web configured
+waypoint đã nhận cấu hình mới
+     20 503
+=> backend web-v1 nhận 80 request; retry: 60; retry bị budget chặn: 0
+```
+
+</Expected>
+
+Người dùng thấy 20 lỗi, như không có retry. Backend nhận 80: mỗi request một lần gốc cộng 3 lần thử lại, vô ích vì backend hỏng hẳn.
+
+<Predict question="Giờ client cũng tự retry: mỗi request gửi tối đa 3 lần, dừng khi nhận 200. Backend nhận bao nhiêu request cho 20 thao tác của người dùng?">
+
+240. Mỗi lần client gửi thành 4 lần gọi ở waypoint, và client gửi 3 lần: 20 × 3 × 4 = 240. Hai lớp retry nhân với nhau, đúng công thức của D18.2.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+./chenh.sh kubectl -n k11-tl exec client -- sh -c \
+  'for i in $(seq 20); do for t in 1 2 3; do c=$(curl -s -o /dev/null -w "%{http_code}" "web/echo?status=503"); [ "$c" = 200 ] && break; done; echo $c; done | sort | uniq -c'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+     20 503
+=> backend web-v1 nhận 240 request; retry: 180; retry bị budget chặn: 0
+```
+
+</Expected>
+
+Mười hai lần gọi backend cho mỗi thao tác của người dùng, và người dùng vẫn nhận lỗi. Bây giờ chạy dưới tải đồng thời: 400 request qua 16 kết nối song song, tất cả vào backend đang hỏng.
+
+<Terminal where="mac">
+
+```bash
+./chenh.sh ./tai.sh -c 16 -qps 0 -n 400 'http://web/echo?status=503'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"ma":{"503":400},"qps":158,"p50":"92ms","p75":"116ms","p90":"134ms","p99":"158ms","p99.9":"166ms"}
+=> backend web-v1 nhận 1600 request; retry: 1200; retry bị budget chặn: 0
+```
+
+</Expected>
+
+Gấp đúng 4 lần. Độ trễ của một request lỗi lên khoảng 80 tới 120 ms ở trung vị, vì mỗi request phải chờ ba lần thử lại kèm khoảng nghỉ (backoff) giữa các lần thử. Không có trần nào chặn số retry: đọc các ngưỡng circuit breaker mà istiod đặt cho cluster `web-v1` trên waypoint:
+
+<Terminal where="mac">
+
+```bash
+W=$(kubectl -n k11-tl get pod -l gateway.networking.k8s.io/gateway-name=waypoint -o jsonpath='{.items[0].metadata.name}')
+./bin/istioctl proxy-config cluster $W.k11-tl -o json \
+  | jq -c '.[] | select(.name | test("web-v1")) | .circuitBreakers.thresholds[0]'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"maxConnections":4294967295,"maxPendingRequests":4294967295,"maxRequests":4294967295,"maxRetries":4294967295}
+```
+
+</Expected>
+
+4294967295 là 2^32-1: số kết nối, request đang chờ, request đang chạy và retry đang chạy đều gần như không giới hạn, khác hẳn mặc định 3 retry đồng thời của Envoy tự cấu hình ở D18.2.
+
+Thêm retry budget cho cluster `web-v1`: retry đang chạy không quá 20% số request đang chạy, tối thiểu 1. Chạy lại đúng lượt tải đó:
+
+<Terminal where="mac" title="~/masteva-d18/dr-budget.yaml">
+
+```bash
+cat > dr-budget.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: web-v1, namespace: k11-tl}
+spec:
+  host: web-v1.k11-tl.svc.cluster.local
+  trafficPolicy:
+    retryBudget:
+      percent: 20
+      minRetryConcurrency: 1
+EOF
+kubectl apply -f dr-budget.yaml
+./cho-xds.sh cluster 'retryBudget'
+./chenh.sh ./tai.sh -c 16 -qps 0 -n 400 'http://web/echo?status=503'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+destinationrule.networking.istio.io/web-v1 created
+waypoint đã nhận cấu hình mới
+{"ma":{"503":400},"qps":259,"p50":"2ms","p75":"3ms","p90":"4ms","p99":"115ms","p99.9":"146ms"}
+=> backend web-v1 nhận 455 request; retry: 55; retry bị budget chặn: 384
+```
+
+</Expected>
+
+Cùng 400 request, backend chỉ nhận khoảng 450 thay vì 1.600: phần lớn retry bị budget từ chối (`retry_overflow`), và request trả lỗi gốc ngay, nên trung vị độ trễ về vài mili-giây; chỉ phần đuôi (p99) còn khoảng 100 ms, là những request may mắn được retry. Con số retry được phép trên máy bạn sẽ dao động (khoảng 20 tới 80) tuỳ có bao nhiêu request đang dở lúc mỗi retry được xét. Người dùng vẫn nhận 400 lỗi, như trước: khi backend hỏng hẳn, không retry nào cứu được, và budget bảo đảm retry không làm hỏng thêm.
+
+<Check id="d18.2.lab-retry">Đo được bằng bộ đếm của waypoint số request backend nhận khi mesh retry, khi client và mesh cùng retry, và khi có retry budget, và giải thích được từng con số.</Check>
+
+### 7. Outlier detection loại một pod hỏng
+
+Gỡ VirtualService và DestinationRule của bước 6 để quay về mặc định (không retry `503`). Thêm một pod hỏng vào phiên bản v1: cùng label `app: web, version: v1`, nhưng `-echo-server-default-params status=503` bảo fortio trả `503` cho mọi request không có query string. Service `web-v1` giờ có ba pod, một pod hỏng.
+
+<Callout kind="danger">
+
+Khối dưới xoá VirtualService `web` và DestinationRule `web-v1` trong namespace `k11-tl` của cụm lab.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-d18/web-hong.yaml">
+
+```bash
+kubectl -n k11-tl delete virtualservice web
+kubectl -n k11-tl delete destinationrule web-v1
+cat > web-hong.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web-v1-hong, namespace: k11-tl}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: web, version: v1, ban: hong}}
+  template:
+    metadata: {labels: {app: web, version: v1, ban: hong}}
+    spec:
+      containers:
+        - name: fortio
+          image: fortio/fortio:1.75.3
+          args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled",
+                 "-echo-server-default-params", "status=503"]
+EOF
+kubectl apply -f web-hong.yaml
+kubectl -n k11-tl rollout status deploy/web-v1-hong --timeout=120s
+./cho-xds.sh endpoint "$(kubectl -n k11-tl get pod -l ban=hong -o jsonpath='{.items[0].status.podIP}'):8080"
+./tai.sh -c 4 -qps 50 -t 10s http://web-v1/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+virtualservice.networking.istio.io "web" deleted from k11-tl namespace
+destinationrule.networking.istio.io "web-v1" deleted from k11-tl namespace
+deployment.apps/web-v1-hong created
+deployment "web-v1-hong" successfully rolled out
+waypoint đã nhận cấu hình mới
+{"ma":{"200":328,"503":172},"qps":49,"p50":"2ms","p75":"3ms","p90":"4ms","p99":"7ms","p99.9":"9ms"}
+```
+
+</Expected>
+
+Khoảng một phần ba request lỗi, đúng tỉ lệ một trên ba pod: waypoint chia đều và không biết pod nào hỏng. Pod đó vẫn `Running` và `Ready`, vì fortio vẫn trả lời; probe (K1.3) không cứu được trường hợp này.
+
+Bật outlier detection: 3 lỗi `5xx` liên tiếp từ một pod thì loại nó 30 giây, xét mỗi giây, không loại quá 50% số pod. Rồi chạy lại đúng lượt tải đó và xem bộ đếm:
+
+<Terminal where="mac" title="~/masteva-d18/dr-outlier.yaml">
+
+```bash
+cat > dr-outlier.yaml <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata: {name: web-v1, namespace: k11-tl}
+spec:
+  host: web-v1.k11-tl.svc.cluster.local
+  trafficPolicy:
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 1s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+EOF
+kubectl apply -f dr-outlier.yaml
+./cho-xds.sh cluster 'outlierDetection'
+./tai.sh -c 4 -qps 50 -t 10s http://web-v1/
+./dem.sh | grep 'web-v1 outlier'
+W=$(kubectl -n k11-tl get pod -l gateway.networking.k8s.io/gateway-name=waypoint -o jsonpath='{.items[0].metadata.name}')
+./bin/istioctl proxy-config endpoint $W.k11-tl --cluster 'inbound-vip|80|http|web-v1.k11-tl.svc.cluster.local'
+kubectl -n k11-tl get pods -l app=web,version=v1 -o wide | awk '{print $1, $6}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+destinationrule.networking.istio.io/web-v1 created
+waypoint đã nhận cấu hình mới
+{"ma":{"200":499,"503":1},"qps":49,"p50":"2ms","p75":"3ms","p90":"3ms","p99":"6ms","p99.9":"6ms"}
+web-v1 outlier_detection.ejections_active: 1
+web-v1 outlier_detection.ejections_enforced_total: 1
+ENDPOINT                                       STATUS      OUTLIER CHECK     CLUSTER
+envoy://connect_originate/10.244.1.10:8080     HEALTHY     FAILED            inbound-vip|80|http|web-v1.k11-tl.svc.cluster.local
+envoy://connect_originate/10.244.1.5:8080      HEALTHY     OK                inbound-vip|80|http|web-v1.k11-tl.svc.cluster.local
+envoy://connect_originate/10.244.2.9:8080      HEALTHY     OK                inbound-vip|80|http|web-v1.k11-tl.svc.cluster.local
+NAME IP
+web-v1-66bd5ff779-5hjkw 10.244.1.5
+web-v1-66bd5ff779-fx25v 10.244.2.9
+web-v1-hong-5c7c9dbbd7-q9hqz 10.244.1.10
+```
+
+</Expected>
+
+Chỉ vài lỗi thay vì khoảng 170. Sau lần `503` thứ ba liên tiếp từ pod hỏng, Envoy đánh dấu nó `FAILED` ở cột `OUTLIER CHECK` và bỏ nó khỏi vòng chọn.
+
+So IP ở cột `ENDPOINT` với danh sách pod để thấy đúng pod `web-v1-hong` bị loại. Tiền tố `envoy://connect_originate/` nghĩa là waypoint mở đường hầm HBONE tới địa chỉ đó.
+
+Phát hiện thụ động luôn có vài nạn nhân đầu tiên, như D9.6 đã chỉ ra. Con số trong kết quả có thể chỉ là 1 tới 6: fortio gửi vài request khởi động (warmup) trên mỗi kết nối trước khi đo; các request này không được tính vào `ma`, nhưng có thể là những lỗi đầu tiên mà Envoy đếm.
+
+Sau 30 giây, pod được thả lại, lỗi tiếp, và lần loại thứ hai kéo dài 60 giây.
+
+<Check id="d18.2.lab-outlier">Tái hiện được một pod `Ready` nhưng trả `503`, bật outlier detection bằng DestinationRule, và chỉ ra được pod bị loại bằng bộ đếm và bằng `istioctl proxy-config endpoint`.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Tỉ lệ vẫn khoảng 2/1 sau khi có HTTPRoute | Namespace chưa có label `istio.io/use-waypoint`, hoặc pod waypoint chưa chạy | `./bin/istioctl ztunnel-config services`: cột `WAYPOINT`; `ResolvedWaypoints` trong status của route |
+| HTTPRoute `Accepted` nhưng không có tác dụng | `parentRefs` thiếu `group: ""` hoặc sai `port` | `kubectl -n k11-tl get httproute web -o yaml` |
+| `dem.sh` vẫn không in gì sau khi đã có request | Annotation `proxy.istio.io/config` gõ sai, hoặc pod waypoint tạo trước khi có annotation | `kubectl -n k11-tl get pod -l gateway.networking.k8s.io/gateway-name=waypoint -o yaml \| grep -A3 proxy.istio.io` |
+| Kết quả lạ, lúc theo HTTPRoute lúc theo VirtualService | Còn cả hai cho cùng Service `web` | `kubectl -n k11-tl get httproute,virtualservice` |
+| `cho-xds.sh` báo hết 30 giây | istiod không dịch được cấu hình (sai tên Service, sai `host`), hoặc pod waypoint đang khởi động lại | `./bin/istioctl analyze -n k11-tl`; `kubectl -n istio-system logs deploy/istiod --since=2m \| grep -i error` |
+| `tai.sh` không in gì | fortio dừng vì lỗi khác lỗi HTTP (sai tên Service) | Chạy lệnh `fortio load` trong `tai.sh` mà bỏ `2>/dev/null` |
+| Bước 7 vẫn khoảng 1/3 lỗi | DestinationRule đặt `host` ngắn hoặc sai namespace | `./bin/istioctl proxy-config cluster $W.k11-tl -o json \| jq '.[] \| select(.name \| test("web-v1")) \| .outlierDetection'` |
+
+### Dọn dẹp
+
+K11.3 dựng một cụm mới (Kubernetes 1.36, lý do ở bài đó), nên cụm này không còn dùng.
+
+<Callout kind="danger">
+
+Khối thứ nhất xoá cả cụm `k11-lab` cùng mọi thứ trong đó. Khối thứ hai xoá thêm thư mục lab; chỉ chạy khi bạn không học tiếp K11.3, vì K11.3 dùng lại `istioctl` trong `~/masteva-d18/bin`.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm, giữ thư mục cho K11.3">
+
+```bash
+kind delete cluster --name k11-lab
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+rm -rf ~/masteva-d18
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Retry nên đặt ở client hay ở mesh?">
+
+Ở **một** chỗ, và chỗ đó phải có đủ thông tin. Client biết thao tác nào idempotent, người dùng còn chờ bao lâu, có fallback nào; mesh thì không. Mesh biết lỗi là do kết nối hay do stream bị từ chối, phần lớn là những lỗi mà request chưa tới ứng dụng, nên retry chúng thường an toàn; đó đúng là chính sách mặc định của Istio. Cách hay gặp trên production: để mesh retry lỗi kết nối (mặc định), có retry budget; để ứng dụng retry lỗi nghiệp vụ có backoff và jitter (SB7.2 của roadmap Spring Boot làm việc này bằng retry có backoff và jitter trong code Java); không bật `retryOn: 5xx` ở mesh cho request không idempotent. Dù chọn cách nào, viết nó vào tài liệu của service, vì đội ứng dụng không nhìn thấy VirtualService.
+
+</Reveal>
+
+<Reveal title="Giới hạn trong DestinationRule áp ở sidecar khác ở waypoint thế nào?">
+
+Các trần của `connectionPool` và `retryBudget` là `circuit_breakers` của một cluster **trong một proxy**. Với sidecar, mỗi pod client có Envoy riêng, nên mỗi pod client có trần riêng: 50 pod client với `maxRetries: 3` vẫn có thể cùng lúc tạo 150 retry vào backend. Muốn giới hạn tổng, bạn phải chia trần cho số pod client, và con số đó đổi mỗi khi HPA thêm bớt pod. Với waypoint, mọi client của Service đi qua cùng một Envoy (hoặc vài bản sao của waypoint), nên trần ở đó gần với trần của cả Service; bước 6 thấy budget có tác dụng ngay với một DestinationRule. Đổi lại, waypoint thành một điểm nghẽn chung: nó cần đủ CPU, đủ bản sao, và có giới hạn riêng của nó, đúng loại giới hạn trong callout về GitHub.
+
+</Reveal>
+
+<Reveal title="Tiêm lỗi ở mesh khác chaos engineering (D17) ở đâu?">
+
+Tiêm lỗi của mesh làm proxy giả lỗi ở tầng HTTP: chính xác, theo header, gỡ ngay được, không đụng tới pod. Nó trả lời câu hỏi về phía **gọi**: client chịu được backend chậm hay lỗi không. Chaos engineering với công cụ như Chaos Mesh làm hỏng thật: giết pod, cắt mạng, làm đầy đĩa, lệch đồng hồ; nó trả lời câu hỏi về **cả hệ**: autoscaling, failover, cảnh báo có chạy không. Hai cách bổ sung nhau. Cái giá của tiêm lỗi ở mesh: nó chỉ có ở VirtualService, và chỉ có tác dụng với traffic đi qua waypoint.
+
+</Reveal>
+
+<Reveal title="Outlier detection loại pod, sao không dùng readinessProbe?">
+
+Probe hỏi một endpoint riêng (`/healthz`) theo chu kỳ của kubelet; nó chỉ biết pod tự nói mình khoẻ. Outlier detection nhìn **request thật** mà proxy đang chuyển: pod trả `503` cho người dùng mà `/healthz` vẫn `200` (phụ thuộc của nó hỏng, cấu hình sai sau một lần deploy) thì chỉ outlier detection bắt được. Ngược lại, outlier detection loại cục bộ ở từng proxy và chỉ tạm thời; pod vẫn nằm trong EndpointSlice. Dùng cả hai, và theo dõi `ejections_active`: một pod bị loại đi loại lại là dấu hiệu cần xem nó, không phải để proxy che mãi.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết HTTPRoute chia lưu lượng, VirtualService tiêm lỗi, hay DestinationRule với outlier detection, hoặc đọc một đoạn `istioctl proxy-config`. AI hay sai ở: (1) gắn HTTPRoute trong mesh vào một `Gateway` thay vì `kind: Service`; (2) viết `retry` vào HTTPRoute khi cụm chỉ có CRD kênh standard, và `kubectl apply` báo trường không tồn tại; (3) đề xuất VirtualService và HTTPRoute cùng lúc cho một Service; (4) dùng `subset` trong VirtualService mà quên DestinationRule định nghĩa subset; (5) cho rằng Istio mặc định retry `503` hay mặc định có timeout 15 giây như Envoy tự cấu hình. Kiểm bằng `istioctl proxy-config route` và `cluster` trên waypoint: đó là cấu hình thật Envoy đang chạy, không phải điều bạn tưởng đã viết.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.2 và K6.2 dạy cấu trúc HTTPRoute, timeout và ranh giới chuẩn với riêng mà bài này dùng lại trong mesh. D9.6 dạy outlier detection và panic của Envoy; D18.2 dạy retry storm, retry budget và load shedding, nền của bước 6. D13.3 dùng Argo Rollouts làm canary theo số pod; với mesh, Rollouts sửa trọng số của HTTPRoute hoặc VirtualService. K11.3 đo cái giá của waypoint, nâng cấp Istio, và gỡ lỗi một AuthorizationPolicy hỏng sau khi thêm waypoint. D12.6 dạy tracing với OTel Collector và Tempo, thứ waypoint gửi được khi bạn bật Telemetry của Istio.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d18.2.mastery-canary">Tự dựng được waypoint cho một namespace ambient và làm canary 90/10 rồi 50/50, có rule theo header cho nhóm thử nghiệm, đo được tỉ lệ thật.</Check>
+
+<Check id="d18.2.mastery-retry">Nhìn cấu hình retry của client và mesh, tính được số request backend nhận khi backend hỏng, và sửa bằng cách giữ retry ở một lớp kèm retry budget.</Check>
+
+<Check id="d18.2.mastery-chiu-loi">Dùng tiêm lỗi để kiểm một service gọi phụ thuộc chậm, và dùng outlier detection để một pod hỏng chỉ làm hỏng vài request.</Check>
+
+</Mastery>

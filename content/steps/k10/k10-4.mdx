@@ -1,0 +1,816 @@
+---
+title: Chính sách chung cho fleet
+description: Chuẩn hoá cấu hình nền trên mọi cụm bằng GitOps; đưa Kyverno (render từ chart đã kiểm checksum, ghim digest) và một bộ policy tới mọi cụm bằng ApplicationSet có selfHeal, gom PolicyReport của từng cụm về một báo cáo, thấy một lần sửa tay bị kéo về, viết script kiểm kê cụm nào chạy bản nào; rồi nâng cấp fleet theo vòng và so sánh Rancher Fleet, OCM, Karmada.
+id: k10.4
+step: k10
+prerequisites: [k10.3, k8.3]
+topics: [k10.chinh-sach-fleet]
+status: verified
+verified:
+  date: 2026-10-20
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    kind: 0.33.0
+    kubernetes: 1.37.0 (kindest/node)
+    kubectl: 1.37.1
+    argo-cd: 3.5.5 (core-install)
+    kyverno: 1.19.1 (chart 3.9.1)
+    helm: 4.3.0
+    gitea: 28.1.0
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+K10.2 đưa ứng dụng tới nhiều cụm. Bài này lo phần dưới ứng dụng: thứ **mọi** cụm phải có giống nhau, policy engine, luật bảo mật, quyền, agent giám sát. Học xong, bạn giải thích được:
+
+- Vì sao "cụm nào cũng cài Kyverno" chưa đủ, và một nền chung đúng nghĩa cần những gì: cùng phiên bản, cùng cấu hình, tự kéo về khi bị sửa, và biết được nó đang ở đâu.
+- Đội nền tảng biết được cụm nào đang chạy workload vi phạm luật mà không phải đăng nhập từng cụm thế nào.
+- Vì sao một bản cập nhật hệ điều hành chạy ngoài quy trình có thể hạ cả một nền tảng trong một ngày, và nâng cấp fleet theo vòng chặn điều đó ra sao.
+- Khi nào ApplicationSet là đủ, khi nào cần công cụ quản lý fleet như Rancher Fleet, Open Cluster Management hay Karmada.
+
+</Goal>
+
+<Knowledge>
+
+### Nền chung của mọi cụm
+
+Mỗi cụm trong fleet có hai lớp: **nền** (baseline) do đội nền tảng quản, giống nhau ở mọi cụm cùng loại; và **ứng dụng** do các đội sản phẩm quản. Nền thường gồm:
+
+| Thành phần | Ví dụ | Vì sao phải giống nhau |
+|---|---|---|
+| Policy engine và policy | Kyverno, các luật về image, quyền, nhãn | Một cụm thiếu luật là lỗ hổng của cả fleet |
+| RBAC chung | Nhóm trực ca chỉ đọc, nhóm nền tảng quản trị | Người trực xử lý mọi cụm như nhau |
+| Agent quan sát | Agent gửi metric, log, trace (D12, D16.3) | Cụm thiếu agent là cụm không ai thấy |
+| Add-on mạng và chứng chỉ | CNI, Gateway, cert-manager, external-dns | Ứng dụng dựa vào chúng có mặt ở mọi nơi |
+| Cấu hình cụm | Pod Security mặc định, quota, PriorityClass | Cùng một manifest chạy hay hỏng như nhau ở mọi cụm |
+
+Nguyên tắc đưa nền tới fleet giống ứng dụng (K10.2), với hai khác biệt. Thứ nhất, nền phải **luôn đúng** như Git: một policy bị xoá tay là một lỗ hổng đang mở, nên ApplicationSet của nền bật `selfHeal`, đổi lại không dùng RollingSync. Thứ hai, nền đổi chậm và mỗi lần đổi rủi ro cao, nên phiên bản của nó được ghim và đưa qua từng vòng cụm (phần cuối bài).
+
+Lab đưa Kyverno tới mọi cụm theo kiểu **render sẵn**: tải chart, kiểm checksum, `helm template` ra manifest, ghim digest của image, commit cả kết quả vào Git. So với để Argo CD tự kéo chart từ kho Helm:
+
+| | Argo CD kéo chart | Commit manifest đã render |
+|---|---|---|
+| Diff khi nâng phiên bản | Chỉ thấy số phiên bản đổi | Thấy từng dòng đổi trong pull request |
+| Kiểm checksum, ghim digest | Không có chỗ làm | Làm một lần lúc render |
+| Kích thước repo | Nhỏ | Lớn (Kyverno khoảng 6 MB, phần lớn là CRD) |
+| Phụ thuộc lúc sync | Kho chart phải trả lời | Chỉ cần Git |
+
+<Check id="k10.4.nen-chung">Kể được các thành phần thường có trong nền chung của fleet và vì sao từng thứ phải giống nhau, giải thích được vì sao nền dùng `selfHeal` còn ứng dụng có thể dùng RollingSync, và so sánh được việc kéo chart với commit manifest đã render.</Check>
+
+### Báo cáo tuân thủ gom về một chỗ
+
+K8.3 đã dùng Kyverno ở chế độ `Audit` với quét nền: reports controller đánh giá lại tài nguyên đã có và ghi kết quả thành object `PolicyReport` trong từng namespace. Với một cụm, `kubectl get policyreport -A` là đủ. Với hai mươi cụm, câu "cụm nào đang vi phạm" cần một chỗ gom:
+
+```text
+  cụm k10-a                 cụm k10-b                 ... cụm thứ N
+  ┌───────────────┐         ┌───────────────┐
+  │ Kyverno quét  │         │ Kyverno quét  │
+  │ PolicyReport  │         │ PolicyReport  │
+  └──────┬────────┘         └──────┬────────┘
+         │ (lab: script đọc qua từng context)
+         │ (thật: Policy Reporter đẩy kết quả, hoặc metric của Kyverno về Prometheus nhiều cụm)
+         ▼                          ▼
+   ┌────────────────────────────────────────────┐
+   │ một bảng: cụm, namespace, tài nguyên, luật │
+   └────────────────────────────────────────────┘
+```
+
+Trên hệ thống thật có hai cách hay gặp: **Policy Reporter** (dự án của cộng đồng Kyverno) chạy trên mỗi cụm và gửi kết quả về một nơi tập trung; hoặc dùng metric mà Kyverno xuất ra cho Prometheus, gom bằng Thanos như D16.3, rồi cảnh báo trên đó. Lab dùng một script đọc lần lượt từng cụm, đủ để thấy dữ liệu cần gom là gì.
+
+Hai lỗi hay gặp khi gom báo cáo: chỉ đếm `fail` mà không biết cụm nào **không gửi báo cáo** (cụm mất agent trông giống cụm sạch), và đưa namespace hệ thống vào làm nhiễu. Lab loại `kube-system`, `kyverno`, `local-path-storage` ngay trong policy, và script in mọi cụm kể cả cụm không có vi phạm.
+
+<Check id="k10.4.bao-cao">Mô tả được đường đi của một kết quả vi phạm từ Kyverno trên một cụm tới báo cáo chung, kể được hai cách gom trên hệ thống thật, và hai lỗi hay gặp khi đọc báo cáo gom.</Check>
+
+### Drift giữa các cụm và kiểm kê
+
+**Drift** là khi thứ đang chạy khác thứ đã khai. Trong một fleet có ba loại, và mỗi loại cần một công cụ khác:
+
+| Loại drift | Ví dụ | Ai phát hiện, ai sửa |
+|---|---|---|
+| Tài nguyên do GitOps quản bị sửa tay | Ai đó xoá một policy, scale policy engine về 0 | Argo CD thấy `OutOfSync` ở những trường Git có khai; `selfHeal` kéo về. Trường Git không khai thì không ai thấy (bước 4 của lab) |
+| Tài nguyên không ai quản | Một Deployment tạo bằng `kubectl` lúc xử lý sự cố, rồi bị quên | Argo CD **không** thấy; policy (báo cáo vi phạm) và kiểm kê mới thấy |
+| Thay đổi bên dưới Kubernetes | Hệ điều hành của node tự cập nhật gói, kernel đổi | Không công cụ nào trong cụm thấy; cần image bất biến và thay node (K10.1, D8.4) |
+
+**Kiểm kê** (inventory) trả lời "cụm nào đang chạy bản nào": phiên bản Kubernetes, phiên bản từng add-on của nền, commit Git mà nền đang ở, tình trạng kết nối với hub. Không có nó, câu "đã vá CVE này ở mọi cụm chưa" không có câu trả lời nhanh. Bảng kiểm kê nên đọc từ **thứ đang chạy** (image và nhãn của Deployment, phiên bản API server), không đọc từ Git: Git nói điều bạn muốn, kiểm kê nói điều đang có, và khoảng cách giữa hai thứ chính là drift.
+
+<Callout kind="production">
+
+Ngày 10/06/2025, khách hàng của Heroku bị gián đoạn từ 06:00 UTC, nhiều khách hàng tới 24 giờ, theo [bản tóm tắt sự cố của Heroku](https://www.heroku.com/blog/summary-of-june-10-outage/). Heroku nêu ba vấn đề cộng lại:
+
+- **Kiểm soát**: một bản cập nhật hệ điều hành tự động chạy trên hạ tầng production khi lẽ ra đã bị tắt; nó khởi động lại dịch vụ mạng của máy chủ.
+- **Khả năng chịu lỗi**: dịch vụ mạng dựa vào một script cũ chỉ đặt đúng luật định tuyến lúc máy khởi động lần đầu; khởi động lại dịch vụ thì luật không được đặt lại, và mọi dyno trên máy mất kết nối ra ngoài.
+- **Thiết kế**: công cụ nội bộ và trang trạng thái của Heroku chạy trên chính hạ tầng bị ảnh hưởng, nên khả năng phản ứng và thông báo cũng bị cản.
+
+Dòng thời gian (UTC): 08:26 xác nhận phần lớn dyno trong Private Spaces không gửi được request HTTP ra ngoài; 11:54 tìm ra các tuyến mạng bị thiếu khi so máy khoẻ với máy hỏng; 13:42 xác định nguyên nhân là một lần nâng cấp tự động một gói hệ thống; 17:30 tới 19:18 vô hiệu hoá token dùng cho các lần cập nhật tự động để không máy nào bị thêm; 22:01 khởi động lại dyno trên toàn fleet; sự cố đóng lúc 05:50 ngày 11/06. Heroku viết rằng thiếu các biện pháp kiểm soát tính bất biến (immutability) đã cho phép một tiến trình tự động thay đổi production ngoài kế hoạch, và cam kết: không thay đổi hệ thống nào xảy ra ngoài quy trình triển khai có kiểm soát, rà mọi image nền tìm rủi ro tương tự, và dựng kênh thông báo độc lập.
+
+Phần của bài này: một thay đổi tới **mọi** máy của fleet cùng lúc, đi ngoài đường triển khai có vòng, là loại drift không công cụ Kubernetes nào thấy. Cách chống là nền bất biến (thay chứ không sửa, K10.1) và mọi thay đổi nền, kể cả cập nhật hệ điều hành, đi qua cùng một đường có vòng.
+
+</Callout>
+
+<Check id="k10.4.drift">Phân biệt được ba loại drift trong fleet cùng công cụ phát hiện từng loại, giải thích được vì sao kiểm kê phải đọc từ thứ đang chạy, và chỉ ra được trong sự cố Heroku loại drift nào đã xảy ra và cam kết nào của họ nhắm vào nó.</Check>
+
+### Nâng cấp fleet theo vòng
+
+Nâng một add-on của nền (Kyverno 1.19 lên 1.20, CNI, cert-manager) là thay đổi rủi ro nhất trong fleet: nó chạm mọi cụm, và một policy engine hỏng có thể chặn mọi lần tạo pod (K8.3 đã thấy webhook treo). Cách làm phổ biến là chia cụm thành **vòng** (ring), giống wave của D13.4 nhưng đơn vị là cụm và nhịp tính bằng ngày:
+
+```text
+ vòng 0: cụm của đội nền tảng, cụm thử    ─ bake 1 ngày ─▶
+ vòng 1: một hai cụm production nhỏ        ─ bake 2-3 ngày ─▶
+ vòng 2: phần còn lại của production, theo lô
+         mỗi vòng: kiểm kê xác nhận phiên bản, báo cáo policy không tăng vi phạm,
+         metric của add-on (độ trễ webhook, lỗi) bình thường, rồi mới mở vòng sau
+```
+
+Hai cách hiện thực vòng bằng GitOps:
+
+| | Phiên bản theo vòng trong Git | RollingSync theo nhãn vòng |
+|---|---|---|
+| Cách làm | Mỗi vòng một thư mục (hoặc một tag) ghim phiên bản của nền; thăng cấp là một pull request đổi vòng sau sang phiên bản mới | Một thư mục chung, ApplicationSet chia bước theo nhãn `ring` của Secret cụm (K10.2) |
+| Bake time | Bao lâu tuỳ bạn: pull request kế tiếp mở khi nào | Không có sẵn; chỉ chờ `Healthy` |
+| selfHeal | Giữ được | Mất |
+| Lịch sử | Git cho biết vòng nào đang ở phiên bản nào | Phải đọc trạng thái của ApplicationSet |
+
+Với nền, cách thứ nhất hợp hơn: giữ được `selfHeal`, bake tính bằng ngày, và kiểm kê đối chiếu được với Git. Kiểm kê ở cuối mỗi vòng là cổng: mọi cụm của vòng phải báo đúng phiên bản mới, không cụm nào mất kết nối, trước khi mở pull request cho vòng sau.
+
+<Check id="k10.4.vong">Mô tả được ba vòng nâng cấp fleet và cổng kiểm giữa các vòng, và so sánh được phiên bản theo vòng trong Git với RollingSync theo nhãn vòng.</Check>
+
+### Công cụ quản lý fleet
+
+ApplicationSet đủ cho nhiều tổ chức. Khi cần nhiều hơn (đặt workload theo dung lượng của cụm, giao diện cho người không dùng Git, quản cụm từ nhiều nhà cung cấp), có các công cụ chuyên:
+
+| Công cụ | Ý tưởng chính | Trạng thái (10/2026) |
+|---|---|---|
+| Argo CD ApplicationSet | Sinh Application theo cụm từ generator; hub-and-spoke | Một phần của Argo CD (CNCF Graduated) |
+| Rancher Fleet | GitOps cho số lượng cụm rất lớn: agent trên mỗi cụm kéo "bundle", nhắm cụm theo nhãn và nhóm | Của SUSE, đi kèm Rancher (K4.6), mã nguồn mở Apache-2.0, bản 0.16 |
+| Open Cluster Management (OCM) | Hub-and-spoke với agent (klusterlet) trên mỗi cụm; `ManifestWork` đưa manifest xuống cụm, `Placement` chọn cụm theo nhãn và trạng thái | CNCF Sandbox từ 11/2021, bản 1.4 |
+| Karmada | API của Kubernetes ở tầng fleet: bạn tạo Deployment ở control plane của Karmada, `PropagationPolicy` quyết định nó tới cụm nào, chia bao nhiêu bản sao, `OverridePolicy` sửa theo cụm | CNCF Graduated từ 03/09/2026, bản 1.19 |
+
+Khác biệt cốt lõi: ApplicationSet, Rancher Fleet và OCM **đưa manifest** tới cụm, còn Karmada **lập lịch** workload giữa các cụm (đặt 6 bản sao ở cụm có chỗ, dời đi khi một cụm hỏng). Cái giá của Karmada là thêm một control plane nữa, và mọi công cụ của bạn (CI, GitOps) phải nói chuyện với control plane đó thay vì với từng cụm. Quy tắc chọn: bắt đầu với công cụ GitOps bạn đã có; chuyển khi một nhu cầu cụ thể (lập lịch giữa cụm, quy mô hàng trăm cụm, agent kéo vì mạng chỉ cho đi ra) không làm được bằng nó.
+
+<Check id="k10.4.cong-cu">So sánh được ApplicationSet, Rancher Fleet, OCM và Karmada theo ý tưởng và trạng thái dự án, và nêu được nhu cầu cụ thể nào đáng để thêm một công cụ quản lý fleet.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Policy Reports (Kyverno)](https://kyverno.io/docs/policy-reports/): cấu trúc `PolicyReport`, kết quả `pass`/`fail`, quét nền và cách đọc báo cáo.
+- [Automated Sync Policy (Argo CD)](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/): `selfHeal`, `prune` và khi nào Argo CD tự sync lại.
+- [What is Karmada? (Karmada)](https://karmada.io/docs/): `PropagationPolicy`, `OverridePolicy` và kiến trúc control plane của Karmada.
+- [Architecture (Open Cluster Management)](https://open-cluster-management.io/docs/concepts/architecture/): kiến trúc hub, klusterlet, `ManifestWork` và `Placement`.
+- [Summary of June 10 outage (Heroku)](https://www.heroku.com/blog/summary-of-june-10-outage/): nguồn của callout; đọc ba vấn đề và các cam kết.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng ba cụm, Gitea và repo `fleet` của K10.2 (K10.3 đã bật lại hub và Gitea ở bước dọn dẹp). `kubectl` 1.36 hay 1.37 đều được. Bạn cần thêm `helm` (K3.1 dùng Helm 4) để render chart. Lab tải chart Kyverno 3.9.1 (khoảng 800 KB) và ba image của Kyverno 1.19.1 (mỗi image khoảng 40 MB) lên hai cụm đích.
+
+**Profile máy.** Đây là bài nặng nhất của chặng. Kyverno thêm khoảng 400 tới 600 MiB cho mỗi cụm đích (hai controller, cộng API server phình ra vì 22 CRD của Kyverno), và application controller của Argo CD trên hub lớn lên vì phải giữ các CRD đó trong cache. Theo `docker stats`, cả lab khoảng 3,8 tới 4,3 GiB (hub khoảng 1,3 tới 1,6 GiB, mỗi cụm đích 1,2 tới 1,5 GiB), có lúc vọt lên khoảng 4,6 GiB trong vài chục giây khi Kyverno vừa cài; phần bộ nhớ thật sự phải giữ (không tính cache file kernel thu hồi được) khoảng 3,5 GiB. Cần cấp cho Docker ít nhất 6 GB. Máy 8 GB: bỏ cụm `k10-b` (xoá Secret `cluster-k10-b` trên hub rồi `docker stop k10-b-control-plane`) và cấp cho Docker 5 GB; bước 3 khi đó chỉ có một cụm trong báo cáo.
+
+Helm của máy bạn có thể có cấu hình kho chart riêng; các lệnh dưới chỉ dùng file `.tgz` đã tải, không đụng tới kho đã khai.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+docker start k10-gitea k10-hub-control-plane k10-a-control-plane k10-b-control-plane >/dev/null
+for i in $(seq 1 90); do [ "$(hub -n argocd get applications -o jsonpath='{.items[*].status.health.status}' 2>/dev/null)" = "Healthy Healthy" ] && break; sleep 2; done
+hub -n argocd get applications -L ring
+cd fleet && an_git pull -q origin main && git log --oneline -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME        SYNC STATUS   HEALTH STATUS   RING
+web-k10-a   Synced        Healthy         canary
+web-k10-b   Synced        Healthy         main
+53ce538 Revert "web: v3"
+```
+
+</Expected>
+
+### 1. Render Kyverno vào repo
+
+Script `render-kyverno.sh` tải chart (nếu chưa có), so sha256 với `index.yaml` của kho chart chính thức như K8.3, và chỉ render khi khớp (`set -e` dừng script ngay khi `shasum -c` báo sai). `--no-hooks` bỏ các tài nguyên mà chart đánh dấu là hook của Helm (ví dụ Job chạy trước khi gỡ chart): Argo CD nhận ra annotation hook của Helm và sẽ chạy chúng như hook của chính nó, điều chặng không cần; tắt background controller và cleanup controller vì chặng không dùng sinh tài nguyên hay dọn theo lịch, cũng để tiết kiệm RAM. Tham số thêm khi gọi script được chuyển cho `helm template`; bước 4 cần đến.
+
+<Terminal where="mac" title="~/masteva-k10/render-kyverno.sh">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+mkdir -p charts fleet/platform/kyverno fleet/platform/policies fleet/platform/baseline
+cat > render-kyverno.sh <<'EOF'
+#!/bin/sh
+# Render Kyverno 3.9.1 từ chart đã kiểm sha256 vào fleet/platform/kyverno/kyverno.yaml.
+# Tham số thêm (ví dụ --set ...) được chuyển cho helm template.
+set -e
+cd "$HOME/masteva-k10"
+[ -f charts/kyverno-3.9.1.tgz ] || curl -fsSLo charts/kyverno-3.9.1.tgz https://kyverno.github.io/kyverno/kyverno-3.9.1.tgz
+SUM=$(curl -fsSL https://kyverno.github.io/kyverno/index.yaml | yq '.entries.kyverno[] | select(.version == "3.9.1") | .digest')
+echo "$SUM  charts/kyverno-3.9.1.tgz" | shasum -a 256 -c
+helm template kyverno charts/kyverno-3.9.1.tgz --namespace kyverno --no-hooks \
+  --set backgroundController.enabled=false --set cleanupController.enabled=false \
+  --set webhooksCleanup.enabled=false "$@" > fleet/platform/kyverno/kyverno.yaml
+echo "trường rỗng trước khi dọn: $(grep -c '^    {}$' fleet/platform/kyverno/kyverno.yaml)"
+yq -i 'del(.metadata.labels | select(length == 0)) | del(.metadata.annotations | select(length == 0))' fleet/platform/kyverno/kyverno.yaml
+echo "trường rỗng sau khi dọn: $(grep -c '^    {}$' fleet/platform/kyverno/kyverno.yaml)"
+EOF
+chmod +x render-kyverno.sh && ./render-kyverno.sh
+yq -N '.kind' fleet/platform/kyverno/kyverno.yaml | sort | uniq -c
+grep -h 'image: ' fleet/platform/kyverno/kyverno.yaml | sort -u
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+charts/kyverno-3.9.1.tgz: OK
+trường rỗng trước khi dọn: 22
+trường rỗng sau khi dọn: 0
+  12 ClusterRole
+   4 ClusterRoleBinding
+   2 ConfigMap
+  22 CustomResourceDefinition
+   2 Deployment
+   2 Role
+   2 RoleBinding
+   3 Service
+   2 ServiceAccount
+          image: "reg.kyverno.io/kyverno/kyverno:v1.19.1"
+          image: "reg.kyverno.io/kyverno/kyvernopre:v1.19.1"
+          image: "reg.kyverno.io/kyverno/reports-controller:v1.19.1"
+```
+
+</Expected>
+
+Hai dòng "trường rỗng" là một bước dọn mà manifest render từ chart thường cần. Mười một CRD của nhóm `policies.kyverno.io` được render với `labels: {}` và `annotations: {}` rỗng. Kubernetes không lưu trường rỗng, nên Argo CD so manifest trong Git với object trên cụm sẽ thấy khác ở mọi lần đối chiếu: Application báo `OutOfSync` mãi, và với `selfHeal` nó sync lại lặp đi lặp lại (giãn dần theo backoff). Lệnh `yq` trong script xoá các trường rỗng đó; số dòng `{}` đứng riêng giảm từ 22 về 0. Vì nằm trong script, bước dọn chạy lại mỗi lần bạn render lại hay nâng chart.
+
+Trong manifest vừa render, ba image chỉ có tag. Kustomization của `platform/kyverno` ghim chúng bằng digest; ba digest dưới đây là của bản phát hành 1.19.1, bạn tự kiểm được bằng `docker buildx imagetools inspect reg.kyverno.io/kyverno/kyverno:v1.19.1`. Thư mục `platform` còn hai phần nữa:
+
+- `policies`: ValidatingPolicy `ghim-digest` ở chế độ `Audit`, có quét nền: mọi container của Deployment phải dùng image ghim bằng digest. Nó gắn sync wave 1 để Argo CD áp sau khi CRD và Kyverno (wave 0) đã khoẻ (D13.4).
+- `baseline`: một ConfigMap `fleet-baseline` ghi phiên bản của cả nền, để kiểm kê đọc được nền nào đang chạy ở cụm nào.
+
+<Terminal where="mac" title="~/masteva-k10/fleet/platform">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh && cd fleet
+cat > platform/kyverno/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [kyverno.yaml]
+images:
+  - name: reg.kyverno.io/kyverno/kyverno
+    digest: sha256:b31d8511ae5fd6010e2a01ea72ebae08eb82fa51d91af14a1d9fe989949b4edb
+  - name: reg.kyverno.io/kyverno/kyvernopre
+    digest: sha256:c25c47461f06f2845a48c319ae86fbbc1730a7b9ed5b701889c9dc1f9ee94b09
+  - name: reg.kyverno.io/kyverno/reports-controller
+    digest: sha256:c0eee97b9b44a0dd35805d56b358fa52548480f79d4944602b9609538eccd64c
+EOF
+cat > platform/policies/ghim-digest.yaml <<'EOF'
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: ghim-digest
+spec:
+  validationActions: [Audit]
+  evaluation:
+    background:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, kyverno, local-path-storage]
+  validations:
+    - expression: "object.spec.template.spec.containers.all(c, c.image.contains('@sha256:'))"
+      message: "Mọi container phải ghim image bằng digest (@sha256:...)"
+EOF
+cat > platform/policies/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [ghim-digest.yaml]
+commonAnnotations:
+  argocd.argoproj.io/sync-wave: "1"
+EOF
+cat > platform/baseline/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: kyverno
+configMapGenerator:
+  - name: fleet-baseline
+    literals: [BASELINE=2026.10.1, KYVERNO=1.19.1]
+generatorOptions:
+  disableNameSuffixHash: true
+EOF
+cat > platform/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [kyverno, policies, baseline]
+EOF
+kubectl kustomize platform | grep -E 'image: reg|sync-wave' | sort | uniq -c
+git add -A && git commit -qm "platform: Kyverno 1.19.1 (chart 3.9.1), policy ghim-digest, baseline 2026.10.1"
+an_git push -q origin main && git log --oneline -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   1         image: reg.kyverno.io/kyverno/kyverno@sha256:b31d8511ae5fd6010e2a01ea72ebae08eb82fa51d91af14a1d9fe989949b4edb
+   1         image: reg.kyverno.io/kyverno/kyvernopre@sha256:c25c47461f06f2845a48c319ae86fbbc1730a7b9ed5b701889c9dc1f9ee94b09
+   1         image: reg.kyverno.io/kyverno/reports-controller@sha256:c0eee97b9b44a0dd35805d56b358fa52548480f79d4944602b9609538eccd64c
+   1     argocd.argoproj.io/sync-wave: "1"
+587b96f platform: Kyverno 1.19.1 (chart 3.9.1), policy ghim-digest, baseline 2026.10.1
+```
+
+</Expected>
+
+Mã commit trên máy bạn sẽ khác. Kết quả cuối cùng mà các cụm sẽ nhận là ba image ghim digest và một policy ở wave 1. Từ giờ, mọi lần nâng Kyverno là một pull request chứa toàn bộ diff của manifest.
+
+<Check id="k10.4.lab-render">Render được một chart đã kiểm checksum thành manifest trong Git, ghim được image bằng digest qua Kustomize, và giải thích được vì sao policy cần sync wave sau Kyverno.</Check>
+
+### 2. Một ApplicationSet cho nền của mọi cụm
+
+Khác ApplicationSet `web` ở ba điểm: chỉ cần generator `clusters` (mọi cụm prod nhận cùng nền), dùng `AllAtOnce` mặc định và bật `selfHeal`, và AppProject `platform` được tạo tài nguyên cấp cụm (CRD, ClusterRole, webhook). `ServerSideApply` cần cho CRD lớn của Kyverno: áp kiểu cũ ghi cả manifest vào annotation và vượt giới hạn kích thước của nó.
+
+<Terminal where="mac" title="~/masteva-k10/appset-platform.yaml">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+cat > appset-platform.yaml <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: { name: platform, namespace: argocd }
+spec:
+  sourceRepos: [http://k10-gitea:3000/an/fleet.git]
+  destinations:
+    - { name: "k10-*", namespace: "*" }
+  clusterResourceWhitelist:
+    - { group: "*", kind: "*" }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata: { name: platform, namespace: argocd }
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - clusters:
+        selector:
+          matchLabels: { masteva.dev/env: prod }
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+  template:
+    metadata:
+      name: 'platform-{{ .name }}'
+    spec:
+      project: platform
+      source:
+        repoURL: http://k10-gitea:3000/an/fleet.git
+        targetRevision: main
+        path: platform
+      destination:
+        name: '{{ .name }}'
+        namespace: kyverno
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+        syncOptions: [CreateNamespace=true, ServerSideApply=true]
+        retry:
+          limit: 5
+          backoff: { duration: 10s, factor: 2, maxDuration: 2m }
+EOF
+hub apply -f appset-platform.yaml
+for i in $(seq 1 120); do
+  [ "$(hub -n argocd get applications -l '!ring' -o jsonpath='{.items[*].status.sync.status} {.items[*].status.health.status}')" = "Synced Synced Healthy Healthy" ] && break; sleep 5
+done
+hub -n argocd get applications
+ka -n kyverno get deploy; kb -n kyverno get deploy
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+appproject.argoproj.io/platform created
+applicationset.argoproj.io/platform created
+NAME             SYNC STATUS   HEALTH STATUS
+platform-k10-a   Synced        Healthy
+platform-k10-b   Synced        Healthy
+web-k10-a        Synced        Healthy
+web-k10-b        Synced        Healthy
+NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+kyverno-admission-controller   1/1     1            1           44s
+kyverno-reports-controller     1/1     1            1           44s
+NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+kyverno-admission-controller   1/1     1            1           44s
+kyverno-reports-controller     1/1     1            1           44s
+```
+
+</Expected>
+
+Lần đầu mất khoảng một tới năm phút, phần lớn để hai cụm kéo image của Kyverno; nếu vòng chờ hết 10 phút mà chưa xong, xem mục Gỡ lỗi. `-l '!ring'` chọn các Application không có nhãn `ring`, tức của ApplicationSet `platform`. Một commit và một ApplicationSet đã đưa cùng một policy engine, cùng một policy, tới mọi cụm có nhãn `masteva.dev/env: prod`; cụm thứ mười nhận nó ngay khi được đăng ký bằng `dang-ky-cum.sh`.
+
+<Check id="k10.4.lab-appset">Đưa được một bộ add-on và policy tới mọi cụm bằng ApplicationSet với generator `clusters`, `selfHeal` và `ServerSideApply`, và giải thích được vì sao AppProject của nền khác AppProject của ứng dụng.</Check>
+
+### 3. Một cụm vi phạm, một báo cáo gom
+
+Trên `k10-b`, một người tạo tay một Deployment dùng image chỉ có tag, như lúc xử lý sự cố vội. Argo CD không quản nó, nên với Argo CD nó không tồn tại:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+kb create namespace tam
+kb -n tam create deployment sua-gap --image=busybox:1.38.0 -- sleep 3600
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/tam created
+deployment.apps/sua-gap created
+```
+
+</Expected>
+
+Script `bao-cao.sh` đọc PolicyReport của từng cụm có trong kubeconfig và in một bảng chung. Với mỗi cụm nó in số kết quả `pass` và `fail`, cả khi bằng 0, rồi liệt kê từng vi phạm; cụm không có báo cáo nào được in ra là `CHƯA CÓ BÁO CÁO` thay vì bị bỏ qua.
+
+<Terminal where="mac" title="~/masteva-k10/bao-cao.sh">
+
+```bash
+cd ~/masteva-k10
+cat > bao-cao.sh <<'EOF'
+#!/bin/sh
+# Gom PolicyReport của mọi cụm đích (context kind-k10-a, kind-k10-b) thành một bảng.
+for ctx in kind-k10-a kind-k10-b; do
+  json=$(kubectl --context $ctx get policyreport -A -o json 2>/dev/null)
+  n=$(echo "$json" | jq '.items | length')
+  if [ "${n:-0}" = 0 ]; then echo "${ctx#kind-}  CHƯA CÓ BÁO CÁO"; continue; fi
+  echo "$json" | jq -r --arg c "${ctx#kind-}" '
+    ([.items[].results[]?] | "\($c)  pass=\(map(select(.result == "pass")) | length)  fail=\(map(select(.result == "fail")) | length)"),
+    (.items[] | . as $r | .results[]? | select(.result == "fail")
+      | "\($c)  FAIL  \($r.metadata.namespace)/\($r.scope.kind)/\($r.scope.name)  \(.policy): \(.message)")'
+done
+EOF
+chmod +x bao-cao.sh
+```
+
+</Terminal>
+
+Quét nền của Kyverno chạy bất đồng bộ; lần đầu có thể mất tới vài chục giây. Vòng chờ dừng khi `k10-b` đã có báo cáo cho Deployment `sua-gap`:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+for i in $(seq 1 60); do kb -n tam get policyreport -o name 2>/dev/null | grep -q . && break; sleep 2; done
+./bao-cao.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k10-a  pass=1  fail=0
+k10-b  pass=1  fail=1
+k10-b  FAIL  tam/Deployment/sua-gap  ghim-digest: Mọi container phải ghim image bằng digest (@sha256:...)
+```
+
+</Expected>
+
+Một bảng cho cả fleet: `web` ở cả hai cụm qua (`pass`), vì base của K10.2 ghim digest; `sua-gap` ở `k10-b` trượt. Đội nền tảng thấy vi phạm này mà không phải đăng nhập `k10-b`, và thấy nó dù Argo CD không biết Deployment đó tồn tại. Đây là drift loại hai ở bảng phần Kiến thức. Policy ở chế độ `Audit` nên không chặn ai; K8.3 đã dạy trình tự Audit, đọc báo cáo, sửa, rồi mới `Deny`, và với fleet, bảng này là thứ cho biết khi nào đã an toàn để bật `Deny`.
+
+<Check id="k10.4.lab-bao-cao">Gom được PolicyReport của nhiều cụm thành một bảng có cả cụm không vi phạm, tìm ra được tài nguyên vi phạm do người tạo tay mà GitOps không thấy, và giải thích được vì sao báo cáo phải phân biệt cụm sạch với cụm không có báo cáo.</Check>
+
+### 4. Sửa tay trên một cụm, và nền tự quay về
+
+<Callout kind="danger">
+
+Các khối của bước này xoá policy `ghim-digest` và tắt admission controller của Kyverno trên `k10-a`: trong khoảng đó cụm không có policy nào. Kiểm bạn đang dùng hàm `ka` (context `kind-k10-a`) trước khi chạy.
+
+</Callout>
+
+Hai lần sửa tay hay gặp lúc xử lý sự cố: xoá một policy "đang chặn", và scale policy engine về 0 "cho chắc".
+
+<Predict question="ApplicationSet `platform` có `selfHeal`. Sau hai lần sửa tay đó, Argo CD kéo được gì về?">
+
+Policy thì có: nó là một object trong Git, bị xoá thì Argo CD thấy thiếu và tạo lại. Số bản sao thì không: chart để trống `replicas`, nên Git không khai số bản sao và Argo CD không có gì để so. Admission controller nằm ở 0 bản sao trong khi Application vẫn `Synced`. Khối dưới cho bạn thấy cả hai.
+
+</Predict>
+
+Khối dưới sửa tay cả hai, chờ policy quay lại, chờ thêm một phút, rồi đọc số bản sao, trạng thái của Application và trường `replicas` trong manifest đã render:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+ka delete validatingpolicy ghim-digest
+ka -n kyverno scale deploy kyverno-admission-controller --replicas=0
+T0=$(date +%s)
+for i in $(seq 1 90); do ka get validatingpolicy ghim-digest >/dev/null 2>&1 && break; sleep 1; done
+echo "policy quay về sau $(( $(date +%s) - T0 )) giây"
+sleep 60
+echo "admission controller: $(ka -n kyverno get deploy kyverno-admission-controller -o jsonpath='{.spec.replicas}') bản sao"
+hub -n argocd get application platform-k10-a -o jsonpath='{.status.sync.status}{"\n"}'
+yq -N 'select(.kind == "Deployment") | .metadata.name + ": replicas = " + (.spec.replicas // "để trống" | tostring)' fleet/platform/kyverno/kyverno.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+validatingpolicy.policies.kyverno.io "ghim-digest" deleted
+deployment.apps/kyverno-admission-controller scaled
+policy quay về sau 4 giây
+admission controller: 0 bản sao
+Synced
+kyverno-admission-controller: replicas = để trống
+kyverno-reports-controller: replicas = để trống
+```
+
+</Expected>
+
+Policy quay về sau vài giây, có khi tới nửa phút: Argo CD thấy thiếu một object của Git và `selfHeal` tạo lại nó. Nhưng một phút sau admission controller vẫn **0 bản sao**, và Application vẫn báo `Synced`. Chart Kyverno render `replicas:` để trống khi bạn không đặt giá trị, nên manifest trong Git không khai số bản sao, và Argo CD chỉ so những trường có giá trị trong manifest của Git. Kết quả: policy có mặt, nhưng không có webhook nào xử lý admission, còn mọi màn hình GitOps đều xanh. `selfHeal` chỉ kéo về được thứ Git có khai.
+
+Sửa ở Git: render lại với số bản sao khai rõ (lab đặt 1 cho nhẹ; production đặt từ 2 trở lên cho admission controller, như K8.3 đã nói), commit, rồi chờ Argo CD đưa admission controller lên lại:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+./render-kyverno.sh --set admissionController.replicas=1 --set reportsController.replicas=1
+cd fleet && git diff --stat
+git commit -qam "platform: khai rõ số bản sao của Kyverno" && an_git push -q origin main && cd ..
+lam_moi
+for i in $(seq 1 120); do [ "$(ka -n kyverno get deploy kyverno-admission-controller -o jsonpath='{.status.readyReplicas}')" = 1 ] && break; sleep 2; done
+ka -n kyverno get deploy
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+charts/kyverno-3.9.1.tgz: OK
+trường rỗng trước khi dọn: 22
+trường rỗng sau khi dọn: 0
+ platform/kyverno/kyverno.yaml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+kyverno-admission-controller   1/1     1            1           10m
+kyverno-reports-controller     1/1     1            1           10m
+```
+
+</Expected>
+
+Diff ở hai chỗ: `replicas:` để trống thành `replicas: 1`, mỗi Deployment một chỗ. Giờ thử lại lần sửa tay thứ hai. Vòng chờ dùng `metadata.generation` của Deployment, con số tăng mỗi lần `spec` đổi: lần `scale` của bạn tăng nó một, lần Argo CD kéo về tăng thêm một, nên chờ tới khi nó tăng đủ hai và pod mới sẵn sàng:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+G0=$(ka -n kyverno get deploy kyverno-admission-controller -o jsonpath='{.metadata.generation}')
+ka -n kyverno scale deploy kyverno-admission-controller --replicas=0
+T0=$(date +%s)
+for i in $(seq 1 180); do
+  d=$(ka -n kyverno get deploy kyverno-admission-controller -o jsonpath='{.metadata.generation} {.status.readyReplicas}')
+  [ "${d% *}" -ge $((G0 + 2)) ] && [ "${d#* }" = 1 ] && break; sleep 1
+done
+echo "admission controller quay về sau $(( $(date +%s) - T0 )) giây"
+hub -n argocd get application platform-k10-a -o json | jq -r '.status.operationState | "\(.phase)  tự động: \(.operation.initiatedBy.automated)"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/kyverno-admission-controller scaled
+admission controller quay về sau 32 giây
+Succeeded  tự động: true
+```
+
+</Expected>
+
+Lần này Argo CD thấy `replicas` lệch khỏi Git và đưa về 1; phần lớn thời gian là pod admission controller khởi động và sẵn sàng, nên trên máy bạn con số có thể từ khoảng 20 giây tới hơn một phút. `tự động: true` cho biết lần sync do Argo CD tự làm, không phải người. Lần sửa tay thứ ba trong thời gian ngắn trên cùng một commit sẽ được kéo về chậm hơn: D13.1 đã nói về backoff của các lần tự sửa liên tiếp. So với `web` ở K10.2, nơi RollingSync chỉ báo `OutOfSync` và chờ người: với nền, đó là lý do chọn `selfHeal`, và cũng là lý do mọi trường quan trọng của nền phải được khai rõ trong Git.
+
+<Check id="k10.4.lab-drift">Tái hiện được hai lần sửa tay trên nền của một cụm, chỉ ra được vì sao `selfHeal` kéo policy về nhưng không kéo số bản sao về khi Git không khai `replicas`, sửa được bằng cách khai rõ trong Git, và chứng minh được bằng `operationState` rằng lần sửa sau là tự động.</Check>
+
+### 5. Kiểm kê: cụm nào chạy bản nào
+
+`kiem-ke.sh` đọc từ thứ đang chạy ở mỗi cụm: phiên bản API server, chart và digest image của Kyverno, ConfigMap `fleet-baseline`, phiên bản `web`; và từ hub: kết nối tới cụm và commit Git mà nền của cụm đó đang ở.
+
+<Terminal where="mac" title="~/masteva-k10/kiem-ke.sh">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+cat > kiem-ke.sh <<'EOF'
+#!/bin/sh
+# In một dòng cho mỗi cụm đích: đọc từ cụm và từ Argo CD trên hub.
+H="kubectl --context kind-k10-hub -n argocd"
+printf '%-7s %-9s %-14s %-13s %-10s %-4s %-11s %s\n' CLUSTER K8S KYVERNO-CHART KYVERNO-IMAGE BASELINE WEB CONNECTION PLATFORM@COMMIT
+for c in k10-a k10-b; do
+  k="kubectl --context kind-$c --request-timeout=5s"
+  k8s=$($k version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion // "?"')
+  chart=$($k -n kyverno get deploy kyverno-admission-controller -o jsonpath='{.metadata.labels.helm\.sh/chart}' 2>/dev/null)
+  img=$($k -n kyverno get deploy kyverno-admission-controller -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/.*@sha256:\(.\{12\}\).*/\1/')
+  base=$($k -n kyverno get cm fleet-baseline -o jsonpath='{.data.BASELINE}' 2>/dev/null)
+  web=$($k -n web get cm -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.name | startswith("web-")) | .data.VERSION] | first // "?"')
+  conn=$($H exec argocd-application-controller-0 -- argocd --core cluster get $c -o json 2>/dev/null | jq -r '.connectionState.status // "?"')
+  rev=$($H get application platform-$c -o jsonpath='{.status.sync.revision}' 2>/dev/null | cut -c1-7)
+  printf '%-7s %-9s %-14s %-13s %-10s %-4s %-11s %s\n' "$c" "$k8s" "${chart:-?}" "${img:-?}" "${base:-?}" "$web" "$conn" "${rev:-?}"
+done
+EOF
+chmod +x kiem-ke.sh && ./kiem-ke.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CLUSTER K8S       KYVERNO-CHART  KYVERNO-IMAGE BASELINE   WEB  CONNECTION  PLATFORM@COMMIT
+k10-a   v1.37.0   kyverno-3.9.1  b31d8511ae5f  2026.10.1  v2   Successful  9e618ed
+k10-b   v1.37.0   kyverno-3.9.1  b31d8511ae5f  2026.10.1  v2   Successful  9e618ed
+```
+
+</Expected>
+
+Hai dòng giống nhau là điều bạn muốn thấy. Mã commit ở cột cuối trên máy bạn sẽ khác; đó là commit sửa `replicas` ở bước 4. Khi một cụm khác các cụm còn lại ở một cột, đó là drift loại ba hoặc một vòng nâng cấp chưa xong. Cột `CONNECTION` là điều hub nói về cụm; cột `K8S` và các cột sau là điều chính cụm trả lời. Khối dưới cho thấy vì sao cần cả hai.
+
+Thử xem kiểm kê nói gì khi một cụm mất kết nối, bằng cách đóng băng `k10-b` như K10.3, chờ một phút rồi chạy lại. Mỗi lệnh `kubectl` trong script có `--request-timeout=5s`, nên cụm không trả lời làm script chậm vài giây chứ không treo:
+
+<Callout kind="danger">
+
+Khối dưới đóng băng toàn bộ cụm `k10-b` khoảng một phút: `web` và Kyverno trên đó ngừng trả lời. Nếu khối bị ngắt giữa chừng, chạy `docker unpause k10-b-control-plane`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+docker pause k10-b-control-plane >/dev/null
+sleep 60
+./kiem-ke.sh
+argocd cluster get k10-b -o json 2>/dev/null | jq -c '.connectionState'
+docker unpause k10-b-control-plane >/dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CLUSTER K8S       KYVERNO-CHART  KYVERNO-IMAGE BASELINE   WEB  CONNECTION  PLATFORM@COMMIT
+k10-a   v1.37.0   kyverno-3.9.1  b31d8511ae5f  2026.10.1  v2   Successful  9e618ed
+k10-b   ?         ?              ?             ?          ?    Successful  9e618ed
+{"status":"Successful","message":"","attemptedAt":"2026-10-19T21:30:37Z"}
+```
+
+</Expected>
+
+Script không đọc được gì từ `k10-b` nên in `?`. Nhưng cột `CONNECTION`, thứ hub nói về cụm, vẫn là `Successful`, với `attemptedAt` vừa cập nhật.
+
+Argo CD không phát hiện được kiểu hỏng này: cụm bị đóng băng không đóng kết nối cũng không trả lỗi, chỉ không trả lời. Bạn có thể đóng băng lâu hơn rồi chạy lại hai lệnh giữa của khối: trạng thái này có thể giữ nguyên nhiều phút, và trong lúc đó Application của `k10-b` vẫn có thể hiện `Synced`, `Healthy`.
+
+Đây là lỗi hay gặp thứ nhất ở phần Kiến thức, ở dạng khó thấy nhất: một cụm không trả lời không phải là cụm sạch. Màn hình GitOps xanh không chứng minh cụm còn sống; kiểm kê phải tự hỏi từng cụm, có hạn chờ.
+
+<Check id="k10.4.lab-kiem-ke">Viết được script kiểm kê đọc phiên bản Kubernetes, add-on và nền từ thứ đang chạy ở mỗi cụm cùng trạng thái kết nối từ hub, và đọc được kết quả khi một cụm mất kết nối.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `platform-*` báo `ComparisonError` hoặc `metadata.annotations: Too long` | Thiếu `ServerSideApply=true` với CRD lớn | `hub -n argocd get application platform-k10-a -o yaml \| yq '.status.conditions'` |
+| `platform-*` `OutOfSync` mãi, `argocd app diff` chỉ ra `labels: {}` ở các CRD | Thiếu bước `yq` xoá trường rỗng sau khi render | `argocd app diff platform-k10-a \| head` |
+| `platform-*` ở `Progressing` lâu | Đang kéo image Kyverno, hoặc máy thiếu CPU làm probe của Kyverno thất bại và pod khởi động lại | `ka -n kyverno get pods`; `ka -n kyverno get events --sort-by=.lastTimestamp \| tail` |
+| Policy báo lỗi `no matches for kind ValidatingPolicy` | Policy được áp trước CRD: thiếu sync wave | `kubectl kustomize ~/masteva-k10/fleet/platform \| grep sync-wave` |
+| `bao-cao.sh` in `CHƯA CÓ BÁO CÁO` | Reports controller chưa chạy hoặc chưa quét xong | `ka -n kyverno logs deploy/kyverno-reports-controller \| tail` |
+| Policy bị xoá không quay lại | Template thiếu `selfHeal: true`, hoặc đang trong backoff của các lần tự sửa liên tiếp | `hub -n argocd get application platform-k10-a -o jsonpath='{.spec.syncPolicy}'` |
+
+### Dọn dẹp
+
+Bài cuối của chặng. Nếu chưa muốn xoá hẳn, dừng các container như cuối K10.2.
+
+<Callout kind="danger">
+
+Khối dưới xoá vĩnh viễn ba cụm kind, Gitea cùng volume dữ liệu của nó (repo `fleet` trên Gitea mất theo; bản clone trong `~/masteva-k10/fleet` vẫn còn). Kiểm tên trước khi chạy để không xoá nhầm cụm hay volume của lab khác.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+docker unpause k10-b-control-plane 2>/dev/null
+for c in k10-hub k10-a k10-b; do kind delete cluster --name $c; done
+docker rm -f k10-gitea && docker volume rm k10-gitea-data
+docker ps -a --format '{{.Names}}' | grep -c '^k10-'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Deleting cluster "k10-hub" ...
+Deleted nodes: ["k10-hub-control-plane"]
+Deleting cluster "k10-a" ...
+Deleted nodes: ["k10-a-control-plane"]
+Deleting cluster "k10-b" ...
+Deleted nodes: ["k10-b-control-plane"]
+k10-gitea
+k10-gitea-data
+0
+```
+
+</Expected>
+
+Thư mục `~/masteva-k10` chỉ còn file. Khi không cần nữa:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá cả thư mục lab, kể cả token Gitea trong `gitea.env`, kubeconfig và các script của chặng.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+rm -rf ~/masteva-k10
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Bật Deny cho một policy trên cả fleet thế nào cho an toàn?">
+
+Theo vòng, như mọi thay đổi của nền. Policy đổi `validationActions` từ `Audit` sang `Deny` là một thay đổi có thể chặn mọi lần triển khai của mọi đội. Trình tự: chạy `Audit` ở mọi cụm; đọc báo cáo gom cho tới khi số `fail` về 0 ở vòng 0 (hoặc mọi vi phạm còn lại đã có `PolicyException` có hạn); bật `Deny` ở vòng 0, chờ; vòng 1; vòng 2. Trong bảng báo cáo, chia vi phạm theo đội sở hữu namespace để mỗi đội biết phần việc của mình. K8.3 đã dạy trình tự này trong một cụm; ở fleet, chỉ thêm chiều "vòng".
+
+</Reveal>
+
+<Reveal title="Có nên để nền và ứng dụng cùng một ApplicationSet?">
+
+Không. Chúng khác nhau ở người sở hữu, nhịp thay đổi, chính sách sync (`selfHeal` hay RollingSync) và quyền (nền cần tạo CRD và ClusterRole, ứng dụng thì không). Gộp lại thì AppProject phải rộng theo thứ cần quyền nhiều nhất, và một lỗi trong template của ứng dụng có thể làm Argo CD xoá cả policy engine. Lab tách hai ApplicationSet và hai AppProject vì lý do đó. Một tổ chức lớn thường còn tách repo: repo nền do đội nền tảng duyệt, repo ứng dụng do từng đội.
+
+</Reveal>
+
+<Reveal title="Kiểm kê nên đặt ở đâu khi có hàng trăm cụm?">
+
+Script đọc từng cụm như lab không còn chạy nổi. Các cách hay gặp: mỗi cụm xuất metric về phiên bản của chính nó (`kube_*` của kube-state-metrics có nhãn phiên bản, metric `build_info` của các add-on), gom qua hệ metric nhiều cụm (D16.3), rồi một dashboard và một cảnh báo "cụm có phiên bản lệch khỏi đa số"; hoặc công cụ fleet (OCM, Rancher) có sẵn bảng cụm. Dù cách nào, nguồn vẫn phải là thứ đang chạy, và phải có cảnh báo khi một cụm **ngừng báo cáo**.
+
+</Reveal>
+
+<Reveal title="Nền bất biến nghĩa là gì ở tầng node?">
+
+Node không được sửa tại chỗ: không cập nhật gói tự động, không `ssh` cài thêm, không cấu hình tay. Image của node được dựng sẵn (D8.4), ghim phiên bản; vá là dựng image mới và thay node theo vòng, bằng CAPI (K10.1) hoặc node pool của cloud. Hệ điều hành chuyên cho Kubernetes như Talos hay Flatcar đi xa hơn: hệ thống file gốc chỉ đọc, không có trình quản lý gói. Sự cố Heroku cho thấy cái giá của việc thiếu điều này: một tiến trình cập nhật tự động thay đổi máy production ngoài mọi quy trình.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết policy cho cả fleet, script gom báo cáo hay kiểm kê, và soạn kế hoạch nâng cấp theo vòng là cách dùng tốt. AI hay sai ở: viết policy Kyverno thế hệ cũ (`ClusterPolicy` với `validate.pattern`) mà K8.3 đã nói bị deprecated từ 1.19; quên `ServerSideApply` cho CRD lớn; cho policy và CRD cùng wave; viết script kiểm kê đọc từ Git thay vì từ cụm; và coi cụm không có báo cáo là cụm sạch. Kiểm bằng cách làm như lab: xoá tay một thứ của nền và xem nó có quay về không, đóng băng một cụm và xem báo cáo, kiểm kê nói gì.
+
+</Callout>
+
+<Callout kind="link">
+
+K8.3 dạy Kyverno, ValidatingPolicy, PolicyReport và trình tự Audit tới Deny trong một cụm. D13.1 dạy `selfHeal` và backoff; D13.4 dạy sync wave và bake time, ở đây dùng cho thứ tự CRD trước policy và cho vòng nâng cấp. K10.1 thay node thay vì sửa; K10.2 tách ứng dụng (RollingSync) khỏi nền (selfHeal); K10.3 cho thấy một cụm mất kết nối trông thế nào từ bên ngoài. D8.4 dựng image máy, D8.5 vá theo lô, cùng ý với vòng nâng cấp ở tầng hệ điều hành. D16.3 gom metric nhiều cụm, cách đưa báo cáo và kiểm kê lên quy mô lớn.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k10.4.mastery-nen">Thiết kế được nền chung cho một fleet: thành phần, cách render và ghim phiên bản, ApplicationSet và AppProject riêng cho nền, và chính sách sync có lý do.</Check>
+
+<Check id="k10.4.mastery-tuan-thu">Dựng được báo cáo tuân thủ gom từ nhiều cụm và kiểm kê đọc từ thứ đang chạy, và dùng được chúng để quyết định một policy đã sẵn sàng chuyển từ `Audit` sang `Deny` ở vòng nào.</Check>
+
+<Check id="k10.4.mastery-vong">Lập được kế hoạch nâng một add-on của nền trên cả fleet theo vòng: chia vòng, bake time, cổng kiểm bằng kiểm kê và báo cáo, cách dừng và cách lui.</Check>
+
+</Mastery>

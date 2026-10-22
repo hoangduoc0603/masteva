@@ -1,0 +1,638 @@
+---
+title: Secret trong cụm và trong repo - External Secrets Operator, SOPS và KMS
+description: Đồng bộ secret từ OpenBao vào cụm bằng External Secrets Operator, xoay một giá trị và đo xem Secret, file trong pod và biến môi trường mỗi thứ nhận giá trị mới sau bao lâu; mã hoá file values trong repo GitOps bằng SOPS với khoá age, và hiểu KMS của cloud đứng sau cả hai thế nào.
+id: d15.2
+step: d15
+prerequisites: [d15.1]
+topics: [d15.vault-kms-external-secrets]
+status: verified
+verified:
+  date: 2026-10-20
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    openbao: 2.7.1
+    external-secrets: 2.13.0
+    sops: 3.13.3
+    age: 1.3.2
+    go: 1.27.1
+    git: 2.39.3
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+D15.1 dựng kho secret và cho ứng dụng tự lấy credential. Bài này lo hai đường còn lại mà hầu hết đội vận hành dùng hằng ngày: secret được đồng bộ thành Secret của Kubernetes, và secret nằm trong repo GitOps ở dạng đã mã hoá. Học xong, bạn giải thích được:
+
+- Vì sao External Secrets Operator đã cập nhật Secret mà biến môi trường trong pod vẫn là giá trị cũ, còn file mount thì đổi sau khoảng một phút.
+- Vì sao dùng ESO thì mã hoá etcd và quyền đọc Secret trở thành bắt buộc.
+- Vì sao file values mã hoá bằng SOPS vẫn đọc được số bản sao nhưng sửa con số đó là file hỏng, và vì sao bỏ một người khỏi danh sách giải mã vẫn phải xoay secret.
+- KMS của cloud làm gì trong auto-unseal, trong SOPS và trong mã hoá Secret của Kubernetes.
+
+</Goal>
+
+<Knowledge>
+
+### Secret nằm ở đâu sau khi rời kho
+
+Kho secret chỉ là nửa câu chuyện. Giá trị còn phải tới được tiến trình, và trên đường đi nó dừng lại ở nhiều chỗ: Secret trong etcd, biến môi trường của container, file trên node, repo cấu hình, log CI. Mỗi chỗ dừng là một chỗ có thể lộ, và là một chỗ phải được cập nhật khi xoay. Bài này đi theo hai đường phổ biến nhất trong một hệ GitOps: kho → ESO → Secret → pod, và repo → SOPS → controller → Secret.
+
+<Callout kind="production">
+
+**Secret của Kubernetes trong repo công khai, nghiên cứu của Aqua Nautilus 11/2023.** Theo [bài của Aqua Nautilus](https://www.aquasec.com/blog/the-ticking-supply-chain-attack-bomb-of-exposed-kubernetes-secrets/) (21/11/2023), nhóm nghiên cứu tìm trên GitHub các manifest Secret kiểu `.dockerconfigjson` và `.dockercfg` (Secret chứa tài khoản đăng nhập registry image). Truy vấn đầu trả về hơn 8.000 kết quả; lọc còn 438 bản ghi có tên đăng nhập và mật khẩu mã hoá base64; trong đó 203 bản ghi (khoảng 46%) là credential còn dùng được. Với SAP, credential cho truy cập kho artifact của SAP chứa hơn 95 triệu artifact, có quyền tải về và một phần quyền triển khai; với hai công ty blockchain lớn, credential cho cả đẩy và kéo image. Riêng Docker Hub, 64 trên 94 credential (68%) còn dùng được và cho toàn quyền tài khoản. Bài viết nêu một lý do: có người tin rằng giá trị đã mã hoá base64 là an toàn, trong khi "encoding is tantamount to plaintext" (mã hoá base64 không khác gì văn bản thường); và Gitleaks, TruffleHog, Trivy ở cấu hình mặc định đã bỏ sót các giá trị base64 này, một luật tuỳ chỉnh của Trivy mới bắt được. Nhóm báo cho SAP và SAP đã đóng lỗ hổng.
+
+Điều rút ra (của bài): Secret của Kubernetes không phải định dạng để lưu trong Git, vì `data` chỉ là base64. Hai cách của bài này giải quyết đúng chỗ đó: ExternalSecret để repo chỉ chứa **tên** của secret, không chứa giá trị; SOPS để giá trị nào buộc phải nằm trong repo thì nằm ở dạng đã mã hoá thật.
+
+</Callout>
+
+<Check id="d15.2.cho-dung">Kể được các chỗ một secret dừng lại trên đường từ kho tới tiến trình, và giải thích được vì sao Secret của Kubernetes không được nằm trong Git dù đã mã hoá base64.</Check>
+
+### External Secrets Operator
+
+**External Secrets Operator** (ESO) là một controller (chương trình chạy trong cụm, liên tục đưa trạng thái thật về trạng thái khai báo; K9.2 đi sâu) đọc secret từ kho ngoài cụm (OpenBao, Vault, AWS Secrets Manager, Google Secret Manager, Azure Key Vault…) và ghi thành Secret của Kubernetes. Bạn khai hai loại object:
+
+```text
+ SecretStore "openbao"            ExternalSecret "payment-gateway"          Secret "payment-gateway"
+ (kho ở đâu, đăng nhập thế nào)    (lấy khoá nào, mỗi bao lâu, ghi vào đâu)    (do ESO tạo và sở hữu)
+   server: http://openbao…          refreshInterval: 15s                       data:
+   path: kv, version: v2     ◀────  remoteRef: shop/payment-gateway   ──────▶    API_KEY: …
+   auth: token trong Secret         target.name: payment-gateway
+                                         │
+                     cứ mỗi refreshInterval, controller đọc lại kho; giá trị khác thì ghi đè Secret
+```
+
+`ClusterSecretStore` là bản dùng chung cho cả cụm. `refreshInterval` mặc định là một giờ; xoay một secret trong kho thì cụm thấy giá trị mới chậm nhất sau khoảng đó. Từ Secret tới tiến trình còn hai chặng nữa, và đây là chỗ lab sẽ cho bạn thấy:
+
+| Pod dùng Secret qua | Khi Secret đổi |
+|---|---|
+| Biến môi trường (`env.valueFrom.secretKeyRef`) | **Không đổi.** Biến môi trường được đặt một lần khi container khởi động; phải khởi động lại pod |
+| Volume (`volumes.secret`) | File được kubelet cập nhật sau một khoảng trễ, thường dưới một phút; ứng dụng phải đọc lại file |
+
+ESO hợp với secret tĩnh cần xoay định kỳ (API key, chứng chỉ). Hai điều phải nhớ khi chọn nó. Một: secret giờ nằm trong etcd của cụm, nên K8.5 về mã hoá Secret trong etcd và RBAC đọc Secret (K2.3) trở thành điều kiện bắt buộc. Hai: ESO cần quyền đọc kho, nên chính danh tính của ESO là thứ phải bảo vệ; lab dùng token để đơn giản; D15.3 dạy cách thay token bằng danh tính của ServiceAccount, và SecretStore có kiểu đăng nhập `kubernetes` dùng đúng cơ chế đó.
+
+<Check id="d15.2.eso">Vẽ được quan hệ SecretStore, ExternalSecret và Secret, giải thích được `refreshInterval`, và nói được vì sao biến môi trường không nhận giá trị mới còn volume thì có.</Check>
+
+### SOPS và age: secret trong repo GitOps
+
+D13 đặt mọi cấu hình trong Git và để Argo CD kéo về. Secret thì không được nằm trong Git ở dạng đọc được. Có hai hướng:
+
+- **Không để secret trong Git**: Git chỉ chứa ExternalSecret (trỏ tới khoá trong kho), giá trị nằm ở OpenBao. Đây là hướng của phần trên.
+- **Để secret trong Git nhưng đã mã hoá**: **SOPS** mã hoá từng giá trị trong file YAML, JSON, `.env`, giữ nguyên khoá và cấu trúc, nên diff trong pull request vẫn đọc được ("đổi `database.password`") mà không lộ giá trị.
+
+SOPS mã hoá mỗi file bằng một khoá dữ liệu ngẫu nhiên (AES-256-GCM), rồi mã hoá khoá dữ liệu đó cho từng **người nhận**: một khoá **age** (công cụ mã hoá nhỏ, khoá công khai dạng `age1…`), một khoá PGP, hoặc một khoá trong KMS của cloud. Ai có một trong các khoá riêng tương ứng thì giải mã được. File còn mang một **MAC** (message authentication code, mã xác thực thông điệp: một giá trị tính từ nội dung file bằng khoá dữ liệu; không có khoá thì không tính lại được MAC khớp với nội dung đã sửa). MAC của SOPS tính trên toàn bộ giá trị, kể cả giá trị không mã hoá, nên sửa tay một con số cũng làm file không giải mã được.
+
+```text
+ values.yaml (prod)                  Ai giải mã được
+   replicas: 3                       - đội vận hành prod: khoá age riêng, cất ngoài repo
+   database.password: ENC[AES256…]   - controller trong cụm prod: khoá age trong một Secret của cụm,
+   paymentGateway.apiKey: ENC[…]       hoặc quyền gọi KMS (Flux giải mã SOPS sẵn; Argo CD cần plugin)
+   sops: { age: [...], mac: … }      - lập trình viên: không, trừ khi được thêm làm người nhận
+```
+
+File `.sops.yaml` ở gốc repo nói thư mục nào mã hoá cho ai và trường nào được mã hoá, nên không ai phải nhớ tham số. Thu hồi một người không xoá được những gì họ đã đọc: bỏ họ khỏi danh sách người nhận (`sops updatekeys`) chỉ chặn các bản sau, còn secret họ từng thấy phải được xoay.
+
+<Check id="d15.2.sops">So sánh được hai hướng giữ secret cho GitOps, giải thích được SOPS mã hoá gì và để nguyên gì, vai trò của `.sops.yaml` và MAC, và vì sao bỏ một người nhận vẫn phải xoay secret.</Check>
+
+### KMS của cloud
+
+**KMS** (key management service) giữ khoá trong phần cứng của nhà cung cấp và không bao giờ trả khoá ra: bạn gửi dữ liệu nhỏ vào, nó mã hoá hoặc giải mã rồi trả kết quả, mọi lần gọi đều qua IAM và có log. Cách dùng phổ biến là **envelope encryption**: dữ liệu được mã hoá bằng một khoá dữ liệu sinh tại chỗ, chỉ khoá dữ liệu được gửi cho KMS mã hoá, rồi lưu cạnh dữ liệu. Ba chỗ bạn đã gặp ở D15.1 và bài này dùng đúng mô hình đó:
+
+| Chỗ dùng | KMS mã hoá cái gì |
+|---|---|
+| Auto-unseal của OpenBao | Root key của kho |
+| SOPS với người nhận là khoá KMS | Khoá dữ liệu của từng file |
+| Provider `kms` v2 của Kubernetes (K8.5) | Khoá dữ liệu mà API server dùng để mã hoá Secret trong etcd |
+
+Lợi ích chung: khoá gốc không nằm trên đĩa của máy nào bạn quản lý, và quyền giải mã là một quyền IAM thu hồi được. KMS thật cần tài khoản cloud; bài dừng ở mức khái niệm, D22 đi sâu tổ chức tài khoản và quyền trên cloud.
+
+<Check id="d15.2.kms">Giải thích được envelope encryption và kể được ba chỗ KMS đứng sau: auto-unseal, SOPS, mã hoá Secret trong etcd.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [HashiCorp Vault provider (External Secrets Operator)](https://external-secrets.io/latest/provider/hashicorp-vault/): cấu hình SecretStore cho Vault và OpenBao, các cách đăng nhập kể cả Kubernetes auth.
+- [Secrets (Kubernetes)](https://kubernetes.io/docs/concepts/configuration/secret/): Secret dùng qua biến môi trường và qua volume khác nhau thế nào khi giá trị đổi.
+- [Key management (SOPS)](https://getsops.io/docs/usage/key-management/): người nhận age và KMS, `updatekeys`; và [Common operations (SOPS)](https://getsops.io/docs/usage/common-operations/): `.sops.yaml`, `encrypted_regex`.
+- [Encrypting Confidential Data at Rest (Kubernetes)](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/): provider `kms` v2 và envelope encryption cho Secret trong etcd.
+- [The Ticking Supply Chain Attack Bomb of Exposed Kubernetes Secrets (Aqua Nautilus)](https://www.aquasec.com/blog/the-ticking-supply-chain-attack-bomb-of-exposed-kubernetes-secrets/): nguồn của callout.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài dùng tiếp cụm `d15-lab` của D15.1: OpenBao đã unseal, có secret `kv/shop/payment-gateway` và file `~/masteva-d15/eso.token` (token chỉ đọc `kv/data/shop/*`). Nếu đã xoá cụm, làm lại bước 1 và 2 của D15.1. Bước 4 và 5 chạy hoàn toàn trên máy bạn, cần `go` để cài age.
+
+**Profile máy.** ESO thêm ba pod; cả node kind khoảng 1,1 tới 1,25 GiB RAM của Docker khi ESO chạy. Lab tải khoảng 80 MB image và khoảng 30 MB binary.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d15
+export KUBECONFIG=~/masteva-d15/kubeconfig
+kubectl -n openbao get pod openbao-0
+./bao.sh kv get -field=api_key kv/shop/payment-gateway; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME        READY   STATUS    RESTARTS   AGE
+openbao-0   1/1     Running   0          12m
+pk_test_2026_aaa
+```
+
+</Expected>
+
+`1/1` nghĩa là kho đã mở. Nếu thấy `0/1`, kho đang sealed (Docker hay máy vừa khởi động lại): chạy `./unseal.sh`, script tạo ở bước 1 của D15.1.
+
+### 1. Cài External Secrets Operator
+
+Chart ESO 2.13.0 tải từ trang phát hành trên GitHub, so sha256 với `index.yaml` của kho chart. Chart cài ba Deployment: controller, webhook kiểm object, và cert-controller cấp chứng chỉ cho webhook.
+
+<Terminal where="mac">
+
+```bash
+curl -fsSLO https://github.com/external-secrets/external-secrets/releases/download/helm-chart-2.13.0/external-secrets-2.13.0.tgz
+SUM=$(curl -fsSL https://charts.external-secrets.io/index.yaml | yq '.entries.external-secrets[] | select(.version == "2.13.0") | .digest')
+if echo "$SUM  external-secrets-2.13.0.tgz" | shasum -a 256 -c; then
+  helm install external-secrets ./external-secrets-2.13.0.tgz -n external-secrets --create-namespace 2>&1 | grep -E '^(STATUS|Error)'
+fi
+kubectl -n external-secrets wait --for=condition=Available deploy --all --timeout=600s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+external-secrets-2.13.0.tgz: OK
+STATUS: deployed
+deployment.apps/external-secrets condition met
+deployment.apps/external-secrets-cert-controller condition met
+deployment.apps/external-secrets-webhook condition met
+```
+
+</Expected>
+
+<Check id="d15.2.lab-cai">Cài được ESO từ chart đã kiểm sha256 và kể được ba Deployment của nó làm gì.</Check>
+
+### 2. SecretStore và ExternalSecret
+
+SecretStore dùng `eso.token` mà bước 2 của D15.1 đã tạo (chỉ đọc được `kv/data/shop/*`). `bao … -field=token` ghi token ra file không kèm ký tự xuống dòng, nên `$(cat …)` lấy đúng token; file token tạo tay bằng `echo` thì có ký tự xuống dòng ở cuối, và mục Gỡ lỗi nói chuyện gì xảy ra khi đó. ExternalSecret đọc lại kho mỗi 15 giây.
+
+<Terminal where="mac" title="~/masteva-d15/eso.yaml">
+
+```bash
+kubectl -n d15-app create secret generic eso-bao-token --from-literal=token="$(cat eso.token)"
+cat > eso.yaml <<'EOF'
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: openbao
+  namespace: d15-app
+spec:
+  provider:
+    vault:
+      server: http://openbao.openbao.svc:8200
+      path: kv
+      version: v2
+      auth:
+        tokenSecretRef:
+          name: eso-bao-token
+          key: token
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: payment-gateway
+  namespace: d15-app
+spec:
+  refreshInterval: 15s
+  secretStoreRef:
+    kind: SecretStore
+    name: openbao
+  target:
+    name: payment-gateway
+  data:
+    - secretKey: API_KEY
+      remoteRef:
+        key: shop/payment-gateway
+        property: api_key
+EOF
+kubectl apply -f eso.yaml
+kubectl -n d15-app wait --for=condition=Ready secretstore/openbao externalsecret/payment-gateway --timeout=90s
+kubectl -n d15-app get secret payment-gateway -o jsonpath='{.data.API_KEY}' | base64 -d; echo
+kubectl -n d15-app get secret payment-gateway -o jsonpath='{.metadata.ownerReferences[0].kind}'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+secret/eso-bao-token created
+secretstore.external-secrets.io/openbao created
+externalsecret.external-secrets.io/payment-gateway created
+secretstore.external-secrets.io/openbao condition met
+externalsecret.external-secrets.io/payment-gateway condition met
+pk_test_2026_aaa
+ExternalSecret
+```
+
+</Expected>
+
+Secret `payment-gateway` do ESO tạo, có `ownerReference` trỏ về ExternalSecret: xoá ExternalSecret thì Secret bị xoá theo. Và giá trị đã nằm trong etcd của cụm, ai có quyền `get secrets` trong namespace là đọc được, như lệnh `base64 -d` vừa làm.
+
+<Check id="d15.2.lab-dong-bo">Đồng bộ được một khoá trong OpenBao thành Secret của cụm, chỉ ra được `ownerReference` của Secret, và giải thích được vì sao giá trị giờ nằm trong etcd.</Check>
+
+### 3. Xoay giá trị: Secret, file và biến môi trường
+
+Một pod `checkout` dùng Secret này hai cách cùng lúc: biến môi trường `API_KEY` và file `/etc/payment/API_KEY`. Sau đó đổi giá trị trong OpenBao và đo mỗi chặng mất bao lâu.
+
+<Terminal where="mac" title="~/masteva-d15/checkout.yaml">
+
+```bash
+cat > checkout.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: d15-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: checkout }
+  template:
+    metadata:
+      labels: { app: checkout }
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+          command: ["sh", "-c", "sleep 86400"]
+          env:
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef: { name: payment-gateway, key: API_KEY }
+          volumeMounts:
+            - { name: pg, mountPath: /etc/payment, readOnly: true }
+      volumes:
+        - name: pg
+          secret:
+            secretName: payment-gateway
+EOF
+kubectl apply -f checkout.yaml && kubectl -n d15-app rollout status deploy/checkout --timeout=120s | tail -1
+xem() { kubectl -n d15-app exec deploy/checkout -- sh -c 'echo "env=$API_KEY file=$(cat /etc/payment/API_KEY)"'; }
+xem
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/checkout created
+deployment "checkout" successfully rolled out
+env=pk_test_2026_aaa file=pk_test_2026_aaa
+```
+
+</Expected>
+
+<Predict question="Bạn ghi `api_key=pk_test_2026_bbb` vào OpenBao. Sau một phút rưỡi, Secret, file và biến môi trường trong pod mỗi thứ mang giá trị nào?">
+
+Secret và file mang giá trị mới, biến môi trường vẫn giá trị cũ. Secret đổi trong khoảng `refreshInterval` (15 giây). File đổi sau đó, khi kubelet đồng bộ volume. Biến môi trường được đặt một lần lúc container khởi động và không bao giờ đổi.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+./bao.sh kv put kv/shop/payment-gateway api_key=pk_test_2026_bbb | grep -E '^version'
+date +%T
+for i in $(seq 1 30); do [ "$(kubectl -n d15-app get secret payment-gateway -o jsonpath='{.data.API_KEY}' | base64 -d)" = pk_test_2026_bbb ] && break; sleep 2; done
+echo "$(date +%T) Secret đã đổi"
+for i in $(seq 1 60); do [ "$(kubectl -n d15-app exec deploy/checkout -- cat /etc/payment/API_KEY)" = pk_test_2026_bbb ] && break; sleep 2; done
+echo "$(date +%T) file trong pod đã đổi"
+xem
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+version            2
+17:33:38
+17:33:49 Secret đã đổi
+17:34:10 file trong pod đã đổi
+env=pk_test_2026_aaa file=pk_test_2026_bbb
+```
+
+</Expected>
+
+Secret đổi sau khoảng 15 giây, file đổi sau đó thêm khoảng nửa phút tới một phút (trên máy bạn mỗi khoảng có thể ngắn hơn, tuỳ lúc bạn ghi nằm ở đâu trong chu kỳ đồng bộ). Biến môi trường vẫn là `pk_test_2026_aaa`. Ứng dụng đọc secret từ biến môi trường cần được khởi động lại sau mỗi lần xoay; production thường giao việc đó cho một controller theo dõi Secret và tự `rollout restart` (ví dụ Reloader), hoặc chuyển ứng dụng sang đọc file.
+
+<Terminal where="mac">
+
+```bash
+kubectl -n d15-app rollout restart deploy/checkout && kubectl -n d15-app rollout status deploy/checkout --timeout=120s | tail -1
+xem
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/checkout restarted
+deployment "checkout" successfully rolled out
+env=pk_test_2026_bbb file=pk_test_2026_bbb
+```
+
+</Expected>
+
+<Check id="d15.2.lab-rotate">Đo được độ trễ từ kho tới Secret và tới file trong pod, và chứng minh được biến môi trường chỉ nhận giá trị mới sau khi pod khởi động lại.</Check>
+
+### 4. SOPS và age trên repo GitOps
+
+Bước này chạy hoàn toàn trên máy bạn. `sops` tải bản phát hành cho macOS, so với file `checksums.txt` chính thức, cài vào `~/masteva-d15/bin`. `age` không phát hành file checksum dạng `checksums.txt`: mỗi bản phát hành kèm file `.proof` (bằng chứng trong nhật ký minh bạch Sigsum, cần công cụ riêng để kiểm), và GitHub hiển thị sha256 cạnh từng file. Bài cài age bằng `go install`: lệnh `go` tự đối chiếu mã nguồn với cơ sở dữ liệu checksum công khai `sum.golang.org` trước khi build. `GOMODCACHE` và `GOCACHE` trỏ vào thư mục lab để mã nguồn tải về và bộ đệm build nằm trong `~/masteva-d15` và bị xoá cùng nó.
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-d15/bin && cd ~/masteva-d15/bin
+ARCH=$(uname -m | sed 's/x86_64/amd64/')
+V=v3.13.3
+curl -fsSLO https://github.com/getsops/sops/releases/download/$V/sops-$V.darwin.$ARCH
+if curl -fsSL https://github.com/getsops/sops/releases/download/$V/sops-$V.checksums.txt | grep " sops-$V.darwin.$ARCH\$" | shasum -a 256 -c; then
+  mv sops-$V.darwin.$ARCH sops && chmod +x sops
+fi
+GOBIN=$HOME/masteva-d15/bin GOMODCACHE=$HOME/masteva-d15/go/mod GOCACHE=$HOME/masteva-d15/go/cache \
+  go install filippo.io/age/cmd/...@v1.3.2
+cd ~/masteva-d15
+export PATH=$HOME/masteva-d15/bin:$PATH
+sops --version --disable-version-check
+age --version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+sops-v3.13.3.darwin.arm64: OK
+go: downloading filippo.io/age v1.3.2
+go: downloading golang.org/x/crypto v0.55.0
+go: downloading filippo.io/hpke v0.4.0
+go: downloading golang.org/x/term v0.45.0
+go: downloading golang.org/x/sys v0.47.0
+go: downloading filippo.io/edwards25519 v1.2.0
+go: downloading filippo.io/nistec v0.0.4
+sops 3.13.3
+v1.3.2
+```
+
+</Expected>
+
+Trên Mac chip Intel, dòng đầu là `sops-v3.13.3.darwin.amd64: OK`. Các dòng `go: downloading …` chỉ có lần đầu, phiên bản các module phụ thuộc có thể khác.
+
+Tạo khoá age cho môi trường prod, viết `.sops.yaml` nói "mọi file dưới `prod/` mã hoá cho khoá này, chỉ các trường `password` và `apiKey`", rồi mã hoá một file values:
+
+<Terminal where="mac" title="~/masteva-d15/gitops">
+
+```bash
+mkdir -p gitops/prod && cd gitops
+age-keygen -o ../age-prod.key 2>&1 | cut -c1-20
+cat > .sops.yaml <<EOF
+creation_rules:
+  - path_regex: prod/.*\.yaml\$
+    encrypted_regex: ^(password|apiKey)\$
+    age: $(age-keygen -y ../age-prod.key)
+EOF
+cat > prod/values.yaml <<'EOF'
+replicas: 3
+database:
+  host: pg-prod.internal
+  user: checkout
+  password: s3cr3t-prod-2026
+paymentGateway:
+  apiKey: pk_live_2026_zzz
+EOF
+sops encrypt --in-place prod/values.yaml
+sed -n '1,8p' prod/values.yaml | cut -c1-70
+grep -c 's3cr3t-prod-2026\|pk_live_2026_zzz' prod/values.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Public key: age1xha3
+replicas: 3
+database:
+    host: pg-prod.internal
+    user: checkout
+    password: ENC[AES256_GCM,data:UGdcaAr57o1Uq1KuAI484A==,iv:qSdpDicf
+paymentGateway:
+    apiKey: ENC[AES256_GCM,data:Ytpx4xsx/29GfqaZl58Flg==,iv:I8o/HFfTcp
+sops:
+0
+```
+
+</Expected>
+
+`replicas`, `host`, `user` vẫn đọc được: người review thấy pull request đổi gì. Hai giá trị nhạy cảm thành `ENC[…]`, và `grep -c` in `0`: không còn bản rõ nào trong file. Phần `sops:` ở cuối file ghi khoá dữ liệu đã mã hoá cho khoá age, cùng MAC. SOPS cũng đổi thụt lề sang 4 dấu cách. Chuỗi khoá công khai và phần mã hoá trên máy bạn sẽ khác.
+
+Giải mã cần khoá riêng, đọc từ biến `SOPS_AGE_KEY_FILE` (hoặc từ file mặc định `~/Library/Application Support/sops/age/keys.txt` trên macOS; nếu bạn đặt biến `XDG_CONFIG_HOME` thì là `$XDG_CONFIG_HOME/sops/age/keys.txt`):
+
+<Terminal where="mac">
+
+```bash
+sops decrypt prod/values.yaml 2>&1 | grep -m1 -o 'no master key was able to decrypt the file'
+SOPS_AGE_KEY_FILE=../age-prod.key sops decrypt --extract '["database"]["password"]' prod/values.yaml; echo
+sed 's/^replicas: 3/replicas: 30/' prod/values.yaml > sua-tay.yaml
+SOPS_AGE_KEY_FILE=../age-prod.key sops decrypt sua-tay.yaml 2>&1 | cut -c1-12
+cd ~/masteva-d15
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+no master key was able to decrypt the file
+s3cr3t-prod-2026
+MAC mismatch
+```
+
+</Expected>
+
+Không có khoá thì không giải mã được. Có khoá thì lấy được đúng một trường bằng `--extract`, đó là cách một pipeline hay controller lấy giá trị cần dùng. Dòng cuối: sửa `replicas` từ 3 lên 30, một trường **không** mã hoá, vẫn làm file hỏng, vì MAC tính trên mọi giá trị. Ai đó chen một thay đổi vào file đã mã hoá mà không có khoá thì bị phát hiện lúc giải mã.
+
+Trong repo GitOps thật, `.sops.yaml` và các file `ENC[…]` được commit; khoá riêng thì không bao giờ. Khoá riêng của cụm prod nằm trong một Secret mà controller GitOps đọc được (Flux có sẵn tính năng giải mã SOPS; Argo CD cần plugin như KSOPS hoặc helm-secrets), hoặc thay bằng khoá KMS để quyền giải mã là một quyền IAM.
+
+<Check id="d15.2.lab-sops">Mã hoá được một file values bằng SOPS với khoá age theo luật trong `.sops.yaml`, giải mã một trường bằng khoá riêng, và chứng minh được sửa một giá trị không mã hoá cũng làm MAC không khớp.</Check>
+
+### 5. Thêm và bỏ người nhận
+
+Pipeline triển khai cần đọc được file này, nên nó cần một khoá riêng thay vì mượn khoá của đội vận hành. Trước hết commit file vào Git như trong một repo GitOps thật (chỉ `.sops.yaml` và file đã mã hoá, không bao giờ là khoá), rồi tạo khoá `age-ci.key` và thêm nó làm người nhận thứ hai. `sops updatekeys` mã hoá lại khoá dữ liệu của file cho danh sách người nhận mới, cần một khoá hiện có để làm việc đó; giá trị bên trong không đổi.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d15/gitops
+git init -q -b main . && git add .sops.yaml prod/values.yaml
+git -c user.name=An -c user.email=an@example.com commit -q -m "values prod, mã hoá cho đội vận hành"
+age-keygen -o ../age-ci.key 2>&1 | cut -c1-20
+OPS=$(age-keygen -y ../age-prod.key); CI=$(age-keygen -y ../age-ci.key)
+sed -i '' "s/age: .*/age: $OPS,$CI/" .sops.yaml
+SOPS_AGE_KEY_FILE=../age-prod.key sops updatekeys -y prod/values.yaml 2>&1 | grep -E '^(\+\+\+|---)' | cut -c1-20
+yq '.sops.age[].recipient' prod/values.yaml | cut -c1-12
+SOPS_AGE_KEY_FILE=../age-ci.key sops decrypt --extract '["paymentGateway"]["apiKey"]' prod/values.yaml; echo
+git -c user.name=An -c user.email=an@example.com commit -q -am "thêm khoá của CI"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Public key: age19jyc
++++ age19jycxly76as6
+age1xha3s4ye
+age19jycxly7
+pk_live_2026_zzz
+```
+
+</Expected>
+
+Dòng `+++` là người nhận vừa thêm. File giờ có hai khối `age`, và khoá của CI giải mã được. Giờ giả sử đội vận hành cũ rời dự án: bỏ khoá của họ khỏi `.sops.yaml`, chạy lại `updatekeys` bằng khoá của CI, commit.
+
+<Predict question="Sau commit cuối, khoá `age-prod.key` cũ còn đọc được mật khẩu database không?">
+
+Không với file hiện tại, nhưng có với lịch sử. Mọi commit trước đó vẫn chứa file mã hoá cho khoá cũ, và ai từng có quyền đọc repo đều có các commit đó. Bỏ người nhận chỉ chặn được các phiên bản sau; mật khẩu thật phải được xoay.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+sed -i '' "s/age: .*/age: $CI/" .sops.yaml
+SOPS_AGE_KEY_FILE=../age-ci.key sops updatekeys -y prod/values.yaml 2>&1 | grep -E '^(\+\+\+|---)' | cut -c1-20
+git -c user.name=An -c user.email=an@example.com commit -q -am "bỏ khoá của đội vận hành"
+SOPS_AGE_KEY_FILE=../age-prod.key sops decrypt prod/values.yaml 2>&1 | grep -m1 -o 'no master key was able to decrypt the file'
+git show HEAD~1:prod/values.yaml > ban-cu.yaml
+SOPS_AGE_KEY_FILE=../age-prod.key sops decrypt --extract '["database"]["password"]' ban-cu.yaml; echo
+cd ~/masteva-d15
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+--- age1xha3s4ye7ctc
+no master key was able to decrypt the file
+s3cr3t-prod-2026
+```
+
+</Expected>
+
+Khoá cũ không mở được file hiện tại, nhưng mở được bản ở commit trước bằng một lệnh `git show`. Đây là lý do quy trình "một người rời nhóm" luôn có hai bước: bỏ khoá của họ khỏi danh sách người nhận, **và** xoay mọi secret mà khoá đó từng đọc được.
+
+<Check id="d15.2.lab-nguoi-nhan">Thêm được một người nhận bằng `sops updatekeys`, bỏ được một người nhận, và chứng minh được khoá đã bị bỏ vẫn đọc được secret trong lịch sử Git.</Check>
+
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm và sửa |
+|---|---|---|
+| `kubectl wait` của bước 1 hết hạn, pod ESO đứng ở `ContainerCreating` | Máy bận hoặc mạng chậm, image chưa kéo xong | `kubectl -n external-secrets get pods`, `kubectl -n external-secrets get events`; chạy lại dòng `kubectl wait` |
+| `kubectl apply -f eso.yaml` báo `failed calling webhook "validate.secretstore.external-secrets.io"` | Webhook của ESO chưa sẵn sàng | Chờ cả ba Deployment `Available` (bước 1) rồi apply lại |
+| SecretStore `InvalidProviderConfig`, event ghi `token contains non-printable characters` | Token có ký tự xuống dòng ở cuối, thường do file token được tạo tay bằng `echo` | Ghi lại file bằng `printf '%s' …` hoặc `bao … -field=token`, rồi tạo lại Secret |
+| ExternalSecret vẫn `SecretSyncedError` sau khi đã sửa SecretStore | Controller đang chờ theo backoff trước lần thử kế | `kubectl -n d15-app annotate externalsecret payment-gateway force-sync=$(date +%s) --overwrite` |
+| SecretStore báo `permission denied` | Token hết hạn (24 giờ từ bước 2 của D15.1) hoặc kho sealed | Kiểm `kubectl -n openbao get pod openbao-0`; tạo lại token như bước 2 của D15.1 rồi tạo lại Secret `eso-bao-token` |
+| `go: command not found` ở bước 4 | Máy chưa cài Go | Cài Go theo D3.3, hoặc tải `age-v1.3.2-darwin-arm64.tar.gz` từ trang phát hành của age và so sha256 với giá trị GitHub hiển thị cạnh file (chưa chạy trong lab) |
+
+Nếu mở terminal mới giữa bài: `cd ~/masteva-d15`, `export KUBECONFIG=~/masteva-d15/kubeconfig`, `export PATH=$HOME/masteva-d15/bin:$PATH`, và chép lại hàm `xem` ở bước 3 nếu cần. Ở bước 5, đặt lại hai biến khoá: `cd ~/masteva-d15/gitops && OPS=$(age-keygen -y ../age-prod.key); CI=$(age-keygen -y ../age-ci.key)`. Kho sealed thì chạy `./unseal.sh` trong `~/masteva-d15`.
+
+### Dọn dẹp
+
+D15.3 dùng tiếp cụm và OpenBao, không cần ESO. Gỡ những gì bài này cài:
+
+<Callout kind="danger">
+
+Khối dưới xoá Deployment `checkout`, ExternalSecret (kéo theo Secret `payment-gateway`), Secret token của ESO, và gỡ ESO khỏi cụm. Kiểm `kubectl config current-context` là `kind-d15-lab`.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho D15.3">
+
+```bash
+kubectl config current-context
+kubectl delete -f checkout.yaml -f eso.yaml
+kubectl -n d15-app delete secret eso-bao-token
+helm uninstall external-secrets -n external-secrets
+kubectl delete namespace external-secrets
+```
+
+</Terminal>
+
+Các file khoá age, thư mục `gitops` và `bin` ở lại trong `~/masteva-d15`, được xoá cùng thư mục lab ở cuối D15.4.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="ESO, SOPS hay Sealed Secrets cho một repo GitOps?">
+
+Cả ba đều để Git không chứa giá trị rõ. **ExternalSecret**: Git chỉ chứa tên khoá; giá trị và lịch sử của nó ở kho, xoay một chỗ là cụm nào cũng nhận; đổi lại cụm phụ thuộc vào kho lúc đồng bộ, và cần cấp quyền đọc kho cho từng cụm. **SOPS**: giá trị nằm trong Git, diff đọc được, không cần dịch vụ nào ngoài khoá giải mã; đổi lại xoay một secret là một commit, và ai từng có khoá thì đọc được mọi phiên bản cũ trong lịch sử. **Sealed Secrets** (Bitnami): mã hoá bằng khoá công khai của một controller trong cụm, chỉ cụm đó giải mã được; đơn giản nhưng gắn chặt với từng cụm và khoá của controller phải được sao lưu. Tổ chức có kho secret thường chọn ExternalSecret cho secret của ứng dụng và dùng SOPS cho số ít secret mà chính nền tảng cần trước khi kho chạy được.
+
+</Reveal>
+
+<Reveal title="Secret đã nằm trong etcd thì bảo vệ thêm được gì?">
+
+Ba lớp, đều ngoài ESO. Mã hoá etcd bằng provider `kms` v2 (K8.5 đã bật `secretbox`; KMS chuyển khoá ra khỏi node). RBAC: rất ít người và ServiceAccount có `get`, `list`, `watch` trên `secrets`; `list` cả namespace nghĩa là đọc mọi giá trị (K2.3). Audit log ở mức `Metadata` cho Secret để biết ai đã đọc mà không ghi giá trị (K8.5). ESO cũng có `PushSecret` theo chiều ngược lại và generator sinh credential động như D15.1, nhưng giá trị cuối cùng vẫn là một Secret trong etcd; nếu yêu cầu là secret không bao giờ chạm etcd, dùng agent hoặc CSI driver như bảng ở D15.1.
+
+</Reveal>
+
+<Reveal title="Ứng dụng đọc secret từ biến môi trường thì xoay thế nào cho an toàn?">
+
+Hai giá trị phải cùng hợp lệ trong lúc chuyển. Quy trình: tạo khoá mới ở phía nhà cung cấp mà khoá cũ vẫn còn hiệu lực; ghi khoá mới vào kho; chờ ESO đồng bộ; `rollout restart` từng Deployment dùng nó và chờ rollout xong; kiểm log không còn yêu cầu nào dùng khoá cũ; rồi mới thu hồi khoá cũ. Thu hồi khoá cũ trước khi mọi pod đã khởi động lại là gây sự cố cho chính mình. Một controller tự restart khi Secret đổi (như Reloader) rút ngắn bước giữa, nhưng không thay được bước cuối: kiểm trước khi thu hồi.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết SecretStore, ExternalSecret và `.sops.yaml` nhanh, và hay sai ở: (1) để `refreshInterval` mặc định một giờ rồi kết luận "đã xoay vòng tự động"; (2) quên rằng pod dùng biến môi trường cần khởi động lại; (3) dùng `ClusterSecretStore` với một token đọc được cả kho cho mọi namespace; (4) `encrypted_regex` không khớp tên trường thật, để lọt giá trị rõ vào Git; (5) đề xuất commit khoá age riêng "vào thư mục an toàn" của repo. Kiểm bằng lab: đo độ trễ như bước 3, và chạy `grep` tìm giá trị rõ trong file đã mã hoá trước khi commit.
+
+</Callout>
+
+<Callout kind="link">
+
+D15.1 dựng kho và nêu bốn cách đưa secret tới ứng dụng; bài này làm cách thứ tư. K2.3 dạy RBAC trên Secret; K8.5 dạy mã hoá Secret trong etcd và audit log, hai thứ bắt buộc khi dùng ESO. K9.2 dạy controller (chương trình chạy trong cụm đưa trạng thái thật về trạng thái khai báo) và vòng reconcile, đúng thứ ESO làm. D8.2 dạy Ansible Vault, cùng ý tưởng mã hoá tại chỗ như SOPS nhưng cho playbook. D13 dạy GitOps, nơi ExternalSecret và file SOPS thay cho Secret viết tay. D15.3 thay token tĩnh của ứng dụng bằng danh tính của ServiceAccount, và SecretStore của ESO có kiểu đăng nhập `kubernetes` dùng đúng cơ chế đó; D15.6 đặt bước quét secret vào pipeline.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d15.2.mastery-chon">Chọn được giữa ExternalSecret, SOPS và agent cạnh ứng dụng cho một service cụ thể, có lý do theo cách xoay vòng và nơi secret nằm.</Check>
+
+<Check id="d15.2.mastery-xoay">Viết được quy trình xoay một API key dùng qua ESO mà không gây gián đoạn, gồm bước chờ đồng bộ, khởi động lại và kiểm trước khi thu hồi khoá cũ.</Check>
+
+<Check id="d15.2.mastery-sops">Thiết lập được `.sops.yaml` với `encrypted_regex` và danh sách người nhận cho một môi trường, nêu được ai giữ khoá nào, và xử lý được việc một người rời nhóm: bỏ người nhận rồi xoay secret.</Check>
+
+</Mastery>

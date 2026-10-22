@@ -1,0 +1,971 @@
+---
+title: "Đa vùng cho dữ liệu: replica cluster, failover và failback"
+description: Replication bất đồng bộ giữa hai vùng cho RPO khác 0 và vì sao; dựng một replica cluster của CloudNativePG ở cụm B theo distributed topology, đo độ trễ khi chỉ ship WAL qua object storage rồi khi thêm streaming; ai được quyết failover và bằng tiêu chí nào; failover sang B khi cụm A đóng băng và đo RPO, RTO thật; thấy split-brain khi A quay lại, fencing nó; vì sao failback khó hơn failover, dựng lại A rồi chuyển vai có kiểm soát bằng demotion token.
+id: d17.4
+step: d17
+prerequisites: [d17.3, d21.3]
+topics: [d17.da-vung, d17.failover-failback]
+status: verified
+verified:
+  date: 2026-10-22
+  os: macOS 14.4.1 (hai cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    cloudnative-pg: 1.30.1
+    plugin-barman-cloud: 0.15.1
+    cert-manager: 1.21.2
+    postgresql: 18.6 (image ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie)
+    seaweedfs: "4.48"
+    yq: 4.54.1
+    jq: 1.8.2
+---
+
+<Goal>
+
+K7.4 đã failover một cụm PostgreSQL bên trong một cụm Kubernetes: ba instance cùng một vùng, độ trễ giữa chúng tính bằng phần mười mili giây. Bài này kéo khoảng cách đó ra thành hai vùng, hai cụm Kubernetes, hai object storage, và làm trọn một vòng DR: chuyển sang vùng dự phòng rồi quay về. Học xong, bạn giải thích được:
+
+- Vì sao replication giữa hai vùng gần như luôn bất đồng bộ, và RPO của một lần failover bằng chính độ trễ replication tại lúc thảm hoạ.
+- Một replica cluster của CloudNativePG nhận dữ liệu bằng hai đường (WAL qua object storage, streaming), mỗi đường cho độ trễ cỡ nào.
+- Ai nên được quyết failover, vì sao tự động failover giữa vùng nguy hiểm hơn bên trong một vùng, và quyết định đó đánh đổi gì.
+- Vì sao site cũ quay lại có thể nhận ghi song song (split-brain), fencing chặn nó thế nào, và vì sao failback khó hơn failover.
+
+</Goal>
+
+<Knowledge>
+
+### Dữ liệu giữa hai vùng: bất đồng bộ, và RPO khác 0
+
+D20.1 đã đặt câu hỏi: dữ liệu sang site DR bằng đường nào. Giữa hai vùng cách nhau hàng trăm tới hàng nghìn km, đường đồng bộ có giá rất cụ thể: mỗi `COMMIT` chờ thêm một vòng mạng. Postmortem của Azure DevOps (callout dưới) nêu con số khoảng 70 ms mỗi vòng giữa hai vùng South Central US và North Central US, cộng vào **mọi** lệnh ghi; và mỗi lệnh ghi chỉ thành công khi cả hai nơi cùng khoẻ, nên vùng kia chậm hay hỏng thì ghi ở vùng này cũng chậm hay đứng (K7.4 đã cho thấy ghi đứng yên khi mất standby đồng bộ). Vì vậy replication giữa vùng gần như luôn **bất đồng bộ**, và hệ quả không tránh được:
+
+```text
+  vùng A (primary)                                   vùng B (replica)
+  COMMIT #1001 ──► trả OK cho ứng dụng
+  COMMIT #1002 ──► trả OK                 WAL ─────►  đã nhận tới #1000
+  COMMIT #1003 ──► trả OK                             (trễ vài trăm ms tới vài phút)
+        ✖ vùng A mất
+                                                     promote: dữ liệu tới #1000
+                                                     #1001..#1003 đã báo thành công, nhưng MẤT
+```
+
+**RPO của một lần failover giữa vùng bằng độ trễ replication đúng lúc thảm hoạ**, không phải độ trễ trung bình. Độ trễ đó phụ thuộc đường đi của WAL:
+
+| Đường | Cơ chế | Độ trễ thường gặp | Lúc nào tăng |
+|---|---|---|---|
+| WAL qua object storage (log shipping) | Primary đẩy từng file WAL 16 MB lên bucket; replica đọc file về và phát lại | Tới `archive_timeout` (CNPG đặt 5 phút) cộng thời gian tải | Lúc ít ghi (file lâu đầy), lúc object storage chậm |
+| Streaming | Replica nối thẳng vào primary, nhận WAL ngay khi được ghi | Dưới một giây | Mạng giữa vùng nghẽn, replica phát lại chậm (D19.1) |
+| Cả hai | Streaming là đường chính; khi đứt, replica tự đọc tiếp từ object storage | Như streaming | Như streaming, với lưới an toàn khi mạng chập chờn |
+
+D19.1 đã đo replication lag bằng `pg_stat_replication` bên trong một cụm. Giữa hai cụm, cách đo đơn giản và đáng tin nhất là **so một mốc thời gian ghi trong dữ liệu**: một bảng nhận một dòng mỗi giây có cột giờ ghi; lag là hiệu giữa giờ hiện tại ở primary và dòng mới nhất đã có ở replica. Lab đo đúng như vậy.
+
+<Check id="d17.4.bat-dong-bo">Giải thích được vì sao replication giữa vùng thường là bất đồng bộ, vì sao RPO của failover bằng độ trễ replication tại lúc thảm hoạ, và so sánh được log shipping qua object storage với streaming theo độ trễ.</Check>
+
+### Replica cluster của CloudNativePG
+
+Bên trong một cụm Kubernetes, CNPG có primary và các replica, failover tự động (K7.4). Giữa các cụm, CNPG có **replica cluster**: một object `Cluster` ở cụm khác, mọi instance của nó đều là replica của một cụm nguồn. Instance đứng đầu của replica cluster gọi là **designated primary**: nó là replica nhận WAL từ cụm nguồn, các instance còn lại (nếu có) nhận WAL từ nó.
+
+Cách khai hiện hành là **distributed topology**: mọi cụm trong nhóm khai giống nhau một danh sách `externalClusters` (mỗi cụm một mục, gồm object storage và tuỳ chọn thông tin kết nối streaming), và một trường chung cho biết ai đang là primary của cả nhóm:
+
+```text
+  cụm d20-a: Cluster pg-a                             cụm d20-b: Cluster pg-b
+  spec.replica:                                        spec.replica:
+    primary: pg-a   ◄── giống nhau ở cả hai ──►          primary: pg-a
+    source:  pg-b                                        source:  pg-a
+  => pg-a == primary: là primary của nhóm              => pg-b != primary: là replica, lấy WAL từ pg-a
+     đẩy WAL lên store-a                                  đẩy WAL (khi thành primary) lên store-b
+            │                                                   ▲
+            ├──── WAL file ──► [ store-a ] ─── đọc file ────────┤
+            └──── streaming qua cổng 30432 của node A ──────────┘
+```
+
+Đổi vai có hai cách, khác nhau ở chỗ cụm primary cũ còn sống hay không:
+
+- **Switchover có kiểm soát** (cả hai cụm còn sống). Bước 1: đổi `primary` của cụm cũ sang cụm mới; cụm cũ dừng nhận ghi, đẩy nốt WAL, rồi ghi vào `status.demotionToken` một **demotion token**: mã hoá vị trí WAL cuối cùng của nó. Bước 2: ở cụm mới, đặt cùng lúc `primary` là chính nó và `promotionToken` là token vừa lấy. Cụm mới chờ phát lại WAL tới đúng vị trí trong token rồi mới promote. Không mất giao dịch nào, và cụm cũ tự nối vào làm replica.
+- **Failover** (cụm primary cũ mất). Đổi `primary` ở cụm còn sống sang chính nó, **không** có token. Nó promote với những gì đã nhận được, ngay khi `restore_command` của nó không còn phụ thuộc vào vùng đã mất (bước 4 của lab cho thấy điều kiện này quan trọng thế nào): RPO bằng độ trễ lúc đó. Tài liệu CNPG ghi rõ: cụm primary cũ, nếu quay lại, phải được **dựng lại từ đầu** (re-clone).
+
+Hai yêu cầu dễ quên: mọi role và Secret của ứng dụng phải giống nhau ở mọi cụm trong nhóm (replica không sửa được catalog, nên khác biệt chỉ lộ ra lúc promote); và cụm ở xa cần Secret chứng chỉ của cụm nguồn (`<cụm>-replication`, `<cụm>-ca`) để nối streaming, vì CNPG xác thực user `streaming_replica` bằng chứng chỉ TLS.
+
+<Check id="d17.4.replica-cluster">Mô tả được distributed topology của CNPG (`replica.primary`, `replica.source`, `externalClusters`, designated primary), và phân biệt được switchover có demotion token với failover không token theo điều kiện dùng, dữ liệu mất và số phận của cụm cũ.</Check>
+
+### Ai quyết failover
+
+Bên trong một cụm, CNPG tự failover sau vài chục giây (K7.4), và cái giá của một lần failover nhầm là vài chục giây gián đoạn. Giữa hai vùng, failover nhầm đắt hơn nhiều: mất dữ liệu bằng độ trễ replication, phải dựng lại cả cụm cũ, và mọi ứng dụng phải chuyển theo. Nên câu hỏi không chỉ là "làm thế nào" mà là "ai quyết, dựa vào gì":
+
+| | Failover tự động giữa vùng | Failover do người quyết, các bước tự động |
+|---|---|---|
+| Phát hiện | Health check từ một điểm thứ ba | Alert, người trực xác nhận |
+| Rủi ro chính | Báo động giả: mạng giữa hai vùng đứt, cả hai vùng vẫn sống, cả hai cùng nhận ghi | Chậm: chờ người, chờ thêm thông tin |
+| Mất dữ liệu | Có, mỗi lần chạy, kể cả lần nhầm | Có, nhưng chỉ khi đã cân nhắc |
+| Hợp với | Hệ thống chấp nhận mất vài giây dữ liệu đổi lấy RTO ngắn, có cơ chế fencing đáng tin | Phần lớn hệ thống có dữ liệu tiền, đơn hàng |
+
+Whitepaper DR của AWS (D20.1) viết rằng failover tự động theo health check phải dùng thận trọng, vì failover khi không cần thì vẫn chịu cả mất dữ liệu lẫn gián đoạn; nên failover thường do người khởi động, còn các bước sau đó được tự động hoá để "khởi động" chỉ như bấm một nút. Lab của bài làm đúng mô hình đó: một lệnh `kubectl patch` do bạn chạy.
+
+Quyết định failover là quyết định đổi **RPO lấy RTO**: failover ngay thì mất một đoạn dữ liệu nhưng dịch vụ sớm chạy lại; chờ vùng chính hồi phục thì không mất gì nhưng ngừng lâu, và không ai biết trước là bao lâu. Người chỉ huy sự cố (D17.1) cần ba con số để quyết: độ trễ replication đo được ngay trước sự cố (RPO nếu failover bây giờ), RTO của chính thao tác failover (đo trong diễn tập), và ước lượng thời gian vùng chính quay lại. Con số thứ ba luôn kém tin cậy nhất. Tiêu chí nên viết sẵn trong runbook, ví dụ: "vùng chính không phục hồi sau 30 phút và độ trễ trước sự cố dưới 10 giây thì failover".
+
+<Callout kind="production">
+
+Sáng 04/09/2018, bão sét ở miền nam Texas làm sụt và tăng áp trên lưới điện cấp cho vùng Azure South Central US. Theo [bản RCA sơ bộ trên trang lịch sử trạng thái của Azure](https://web.archive.org/web/20180911143420/https://azure.microsoft.com/en-us/status/history/), lúc 08:42 UTC sét làm một phần trung tâm dữ liệu chuyển sang máy phát và làm tắt hệ thống làm mát dù đã có thiết bị chống sét lan truyền; khi lớp đệm nhiệt cạn, nhiệt độ vượt ngưỡng an toàn, thiết bị tự tắt, nhưng có phần nóng lên nhanh tới mức phần cứng hỏng trước khi kịp tắt, trong đó có một số lượng lớn máy chủ lưu trữ. Ảnh hưởng tới khách hàng bắt đầu khoảng 09:29 UTC. RCA ghi: Microsoft quyết định tập trung khôi phục dữ liệu và **không failover sang trung tâm dữ liệu khác**, vì failover sẽ gây mất một phần dữ liệu do bản chất bất đồng bộ của geo-replication. Một dịch vụ quản lý toàn cầu (ASM, cho tài nguyên "classic") có site chính ở vùng này và không hỗ trợ failover tự động, nên ảnh hưởng lan ra ngoài vùng.
+
+[Postmortem của Azure DevOps (khi đó là VSTS)](https://devblogs.microsoft.com/devopsservice/postmortem-vsts-4-september-2018/), do Buck Hodges, Director of Engineering, viết, kể phía một dịch vụ chạy trên vùng đó. Từ 09:45 UTC mọi scale unit của VSTS ở South Central US ngừng, tới 00:05 UTC ngày 06/09 mới hết; bài gọi đây là lần ngừng dài nhất trong bảy năm của VSTS. Trang trạng thái và công cụ liên lạc nội bộ của họ cũng nằm ở vùng này, nên cập nhật bị chậm.
+
+Lý do không failover, theo bài:
+
+- Dữ liệu được giữ ở hai vùng bằng backup PITR của Azure SQL và geo-redundant storage, nhưng chỉ Azure Storage được quyết failover các tài khoản GRS.
+- Dùng bản sao chỉ đọc thì Git và Build không chạy được.
+- Failover sang backup thì mất dữ liệu, vì backup trễ sau dữ liệu thật.
+- Replication đồng bộ giữa vùng có cái giá khoảng 70 ms mỗi vòng, cộng vào mọi lệnh ghi.
+
+Hodges viết rằng ông không muốn thay khách hàng quyết định có chấp nhận mất dữ liệu hay không: có khách muốn chạy lại ngay dù mất dữ liệu, có khách thà chờ; quyết định lại phải đưa ra khi chưa biết sự cố kéo dài bao lâu, và ước lượng thời gian khắc phục gần như luôn quá lạc quan. Các việc làm tiếp gồm chuyển sang vùng có Availability Zone, tìm hiểu replication bất đồng bộ giữa vùng, diễn tập failover giữa vùng định kỳ, và đưa công cụ nội bộ ra nhiều vùng.
+
+Điều rút ra cho bài này (của bài): đây là bảng "ai quyết failover" ở quy mô thật. Có bản sao ở vùng khác chưa đủ; còn phải biết ai có quyền bấm, mất bao nhiêu dữ liệu nếu bấm, và quyết định đó phải được viết sẵn trước khi không ai biết sự cố sẽ kéo dài bao lâu.
+
+</Callout>
+
+<Check id="d17.4.ai-quyet">So sánh được failover tự động với failover do người quyết giữa hai vùng theo rủi ro và mất dữ liệu, nêu được ba con số người quyết cần, và giải thích được trong sự cố Azure 2018 vì sao lựa chọn không failover là đổi RTO lấy RPO.</Check>
+
+### Split-brain và fencing giữa hai vùng
+
+D9.3 đã tái hiện split-brain với Keepalived: hai máy cùng giữ một VIP vì không thấy nhau. Với database, hệ quả nặng hơn: **hai primary cùng nhận ghi**, dữ liệu rẽ thành hai nhánh, và không có cách tự động nào gộp lại (hai đơn hàng khác nhau mang cùng số `id` ở hai nơi).
+
+Kịch bản điển hình sau failover: vùng A không chết, chỉ bị cắt mạng hoặc đóng băng một lúc. Bạn promote B. Rồi A quay lại, vẫn mang cấu hình "tôi là primary", và ứng dụng ở vùng A tiếp tục ghi vào nó. Lab tái hiện đúng kịch bản này.
+
+**Fencing** là bảo đảm site cũ không nhận ghi nữa, **trước** khi hoặc **ngay khi** nó quay lại. Các lớp fencing, từ chắc tới yếu:
+
+| Lớp | Cách làm | Chặn được gì |
+|---|---|---|
+| Tắt hẳn (STONITH, "shoot the other node in the head") | Ngắt điện, xoá máy, gỡ đĩa qua API của hạ tầng | Mọi thứ; nhưng cần một kênh điều khiển còn sống khi site kia không trả lời |
+| Database | CNPG fencing (`cnpg.io/fencedInstances`), hoặc đổi `replica.primary` để cụm cũ tự hạ vai | Mọi lệnh ghi vào database đó, kể cả từ ứng dụng cùng vùng |
+| Mạng và traffic | Rút cụm cũ khỏi DNS, global load balancer (K10.3), chặn cổng database bằng firewall | Ghi đi qua đường traffic chính; không chặn ứng dụng nằm cùng vùng |
+| Ứng dụng | Scale ứng dụng ở vùng cũ về 0 | Chỉ ứng dụng bạn biết |
+
+Tài liệu PostgreSQL về failover ghi cùng ý: hệ thống phải có cách báo cho primary cũ biết nó không còn là primary, thường gọi là STONITH, để tránh hai hệ thống cùng nghĩ mình là primary. Thứ tự đúng trong runbook: **fence trước, promote sau, chuyển traffic sau cùng**; và khi vùng cũ quay lại, việc đầu tiên là fence nó, trước cả việc tìm hiểu vì sao nó chết.
+
+<Check id="d17.4.fencing">Giải thích được split-brain giữa hai vùng xảy ra thế nào sau một failover, kể được bốn lớp fencing và mỗi lớp chặn được gì, và nêu được thứ tự fence, promote, chuyển traffic.</Check>
+
+### Failback: vì sao khó hơn failover
+
+**Failback** là đưa vai primary về site gốc sau khi nó được sửa. Nghe như failover theo chiều ngược lại, nhưng có ba chỗ khác:
+
+```text
+  timeline 1 (A là primary) ────────●─── A ghi tiếp vài giây (split-brain) ──► nhánh chết
+                                    │
+                                    └── failover: B promote, timeline 2 ──────► nhánh sống
+```
+
+- **A đã rẽ nhánh.** Từ điểm B promote, B đi timeline mới; mọi thứ A ghi sau điểm đó (kể cả vài lệnh ghi cuối chưa kịp sang B) là một nhánh không có ở B. A không thể "theo" B tiếp: PostgreSQL từ chối nối một replica có lịch sử WAL không phải tổ tiên của primary.
+- **Phải đồng bộ ngược.** Có hai cách đưa A về làm replica của B. **`pg_rewind`** (công cụ của PostgreSQL) so hai thư mục dữ liệu, chép lại từ B chỉ những block A đã đổi kể từ điểm rẽ nhánh, nhanh khi nhánh ngắn; nó đòi `wal_log_hints` bật hoặc data checksum bật từ lúc `initdb` (từ PostgreSQL 18, `initdb` bật data checksum mặc định). **Dựng lại từ đầu** (re-clone): xoá dữ liệu của A, chép lại toàn bộ từ B hoặc từ backup của B; chậm khi database lớn nhưng đơn giản. CloudNativePG bật sẵn `wal_log_hints` trong tham số mặc định, và mục Troubleshooting của tài liệu CNPG cho thấy nó dùng `pg_rewind` khi primary cũ nối lại trong cùng một cụm; với replica cluster sau một failover không token, tài liệu CNPG yêu cầu cách thứ hai.
+- **Dữ liệu ở nhánh chết phải được xử lý bằng tay**, trước khi xoá A: trích các bản ghi đó ra, đối chiếu với nghiệp vụ, rồi quyết định nhập lại hay bỏ. Không công cụ nào làm thay được, vì chúng có thể xung đột với dữ liệu mới ở B.
+
+Khi A đã là replica theo kịp B, failback là một **switchover có kiểm soát** bằng demotion token: không mất dữ liệu, gián đoạn ghi ngắn. Failback vì vậy là việc có kế hoạch, chọn giờ thấp điểm, không vội: chạy trên site DR thêm vài giờ hay vài ngày thường an toàn hơn quay về vội vàng. TT 09/2020 (D20.1) yêu cầu chạy chính thức trên hệ thống dự phòng ít nhất một ngày làm việc trong đợt diễn tập; vòng đầy đủ là failover, vận hành, failback.
+
+<Check id="d17.4.failback">Giải thích được vì sao site cũ không tự nối vào làm replica sau failover, so sánh được `pg_rewind` với dựng lại từ đầu, và nêu được ba chỗ làm failback khó hơn failover.</Check>
+
+### Chuyển traffic, và đa vùng của cloud
+
+Database đã chuyển vai thì ứng dụng và người dùng phải tới đúng nơi. K10.3 đã dạy ba lớp: DNS có health check (chậm vì TTL và cache), global load balancer (vài giây), anycast. Với dữ liệu, chiều chuyển traffic đi **sau** fencing và promote: trỏ người dùng sang vùng B trước khi database ở B nhận ghi chỉ đổi một loại lỗi lấy loại khác. Trong lab, ứng dụng ở mỗi vùng nối vào database của chính vùng đó (`pg-a-rw`, `pg-b-rw`), nên "chuyển traffic" là bật ứng dụng ở vùng B.
+
+Dịch vụ database được quản lý của cloud đóng gói cùng các khái niệm này: bản sao đọc ở vùng khác (cross-region read replica) là replica cluster; "promote" bản sao là failover không token, với RPO bằng độ trễ lúc đó; một số dịch vụ có kiểu "global database" với đường replication riêng và thao tác chuyển vai có kiểm soát giống switchover. Whitepaper của AWS ghi Aurora global database thường có độ trễ replication dưới một giây và promote được vùng phụ trong dưới một phút. Những con số đó là của nhà cung cấp; câu hỏi ai quyết, fence thế nào, failback ra sao vẫn là của bạn.
+
+<Check id="d17.4.traffic-cloud">Giải thích được vì sao chuyển traffic phải đi sau fencing và promote, và ánh xạ được bản sao đọc ở vùng khác của một dịch vụ cloud vào replica cluster, failover và switchover của bài.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [CloudNativePG 1.30: Replica clusters](https://cloudnative-pg.io/docs/1.30/replica_cluster/): distributed topology, demotion và promotion token, cấu hình streaming giữa hai cụm.
+- [PostgreSQL 18: 26.3. Failover](https://www.postgresql.org/docs/18/warm-standby-failover.html): promote, STONITH, và việc primary cũ quay lại.
+- [PostgreSQL 18: pg_rewind](https://www.postgresql.org/docs/18/app-pgrewind.html): đồng bộ primary cũ theo timeline mới, điều kiện `wal_log_hints` hoặc data checksum.
+- [Postmortem: VSTS 4 September 2018 (Azure DevOps)](https://devblogs.microsoft.com/devopsservice/postmortem-vsts-4-september-2018/): nguồn của callout; đọc mục "Why didn't VSTS services fail over to another region?".
+- [Azure status history, bản lưu 11/09/2018](https://web.archive.org/web/20180911143420/https://azure.microsoft.com/en-us/status/history/): RCA sơ bộ của sự cố South Central US.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp hai cụm `d20-a`, `d20-b` và SeaweedFS `d20-s3` của D20.2 và D20.3, với operator CloudNativePG và plugin Barman Cloud đã cài ở cả hai cụm. Nếu đã xoá, chạy lại bước 1 và 2 của D20.2. Bài này không cần Velero, và namespace `shop` ở cụm B đã được xoá ở cuối D20.3; khối lệnh đầu của bước 1 gỡ Velero khỏi hai cụm để có thêm RAM. Bài thêm một SeaweedFS thứ hai, `d20-s3-b`, làm object storage của vùng B: mỗi vùng một object storage, như thật. Cổng mới: **9903** (S3 của vùng B), chỉ nghe trên `127.0.0.1`.
+
+**Profile máy.** Hai node kind, mỗi node một instance PostgreSQL (giới hạn 256 MiB) và một `ticker`, cùng hai SeaweedFS; Velero đã gỡ và cert-manager tạm dừng ở bước 1. Theo `docker stats` ở cuối bước 6: node cụm A khoảng 1,4 GiB, node cụm B khoảng 1,3 GiB, `d20-s3` khoảng 300 MiB, `d20-s3-b` khoảng 100 MiB, tổng khoảng 3,2 GiB, dao động vài trăm MiB theo page cache. Máy 8 GB: đặt Docker 5 GB, dừng mọi thứ khác, đóng trình duyệt; máy sẽ chậm. Bước 4 có một lần chờ khoảng 5 phút; cả lab khoảng 30 tới 40 phút.
+
+Hai điều lab làm cho gọn mà production không làm: hai "vùng" nằm trên cùng một máy nên độ trễ giữa chúng gần 0, và mỗi vùng chỉ có một instance PostgreSQL (HA bên trong một vùng là việc của K7.4 và D19.1). `archive_timeout` của cụm nguồn đặt 60 giây thay vì 5 phút mặc định của CNPG, để bước 2 không phải chờ lâu.
+
+<Callout kind="danger">
+
+Khối đầu của bước 1 gỡ Velero khỏi cả hai cụm (`velero uninstall --force` xoá namespace `velero` và mọi CRD của nó, không hỏi lại; bản backup trong SeaweedFS vẫn còn). Bài cũng đóng băng cả vùng A bằng `docker pause`, cố ý tạo split-brain, rồi xoá và dựng lại cụm PostgreSQL ở vùng A. Mọi lệnh chỉ dành cho hai cụm lab, qua các hàm `ka`, `kb` có `--context` cố định.
+
+</Callout>
+
+### 1. Vùng A: object storage thứ hai và cụm nguồn
+
+Khối đầu gỡ Velero khỏi hai cụm và tạm dừng cert-manager ở cả hai (scale về 0; chứng chỉ mà plugin Barman Cloud cần đã được cấp từ D20.2 và còn hạn lâu hơn nhiều so với thời gian lab), dựng object storage của vùng B và ghi thêm vào `lab.sh` hai hàm: `pa` chạy một câu SQL trên primary của `pg-a` ở cụm A, `pb` trên instance đứng đầu của `pg-b` ở cụm B (database `app`).
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+velero uninstall --force --kubecontext kind-d20-a > /dev/null
+velero uninstall --force --kubecontext kind-d20-b > /dev/null
+for c in kind-d20-a kind-d20-b; do kubectl --context $c -n cert-manager scale deploy --all --replicas 0 > /dev/null; done
+mkdir -p d17-4
+docker run -d --name d20-s3-b --network kind --memory 512m -p 127.0.0.1:9903:8333 \
+  -e AWS_ACCESS_KEY_ID=masteva -e AWS_SECRET_ACCESS_KEY=masteva-secret -v d20-s3-b-data:/data \
+  chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d \
+  server -dir=/data -s3 -master.volumeSizeLimitMB=128 -volume.max=30 > /dev/null
+for i in $(seq 1 90); do curl -s -o /dev/null http://127.0.0.1:9903/ && break; sleep 1; done
+docker exec d20-s3-b sh -c "echo 's3.bucket.create -name cnpg' | weed shell" | tail -1
+cat >> lab.sh <<'EOF'
+pa() { ka -n dr exec "$(ka -n dr get cluster pg-a -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres -d app -Atc "$1"; }
+pb() { kb -n dr exec "$(kb -n dr get cluster pg-b -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres -d app -Atc "$1"; }
+EOF
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+created bucket cnpg
+```
+
+</Expected>
+
+File `common.yaml` giống hệt nhau ở hai cụm: Secret mật khẩu ứng dụng `app-db` (role và mật khẩu phải giống nhau ở mọi cụm của nhóm), Secret khoá S3, và **hai** ObjectStore, `store-a` trỏ SeaweedFS của vùng A, `store-b` trỏ của vùng B. Mỗi cụm cần đọc được object storage của cụm kia.
+
+File `topology.yaml` là phần `externalClusters` chung, cũng giống hệt ở hai cụm. Mỗi mục có hai đường: `plugin` để đọc WAL từ object storage của cụm đó, và `connectionParameters` để streaming qua cổng NodePort 30432 của node cụm đó, xác thực bằng chứng chỉ của user `streaming_replica`. `sslmode: verify-ca` kiểm chứng chỉ server có do CA của cụm kia ký không, nhưng không kiểm tên máy, vì chứng chỉ server của CNPG mang tên Service bên trong cụm, không mang tên node.
+
+<Terminal where="mac" title="~/masteva-d17/d17-4/common.yaml, topology.yaml">
+
+```bash
+cd ~/masteva-d17/d17-4
+cat > common.yaml <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata: { name: app-db }
+type: kubernetes.io/basic-auth
+stringData: { username: app, password: app-pass-2026 }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: s3-creds }
+stringData: { ACCESS_KEY_ID: masteva, ACCESS_SECRET_KEY: masteva-secret }
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata: { name: store-a }
+spec:
+  configuration:
+    destinationPath: s3://cnpg/
+    endpointURL: http://d20-s3:8333
+    s3Credentials:
+      accessKeyId: { name: s3-creds, key: ACCESS_KEY_ID }
+      secretAccessKey: { name: s3-creds, key: ACCESS_SECRET_KEY }
+    wal: { compression: gzip }
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata: { name: store-b }
+spec:
+  configuration:
+    destinationPath: s3://cnpg/
+    endpointURL: http://d20-s3-b:8333
+    s3Credentials:
+      accessKeyId: { name: s3-creds, key: ACCESS_KEY_ID }
+      secretAccessKey: { name: s3-creds, key: ACCESS_SECRET_KEY }
+    wal: { compression: gzip }
+EOF
+cat > topology.yaml <<'EOF'
+  externalClusters:
+    - name: pg-a
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters: { barmanObjectName: store-a, serverName: pg-a }
+      connectionParameters: { host: d20-a-control-plane, port: "30432", user: streaming_replica, dbname: postgres, sslmode: verify-ca }
+      sslKey: { name: pg-a-replication, key: tls.key }
+      sslCert: { name: pg-a-replication, key: tls.crt }
+      sslRootCert: { name: pg-a-ca, key: ca.crt }
+    - name: pg-b
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters: { barmanObjectName: store-b, serverName: pg-b }
+      connectionParameters: { host: d20-b-control-plane, port: "30432", user: streaming_replica, dbname: postgres, sslmode: verify-ca }
+      sslKey: { name: pg-b-replication, key: tls.key }
+      sslCert: { name: pg-b-replication, key: tls.crt }
+      sslRootCert: { name: pg-b-ca, key: ca.crt }
+EOF
+```
+
+</Terminal>
+
+Cụm `pg-a` ở vùng A: `replica.primary: pg-a` trùng tên chính nó, nên nó là primary của nhóm. Nó đẩy WAL lên `store-a` với `serverName: pg-a`. Bảng `ticks` nhận một dòng mỗi nửa giây từ ứng dụng `ticker`, mỗi dòng ghi vùng đã ghi nó và giờ ghi: đó là thước đo lag, RPO và RTO của cả bài. Ngay khi cụm sẵn sàng, một `Backup` lấy base backup đầu tiên: cụm ở vùng B sẽ được dựng từ nó.
+
+<Terminal where="mac" title="~/masteva-d17/d17-4/pg-a.yaml, ticker.yaml">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh && cd d17-4
+cat > pg-a.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata: { name: pg-a }
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage: { size: 1Gi }
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }
+  postgresql:
+    parameters: { archive_timeout: 60s }
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+      secret: { name: app-db }
+      postInitApplicationSQL:
+        - create table ticks (id bigserial primary key, site text not null, at timestamptz not null default clock_timestamp())
+        - alter table ticks owner to app
+  replica:
+    primary: pg-a
+    source: pg-b
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters: { barmanObjectName: store-a, serverName: pg-a }
+EOF
+cat topology.yaml >> pg-a.yaml
+cat > ticker.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: ticker }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: ticker } }
+  template:
+    metadata: { labels: { app: ticker } }
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: ticker
+          image: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+          env:
+            - { name: SITE, value: SITE_NAME }
+            - { name: PGHOST, value: CLUSTER_NAME-rw }
+            - { name: PGDATABASE, value: app }
+            - { name: PGCONNECT_TIMEOUT, value: "1" }
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: app-db, key: username } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: app-db, key: password } }
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                psql -qAt -c "insert into ticks (site) values ('$SITE')" > /dev/null 2>&1 \
+                  || echo "$(date -u +%T) ghi thất bại"
+                sleep 0.5
+              done
+EOF
+ka create namespace dr
+ka -n dr apply -f common.yaml
+ka -n dr apply -f pg-a.yaml
+ka -n dr wait --for=condition=Ready cluster/pg-a --timeout=900s
+sed 's/SITE_NAME/a/; s/CLUSTER_NAME/pg-a/' ticker.yaml | ka -n dr apply -f -
+ka -n dr rollout status deploy/ticker --timeout=300s
+cat <<'EOF' | ka -n dr apply -f -
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata: { name: pg-a-base-1 }
+spec:
+  cluster: { name: pg-a }
+  method: plugin
+  pluginConfiguration: { name: barman-cloud.cloudnative-pg.io }
+EOF
+ka -n dr wait --for=jsonpath='{.status.phase}'=completed backup/pg-a-base-1 --timeout=600s
+pa "select site, count(*) from ticks group by site"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/dr created
+secret/app-db created
+secret/s3-creds created
+objectstore.barmancloud.cnpg.io/store-a created
+objectstore.barmancloud.cnpg.io/store-b created
+cluster.postgresql.cnpg.io/pg-a created
+cluster.postgresql.cnpg.io/pg-a condition met
+deployment.apps/ticker created
+Waiting for deployment "ticker" rollout to finish: 0 of 1 updated replicas are available...
+deployment "ticker" successfully rolled out
+backup.postgresql.cnpg.io/pg-a-base-1 created
+backup.postgresql.cnpg.io/pg-a-base-1 condition met
+a|10
+```
+
+</Expected>
+
+Đọc kết quả: `pg-a` sẵn sàng, `ticker` đang ghi (10 dòng trong kết quả mẫu, trên máy bạn tuỳ lúc bạn đọc tới đây), và bản base backup đầu tiên đã `completed` trong `store-a`. Khối đầu không in gì khi gỡ Velero; dòng `created bucket cnpg` là bucket của vùng B.
+
+### 2. Vùng B: replica cluster, khi chỉ có object storage
+
+Cụm `pg-b` ở vùng B cần hai Secret chứng chỉ của `pg-a` để streaming: `pg-a-replication` (chứng chỉ client của user `streaming_replica`) và `pg-a-ca`. Khối dưới chép chúng sang cụm B bằng `jq`, bỏ metadata gắn với cụm A (chủ sở hữu, label của operator), và với `pg-a-ca` chỉ giữ `ca.crt`: khoá riêng của CA không cần và không nên rời vùng A.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+kb create namespace dr
+kb -n dr apply -f d17-4/common.yaml
+ka -n dr get secret pg-a-replication pg-a-ca -o json \
+  | jq '.items[] |= (.metadata = {name: .metadata.name} | if .metadata.name == "pg-a-ca" then .data = {"ca.crt": .data["ca.crt"]} else . end)' \
+  | kb -n dr apply -f -
+kb -n dr get secret pg-a-ca -o jsonpath='{.data}' | jq -r 'keys[]'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/dr created
+secret/app-db created
+secret/s3-creds created
+objectstore.barmancloud.cnpg.io/store-a created
+objectstore.barmancloud.cnpg.io/store-b created
+secret/pg-a-replication created
+secret/pg-a-ca created
+ca.crt
+```
+
+</Expected>
+
+Cụm `pg-b`: `replica.primary: pg-a` khác tên nó, nên nó là replica của nhóm, lấy dữ liệu từ `source: pg-a`. Nó được dựng bằng `bootstrap.recovery` từ base backup vừa lấy trong `store-a`, rồi phát lại WAL. Nó cũng khai `plugins` trỏ `store-b`: khi thành primary, nó sẽ đẩy WAL vào object storage của chính vùng B. Ứng dụng `ticker` ở vùng B được triển khai sẵn nhưng với `replicas: 0`, kiểu pilot light của D20.1.
+
+Lúc này chưa có Service nào mở cổng 30432 ở cụm A: đường streaming giữa hai vùng chưa có. Cụm B chỉ còn đường object storage.
+
+<Predict question="WAL chỉ đi qua object storage, `archive_timeout` 60 giây, ticker ghi hai dòng mỗi giây. Độ trễ của vùng B sẽ thế nào theo thời gian?">
+
+Nó không đứng yên mà đi theo hình răng cưa. Vùng A chỉ đẩy một file WAL khi file đầy hoặc khi hết 60 giây; hai dòng mỗi giây không làm đầy nổi 16 MB, nên gần như mỗi 60 giây mới có một file. Giữa hai file, vùng B không nhận được gì và độ trễ tăng đều từng giây; khi file mới tới và được phát lại, độ trễ tụt về vài giây rồi lại tăng. RPO nếu failover ngay lúc này là bất kỳ đâu từ vài giây tới hơn một phút.
+
+</Predict>
+
+<Terminal where="mac" title="~/masteva-d17/d17-4/pg-b.yaml">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh && cd d17-4
+cat > pg-b.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata: { name: pg-b }
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage: { size: 1Gi }
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }
+  postgresql:
+    parameters: { archive_timeout: 60s }
+  bootstrap:
+    recovery:
+      source: pg-a
+      database: app
+      owner: app
+      secret: { name: app-db }
+  replica:
+    primary: pg-a
+    source: pg-a
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters: { barmanObjectName: store-b, serverName: pg-b }
+EOF
+cat topology.yaml >> pg-b.yaml
+kb -n dr apply -f pg-b.yaml
+kb -n dr wait --for=condition=Ready cluster/pg-b --timeout=900s
+sed 's/SITE_NAME/b/; s/CLUSTER_NAME/pg-b/; s/replicas: 1/replicas: 0/' ticker.yaml | kb -n dr apply -f -
+for i in $(seq 1 10); do echo "$(date -u +%T) độ trễ của vùng B: $(pb "select date_trunc('second', now() - max(at)) from ticks")"; sleep 15; done
+pb "select status, sender_host from pg_stat_wal_receiver"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cluster.postgresql.cnpg.io/pg-b created
+cluster.postgresql.cnpg.io/pg-b condition met
+deployment.apps/ticker created
+00:28:26 độ trễ của vùng B: 00:00:06
+00:28:41 độ trễ của vùng B: 00:00:21
+00:28:56 độ trễ của vùng B: 00:00:37
+00:29:12 độ trễ của vùng B: 00:00:52
+00:29:27 độ trễ của vùng B: 00:00:07
+00:29:42 độ trễ của vùng B: 00:00:22
+00:29:57 độ trễ của vùng B: 00:00:37
+00:30:13 độ trễ của vùng B: 00:00:53
+00:30:28 độ trễ của vùng B: 00:00:08
+00:30:43 độ trễ của vùng B: 00:00:23
+```
+
+</Expected>
+
+Đúng hình răng cưa: độ trễ tăng 15 giây sau mỗi lần đo, lên gần 60 giây, rồi tụt về vài giây khi một file WAL mới tới; chu kỳ đúng bằng `archive_timeout` 60 giây. Con số cụ thể trên máy bạn lệch đi tuỳ lúc vòng đo bắt đầu so với chu kỳ, nhưng hình dạng giống hệt. Dòng `pg_stat_wal_receiver` cuối không in gì: chưa có tiến trình nhận WAL qua streaming nào. Nếu failover ngay lúc này, RPO là từ vài giây tới gần một phút, tuỳ rơi vào đâu trong chu kỳ.
+
+### 3. Mở đường streaming giữa hai vùng
+
+Service `pg-a-site` kiểu NodePort mở cổng 30432 trên node của cụm A, trỏ vào pod primary của `pg-a` (selector theo label `cnpg.io/instanceRole: primary` mà operator gắn). Ở production, đó là đường mạng riêng giữa hai vùng, có firewall chỉ cho node của vùng kia vào. Cụm B đã có sẵn `connectionParameters` trỏ tới cổng này, nên nó tự nối vào khi cổng mở.
+
+<Terminal where="mac" title="~/masteva-d17/d17-4/site-svc.yaml">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh && cd d17-4
+cat > site-svc.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata: { name: CLUSTER_NAME-site }
+spec:
+  type: NodePort
+  selector: { cnpg.io/cluster: CLUSTER_NAME, cnpg.io/instanceRole: primary }
+  ports:
+    - { port: 5432, targetPort: 5432, nodePort: 30432 }
+EOF
+sed 's/CLUSTER_NAME/pg-a/' site-svc.yaml | ka -n dr apply -f -
+for i in $(seq 1 120); do [ "$(pb "select status from pg_stat_wal_receiver")" = streaming ] && break; sleep 2; done
+pb "select status, sender_host, sender_port from pg_stat_wal_receiver"
+for i in $(seq 1 5); do echo "$(date -u +%T) độ trễ của vùng B: $(pb "select now() - max(at) from ticks")"; sleep 3; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+service/pg-a-site created
+streaming|d20-a-control-plane|30432
+00:31:26 độ trễ của vùng B: 00:00:00.220845
+00:31:29 độ trễ của vùng B: 00:00:00.159581
+00:31:32 độ trễ của vùng B: 00:00:00.059506
+00:31:35 độ trễ của vùng B: 00:00:00.499793
+00:31:39 độ trễ của vùng B: 00:00:00.434917
+```
+
+</Expected>
+
+Vùng B đã streaming từ `d20-a-control-plane` cổng 30432, và độ trễ tụt xuống dưới một giây. Phần còn lại của con số chủ yếu là khoảng cách giữa hai dòng của `ticker` (nửa giây), không phải độ trễ mạng: `now() - max(at)` đo từ dòng mới nhất đã có tới bây giờ. Từ giờ, RPO nếu failover là cỡ nửa giây.
+
+<Check id="d17.4.lab-replica-cluster">Dựng được một replica cluster ở cụm khác theo distributed topology từ base backup trong object storage, chép đúng hai Secret chứng chỉ cần cho streaming (không chép khoá riêng của CA), đo được độ trễ răng cưa khi WAL chỉ đi qua object storage, rồi mở streaming và chỉ ra bằng `pg_stat_wal_receiver` rằng độ trễ tụt xuống dưới một giây.</Check>
+
+### 4. Vùng A mất: failover sang vùng B
+
+Thảm hoạ: cả vùng A đóng băng, gồm node của cụm A lẫn object storage của nó. `docker pause` dừng mọi tiến trình mà không tắt chúng, đúng kiểu hỏng khó nhất của K10.3: không ai từ chối kết nối, mọi thứ chỉ im lặng. Bạn là người quyết failover theo tiêu chí ở phần Kiến thức; trong lab, quyết ngay.
+
+Runbook failover, theo thứ tự fence, promote, chuyển traffic:
+
+1. Fence vùng A: không làm được qua API của nó vì nó không trả lời. Trong lab, việc đóng băng chính là fence tạm thời; bước 5 cho thấy vì sao không được dừng ở đó.
+2. Promote: đổi `replica.primary` của `pg-b` thành `pg-b`, **không** có promotion token, vì không lấy được token từ một cụm đã mất.
+3. Chuyển traffic: bật `ticker` ở vùng B.
+
+Mốc giờ ghi vào `drill.log` của chặng, xoá trắng trước khi bắt đầu. Khối đầu làm hai bước đầu của runbook rồi chờ tối đa 90 giây.
+
+<Callout kind="danger">
+
+`docker pause` đóng băng node `d20-a-control-plane` và SeaweedFS `d20-s3`: mọi lệnh tới cụm A sẽ treo cho tới khi bước 5 gỡ đóng băng. Kiểm tên hai container trước khi chạy.
+
+</Callout>
+
+<Predict question="Vùng B đã có dữ liệu tới trước thảm hoạ nửa giây; lệnh promote chỉ đổi một trường. Sau bao lâu `pg-b` nhận ghi?">
+
+Lâu hơn nhiều so với vài giây của K7.4. Khi được yêu cầu promote, PostgreSQL vẫn hỏi archive lần cuối: còn file WAL nào chưa phát lại, đã có timeline nào mới hơn chưa. `restore_command` của `pg-b` hỏi qua plugin, và cho tới khi promote xong, plugin trả lời từ object storage của `replica.source`, tức `store-a` của vùng vừa đóng băng. Container bị `docker pause` vẫn bắt tay TCP được (phần mạng nằm trong kernel, không bị đóng băng), nên client không bị từ chối kết nối như với một máy đã tắt: nó gửi được yêu cầu rồi chờ câu trả lời tới khi hết thời gian chờ đọc. Vùng dự phòng đang phụ thuộc vào chính vùng đã chết.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+: > drill.log
+pb "select 'vùng B có tới dòng ' || max(id) || ' lúc ' || max(at)::time(0) from ticks"
+mark "F0 vùng A mất"
+docker pause d20-a-control-plane d20-s3
+kb -n dr patch cluster pg-b --type merge -p '{"spec":{"replica":{"primary":"pg-b"}}}'
+for i in $(seq 1 90); do [ "$(pb 'select pg_is_in_recovery()' 2>/dev/null)" = f ] && break; sleep 1; done
+pb "select 'pg-b còn đang khôi phục: ' || pg_is_in_recovery()"
+kb -n dr logs pg-b-1 -c plugin-barman-cloud --since=5m \
+  | jq -Rr 'fromjson? | select(.msg == "Restoring WAL file") | "\(.ts[11:19]) đang tải \(.walName) từ \(.objectStore)"' | tail -3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+vùng B có tới dòng 538 lúc 00:32:07
+00:32:07 F0 vùng A mất
+d20-a-control-plane
+d20-s3
+cluster.postgresql.cnpg.io/pg-b patched
+pg-b còn đang khôi phục: true
+00:31:25 đang tải 000000010000000000000009 từ store-a
+00:31:25 đang tải 000000010000000000000009 từ store-a
+00:32:07 đang tải 00000002.history từ store-a
+```
+
+</Expected>
+
+Sau 90 giây, `pg-b` vẫn đang khôi phục. Log của plugin trả lời vì sao: dòng cuối, đúng lúc F0, là lần hỏi file `00000002.history` (file lịch sử của timeline mới mà nó sắp mở) ở `store-a`, và lần hỏi đó chưa xong. Các dòng trên nó là những lần tải từ trước (file WAL, đôi khi cả file history), khi vùng B còn đọc qua object storage ở bước 2; trên máy bạn số dòng như vậy có thể khác. Lỗi `Read timeout on endpoint URL` chỉ xuất hiện trong log khi lần hỏi hết thời gian chờ, khoảng 5 phút sau.
+
+Chỗ vướng của runbook: `pg-b` cần được **tách khỏi nguồn ở vùng đã chết** trước khi promote. Bỏ phần `plugin` của mục `pg-a` trong `externalClusters` của `pg-b` (mục đầu tiên của danh sách): `restore_command` sẽ không hỏi `store-a` nữa. Lần hỏi đang treo không bị huỷ; nó chạy tới hết thời gian chờ, và lần hỏi kế tiếp không còn đi tới vùng A. Bước 6 thêm lại mục đó khi vùng A đã sống.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+mark "VƯỚNG: pg-b treo khi hỏi WAL ở store-a của vùng A"
+kb -n dr patch cluster pg-b --type json -p '[{"op":"remove","path":"/spec/externalClusters/0/plugin"}]'
+for i in $(seq 1 600); do [ "$(pb 'select pg_is_in_recovery()' 2>/dev/null)" = f ] && break; sleep 1; done
+mark "F1 pg-b nhận ghi"
+kb -n dr scale deploy/ticker --replicas 1
+for i in $(seq 1 120); do [ "$(pb "select count(*) from ticks where site = 'b'" 2>/dev/null)" -gt 0 ] 2>/dev/null && break; sleep 1; done
+mark "F2 ứng dụng ở vùng B ghi được"
+kb -n dr get cluster pg-b -o custom-columns='CLUSTER:.metadata.name,PRIMARY:.status.currentPrimary,STATUS:.status.phase'
+awk 'NR==1{t0=$1} {printf "%5d giây  %s\n", $1-t0, substr($0, index($0,$3))}' drill.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+00:34:23 VƯỚNG: pg-b treo khi hỏi WAL ở store-a của vùng A
+cluster.postgresql.cnpg.io/pg-b patched
+00:37:18 F1 pg-b nhận ghi
+deployment.apps/ticker scaled
+00:37:19 F2 ứng dụng ở vùng B ghi được
+CLUSTER   PRIMARY   STATUS
+pg-b      pg-b-1    Primary instance is being restarted in-place
+    0 giây  F0 vùng A mất
+  136 giây  VƯỚNG: pg-b treo khi hỏi WAL ở store-a của vùng A
+  311 giây  F1 pg-b nhận ghi
+  312 giây  F2 ứng dụng ở vùng B ghi được
+```
+
+</Expected>
+
+Đọc các mốc:
+
+- **F0 tới F1 khoảng 5 phút**, gần như toàn bộ là chờ lần hỏi `store-a` đang treo hết thời gian chờ; lệnh patch không rút ngắn được lần hỏi đó, chỉ ngăn những lần sau. Không có chỗ vướng này, promote xong trong vài giây. F1 rơi vào khoảng 5 phút sau F0, miễn là bạn patch trong 5 phút đó. Con số 5 phút đến từ thư viện boto3 mà barman-cloud dùng: mỗi lần đọc chờ tối đa 60 giây và thử lại tới 5 lần. Nếu không patch, mỗi lần PostgreSQL hỏi archive tiếp theo lại treo thêm khoảng 5 phút.
+- **F1 tới F2 khoảng một giây**: bật ứng dụng ở vùng B là phần nhanh nhất.
+- Trạng thái `Primary instance is being restarted in-place` là operator áp lại cấu hình sau khi `externalClusters` đổi; nó về `Cluster in healthy state` sau ít giây.
+
+Đây là một phụ thuộc ẩn đúng kiểu D20.1 đã kể: vùng dự phòng cần vùng chính để trở thành vùng chính. Việc cần làm sau bài: đưa bước "tách khỏi nguồn ở vùng đã chết" vào runbook **trước** lệnh promote; D20.5 chạy runbook đã sửa.
+
+<Check id="d17.4.lab-failover">Failover được sang vùng B khi vùng A đóng băng, tìm ra được từ log của plugin vì sao promote treo, tách được vùng B khỏi object storage của vùng A, và đọc được RTO từ các mốc F0, F1, F2.</Check>
+
+### 5. Vùng A quay lại: split-brain, rồi fencing
+
+Vùng A gỡ đóng băng. `pg-a` vẫn mang `replica.primary: pg-a`, và không có gì báo cho nó biết vùng B đã thành primary.
+
+<Predict question="Vùng A chạy lại. `ticker` ở vùng A cũng chạy lại. Lệnh ghi của nó vào `pg-a` sẽ thất bại chứ?">
+
+Không. Với `pg-a`, không có gì thay đổi: nó là primary, nó nhận ghi. `ticker` ở vùng A tiếp tục chèn dòng ngay khi tiến trình được gỡ đóng băng. Giờ có hai primary, mỗi bên một nhánh dữ liệu; đó là split-brain, và nó bắt đầu trong vòng một giây sau khi vùng A quay lại.
+
+</Predict>
+
+Khối lệnh dưới làm đúng thứ tự của một runbook "vùng cũ quay lại": gỡ đóng băng; cắt traffic ghi của vùng A (scale `ticker` về 0); đo những gì cần đo trên `pg-a` khi nó còn trả lời được; rồi **fence** `pg-a` bằng annotation `cnpg.io/fencedInstances` (K7.4 đã dùng qua `kubectl cnpg fencing`): PostgreSQL trong pod bị tắt, pod và đĩa giữ nguyên. Lệnh annotate nằm trong một vòng thử lại: ngay sau khi gỡ đóng băng, webhook của operator ở cụm A có thể chưa trả lời, và API server từ chối thay đổi với lỗi `failed calling webhook "mcluster.cnpg.io"`.
+
+Hai phép đo, đều dựa vào mốc F0 trong `drill.log` và dòng `site = 'a'` lớn nhất mà vùng B có (biến `BMAX`):
+
+- **RPO thật**: số dòng vùng A ghi **trước** F0 với `id` lớn hơn `BMAX`. Chúng đã báo thành công cho ứng dụng nhưng chưa kịp sang vùng B, và mất trong failover.
+- **Split-brain**: số dòng vùng A ghi **sau** F0, tức sau khi vùng B đã thành primary. Chúng được trích ra file `split-brain.tsv` để đối soát sau, vì `pg-a` sắp bị dựng lại.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+F0=$(head -1 drill.log | cut -d' ' -f1)
+docker unpause d20-s3 d20-a-control-plane
+mark "R0 vùng A quay lại"
+for i in $(seq 1 120); do ka -n dr get cluster pg-a > /dev/null 2>&1 && break; sleep 1; done
+pa "select 'pg-a đang là primary: ' || not pg_is_in_recovery()"
+pb "select 'pg-b đang là primary: ' || not pg_is_in_recovery()"
+ka -n dr scale deploy/ticker --replicas 0
+for i in $(seq 1 60); do [ -z "$(ka -n dr get pods -l app=ticker -o name)" ] && break; sleep 1; done
+BMAX=$(pb "select max(id) from ticks where site = 'a'")
+pa "select 'mất trong failover: ' || count(*) || ' dòng, ' || coalesce(date_trunc('second', max(at) - min(at))::text, '0') from ticks where site = 'a' and id > $BMAX and at < to_timestamp($F0)"
+pa "copy (select * from ticks where site = 'a' and at > to_timestamp($F0) order by id) to stdout" > d17-4/split-brain.tsv
+echo "split-brain: vùng A ghi $(wc -l < d17-4/split-brain.tsv | tr -d ' ') dòng sau F0"
+for i in $(seq 1 60); do ka -n dr annotate cluster pg-a cnpg.io/fencedInstances='["*"]' --overwrite 2>/dev/null && break; sleep 2; done
+mark "R1 đã fence pg-a"
+for i in $(seq 1 60); do pa "select 1" > /dev/null 2>&1 || break; sleep 1; done
+pa "select 1" 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d20-s3
+d20-a-control-plane
+00:37:49 R0 vùng A quay lại
+pg-a đang là primary: true
+pg-b đang là primary: true
+deployment.apps/ticker scaled
+mất trong failover: 0 dòng, 0
+split-brain: vùng A ghi 2 dòng sau F0
+cluster.postgresql.cnpg.io/pg-a annotated
+00:37:51 R1 đã fence pg-a
+command terminated with exit code 2
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Hai dòng đầu là split-brain đúng nghĩa: cả hai cụm cùng báo mình là primary.
+- **RPO thật là 0 dòng** trong kết quả mẫu: nhờ streaming, vùng B đã có mọi dòng vùng A ghi trước F0. Trên máy bạn có thể là 0 tới vài dòng (mỗi dòng là nửa giây): nếu `docker pause` rơi đúng lúc một dòng vừa commit ở vùng A mà chưa sang B, dòng đó mất.
+- **Split-brain 2 dòng** trong kết quả mẫu (trên máy bạn thường từ 2 tới 4): vùng A nhận ghi trong một hai giây giữa lúc gỡ đóng băng và lúc `ticker` bị scale về 0. Trong khoảng đó có hai database, mỗi bên một nhánh. Với một hệ thống thật, khoảng đó là từ lúc vùng A quay lại tới lúc có người nhận ra, có thể là hàng giờ.
+- Dòng cuối là lỗi của `psql` khi PostgreSQL trong pod đã bị fence: `pg-a` không còn nhận kết nối nào.
+
+<Check id="d17.4.lab-split-brain">Thấy được hai primary cùng nhận ghi khi vùng cũ quay lại, fence được nó theo đúng thứ tự (cắt traffic, trích dữ liệu, fence), và đo được RPO thật cùng số dòng split-brain.</Check>
+
+### 6. Failback: dựng lại vùng A, rồi chuyển vai có kiểm soát
+
+Vùng A đã sống nhưng `pg-a` đã rẽ nhánh (các dòng split-brain, và timeline cũ), nên theo tài liệu CNPG nó phải được dựng lại từ đầu. Runbook failback:
+
+1. Xoá Cluster `pg-a`; operator xoá luôn PVC của nó. Các dòng split-brain đã nằm trong file.
+2. Chép hai Secret chứng chỉ của `pg-b` sang cụm A, và mở cổng 30432 ở cụm B: vùng A sẽ streaming từ vùng B.
+3. Đổi "thế hệ" trong object storage: `pg-a` mới đẩy WAL vào `serverName: pg-a-2`, vì thư mục `pg-a` trên `store-a` còn WAL của cụm cũ, và plugin từ chối ghi vào một thư mục không trống (`Expected empty archive`, D20.3). File `topology-2.yaml` là `topology.yaml` với đúng thay đổi đó, áp cho cả hai cụm; ở `pg-b` nó cũng thêm lại phần `plugin` đã bỏ ở bước 4.
+4. Dựng `pg-a` mới làm replica của `pg-b`, bằng `bootstrap.pg_basebackup` chép thẳng qua streaming.
+
+<Callout kind="danger">
+
+`ka -n dr delete cluster pg-a` xoá cụm PostgreSQL ở vùng A cùng đĩa của nó, gồm cả nhánh dữ liệu split-brain. Chỉ chạy sau khi bước 5 đã ghi `split-brain.tsv`.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-d17/d17-4/topology-2.yaml, pg-a-2.yaml">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh && cd d17-4
+ka -n dr delete cluster pg-a
+for i in $(seq 1 120); do [ -z "$(ka -n dr get pvc -o name)" ] && break; sleep 2; done
+kb -n dr get secret pg-b-replication pg-b-ca -o json \
+  | jq '.items[] |= (.metadata = {name: .metadata.name} | if .metadata.name == "pg-b-ca" then .data = {"ca.crt": .data["ca.crt"]} else . end)' \
+  | ka -n dr apply -f -
+sed 's/CLUSTER_NAME/pg-b/' site-svc.yaml | kb -n dr apply -f -
+sed 's/serverName: pg-a }/serverName: pg-a-2 }/' topology.yaml > topology-2.yaml
+kb -n dr patch cluster pg-b --type merge -p "$(yq -o json '{"spec": {"externalClusters": .externalClusters}}' topology-2.yaml)"
+cat > pg-a-2.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata: { name: pg-a }
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage: { size: 1Gi }
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }
+  postgresql:
+    parameters: { archive_timeout: 60s }
+  bootstrap:
+    pg_basebackup:
+      source: pg-b
+      database: app
+      owner: app
+      secret: { name: app-db }
+  replica:
+    primary: pg-b
+    source: pg-b
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters: { barmanObjectName: store-a, serverName: pg-a-2 }
+EOF
+cat topology-2.yaml >> pg-a-2.yaml
+ka -n dr apply -f pg-a-2.yaml
+ka -n dr wait --for=condition=Ready cluster/pg-a --timeout=900s
+for i in $(seq 1 60); do [ "$(pa "select status from pg_stat_wal_receiver")" = streaming ] && break; sleep 2; done
+pa "select status, sender_host from pg_stat_wal_receiver"
+pa "select 'độ trễ của vùng A: ' || (now() - max(at)) from ticks"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cluster.postgresql.cnpg.io "pg-a" deleted from dr namespace
+secret/pg-b-replication created
+secret/pg-b-ca created
+service/pg-b-site created
+cluster.postgresql.cnpg.io/pg-b patched
+cluster.postgresql.cnpg.io/pg-a created
+cluster.postgresql.cnpg.io/pg-a condition met
+streaming|d20-b-control-plane
+độ trễ của vùng A: 00:00:00.514593
+```
+
+</Expected>
+
+`pg-a` mới đã streaming từ `d20-b-control-plane` với độ trễ dưới một giây. Bước `pg_basebackup` mất chưa tới một phút vì database chỉ vài MB; với database thật, đây là bước tính bằng giờ, và là lý do chính khiến failback được lên lịch thay vì làm ngay.
+
+Giờ là chuyển vai có kiểm soát, theo hai bước của distributed topology. Một chi tiết dễ quên ở dòng đầu: `pg-a` là Cluster **mới**, nên operator đã sinh CA và chứng chỉ mới cho nó; bản chép `pg-a-replication`, `pg-a-ca` ở cụm B từ bước 2 đã cũ, và vùng B sẽ không streaming được từ vùng A nếu không chép lại.
+
+1. Dừng ứng dụng ở vùng B, rồi hạ vai `pg-b`: đặt `primary` và `source` của nó là `pg-a`. `pg-b` ngừng nhận ghi, đẩy nốt WAL, và ghi demotion token vào `status.demotionToken`.
+2. Ở `pg-a`, đặt cùng lúc `primary: pg-a` và `promotionToken` là token đó. `pg-a` chờ phát lại WAL tới đúng vị trí trong token rồi mới promote.
+3. Bật ứng dụng ở vùng A.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+ka -n dr get secret pg-a-replication pg-a-ca -o json \
+  | jq '.items[] |= (.metadata = {name: .metadata.name} | if .metadata.name == "pg-a-ca" then .data = {"ca.crt": .data["ca.crt"]} else . end)' \
+  | kb -n dr apply -f -
+mark "B0 bắt đầu failback"
+kb -n dr scale deploy/ticker --replicas 0
+for i in $(seq 1 60); do [ -z "$(kb -n dr get pods -l app=ticker -o name)" ] && break; sleep 1; done
+kb -n dr patch cluster pg-b --type merge -p '{"spec":{"replica":{"primary":"pg-a","source":"pg-a"}}}'
+for i in $(seq 1 300); do T=$(kb -n dr get cluster pg-b -o jsonpath='{.status.demotionToken}'); [ -n "$T" ] && break; sleep 1; done
+mark "B1 pg-b đã hạ vai, có demotion token"
+echo "$T" | base64 -d | jq -c '{latestCheckpointTimelineID, redoWalFile, timeOfLatestCheckpoint}'
+ka -n dr patch cluster pg-a --type merge -p "{\"spec\":{\"replica\":{\"primary\":\"pg-a\",\"source\":\"pg-b\",\"promotionToken\":\"$T\"}}}"
+for i in $(seq 1 600); do [ "$(pa 'select pg_is_in_recovery()' 2>/dev/null)" = f ] && break; sleep 1; done
+mark "B2 pg-a nhận ghi"
+ka -n dr scale deploy/ticker --replicas 1
+for i in $(seq 1 120); do [ "$(pa "select count(*) from ticks where site = 'a' and at > now() - interval '30 seconds'")" -gt 0 ] 2>/dev/null && break; sleep 1; done
+mark "B3 ứng dụng ở vùng A ghi lại"
+for i in $(seq 1 120); do [ "$(pb "select status from pg_stat_wal_receiver" 2>/dev/null)" = streaming ] && break; sleep 2; done
+pb "select status, sender_host from pg_stat_wal_receiver"
+pa "select 'ngừng ghi khi failback: ' || date_trunc('second', (select min(at) from ticks where site = 'a' and at > (select max(at) from ticks where site = 'b')) - (select max(at) from ticks where site = 'b'))"
+awk '$3 ~ /^B/' drill.log | awk 'NR==1{t0=$1} {printf "%5d giây  %s\n", $1-t0, substr($0, index($0,$3))}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+secret/pg-a-replication configured
+secret/pg-a-ca configured
+00:39:15 B0 bắt đầu failback
+deployment.apps/ticker scaled
+cluster.postgresql.cnpg.io/pg-b patched
+00:39:16 B1 pg-b đã hạ vai, có demotion token
+{"latestCheckpointTimelineID":"2","redoWalFile":"00000002000000000000000D","timeOfLatestCheckpoint":"Thu Oct 22 00:39:15 2026"}
+cluster.postgresql.cnpg.io/pg-a patched
+00:39:20 B2 pg-a nhận ghi
+deployment.apps/ticker scaled
+00:39:21 B3 ứng dụng ở vùng A ghi lại
+streaming|d20-a-control-plane
+ngừng ghi khi failback: 00:00:05
+    0 giây  B0 bắt đầu failback
+    1 giây  B1 pg-b đã hạ vai, có demotion token
+    5 giây  B2 pg-a nhận ghi
+    6 giây  B3 ứng dụng ở vùng A ghi lại
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Demotion token là một chuỗi base64 chứa JSON; khối lệnh in ba trường của nó: timeline (2, timeline mà `pg-b` mở khi promote ở bước 4), file WAL và giờ của checkpoint cuối. `pg-a` chỉ promote khi đã phát lại tới đúng chỗ đó, nên không giao dịch nào của vùng B bị bỏ lại.
+- Ứng dụng ngừng ghi khoảng 3 tới 6 giây, phần lớn là thời gian dừng `ticker` ở B rồi bật ở A. So với failover ở bước 4: không mất dữ liệu, gián đoạn ngắn hơn hàng trăm lần, vì cả hai vùng còn sống và cùng tham gia.
+- Dòng `streaming|d20-a-control-plane`: `pg-b` đã quay về làm replica của `pg-a`. Nhóm trở lại đúng trạng thái đầu bài, với `pg-a` ở thế hệ `pg-a-2` trong object storage.
+
+<Check id="d17.4.lab-failback">Dựng lại được cụm ở vùng cũ làm replica của vùng mới (Secret chứng chỉ, cổng streaming, `serverName` thế hệ mới), rồi failback có kiểm soát bằng demotion token và promotion token, đo được thời gian ngừng ghi và kiểm được vùng B đã streaming từ vùng A.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `pg-b` đứng ở job `full-recovery` lâu | Chưa có base backup của `pg-a` trong `store-a`, sai `serverName` | `kb -n dr logs job/pg-b-1-full-recovery`; `ka -n dr get backup` |
+| `pg_stat_wal_receiver` không bao giờ `streaming` | Thiếu Secret `pg-a-replication` hoặc `pg-a-ca` ở cụm B, chưa có Service `pg-a-site` | `kb -n dr logs pg-b-1 -c postgres \| grep -i "could not connect"`; `kb -n dr get secret` |
+| Lỗi `certificate verify failed` khi streaming | Secret chứng chỉ đã cũ, ví dụ sau khi dựng lại `pg-a` | Chép lại hai Secret như khối đầu của phần failback |
+| Promote treo nhiều phút | `restore_command` hỏi object storage của vùng không trả lời | Log `plugin-barman-cloud` của pod; bỏ `plugin` của mục nguồn như bước 4. Muốn mỗi lần hỏi treo ngắn hơn, đặt `spec.configuration.wal.restoreAdditionalCommandArgs: ["--read-timeout", "10"]` trên ObjectStore `store-a` (tuỳ chọn của `barman-cloud-wal-restore`, mặc định 60 giây); trường này được API server chấp nhận, nhưng lab không chạy cách này |
+| `pg-a` mới báo `Expected empty archive` | `serverName` trong `plugins` trùng thư mục của thế hệ cũ | Dùng `serverName` mới (`pg-a-2`) ở cả `plugins` lẫn `topology-2.yaml` |
+| Lệnh `ka` treo | Cụm A còn đang bị `docker pause` | `docker ps --format '{{.Names}} {{.Status}}' \| grep d20`; `docker unpause` |
+
+### Dọn dẹp
+
+D20.5 dùng tiếp hai cụm, hai object storage và namespace `dr` ở trạng thái cuối bước 6. Nếu dừng ở đây, dùng khối xoá toàn bộ ở cuối D20.3, cộng thêm SeaweedFS của vùng B:
+
+<Callout kind="danger">
+
+Khối dưới xoá SeaweedFS của vùng B cùng mọi backup trong đó.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá object storage của vùng B">
+
+```bash
+docker rm -f d20-s3-b
+docker volume rm d20-s3-b-data
+```
+
+</Terminal>
+
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không để CNPG tự failover giữa hai cụm?">
+
+Bên trong một cụm, operator thấy mọi instance và giữ một Lease trên cùng một API server, nên nó quyết được ai là primary. Giữa hai cụm không có trọng tài chung: operator ở cụm B không phân biệt được "vùng A chết" với "mạng giữa hai vùng đứt, vùng A vẫn đang phục vụ người dùng của nó". Nếu nó tự promote trong trường hợp thứ hai, bạn có đúng split-brain của bước 5, chỉ là không ai bấm nút. Vì vậy distributed topology để việc đổi `replica.primary` cho con người hoặc cho một hệ thống điều phối bên ngoài có góc nhìn từ nơi thứ ba.
+
+</Reveal>
+
+<Reveal title="Muốn RPO bằng 0 giữa hai vùng thì sao?">
+
+Chỉ có replication đồng bộ, với cái giá đã nói: mỗi `COMMIT` thêm một vòng mạng giữa vùng, và vùng kia hỏng thì ghi đứng (K7.4). Một số hệ thống chọn đồng bộ giữa hai trung tâm gần nhau trong một thành phố, bất đồng bộ tới vùng xa (D20.1). Một cách khác là giảm phạm vi của RPO thay vì giảm con số: tách dữ liệu tiền ra một hệ thống nhỏ chạy đồng bộ, phần còn lại chạy bất đồng bộ; hoặc giữ ở phía ứng dụng một nhật ký các lệnh đã gửi, để sau failover đối soát được những gì đã mất.
+
+</Reveal>
+
+<Reveal title="Bước 4 phải tách vùng B khỏi object storage của vùng A. Tại sao không dùng một object storage chung cho cả hai vùng?">
+
+Vì khi đó object storage chung là thứ cả hai vùng cùng phụ thuộc: nó chết thì không vùng nào khôi phục được, và nó nằm ở đâu thì vùng đó vẫn là "vùng chính" theo nghĩa phụ thuộc. Mỗi vùng giữ backup ở object storage của chính nó, và đọc chéo của vùng kia khi cần, là thiết kế đúng; cái giá là runbook phải biết bỏ một nguồn không còn trả lời, như bước 4. Nhiều object storage cũng tự nhân bản sang vùng khác (S3 Cross-Region Replication, D20.1), thêm một lớp nữa cho bản backup.
+
+</Reveal>
+
+<Reveal title="Sau failback, các bản backup cũ của `pg-a` còn dùng được không?">
+
+Còn, cho PITR về thời điểm trước failover: thư mục `pg-a` trong `store-a` vẫn có base backup và WAL của thế hệ cũ, và một Cluster mới khai `serverName: pg-a` trong `externalClusters` khôi phục được từ đó như K7.4. Thế hệ mới (`pg-a-2`) bắt đầu từ lần `pg_basebackup` ở bước 6 và chưa có base backup nào trong object storage cho tới khi bạn lấy một bản; vì vậy runbook failback nên kết thúc bằng một `Backup` mới, và chính sách retention phải tính tới việc các thế hệ cũ chỉ bị dọn khi không còn cần cho PITR.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết manifest distributed topology cho hai hay ba cụm, viết script đo lag giữa hai cụm, soạn runbook failover và failback có thứ tự, đọc log của instance manager và plugin khi promote treo.
+
+**AI hay sai ở đâu:** dùng kiểu replica cluster cũ (`replica.enabled`) và nói việc tắt nó là "switchover" (tài liệu CNPG ghi đó là thao tác không đảo ngược); quên rằng failover không token buộc dựng lại cụm cũ; quên chép lại Secret chứng chỉ khi cụm được dựng lại; để cụm mới ghi WAL vào thư mục của thế hệ cũ; chép cả khoá riêng của CA sang vùng khác; và trả lời "failover mất vài giây" cho một lần chuyển vùng.
+
+**Cách kiểm tra:** mọi thao tác chuyển vai phải chạy được trên một cặp cụm thử với `ticker` đang ghi, và đo được bằng mốc giờ như bài; đọc `pg_stat_wal_receiver` ở replica và `pg_is_in_recovery()` ở cả hai phía sau mỗi bước.
+
+</Callout>
+
+<Callout kind="link">
+
+K7.4 dạy failover, fencing và PITR bên trong một cụm; D19.1 đo replication lag và cái giá của commit đồng bộ. D9.3 tái hiện split-brain với Keepalived. K10.3 chuyển traffic stateless giữa hai cụm bằng Envoy và DNS. D17.1 dạy vai trò chỉ huy sự cố, người quyết failover. D20.1 đặt RPO, RTO và thành phần dùng chung; D20.5 chạy lại vòng failover và failback này thành một buổi diễn tập có checklist. D21 bàn failure domain và cell, cách thu nhỏ thứ một lần failover phải chuyển.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d17.4.mastery-dung">Dựng được một cặp cụm PostgreSQL ở hai vùng theo distributed topology, đo được độ trễ replication và nói được RPO nếu failover ngay lúc đó.</Check>
+
+<Check id="d17.4.mastery-vong">Làm được trọn một vòng failover, fencing site cũ, dựng lại nó và failback có kiểm soát, đo được RPO và RTO của từng chiều.</Check>
+
+<Check id="d17.4.mastery-quyet">Viết được tiêu chí quyết định failover giữa vùng cho một hệ thống cụ thể: ai quyết, dựa vào số đo nào, và thứ tự fence, promote, chuyển traffic.</Check>
+
+</Mastery>

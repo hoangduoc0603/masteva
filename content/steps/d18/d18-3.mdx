@@ -1,0 +1,952 @@
+---
+title: Vận hành mesh, chọn Istio hay Linkerd
+description: Dựng một cụm còn chạy Istio 1.30, nâng lên 1.31 theo revision trong lúc có tải và đo số request bị ảnh hưởng, chuyển waypoint và sidecar sang control plane mới bằng revision tag rồi gỡ bản cũ, đo RAM, CPU và độ trễ p50, p99 của cùng ứng dụng khi không có mesh, ambient, ambient có waypoint và sidecar, gỡ lỗi một AuthorizationPolicy chặn nhầm sau khi thêm waypoint, và so Istio với Linkerd và Cilium.
+id: d18.3
+step: d18
+prerequisites: [d18.2]
+topics: [d18.istio-linkerd, d18.sidecar-ambient]
+status: verified
+verified:
+  date: 2026-10-19
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.36.4
+    kubectl: 1.36.1
+    istio: 1.30.6 nâng lên 1.31.2
+    gateway-api: 1.6.3 (standard)
+    fortio: 1.75.3
+    jq: 1.8.2
+---
+
+<Goal>
+
+K11.1 và K11.2 dựng mesh và dùng nó. Bài này là phần việc của người giữ mesh chạy trong nhiều năm: nó tốn bao nhiêu, nâng cấp thế nào để không làm sập hệ, gỡ lỗi khi traffic bị chặn mà không ai hiểu vì sao, và khi nào không nên dùng mesh. Học xong, bạn giải thích được:
+
+- Mỗi pod sidecar tốn thêm bao nhiêu RAM và CPU so với ambient, và độ trễ thêm vào ở mỗi chế độ, bằng số đo của chính bạn.
+- Vì sao Istio khuyên nâng control plane theo revision, thành phần nào nâng được kiểu canary và thành phần nào buộc phải nâng tại chỗ.
+- Vì sao một cụm Kubernetes không nâng lên bản mới được khi bản Istio đang chạy chưa hỗ trợ nó.
+- Vì sao một AuthorizationPolicy đang chạy đúng bỗng chặn mọi request ngay khi thêm waypoint, và tìm ra điều đó từ log nào.
+- Khi nào chọn Istio, Linkerd, Cilium, hay không dùng mesh.
+
+</Goal>
+
+<Knowledge>
+
+### Mesh tốn bao nhiêu
+
+Chi phí của mesh có ba phần, và mỗi chế độ trả theo cách khác:
+
+| | Sidecar | Ambient, chỉ ztunnel | Ambient có waypoint |
+|---|---|---|---|
+| Proxy trên đường đi | 2 Envoy (bên gọi, bên nhận) | 2 ztunnel (node gọi, node nhận) | 2 ztunnel và 1 Envoy waypoint |
+| RAM tăng theo | Số **pod** | Số **node** | Số node, cộng số waypoint |
+| CPU tăng theo | Số request, nhân 2 lần xử lý HTTP | Số request, chỉ xử lý TCP và mã hoá | Số request, 1 lần xử lý HTTP |
+| Độ trễ thêm | 2 lần qua Envoy | 2 lần qua ztunnel | 2 lần qua ztunnel và 1 lần qua Envoy, thêm một chặng mạng nếu waypoint ở node khác |
+
+Số liệu chính thức của Istio (đo với bản 1.24, 1.000 request HTTP mỗi giây, mỗi request 1 KB): một sidecar dùng khoảng 0,20 vCPU và 60 MB; một waypoint khoảng 0,25 vCPU và 60 MB; một ztunnel khoảng 0,06 vCPU và 12 MB. RAM của Envoy còn tăng theo lượng cấu hình nó giữ (số Service, route, endpoint trong mesh). Bước 5 của lab cho bạn con số trên chính cụm của mình.
+
+Phép tính cho một cụm 50 node, 1.500 pod: sidecar thêm khoảng 1.500 Envoy, tức cỡ 90 GB RAM chỉ cho proxy nếu mỗi cái 60 MB; ambient thêm 50 ztunnel và vài chục waypoint. Ngược lại, khi phần lớn service cần tầng 7, waypoint gom mọi request của một namespace vào một Deployment: nó phải được cấp đủ CPU, đủ bản sao, và theo dõi như một thành phần dùng chung.
+
+Control plane cũng có giá: istiod tốn CPU theo tốc độ thay đổi của pod và cấu hình, và theo số proxy nối vào nó. Ở cụm lớn, giới hạn phạm vi istiod theo dõi (`discoverySelectors` trong cấu hình mesh) để mỗi proxy không phải giữ cấu hình của cả cụm.
+
+<Check id="d18.3.chi-phi">So sánh được sidecar, ambient và ambient có waypoint ở số proxy trên đường đi, cách RAM và CPU tăng theo quy mô, và ước lượng được RAM proxy của một cụm theo số pod hoặc số node.</Check>
+
+### Nâng cấp theo revision
+
+Một **revision** là một bản cài control plane có tên riêng (ví dụ `1-30-6`): Deployment `istiod-1-30-6`, Service cùng tên, webhook tiêm sidecar riêng. Nhiều revision chạy song song được. Một **revision tag** là con trỏ có thể đổi, trỏ tới một revision; tag `default` là tag mà namespace `istio-injection=enabled` và waypoint không ghi revision sẽ dùng.
+
+```text
+                  tag "default" ─────────┐  (đổi con trỏ = nâng cấp; trỏ lại = lui)
+                                          v
+   istiod-1-30-6  ◄── trước khi nâng      istiod-1-31-2  ◄── sau khi đổi tag
+        │                                      │
+        │ xDS                                  │ xDS
+        v                                      v
+   sidecar cũ: giữ bản cũ tới khi pod được tạo lại
+   waypoint:   istiod tạo lại ngay khi tag đổi
+   ztunnel, istio-cni: DaemonSet dùng chung, nâng TẠI CHỖ, từng node một
+```
+
+Thứ tự và tính chất của từng thành phần:
+
+| Thành phần | Nâng thế nào | Ảnh hưởng | Lui thế nào |
+|---|---|---|---|
+| CRD của Istio | `istioctl install` của bản mới cập nhật, dùng chung cho mọi revision | Revision cũ đang chạy đọc CRD mới | Không lui dễ; đọc ghi chú nâng cấp trước |
+| istiod | Cài revision mới song song | Sidecar và waypoint chưa dùng nó; ztunnel thì chuyển sang ngay (hàng dưới) | Gỡ revision mới |
+| ztunnel, istio-cni | Tại chỗ, theo kiểu rolling của DaemonSet | Mọi pod ambient trên node mất kết nối đang mở trong khoảnh khắc ztunnel khởi động lại; istio-cni đang khởi động lại thì chặn pod mới trên node đó | Cài lại bản cũ |
+| Waypoint | Theo tag: đổi tag thì istiod tạo lại Deployment waypoint | Như một rolling update | Trỏ tag về revision cũ |
+| Sidecar | Theo tag, nhưng chỉ khi pod được tạo lại | Từng Deployment một, bạn chọn thời điểm | Trỏ tag về cũ rồi tạo lại pod |
+
+Hai luật tương thích theo tài liệu Istio: control plane được phép **mới hơn** data plane một bản phụ, không bao giờ ngược lại; ztunnel và istio-cni bản 1.x chạy được với control plane 1.x và 1.x+1. Vì vậy thứ tự luôn là: control plane trước, rồi ztunnel và istio-cni, rồi waypoint và sidecar. Nâng theo revision cho phép nhảy hai bản phụ một lần; nâng tại chỗ thì phải qua từng bản.
+
+Luật thứ ba đến từ trang Supported Releases: mỗi bản Istio chỉ hỗ trợ một dải năm, sáu bản Kubernetes. Istio 1.30 hỗ trợ Kubernetes 1.32 tới 1.36; Istio 1.31 hỗ trợ tới 1.37. Một cụm đang chạy Istio 1.30 muốn lên Kubernetes 1.37 phải **nâng Istio trước**. Lab của bài dựng đúng tình huống đó: cụm Kubernetes 1.36 với Istio 1.30.
+
+<Callout kind="production">
+
+**Google Cloud Traffic Director, 08/03/2022.** Traffic Director là control plane xDS do Google vận hành cho service mesh của khách hàng. Theo [báo cáo sự cố](https://status.cloud.google.com/incidents/LuGcJVjNTeC5Sb9pSJ9o), từ 10:07 tới 12:42 giờ Thái Bình Dương (2 giờ 35 phút), khách hàng có backend do Traffic Director quản lý gặp lỗi tăng cao. Nguyên nhân: đường ống cấu hình của Traffic Director đang được viết lại qua nhiều năm, và từ tháng 11/2021 cấu hình của khách hàng được chuyển dần sang định dạng mới. Việc chuyển chưa xong; vài lỗi lẻ tẻ trong quá trình chuyển bị coi là chỉ ảnh hưởng cấu hình thử nghiệm của tính năng chưa phát hành, nên che mất tình trạng thật. Lúc 10:05, một thay đổi mã xử lý cấu hình được triển khai với giả định việc chuyển đã xong. Với các project thuộc Shared VPC có cả cấu hình đã chuyển lẫn chưa chuyển, mã mới **xoá** cấu hình, khiến các client phía dưới mất cấu hình và data plane bị gỡ cấu hình. Người dùng đứng sau load balancer của Google thấy lỗi `500`. Google biết sự cố lúc 10:24 qua một yêu cầu hỗ trợ của khách hàng, lui đợt triển khai cấu hình, và lúc 12:42 buộc đẩy lại cấu hình để khôi phục. Một số khách hàng tự xử lý bằng cách chuyển sang backend không do Traffic Director quản lý.
+
+Nhận xét của bài: D9.6 cho thấy Envoy từ chối một bản cấu hình **hỏng** và giữ bản tốt cũ; nhưng "không còn route nào" là một bản cấu hình **hợp lệ**, và proxy làm theo đúng. Control plane vì vậy nằm trên đường đi của mọi thay đổi cho mọi proxy cùng lúc. Nâng cấp theo revision giới hạn bán kính ảnh hưởng: control plane mới chỉ điều khiển những proxy bạn đã chuyển sang nó, và trỏ tag về bản cũ là cách lui.
+
+</Callout>
+
+<Check id="d18.3.revision">Giải thích được revision và revision tag, kể được thứ tự nâng các thành phần cùng thành phần nào nâng được kiểu canary và thành phần nào buộc nâng tại chỗ, và nói được vì sao phải nâng Istio trước khi nâng Kubernetes trong một số trường hợp.</Check>
+
+### Chuyển từ sidecar sang ambient
+
+Hai chế độ sống chung trong một mesh, nên chuyển được từng namespace. Tài liệu Istio chia làm ba bước: cài thêm thành phần ambient (ztunnel, cấu hình istio-cni) mà không đụng sidecar; chuyển chính sách (VirtualService sang HTTPRoute, AuthorizationPolicy có điều kiện HTTP sang gắn vào waypoint bằng `targetRefs`, trường trỏ thẳng tới object mà policy gắn vào, ví dụ một `Gateway` waypoint hay một `Service`, thay cho `selector` chọn pod theo label); rồi với từng namespace: dựng waypoint nếu cần, gắn label ambient, bỏ label tiêm sidecar, tạo lại pod.
+
+Những điều tài liệu cảnh báo:
+
+- Nếu có chính sách tầng 7, có một khoảng thời gian chính sách đó **không được thực thi**: phải gỡ bản dành cho sidecar trước khi bản dành cho waypoint có hiệu lực. Cần một khung giờ bảo trì nếu điều đó không chấp nhận được.
+- Traffic từ pod sidecar tới một service có waypoint **đi vòng qua waypoint**: chính sách ở waypoint không áp cho client chưa chuyển.
+- `EnvoyFilter` không được hỗ trợ ở waypoint; máy ảo và SPIRE chưa vào được ambient.
+
+DestinationRule và AuthorizationPolicy chỉ dùng thuộc tính tầng 4 giữ nguyên được.
+
+### Bộ công cụ gỡ lỗi
+
+| Câu hỏi | Lệnh | Đọc gì |
+|---|---|---|
+| Cụm có cài hay nâng cấp được không | `istioctl x precheck` | Lỗi phiên bản, CRD cũ, cấu hình không hợp lệ |
+| Cấu hình có chỗ nào sai rõ ràng | `istioctl analyze -n <ns>` | Cảnh báo về Service thiếu cổng, policy trỏ vào thứ không tồn tại |
+| Proxy nào nối với istiod nào, bản nào | `istioctl proxy-status` (thêm `-r <revision>` cho revision khác `default`) | Cột `ISTIOD`, `VERSION` |
+| Pod có trong mesh không, Service có waypoint không | `istioctl ztunnel-config workloads`, `services` | Cột `PROTOCOL`, `WAYPOINT` |
+| Kết nối có thành công không, ai gọi ai | Log ztunnel ở node **nhận** | `src.identity`, `dst.identity`, `error=` |
+| Waypoint hay sidecar đang chạy cấu hình gì | `istioctl proxy-config route\|cluster\|endpoint <pod>` | Cấu hình xDS thật, không phải YAML bạn tưởng đã áp |
+| Chứng chỉ của pod | `istioctl ztunnel-config certificates` | Thời hạn, danh tính |
+
+Thói quen quan trọng nhất: với mỗi request lỗi trong ambient, đọc log ztunnel ở **node của pod đích**. Đó là nơi chính sách tầng 4 được thực thi và nơi ghi lý do từ chối.
+
+<Check id="d18.3.go-loi">Chọn được lệnh đúng cho từng câu hỏi gỡ lỗi, và giải thích được vì sao trong ambient log ztunnel bên nhận là chỗ nhìn đầu tiên.</Check>
+
+### Khi nào không cần mesh
+
+Mesh đáng giá khi số service và số đội đủ lớn để "mỗi đội tự làm TLS, retry, metric" thành gánh nặng, hoặc khi có yêu cầu bắt buộc về mã hoá và danh tính giữa mọi service. Những trường hợp nên cân nhắc lại:
+
+| Tình huống | Thường đủ dùng | Lý do |
+|---|---|---|
+| Ít service (dưới khoảng mười), một đội | NetworkPolicy, TLS ở gateway, thư viện retry trong code | Mesh thêm một control plane, CRD, quy trình nâng cấp, nhiều hơn thứ nó tiết kiệm |
+| Đã có Cilium (K6.1), chỉ cần mã hoá và chính sách | WireGuard hoặc IPsec của Cilium, CiliumNetworkPolicy có tầng 7 | Đã có mã hoá giữa node và chính sách theo identity của Cilium mà không thêm proxy |
+| Đội vận hành nhỏ, chưa có observability (D12) | Làm D12 trước | Mesh sinh nhiều metric; không ai đọc thì không có giá trị |
+| Cần độ trễ cực thấp, mỗi micro giây đều tính | Không mesh, hoặc chỉ ztunnel | Bước 5 cho thấy mỗi chế độ thêm bao nhiêu |
+
+### Istio, Linkerd và Cilium
+
+| | Istio | Linkerd | Cilium service mesh |
+|---|---|---|---|
+| Proxy | Envoy (sidecar, waypoint); ztunnel viết bằng Rust | linkerd2-proxy, một "micro-proxy" viết bằng Rust, chỉ dành cho mesh, không dùng Envoy | eBPF cho tầng 3, 4; Envoy chạy theo node cho tầng 7 |
+| Mô hình | Sidecar hoặc ambient | Sidecar (native sidecar mặc định từ 2.20) | Không sidecar |
+| mTLS giữa workload | Có, tự động, SPIFFE | Có, tự động | "Mutual authentication" theo SPIFFE, đang **beta**, cần SPIRE; mã hoá dữ liệu do WireGuard hoặc IPsec làm riêng |
+| Điều phối tầng 7 | Rộng nhất: HTTPRoute, VirtualService, tiêm lỗi, retry, outlier detection | HTTPRoute, retry, timeout, circuit breaker, tiêm lỗi; ít tuỳ chọn hơn | HTTPRoute (GAMMA), chính sách tầng 7 |
+| Phát hành | Mã nguồn và bản phát hành Apache-2.0; mỗi bản phụ được vá tới 6 tuần sau khi bản phụ thứ hai sau nó ra đời | Mã nguồn Apache-2.0; dự án chỉ phát hành bản **edge** (gần như hằng tuần, dạng `edge-26.10.1`). Bản **stable** (2.20) do Buoyant phát hành dưới tên Buoyant Enterprise for Linkerd: miễn phí cho cá nhân và công ty dưới 50 nhân viên, công ty lớn hơn trả phí khi dùng production | Apache-2.0 |
+| Hợp với | Cần nhiều tính năng tầng 7, nhiều đội, cụm lớn | Muốn mesh nhỏ, ít cấu hình, chấp nhận chạy bản edge hoặc mua bản stable | Đã dùng Cilium làm CNI, cần ít tính năng mesh |
+
+Hai điều hay bị hiểu sai. Một: "Linkerd stable" không còn là sản phẩm mã nguồn mở bạn tải về tự do; từ tháng 2/2024 dự án ngừng phát hành bản stable, và bài phải ghi rõ đang dùng bản edge nào hay bản stable của Buoyant. Hai: chính sách và mã hoá của Cilium mạnh nhưng không cho danh tính mTLS theo từng workload như Istio và Linkerd khi mutual authentication còn ở beta.
+
+<Check id="d18.3.chon-mesh">So sánh được Istio, Linkerd và Cilium ở proxy, mô hình triển khai, mTLS và cách phát hành, và đưa ra được lựa chọn có lý do (kể cả không dùng mesh) cho một tình huống cho trước.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Performance and Scalability (Istio)](https://istio.io/latest/docs/ops/deployment/performance-and-scalability/): số liệu chính thức về CPU, RAM của sidecar, waypoint, ztunnel và cách đo.
+- [Canary Upgrades (Istio)](https://istio.io/latest/docs/setup/upgrade/canary/) và [Upgrade with Helm (ambient)](https://istio.io/latest/docs/ambient/upgrade/helm/): revision, revision tag, và lý do ztunnel phải nâng tại chỗ.
+- [Supported Releases (Istio)](https://istio.io/latest/docs/releases/supported-releases/): bản Istio nào hỗ trợ bản Kubernetes nào, và độ lệch được phép giữa control plane và data plane.
+- [Migrate from Sidecar to Ambient (Istio)](https://istio.io/latest/docs/ambient/migrate/): các bước chuyển, bảng ánh xạ tài nguyên và những gì chưa hỗ trợ.
+- [Architecture (Linkerd)](https://linkerd.io/2-edge/reference/architecture/) và [Linkerd Licensing Explained: Apache 2.0, Edge, BEL](https://www.buoyant.io/articles/how-linkerd-licensing-actually-works-apache-2-0-edge-releases-and-what-bel-pays-for): kiến trúc micro-proxy và cách phát hành bản edge, bản stable.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Đã làm K11.2 và xoá cụm `k11-lab` ở cuối bài đó. Thư mục `~/masteva-d18` còn `bin/istioctl` bản 1.31.2 từ K11.1.
+- **Profile máy:** cụm ba node chạy Kubernetes 1.36, hai control plane Istio cùng lúc trong vài phút ở bước 3, và ba bộ ứng dụng nhỏ. Tổng RAM của ba node khoảng 1,8 tới 2,7 GiB ở cuối bài (đo bằng `docker stats`: control plane 1,1 tới 1,5 GiB, mỗi worker 0,3 tới 0,6 GiB). Máy 8 GB: Docker Desktop 4 GB, không chạy cụm khác; bước 5 có thể bỏ bộ sidecar nếu thiếu RAM.
+- Bước 3 cần **hai cửa sổ terminal**.
+
+Mọi khối lệnh chạy trong `~/masteva-d18`. **Nếu mở terminal mới**, chạy lại:
+
+<Terminal where="mac" title="Terminal mới">
+
+```bash
+cd ~/masteva-d18
+export KUBECONFIG=~/masteva-d18/kubeconfig
+```
+
+</Terminal>
+
+### 1. Một cụm còn chạy Istio 1.30
+
+Tình huống: cụm đang chạy Kubernetes 1.36 và Istio 1.30.6. Đội muốn lên Kubernetes 1.37, nhưng trang Supported Releases ghi Istio 1.30 chỉ hỗ trợ tới Kubernetes 1.36. Việc đầu tiên vì vậy là nâng Istio lên 1.31.
+
+Tải `istioctl` 1.30.6 vào thư mục riêng, cạnh bản 1.31.2 đã có, với cùng cách kiểm checksum như K11.1:
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-d18/bin/1.30.6 && cd ~/masteva-d18/bin/1.30.6
+V=1.30.6; F=istioctl-$V-osx-arm64.tar.gz
+curl -sLO https://github.com/istio/istio/releases/download/$V/$F
+curl -sLO https://github.com/istio/istio/releases/download/$V/$F.sha256
+echo "$(cut -d' ' -f1 $F.sha256)  $F" | shasum -a 256 -c - && tar xzf $F && ./istioctl version --remote=false
+cd ~/masteva-d18
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+istioctl-1.30.6-osx-arm64.tar.gz: OK
+client version: 1.30.6
+```
+
+</Expected>
+
+Dựng cụm với node image Kubernetes 1.36.4 (ghim digest của kind 0.33), cài CRD Gateway API kênh standard, rồi cài Istio 1.30.6 **có tên revision** `1-30-6`. Đặt revision ngay từ lần cài đầu là thói quen tốt: lần nâng cấp sau chỉ việc thêm revision mới bên cạnh.
+
+<Terminal where="mac" title="~/masteva-d18/kind-k11-136.yaml">
+
+```bash
+export KUBECONFIG=~/masteva-d18/kubeconfig
+cat > kind-k11-136.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k11-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+EOF
+kind create cluster --config kind-k11-136.yaml
+kubectl wait --for=condition=Ready node --all --timeout=180s
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml | grep -c serverside-applied
+./bin/1.30.6/istioctl install --set profile=ambient --set revision=1-30-6 --skip-confirmation
+kubectl -n istio-system get pods
+./bin/istioctl tag list
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Creating cluster "k11-lab" ...
+...
+node/k11-lab-control-plane condition met
+node/k11-lab-worker condition met
+node/k11-lab-worker2 condition met
+12
+...
+✔ Installation completeThe ambient profile has been installed successfully, enjoy Istio without sidecars!
+NAME                             READY   STATUS    RESTARTS   AGE
+istio-cni-node-7xzw7             1/1     Running   0          28s
+istio-cni-node-8smzk             1/1     Running   0          28s
+istio-cni-node-p5l5s             1/1     Running   0          28s
+istiod-1-30-6-657689d9c9-dxrfl   1/1     Running   0          28s
+ztunnel-4vp6n                    1/1     Running   0          8s
+ztunnel-k2hgp                    1/1     Running   0          8s
+ztunnel-kscjz                    1/1     Running   0          8s
+TAG     REVISION NAMESPACES
+default 1-30-6
+```
+
+</Expected>
+
+istiod mang tên revision (`istiod-1-30-6`). Vì đây là revision đầu tiên, `istioctl` tự tạo tag `default` trỏ vào nó. ztunnel và istio-cni không mang tên revision: mỗi node chỉ có một bản.
+
+### 2. Ba bộ ứng dụng: không mesh, ambient, sidecar
+
+Cùng một ứng dụng chạy trong ba namespace để so sánh ở bước 5: `web` (fortio server, ghim lên `k11-lab-worker2`) và `tai` (fortio để tạo tải, ServiceAccount `tai`, ghim lên `k11-lab-worker`), nên mọi request đều đi qua mạng giữa hai node.
+
+- `k11-tran`: không vào mesh.
+- `k11-ambient`: label `istio.io/dataplane-mode=ambient`, thêm một waypoint (chưa gắn, bước 5 mới dùng).
+- `k11-sidecar`: label `istio-injection=enabled`, mỗi pod có một Envoy sidecar do control plane của tag `default` tiêm.
+
+<Terminal where="mac" title="~/masteva-d18/ung-dung.yaml">
+
+```bash
+cat > ung-dung.yaml <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: tai}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: k11-lab-worker2}
+      containers:
+        - name: fortio
+          image: fortio/fortio:1.75.3
+          args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled"]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web}
+spec:
+  selector: {app: web}
+  ports: [{name: http, port: 80, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: tai}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: tai}}
+  template:
+    metadata: {labels: {app: tai}}
+    spec:
+      serviceAccountName: tai
+      nodeSelector: {kubernetes.io/hostname: k11-lab-worker}
+      containers:
+        - name: fortio
+          image: fortio/fortio:1.75.3
+          args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled"]
+EOF
+kubectl create namespace k11-tran
+kubectl create namespace k11-ambient
+kubectl create namespace k11-sidecar
+kubectl label namespace k11-ambient istio.io/dataplane-mode=ambient
+kubectl label namespace k11-sidecar istio-injection=enabled
+for ns in k11-tran k11-ambient k11-sidecar; do kubectl -n $ns apply -f ung-dung.yaml > /dev/null; done
+for ns in k11-tran k11-ambient k11-sidecar; do
+  kubectl -n $ns rollout status deploy/web --timeout=180s > /dev/null
+  kubectl -n $ns rollout status deploy/tai --timeout=180s > /dev/null
+done
+./bin/1.30.6/istioctl waypoint apply -n k11-ambient --wait
+kubectl get pods -A -l 'app in (web,tai)' | awk '{print $1, $2, $3, $4}' | column -t
+./bin/istioctl proxy-status
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k11-tran created
+namespace/k11-ambient created
+namespace/k11-sidecar created
+namespace/k11-ambient labeled
+namespace/k11-sidecar labeled
+✅ waypoint k11-ambient/waypoint applied
+✅ waypoint k11-ambient/waypoint is ready!
+NAMESPACE    NAME                  READY  STATUS
+k11-ambient  tai-b679fb6b-nqgjh    1/1    Running
+k11-ambient  web-7d5b5495f4-xjnq2  1/1    Running
+k11-sidecar  tai-b679fb6b-sls9q    2/2    Running
+k11-sidecar  web-7d5b5495f4-4868t  2/2    Running
+k11-tran     tai-b679fb6b-9hn8s    1/1    Running
+k11-tran     web-7d5b5495f4-5hfb7  1/1    Running
+NAME                                      CLUSTER        ISTIOD                             VERSION     SUBSCRIBED TYPES
+tai-b679fb6b-sls9q.k11-sidecar            Kubernetes     istiod-1-30-6-657689d9c9-dxrfl     1.30.6      5 (CDS,LDS,EDS,RDS,WDS)
+waypoint-6474fdc446-p6c6b.k11-ambient     Kubernetes     istiod-1-30-6-657689d9c9-dxrfl     1.30.6      3 (CDS,LDS,WDS)
+web-7d5b5495f4-4868t.k11-sidecar          Kubernetes     istiod-1-30-6-657689d9c9-dxrfl     1.30.6      5 (CDS,LDS,EDS,RDS,WDS)
+ztunnel-4vp6n.istio-system                Kubernetes     istiod-1-30-6-657689d9c9-dxrfl     1.30.6      2 (WADS,WDS)
+ztunnel-k2hgp.istio-system                Kubernetes     istiod-1-30-6-657689d9c9-dxrfl     1.30.6      2 (WADS,WDS)
+ztunnel-kscjz.istio-system                Kubernetes     istiod-1-30-6-657689d9c9-dxrfl     1.30.6      2 (WADS,WDS)
+```
+
+</Expected>
+
+Pod ở `k11-sidecar` là `2/2`: container ứng dụng cộng `istio-proxy`. `proxy-status` liệt kê mọi proxy nối vào istiod: hai sidecar, một waypoint, ba ztunnel, tất cả bản 1.30.6. Pod ambient và pod ngoài mesh không có trong danh sách vì không có proxy riêng. Từ đây bài dùng `istioctl` 1.31.2 cho các lệnh đọc; tài liệu nâng cấp của Istio cũng bắt đầu bằng việc tải `istioctl` của bản mới và chạy `precheck`.
+
+<Check id="d18.3.lab-truoc-nang">Cài được Istio với tên revision, triển khai được cùng một ứng dụng ở ba chế độ, và đọc được `proxy-status` để biết proxy nào nối với control plane nào, bản nào.</Check>
+
+### 3. Nâng control plane trong lúc có tải
+
+Mở **terminal thứ hai** và cho `tai` trong `k11-ambient` gửi tải đều 20 request mỗi giây trong 150 giây. Lượt tải này chạy trong lúc bạn nâng cấp ở terminal thứ nhất; kết quả cho biết người dùng của một service ambient thấy gì khi ztunnel được nâng.
+
+<Terminal where="mac" title="Terminal 2: chạy ngay trước khối kế tiếp">
+
+```bash
+export KUBECONFIG=~/masteva-d18/kubeconfig
+kubectl -n k11-ambient exec deploy/tai -- fortio load -quiet -allow-initial-errors -json - -qps 20 -c 2 -t 150s http://web/echo 2>/dev/null \
+  | jq -c '{ma: .RetCodes, loi_ket_noi: .ErrorsDurationHistogram.Count, so_ket_noi_moi: .SocketCount}'
+```
+
+</Terminal>
+
+Ở terminal thứ nhất, kiểm cụm bằng `istioctl` bản mới rồi cài revision `1-31-2` bên cạnh revision cũ:
+
+<Terminal where="mac" title="Terminal 1">
+
+```bash
+./bin/istioctl x precheck
+./bin/istioctl install --set profile=ambient --set revision=1-31-2 --skip-confirmation
+kubectl -n istio-system get pods
+./bin/istioctl tag list
+./bin/istioctl proxy-status -r 1-31-2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+✔ No issues found when checking the cluster. Istio is safe to install or upgrade!
+...
+✔ Installation completeThe ambient profile has been installed successfully, enjoy Istio without sidecars!
+NAME                             READY   STATUS      RESTARTS   AGE
+istio-cni-node-72pv9             1/1     Running     0          56s
+istio-cni-node-p6cqh             1/1     Running     0          47s
+istio-cni-node-pzdqn             1/1     Running     0          40s
+istiod-1-30-6-657689d9c9-dxrfl   1/1     Running     0          2m48s
+istiod-1-31-2-78d9f855db-6cms2   1/1     Running     0          56s
+ztunnel-4vcks                    1/1     Running     0          32s
+ztunnel-4vp6n                    0/1     Completed   0          2m28s
+ztunnel-74g4z                    1/1     Running     0          26s
+ztunnel-8xbnm                    1/1     Running     0          20s
+ztunnel-k2hgp                    0/1     Completed   0          2m28s
+TAG     REVISION NAMESPACES
+default 1-30-6
+        1-31-2
+NAME                           CLUSTER        ISTIOD                             VERSION     SUBSCRIBED TYPES
+ztunnel-4vcks.istio-system     Kubernetes     istiod-1-31-2-78d9f855db-6cms2     1.31.2      2 (WADS,WDS)
+ztunnel-74g4z.istio-system     Kubernetes     istiod-1-31-2-78d9f855db-6cms2     1.31.2      2 (WADS,WDS)
+ztunnel-8xbnm.istio-system     Kubernetes     istiod-1-31-2-78d9f855db-6cms2     1.31.2      2 (WADS,WDS)
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Hai istiod chạy song song. Tag `default` **vẫn trỏ 1-30-6**: sidecar và waypoint chưa đổi gì.
+- ztunnel và istio-cni thì **đã** được thay (cột `AGE` mới vài chục giây) và giờ nối vào istiod 1.31.2. Hai pod ztunnel cũ ở trạng thái `Completed` là bản 1.30.6 vừa dừng, sẽ biến mất sau ít giây; bạn có thể không thấy chúng nếu pod cũ đã biến mất trước khi lệnh `get pods` chạy. Đây là phần không canary được: mỗi node chỉ có một ztunnel, nên cài revision mới với profile ambient là nâng nó tại chỗ, từng node một.
+- `proxy-status` mặc định chỉ liệt kê proxy của tag `default`; thêm `-r 1-31-2` để xem proxy của revision mới.
+
+Chờ lượt tải ở terminal 2 kết thúc (150 giây kể từ lúc bắt đầu), rồi đọc kết quả ở đó:
+
+<Expected>
+
+```text
+{"ma":{"200":3000},"loi_ket_noi":0,"so_ket_noi_moi":4}
+```
+
+</Expected>
+
+Cả 3.000 request đều `200`, nhưng `so_ket_noi_moi` là 4 chứ không phải 2: hai kết nối của fortio đã bị cắt khi ztunnel trên node của `tai` hoặc của `web` khởi động lại, và fortio mở kết nối mới. Lần này việc mở lại diễn ra giữa hai request nên không request nào hỏng. Trên máy bạn có thể thấy vài request mã `-1` (lỗi ở tầng kết nối, fortio không nhận được response) nếu ztunnel dừng đúng lúc một request đang bay. Một ứng dụng có retry khi mất kết nối (hoặc đứng sau một waypoint có retry mặc định cho `connect-failure`) sẽ không lộ lỗi này cho người dùng; một kết nối sống lâu (WebSocket, luồng gRPC) thì bị ngắt. Tài liệu Istio khuyên cordon và drain node (K4.4) trước khi nâng ztunnel trên node đó nếu ứng dụng nhạy với việc này.
+
+<Check id="d18.3.lab-nang-cp">Cài được revision control plane mới song song với bản cũ, chỉ ra được thành phần nào đã đổi ngay và thành phần nào chưa, và đo được ảnh hưởng của việc nâng ztunnel tại chỗ lên một ứng dụng đang có tải.</Check>
+
+### 4. Chuyển data plane bằng tag, rồi gỡ bản cũ
+
+Đổi tag `default` sang revision mới. Waypoint (không ghi revision, nên theo tag) được istiod tạo lại ngay; sidecar thì chưa:
+
+<Terminal where="mac">
+
+```bash
+./bin/istioctl tag set default --revision 1-31-2 --overwrite
+kubectl -n k11-ambient rollout status deploy/waypoint --timeout=120s
+./bin/istioctl proxy-status | awk '{print $1, $3, $4}' | column -t
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Revision tag "default" created, referencing control plane revision "1-31-2". To enable injection using this
+revision tag, use 'kubectl label namespace <NAMESPACE> istio.io/rev=default'
+deployment "waypoint" successfully rolled out
+NAME                                   ISTIOD                          VERSION
+waypoint-68fb99b94d-ljljc.k11-ambient  istiod-1-31-2-78d9f855db-6cms2  1.31.2
+ztunnel-4vcks.istio-system             istiod-1-31-2-78d9f855db-6cms2  1.31.2
+ztunnel-74g4z.istio-system             istiod-1-31-2-78d9f855db-6cms2  1.31.2
+ztunnel-8xbnm.istio-system             istiod-1-31-2-78d9f855db-6cms2  1.31.2
+```
+
+</Expected>
+
+Waypoint đã ở 1.31.2. Hai sidecar không còn trong danh sách của tag `default`: chúng vẫn nối với istiod 1.30.6 cho tới khi pod được tạo lại. Đây là chỗ bạn canary: tạo lại **một** Deployment trước, kiểm, rồi mới tới cái kế tiếp. Nếu có vấn đề, trỏ tag về `1-30-6` và tạo lại pod đó. Khối dưới tạo lại `web`, xem proxy nào còn ở revision cũ, cho `tai` (sidecar 1.30.6) gọi `web` (sidecar 1.31.2) 20 lần, rồi mới tạo lại `tai`.
+
+<Callout kind="danger">
+
+Khối dưới tạo lại các pod trong namespace `k11-sidecar` của cụm lab (`rollout restart`). Kiểm `kubectl config current-context` trả `kind-k11-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl -n k11-sidecar rollout restart deploy/web
+kubectl -n k11-sidecar rollout status deploy/web --timeout=120s
+./bin/istioctl proxy-status -r 1-30-6 | awk '{print $1, $4}' | column -t
+kubectl -n k11-sidecar exec deploy/tai -c fortio -- fortio load -quiet -json - -n 20 -qps 0 http://web/echo 2>/dev/null | jq -c .RetCodes
+kubectl -n k11-sidecar rollout restart deploy/tai
+kubectl -n k11-sidecar rollout status deploy/tai --timeout=120s
+./bin/istioctl proxy-status | awk '{print $1, $4}' | column -t
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k11-lab
+deployment.apps/web restarted
+deployment "web" successfully rolled out
+NAME                            VERSION
+tai-b679fb6b-sls9q.k11-sidecar  1.30.6
+{"200":20}
+deployment.apps/tai restarted
+deployment "tai" successfully rolled out
+NAME                                   VERSION
+tai-86d788c4f4-97hbf.k11-sidecar       1.31.2
+waypoint-68fb99b94d-ljljc.k11-ambient  1.31.2
+web-6bf5c75b59-cz6td.k11-sidecar       1.31.2
+ztunnel-4vcks.istio-system             1.31.2
+ztunnel-74g4z.istio-system             1.31.2
+ztunnel-8xbnm.istio-system             1.31.2
+```
+
+</Expected>
+
+Giữa hai lần restart, revision cũ chỉ còn một proxy (`tai` 1.30.6), trong khi `web` đã sang 1.31.2. Cả 20 request từ sidecar bản cũ tới sidecar bản mới đều `200`: data plane hai bản phụ liền nhau gọi nhau được. Khi revision cũ không còn proxy nào, gỡ nó:
+
+<Callout kind="danger">
+
+Khối dưới gỡ control plane revision `1-30-6` khỏi cụm lab. Kiểm `kubectl config current-context` trả `kind-k11-lab`, và `istioctl proxy-status -r 1-30-6` không còn proxy nào, trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+./bin/istioctl proxy-status -r 1-30-6
+./bin/istioctl uninstall --revision 1-30-6 -y 2>&1 | tail -1; echo
+kubectl -n istio-system wait --for=delete pod -l app=istiod,istio.io/rev=1-30-6 --timeout=120s
+kubectl wait --for=delete mutatingwebhookconfiguration/istio-sidecar-injector-1-30-6 --timeout=60s
+kubectl -n istio-system get pods
+kubectl get mutatingwebhookconfigurations -L istio.io/rev,istio.io/tag
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k11-lab
+NAME     CLUSTER     ISTIOD     VERSION     SUBSCRIBED TYPES
+✔ Uninstall complete
+
+pod/istiod-1-30-6-657689d9c9-dxrfl condition met
+NAME                             READY   STATUS    RESTARTS   AGE
+istio-cni-node-72pv9             1/1     Running   0          4m30s
+istio-cni-node-p6cqh             1/1     Running   0          4m21s
+istio-cni-node-pzdqn             1/1     Running   0          4m14s
+istiod-1-31-2-78d9f855db-6cms2   1/1     Running   0          4m30s
+ztunnel-4vcks                    1/1     Running   0          4m6s
+ztunnel-74g4z                    1/1     Running   0          4m
+ztunnel-8xbnm                    1/1     Running   0          3m54s
+NAME                            WEBHOOKS   AGE     REV      TAG
+istio-revision-tag-default      4          5m54s   1-31-2   default
+istio-sidecar-injector-1-31-2   2          4m30s   1-31-2
+```
+
+</Expected>
+
+Hai lệnh `kubectl wait --for=delete` chờ pod istiod cũ dừng hẳn và webhook tiêm sidecar của nó bị xoá (lệnh thứ hai không in gì nếu webhook đã bị xoá trước khi nó chạy); nếu liệt kê ngay sau lệnh `uninstall`, bạn có thể còn thấy pod ở trạng thái `Terminating` và webhook `istio-sidecar-injector-1-30-6` còn thêm vài giây. Sau đó chỉ còn istiod 1.31.2; webhook tiêm sidecar của tag `default` trỏ revision mới. Cụm giờ sẵn sàng để nâng Kubernetes lên 1.37 (K4.3 dạy cách nâng cụm; bài này không làm bước đó trên kind).
+
+<Check id="d18.3.lab-tag">Chuyển được waypoint và sidecar sang control plane mới bằng revision tag, canary được từng Deployment sidecar, và gỡ được revision cũ sau khi kiểm không còn proxy nào dùng nó.</Check>
+
+### 5. Đo chi phí: không mesh, ambient, waypoint, sidecar
+
+Hai script đo. `ram.sh` đọc RAM của từng container bằng `crictl stats` ngay trong hai node worker (kind không có metrics-server, và `crictl` đọc thẳng số liệu cgroup). `do.sh` ghi lại CPU đã dùng của mọi container trên đường đi, cho `tai` gửi 200 request mỗi giây trong 30 giây qua 8 kết nối, đọc lại CPU, rồi in độ trễ ở phân vị 50, 90, 99 và số mili-giây CPU mỗi container đã tiêu trong lượt tải. Container dùng dưới 5 ms CPU không được in.
+
+<Terminal where="mac" title="~/masteva-d18/ram.sh và do.sh">
+
+```bash
+cat > ram.sh <<'EOF'
+#!/bin/sh
+# RAM (working set, MiB) của từng container trong istio-system và các namespace k11-*, trên hai worker
+for n in k11-lab-worker k11-lab-worker2; do
+  docker exec "$n" crictl stats -o json | jq -r --arg node "${n#k11-lab-}" '.stats[]
+    | .attributes.labels as $l
+    | select($l["io.kubernetes.pod.namespace"] | test("^(k11-|istio-system)"))
+    | select($l["io.kubernetes.container.name"] != "istio-validation")
+    | [$l["io.kubernetes.pod.namespace"],
+       ($l["io.kubernetes.pod.name"] | sub("-[a-z0-9]{8,10}-[a-z0-9]{5}$"; "") | sub("-[a-z0-9]{5}$"; "")) + "(" + $node + ")",
+       $l["io.kubernetes.container.name"],
+       ((.memory.workingSetBytes.value // "0" | tonumber) / 1048576 | floor | tostring) + " MiB"] | @tsv'
+done | sort | column -t
+EOF
+cat > do.sh <<'EOF'
+#!/bin/sh
+# Dùng: ./do.sh <namespace>. Tải cố định từ tai tới web, in độ trễ và CPU từng container đã dùng
+NS=$1
+cpu() {
+  for n in k11-lab-worker k11-lab-worker2; do
+    docker exec "$n" crictl stats -o json | jq -r --arg ns "$NS" --arg node "${n#k11-lab-}" '.stats[]
+      | .attributes.labels as $l
+      | select($l["io.kubernetes.pod.namespace"] == $ns or ($l["io.kubernetes.pod.name"] | startswith("ztunnel")))
+      | select($l["io.kubernetes.container.name"] != "istio-validation")
+      | [.attributes.id[0:12],
+         ($l["io.kubernetes.pod.name"] | sub("-[a-z0-9]{8,10}-[a-z0-9]{5}$"; "") | sub("-[a-z0-9]{5}$"; "")) + "(" + $node + ")",
+         $l["io.kubernetes.container.name"],
+         (.cpu.usageCoreNanoSeconds.value // "0" | tonumber)] | @tsv'
+  done | sort
+}
+cpu > cpu-truoc.txt
+kubectl -n "$NS" exec deploy/tai -c fortio -- fortio load -quiet -json - -qps 200 -c 8 -t 30s http://web/echo 2>/dev/null \
+  | jq -r '"qps=\(.ActualQPS | floor) loi=\(.ErrorsDurationHistogram.Count) " +
+      ([.DurationHistogram.Percentiles[] | select(.Percentile == 50 or .Percentile == 90 or .Percentile == 99)
+        | "p\(.Percentile)=\(.Value * 1000 * 100 | round / 100)ms"] | join(" "))'
+cpu > cpu-sau.txt
+join cpu-truoc.txt cpu-sau.txt | awk '{d = ($7 - $4) / 1e6; if (d >= 5) printf "  %-18s %-12s %5.0f ms CPU\n", $2, $3, d}' | sort
+EOF
+chmod +x ram.sh do.sh
+./ram.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+istio-system  istio-cni-node(worker)   install-cni  34  MiB
+istio-system  istio-cni-node(worker2)  install-cni  21  MiB
+istio-system  istiod-1-31-2(worker2)   discovery    83  MiB
+istio-system  ztunnel(worker)          istio-proxy  9   MiB
+istio-system  ztunnel(worker2)         istio-proxy  4   MiB
+k11-ambient   tai(worker)              fortio       7   MiB
+k11-ambient   waypoint(worker)         istio-proxy  49  MiB
+k11-ambient   web(worker2)             fortio       10  MiB
+k11-sidecar   tai(worker)              fortio       4   MiB
+k11-sidecar   tai(worker)              istio-proxy  31  MiB
+k11-sidecar   web(worker2)             fortio       4   MiB
+k11-sidecar   web(worker2)             istio-proxy  34  MiB
+k11-tran      tai(worker)              fortio       7   MiB
+k11-tran      web(worker2)             fortio       7   MiB
+```
+
+</Expected>
+
+Container của ztunnel tên `istio-proxy` (giống sidecar), nhưng nằm trong pod `ztunnel` của `istio-system`. Con số đáng nhớ: **mỗi** sidecar khoảng 30 tới 55 MiB, trong khi **cả** một ztunnel phục vụ mọi pod ambient trên node chỉ vài MiB. Waypoint là một Envoy nên tốn ngang một sidecar (30 tới 50 MiB), nhưng một waypoint phục vụ cả namespace. Node chứa istiod và waypoint trên máy bạn có thể khác, và RAM của từng container dao động vài MiB giữa các lần đo.
+
+Giờ đo độ trễ và CPU, lần lượt bốn chế độ. Mỗi lượt mất khoảng 35 giây; chạy tuần tự, không song song, để các lượt không tranh CPU của nhau. Dòng đầu gỡ label `use-waypoint` (nếu có) để lượt "chỉ ztunnel" đúng là chỉ qua ztunnel khi bạn chạy lại khối này; lượt thứ ba gắn namespace `k11-ambient` vào waypoint trước khi đo:
+
+<Terminal where="mac">
+
+```bash
+kubectl label namespace k11-ambient istio.io/use-waypoint- > /dev/null 2>&1
+echo "== không mesh"; ./do.sh k11-tran
+echo "== ambient, chỉ ztunnel"; ./do.sh k11-ambient
+kubectl label namespace k11-ambient istio.io/use-waypoint=waypoint > /dev/null; sleep 5
+echo "== ambient có waypoint"; ./do.sh k11-ambient
+echo "== sidecar"; ./do.sh k11-sidecar
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+== không mesh
+qps=199 loi=0 p50=0.54ms p90=0.93ms p99=1.71ms
+  tai(worker)        fortio          715 ms CPU
+  web(worker2)       fortio          688 ms CPU
+  ztunnel(worker)    istio-proxy     68 ms CPU
+  ztunnel(worker2)   istio-proxy      6 ms CPU
+== ambient, chỉ ztunnel
+qps=199 loi=0 p50=0.78ms p90=1.67ms p99=3.15ms
+  tai(worker)        fortio          643 ms CPU
+  waypoint(worker)   istio-proxy     58 ms CPU
+  web(worker2)       fortio          616 ms CPU
+  ztunnel(worker)    istio-proxy    513 ms CPU
+  ztunnel(worker2)   istio-proxy    456 ms CPU
+== ambient có waypoint
+qps=199 loi=0 p50=1.86ms p90=2.81ms p99=3.79ms
+  tai(worker)        fortio          594 ms CPU
+  waypoint(worker)   istio-proxy   1055 ms CPU
+  web(worker2)       fortio          572 ms CPU
+  ztunnel(worker)    istio-proxy    416 ms CPU
+  ztunnel(worker2)   istio-proxy    460 ms CPU
+== sidecar
+qps=199 loi=0 p50=1.62ms p90=2.55ms p99=3.81ms
+  tai(worker)        fortio          617 ms CPU
+  tai(worker)        istio-proxy   1295 ms CPU
+  web(worker2)       fortio          617 ms CPU
+  web(worker2)       istio-proxy   1264 ms CPU
+  ztunnel(worker)    istio-proxy     63 ms CPU
+  ztunnel(worker2)   istio-proxy      9 ms CPU
+```
+
+</Expected>
+
+Mỗi lượt là 6.000 request. Đọc theo từng cột:
+
+- **Độ trễ:** ambient chỉ ztunnel thêm khoảng 0,2 tới 0,6 ms ở trung vị so với không mesh; waypoint và sidecar thêm khoảng 1,1 tới 1,8 ms, vì request đi qua Envoy xử lý HTTP (waypoint một lần cộng hai ztunnel, sidecar hai lần). Trên máy bạn, các con số tuyệt đối có thể lệch gấp rưỡi tuỳ Docker Desktop bận hay rảnh, nhưng thứ tự thường giữ nguyên: không mesh < ztunnel < waypoint ≈ sidecar. Chạy lại hai lần để thấy độ dao động.
+- **CPU của proxy:** hai ztunnel cộng lại khoảng 1 giây CPU cho 6.000 request; hai sidecar khoảng 2,5 tới 3,5 giây; waypoint khoảng 1 tới 1,3 giây cộng hai ztunnel. Một ztunnel vẫn tiêu vài chục ms ngay cả ở lượt không mesh: đó là việc riêng của nó trong 30 giây, không liên quan tới lượt tải. Ở lượt "chỉ ztunnel", waypoint vẫn tiêu vài chục ms CPU dù không request nào đi qua nó: một proxy đứng chờ cũng có giá.
+- **ztunnel trong lượt sidecar** gần như không làm gì: pod sidecar không ở chế độ ambient, traffic không đi qua ztunnel.
+
+Ghép với bảng RAM ở trên, bạn có số liệu thật để trả lời "mesh tốn bao nhiêu" cho cụm của mình, để đối chiếu với số liệu chính thức của Istio trên đúng phần cứng của bạn.
+
+Gỡ waypoint khỏi đường đi của `k11-ambient` cho bước 6:
+
+<Terminal where="mac">
+
+```bash
+kubectl label namespace k11-ambient istio.io/use-waypoint-
+```
+
+</Terminal>
+
+<Check id="d18.3.lab-do">Đo được RAM từng proxy và độ trễ p50, p99 cùng CPU proxy của cùng ứng dụng ở bốn chế độ, và giải thích được thứ tự các con số bằng số proxy và số lần xử lý HTTP trên đường đi.</Check>
+
+### 6. Gỡ lỗi: AuthorizationPolicy chặn nhầm sau khi thêm waypoint
+
+Tình huống: đội bảo mật đã khoá `web` trong `k11-ambient` chỉ cho `tai` gọi, bằng một policy tầng 4 giống K11.1. Mọi thứ chạy tốt:
+
+<Terminal where="mac" title="~/masteva-d18/authz-cu.yaml">
+
+```bash
+cat > authz-cu.yaml <<'EOF'
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: web-chi-cho-tai, namespace: k11-ambient}
+spec:
+  selector:
+    matchLabels: {app: web}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/k11-ambient/sa/tai"]
+EOF
+kubectl apply -f authz-cu.yaml
+sleep 3
+kubectl -n k11-ambient exec deploy/tai -- fortio load -quiet -allow-initial-errors -json - -n 20 -c 1 -qps 0 http://web/echo 2>/dev/null | jq -c .RetCodes
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+authorizationpolicy.security.istio.io/web-chi-cho-tai created
+{"200":20}
+```
+
+</Expected>
+
+Rồi đội ứng dụng gắn namespace vào waypoint để dùng HTTPRoute như K11.2. Ngay sau đó:
+
+<Terminal where="mac">
+
+```bash
+kubectl label namespace k11-ambient istio.io/use-waypoint=waypoint
+sleep 5
+kubectl -n k11-ambient exec deploy/tai -- fortio load -quiet -allow-initial-errors -json - -n 20 -c 1 -qps 0 http://web/echo 2>/dev/null | jq -c .RetCodes
+kubectl -n k11-ambient exec deploy/tai -- fortio curl -quiet http://web/echo 2>/dev/null | head -3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k11-ambient labeled
+{"503":20}
+HTTP/1.1 503 Service Unavailable
+content-length: 95
+content-type: text/plain
+```
+
+</Expected>
+
+Mọi request nhận `503`. Không ai sửa policy, `tai` vẫn là `tai`. Hãy tự tìm nguyên nhân trước khi đọc tiếp, theo thói quen ở phần Kiến thức: log ztunnel ở **node của pod đích** (`web` chạy trên `k11-lab-worker2`).
+
+<Terminal where="mac">
+
+```bash
+Z2=$(kubectl -n istio-system get pod -l app=ztunnel --field-selector spec.nodeName=k11-lab-worker2 -o name)
+kubectl -n istio-system logs $Z2 --since=10m | grep 'policy rejection' | tail -1 \
+  | grep -oE '(src\.workload|src\.identity|dst\.workload|direction|error)="[^"]+"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+src.workload="waypoint-68fb99b94d-ljljc"
+src.identity="spiffe://cluster.local/ns/k11-ambient/sa/waypoint"
+dst.workload="web-7d5b5495f4-xjnq2"
+direction="inbound"
+error="connection closed due to policy rejection: allow policies exist, but none allowed"
+```
+
+</Expected>
+
+Nguyên nhân nằm ở `src.identity`: ztunnel của `web` thấy kết nối đến từ **waypoint**, không phải từ `tai`. Waypoint là bên mở kết nối tới `web` và nó dùng danh tính của chính nó (ServiceAccount `waypoint`). Policy cũ chỉ cho `sa/tai`, nên chặn. Phía waypoint, kết nối lên `web` bị đóng, và nó trả `503` cho `tai`.
+
+Cách sửa theo tài liệu Istio có hai phần:
+
+- Kiểm danh tính client ở chỗ còn thấy nó: **gắn** policy vào waypoint bằng `targetRefs` trỏ tới Service `web`. Waypoint thực thi, và nó thấy `sa/tai`.
+- Khoá ztunnel của `web` chỉ nhận từ waypoint, để không ai đi vòng qua waypoint bằng cách gọi thẳng IP pod.
+
+<Terminal where="mac" title="~/masteva-d18/authz-moi.yaml">
+
+```bash
+cat > authz-moi.yaml <<'EOF'
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: web-chi-cho-tai, namespace: k11-ambient}
+spec:
+  targetRefs:
+    - {kind: Service, group: "", name: web}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/k11-ambient/sa/tai"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: web-chi-qua-waypoint, namespace: k11-ambient}
+spec:
+  selector:
+    matchLabels: {app: web}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/k11-ambient/sa/waypoint"]
+EOF
+kubectl apply -f authz-moi.yaml
+kubectl -n k11-ambient run khac --image=fortio/fortio:1.75.3 --restart=Never -- server -http-port 8080 -grpc-port disabled -redirect-port disabled > /dev/null
+kubectl -n k11-ambient wait --for=condition=Ready pod/khac --timeout=120s > /dev/null
+sleep 3
+for p in deploy/tai pod/khac; do
+  echo "$p: $(kubectl -n k11-ambient exec $p -- fortio load -quiet -allow-initial-errors -json - -n 10 -c 1 -qps 0 http://web/echo 2>/dev/null | jq -c .RetCodes)"
+done
+kubectl -n k11-ambient exec pod/khac -- fortio curl -quiet http://web/echo 2>/dev/null | tail -1; echo
+IP=$(kubectl -n k11-ambient get pod -l app=web -o jsonpath='{.items[0].status.podIP}')
+echo "tai gọi thẳng IP pod: $(kubectl -n k11-ambient exec deploy/tai -- fortio load -quiet -allow-initial-errors -json - -n 5 -c 1 -qps 0 http://$IP:8080/echo 2>/dev/null | jq -c .RetCodes)"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+authorizationpolicy.security.istio.io/web-chi-cho-tai configured
+authorizationpolicy.security.istio.io/web-chi-qua-waypoint created
+deploy/tai: {"200":10}
+pod/khac: {"403":10}
+RBAC: access denied
+tai gọi thẳng IP pod: {"-1":5}
+```
+
+</Expected>
+
+Ba kết quả, ba lớp:
+
+- `tai` qua Service: waypoint thấy `sa/tai`, cho qua; ztunnel của `web` thấy `sa/waypoint`, cho qua. `200`.
+- `khac` (ServiceAccount `default`) qua Service: waypoint từ chối và trả `403`; dòng `RBAC: access denied` là nội dung response mà `fortio curl` in ra. Lỗi tầng 7, rõ ràng, khác hẳn kiểu kết nối bị cắt.
+- `tai` gọi thẳng IP pod: không qua waypoint (waypoint chỉ nhận traffic tới Service), nên tới thẳng ztunnel của `web` với danh tính `sa/tai`, và bị chặn ở tầng kết nối (`-1`). Không ai đi vòng được.
+
+<Check id="d18.3.lab-go-loi">Tái hiện được việc AuthorizationPolicy tầng 4 chặn nhầm sau khi thêm waypoint, tìm ra nguyên nhân từ `src.identity` trong log ztunnel bên nhận, và sửa bằng một policy gắn vào waypoint cộng một policy khoá ztunnel.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `istioctl install` bản 1.30.6 báo phiên bản Kubernetes không hỗ trợ | Cụm dùng node 1.37 (bỏ dòng `image:` trong file kind) | `kubectl get nodes` |
+| `proxy-status` không có sidecar nào | Đang xem tag `default` trong khi sidecar ở revision khác | Thêm `-r <revision>` |
+| Sidecar vẫn bản cũ sau khi đổi tag | Pod chưa được tạo lại | `kubectl -n k11-sidecar rollout restart deploy/<tên>` |
+| Terminal 2 báo nhiều lỗi `-1` kéo dài | ztunnel mới không khởi động được trên một node | `kubectl -n istio-system get pods -l app=ztunnel`; log của pod đó |
+| `do.sh` không in dòng CPU nào | `crictl` không chạy được trong node, hoặc thiếu `KUBECONFIG` | `docker exec k11-lab-worker crictl stats` |
+| Bước 6 vẫn `503` sau khi áp `authz-moi.yaml` | Policy mới thiếu `group: ""` trong `targetRefs`, hoặc tên ServiceAccount của waypoint khác `waypoint` | `kubectl -n k11-ambient get pod -l gateway.networking.k8s.io/gateway-name=waypoint -o jsonpath='{.items[0].spec.serviceAccountName}'` |
+
+### Dọn dẹp
+
+Đây là bài cuối của K11.
+
+<Callout kind="danger">
+
+Khối thứ nhất xoá cụm `k11-lab` cùng mọi thứ trong đó. Khối thứ hai xoá thư mục lab, kể cả hai bản `istioctl`.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm">
+
+```bash
+kind delete cluster --name k11-lab
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Xoá thư mục lab">
+
+```bash
+rm -rf ~/masteva-d18
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao Istio không cho canary ztunnel như canary istiod?">
+
+Vì một node chỉ có một ztunnel, và ztunnel giữ socket bên trong network namespace của mọi pod ambient trên node đó. Hai ztunnel cùng lúc trên một node sẽ phải chia nhau các pod, và istio-cni phải biết pod nào thuộc ztunnel nào; tài liệu nâng cấp hiện ghi rõ istio-cni không hỗ trợ canary, còn ztunnel nâng tại chỗ sẽ làm gián đoạn ngắn mọi traffic ambient trên node. Cách giảm rủi ro nằm ở tầng node: cordon và drain (K4.4) trước khi nâng ztunnel trên node đó, hoặc dựng nhóm node mới chạy bản mới rồi dời workload sang (blue/green theo node pool). Đổi lại, ambient không phải tạo lại pod ứng dụng để nâng proxy, điều sidecar luôn đòi.
+
+</Reveal>
+
+<Reveal title="Policy ở bước 6 nên giữ ở waypoint hay ở ztunnel về lâu dài?">
+
+Giữ danh tính client ở **waypoint**, và ở ztunnel chỉ một luật "chỉ nhận từ waypoint". Lý do: khi có waypoint, chỉ waypoint còn thấy danh tính gốc; ztunnel bên nhận chỉ thấy waypoint. Policy tầng 7 (method, đường dẫn) cũng chỉ chạy ở waypoint. Hệ quả vận hành: mỗi lần một namespace bắt đầu hoặc thôi dùng waypoint, mọi AuthorizationPolicy của namespace đó phải được rà lại. Đưa việc rà đó vào checklist khi thêm waypoint, và viết một test gọi thử từ một danh tính được phép và một danh tính không được phép, như bước 6.
+
+</Reveal>
+
+<Reveal title="Cụm có 300 namespace dùng tag default. Nâng một lần có an toàn không?">
+
+Không nên. Đổi tag `default` thì mọi waypoint theo tag đó được tạo lại cùng lúc, và mọi pod sidecar tạo lại sau đó đều lấy bản mới. Tài liệu Istio khuyên chia cụm thành nhiều tag (ví dụ `prod-canary`, `prod-stable`), namespace gắn `istio.io/rev=<tag>`, rồi nâng từng tag, bắt đầu từ ứng dụng ít rủi ro, theo dõi một thời gian trước khi nâng tag kế tiếp. Với waypoint, Istio 1.31 có thêm cách chuyển dần lưu lượng của một Service sang một waypoint mới theo tỉ lệ: label `istio.io/use-waypoint-canary` và annotation `istio.io/use-waypoint-canary-weight`. Tài liệu Istio xếp tính năng này ở mức alpha, và theo ghi chú phát hành 1.31, tỉ lệ áp theo **kết nối** trong mesh chứ không theo request. Đó cũng chính là ý "triển khai theo wave" của D13.4, áp cho hạ tầng.
+
+</Reveal>
+
+<Reveal title="Chọn Linkerd bản edge cho production có ổn không?">
+
+Dự án Linkerd ghi bản edge "thường được coi là sẵn sàng cho production", mỗi bản có kiểm thử tự động và người bảo trì duyệt, bản lỗi được đánh dấu "not recommended"; nhưng bản edge có thể chứa tính năng dở dang và đôi khi thay đổi không tương thích. Hệ quả: bạn phải tự chọn bản, đọc ghi chú phát hành hằng tuần, và tự kiểm trước khi nâng, việc mà bản stable làm hộ. Công ty dưới 50 nhân viên dùng được bản stable của Buoyant miễn phí; công ty lớn hơn so chi phí đó với công sức tự theo bản edge. Dù chọn gì, ghi rõ phiên bản (`edge-26.10.1` hay `2.20.x` của Buoyant) trong tài liệu vận hành.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết kế hoạch nâng cấp theo revision cho cụm của bạn, đọc `proxy-status`, hoặc giải thích một dòng log ztunnel. AI hay sai ở: (1) đề xuất `istioctl upgrade` tại chỗ cho cả control plane thay vì revision; (2) không biết cài revision mới với profile ambient sẽ nâng ztunnel và istio-cni ngay lập tức; (3) quên kiểm trang Supported Releases trước khi nâng Kubernetes; (4) mô tả Linkerd như có bản stable mã nguồn mở mới nhất, hoặc nói Cilium có mTLS theo workload ổn định; (5) đưa số liệu hiệu năng mesh không nguồn. Kiểm bằng cụm thật: `istioctl x precheck`, `proxy-status -r` cho từng revision, và số đo của chính bạn như bước 5.
+
+</Callout>
+
+<Callout kind="link">
+
+K11.1 và K11.2 dựng mesh, mTLS, waypoint mà bài này vận hành. K4.3 dạy nâng cấp cụm Kubernetes, việc làm sau khi Istio đã hỗ trợ bản mới; K4.4 dạy cordon và drain để nâng ztunnel từng node an toàn. K6.1 là Cilium, lựa chọn thay mesh trong bảng so sánh. D13.4 dạy triển khai theo wave, cùng ý với nâng từng revision tag. D12 và D16 là nơi các metric của waypoint và ztunnel đi vào. Mesh nhiều cụm nằm ngoài phạm vi K11; K10 nói về vận hành nhiều cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d18.3.mastery-ke-hoach">Viết được kế hoạch nâng một bản phụ của Istio cho một cụm có cả sidecar và ambient: kiểm phiên bản hỗ trợ, cài revision mới, xử lý ztunnel theo node, đổi tag, canary sidecar, gỡ bản cũ, và cách lui ở mỗi bước.</Check>
+
+<Check id="d18.3.mastery-chi-phi">Đo được và trình bày được chi phí RAM, CPU, độ trễ của mesh trên cụm của mình, và dùng số đó để chọn giữa không mesh, ambient, waypoint và sidecar.</Check>
+
+<Check id="d18.3.mastery-go-loi">Gặp một request lỗi trong mesh, dùng log ztunnel bên nhận, `ztunnel-config` và `proxy-config` để tìm ra nguyên nhân là chính sách, danh tính hay cấu hình định tuyến.</Check>
+
+</Mastery>

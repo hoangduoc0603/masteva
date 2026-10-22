@@ -1,0 +1,726 @@
+---
+title: "Vận hành cache Valkey, và database nên đặt ở đâu"
+description: Valkey thay Redis vì giấy phép; replica và Sentinel tự failover, maxmemory và eviction, hot key và big key; tái hiện cache stampede khi một key nóng hết hạn làm 200 request cùng dồn vào PostgreSQL, sửa bằng gộp request và khoá phân tán rồi đo lại; cuối cùng là bảng quyết định đặt database trên Kubernetes, trên VM hay dùng dịch vụ quản lý.
+id: d24.5
+step: d24
+prerequisites: [d24.1]
+topics: [d24.cache-ops, d24.database-dat-o-dau]
+status: verified
+verified:
+  date: 2026-10-21
+  os: macOS 14.4.1 (container trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    valkey: 9.1.2 (image valkey/valkey:9.1.2)
+    postgresql: 18.6 (image postgres:18.6-alpine)
+    python: 3.14 (image python:3.14-slim)
+    valkey-py: 6.2.0
+    psycopg: 3.3.6 (cùng psycopg-pool 3.3.3)
+---
+
+<Goal>
+
+SB9.1 đã dùng cache từ phía ứng dụng: cache-aside, TTL, xoá cache khi ghi, và gặp cache stampede trong một JVM. Bài này đứng ở phía người vận hành một cache dùng chung cho nhiều service, rồi trả lời câu hỏi cuối của chặng: database nên đặt ở đâu. Học xong, bạn giải thích được:
+
+- Valkey là gì, vì sao nhiều nơi chuyển từ Redis sang, và chọn giữa một instance có replica với Sentinel hay cluster mode.
+- Valkey làm gì khi đầy bộ nhớ, chọn chính sách eviction nào cho cache, và đọc được dấu hiệu đang bị đuổi key.
+- Hot key, big key là gì và tìm chúng thế nào.
+- Vì sao một key nóng hết hạn có thể đánh sập database, đo được điều đó, và sửa bằng gộp request hoặc khoá.
+- Đặt database trên Kubernetes, trên VM hay dùng dịch vụ quản lý, bằng một bảng tiêu chí chứ không bằng sở thích.
+
+</Goal>
+
+<Knowledge>
+
+### Valkey thay Redis
+
+**Valkey** là bản fork của Redis 7.2.4, ra đời năm 2024 sau khi Redis đổi giấy phép từ BSD sang giấy phép kép RSAL/SSPL, không còn được coi là mã nguồn mở; Redis 8 thêm lựa chọn AGPL. Valkey giữ BSD-3-Clause, thuộc Linux Foundation, và tương thích giao thức với Redis: client Redis, lệnh và phần lớn công cụ dùng được với Valkey. Công cụ dòng lệnh của nó là `valkey-cli`. Lab dùng Valkey 9.1. Các khái niệm của bài (replication, Sentinel, eviction) giống Redis; khác biệt chủ yếu là giấy phép và lộ trình phát triển.
+
+### Replication, Sentinel và cluster mode
+
+| Mô hình | Thành phần | Khi primary chết | Dung lượng | Dùng khi |
+|---|---|---|---|---|
+| Một instance | 1 primary | Mất cache tới khi khởi động lại | Một máy | Cache mất được, môi trường phát triển |
+| Replica và Sentinel | 1 primary, N replica, 3 Sentinel trở lên | Sentinel đưa một replica lên primary; client hỏi Sentinel địa chỉ mới | Một máy (replica để đọc và dự phòng) | Dữ liệu vừa một máy, cần tự failover |
+| Cluster mode | Nhiều primary, mỗi primary có replica | Replica của shard đó lên thay, cụm tự xử lý | Chia trên nhiều máy theo 16.384 hash slot | Dữ liệu hoặc lưu lượng vượt một máy |
+
+**Replication** của Valkey là **bất đồng bộ**: primary trả lời client trước khi replica nhận được. Lệnh `WAIT` cho client chờ đủ replica xác nhận, nhưng tài liệu Valkey nói rõ nó chỉ giảm, không loại bỏ, khả năng mất ghi khi failover.
+
+**Sentinel** là các tiến trình theo dõi primary. Mỗi Sentinel tự đánh dấu primary là hỏng khi không trả lời quá `down-after-milliseconds`; khi đủ **quorum** Sentinel đồng ý, một Sentinel được **quá nửa** số Sentinel bầu làm người điều phối failover, chọn một replica, đưa nó lên primary và trỏ các replica còn lại sang. Client không nối vào một địa chỉ cố định mà hỏi Sentinel "primary của `mymaster` đang ở đâu".
+
+```text
+  client --(1) primary của mymaster ở đâu? --> Sentinel 1, 2, 3
+         <--(2) d19-valkey-1:6379 ----------
+         --(3) GET / SET -------------------> primary
+                                                 |  replication bất đồng bộ
+                                                 v
+                                              replica
+  primary chết: >= quorum Sentinel thấy hỏng -> bầu người điều phối (quá nửa)
+              -> REPLICAOF NO ONE trên replica -> client hỏi lại ở (1)
+```
+
+Với cache, mất vài giây ghi lúc failover thường chấp nhận được. Điều đáng lo hơn là **split-brain**: primary cũ bị cô lập vẫn nhận ghi từ client cùng phía, và mọi ghi đó mất khi nó quay về làm replica. Cặp `min-replicas-to-write` và `min-replicas-max-lag` cho primary tự từ chối ghi khi không còn replica nào theo kịp, đổi lại primary dừng ghi khi mọi replica cùng chết: cùng đánh đổi đã gặp ở PostgreSQL (D19.1) và Kafka (D19.4).
+
+**Cluster mode** chia keyspace thành 16.384 slot theo CRC16 của key, mỗi primary giữ một dải slot. Lệnh nhiều key (`MGET`, transaction, Lua) chỉ chạy được khi các key nằm cùng slot, nên ứng dụng phải đặt **hash tag** (`{user:42}:cart`, `{user:42}:profile`). Chuyển một ứng dụng đang chạy từ instance đơn sang cluster mode vì vậy là việc của cả ứng dụng, không chỉ của hạ tầng.
+
+Trên Kubernetes, operator chính thức `valkey-io/valkey-operator` mới ở bản 0.x (v0.7.1 ngày 28/09/2026, API `v1alpha1`), và README của nó ghi rõ chưa sẵn sàng cho production; OT-Container-Kit `redis-operator` là lựa chọn đang được bảo trì, còn `spotahome/redis-operator` đã archived. Lab chạy Valkey bằng container Docker để thấy rõ từng tiến trình.
+
+<Check id="d24.5.valkey-ha">So sánh được ba mô hình triển khai Valkey theo cách failover và dung lượng, giải thích được quorum và việc bầu người điều phối của Sentinel, và nêu được vì sao replication bất đồng bộ cộng split-brain có thể làm mất ghi cùng cách giảm.</Check>
+
+### Hết bộ nhớ: `maxmemory` và eviction
+
+`maxmemory` là trần bộ nhớ cho dữ liệu. Chạm trần, Valkey làm theo `maxmemory-policy`:
+
+| Chính sách | Đuổi key nào | Hợp với |
+|---|---|---|
+| `noeviction` (mặc định) | Không đuổi; lệnh ghi bị lỗi `OOM command not allowed` | Valkey dùng làm nơi lưu, không phải cache |
+| `allkeys-lru` | Key ít được dùng gần đây nhất, trong mọi key | Cache chung; tài liệu Valkey khuyên chọn khi không chắc |
+| `allkeys-lfu` | Key ít được dùng nhất (đếm tần suất) | Có nhóm key nóng ổn định |
+| `volatile-lru`, `volatile-lfu`, `volatile-ttl`, `volatile-random` | Chỉ trong các key có TTL | Một instance vừa làm cache vừa giữ key không được mất; không có key có TTL thì cư xử như `noeviction` |
+| `allkeys-random` | Ngẫu nhiên | Mọi key được truy cập đều nhau |
+
+LRU và LFU của Valkey là **xấp xỉ**: nó lấy mẫu vài key rồi đuổi key tệ nhất trong mẫu, không duyệt toàn bộ. Ba con số phải theo dõi, có sẵn trong `INFO`: `used_memory` so với `maxmemory`, `evicted_keys` (tăng nghĩa là cache nhỏ hơn tập dữ liệu nóng), và tỉ lệ `keyspace_hits` trên tổng `keyspace_hits + keyspace_misses`. Hit ratio tụt cùng lúc `evicted_keys` tăng thì database đang gánh phần cache không giữ nổi.
+
+<Check id="d24.5.eviction">Giải thích được Valkey làm gì khi chạm `maxmemory` với `noeviction` và với `allkeys-lru`, chọn được chính sách cho một cache dùng chung, và kể được ba chỉ số trong `INFO` cho biết cache đang thiếu bộ nhớ.</Check>
+
+### Hot key và big key
+
+Valkey xử lý lệnh trên **một luồng chính** cho mỗi instance (phần I/O mạng có thể chia luồng). Hệ quả: một lệnh chậm làm mọi client khác chờ, và một key bị truy cập quá nhiều dồn hết tải vào một instance, kể cả trong cluster mode.
+
+- **Hot key:** một key nhận phần lớn lưu lượng (sản phẩm đang khuyến mãi, cấu hình chung). Trong cluster mode, slot chứa nó làm một node quá tải trong khi node khác rảnh. Tìm bằng `valkey-cli --hotkeys`, lệnh này cần chính sách eviction loại `*-lfu` để Valkey đếm tần suất. Cách xử lý: thêm một tầng cache trong bộ nhớ ứng dụng với TTL ngắn, hoặc nhân key thành nhiều bản (`promo:1#0` tới `promo:1#7`) để chia tải.
+- **Big key:** một key rất lớn (một hash hàng trăm nghìn field, một chuỗi vài chục MB). Đọc hay xoá nó chiếm luồng chính lâu, chép sang replica nặng, và làm lệch bộ nhớ giữa các node. Tìm bằng `valkey-cli --bigkeys` (key nhiều phần tử nhất theo từng kiểu) và `--memkeys` (key tốn bộ nhớ nhất); cả hai quét bằng `SCAN` nên không chặn server, nhưng vẫn thêm tải. Xoá big key bằng `UNLINK` (giải phóng bộ nhớ ở luồng nền) thay vì `DEL`.
+
+<Check id="d24.5.hot-big-key">Giải thích được vì sao một hot key hay một big key làm chậm cả instance, tìm được chúng bằng `valkey-cli`, và nêu được một cách xử lý cho mỗi loại.</Check>
+
+### Cache stampede ở quy mô nhiều service
+
+SB9.1 đã cho thấy `@Cacheable(sync = true)` một mình không chặn được stampede với `RedisCache` mặc định, và chỉ chặn được bằng cache writer có khoá, khoá chung cho cả cache, trong phạm vi một JVM. Ở quy mô hệ thống, stampede nặng hơn vì ba lẽ: nhiều pod cùng miss một lúc (khoá trong một JVM không giúp được giữa các pod), truy vấn nạp lại thường đắt hơn nhiều so với đọc cache, và database được định cỡ theo lưu lượng **sau** cache.
+
+```text
+  bình thường: 2.000 req/s, hit 99%  ->  database nhận 20 truy vấn/s
+  key nóng hết hạn: 200 request trong cùng một khoảnh khắc đều miss
+                                     ->  200 truy vấn giống hệt nhau cùng chạy
+                                     ->  pool kết nối cạn, truy vấn khác xếp hàng,
+                                         request timeout, client thử lại -> càng nhiều miss
+  mất hẳn cache (restart, failover không có replica nóng)
+                                     ->  database nhận 2.000 truy vấn/s, gấp 100 lần
+```
+
+| Cách chống | Cơ chế | Giới hạn |
+|---|---|---|
+| Khoá phân tán | Request miss đầu tiên `SET lock:<key> <id> NX PX 5000` rồi nạp; request khác chờ và đọc lại cache | Phải đặt hạn cho khoá (người giữ khoá có thể chết) và giới hạn thời gian chờ |
+| Gộp request (request coalescing, singleflight) | Trong một tiến trình, các request cùng key chờ chung một lần nạp | Mỗi tiến trình vẫn nạp một lần: 30 pod là 30 truy vấn |
+| TTL ngẫu nhiên (jitter) | Cộng một khoảng ngẫu nhiên vào TTL | Chống nhiều key hết hạn cùng lúc; không cứu một key rất nóng |
+| Làm mới sớm, trả bản cũ trong lúc làm mới | Nạp lại khi TTL còn ít, hoặc giữ bản cũ thêm một lúc và phục vụ nó trong lúc một request nạp bản mới | Phức tạp hơn; chấp nhận dữ liệu cũ thêm vài giây |
+
+Phía vận hành, điều cần nhớ: **database phải sống được qua lúc cache trống**. Ước lượng tải database khi hit ratio về 0, đặt trần đồng thời cho đường nạp lại (pool nhỏ, load shedding như D18.2), và làm ấm cache trước khi đưa một instance mới vào phục vụ.
+
+<Callout kind="production">
+
+Ngày 23/09/2010, Facebook ngừng hoặc không truy cập được khoảng 2,5 giờ, sự cố nặng nhất của họ trong hơn bốn năm, theo [bài của Robert Johnson trên blog kỹ thuật của Facebook](https://engineering.fb.com/2010/09/23/uncategorized/more-details-on-today-s-outage/). Họ có một hệ thống tự động kiểm giá trị cấu hình: thấy giá trị trong cache không hợp lệ thì thay bằng giá trị từ nơi lưu bền vững, việc này cần một truy vấn tới một cụm database. Hôm đó, một thay đổi ở bản lưu bền vững của một giá trị cấu hình bị hiểu là không hợp lệ. Mọi client cùng thấy giá trị sai và cùng đi sửa, và cụm database nhận hàng trăm nghìn truy vấn mỗi giây.
+
+Tệ hơn, mỗi khi một client gặp lỗi lúc truy vấn database, nó coi đó là giá trị không hợp lệ và **xoá key tương ứng trong cache**. Vì vậy dù nguyên nhân gốc đã được sửa, dòng truy vấn vẫn không dừng: database càng không trả lời kịp thì càng sinh thêm truy vấn tới chính nó. Cách để cắt vòng lặp là chặn mọi lưu lượng tới cụm database đó, nghĩa là tắt trang web; khi database hồi phục và nguyên nhân đã sửa, họ cho người dùng quay lại từ từ. Họ tắt hệ thống tự sửa cấu hình và tìm thiết kế khác chịu được vòng phản hồi và đột biến tải.
+
+Điều rút ra cho bài này (của bài): đây là stampede cộng vòng phản hồi mà D18.2 gọi là trạng thái metastable. Hai chi tiết đáng giữ: đường "cache miss thì hỏi database" không có trần đồng thời, và lỗi phía database bị diễn giải thành lý do để **xoá thêm cache**. Khi thiết kế cache, quyết định trước điều gì xảy ra khi database chậm hoặc lỗi: trả bản cũ, trả lỗi nhanh, hay chờ; đừng để mỗi lỗi sinh thêm miss.
+
+</Callout>
+
+<Check id="d24.5.stampede">Giải thích được vì sao stampede ở quy mô nhiều pod nặng hơn trong một JVM, so sánh được khoá phân tán, gộp request, TTL ngẫu nhiên và làm mới sớm, và nêu được việc phía vận hành phải làm để database sống qua lúc cache trống.</Check>
+
+### Database đặt ở đâu
+
+K7.4 đã nêu vài tiêu chí giữa operator và dịch vụ được quản lý. Ở cấp quyết định của một hệ thống lớn có ba lựa chọn, và câu hỏi đúng không phải "cái nào tốt hơn" mà "**ai** làm những việc sau, và làm có tốt không":
+
+| Việc | Dịch vụ được quản lý (RDS, Cloud SQL, Azure Database…) | Tự chạy trên VM | Tự chạy trên Kubernetes bằng operator |
+|---|---|---|---|
+| Cài, vá OS và PostgreSQL bản nhỏ | Nhà cung cấp, theo cửa sổ bảo trì | Bạn (Ansible, D8) | Operator làm rolling update; bạn chọn lúc và kiểm |
+| Failover | Nhà cung cấp; bạn không chỉnh sâu được | Bạn dựng (Patroni, Pacemaker) và giữ nó đúng | Operator; bạn hiểu và tập (K7.4, D19.1) |
+| Backup, PITR | Bật một tuỳ chọn | Bạn dựng (pgBackRest, Barman) | Operator cộng object storage; kiểm khôi phục vẫn là của bạn (D19.2) |
+| Nâng cấp bản lớn | Có công cụ, vẫn cần thử trước | Bạn | Bạn, với công cụ của operator |
+| Lưu trữ, IOPS | Chọn loại đĩa, trả theo IOPS | Đĩa của máy, toàn quyền | PVC: phụ thuộc CSI và lớp lưu trữ bên dưới (K7.1 tới K7.3) |
+| Pooling, theo dõi, cảnh báo | Một phần có sẵn | Bạn | `Pooler`, metric có sẵn; dashboard và alert là của bạn |
+| Schema, index, truy vấn chậm, bloat, backfill | **Bạn** | **Bạn** | **Bạn** |
+| Trực khi database có vấn đề | Nhà cung cấp lo phần hạ tầng; bạn vẫn trực phần còn lại | Bạn | Bạn |
+
+Hai hàng cuối là điều hay bị quên: dịch vụ được quản lý không lấy đi phần khó nhất của vận hành database. Truy vấn chậm, migration khoá bảng, replica tụt lại vì backfill (D19.3), cache stampede dồn vào database: tất cả vẫn là việc của đội bạn ở cả ba lựa chọn.
+
+Những gì **thật sự khó** khi tự vận hành, theo thứ tự hay gặp:
+
+1. **Lưu trữ.** Database nhạy với độ trễ đĩa hơn hầu hết workload khác. Trên Kubernetes, PVC có thể là đĩa mạng chậm hơn hẳn đĩa cục bộ, và lỗi ở lớp lưu trữ (K7.2, K7.3) thành lỗi database.
+2. **Khôi phục và nâng cấp bản lớn.** Việc hiếm làm, nên ít người thạo, và luôn xảy ra lúc áp lực cao.
+3. **Con người.** Cần vài người hiểu PostgreSQL đủ sâu để trực; tài liệu CNPG nói chạy PostgreSQL trên Kubernetes cần cả kỹ năng PostgreSQL lẫn Kubernetes trong đội. Chỉ một người biết là rủi ro tập trung.
+4. **Vòng đời của chính operator** (K9.5): nâng operator có thể khởi động lại database, và lỗi của operator là lỗi của bạn, như issue về pooler mà D19.1 gặp.
+
+Bảng quyết định, đọc theo hàng; mỗi hàng nghiêng về một phía:
+
+| Tiêu chí | Nghiêng về dịch vụ được quản lý | Nghiêng về tự chạy (VM hoặc Kubernetes) |
+|---|---|---|
+| Đội ngũ | Không ai chuyên database, hoặc chưa có lịch trực | Có người thạo PostgreSQL và có lịch trực |
+| SLO, RTO, RPO | Con số nhà cung cấp cam kết đủ dùng | Cần RTO, RPO hay độ trễ mà dịch vụ không cam kết được |
+| Chi phí | Ít instance, tải vừa; công người đắt hơn phần chênh giá | Nhiều instance hoặc rất lớn, phần chênh giá vượt chi phí một đội vận hành |
+| Tuân thủ, nơi đặt dữ liệu | Nhà cung cấp có vùng và chứng nhận phù hợp | Quy định buộc dữ liệu nằm ở trung tâm dữ liệu riêng hoặc vùng nhà cung cấp không có |
+| Hạ tầng | Đã ở hẳn trên một cloud | On-prem, bare metal, nhiều cloud cần chạy giống nhau |
+| Độ phức tạp | Bản và extension phổ biến | Extension, phiên bản, cấu hình hay mô hình replication đặc biệt |
+
+Giữa VM và Kubernetes, khi đã quyết tự chạy: Kubernetes có lợi khi đội đã vận hành Kubernetes tốt và cần nhiều database giống nhau (mỗi service một cụm, môi trường tạm cho mỗi nhánh), vì operator biến mỗi cụm thành một object khai báo. VM có lợi khi chỉ có vài database rất lớn, cần tinh chỉnh sát phần cứng, hoặc đội thạo PostgreSQL mà chưa thạo Kubernetes.
+
+Ba ví dụ áp bảng trên (ví dụ của bài, để luyện cách lập luận):
+
+- **Startup 6 kỹ sư, một sản phẩm SaaS, đã ở trên AWS, chưa có lịch trực đêm.** Dịch vụ được quản lý, cấu hình nhiều zone. Phần chênh giá rẻ hơn một người trực.
+- **Ngân hàng, dữ liệu khách hàng phải nằm ở trung tâm dữ liệu riêng, có đội DBA, nền tảng Kubernetes còn non.** Tự chạy trên VM với Patroni hoặc tương đương; cân nhắc Kubernetes khi đội nền tảng chín.
+- **Công ty có nền tảng Kubernetes trưởng thành, 120 microservice, mỗi service một database nhỏ, cần môi trường tạm cho mỗi pull request.** Operator trên Kubernetes cho phần lớn; database lõi lớn nhất (thanh toán) có thể vẫn ở dịch vụ được quản lý hoặc trên node riêng với đĩa cục bộ, theo đúng bảng trên.
+
+<Check id="d24.5.dat-database">Kể được những việc vẫn là của đội bạn ở cả ba lựa chọn, nêu được ít nhất ba điều thật sự khó khi tự vận hành database, và áp được bảng tiêu chí (đội ngũ, SLO, chi phí, tuân thủ, độ phức tạp) để chọn chỗ đặt database cho một hệ thống cụ thể.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Valkey: Key eviction](https://valkey.io/topics/lru-cache/): các chính sách `maxmemory-policy`, cách eviction diễn ra và các chỉ số trong `INFO`.
+- [Valkey: High availability with Valkey Sentinel](https://valkey.io/topics/sentinel/): quorum, bầu người điều phối, các mô hình triển khai mẫu và mục về mất ghi do replication bất đồng bộ.
+- [Valkey: Replication](https://valkey.io/topics/replication/): replication bất đồng bộ, `WAIT`, `min-replicas-to-write`.
+- [CloudNativePG 1.30: FAQ](https://cloudnative-pg.io/docs/1.30/faq/): mục "Running PostgreSQL in Kubernetes", kỹ năng cần có và kiến trúc khuyên dùng.
+- [More Details on Today's Outage (Facebook, 2010)](https://engineering.fb.com/2010/09/23/uncategorized/more-details-on-today-s-outage/): nguồn của callout.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài này không cần Kubernetes: mọi thứ chạy bằng container Docker trên một mạng riêng `d19-net`, để thấy rõ từng tiến trình. Cần Docker Desktop và mạng để kéo image và gói Python.
+
+**Profile máy.** Sáu container của bài (hai Valkey, ba Sentinel, một PostgreSQL) dùng tổng khoảng 90 tới 180 MiB RAM của Docker, đo bằng `docker stats` ở cuối bước 5; container Python của bước 4 chỉ sống vài giây mỗi lần đo. Lần đầu phải kéo image Valkey (khoảng 40 MB), PostgreSQL alpine (khoảng 110 MB), Python slim (khoảng 50 MB) và tải ba gói Python, nên bước 1 và bước 4 có thể mất vài phút. Máy 8 GB chạy được bài này, kể cả khi đặt Docker 4 GB.
+
+<Callout kind="danger">
+
+Bài này dừng container Valkey primary để gây failover, và xoá các container của bài ở cuối. Mọi container của bài có tiền tố `d19-`; đừng dùng các lệnh `docker stop`, `docker rm` của bài với tên khác.
+
+</Callout>
+
+### 1. Valkey có replica và ba Sentinel
+
+Một primary, một replica, ba Sentinel, image Valkey ghim digest. Biến `V` giữ tên image cho các khối sau; hàm `vc` chạy `valkey-cli` trong một container tạm trên cùng mạng. File cấu hình Sentinel dùng tên container thay vì IP (`resolve-hostnames`, `announce-hostnames`), vì IP trong mạng Docker có thể đổi khi container khởi động lại; `down-after-milliseconds 5000` nghĩa là Sentinel coi primary hỏng sau 5 giây không trả lời; quorum là 2 trên 3. Mỗi Sentinel cần một file cấu hình riêng vì nó tự ghi trạng thái vào đó.
+
+<Terminal where="mac" title="~/masteva-d24/d24-5/sentinel.conf">
+
+```bash
+mkdir -p ~/masteva-d24/d24-5 && cd ~/masteva-d24/d24-5
+V=valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+vc() { docker run --rm --network d19-net $V valkey-cli "$@"; }
+docker network create d19-net
+docker run -d --name d19-valkey-1 --network d19-net $V valkey-server --save "" --appendonly no --replica-announce-ip d19-valkey-1
+docker run -d --name d19-valkey-2 --network d19-net $V valkey-server --save "" --appendonly no --replica-announce-ip d19-valkey-2 --replicaof d19-valkey-1 6379
+cat > sentinel.conf <<'EOF'
+sentinel resolve-hostnames yes
+sentinel announce-hostnames yes
+sentinel monitor mymaster d19-valkey-1 6379 2
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 30000
+EOF
+for i in 1 2 3; do
+  cp sentinel.conf sentinel-$i.conf
+  docker run -d --name d19-sentinel-$i --network d19-net -v "$PWD/sentinel-$i.conf:/data/sentinel.conf" \
+    $V valkey-sentinel /data/sentinel.conf --sentinel announce-ip d19-sentinel-$i
+done
+for i in $(seq 1 30); do vc -h d19-valkey-2 info replication | grep -q 'master_link_status:up' && break; sleep 1; done
+vc -h d19-valkey-1 info replication | grep -E '^(role|connected_slaves|slave0)'
+vc -h d19-sentinel-1 -p 26379 sentinel get-master-addr-by-name mymaster
+vc -h d19-sentinel-1 -p 26379 sentinel ckquorum mymaster
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+a8e02812baccbec56fbaf7f38a398ef1a2de64ad56874d0c1b6be76133691e57
+...
+role:master
+connected_slaves:1
+slave0:ip=d19-valkey-2,port=6379,state=online,offset=869,lag=1,type=replica
+d19-valkey-1
+6379
+OK 3 usable Sentinels. Quorum and failover authorization can be reached
+```
+
+</Expected>
+
+Sáu dòng đầu (rút gọn trong kết quả mẫu) là mã của mạng và năm container mà `docker run -d` in ra, trên máy bạn khác. Primary có một replica đang `online`; Sentinel trả về địa chỉ primary dưới dạng tên container và cổng; `ckquorum` xác nhận ba Sentinel đủ để đạt quorum 2 và đủ quá nửa để được phép failover.
+
+**Các khối sau dùng biến `V` và hàm `vc` của khối này.** Mở terminal mới giữa chừng bài thì dán khối dưới trước.
+
+<Terminal where="mac" title="Khi mở terminal mới">
+
+```bash
+cd ~/masteva-d24/d24-5
+V=valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+vc() { docker run --rm --network d19-net $V valkey-cli "$@"; }
+```
+
+</Terminal>
+
+### 2. Chạm trần bộ nhớ: `noeviction` và `allkeys-lru`
+
+Đặt trần 16 MB với chính sách mặc định `noeviction`, rồi dùng `valkey-benchmark` (đi kèm Valkey) ghi 50.000 key ngẫu nhiên, mỗi key 1 KB, tổng cỡ 50 MB.
+
+<Predict question="Trần 16 MB, chính sách noeviction, ghi 50 MB. Lệnh ghi thứ mười nghìn có thành công không?">
+
+Không. Với `noeviction`, khi bộ nhớ dữ liệu chạm 16 MB, mọi lệnh ghi làm tăng bộ nhớ bị từ chối với lỗi `OOM`; Valkey không tự xoá gì. Khoảng 6.000 key đầu vào được, phần còn lại bị từ chối, và `valkey-benchmark` dừng ngay ở lỗi đầu tiên. Với một cache, đây là lỗi phía ứng dụng: mọi lệnh `SET` sau khi miss đều thất bại.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+vc -h d19-valkey-1 config set maxmemory 16mb
+vc -h d19-valkey-1 config get maxmemory-policy | tail -1
+docker run --rm --network d19-net $V valkey-benchmark -h d19-valkey-1 -t set -n 50000 -r 1000000 -d 1024 -q 2>&1 | tr '\r' '\n' | grep -o 'Error.*' | head -1
+vc -h d19-valkey-1 info memory | grep -E '^(used_memory_human|maxmemory_human)'
+vc -h d19-valkey-1 dbsize
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+OK
+noeviction
+Error from server: OOM command not allowed when used memory > 'maxmemory'.
+used_memory_human:15.20M
+maxmemory_human:16.00M
+6105
+```
+
+</Expected>
+
+Bộ nhớ dữ liệu dừng ngay dưới trần, khoảng 6.100 key, và lệnh ghi bị từ chối. Đây là hành vi mặc định: nếu bạn dùng Valkey làm cache mà quên đổi chính sách, cache đầy là cache ngừng nhận ghi.
+
+Đổi sang `allkeys-lru`, xoá thống kê, ghi lại đúng lượng đó.
+
+<Terminal where="mac">
+
+```bash
+vc -h d19-valkey-1 config set maxmemory-policy allkeys-lru
+vc -h d19-valkey-1 config resetstat
+docker run --rm --network d19-net $V valkey-benchmark -h d19-valkey-1 -t set -n 50000 -r 1000000 -d 1024 -q 2>&1 | tr '\r' '\n' | grep . | tail -1
+vc -h d19-valkey-1 info stats | grep -E '^evicted_keys'
+vc -h d19-valkey-1 dbsize
+vc -h d19-valkey-2 dbsize
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+OK
+OK
+SET: 125313.29 requests per second, p50=0.223 msec
+evicted_keys:52748
+3193
+3193
+```
+
+</Expected>
+
+Lần này cả 50.000 lệnh ghi đều thành công (dòng `SET: ... requests per second`; con số trên máy bạn khác), và Valkey đã đuổi hơn 50.000 key để giữ bộ nhớ dưới trần: `evicted_keys` đếm cả những key vừa ghi rồi bị đuổi ngay. Còn lại khoảng 3.000 key, ít hơn lúc `noeviction`, vì bộ đệm của các kết nối ghi đồng thời và của replica cũng chiếm bộ nhớ. Replica có cùng số key: primary đuổi key nào thì gửi lệnh xoá key đó sang replica, replica không tự đuổi. Đây là cái giá của cache đầy: mỗi key bị đuổi là một lần miss sau đó, và database gánh lần miss đó.
+
+<Check id="d24.5.lab-eviction">Đặt được `maxmemory` và chính sách eviction lúc đang chạy, cho thấy được lệnh ghi bị từ chối với `noeviction` và key bị đuổi với `allkeys-lru`, và đọc được `evicted_keys`, `used_memory`.</Check>
+
+### 3. Tìm hot key và big key
+
+`--hotkeys` cần chính sách LFU. Đổi sang `allkeys-lfu`, đọc một key `promo:1` 20.000 lần (một sản phẩm đang khuyến mãi), rồi hỏi Valkey key nào nóng nhất. Sau đó dựng một big key: một hash 200.000 field, bằng một script Lua chạy trên server.
+
+<Terminal where="mac">
+
+```bash
+vc -h d19-valkey-1 config set maxmemory-policy allkeys-lfu
+vc -h d19-valkey-1 set promo:1 "giam-gia-50"
+docker run --rm --network d19-net $V valkey-benchmark -h d19-valkey-1 -n 20000 -q GET promo:1 2>&1 | tr '\r' '\n' | grep . | tail -1
+vc -h d19-valkey-1 --hotkeys 2>/dev/null | grep -E 'hot key found' | head -3
+vc -h d19-valkey-1 config set maxmemory 256mb
+vc -h d19-valkey-1 eval "for i = 1, 200000 do server.call('HSET', KEYS[1], 'f' .. i, i) end return 1" 1 big:hash
+vc -h d19-valkey-1 --bigkeys 2>/dev/null | grep -E '^Biggest'
+vc -h d19-valkey-1 memory usage big:hash
+vc -h d19-valkey-1 slowlog get 1 | head -4
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+OK
+OK
+GET promo:1: 136054.42 requests per second, p50=0.183 msec
+hot key found with counter: 60	keyname: "promo:1"
+OK
+1
+Biggest   hash found '"big:hash"' has 200000 fields
+Biggest string found '"key:000000156813"' has 1024 bytes
+7471736
+0
+1792591934
+304795
+eval
+```
+
+</Expected>
+
+Đọc từng phần:
+
+- `--hotkeys` tìm ra `promo:1`. Con số `counter` là bộ đếm tần suất kiểu logarit của LFU (khoảng 50 tới 90 trên máy bạn), không phải số lần đọc.
+- `--bigkeys` báo hash `big:hash` có 200.000 field; `MEMORY USAGE` cho biết nó chiếm khoảng 7 MB, nhiều hơn cả 3.000 chuỗi 1 KB cộng lại.
+- `SLOWLOG GET 1` in lệnh chậm nhất gần đây: mã, thời điểm (unix), **thời gian chạy tính bằng micro giây** (khoảng 0,3 giây trong kết quả mẫu), rồi tên lệnh. Trong 0,3 giây đó, luồng chính không phục vụ được client nào khác. Xoá key này bằng `DEL` cũng mất thời gian cỡ đó; `UNLINK` trả lời ngay và giải phóng bộ nhớ ở luồng nền.
+
+<Check id="d24.5.lab-hot-big">Tìm được hot key bằng `--hotkeys` sau khi bật chính sách LFU, tìm được big key bằng `--bigkeys` và `MEMORY USAGE`, và đọc được trong `SLOWLOG` một lệnh đã chiếm luồng chính bao lâu.</Check>
+
+### 4. Cache stampede dồn vào PostgreSQL, rồi sửa
+
+Database là PostgreSQL 18.6 (image chính thức, ghim digest), `max_connections` 40. Hàm `load_product` giả lập một truy vấn đắt: nghỉ 200 ms, và mỗi lần được gọi thì tăng sequence `loads`, để biết database thật sự bị gọi bao nhiêu lần. Vòng chờ dùng `pg_isready -h 127.0.0.1` (qua TCP): image `postgres` chính thức chạy một server khởi tạo tạm chỉ nghe socket unix rồi mới khởi động server thật, nên kiểm qua socket có thể báo sẵn sàng quá sớm.
+
+<Terminal where="mac">
+
+```bash
+docker run -d --name d19-pg --network d19-net -e POSTGRES_PASSWORD=masteva -e POSTGRES_DB=shop \
+  postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 -c max_connections=40
+for i in $(seq 1 60); do docker exec d19-pg pg_isready -h 127.0.0.1 -U postgres > /dev/null 2>&1 && break; sleep 1; done
+docker exec -i d19-pg psql -U postgres -h 127.0.0.1 shop -q <<'EOF'
+create table products (id int primary key, name text, price int);
+insert into products values (1, 'tai nghe', 990000);
+create sequence loads;
+create function load_product(p int) returns text language plpgsql as $$
+begin
+  perform nextval('loads');
+  perform pg_sleep(0.2);
+  return (select name || ':' || price from products where id = p);
+end $$;
+EOF
+docker exec d19-pg psql -U postgres -h 127.0.0.1 shop -Atc "select load_product(1)"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+tai nghe:990000
+```
+
+</Expected>
+
+"Ứng dụng" là script Python `stampede.py`, chạy trong container dựng từ image `python:3.14-slim` (ghim digest) với hai thư viện ghim phiên bản: `valkey` (client) và `psycopg` cùng `psycopg-pool` (driver PostgreSQL và pool kết nối). Script khởi động một số tiến trình, mỗi tiến trình giống một pod: có pool riêng tối đa 10 kết nối, chờ lấy kết nối tối đa 1 giây (quá thì lỗi `PoolTimeout`, như một request bị timeout), và một số luồng cùng lúc đọc key `product:1` theo kiểu cache-aside. Ba cách xử lý khi miss, chọn bằng tham số đầu:
+
+- `naive`: miss thì tự đi hỏi database rồi ghi cache.
+- `coalesce`: gộp request trong một tiến trình; luồng đầu tiên đi hỏi, các luồng khác cùng tiến trình chờ kết quả đó.
+- `lock`: khoá phân tán bằng `SET lock:product:1 <token> NX PX 5000`; ai lấy được khoá thì hỏi database, còn lại đọc lại cache mỗi 20 ms, tối đa 3 giây. Khoá được nhả bằng một script Lua chỉ xoá khi token còn là của mình.
+
+<Terminal where="mac" title="~/masteva-d24/d24-5/stampede.py">
+
+```bash
+cat > Dockerfile <<'EOF'
+FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+RUN pip install --no-cache-dir --only-binary=:all: valkey==6.2.0 psycopg[binary]==3.3.6 psycopg-pool==3.3.3
+EOF
+docker build -q -t d19-cache-client:1 . > /dev/null && echo "đã dựng d19-cache-client:1"
+cat > stampede.py <<'EOF'
+import sys, time, threading, uuid, multiprocessing as mp
+import valkey, psycopg_pool
+
+KEY, TTL = "product:1", 60
+
+def run(mode, threads, out):
+    r = valkey.Valkey(host="d19-valkey-1", port=6379, socket_timeout=5)
+    pool = psycopg_pool.ConnectionPool("host=d19-pg user=postgres password=masteva dbname=shop",
+                                       min_size=0, max_size=10, timeout=1, open=True)
+    inflight, guard = {}, threading.Lock()
+
+    def load():
+        with pool.connection() as c:
+            return c.execute("select load_product(1)").fetchone()[0]
+
+    def naive():
+        v = r.get(KEY)
+        if v is None:
+            v = load()
+            r.set(KEY, v, ex=TTL)
+        return v
+
+    def coalesce():
+        v = r.get(KEY)
+        if v is not None:
+            return v
+        with guard:
+            ev = inflight.get(KEY)
+            leader = ev is None
+            if leader:
+                ev = inflight[KEY] = threading.Event()
+        if leader:
+            try:
+                v = load()
+                r.set(KEY, v, ex=TTL)
+            finally:
+                ev.set()
+                with guard:
+                    inflight.pop(KEY, None)
+            return v
+        ev.wait(5)
+        return r.get(KEY)
+
+    def lock():
+        v = r.get(KEY)
+        if v is not None:
+            return v
+        token = uuid.uuid4().hex
+        if r.set("lock:" + KEY, token, nx=True, px=5000):
+            try:
+                v = load()
+                r.set(KEY, v, ex=TTL)
+            finally:
+                r.eval("if server.call('get', KEYS[1]) == ARGV[1] then return server.call('del', KEYS[1]) end return 0",
+                       1, "lock:" + KEY, token)
+            return v
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            time.sleep(0.02)
+            v = r.get(KEY)
+            if v is not None:
+                return v
+        raise TimeoutError("chờ cache quá 3 giây")
+
+    fn = {"naive": naive, "coalesce": coalesce, "lock": lock}[mode]
+    barrier = threading.Barrier(threads)
+    lat, errs = [], []
+
+    def worker():
+        barrier.wait()
+        t = time.perf_counter()
+        try:
+            fn()
+            lat.append(time.perf_counter() - t)
+        except Exception as e:
+            errs.append(type(e).__name__)
+
+    ts = [threading.Thread(target=worker) for _ in range(threads)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    pool.close()
+    out.put((lat, errs))
+
+if __name__ == "__main__":
+    mode, total, procs = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+    q = mp.Queue()
+    ps = [mp.Process(target=run, args=(mode, total // procs, q)) for _ in range(procs)]
+    for p in ps: p.start()
+    lat, errs = [], []
+    for _ in ps:
+        l, e = q.get(); lat += l; errs += e
+    for p in ps: p.join()
+    lat.sort()
+    p50 = lat[len(lat) // 2] * 1000 if lat else 0
+    p99 = lat[max(int(len(lat) * 0.99) - 1, 0)] * 1000 if lat else 0
+    print(f"{mode}: {total} request, {procs} tiến trình, thành công {len(lat)}, lỗi {len(errs)} {sorted(set(errs))}, p50 {p50:.0f} ms, p99 {p99:.0f} ms")
+EOF
+```
+
+</Terminal>
+
+Hàm `run` làm một lần đo: xoá key cache (giả lập key nóng vừa hết hạn), đặt lại sequence `loads`, chạy 400 request cùng lúc chia cho 4 tiến trình (4 "pod" × 100 luồng), rồi in số lần database bị gọi.
+
+<Terminal where="mac">
+
+```bash
+run() {
+  vc -h d19-valkey-1 del product:1 > /dev/null
+  docker exec d19-pg psql -U postgres -h 127.0.0.1 shop -Atc "select setval('loads', 1, false)" > /dev/null
+  docker run --rm --network d19-net -v "$PWD/stampede.py:/app/stampede.py:ro" d19-cache-client:1 python /app/stampede.py $1 400 4
+  echo "database bị gọi: $(docker exec d19-pg psql -U postgres -h 127.0.0.1 shop -Atc "select case when is_called then last_value else 0 end from loads") lần"
+}
+run naive
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+naive: 400 request, 4 tiến trình, thành công 212, lỗi 188 ['PoolTimeout'], p50 746 ms, p99 1303 ms
+database bị gọi: 212 lần
+```
+
+</Expected>
+
+400 request cùng miss một key, và database bị gọi hơn 200 lần cho đúng một giá trị. Mỗi "pod" chỉ có 10 kết nối, mỗi truy vấn 200 ms, nên request thứ 50 của một pod phải chờ khoảng một giây mới có kết nối; gần một nửa số request không lấy được kết nối trong 1 giây và lỗi `PoolTimeout`. Request thành công cũng chậm: trung vị khoảng 0,7 tới 0,9 giây cho một giá trị lẽ ra đọc từ cache trong vài mili giây. Số lỗi và số lần gọi database trên máy bạn dao động quanh mức đó (khoảng 190 tới 210), vì phụ thuộc thời điểm các luồng đến. Không có giới hạn 1 giây, cả 400 request đều tới database.
+
+Hai cách sửa, cùng tải đó:
+
+<Terminal where="mac">
+
+```bash
+run coalesce
+run lock
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+coalesce: 400 request, 4 tiến trình, thành công 400, lỗi 0 [], p50 243 ms, p99 257 ms
+database bị gọi: 4 lần
+lock: 400 request, 4 tiến trình, thành công 400, lỗi 0 [], p50 251 ms, p99 264 ms
+database bị gọi: 1 lần
+```
+
+</Expected>
+
+- `coalesce`: database bị gọi **4 lần**, đúng bằng số tiến trình: mỗi "pod" gộp được request của chính nó, không gộp được với pod khác. Với 30 pod là 30 lần gọi.
+- `lock`: database bị gọi **1 lần**, dù có 4 tiến trình: khoá nằm ở Valkey nên chung cho mọi pod.
+- Cả hai cách đều không còn lỗi nào, và độ trễ của mọi request về khoảng 250 tới 300 ms: một truy vấn 200 ms cộng thời gian chờ đọc lại cache.
+
+Chọn cách nào: gộp request rẻ, không phụ thuộc gì bên ngoài, và thường đủ khi số pod nhỏ. Khoá phân tán bảo vệ database tốt nhất, đổi lại thêm một phụ thuộc vào Valkey: nếu chính Valkey chậm hay mất, đường khoá cũng hỏng theo, nên vẫn cần giới hạn đồng thời ở đường gọi database.
+
+<Check id="d24.5.lab-stampede">Tái hiện được một cache stampede đếm được số lần database bị gọi, số request lỗi và độ trễ, và đo lại được sau khi sửa bằng gộp request trong tiến trình và bằng khoá phân tán.</Check>
+
+### 5. Primary chết: Sentinel failover
+
+Dừng container primary và hỏi Sentinel địa chỉ primary mỗi giây, tối đa 60 giây.
+
+<Predict question="down-after-milliseconds là 5 giây. Sentinel trả địa chỉ primary mới sau khoảng bao lâu?">
+
+Khoảng 5 giây để Sentinel đầu tiên đánh dấu primary hỏng (`down-after-milliseconds`), cộng thời gian các Sentinel đồng ý, bầu người điều phối và đưa replica lên. Tổng cộng thường vài giây hơn 5 giây; trong khoảng đó, mọi lệnh ghi vào cache đều lỗi, và mọi lệnh đọc trỏ tới primary cũ cũng lỗi.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+docker stop d19-valkey-1
+S=$(date +%s)
+for i in $(seq 1 60); do
+  M=$(vc -h d19-sentinel-1 -p 26379 sentinel get-master-addr-by-name mymaster | head -1)
+  [ "$M" = d19-valkey-2 ] && break; sleep 1
+done
+echo "primary mới: $M sau $(( $(date +%s) - S )) giây"
+vc -h d19-valkey-2 info replication | grep '^role'
+vc -h d19-valkey-2 dbsize
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d19-valkey-1
+primary mới: d19-valkey-2 sau 7 giây
+role:master
+3121
+```
+
+</Expected>
+
+Khoảng 7 giây sau khi primary dừng, Sentinel trả về `d19-valkey-2`, và nó đã là `master`, giữ dữ liệu đã chép từ primary cũ (khoảng 3.100 key). Con số trên máy bạn thường trong khoảng 6 tới 10 giây. Client dùng Sentinel đúng cách (hỏi lại địa chỉ khi kết nối lỗi) tự chuyển sang primary mới; client nối cứng vào `d19-valkey-1` thì lỗi tới khi có người sửa cấu hình. Những gì ghi vào primary cũ mà chưa kịp chép sang replica thì mất: replication bất đồng bộ.
+
+Khởi động lại primary cũ: Sentinel cấu hình nó thành replica của primary mới.
+
+<Terminal where="mac">
+
+```bash
+docker start d19-valkey-1 > /dev/null
+for i in $(seq 1 60); do vc -h d19-valkey-1 info replication 2>/dev/null | grep -q '^role:slave' && break; sleep 1; done
+vc -h d19-valkey-1 info replication | grep -E '^(role|master_host)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+role:slave
+master_host:d19-valkey-2
+```
+
+</Expected>
+
+<Check id="d24.5.lab-sentinel">Dựng được Valkey có replica và ba Sentinel, gây được failover bằng cách dừng primary, đo được thời gian tới khi Sentinel trả primary mới, và chỉ ra được primary cũ quay về làm replica.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Dán một khối nhiều lệnh, vài lệnh sau không chạy | Một lệnh `docker run -i` đọc mất phần còn lại của khối đang dán | Hàm `vc` của bài không dùng `-i`; đừng thêm vào |
+| `sentinel get-master-addr-by-name` trả về IP thay vì tên | Thiếu `announce-hostnames` hoặc `replica-announce-ip` | So lệnh `docker run` của bạn với bước 1 |
+| `ckquorum` báo `NOQUORUM` | Một hai Sentinel chưa chạy hoặc không thấy nhau | `docker logs d19-sentinel-2`; ba Sentinel phải cùng mạng `d19-net` |
+| Bước 4 báo `connection refused` tới `d19-pg` | PostgreSQL chưa sẵn sàng | `docker exec d19-pg pg_isready -h 127.0.0.1 -U postgres` |
+| `pip install` lỗi khi dựng image | Mất mạng, hoặc chưa có bản wheel cho kiến trúc máy bạn | Xem log `docker build` không có `-q`; ba gói đều có wheel cho arm64 và amd64 |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Khối lệnh dưới xoá mọi container và mạng của bài, image `d19-cache-client:1`, và thư mục lab.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá container, mạng, image và thư mục lab">
+
+```bash
+docker rm -f d19-valkey-1 d19-valkey-2 d19-sentinel-1 d19-sentinel-2 d19-sentinel-3 d19-pg
+docker network rm d19-net
+docker rmi d19-cache-client:1
+rm -rf ~/masteva-d24/d24-5
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao cache thường đặt `allkeys-lru` mà không phải `volatile-lru`?">
+
+Với `volatile-*`, Valkey chỉ đuổi những key có TTL. Một ứng dụng quên đặt TTL cho một nhóm key thì nhóm đó không bao giờ bị đuổi, và khi bộ nhớ chỉ còn những key đó, Valkey cư xử như `noeviction`: từ chối ghi. `allkeys-lru` không phụ thuộc vào việc mọi đoạn code đều nhớ đặt TTL, và tài liệu Valkey ghi thêm rằng TTL tốn bộ nhớ, nên chính sách `allkeys-*` cũng hiệu quả hơn về bộ nhớ. Dùng `volatile-*` khi bạn cố ý để một instance vừa làm cache vừa giữ vài key không được mất; khi đó tài liệu Valkey khuyên dùng hai instance riêng.
+
+</Reveal>
+
+<Reveal title="Khoá phân tán bằng `SET NX PX` có an toàn tuyệt đối không?">
+
+Không, và với cache thì không cần. Người giữ khoá có thể bị dừng lâu hơn hạn khoá (GC, máy chậm); khoá hết hạn, một client khác lấy khoá, và hai bên cùng nạp. Failover của Valkey trong lúc khoá chưa kịp chép sang replica cũng làm khoá biến mất. Với cache stampede, hậu quả của các trường hợp đó chỉ là thêm một hai lần gọi database, chấp nhận được. Với việc cần loại trừ thật (chỉ một tiến trình được trừ tiền), đừng dựa vào khoá kiểu này; dùng ràng buộc trong database hoặc một hệ đồng thuận.
+
+</Reveal>
+
+<Reveal title="Có nên chạy Valkey trên Kubernetes không?">
+
+Valkey làm cache là trường hợp dễ nhất để chạy trong cụm: mất dữ liệu chỉ là mất cache, không phải mất dữ liệu nghiệp vụ. Những thứ cần tính: đặt `maxmemory` thấp hơn limit bộ nhớ của container một khoảng (bộ đệm kết nối, bộ đệm replica và phân mảnh bộ nhớ không tính vào `maxmemory`), nếu không kernel sẽ OOM-kill Valkey trước khi nó kịp đuổi key; dùng PodDisruptionBudget và anti-affinity cho primary và replica (K5.2); và nếu dùng Sentinel, client phải hỏi Sentinel chứ không nối cứng vào Service của một pod. Valkey dùng làm nơi lưu dữ liệu chính thì đòi hỏi như mọi database ở phần cuối phần Kiến thức.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết code cache-aside có gộp request hay khoá phân tán cho ngôn ngữ của bạn, đề xuất TTL và chính sách eviction từ mô tả tải, lập bảng so sánh ba lựa chọn đặt database cho hệ thống cụ thể của bạn.
+
+**AI hay sai ở đâu:** nhả khoá bằng `DEL` không kiểm token (xoá nhầm khoá của người khác khi khoá đã hết hạn); không đặt hạn cho khoá; quên rằng `noeviction` là mặc định; gợi ý `KEYS *` để tìm big key trên production (chặn luồng chính) thay vì `--bigkeys` dùng `SCAN`; coi Redis và Valkey khác nhau về lệnh; và trả lời "nên dùng dịch vụ được quản lý" hay "nên tự chạy" mà không hỏi đội ngũ, SLO, tuân thủ.
+
+**Cách kiểm tra:** chạy lại bước 4 với code của bạn và đếm số lần database bị gọi; với lời khuyên về chỗ đặt database, đi lại từng hàng của bảng quyết định với số liệu thật của hệ thống.
+
+</Callout>
+
+<Callout kind="link">
+
+SB9.1 dạy cache-aside, TTL và stampede trong một JVM. D18.2 dạy trạng thái metastable và load shedding, thứ chặn vòng phản hồi trong sự cố Facebook. D19.1 dạy replication và failover của PostgreSQL, D19.4 của Kafka: cùng đánh đổi giữa tính sẵn sàng và mất ghi. K7.4 và K9.5 là nền cho lựa chọn chạy database bằng operator; D10 là chặng cloud, nơi có dịch vụ database được quản lý.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d24.5.mastery-cache">Vận hành được một Valkey có replica và Sentinel: đặt `maxmemory` và chính sách eviction, đọc được dấu hiệu thiếu bộ nhớ, tìm được hot key và big key, và nói được điều client thấy khi failover.</Check>
+
+<Check id="d24.5.mastery-stampede">Đo được tác động của một cache stampede lên database và chọn được cách chống phù hợp cho hệ thống nhiều pod.</Check>
+
+<Check id="d24.5.mastery-chon-cho">Viết được một đề xuất ngắn chọn chỗ đặt database cho một hệ thống cụ thể, có lý do theo từng tiêu chí và nêu rõ việc gì vẫn là của đội mình.</Check>
+
+</Mastery>

@@ -1,0 +1,769 @@
+---
+title: "RPO, RTO và chiến lược DR; hai site của ngân hàng"
+description: Đo RPO và RTO thay vì ghi chúng lên giấy, gắn chúng với SLO và chi phí; năm bậc chiến lược DR từ sao lưu và khôi phục tới active-active, mỗi bậc hay hỏng ở đâu; vì sao dữ liệu và các thành phần dùng chung (DNS, khoá, IdP, registry) quyết định DR; đọc các điều về sao lưu, dự phòng thảm hoạ và diễn tập chuyển đổi của Thông tư 09/2020/TT-NHNN; rồi làm mất một database PostgreSQL vài trăm MB, khôi phục nó bằng hai cách, đo số dòng bị mất và số giây khôi phục, và tính RTO thật bằng một script.
+id: d17.1
+step: d17
+prerequisites: [k7.4, d24.2]
+topics: [d17.rpo-rto, d17.chien-luoc-dr, d17.hai-site]
+status: verified
+verified:
+  date: 2026-10-21
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    postgresql: 18.6 (image postgres:18.6-alpine3.24)
+    python: 3.14.3
+---
+
+<Goal>
+
+K7.4 đã định nghĩa RPO và RTO trong một câu, và D19.2 đã đo thời gian khôi phục bằng một CronJob. Bài này mở đầu chặng DR: chọn cách chịu một thảm hoạ (mất cả máy, cả cụm, cả trung tâm dữ liệu) trước khi nó xảy ra. Học xong, bạn giải thích được:
+
+- RPO và RTO đo từ đâu tới đâu, vì sao con số RTO "trên giấy" thường chỉ là thời gian chạy lệnh khôi phục, và RTO thật gồm những pha nào.
+- Năm bậc chiến lược DR, mỗi bậc cho RPO, RTO cỡ nào, tốn gì, và hay hỏng ở đâu.
+- Vì sao một hệ thống có "site dự phòng" vẫn không chuyển sang được khi công cụ để chuyển chỉ nằm ở site chính.
+- Thông tư 09/2020/TT-NHNN yêu cầu gì về sao lưu, hệ thống dự phòng thảm hoạ và diễn tập chuyển đổi, và các yêu cầu đó thành con số kỹ thuật nào.
+
+</Goal>
+
+<Knowledge>
+
+### RPO và RTO: hai khoảng thời gian quanh một thảm hoạ
+
+**Thảm hoạ** (disaster) ở chặng này là sự cố mà cơ chế chịu lỗi thường ngày không che được: mất cả máy database lẫn đĩa của nó, mất cả cụm, mất cả trung tâm dữ liệu, hoặc dữ liệu bị xoá, bị mã hoá bởi mã độc. **DR** (disaster recovery, khôi phục sau thảm hoạ) là kế hoạch và hạ tầng để đưa dịch vụ trở lại sau những sự cố đó.
+
+```text
+   điểm khôi phục                 thảm hoạ                       dịch vụ chạy lại
+   gần nhất có được                  │                           ở mức đã cam kết
+        │◄──────── RPO ────────────►│◄────────────── RTO ────────────────►│
+        │  dữ liệu ghi trong khoảng  │  phát hiện → quyết định → cấp máy → │
+        │  này có thể mất            │  tải backup → khôi phục → kiểm tra →│
+        │                            │  chuyển ứng dụng                    │
+```
+
+- **RPO** (recovery point objective): lượng dữ liệu tối đa được phép mất, đo bằng thời gian. RPO 1 giờ nghĩa là mọi thứ ghi trong một giờ trước thảm hoạ có thể không lấy lại được. RPO do **cách sao lưu** quyết định: backup mỗi đêm thì RPO xấu nhất gần 24 giờ; có WAL archive với `archive_timeout` 60 giây thì xấu nhất khoảng 60 giây; replication đồng bộ sang site khác thì gần 0.
+- **RTO** (recovery time objective): thời gian tối đa từ lúc thảm hoạ tới lúc dịch vụ chạy lại ở mức đã cam kết. RTO do **cả chuỗi việc** sau thảm hoạ quyết định, không chỉ lệnh khôi phục.
+
+Chữ "objective" quan trọng: đó là mục tiêu cam kết. Thứ bạn đo được trong diễn tập là **RPO thực tế** và **RTO thực tế**; DR đạt khi hai số đo nằm trong hai mục tiêu.
+
+Bẫy hay gặp nhất là RTO trên giấy. Đội ghi "RTO 30 phút" vì lệnh `pg_restore` chạy mất 30 phút trên bản sao của tháng trước. RTO thật cộng thêm mọi pha trước và sau lệnh đó:
+
+| Pha | Gồm | Thường bị quên vì |
+|---|---|---|
+| Phát hiện | Alert kêu, người trực nhận | Thảm hoạ có thể làm chết luôn hệ giám sát |
+| Quyết định | Chắc chắn là phải khôi phục, không chờ sửa được tại chỗ | Không ai muốn chấp nhận mất dữ liệu; chờ "thêm 10 phút nữa" lặp lại nhiều lần |
+| Cấp máy, đĩa | Máy mới, đĩa đủ lớn, mạng, quyền | Hạn mức, hết hàng loại máy đó, quyền chỉ có ở tài khoản bị mất |
+| Tải backup về | Từ object storage ở site khác | Băng thông giữa hai site nhỏ hơn đĩa cục bộ hàng chục lần |
+| Khôi phục và phát lại WAL | `pg_restore`, bung base backup, replay WAL | Dữ liệu tăng mỗi tháng, phép đo thì không |
+| Kiểm dữ liệu | Đếm dòng, checksum, thử nghiệp vụ | Bỏ qua thì có thể mở lại dịch vụ trên dữ liệu sai |
+| Chuyển ứng dụng | Đổi chuỗi kết nối, DNS, mở lại traffic | TTL, cache, client giữ kết nối cũ (K10.3) |
+
+Lab của bài đo hai pha giữa bảng (khôi phục, phát lại WAL) trên máy bạn, rồi dùng một script cộng mọi pha để thấy khoảng cách.
+
+<Check id="d17.1.rpo-rto">Vẽ lại được trục thời gian của RPO và RTO quanh một thảm hoạ, nói được cách sao lưu quyết định RPO thế nào, và kể được ít nhất sáu pha của RTO thật ngoài lệnh khôi phục.</Check>
+
+### Gắn RPO, RTO với SLO và với chi phí
+
+D16.1 đã dạy SLO và error budget. RTO phải đọc cùng chúng: SLO availability 99,9% theo tháng cho khoảng 43 phút ngừng mỗi tháng. Một lần khôi phục mất 4 giờ đốt hết error budget của khoảng năm tháng rưỡi. Vì vậy hai câu hỏi phải trả lời cùng lúc:
+
+- Thảm hoạ có được tính vào SLO không? Nhiều tổ chức tách riêng: SLO cho vận hành thường ngày, RTO và RPO cho thảm hoạ, và ghi rõ cả hai trong cam kết với khách hàng.
+- Bạn trả bao nhiêu để giảm một con số? RPO và RTO càng nhỏ thì chi phí tăng theo bậc thang, không theo đường thẳng: từ "backup ra object storage" lên "một bản sao chạy liên tục ở site khác" là nhân đôi hạ tầng cho phần dữ liệu.
+
+Không phải dữ liệu nào cũng cần cùng một mục tiêu. Quy trình chuẩn là **phân tích tác động nghiệp vụ** (business impact analysis, BIA): với từng hệ thống, mất một giờ dữ liệu hay ngừng một giờ thì thiệt hại gì, rồi mới đặt mục tiêu.
+
+| Dữ liệu | RPO hợp lý | RTO hợp lý | Vì sao |
+|---|---|---|---|
+| Sổ giao dịch, số dư | Gần 0 | Vài phút tới vài giờ | Mất một giao dịch là sai số dư của khách |
+| Đơn hàng | Vài phút | Dưới một giờ | Mất đơn là mất tiền, nhưng có thể đối soát lại với cổng thanh toán |
+| Log, metric | Vài giờ | Một ngày | Mất một đoạn chỉ làm khó điều tra |
+| Cache, session | Không cần | Vài phút | Dựng lại từ nguồn khác được |
+
+<Check id="d17.1.slo-chi-phi">Tính được một lần ngừng dài bao lâu thì đốt hết error budget của một SLO cho trước, và đặt được RPO, RTO khác nhau cho ít nhất ba loại dữ liệu kèm lý do.</Check>
+
+### Năm bậc chiến lược DR
+
+Từ rẻ tới đắt, dựa theo whitepaper "Disaster Recovery of Workloads on AWS" (cách chia dùng được cho cả on-premise). Whitepaper chia bốn chiến lược; bài tách hot standby, biến thể active-passive mà whitepaper xếp chung mục với multi-site active-active, thành một bậc riêng:
+
+```text
+  site chính       site dự phòng (DR site)
+  ┌────────┐
+  │ app+DB │ ─ backup ─►  [ object storage ]                           1. backup và khôi phục
+  └────────┘
+  ┌────────┐            ┌──────────────────┐
+  │ app+DB │ ─ repl ──► │ DB chạy; app TẮT │                           2. pilot light
+  └────────┘            └──────────────────┘
+  ┌────────┐            ┌──────────────────────────┐
+  │ app+DB │ ─ repl ──► │ DB chạy; app chạy, ÍT máy│                   3. warm standby
+  └────────┘            └──────────────────────────┘
+  ┌────────┐            ┌──────────────────────────┐
+  │ app+DB │ ─ repl ──► │ đủ công suất, không nhận │                   4. active-passive (hot standby)
+  └────────┘            │ người dùng               │
+                        └──────────────────────────┘
+  ┌────────┐ ◄─ repl ─► ┌──────────────────────────┐
+  │ app+DB │            │ app+DB, cùng nhận người  │                   5. active-active
+  └────────┘            │ dùng                     │
+                        └──────────────────────────┘
+```
+
+| Bậc | RPO thường đạt | RTO thường đạt | Chi phí ở site DR | Hay hỏng ở đâu |
+|---|---|---|---|---|
+| 1. Backup và khôi phục | Từ phút (có WAL archive) tới một ngày | Giờ tới ngày | Chỉ chỗ chứa backup | Backup chưa từng khôi phục thử; thời gian khôi phục tăng theo dữ liệu; phải dựng lại cả hạ tầng |
+| 2. Pilot light | Giây tới phút | Hàng chục phút | Database chạy liên tục, phần còn lại tắt | Lúc bật app lên mới thấy thiếu cấu hình, thiếu quyền, hết hạn mức máy |
+| 3. Warm standby | Giây tới phút | Phút | Cả hệ thống chạy ở quy mô nhỏ | Không kịp tăng công suất khi cả tải dồn sang |
+| 4. Active-passive | Giây (bất đồng bộ) | Phút | Gần gấp đôi | Site dự phòng "chạy" nhưng chưa từng nhận người dùng thật; failover là đường ít được đi |
+| 5. Active-active | Gần 0 với dữ liệu chia vùng; giây với bất đồng bộ | Gần 0 | Gấp đôi, cộng chi phí thiết kế | Xung đột ghi giữa hai nơi; mỗi site chạy 70% thì mất một site là site kia nhận 140% (K10.3) |
+
+Ba điều bảng không nói hết:
+
+- **Các bậc trên vẫn cần backup.** Replication chép cả lệnh `DELETE` sai và cả dữ liệu bị mã hoá; chỉ backup có lịch sử theo thời gian (K7.4) cứu được. Whitepaper của AWS ghi rõ: với thảm hoạ dữ liệu (hỏng, xoá), kể cả active-active cũng phải dựa vào backup và điểm khôi phục luôn nằm trước lúc phát hiện.
+- **Số trong bảng là cỡ độ lớn, không phải cam kết.** Bậc nào cũng chỉ đạt khi đã đo trong diễn tập. Một warm standby chưa từng chạy thử có thể chậm hơn một backup được khôi phục thử mỗi ngày.
+- **Pilot light và warm standby khác nhau ở một câu hỏi**: site DR có nhận được request ngay không. Pilot light phải bật máy, triển khai thêm rồi mới phục vụ được; warm standby đã phục vụ được, chỉ cần tăng quy mô.
+
+<Check id="d17.1.bac-chien-luoc">Kể được năm bậc chiến lược DR (bốn chiến lược của whitepaper AWS, tách thêm hot standby), so sánh được chúng theo RPO, RTO, chi phí và kiểu hỏng hay gặp, phân biệt được pilot light với warm standby, và giải thích được vì sao bậc nào cũng vẫn cần backup.</Check>
+
+### DR cho dữ liệu khác DR cho phần stateless
+
+Phần **stateless** (không tự giữ dữ liệu: web, API, worker) dựng lại được từ ba thứ đã nằm ngoài site: image trong registry, manifest trong Git (D13 dạy GitOps), cấu hình hạ tầng dạng code (D11). Dựng lại chúng ở site khác là vấn đề vài phút tới vài chục phút, và K10.3 đã chuyển traffic giữa hai cụm như vậy.
+
+Phần **dữ liệu** thì không dựng lại được từ Git. Nó phải được chép liên tục sang site khác trước thảm hoạ, và câu hỏi là chép kiểu gì:
+
+| | Backup ra object storage | Replication bất đồng bộ | Replication đồng bộ |
+|---|---|---|---|
+| RPO | Chu kỳ backup, hoặc `archive_timeout` | Độ trễ replication lúc thảm hoạ, thường giây | Gần 0 |
+| RTO | Thời gian khôi phục, tỉ lệ với kích thước | Thời gian promote bản sao | Thời gian promote bản sao |
+| Cái giá | Rẻ; RTO tăng theo dữ liệu | Có một database chạy liên tục ở site DR | Mỗi `COMMIT` chờ thêm một vòng mạng giữa hai site (D19.1 đo cái giá này) |
+| Chống xoá nhầm | Có, nếu giữ lịch sử | Không: chép cả lệnh sai | Không |
+
+Hệ quả thực dụng: RTO của cả hệ thống bằng RTO của **phần chậm nhất**, gần như luôn là dữ liệu. Phần web chuyển trong ba giây không giúp gì khi database còn đang khôi phục. D20.2 và D20.3 làm DR cho cả hai phần trên Kubernetes; D20.4 làm replication giữa hai cụm.
+
+<Check id="d17.1.du-lieu-stateless">Giải thích được vì sao DR cho phần stateless và cho dữ liệu khác nhau, so sánh được ba cách đưa dữ liệu sang site DR theo RPO, RTO và cái giá, và chỉ ra được phần nào quyết định RTO của cả hệ thống.</Check>
+
+### Thành phần dùng chung: thứ DR hay quên
+
+Sơ đồ DR thường vẽ app và database. Thứ làm DR thất bại thường là những gì **mọi** hệ thống cùng dựa vào, và chúng nằm ở site chính:
+
+| Thành phần dùng chung | Nếu chỉ có ở site chính | Kiểm trong diễn tập bằng |
+|---|---|---|
+| DNS (máy chủ DNS nội bộ, nơi sửa bản ghi) | Không đổi được bản ghi để trỏ sang site DR | Đổi bản ghi khi site chính bị cắt hẳn |
+| Khoá: KMS, kho secret (OpenBao, D15), CA nội bộ (D9.4) | Database khôi phục xong nhưng không giải mã được, app không lấy được mật khẩu | Khôi phục ở site DR mà không gọi được gì về site chính |
+| IdP, SSO cho người vận hành | Người trực không đăng nhập được vào chính công cụ để chuyển | Đăng nhập khi IdP chính bị tắt; tài khoản khẩn cấp (break-glass) |
+| Registry image, kho gói | Cụm DR không kéo được image để chạy | Cụm DR kéo image khi registry chính không có |
+| CI/CD, Git, công cụ triển khai | Không triển khai được bản sửa nào trong lúc DR | Triển khai từ site DR |
+| Giám sát, trang trạng thái, wiki chứa runbook | Không biết chuyện gì xảy ra, không báo được khách, không đọc được runbook | Diễn tập khi các công cụ đó ở site chính bị tắt |
+
+Quy tắc rút ra: liệt kê mọi thứ mà **thao tác DR** cần (không chỉ thứ mà ứng dụng cần), và mỗi thứ phải dùng được khi site chính mất hẳn. Bản in runbook và danh bạ liên lạc ở ngoài hệ thống là cách cũ nhưng vẫn đúng.
+
+<Callout kind="production">
+
+Khoảng 15:19 ngày 15/10/2022 (giờ Hàn Quốc), phòng ắc quy ở tầng hầm B3 của trung tâm dữ liệu SK C&C tại Pangyo bốc cháy; đám cháy được dập hẳn lúc 23:45 cùng ngày, và theo [kết quả điều tra Bộ Khoa học và ICT Hàn Quốc công bố ngày 06/12/2022](https://www.korea.kr/news/policyNewsView.do?newsId=156540855), việc chữa cháy và cắt điện cả toà nhà làm gián đoạn dịch vụ của các công ty đặt máy ở đó, trong đó có Kakao. Điện được cấp lại dần, đủ vào khoảng 05:00 ngày 19/10; Kakao đưa mọi dịch vụ về bình thường khoảng 23:00 ngày 20/10.
+
+Theo bản điều tra, Kakao chia hệ thống thành năm lớp và dự phòng theo kiểu active-standby giữa Pangyo và một trung tâm khác, nhưng phần standby không chạy được như mong đợi:
+
+- **Công cụ vận hành và quản trị dùng để nâng server standby lên active không được dự phòng ở trung tâm khác**, nên khi server active ở Pangyo chết, việc khôi phục bị kéo dài. Một số thành phần ở các lớp khác cũng không được nhân đôi giữa hai trung tâm.
+- Các chức năng lõi dùng chung, như xác thực tài khoản Kakao, tập trung ở Pangyo, nên gần như mọi dịch vụ bị ảnh hưởng ngay.
+- Diễn tập của Kakao chỉ ở mức lỗi một phần server hoặc mạng, chưa chuẩn bị cho kịch bản mất cả một trung tâm.
+
+[Bài của chính Kakao về kế hoạch phòng tái diễn](https://www.kakaocorp.com/page/detail/9900) thêm chi tiết:
+
+- Vụ cháy ảnh hưởng khoảng 34% tổng số server của Kakao.
+- Công cụ giám sát và phân tích chết theo, nên việc phát hiện lỗi không chạy đúng.
+- Phần lớn thông tin cấu hình môi trường cần để chuyển hay cài lại server nằm ở Pangyo.
+- Các công cụ nội bộ (xác thực tài khoản nội bộ, quản lý mã nguồn, triển khai ứng dụng, wiki, Jira) có cái chưa được dự phòng; công cụ triển khai ứng dụng chỉ dự phòng bên trong Pangyo.
+
+Chính phủ yêu cầu Kakao dự phòng công cụ vận hành giữa các trung tâm, phân tán chức năng lõi, diễn tập kịch bản trung tâm dữ liệu bị phá huỷ, và đặt mục tiêu khôi phục cho từng dịch vụ.
+
+Điều rút ra cho bài này (của bài): phần lớn các dòng của bảng thành phần dùng chung ở trên có mặt trong sự cố này: IdP nội bộ, quản lý mã nguồn và công cụ triển khai, giám sát, wiki; nguồn không nhắc DNS, kho khoá hay registry. Một site dự phòng chỉ có giá trị khi chính thao tác chuyển sang nó không cần tới site chính.
+
+</Callout>
+
+<Check id="d17.1.phu-thuoc-chung">Liệt kê được ít nhất năm thành phần dùng chung mà thao tác DR cần, nói được mỗi thứ hỏng thì DR tắc ở đâu, và chỉ ra được trong sự cố Kakao 2022 thành phần nào đã làm standby không lên được.</Check>
+
+### Hai site của ngân hàng: Thông tư 09/2020/TT-NHNN
+
+Ngân hàng tại Việt Nam vận hành hệ thống thông tin theo **Thông tư 09/2020/TT-NHNN** của Ngân hàng Nhà nước "quy định về an toàn hệ thống thông tin trong hoạt động ngân hàng", ký ngày 21/10/2020, hiệu lực từ 01/01/2021 (Điều 56), thay Thông tư 18/2018/TT-NHNN. Phần dưới chỉ thuật những điều về sao lưu và dự phòng, dẫn theo [bản đăng Công báo](https://congbao.chinhphu.vn/van-ban/thong-tu-so-09-2020-tt-nhnn-32321.htm); chặng D24 đi sâu phần tuân thủ còn lại. Thông tư 50/2024/TT-NHNN (hiệu lực 01/01/2025) bãi bỏ Điều 25 của TT 09, một điều về hệ thống giao dịch trực tuyến, không đụng tới các điều dưới đây. Theo Hiệp hội Ngân hàng Việt Nam, Công văn 627/CNTT3 ngày 19/03/2026 của Ngân hàng Nhà nước đề nghị Hiệp hội tổng hợp khó khăn và đề xuất sửa đổi TT 09 từ các ngân hàng; tới lúc viết bài chưa có dự thảo được công bố. Trước khi áp dụng vào dự án thật, kiểm lại văn bản đang có hiệu lực.
+
+**Cấp độ quyết định nghĩa vụ.** Điều 5 chia hệ thống thông tin thành cấp độ 1 tới 5. Hệ thống cung cấp dịch vụ trực tuyến cho khách hàng được phân loại theo Nghị định 85/2016/NĐ-CP (khoản 1); các khoản 2 tới 7 áp cho các hệ thống còn lại, và hai ví dụ sau thuộc nhóm đó: hệ thống phục vụ khách hàng yêu cầu chạy 24/7 và không chấp nhận ngừng mà không có kế hoạch trước là cấp độ 3 (khoản 4 điểm c); hệ thống phục vụ khách hàng có xử lý, lưu trữ dữ liệu của từ 10 triệu khách hàng trở lên là cấp độ 4 (khoản 5 điểm b). Hệ thống gồm nhiều thành phần lấy cấp độ cao nhất của các thành phần (khoản 7). Phần lớn nghĩa vụ dưới đây áp cho hệ thống **từ cấp độ 3 trở lên**.
+
+Các điều về sao lưu và dự phòng:
+
+| Điều, khoản | Văn bản yêu cầu | Thành con số kỹ thuật |
+|---|---|---|
+| Điều 22 khoản 1 | Lập danh sách hệ thống cần sao lưu, kèm thời gian lưu trữ, định kỳ sao lưu, phương pháp sao lưu và thời gian kiểm tra phục hồi | Mỗi hệ thống có bảng RPO, retention, phương pháp, lịch khôi phục thử |
+| Điều 22 khoản 2 | Dữ liệu hệ thống từ cấp độ 3 có phương án tự động sao lưu phù hợp tần suất thay đổi, bảo đảm dữ liệu phát sinh được sao lưu trong vòng 24 giờ | RPO của sao lưu không quá 24 giờ; đây là mức sàn |
+| Điều 22 khoản 3 | Dữ liệu sao lưu của hệ thống từ cấp độ 3 lưu ra phương tiện lưu trữ ngoài, cất giữ tách rời với khu vực đặt hệ thống nguồn ngay trong ngày làm việc tiếp theo | Backup phải rời khỏi site chính; object storage ở site khác, hoặc băng từ cất nơi khác |
+| Điều 22 khoản 4 | Kiểm tra, phục hồi dữ liệu sao lưu từ phương tiện lưu trữ ngoài tối thiểu một năm một lần (từ cấp độ 3), hai năm một lần (hệ thống khác) | Khôi phục thử có ghi chép; D19.2 tự động hoá việc này hằng ngày |
+| Điều 49 khoản 2, 3 | Hệ thống từ cấp độ 3 phải bảo đảm tính sẵn sàng cao và có hệ thống dự phòng thảm hoạ | Ít nhất hai site |
+| Điều 50 khoản 1 điểm a | Chọn địa điểm dự phòng phải đánh giá rủi ro thảm hoạ ảnh hưởng **đồng thời** tới cả hệ thống chính và dự phòng: thiên tai, sự cố lưới điện, hoả hoạn, tấn công mạng | Hai site không chung lưới điện, vùng lũ, nhà cung cấp mạng; văn bản **không** ghi khoảng cách tối thiểu theo km |
+| Điều 50 khoản 1 điểm c | Hệ thống dự phòng phải thay thế được hệ thống chính trong 4 giờ (từ cấp độ 3, trừ hệ thống xử lý bí mật nhà nước), 24 giờ (hệ thống xử lý bí mật nhà nước) | RTO của việc chuyển sang site DR không quá 4 giờ |
+| Điều 51 khoản 3 | Kịch bản chuyển đổi sang hệ thống dự phòng gồm nội dung, trình tự, dự kiến thời gian hoàn thành; có phương án khi chuyển đổi không thành công (điểm đ) | Runbook failover có thời gian từng bước và nhánh "nếu không chuyển được" |
+| Điều 52 khoản 1 điểm a | Tối thiểu sáu tháng một lần kiểm tra, đánh giá hoạt động của hệ thống dự phòng | Kiểm định kỳ site DR |
+| Điều 52 khoản 1 điểm b | Chuyển hoạt động sang hệ thống dự phòng và **hoạt động chính thức trên đó tối thiểu 1 ngày làm việc**: một năm một lần (từ cấp độ 4), hai năm một lần (từ cấp độ 3 trở xuống); đánh giá và cập nhật kịch bản. Nếu không thể chuyển đổi hoạt động trong ngày làm việc, hệ thống dự phòng phải có cùng công suất, cấu hình với hệ thống chính và được chuyển đổi, kiểm tra tính sẵn sàng hằng năm | Failover thật và failback thật theo lịch (D20.4, D20.5) |
+| Điều 52 khoản 3 | Thông báo kế hoạch, kịch bản diễn tập chuyển đổi cho Ngân hàng Nhà nước chậm nhất 5 ngày làm việc trước khi thực hiện | Diễn tập là việc có lịch, có kế hoạch viết sẵn |
+
+Bốn điều đáng để ý khi đọc nguyên văn:
+
+- **Văn bản không dùng chữ RPO, RTO.** Con số gần với RTO là 4 giờ thay thế hệ thống chính (Điều 50); con số gần với RPO là 24 giờ sao lưu dữ liệu phát sinh (Điều 22). 24 giờ là mức sàn của sao lưu, không phải RPO hợp lý cho sổ giao dịch.
+- **Ngoại lệ cho hai site chạy song song.** Câu dẫn của Điều 52 khoản 1 loại trừ "các hệ thống thông tin chính và dự phòng hoạt động song song" khỏi cả điểm a (kiểm tra sáu tháng một lần) lẫn điểm b (chuyển hẳn một ngày làm việc): hệ thống active-active đang chạy thật ở cả hai nơi.
+- **Diễn tập chuyển đổi, theo quy tắc chung, là hoạt động chính thức một ngày làm việc,** không phải một lần bật thử. Ngoại lệ ở cuối điểm b chỉ dành cho hệ thống không thể chuyển trong ngày làm việc, và đổi lại đòi site dự phòng cùng công suất, cùng cấu hình. Muốn chạy một ngày trên site DR thì phải có đường quay về (failback), và đó là lý do D20.4 làm cả failback.
+- **Văn bản yêu cầu đánh giá rủi ro, không cho một con số khoảng cách.** Hai trung tâm cùng một khu công nghệ cao, cùng một trạm biến áp, có thể không qua được phần đánh giá thảm hoạ ảnh hưởng đồng thời ở Điều 50 khoản 1 điểm a.
+
+Tổ chức chỉ có một trụ sở tại Việt Nam phải có thêm văn phòng dự phòng ở một địa điểm khác (Điều 50 khoản 2) và diễn tập bảo đảm hoạt động liên tục hằng năm (Điều 52 khoản 2): DR không chỉ là máy, mà cả chỗ cho người làm việc.
+
+<Check id="d17.1.tt09">Kể được các điều của Thông tư 09/2020/TT-NHNN về sao lưu (Điều 22), hệ thống dự phòng thảm hoạ (Điều 49, 50) và chuyển đổi, diễn tập (Điều 51, 52), chuyển được chúng thành con số kỹ thuật (24 giờ, 4 giờ, một ngày làm việc, tần suất), và nói được văn bản không quy định gì (khoảng cách theo km, chữ RPO và RTO).</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Thông tư số 09/2020/TT-NHNN quy định về an toàn hệ thống thông tin trong hoạt động ngân hàng (Công báo)](https://congbao.chinhphu.vn/van-ban/thong-tu-so-09-2020-tt-nhnn-32321.htm): bản chính thức; đọc Điều 5 (cấp độ), Điều 22 (sao lưu) và Mục 9, Điều 49 tới 52 (bảo đảm hoạt động liên tục).
+- [Disaster recovery options in the cloud (AWS whitepaper)](https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html): bốn chiến lược từ backup tới active-active; đọc ghi chú phân biệt pilot light với warm standby, và phần về thảm hoạ dữ liệu.
+- [PostgreSQL 18: Continuous Archiving and Point-in-Time Recovery](https://www.postgresql.org/docs/18/continuous-archiving.html): cơ chế base backup và WAL archive mà lab dùng; mục 25.3.5 là các bước khôi phục.
+- [디지털서비스 장애 원인 조사결과 발표 (정책브리핑, 06/12/2022)](https://www.korea.kr/news/policyNewsView.do?newsId=156540855): kết quả điều tra của chính phủ Hàn Quốc về sự cố Kakao, nguồn chính của callout (tiếng Hàn).
+- [우리의 재발 방지 계획 (Kakao)](https://www.kakaocorp.com/page/detail/9900): Kakao tự thuật nguyên nhân và kế hoạch phòng tái diễn; đọc phần công cụ vận hành (tiếng Hàn).
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Lab chạy hoàn toàn bằng Docker trên máy bạn: một PostgreSQL 18.6 có WAL archive, một volume Docker đóng vai "nơi cất backup ở site khác", và hai container khôi phục. Cần Docker Desktop và `python3` (có sẵn trên macOS). Cổng dùng: **9900** và **9901**, chỉ nghe trên `127.0.0.1`.
+
+**Profile máy.** Lúc nặng nhất (bước 5) có hai container PostgreSQL, mỗi cái khoảng 150 tới 280 MiB RAM theo `docker stats`, mỗi cái bị giới hạn 512 MiB; cả lab dưới 600 MiB. Đĩa của Docker cần khoảng 5 GB trống: dữ liệu 450 MB, hai bản backup, khoảng 1,5 GB WAL archive và hai bản khôi phục. Máy 8 GB chạy được; image PostgreSQL alpine tải khoảng 110 MB ở lần đầu.
+
+Ba điều lab làm cho gọn mà production không làm: "site khác" là một volume Docker trên cùng máy, nên pha tải backup về coi như bằng 0 và script ở bước 6 cộng lại bằng một tốc độ mạng do bạn nhập; mật khẩu gõ thẳng trên dòng lệnh; và mọi số đo là của một máy laptop với SSD, nhanh hơn nhiều so với đĩa mạng của một máy chủ đang bận.
+
+### 1. Database nguồn có WAL archive
+
+Container `d20-pg` chạy PostgreSQL với ba tham số của WAL archive, thứ mà ở K7.4 operator đặt thay bạn: `archive_mode=on` bật lưu WAL; `archive_command` chép mỗi file WAL đầy sang `/backup/wal`, và không ghi đè file đã có (`test ! -f`); `archive_timeout=60` buộc đẩy WAL đi sau tối đa 60 giây kể cả khi file chưa đầy. Volume `d20-backup` mount ở `/backup` là nơi cất backup. Khối đầu tạo volume và thư mục `wal` với chủ sở hữu là user `postgres` của image, rồi mới chạy database. Vòng chờ dùng `-h 127.0.0.1` vì image chính thức chạy một server khởi tạo tạm chỉ nghe socket trước khi chạy server thật.
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-d17/d17-1 && cd ~/masteva-d17/d17-1
+IMG=postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+docker volume create d20-backup
+docker run --rm -v d20-backup:/backup $IMG sh -c 'mkdir -p /backup/wal && chown -R postgres /backup'
+docker run -d --name d20-pg --memory 512m -p 127.0.0.1:9900:5432 \
+  -e POSTGRES_PASSWORD=masteva -v d20-backup:/backup $IMG \
+  -c archive_mode=on -c archive_timeout=60 \
+  -c 'archive_command=test ! -f /backup/wal/%f && cp %p /backup/wal/%f'
+for i in $(seq 1 60); do docker exec d20-pg pg_isready -q -h 127.0.0.1 -U postgres && break; sleep 1; done
+docker exec d20-pg psql -h 127.0.0.1 -U postgres -Atc "show archive_mode"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d20-backup
+e0f8c34396d9616e6564262eb7a02524f0056fdb18f31ec21c1271a5c5b2c5bc
+on
+```
+
+</Expected>
+
+Dòng cuối `on` nghĩa là archive đã bật. Mã container (dòng chữ số dài) trên máy bạn sẽ khác.
+
+Giờ là dữ liệu: bảng `orders` hai triệu rưỡi đơn hàng, mỗi đơn có một ghi chú 64 ký tự ngẫu nhiên để dữ liệu không nén được quá dễ, cùng hai index phụ. File `load.sql` nằm trong thư mục lab; `psql` đọc nó qua stdin. `/usr/bin/time -p` in dòng `real` là số giây đồng hồ của lệnh.
+
+<Terminal where="mac" title="~/masteva-d17/d17-1/load.sql">
+
+```bash
+cd ~/masteva-d17/d17-1
+cat > load.sql <<'SQL'
+create table orders (
+  id bigint primary key,
+  customer_id int not null,
+  amount numeric(12,2) not null,
+  created_at timestamptz not null,
+  note text not null
+);
+insert into orders
+select g, 1 + g % 100000, round((random() * 1000)::numeric, 2),
+       now() - interval '30 days' + g * interval '1 second',
+       md5(random()::text) || md5(random()::text)
+from generate_series(1, 2500000) g;
+create index orders_customer on orders (customer_id);
+create index orders_created on orders (created_at);
+SQL
+docker exec d20-pg createdb -h 127.0.0.1 -U postgres shop
+/usr/bin/time -p docker exec -i d20-pg psql -h 127.0.0.1 -U postgres -q shop < load.sql 2>&1 | grep real
+docker exec d20-pg psql -h 127.0.0.1 -U postgres shop -Atc "select count(*), pg_size_pretty(pg_database_size('shop')) from orders"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+real 14.85
+2500000|453 MB
+```
+
+</Expected>
+
+Database `shop` khoảng 450 MB, gồm hai triệu rưỡi dòng và ba index. Số giây nạp trên máy bạn sẽ khác, thường trong khoảng 10 tới 40 giây tuỳ máy.
+
+### 2. Hai kiểu backup: logic và vật lý
+
+K7.4 đã dùng base backup qua operator. Ở đây bạn chạy trực tiếp hai công cụ gốc, để thấy chúng khác nhau ở đâu:
+
+- **`pg_dump`** tạo **backup logic**: các câu lệnh và dữ liệu dạng hàng để dựng lại database, không kèm index đã dựng (chỉ có lệnh `CREATE INDEX`). `-Fd -j 2` ghi ra một thư mục, hai tiến trình song song. Backup logic chỉ là ảnh chụp ở một thời điểm: không ghép được với WAL để quay tới thời điểm khác.
+- **`pg_basebackup`** tạo **backup vật lý**: bản chép nguyên các file dữ liệu của cả server, kể cả index. `-Ft` ghi ra file tar; `-X stream` kèm đoạn WAL sinh ra trong lúc chép để bản backup tự nhất quán; `-c fast` yêu cầu checkpoint ngay thay vì chờ checkpoint dàn trải (mặc định), vốn có thể làm lệnh đứng yên vài phút. Backup vật lý ghép được với WAL archive để quay tới bất kỳ thời điểm nào sau nó.
+
+Ngay sau base backup, khối lệnh ghi vị trí WAL hiện tại vào file `lsn0`, để bước 4 tính được lượng WAL phải phát lại.
+
+<Predict question="Database 450 MB. Bản backup nào lớn hơn, và khôi phục từ bản nào sẽ nhanh hơn?">
+
+Bản vật lý lớn hơn hẳn, vì nó chứa cả index và mọi trang dữ liệu kể cả chỗ trống; bản logic chỉ có dữ liệu dạng hàng, được nén. Nhưng khôi phục từ bản vật lý lại nhanh hơn: chỉ là bung file và phát lại WAL, trong khi khôi phục bản logic phải chèn lại từng dòng và **dựng lại mọi index**. Dung lượng backup nhỏ không có nghĩa là RTO nhỏ.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+/usr/bin/time -p docker exec d20-pg pg_dump -h 127.0.0.1 -U postgres -Fd -j 2 -f /backup/shop.dump shop 2>&1 | grep real
+/usr/bin/time -p docker exec d20-pg pg_basebackup -h 127.0.0.1 -U postgres -D /backup/base -Ft -X stream -c fast 2>&1 | grep real
+docker exec d20-pg psql -h 127.0.0.1 -U postgres -Atc "select pg_current_wal_lsn()" > ~/masteva-d17/d17-1/lsn0
+docker exec d20-pg du -sh /backup/shop.dump /backup/base
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+real 8.50
+real 1.93
+125.1M	/backup/shop.dump
+492.6M	/backup/base
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Bản dump khoảng 125 MB, bản base backup khoảng 490 MB: bản logic nhỏ gần bốn lần, vì nó không chứa index và được nén.
+- `pg_basebackup` chỉ mất một hai giây vì nó chép file nguyên khối; `pg_dump` mất vài giây vì phải đọc và chuyển từng dòng. Trên máy bạn, hai con số thường dưới 20 giây.
+
+<Check id="d17.1.lab-backup">Tạo được một backup logic bằng `pg_dump` và một backup vật lý bằng `pg_basebackup` có WAL archive đi kèm, so sánh được kích thước của chúng, và giải thích được vì sao chỉ bản vật lý ghép được với WAL để quay về một thời điểm sau nó.</Check>
+
+### 3. Database tiếp tục chạy, rồi mất hẳn
+
+Sau base backup, database còn nhận ghi như ngày thường. Hai việc tạo ra phần đó:
+
+- Một lệnh `update` sửa 20% đơn hàng (500 nghìn dòng) sinh ra một khối WAL lớn, đóng vai "một ngày ghi sau bản backup đêm qua". Lệnh `vacuum` ngay sau đó dọn các phiên bản dòng cũ mà `update` để lại (D19.3 giải thích vì sao có chúng); chạy nó ngay để autovacuum không ghi thêm WAL nền trong lúc bạn đo RPO.
+- Một vòng ghi chèn một dòng vào bảng `events` mỗi giây, chạy nền trong container bằng `docker exec -d`. Mỗi dòng ghi giờ chèn, để sau khôi phục bạn biết chính xác đã mất tới đâu.
+
+<Terminal where="mac">
+
+```bash
+/usr/bin/time -p docker exec d20-pg psql -h 127.0.0.1 -U postgres shop -qc "update orders set amount = amount + 1 where id % 5 = 0" 2>&1 | grep real
+docker exec d20-pg psql -h 127.0.0.1 -U postgres shop -qc "vacuum orders"
+docker exec d20-pg psql -h 127.0.0.1 -U postgres shop -qc "create table events (id bigserial primary key, at timestamptz not null default clock_timestamp())"
+docker exec -d d20-pg sh -c 'while true; do psql -h 127.0.0.1 -U postgres shop -qc "insert into events default values"; sleep 1; done'
+for i in $(seq 1 60); do [ "$(docker exec d20-pg psql -h 127.0.0.1 -U postgres shop -Atc 'select count(*) >= 30 from events')" = t ] && break; sleep 2; done
+docker exec d20-pg psql -h 127.0.0.1 -U postgres shop -Atc "select pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '$(cat ~/masteva-d17/d17-1/lsn0)')) || ' WAL sau base backup'"
+docker exec d20-pg psql -h 127.0.0.1 -U postgres -Atc "select archived_count, failed_count, last_archived_time::time(0), now()::time(0) from pg_stat_archiver"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+real 13.66
+1351 MB WAL sau base backup
+124|0|15:19:57|15:20:29
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Lệnh `update` 500 nghìn dòng sinh ra khoảng 0,7 tới 1,4 GB WAL cùng với `vacuum`, gấp hai ba lần kích thước bảng: mỗi dòng sửa ghi một phiên bản mới, cập nhật ba index, và trang đầu tiên bị sửa sau mỗi checkpoint được ghi nguyên trang vào WAL. Con số dao động theo thời điểm checkpoint rơi vào giữa lệnh. Đó là lượng WAL bước 4 phải phát lại.
+- Dòng cuối là bốn cột của `pg_stat_archiver`: số file đã đẩy đi, số lần thất bại (phải là `0`), giờ đẩy gần nhất và giờ hiện tại. Giờ trong lab là UTC.
+
+Thảm hoạ: máy chạy database mất hẳn cùng đĩa của nó. Trong lab, đó là xoá container `d20-pg` cùng volume dữ liệu của nó (`-v` xoá volume ẩn danh mà image tạo cho thư mục dữ liệu). Volume `d20-backup` vẫn còn, như object storage ở site khác vẫn còn.
+
+Thời điểm sự cố rơi vào đâu trong chu kỳ 60 giây của `archive_timeout` quyết định mất bao nhiêu, nên khối lệnh làm cho nó rõ ràng: ép đóng file WAL đang ghi (`pg_switch_wal()`), chờ file đó vào archive (lệnh `update` vừa sinh nhiều WAL, archive có thể cần vài chục giây để đuổi kịp), rồi chờ thêm 30 giây mới xoá container. Sự cố rơi giữa chu kỳ. Trước khi xoá, khối lệnh in dòng `events` cuối cùng và tổng tiền của bảng `orders`: đó là hai mốc để so sau khi khôi phục.
+
+<Callout kind="danger">
+
+`docker rm -f -v d20-pg` xoá database và toàn bộ dữ liệu của nó, không lấy lại được ngoài đường backup. Kiểm tên container trước khi chạy: lệnh chỉ dành cho container `d20-pg` của lab.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+W=$(docker exec d20-pg psql -h 127.0.0.1 -U postgres -Atc "select pg_walfile_name(pg_current_wal_lsn())")
+docker exec d20-pg psql -h 127.0.0.1 -U postgres -Atc "select pg_switch_wal()" > /dev/null
+for i in $(seq 1 180); do [ "$(docker exec d20-pg psql -h 127.0.0.1 -U postgres -Atc "select coalesce(last_archived_wal >= '$W', false) from pg_stat_archiver")" = t ] && break; sleep 1; done
+docker exec d20-pg psql -h 127.0.0.1 -U postgres -Atc "select 'đã đẩy WAL tới ' || last_archived_wal || ' lúc ' || last_archived_time::time(0) from pg_stat_archiver"
+sleep 30
+docker exec d20-pg psql -h 127.0.0.1 -U postgres shop -Atc "select 'dòng cuối trước sự cố: ' || max(id) || ' lúc ' || max(at)::time(0) from events"
+docker exec d20-pg psql -h 127.0.0.1 -U postgres -Atc "select 'WAL được đẩy đi gần nhất lúc ' || last_archived_time::time(0) from pg_stat_archiver"
+docker exec d20-pg psql -h 127.0.0.1 -U postgres shop -Atc "select 'tổng tiền đơn hàng: ' || sum(amount) from orders"
+docker rm -f -v d20-pg
+date -u '+sự cố lúc %T UTC'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+đã đẩy WAL tới 00000001000000000000007C lúc 15:20:56
+dòng cuối trước sự cố: 87 lúc 15:21:25
+WAL được đẩy đi gần nhất lúc 15:20:56
+tổng tiền đơn hàng: 1250679211.09
+d20-pg
+sự cố lúc 15:21:26 UTC
+```
+
+</Expected>
+
+Ghi lại ba con số: dòng `events` cuối (87 trong kết quả mẫu), giờ của nó, và tổng tiền đơn hàng. Tổng tiền sinh ngẫu nhiên lúc nạp dữ liệu, nên con số trên máy bạn sẽ khác; điều cần là so nó với chính nó sau khi khôi phục. Giờ đẩy WAL gần nhất cách lúc sự cố khoảng 30 giây: mọi thứ ghi sau mốc đó chỉ nằm trên đĩa vừa mất.
+
+### 4. Khôi phục vật lý: base backup cộng WAL archive
+
+Các bước khôi phục của tài liệu PostgreSQL (mục 25.3.5), làm bằng tay:
+
+1. Bung `base.tar` (bản tar không nén) vào thư mục dữ liệu trống, và `pg_wal.tar` vào `pg_wal` bên trong nó.
+2. Tạo file `recovery.signal`: server khởi động ở chế độ khôi phục từ archive.
+3. Đặt `restore_command` để server tự lấy từng file WAL từ archive, phát lại cho tới file cuối cùng có trong đó. Không đặt mục tiêu khôi phục (`recovery_target_time` như PITR của K7.4), nên khi hết WAL server tự kết thúc khôi phục, mở một **timeline** mới và nhận ghi. Timeline là số hiệu của một nhánh lịch sử WAL (tám chữ số đầu của tên file WAL, K7.4 đã gặp): mỗi lần một server kết thúc khôi phục và bắt đầu nhận ghi, nó mở nhánh mới, để WAL ghi sau đó không bị nhầm với WAL của server cũ.
+
+Khối lệnh dùng một volume dữ liệu mới `d20-pgdata-new`, đo riêng thời gian bung và thời gian tới khi server nhận ghi (`pg_is_in_recovery()` trả `false`), rồi đọc dòng `redo done` trong log: PostgreSQL tự ghi thời gian phát lại WAL ở đó.
+
+<Terminal where="mac">
+
+```bash
+IMG=postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+/usr/bin/time -p docker run --rm -v d20-backup:/backup:ro -v d20-pgdata-new:/var/lib/postgresql $IMG sh -c '
+  set -e
+  mkdir -p $PGDATA
+  tar -xf /backup/base/base.tar -C $PGDATA
+  tar -xf /backup/base/pg_wal.tar -C $PGDATA/pg_wal
+  touch $PGDATA/recovery.signal
+  chown -R postgres $PGDATA && chmod 700 $PGDATA' 2>&1 | grep real
+START=$(date +%s)
+docker run -d --name d20-pg-new --memory 512m -p 127.0.0.1:9901:5432 \
+  -v d20-backup:/backup:ro -v d20-pgdata-new:/var/lib/postgresql $IMG \
+  -c 'restore_command=cp /backup/wal/%f %p' > /dev/null
+for i in $(seq 1 300); do [ "$(docker exec d20-pg-new psql -h 127.0.0.1 -U postgres -Atc 'select not pg_is_in_recovery()' 2>/dev/null)" = t ] && break; sleep 1; done
+echo "nhận ghi sau $(( $(date +%s) - START )) giây"
+docker logs d20-pg-new 2>&1 | grep -E 'redo done|last completed transaction' | sed 's/^.*LOG: *//'
+docker exec d20-pg-new psql -h 127.0.0.1 -U postgres shop -Atc "select 'dòng cuối khôi phục được: ' || max(id) || ' lúc ' || max(at)::time(0) from events"
+docker exec d20-pg-new psql -h 127.0.0.1 -U postgres shop -Atc "select 'tổng tiền đơn hàng: ' || sum(amount) from orders"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+real 3.49
+nhận ghi sau 12 giây
+redo done at 0/7C749D50 system usage: CPU: user: 3.12 s, system: 3.27 s, elapsed: 10.48 s
+last completed transaction was at log time 2026-10-21 15:20:54.881126+00
+dòng cuối khôi phục được: 57 lúc 15:20:55
+tổng tiền đơn hàng: 1250679211.09
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Bung base backup mất khoảng một tới bốn giây, và server nhận ghi sau khoảng 8 tới 12 giây kể cả phát lại WAL. Trên máy bạn thường dưới 30 giây.
+- Dòng `redo done … elapsed` là thời gian phát lại WAL: khoảng 10 giây cho hơn 1,3 GB WAL trong kết quả mẫu.
+- `last completed transaction` là giao dịch cuối cùng có trong archive. **Dòng `events` cuối khôi phục được là 57, dòng cuối trước sự cố là 87**: mất 30 dòng, tức khoảng 30 giây dữ liệu. Đó là RPO thực tế của lần này, khớp với cách khối lệnh ở bước 3 đặt sự cố vào giữa chu kỳ `archive_timeout`. Trên máy bạn số dòng mất thường trong khoảng 28 tới 32, vì vòng ghi mỗi giây không đều tuyệt đối.
+- Tổng tiền đơn hàng khớp với lúc trước sự cố: lệnh `update` sau base backup đã được phát lại từ WAL archive.
+
+Thời gian từ lúc bạn chạy khối lệnh tới lúc server nhận ghi chỉ là pha "khôi phục và phát lại WAL" của bảng RTO.
+
+<Check id="d17.1.lab-khoi-phuc-vat-ly">Khôi phục được một database từ base backup cộng WAL archive vào một server mới, đọc được thời gian phát lại WAL trong log, và tính được RPO thực tế từ dòng cuối trước sự cố và dòng cuối khôi phục được.</Check>
+
+### 5. Khôi phục logic, một luồng và bốn luồng
+
+Bản `pg_dump` không ghép được với WAL: dùng nó là chấp nhận quay về đúng lúc chạy dump, mất cả lệnh `update` lẫn mọi dòng `events`. Nó vẫn đáng đo, vì backup logic là cách hay dùng để chuyển dữ liệu sang phiên bản PostgreSQL khác hay sang nhà cung cấp khác. Khối dưới khôi phục cùng một bản dump vào hai database của một container mới, một lần với một tiến trình (`-j 1`), một lần với bốn (`-j 4`).
+
+<Terminal where="mac">
+
+```bash
+IMG=postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+docker run -d --name d20-restore --memory 512m -e POSTGRES_PASSWORD=masteva -v d20-backup:/backup:ro $IMG > /dev/null
+for i in $(seq 1 60); do docker exec d20-restore pg_isready -q -h 127.0.0.1 -U postgres && break; sleep 1; done
+docker exec d20-restore createdb -h 127.0.0.1 -U postgres shop1
+docker exec d20-restore createdb -h 127.0.0.1 -U postgres shop4
+/usr/bin/time -p docker exec d20-restore pg_restore -h 127.0.0.1 -U postgres -d shop1 -j 1 /backup/shop.dump 2>&1 | grep real
+/usr/bin/time -p docker exec d20-restore pg_restore -h 127.0.0.1 -U postgres -d shop4 -j 4 /backup/shop.dump 2>&1 | grep real
+docker exec d20-restore psql -h 127.0.0.1 -U postgres shop4 -Atc "select count(*), 'tổng tiền đơn hàng: ' || sum(amount) from orders"
+docker exec d20-restore psql -h 127.0.0.1 -U postgres shop4 -Atc "select count(*) from pg_tables where tablename = 'events'"
+docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' d20-pg-new d20-restore
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+real 10.47
+real 7.55
+2500000|tổng tiền đơn hàng: 1250179211.09
+0
+d20-pg-new 215.7MiB / 512MiB
+d20-restore 276.7MiB / 512MiB
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Mỗi lần khôi phục logic mất khoảng 6 tới 11 giây, lâu gấp vài lần khôi phục vật lý dù bản dump nhỏ hơn bốn lần: thời gian đi vào việc chèn lại dòng và dựng lại ba index.
+- `-j 4` ở đây không nhanh hơn rõ rệt, có lần còn chậm hơn: database chỉ có một bảng lớn, nên chỉ phần dựng index chạy song song được. Song song giúp nhiều khi có nhiều bảng cỡ tương đương.
+- Tổng tiền đơn hàng thấp hơn đúng 500 000 so với bước 3: lệnh `update` cộng 1 cho 500 nghìn đơn đã mất, cùng với bảng `events` (dòng `0`). RPO của cách này là từ lúc chạy dump tới lúc sự cố.
+- Hai container khôi phục mỗi cái dùng khoảng 150 tới 280 MiB RAM.
+
+<Check id="d17.1.lab-khoi-phuc-logic">Khôi phục được bản `pg_dump` với một và bốn tiến trình, so được thời gian với khôi phục vật lý, và giải thích được vì sao bản dump nhỏ hơn mà khôi phục lại lâu hơn và mất nhiều dữ liệu hơn.</Check>
+
+### 6. Từ số đo tới RTO thật
+
+Script `dr-calc.py` cộng mọi pha của bảng ở phần Kiến thức. Hai pha giữa lấy từ số đo của bạn (tốc độ khôi phục, tốc độ phát lại WAL); các pha còn lại là con số do tổ chức tự ước lượng và nên được thay bằng số đo từ diễn tập. Mặc định của script: phát hiện 5 phút, quyết định 15 phút, cấp máy 10 phút, kiểm dữ liệu 10 phút, chuyển ứng dụng 5 phút. Mục tiêu mặc định 4 giờ là mức Điều 50 của TT 09 đặt cho hệ thống từ cấp độ 3.
+
+<Terminal where="mac" title="~/masteva-d17/d17-1/dr-calc.py">
+
+```bash
+cd ~/masteva-d17/d17-1
+cat > dr-calc.py <<'EOF'
+#!/usr/bin/env python3
+"""Tính RPO và RTO của cách 'sao lưu và khôi phục' từ số đo thật."""
+import argparse
+
+p = argparse.ArgumentParser()
+p.add_argument("--size-gb", type=float, required=True, help="kích thước backup phải khôi phục")
+p.add_argument("--restore-mbps", type=float, required=True, help="tốc độ khôi phục đo được, MB/s")
+p.add_argument("--wal-gb", type=float, default=0, help="lượng WAL phải phát lại")
+p.add_argument("--replay-mbps", type=float, default=100, help="tốc độ phát lại WAL đo được, MB/s")
+p.add_argument("--fetch-mbps", type=float, default=0, help="tốc độ tải backup từ site khác; 0 = có sẵn trên đĩa")
+p.add_argument("--detect-min", type=float, default=5)
+p.add_argument("--decide-min", type=float, default=15)
+p.add_argument("--provision-min", type=float, default=10)
+p.add_argument("--verify-min", type=float, default=10)
+p.add_argument("--switch-min", type=float, default=5)
+p.add_argument("--archive-timeout-s", type=float, default=0, help="có WAL archive: archive_timeout")
+p.add_argument("--backup-every-h", type=float, default=24, help="không có WAL archive: chu kỳ backup")
+p.add_argument("--target-rto-h", type=float, default=4)
+a = p.parse_args()
+
+mb = a.size_gb * 1024
+phases = [
+    ("phát hiện", a.detect_min),
+    ("quyết định", a.decide_min),
+    ("cấp máy, đĩa", a.provision_min),
+    ("tải backup về", mb / a.fetch_mbps / 60 if a.fetch_mbps else 0),
+    ("khôi phục base", mb / a.restore_mbps / 60),
+    ("phát lại WAL", a.wal_gb * 1024 / a.replay_mbps / 60),
+    ("kiểm dữ liệu", a.verify_min),
+    ("chuyển ứng dụng", a.switch_min),
+]
+total = sum(m for _, m in phases)
+paper = mb / a.restore_mbps / 60
+for name, m in phases:
+    print(f"  {name:<16} {m:8.1f} phút")
+print(f"RTO trên giấy (chỉ lệnh khôi phục): {paper:7.1f} phút")
+verdict = "ĐẠT" if total <= a.target_rto_h * 60 else "KHÔNG ĐẠT"
+print(f"RTO thật (mọi pha): {total:7.1f} phút = {total / 60:.1f} giờ, {verdict} mục tiêu {a.target_rto_h:g} giờ")
+if a.archive_timeout_s:
+    print(f"RPO xấu nhất: khoảng {a.archive_timeout_s:g} giây (WAL chưa kịp đẩy đi)")
+else:
+    print(f"RPO xấu nhất: khoảng {a.backup_every_h:g} giờ (mọi thứ sau bản backup gần nhất)")
+EOF
+python3 dr-calc.py --size-gb 1 --restore-mbps 1 > /dev/null && echo "dr-calc.py chạy được"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+dr-calc.py chạy được
+```
+
+</Expected>
+
+Tính tốc độ khôi phục của bạn từ bước 4: kích thước bản base backup (bước 2) chia cho số giây bung (dòng `real` đầu tiên của bước 4). Tốc độ phát lại WAL: lượng WAL sau base backup (bước 3) chia cho số giây trong dòng `redo done … elapsed`. Thay hai con số đó vào lệnh dưới; con số trong lệnh mẫu là của kết quả mẫu: khoảng 140 MB/s cho khôi phục (490 MB trong 3,5 giây) và 130 MB/s cho phát lại WAL (1 351 MB trong 10,5 giây). Trên máy bạn hai tốc độ này thường nằm trong khoảng 100 tới 500 MB/s.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17/d17-1
+python3 dr-calc.py --size-gb 0.5 --restore-mbps 140 --wal-gb 1.3 --replay-mbps 130 --archive-timeout-s 60
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  phát hiện             5.0 phút
+  quyết định           15.0 phút
+  cấp máy, đĩa         10.0 phút
+  tải backup về         0.0 phút
+  khôi phục base        0.1 phút
+  phát lại WAL          0.2 phút
+  kiểm dữ liệu         10.0 phút
+  chuyển ứng dụng       5.0 phút
+RTO trên giấy (chỉ lệnh khôi phục):     0.1 phút
+RTO thật (mọi pha):    45.2 phút = 0.8 giờ, ĐẠT mục tiêu 4 giờ
+RPO xấu nhất: khoảng 60 giây (WAL chưa kịp đẩy đi)
+```
+
+</Expected>
+
+Với database cỡ lab, lệnh khôi phục gần như không đáng kể: RTO thật là tổng các pha mà lab không đo, phần lớn là con người. Giờ cùng các tốc độ đó cho một database 500 GB với 50 GB WAL của một ngày, backup nằm ở site khác và tải về với 100 MB/s (khoảng 1 Gbit/s thực dụng):
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17/d17-1
+python3 dr-calc.py --size-gb 500 --restore-mbps 140 --wal-gb 50 --replay-mbps 130 --fetch-mbps 100 --archive-timeout-s 60
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  phát hiện             5.0 phút
+  quyết định           15.0 phút
+  cấp máy, đĩa         10.0 phút
+  tải backup về        85.3 phút
+  khôi phục base       61.0 phút
+  phát lại WAL          6.6 phút
+  kiểm dữ liệu         10.0 phút
+  chuyển ứng dụng       5.0 phút
+RTO trên giấy (chỉ lệnh khôi phục):    61.0 phút
+RTO thật (mọi pha):   197.8 phút = 3.3 giờ, ĐẠT mục tiêu 4 giờ
+RPO xấu nhất: khoảng 60 giây (WAL chưa kịp đẩy đi)
+```
+
+</Expected>
+
+Với 500 GB, lệnh khôi phục là khoảng một giờ: đó là con số dễ được ghi vào tài liệu thiết kế. RTO thật là khoảng 3,3 giờ, trong đó tải backup từ site khác chiếm nhiều nhất. Vẫn đạt 4 giờ, nhưng tốc độ của laptop với SSD là trường hợp đẹp. Thử lại với tốc độ hay gặp hơn trên đĩa mạng của một máy chủ đang bận: khôi phục 100 MB/s, phát lại WAL 30 MB/s.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17/d17-1
+python3 dr-calc.py --size-gb 500 --restore-mbps 100 --wal-gb 50 --replay-mbps 30 --fetch-mbps 100 --archive-timeout-s 60
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+  phát hiện             5.0 phút
+  quyết định           15.0 phút
+  cấp máy, đĩa         10.0 phút
+  tải backup về        85.3 phút
+  khôi phục base       85.3 phút
+  phát lại WAL         28.4 phút
+  kiểm dữ liệu         10.0 phút
+  chuyển ứng dụng       5.0 phút
+RTO trên giấy (chỉ lệnh khôi phục):    85.3 phút
+RTO thật (mọi pha):   244.1 phút = 4.1 giờ, KHÔNG ĐẠT mục tiêu 4 giờ
+RPO xấu nhất: khoảng 60 giây (WAL chưa kịp đẩy đi)
+```
+
+</Expected>
+
+RTO trên giấy 85 phút, RTO thật quá 4 giờ. Ba cách kéo nó về, mỗi cách là một bậc của bảng chiến lược: đặt sẵn backup ở site DR (bỏ pha tải về), giữ một bản sao chạy liên tục ở site DR (bỏ cả khôi phục lẫn phát lại, bậc pilot light trở lên), hoặc base backup dày hơn để ít WAL phải phát lại. Số phút của các pha con người (phát hiện, quyết định, kiểm dữ liệu) chỉ có được bằng diễn tập; D20.3 và D20.5 đo chúng.
+
+<Check id="d17.1.lab-rto-that">Tính được tốc độ khôi phục và tốc độ phát lại WAL từ số đo của mình, dùng script cộng được mọi pha thành RTO thật cho database cỡ lab và cho một database lớn, và chỉ ra được pha nào quyết định ở mỗi cỡ.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `pg_basebackup` đứng yên vài phút không in gì | Thiếu `-c fast`, đang chờ checkpoint dàn trải | Thêm `-c fast`; `docker exec d20-pg ps aux` thấy tiến trình `pg_basebackup` |
+| `failed_count` trong `pg_stat_archiver` tăng | Thư mục `/backup/wal` thiếu hoặc không thuộc user `postgres` | Chạy lại lệnh `chown` ở bước 1; `docker logs d20-pg` có dòng `archive command failed` |
+| Bước 4: vòng chờ hết 300 giây, server không nhận ghi | Sai thư mục bung, thiếu `recovery.signal`, hoặc thiếu file WAL ở giữa | `docker logs d20-pg-new`; dòng `could not locate required checkpoint record` là bung sai chỗ |
+| Bước 4 báo `container name "/d20-pg-new" is already in use` | Đang chạy lại bước 4 lần hai | `docker rm -f -v d20-pg-new` và `docker volume rm d20-pgdata-new`, rồi chạy lại |
+| `pg_restore` báo `already exists` | Khôi phục vào database đã có dữ liệu | Tạo database mới, hoặc thêm `--clean` |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Khối dưới xoá các container và volume của bài, gồm cả mọi bản backup trong `d20-backup`. Bài D20.2 không dùng lại chúng.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá container và volume">
+
+```bash
+docker rm -f -v d20-pg-new d20-restore
+docker volume rm d20-backup d20-pgdata-new
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không đo RTO bằng một bản sao nhỏ rồi nhân lên?">
+
+Vì các pha không tăng cùng một kiểu. Bung và chép base backup tăng gần tuyến tính theo kích thước, nhưng chỉ khi đĩa và mạng không bị giới hạn bởi thứ khác; khôi phục logic dựng lại index, và việc sắp xếp để dựng index chậm dần khi dữ liệu không còn vừa bộ nhớ; phát lại WAL chạy trên một tiến trình và phụ thuộc lượng ghi của cả ngày chứ không phụ thuộc kích thước database. Script của bài nhân tuyến tính để thấy cỡ độ lớn; con số cam kết phải đo trên bản sao đủ kích thước, như kiểm tra khôi phục tự động của D19.2 làm mỗi ngày.
+
+</Reveal>
+
+<Reveal title="Muốn RPO nhỏ hơn 60 giây mà vẫn chỉ dùng backup thì làm gì?">
+
+Giảm `archive_timeout` có giá: mỗi lần hết hạn mà đã có ghi mới kể từ lần chuyển file trước, PostgreSQL đóng một file WAL 16 MB dù mới ghi vài KB, nên archive phình lên. Cách đúng là gửi WAL liên tục thay vì theo từng file: `pg_receivewal` nối vào server như một replica và ghi WAL ra đĩa ngay khi có, cho RPO cỡ giây; barman và các công cụ tương tự dùng cơ chế này. Tới mức đó thì bạn đã gần bậc pilot light: một tiến trình chạy liên tục ở site khác, nhận WAL qua mạng.
+
+</Reveal>
+
+<Reveal title="RPO 0 giữa hai site thì sao?">
+
+Chỉ đạt được bằng replication đồng bộ: mỗi `COMMIT` chờ site kia xác nhận đã nhận WAL. Hai site cách nhau vài chục km thêm khoảng một mili giây mỗi commit; hai vùng cách nhau hàng nghìn km thêm hàng chục mili giây, và site kia hỏng thì ghi đứng yên (K7.4). Vì vậy nhiều ngân hàng dùng đồng bộ giữa hai trung tâm gần nhau trong cùng thành phố, và bất đồng bộ tới trung tâm thứ ba ở xa. D20.4 làm phần bất đồng bộ giữa hai cụm.
+
+</Reveal>
+
+<Reveal title="Backup ở site khác có đủ chống mã độc tống tiền không?">
+
+Chưa. Kẻ tấn công có quyền quản trị ở site chính thường cũng có khoá ghi vào bucket backup, và xoá hoặc mã hoá nó trước. Bản backup chống được kiểu này phải **không sửa xoá được trong một khoảng thời gian** kể cả với quản trị viên (object lock ở chế độ compliance, băng từ cất ngoài), nằm ở tài khoản hoặc tổ chức quản trị khác, và được khôi phục thử định kỳ. Điều 22 khoản 3 của TT 09 yêu cầu tách rời về chỗ cất; tách rời về quyền là việc bạn phải tự thêm.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** dựng bảng BIA từ danh sách hệ thống, viết khung runbook khôi phục có thời gian từng bước, tính thử RTO với các giả định khác nhau, tóm tắt một văn bản quy định thành danh sách nghĩa vụ.
+
+**AI hay sai ở đâu:** coi RTO là thời gian chạy lệnh khôi phục; coi replica là backup; nói backup logic và vật lý tương đương; quên `-c fast` hoặc `restore_command`; gán cho TT 09 những con số nó không có (khoảng cách tối thiểu giữa hai site, RTO riêng cho cấp độ 4, chữ "RPO"); dẫn sai số điều hoặc dẫn văn bản đã bị thay; và đưa RPO, RTO điển hình của nhà cung cấp cloud như thể đó là số của hệ thống bạn.
+
+**Cách kiểm tra:** mọi con số về thời gian phải có một phép đo đứng sau, như lab này. Mọi câu về quy định phải mở được nguyên văn ở nguồn chính thức (Công báo, cổng văn bản của Chính phủ) với số điều, khoản cụ thể.
+
+</Callout>
+
+<Callout kind="link">
+
+K7.4 dạy base backup, WAL archive và PITR qua CloudNativePG; D19.2 tự động hoá kiểm tra khôi phục và đo thời gian khôi phục hằng ngày. D16.1 dạy SLO và error budget. K10.3 chuyển traffic stateless giữa hai cụm và tính dung lượng N+1. D9.3 dạy split-brain, thứ quay lại ở D20.4. Trong chặng này, D20.2 sao lưu cả tài nguyên cụm lẫn database, D20.3 khôi phục chúng sang một cụm khác theo runbook có mốc giờ; D20.4 dựng replication giữa hai cụm, failover và failback; D20.5 diễn tập DR toàn phần theo checklist. D24 đi sâu phần tuân thủ của TT 09 và các văn bản liên quan; D21 bàn cách giới hạn phạm vi ảnh hưởng của một sự cố bằng failure domain và cell.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d17.1.mastery-muc-tieu">Với một hệ thống cụ thể, đặt được RPO và RTO cho từng loại dữ liệu từ phân tích tác động, chọn được bậc chiến lược DR tương ứng và nói được chi phí của lựa chọn đó.</Check>
+
+<Check id="d17.1.mastery-do">Đo được RPO và RTO thực tế của một cách sao lưu bằng một lần khôi phục thật, và trình bày được RTO thật gồm những pha nào, pha nào là số đo và pha nào còn là ước lượng.</Check>
+
+<Check id="d17.1.mastery-ngan-hang">Đọc được một yêu cầu DR của TT 09/2020 ở nguyên văn và chuyển nó thành yêu cầu kỹ thuật kiểm được cho một hệ thống ngân hàng.</Check>
+
+</Mastery>

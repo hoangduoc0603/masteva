@@ -1,0 +1,992 @@
+---
+title: Failure domain và kiến trúc cell
+description: Liệt kê các tầng failure domain của một hệ thống và đo blast radius bằng số tenant cùng tỉ lệ request bị lỗi; dựng một router Envoy mỏng nhận bảng gán tenant như dữ liệu, chạy cùng một sự cố trên kiến trúc dùng chung và trên ba cell để thấy phạm vi ảnh hưởng thu từ 100% xuống một phần ba, rồi thêm một cell mới khi hệ đang chạy mà không tenant cũ nào lỗi.
+id: d25.1
+step: d25
+prerequisites: [d23.1, d21.6]
+topics: [d25.failure-domain, d25.kien-truc-cell]
+status: verified
+verified:
+  date: 2026-10-21
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    envoy: 1.40.0
+    golang-image: 1.27.2-alpine
+    python: 3.14.3
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Biết một sự cố lan tới đâu trước khi nó xảy ra, và thiết kế hệ thống sao cho câu trả lời là "một phần nhỏ khách hàng" thay vì "tất cả". Học xong bài này, bạn giải thích được:
+
+- Vì sao ba bản sao api sau một load balancer không cứu được ai khi database dùng chung của chúng hỏng.
+- Vì sao cùng một sự cố, cách đo theo số khách hàng và cách đo theo tỉ lệ request cho hai con số khác nhau, và con số nào dùng để thiết kế.
+- Cell là gì, khác shard và availability zone ở đâu, vì sao router đứng trước các cell phải "mỏng".
+- Vì sao một cell của AWS Lambda lớn hơn mọi cỡ từng được thử đã hỏng năm 2023, và vì sao giới hạn cỡ cell là một quyết định thiết kế.
+
+</Goal>
+
+<Knowledge>
+
+### Failure domain: những thứ hỏng cùng nhau
+
+**Failure domain** (miền lỗi) là tập các thành phần cùng hỏng khi một thứ chúng dùng chung hỏng. Hai máy cắm chung một ổ điện nằm trong cùng một failure domain về điện; hai service đọc chung một database nằm trong cùng một failure domain về dữ liệu, dù chúng chạy ở hai trung tâm dữ liệu khác nhau.
+
+Một hệ thống có nhiều tầng failure domain lồng nhau. Tầng ngoài lớn hơn, hiếm hỏng hơn, và khi hỏng thì kéo theo nhiều hơn:
+
+| Tầng | Cùng hỏng vì | Ví dụ | Giới hạn bằng |
+|---|---|---|---|
+| Tiến trình | Một lỗi code, hết bộ nhớ | Một pod OOM kill (K1.2) | Nhiều bản sao, restart |
+| Node (máy) | Phần cứng, kernel, kubelet | Một node `NotReady` (K4.4) | Bản sao trải trên nhiều node (K5.2) |
+| Rack | Nguồn điện, switch đầu tủ | Mất một tủ máy cùng lúc | Topology spread theo rack |
+| AZ (availability zone) | Một hay vài trung tâm dữ liệu có điện, làm mát, mạng riêng | Mất điện một trung tâm dữ liệu | Chạy trên ít nhất ba AZ, dự phòng dung lượng (D18.1) |
+| Region (vùng) | Nhóm AZ dùng chung control plane của nhà cung cấp | Một vùng cloud gián đoạn | Đa vùng (D20, K10.3) |
+| Phụ thuộc dùng chung | Database, cache, hàng đợi, DNS, IdP mà mọi bản sao gọi | Database chính hỏng, mọi service lỗi | Chia dữ liệu theo cell, cache, chế độ suy giảm |
+| Triển khai và cấu hình | Mọi nơi nhận cùng một bản build, một file cấu hình, cùng lúc | Một cấu hình xấu đẩy ra toàn cầu (D13.4) | Triển khai theo wave, theo cell |
+| Tài khoản và hạn mức | Cùng một account cloud, một quota, một chứng chỉ | Chạm trần quota API của account | Tách account, quota theo cell |
+
+Ba tầng cuối thường không có trên sơ đồ hạ tầng: phụ thuộc dùng chung, thay đổi đẩy ra mọi nơi cùng lúc, và hạn mức dùng chung. Các sự cố ở D13.4 và D13.5 (cấu hình của Azure Front Door, file tính năng của Cloudflare) đều bắt đầu từ tầng triển khai và cấu hình. Bản sao chỉ giúp khi các bản sao nằm ở **các failure domain khác nhau đối với đúng loại lỗi đang xét**: ba pod trải trên ba AZ chống được mất một AZ, nhưng không chống được một bản build lỗi đã được triển khai lên cả ba.
+
+```text
+ region ┌───────────────────────────────────────────────────────────┐
+        │ AZ-a ┌────────────┐  AZ-b ┌────────────┐  AZ-c ┌────────┐ │
+        │      │ node  node │       │ node  node │       │  ...   │ │
+        │      │ api   api  │       │ api   api  │       │        │ │
+        │      └─────┬──────┘       └─────┬──────┘       └───┬────┘ │
+        │            └───────────┬────────┴──────────────────┘      │
+        │                        ▼                                  │
+        │   database chính, IdP, file cấu hình, bản build vừa       │
+        │   triển khai: failure domain ẩn, chung cho cả ba AZ       │
+        └───────────────────────────────────────────────────────────┘
+```
+
+<Check id="d25.1.failure-domain">Kể được các tầng failure domain từ tiến trình tới triển khai và cấu hình, và với một hệ thống cho trước, chỉ ra được thành phần nào làm nhiều bản sao cùng hỏng dù chúng chạy ở nhiều AZ.</Check>
+
+### Blast radius: đo phạm vi ảnh hưởng
+
+**Blast radius** (bán kính vụ nổ, phạm vi ảnh hưởng) là phần hệ thống và người dùng bị ảnh hưởng khi một thành phần hỏng. Nó đo được, và nên đo bằng ít nhất hai con số:
+
+- **Tỉ lệ khách hàng bị ảnh hưởng**: bao nhiêu tenant (khách hàng, tổ chức, workspace) thấy lỗi. Một tenant ở đây là một khách hàng của hệ thống nhiều khách (multi-tenant).
+- **Tỉ lệ request (hoặc doanh thu) bị lỗi**: bao nhiêu phần lưu lượng thất bại.
+
+Hai con số này khác nhau khi tenant không đều nhau. Mười hai tenant chia đều ba nhóm, một nhóm hỏng là 33% khách hàng; nhưng nếu nhóm đó chứa tenant lớn nhất, chiếm một phần tư lưu lượng, thì tỉ lệ request lỗi gần một nửa. Lab của bài cho bạn đo cả hai.
+
+Khi thiết kế, câu hỏi đúng không phải "hệ có hỏng không" (có, mọi thứ đều hỏng) mà là "**sự cố tệ nhất của một thành phần ảnh hưởng tối đa bao nhiêu phần**". Một mục tiêu viết được thành con số: không một lỗi đơn lẻ nào (một bản build, một cấu hình, một tenant, một database) được ảnh hưởng quá 1/N khách hàng, với N là số cell (phần tiếp theo).
+
+<Check id="d25.1.blast-radius">Định nghĩa được blast radius, đo được nó theo số tenant và theo tỉ lệ request, và giải thích được vì sao hai cách đo khác nhau khi có tenant lớn.</Check>
+
+### Kiến trúc cell
+
+**Cell** là một bản sao **đầy đủ và độc lập** của toàn bộ workload: service, database, cache, hàng đợi. Mỗi cell phục vụ một phần khách hàng, và cell không gọi cell khác. Đứng trước các cell là một **cell router** mỏng: nó đọc **khoá phân vùng** (partition key) của request, ví dụ mã tenant, tra bảng gán, và chuyển request tới đúng cell.
+
+```text
+                       request (x-tenant: t06)
+                                │
+                  ┌─────────────▼──────────────┐
+                  │ cell router                │  chỉ đọc khoá, tra bảng gán,
+                  │ bảng gán: t01-t04 → cell-1 │  chuyển tiếp; không logic nghiệp vụ
+                  │           t05-t08 → cell-2 │
+                  │           t09-t12 → cell-3 │
+                  └──────┬─────────┬────────┬──┘
+                         ▼         ▼        ▼
+                    ┌────────┐┌────────┐┌────────┐
+                    │ cell-1 ││ cell-2 ││ cell-3 │   mỗi cell: api + store riêng,
+                    │ api    ││ api    ││ api    │   cùng một khuôn, có thể trải
+                    │ store  ││ store  ││ store  │   trên nhiều AZ
+                    └────────┘└────────┘└────────┘
+     control plane của cell: tạo cell mới, gán tenant, di chuyển tenant (chạy riêng, ít khi cần)
+```
+
+Tài liệu "Reducing the Scope of Impact with Cell-Based Architecture" của AWS mô tả các quyết định chính, bài này tóm lại:
+
+| Quyết định | Điều cần giữ |
+|---|---|
+| **Khoá phân vùng** | Khớp với "thớ" tự nhiên của dịch vụ, có sẵn trong hầu hết request (mã khách hàng, mã tài khoản). Ít lời gọi phải đi ngang qua nhiều cell; lời gọi nào phải đi ngang thì đi lại qua router, không gọi thẳng cell khác |
+| **Cách gán** | Bảng gán đầy đủ (mỗi khoá một dòng, di chuyển được từng khách), theo khoảng hay tiền tố, chia lấy dư (đơn giản nhưng thêm cell là phải chuyển nhiều khách), consistent hashing. Lab dùng bảng gán đầy đủ |
+| **Cell router** | Là thành phần **dùng chung** duy nhất, nên phải đơn giản nhất có thể: không logic nghiệp vụ, mở rộng ngang được, giữ sẵn bảng gán trong bộ nhớ, và một cell không trả lời thì các cell khác vẫn chạy bình thường |
+| **Cỡ cell** | Có **trần cố định**, giống nhau giữa các nơi, và được kiểm thử ở đúng cỡ trần. Cell nhỏ: mỗi sự cố ảnh hưởng ít, dễ thử ở cỡ đầy đủ, ít chạm hạn mức; cell lớn: ít cell phải vận hành, tận dụng tài nguyên tốt hơn, khách lớn vừa trong một cell |
+| **Tạo cell mới** | Từ cùng một khuôn (IaC, chart), không sửa tay; cell đầy thì khách mới vào cell mới, thay vì phình cell cũ quá trần |
+
+Tài liệu đó đưa một phép tính cho cỡ cell: 10 cell thì mỗi cell giữ khoảng 10% khách hàng, 100 cell thì khoảng 1%. Đổi lại, bạn vận hành 100 bản sao của cả hệ thống, nên tạo cell, triển khai, giám sát theo cell đều phải tự động.
+
+**Khách hàng lớn** là chỗ khó. Một tenant lớn tới mức không vừa một cell phải tách theo một chiều thứ hai (khoá ghép, ví dụ tenant cộng vùng hay tenant cộng nhóm người dùng); một tenant lớn nằm chung cell với nhiều tenant nhỏ thì làm blast radius tính theo request của cell đó lớn bất thường. Nhiều hệ đặt khách lớn vào cell riêng.
+
+**Di chuyển tenant giữa các cell** là một thao tác của control plane: sao dữ liệu sang cell mới, đồng bộ phần ghi mới, đổi dòng trong bảng gán, rồi dọn cell cũ. Nó tốn kém và rủi ro, nên bảng gán chỉ đổi khi cần (cân bằng lại, tách khách lớn), không đổi theo từng request.
+
+<Callout kind="production">
+
+Theo bản tóm tắt sự cố của AWS, ngày 13/06/2023 AWS Lambda ở vùng US-EAST-1 có tỉ lệ lỗi và độ trễ tăng khoảng hai giờ. Lambda dùng kiến trúc cell; mỗi cell gồm nhiều hệ thống con, trong đó Lambda Frontend nhận và định tuyến lời gọi hàm. Dòng thời gian (giờ PDT):
+
+- 10:01: đội máy của Lambda Frontend bắt đầu mở rộng theo lưu lượng tăng, mức tăng nằm trong quy luật hằng ngày.
+- 11:49: trong lúc thêm dung lượng, đội máy vượt một **ngưỡng dung lượng chưa từng đạt tới trong một cell**, kích hoạt một lỗi tiềm ẩn: môi trường thực thi được cấp phát nhưng không bao giờ được Frontend dùng hết, nên Lambda không cấp được môi trường mới. Lời gọi hàm **trong cell đó** lỗi và chậm; theo bản tóm tắt, lời gọi trong các cell khác không bị ảnh hưởng.
+- 12:26: đội xác định được lỗi. Cách khắc phục: thu nhỏ đội máy Frontend về mức không còn kích hoạt lỗi. 13:45: lời gọi đồng bộ hồi phục hẳn; hàng đợi lời gọi bất đồng bộ xử lý xong lúc 15:37.
+
+Cùng khoảng thời gian, nhiều dịch vụ khác ở US-EAST-1 cũng lỗi, trong đó có AWS STS, bảng điều khiển của vùng, EventBridge (Lambda là đích nhận sự kiện của nó) và Amazon Connect (dùng Lambda để xử lý cuộc gọi); bản tóm tắt không giải thích STS hay bảng điều khiển phụ thuộc vào Lambda thế nào.
+
+Việc AWS làm sau sự cố: tắt ngay việc mở rộng đội máy Frontend, vá lỗi ở mọi vùng, và một dự án để **mọi cell bị giới hạn ở một cỡ đã được kiểm thử kỹ**.
+
+Phần của bài: cell đã làm đúng việc của nó, giữ lỗi trong một cell. Nhưng cell đó lớn hơn mọi cỡ từng được thử, và blast radius thật phải tính cả những dịch vụ khác đặt phụ thuộc vào đúng cell đó.
+
+</Callout>
+
+<Check id="d25.1.cell">Vẽ được kiến trúc cell gồm router, bảng gán và các cell giống hệt nhau, giải thích được vì sao router phải mỏng và cỡ cell phải có trần đã kiểm thử, và kể được cách thêm cell, xử lý khách hàng lớn, di chuyển tenant.</Check>
+
+### Cell, shard và AZ khác nhau thế nào
+
+Ba khái niệm hay bị dùng lẫn:
+
+| | Shard | AZ | Cell |
+|---|---|---|---|
+| Chia cái gì | **Dữ liệu** của một tầng (database chia theo khoá) | **Hạ tầng vật lý** của nhà cung cấp | **Toàn bộ stack**, theo khách hàng |
+| Phần còn dùng chung | Lớp ứng dụng, cache, hàng đợi, bản build | Phần mềm của bạn: một service trải ba AZ vẫn là một service | Chỉ cell router (và control plane của cell) |
+| Chống được | Một shard database hỏng hay đầy | Mất điện, mất mạng một trung tâm dữ liệu | Ngoài những gì AZ chống được: bản build xấu, cấu hình xấu, tenant gửi request độc, quá tải, chạm hạn mức, nếu triển khai theo cell |
+| Không chống được | Bản build lỗi ở lớp ứng dụng | Bản build lỗi, cấu hình xấu đẩy ra cả ba AZ | Lỗi ở router, lỗi của phụ thuộc mọi cell cùng gọi (D21.3) |
+
+Chúng kết hợp với nhau. Một cell thường trải trên ba AZ để chịu được mất một AZ; K10.2 có ví dụ Skyscanner chia hạ tầng thành các cell, mỗi cell trong một vùng và gồm nhiều cụm ở các AZ. Ngược lại, có hệ chọn **mỗi AZ là một cell**: service trong AZ chỉ gọi service cùng AZ, và rút được cả một AZ khỏi lưu lượng; D21.3 làm việc đó.
+
+<Check id="d25.1.so-sanh">Phân biệt được shard, AZ và cell theo thứ được chia, thứ còn dùng chung và loại lỗi chống được, và mô tả được hai cách kết hợp cell với AZ.</Check>
+
+### Triển khai theo cell
+
+Cell chỉ giới hạn được lỗi do thay đổi nếu thay đổi cũng đi theo cell. D13.4 đã dạy triển khai theo wave và bake time, với cell làm đơn vị của mỗi wave; D13.5 dạy kill switch có phạm vi theo cell. Kiến trúc cell thêm ba quy tắc:
+
+- **Không thay đổi nào chạm hơn một cell cùng lúc** ở wave đầu, kể cả cấu hình động, luật WAF, file dữ liệu sinh tự động. Một hệ thống cấu hình đẩy ra "mọi cell trong một lần" biến lại toàn bộ hệ thành một failure domain.
+- **Cell đầu tiên nhỏ và ít rủi ro nhất**: cell của khách nội bộ, hoặc cell có ít lưu lượng. Mỗi cell có SLI riêng (D16.1) để cổng kiểm giữa các wave so được cell vừa đổi với các cell chưa đổi.
+- **Router và control plane của cell cũng triển khai theo nấc**, vì chúng là phần dùng chung. Router chạy nhiều bản, đổi từng bản; bảng gán mới được kiểm trước khi đẩy, và router giữ bản cũ nếu bản mới hỏng (D9.6 đã thấy Envoy từ chối một bản cấu hình hỏng và giữ bản đang chạy).
+
+<Check id="d25.1.trien-khai">Nêu được ba quy tắc triển khai trong kiến trúc cell và giải thích được vì sao một hệ thống cấu hình đẩy ra mọi cell cùng lúc làm mất tác dụng của cell.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Reducing the Scope of Impact with Cell-Based Architecture (AWS Well-Architected)](https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/reducing-scope-of-impact-with-cell-based-architecture.html): toàn bộ tài liệu về cell; đọc các mục Cell partition, Cell routing, Cell sizing.
+- [Cell sizing (AWS Well-Architected)](https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-sizing.html): bảng đánh đổi cell nhỏ và cell lớn, và vì sao cell cần trần đã kiểm thử.
+- [REL10-BP03 Use bulkhead architectures to limit scope of impact (AWS Well-Architected)](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_fault_isolation_use_bulkhead.html): nguyên tắc vách ngăn mà cell là một dạng, kèm các anti-pattern.
+- [Summary of the AWS Service Event in the Northern Virginia (US-EAST-1) Region](https://aws.amazon.com/message/061323/): nguồn của callout về Lambda; đọc phần về ngưỡng dung lượng trong một cell và danh sách dịch vụ bị ảnh hưởng.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker Desktop hoặc Docker Engine 29 có Compose, `curl`, `jq`, Python 3 (D3.3), máy có mạng. Lab tải image Go (khoảng 70 MB nén) để build ứng dụng mẫu và image Envoy (khoảng 65 MB nén). Dùng cổng **9920**, **9921** (router) và **9930–9934** (store), chỉ nghe trên `127.0.0.1`. Thư mục lab `~/masteva-d25`; D21.2 và D21.3 dùng tiếp ứng dụng và router của bài này. Mọi khối lệnh chạy trong `~/masteva-d25`; nếu mở terminal mới giữa chừng, chạy `cd ~/masteva-d25` trước.
+
+**Profile máy:** cả lab có 11 container (router và 10 container Go), dùng khoảng 120 MiB RAM theo `docker stats` (router khoảng 20 MiB, mỗi container Go 7–12 MiB); bước 4 thêm hai container của cell-4 và container tải, tổng dưới 150 MiB; container ứng dụng giới hạn 0,5 CPU và 64 MiB, router 1 CPU và 128 MiB. Build image Go cần khoảng 1 GB RAM trong chưa tới một phút. Máy 8 GB chạy thoải mái.
+
+### 0. Ứng dụng mẫu
+
+Một binary Go chỉ dùng thư viện chuẩn, chạy nhiều vai theo cờ `-role`:
+
+- **store** đóng vai database của một cell: đếm số lần mỗi tenant gọi. Đường `/admin/fail?on=1` làm nó trả `500` cho mọi request, như database hỏng.
+- **api** nhận request có header `x-tenant`, gọi store của cell mình, trả tên cell trong thân và trong header `x-cell`.
+- **load** là bộ tạo tải (file `load.go` ở khối sau).
+
+Hai danh sách `starts` và `guards` là chỗ D21.2 và D21.3 gắn thêm hành vi (request độc, đọc cấu hình, giới hạn đồng thời, xin token) bằng file Go mới, không phải sửa file này. Khi đọc `main.go`, phần cần hiểu là `runAPI` (một request đi qua các bước: gắn header `x-cell`, chạy lần lượt các hàm trong `guards`, gọi store, trả lời) và hai danh sách đó; `main` và `runStore` chỉ là khung.
+
+<Terminal where="mac" title="~/masteva-d25/app/main.go">
+
+```bash
+mkdir -p ~/masteva-d25/app ~/masteva-d25/router/xds && cd ~/masteva-d25
+cat > app/main.go <<'EOF'
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	role  = flag.String("role", "", "store | api | load (D21.2, D21.3 thêm vai khác)")
+	cell  = flag.String("cell", "", "tên cell, worker hoặc zone; trả về trong header x-cell")
+	store = flag.String("store", "", "api: URL của store trong cell")
+)
+
+var (
+	roles  = map[string]func(){"store": runStore, "api": runAPI, "load": runLoad}
+	starts []func()                              // chạy một lần khi api khởi động (D21.2, D21.3)
+	guards []func(*http.Request) (string, error) // chạy trước mỗi request của api (D21.2, D21.3)
+)
+
+func main() {
+	flag.Parse()
+	run, ok := roles[*role]
+	if !ok {
+		log.Fatalf("vai không hợp lệ: %q", *role)
+	}
+	run()
+}
+
+func serve() { log.Fatal(http.ListenAndServe(":8080", nil)) }
+
+// store: đếm số lần mỗi tenant gọi; /admin/fail?on=1 làm nó trả lỗi, như database hỏng.
+func runStore() {
+	var mu sync.Mutex
+	count := map[string]int{}
+	var broken atomic.Bool
+	http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
+		if broken.Load() {
+			http.Error(w, "store hỏng", http.StatusInternalServerError)
+			return
+		}
+		t := r.URL.Query().Get("tenant")
+		mu.Lock()
+		count[t]++
+		n := count[t]
+		mu.Unlock()
+		fmt.Fprint(w, n)
+	})
+	http.HandleFunc("/admin/fail", func(w http.ResponseWriter, r *http.Request) {
+		broken.Store(r.URL.Query().Get("on") == "1")
+		fmt.Fprintf(w, "%s: store hỏng = %v\n", *cell, broken.Load())
+	})
+	serve()
+}
+
+// api: nhận request có header x-tenant, gọi store của cell mình, trả tên cell.
+func runAPI() {
+	for _, s := range starts {
+		s()
+	}
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-cell", *cell)
+		t := r.Header.Get("x-tenant")
+		out := *cell
+		if t != "" {
+			out += " tenant=" + t
+		}
+		for _, g := range guards {
+			info, err := g(r)
+			if err != nil {
+				http.Error(w, *cell+": "+err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			if info != "" {
+				out += " | " + info
+			}
+		}
+		if *store != "" {
+			resp, err := client.Get(*store + "/get?tenant=" + url.QueryEscape(t))
+			if err != nil {
+				http.Error(w, *cell+": không gọi được store", http.StatusServiceUnavailable)
+				return
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				http.Error(w, *cell+": store lỗi", http.StatusServiceUnavailable)
+				return
+			}
+			out += " n=" + string(b)
+		}
+		fmt.Fprintln(w, out)
+	})
+	serve()
+}
+EOF
+```
+
+</Terminal>
+
+Bộ tạo tải gửi request theo **nhịp cố định** (mô hình mở của D18.1): mỗi giây đúng số request đã đặt, không chờ request trước trả lời. Mỗi tenant được gửi lần lượt theo trọng số (`-weights t01=4` nghĩa là t01 gửi gấp bốn tenant khác). Kết thúc mỗi bậc, nó in bảng theo tenant (khi có nhiều tenant) hoặc một dòng tóm tắt có p50, p99 và số request mỗi cell trả lời (khi không có tenant, dùng ở D21.3).
+
+Phần cần đọc kỹ là hàm `report`, vì nó định nghĩa các con số của bài: một tenant được tính là **bị ảnh hưởng** khi hơn 1% request của nó lỗi; "request lỗi" là mọi request không nhận `200` trong 1 giây, kể cả hết hạn chờ; cột "phục vụ bởi" là các giá trị `x-cell` của những request thành công. Hàm `shoot` chỉ là vòng gửi request, không cần đọc kỹ.
+
+<Terminal where="mac" title="~/masteva-d25/app/load.go">
+
+```bash
+cat > app/load.go <<'EOF'
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"maps"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+var (
+	target = flag.String("url", "http://d21-router:8080/", "load: địa chỉ gửi request")
+	tlist  = flag.String("tenants", "", "load: t01-t12 hoặc t01,t05")
+	wlist  = flag.String("weights", "", "load: tenant nặng hơn, ví dụ t01=4")
+	poison = flag.String("poison", "", "load: tenant gửi request độc (?q=poison)")
+	rates  = flag.String("rps", "120", "load: request mỗi giây; nhiều bậc thì cách nhau dấu phẩy")
+	dur    = flag.Duration("dur", 10*time.Second, "load: thời gian mỗi bậc")
+	repeat = flag.Int("repeat", 1, "load: lặp mỗi bậc bao nhiêu lần, mỗi lần in một dòng")
+	header = flag.String("header", "", "load: thêm một header, ví dụ x-zone=d21-zone-a")
+)
+
+type result struct {
+	tenant, cell string
+	ok           bool
+	lat          time.Duration
+}
+
+func runLoad() {
+	var seq []string // mỗi tenant xuất hiện theo trọng số của nó
+	ts := []string{""}
+	if a, b, ok := strings.Cut(*tlist, "-"); ok {
+		lo, _ := strconv.Atoi(a[1:])
+		hi, _ := strconv.Atoi(b[1:])
+		ts = nil
+		for i := lo; i <= hi; i++ {
+			ts = append(ts, fmt.Sprintf("t%02d", i))
+		}
+	} else if *tlist != "" {
+		ts = strings.Split(*tlist, ",")
+	}
+	for _, t := range ts {
+		n := 1
+		for _, kv := range strings.Split(*wlist, ",") {
+			if k, v, ok := strings.Cut(kv, "="); ok && k == t {
+				n, _ = strconv.Atoi(v)
+			}
+		}
+		for range n {
+			seq = append(seq, t)
+		}
+	}
+	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 500}}
+	start := time.Now()
+	for _, rs := range strings.Split(*rates, ",") {
+		rate, _ := strconv.Atoi(rs)
+		for range *repeat {
+			if *repeat > 1 {
+				fmt.Printf("t=%3.0fs ", time.Since(start).Seconds())
+			}
+			report(rate, shoot(client, seq, rate), len(ts) > 1)
+		}
+	}
+}
+
+// shoot gửi request theo nhịp cố định, không chờ request trước xong (mô hình mở của D18.1).
+func shoot(client *http.Client, seq []string, rate int) []result {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var out []result
+	tick := time.NewTicker(time.Second / time.Duration(rate))
+	defer tick.Stop()
+	end := time.Now().Add(*dur)
+	for i := 0; time.Now().Before(end); i++ {
+		<-tick.C
+		t := seq[i%len(seq)]
+		wg.Go(func() {
+			u := *target
+			if t != "" && t == *poison {
+				u += "?q=poison"
+			}
+			req, _ := http.NewRequest("GET", u, nil)
+			req.Header.Set("x-tenant", t)
+			if k, v, ok := strings.Cut(*header, "="); ok {
+				req.Header.Set(k, v)
+			}
+			r, begin := result{tenant: t}, time.Now()
+			if resp, err := client.Do(req); err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				r.ok, r.cell = resp.StatusCode == http.StatusOK, resp.Header.Get("x-cell")
+			}
+			r.lat = time.Since(begin)
+			mu.Lock()
+			out = append(out, r)
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+	return out
+}
+
+func report(rate int, rs []result, perTenant bool) {
+	okN, cells := 0, map[string]int{}
+	all, good := map[string]int{}, map[string]int{}
+	served := map[string]map[string]bool{}
+	var lats []time.Duration
+	for _, r := range rs {
+		lats = append(lats, r.lat)
+		all[r.tenant]++
+		if served[r.tenant] == nil {
+			served[r.tenant] = map[string]bool{}
+		}
+		if r.ok {
+			okN++
+			good[r.tenant]++
+			cells[r.cell]++
+			served[r.tenant][r.cell] = true
+		}
+	}
+	if perTenant {
+		fmt.Printf("%-7s %-12s %9s %5s\n", "tenant", "phục vụ bởi", "ok/tổng", "lỗi")
+		hit := 0
+		for _, t := range slices.Sorted(maps.Keys(all)) {
+			by := slices.Sorted(maps.Keys(served[t]))
+			if len(by) == 0 {
+				by = []string{"-"}
+			}
+			loss := 100 * float64(all[t]-good[t]) / float64(all[t])
+			if loss > 1 {
+				hit++
+			}
+			fmt.Printf("%-7s %-12s %4d/%-4d %4.0f%%\n", t, strings.Join(by, ","), good[t], all[t], loss)
+		}
+		fmt.Printf("tenant bị ảnh hưởng (lỗi > 1%%): %d/%d (%.0f%%) | request lỗi: %d/%d (%.0f%%)\n",
+			hit, len(all), 100*float64(hit)/float64(len(all)),
+			len(rs)-okN, len(rs), 100*float64(len(rs)-okN)/float64(len(rs)))
+		return
+	}
+	slices.Sort(lats)
+	p := func(q float64) int64 { return lats[int(q*float64(len(lats)-1))].Milliseconds() }
+	var by []string
+	for _, c := range slices.Sorted(maps.Keys(cells)) {
+		by = append(by, fmt.Sprintf("%s=%d", c, cells[c]))
+	}
+	if len(by) == 0 {
+		by = []string{"không request nào thành công"}
+	}
+	fmt.Printf("%4d req/s: ok %5.1f%% | p50 %4dms | p99 %4dms | %s\n", rate,
+		100*float64(okN)/float64(len(rs)), p(0.5), p(0.99), strings.Join(by, " "))
+}
+EOF
+```
+
+</Terminal>
+
+Build image. `Dockerfile` biên dịch mọi file `.go` trong `app/` thành một binary tĩnh và đặt nó vào image `scratch` (không có shell, không có gói nào), chạy bằng user không phải root. Tag `d21-app:1` là bản của bài này; D21.2 và D21.3 build thêm `:2`, `:3` khi thêm file.
+
+<Terminal where="mac" title="~/masteva-d25/app/Dockerfile">
+
+```bash
+cat > app/go.mod <<'EOF'
+module d21/app
+
+go 1.27
+EOF
+cat > app/Dockerfile <<'EOF'
+FROM golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS build
+WORKDIR /src
+COPY go.mod *.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /app .
+FROM scratch
+COPY --from=build /app /app
+USER 65532:65532
+ENTRYPOINT ["/app"]
+EOF
+docker build -q -t d21-app:1 app
+docker pull -q envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de
+docker image ls d21-app:1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+sha256:6b4a344aacae697168dc93a8f228dade4c9e892e794f8ed3f3a04a6b0c7fe57e
+docker.io/envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de
+IMAGE       ID             DISK USAGE   CONTENT SIZE   EXTRA
+d21-app:1   6b4a344aacae        8.5MB         2.52MB
+```
+
+</Expected>
+
+ID của image trên máy bạn sẽ khác. Dòng `docker pull` in lại đúng `tag@digest`: Docker từ chối nếu nội dung tải về không khớp digest. Nếu `docker build` báo lỗi biên dịch, thường là một dòng bị thiếu khi dán; so lại hai khối trên.
+
+### 1. Một router mỏng nhận bảng gán như dữ liệu
+
+D9.6 đã chạy Envoy với cấu hình nạp qua xDS dạng file. Router của bài dùng đúng cách đó:
+
+- `router/envoy.yaml` là file khởi động: một listener cố định ở cổng 8080, và hai nguồn động là CDS (danh sách cluster, tức các nhóm backend) và RDS (bảng route) đọc từ `/xds/cds.yaml` và `/xds/rds.yaml`. Route lấy qua RDS nên đổi bảng route có hiệu lực ngay cả với kết nối đang mở.
+- `router/gen.py` là "control plane" thu nhỏ: đọc một **file kế hoạch** JSON và sinh hai file đó. Kế hoạch của bài này chỉ có một khoá `tenants`: mỗi tenant gán với danh sách backend phục vụ nó. Mỗi tenant thành một route khớp header `x-tenant`; tenant chưa có trong bảng nhận `404`. Các khoá `weights`, `retries`, `health_check`, `outlier`, `label` là cho D21.2 và D21.3.
+- Mỗi cluster có kiểu `STRICT_DNS` khi backend là tên container: Envoy hỏi DNS của Docker định kỳ và dùng mọi địa chỉ nhận được. Khi backend là địa chỉ IP viết sẵn (D21.2), `gen.py` dùng kiểu `STATIC`, không hỏi DNS.
+- `router/apply.sh` chạy `gen.py`, rồi thay hai file trong container router bằng thao tác **đổi tên** (`mv`): Envoy chỉ nạp lại khi file được đổi tên đè lên, như D9.6 đã nói. Thao tác đổi tên phải chạy **bên trong** container: với bind mount của Docker Desktop, `mv` làm trên máy Mac không tới được Envoy dưới dạng sự kiện đổi tên nên Envoy không nạp lại. Lệnh `docker exec -u` chạy nó bằng user của bạn, để file mới cùng chủ với các file khác trong `router/xds/`. Nó áp CDS trước, chờ một giây cho cluster mới sẵn sàng, rồi mới áp RDS trỏ tới chúng. Theo tài liệu Envoy 1.40, `path_config_source` còn có trường `poll_interval`: Envoy đọc lại file theo chu kỳ, không cần sự kiện đổi tên, nên cũng tránh được giới hạn của bind mount; bài giữ cách đổi tên của D9.6 vì Envoy nạp ngay lúc đổi.
+
+<Terminal where="mac" title="~/masteva-d25/router">
+
+```bash
+cat > router/envoy.yaml <<'EOF'
+node: { id: d21-router, cluster: d21 }
+admin:
+  address: { socket_address: { address: 0.0.0.0, port_value: 9901 } }
+dynamic_resources:
+  cds_config: { resource_api_version: V3, path_config_source: { path: /xds/cds.yaml } }
+static_resources:
+  listeners:
+  - name: ingress
+    address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress
+          rds:
+            route_config_name: routes
+            config_source: { resource_api_version: V3, path_config_source: { path: /xds/rds.yaml } }
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
+EOF
+cat > router/gen.py <<'EOF'
+"""gen.py <kế hoạch.json>: sinh xds/cds.next (cluster) và xds/rds.next (route) cho router Envoy.
+Kế hoạch: "tenants" {tenant: [backend...]}, "weights" {zone: trọng số}, tuỳ chọn "retries",
+"health_check", "outlier", "label" (tiền tố tên cluster)."""
+import json
+import sys
+
+
+def cluster(name, hosts, plan):
+    c = {"@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster", "name": name,
+         "type": "STATIC" if hosts[0][0].isdigit() else "STRICT_DNS", "connect_timeout": "0.25s",
+         "load_assignment": {"cluster_name": name, "endpoints": [{"lb_endpoints": [
+             {"endpoint": {"address": {"socket_address": {"address": h, "port_value": 8080}}}} for h in hosts]}]}}
+    if plan.get("health_check"):
+        c["health_checks"] = [{"timeout": "0.5s", "interval": "1s", "unhealthy_threshold": 2,
+                               "healthy_threshold": 1, "http_health_check": {"path": "/healthz"}}]
+        c["ignore_health_on_host_removal"] = True
+    if plan.get("outlier"):
+        c["outlier_detection"] = {"split_external_local_origin_errors": True, "consecutive_local_origin_failure": 2,
+                                  "base_ejection_time": "10s", "max_ejection_percent": 50}
+    return c
+
+
+def route(match, action, plan):
+    action["timeout"] = "0.9s"
+    if plan.get("retries"):
+        action["retry_policy"] = {
+            "retry_on": "connect-failure,reset", "num_retries": plan["retries"], "per_try_timeout": "0.3s",
+            "retry_host_predicate": [{"name": "envoy.retry_host_predicates.previous_hosts", "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate"}}],
+            "host_selection_retry_max_attempts": 3}
+    return {"match": match, "route": action}
+
+
+def by_header(name, value):
+    return {"prefix": "/", "headers": [{"name": name, "string_match": {"exact": value}}]}
+
+
+plan = json.load(open(sys.argv[1]))
+clusters, routes = {}, []
+for tenant, hosts in plan.get("tenants", {}).items():
+    name = plan.get("label", "") + "+".join(hosts)
+    clusters[name] = hosts
+    routes.append(route(by_header("x-tenant", tenant), {"cluster": name}, plan))
+weights = plan.get("weights", {})
+for zone in weights:
+    clusters[zone] = [zone]
+    routes.append(route(by_header("x-zone", zone), {"cluster": zone}, plan))
+if weights:
+    routes.append(route({"prefix": "/"}, {"weighted_clusters": {"clusters": [
+        {"name": z, "weight": w} for z, w in weights.items()]}}, plan))
+else:
+    routes.append({"match": {"prefix": "/"},
+                   "direct_response": {"status": 404, "body": {"inline_string": "tenant chưa được gán cell\n"}}})
+json.dump({"resources": [cluster(n, h, plan) for n, h in clusters.items()]}, open("xds/cds.next", "w"), indent=1)
+json.dump({"resources": [{"@type": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration", "name": "routes",
+                          "virtual_hosts": [{"name": "all", "domains": ["*"], "routes": routes}]}]},
+          open("xds/rds.next", "w"), indent=1)
+print(f"{len(clusters)} cluster, {len(routes)} route")
+EOF
+cat > router/apply.sh <<'EOF'
+#!/bin/bash
+# router/apply.sh <kế hoạch.json>: sinh cấu hình, rồi thay file trong container router bằng thao tác đổi tên.
+set -euo pipefail
+cd "$(dirname "$0")"
+python3 gen.py "$1"
+if [ "$(docker inspect -f '{{.State.Running}}' d21-router 2>/dev/null)" != true ]; then
+  cp xds/cds.next xds/cds.yaml && cp xds/rds.next xds/rds.yaml && exit 0
+fi
+docker exec -u "$(id -u):$(id -g)" d21-router sh -c 'for f in cds rds; do cp /xds/$f.next /xds/.$f.tmp && mv /xds/.$f.tmp /xds/$f.yaml && sleep 1; done'
+curl -s localhost:9921/stats | grep -E '^(cluster_manager.cds|http.ingress.rds.routes).update_(success|rejected)'
+EOF
+chmod +x router/apply.sh
+```
+
+</Terminal>
+
+Giờ là hệ thống. Bài dựng **cùng lúc** hai kiến trúc trong một project Compose, để chuyển qua lại chỉ bằng cách đổi bảng gán của router:
+
+```text
+                         ┌─▶ d21-shared-api-1 ─┐
+ kiến trúc dùng chung:   ├─▶ d21-shared-api-2 ─┼─▶ d21-shared-store   (một store cho mọi tenant)
+                         └─▶ d21-shared-api-3 ─┘
+ router :9920 ─┤
+                         ┌─▶ d21-cell1-api ─▶ d21-cell1-store  :9931
+ ba cell:                ├─▶ d21-cell2-api ─▶ d21-cell2-store  :9932
+                         └─▶ d21-cell3-api ─▶ d21-cell3-store  :9933
+```
+
+Trong `compose.yaml`, `x-app: &app` đặt tên cho một khối cấu hình chung (anchor của YAML), và `<<: *app` chép khối đó vào từng service, nên mỗi service chỉ khai phần riêng: tên container, lệnh, cổng. Mạng `d21-net` có dải địa chỉ cố định `10.221.21.0/24` vì D21.2 cần đặt địa chỉ cố định cho từng worker. `load.sh` chạy bộ tạo tải trong một container trên mạng đó, gọi thẳng `d21-router:8080`. Kế hoạch đầu tiên, `shared.json`, gán cả 12 tenant vào ba api dùng chung: dòng `echo` dùng vòng `for` sinh 12 cặp `"t01": [ba api]` giống nhau, `jq .` định dạng lại thành file, và `jq -c` ngay sau in hai mục đầu để bạn xem.
+
+<Terminal where="mac" title="~/masteva-d25/compose.yaml">
+
+```bash
+cat > compose.yaml <<'EOF'
+name: d21
+x-app: &app
+  image: d21-app:1
+  cpus: 0.5
+  mem_limit: 64m
+  restart: unless-stopped
+services:
+  router:
+    image: envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de
+    container_name: d21-router
+    command: ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "2", "--log-level", "warn"]
+    volumes: ["./router/envoy.yaml:/etc/envoy/envoy.yaml:ro", "./router/xds:/xds"]
+    ports: ["127.0.0.1:9920:8080", "127.0.0.1:9921:9901"]
+    cpus: 1
+    mem_limit: 128m
+  shared-store: { <<: *app, container_name: d21-shared-store, command: -role store -cell shared, ports: ["127.0.0.1:9930:8080"] }
+  shared-api-1: { <<: *app, container_name: d21-shared-api-1, command: -role api -cell shared -store http://d21-shared-store:8080 }
+  shared-api-2: { <<: *app, container_name: d21-shared-api-2, command: -role api -cell shared -store http://d21-shared-store:8080 }
+  shared-api-3: { <<: *app, container_name: d21-shared-api-3, command: -role api -cell shared -store http://d21-shared-store:8080 }
+  cell1-store: { <<: *app, container_name: d21-cell1-store, command: -role store -cell cell-1, ports: ["127.0.0.1:9931:8080"] }
+  cell1-api: { <<: *app, container_name: d21-cell1-api, command: -role api -cell cell-1 -store http://d21-cell1-store:8080 }
+  cell2-store: { <<: *app, container_name: d21-cell2-store, command: -role store -cell cell-2, ports: ["127.0.0.1:9932:8080"] }
+  cell2-api: { <<: *app, container_name: d21-cell2-api, command: -role api -cell cell-2 -store http://d21-cell2-store:8080 }
+  cell3-store: { <<: *app, container_name: d21-cell3-store, command: -role store -cell cell-3, ports: ["127.0.0.1:9933:8080"] }
+  cell3-api: { <<: *app, container_name: d21-cell3-api, command: -role api -cell cell-3 -store http://d21-cell3-store:8080 }
+networks:
+  default:
+    name: d21-net
+    ipam: { config: [ { subnet: 10.221.21.0/24 } ] }
+EOF
+cat > load.sh <<'EOF'
+#!/bin/bash
+# load.sh <cờ của vai load>: chạy bộ tạo tải trong một container trên mạng d21-net.
+exec docker run --rm --network d21-net d21-app:1 -role load "$@"
+EOF
+chmod +x load.sh
+S='["d21-shared-api-1","d21-shared-api-2","d21-shared-api-3"]'
+echo "{\"tenants\": {$(for i in $(seq -w 1 12); do printf '"t%s": %s,' "$i" "$S"; done | sed 's/,$//')}}" | jq . > router/shared.json
+jq -c '.tenants | to_entries[0:2]' router/shared.json
+./router/apply.sh shared.json
+docker compose up -d
+for i in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'x-tenant: t01' localhost:9920/)" = 200 ] && break; sleep 1; done
+curl -s -H 'x-tenant: t01' localhost:9920/
+curl -s -H 'x-tenant: t01' localhost:9920/
+curl -s -H 'x-tenant: t99' localhost:9920/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+[{"key":"t01","value":["d21-shared-api-1","d21-shared-api-2","d21-shared-api-3"]},{"key":"t02","value":["d21-shared-api-1","d21-shared-api-2","d21-shared-api-3"]}]
+1 cluster, 13 route
+shared tenant=t01 n=2
+shared tenant=t01 n=3
+tenant chưa được gán cell
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Giữa dòng `13 route` và ba dòng cuối, `docker compose up` in trạng thái (`Creating`, `Started`…) của mạng `d21-net` và 11 container.
+- Ở lần `apply.sh` đầu tiên router chưa chạy, nên script chỉ chép file vào chỗ để Envoy đọc khi khởi động. Kế hoạch sinh ra 1 cluster (ba api dùng chung gộp thành một nhóm) và 13 route: 12 tenant cộng route mặc định trả `404`.
+- Vòng `for` chờ Envoy phân giải xong tên các api; lần gọi thành công của nó là lần đầu t01 chạm store. `n=2`, `n=3` là số lần t01 đã gọi store: hai request có thể đi tới hai api khác nhau nhưng cùng ghi vào một store.
+
+<Check id="d25.1.lab-router">Dựng được một router Envoy nhận cluster và route qua xDS dạng file từ một file kế hoạch, và giải thích được vì sao thao tác đổi tên file phải chạy bên trong container.</Check>
+
+### 2. Kiến trúc dùng chung: một store hỏng
+
+Chạy tải 10 giây: 150 request mỗi giây chia cho 12 tenant, t01 là tenant lớn gửi gấp bốn tenant khác (4 phần trong tổng 15 phần, khoảng 27% lưu lượng). Lần đầu là lúc mọi thứ khoẻ; rồi làm store dùng chung hỏng và chạy lại.
+
+<Terminal where="mac">
+
+```bash
+./load.sh -tenants t01-t12 -weights t01=4 -rps 150 -dur 10s | tail -1
+curl -s 'localhost:9930/admin/fail?on=1'
+./load.sh -tenants t01-t12 -weights t01=4 -rps 150 -dur 10s | grep -E '^(tenant|t01|t02|t12)|bị ảnh hưởng'
+```
+
+</Terminal>
+
+<Predict question="Ba bản sao api vẫn khoẻ, router vẫn chuyển request đều cho cả ba. Bao nhiêu tenant sẽ thấy lỗi?">
+
+```text
+tenant bị ảnh hưởng (lỗi > 1%): 0/12 (0%) | request lỗi: 0/1496 (0%)
+shared: store hỏng = true
+tenant  phục vụ bởi    ok/tổng   lỗi
+t01     -               0/400   100%
+t02     -               0/100   100%
+t12     -               0/99    100%
+tenant bị ảnh hưởng (lỗi > 1%): 12/12 (100%) | request lỗi: 1493/1493 (100%)
+```
+
+Tất cả: `grep` chỉ giữ ba tenant, nhưng dòng tổng kết đếm đủ 12 trên 12. Ba bản sao api không cùng hỏng vì máy, vì tiến trình; chúng cùng hỏng vì **một phụ thuộc dùng chung**. Blast radius là 100% theo cả hai cách đo. Đây là hình dạng của rất nhiều hệ thống "có dự phòng": nhiều bản sao ở lớp không giữ trạng thái, một database chung phía sau. Tổng số request có thể thấp hơn 1.500 vài đơn vị tới vài chục đơn vị: khi máy bận, bộ tạo tải lỡ vài nhịp của đồng hồ.
+
+</Predict>
+
+<Check id="d25.1.lab-shared">Tái hiện được việc một phụ thuộc dùng chung làm mọi tenant lỗi dù các bản sao api vẫn khoẻ, và đọc được blast radius theo tenant và theo request từ bảng kết quả.</Check>
+
+### 3. Chia thành ba cell
+
+Sửa store dùng chung, rồi gán 12 tenant vào ba cell, mỗi cell bốn tenant. `cells.json` là bảng gán đầy đủ, viết tay để bạn đọc được: đổi một dòng là di chuyển một tenant.
+
+<Terminal where="mac" title="~/masteva-d25/router/cells.json">
+
+```bash
+curl -s 'localhost:9930/admin/fail?on=0'
+cat > router/cells.json <<'EOF'
+{"tenants": {
+  "t01": ["d21-cell1-api"], "t02": ["d21-cell1-api"], "t03": ["d21-cell1-api"], "t04": ["d21-cell1-api"],
+  "t05": ["d21-cell2-api"], "t06": ["d21-cell2-api"], "t07": ["d21-cell2-api"], "t08": ["d21-cell2-api"],
+  "t09": ["d21-cell3-api"], "t10": ["d21-cell3-api"], "t11": ["d21-cell3-api"], "t12": ["d21-cell3-api"]
+}}
+EOF
+./router/apply.sh cells.json
+./load.sh -tenants t01-t12 -weights t01=4 -rps 150 -dur 10s | grep -E '^(tenant|t0[45]|t09)|bị ảnh hưởng'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+shared: store hỏng = false
+3 cluster, 13 route
+cluster_manager.cds.update_rejected: 0
+cluster_manager.cds.update_success: 2
+http.ingress.rds.routes.update_rejected: 0
+http.ingress.rds.routes.update_success: 2
+tenant  phục vụ bởi    ok/tổng   lỗi
+t04     cell-1        100/100     0%
+t05     cell-2        100/100     0%
+t09     cell-3         99/99      0%
+tenant bị ảnh hưởng (lỗi > 1%): 0/12 (0%) | request lỗi: 0/1494 (0%)
+```
+
+</Expected>
+
+Lệnh `grep` chỉ giữ dòng tiêu đề, ba tenant ở ranh giới giữa các cell và dòng tổng kết. Bốn bộ đếm cho biết router đã nhận bản cấu hình mới (`update_success` tăng từ 1 lên 2, lần 1 là lúc khởi động) và không từ chối bản nào. Cột "phục vụ bởi" cho thấy mỗi tenant giờ chỉ đi tới đúng một cell. Container của kiến trúc dùng chung vẫn chạy nhưng không còn nhận request nào.
+
+Giờ làm store của cell-2 hỏng, đúng sự cố của bước 2:
+
+<Terminal where="mac">
+
+```bash
+curl -s 'localhost:9932/admin/fail?on=1'
+./load.sh -tenants t01-t12 -weights t01=4 -rps 150 -dur 10s | grep -E '^(tenant|t01|t04|t05|t08|t09)|bị ảnh hưởng'
+curl -s 'localhost:9932/admin/fail?on=0'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cell-2: store hỏng = true
+tenant  phục vụ bởi    ok/tổng   lỗi
+t01     cell-1        400/400     0%
+t04     cell-1        100/100     0%
+t05     -               0/100   100%
+t08     -               0/100   100%
+t09     cell-3        100/100     0%
+tenant bị ảnh hưởng (lỗi > 1%): 4/12 (33%) | request lỗi: 400/1497 (27%)
+cell-2: store hỏng = false
+```
+
+</Expected>
+
+Bốn tenant từ t05 tới t08 lỗi hết (`grep` chỉ giữ hai đầu của mỗi nhóm; bỏ nó để xem đủ). Cùng một sự cố, blast radius còn **một phần ba khách hàng** và khoảng 27% request (4 phần trên 15). Tám tenant ở cell-1 và cell-3 không thấy gì: chúng không dùng chung với cell-2 thứ gì ngoài router.
+
+Lặp lại với cell-1, nơi có tenant lớn t01. Khối lệnh chỉ in dòng tổng kết của bảng.
+
+<Terminal where="mac">
+
+```bash
+curl -s 'localhost:9931/admin/fail?on=1'
+./load.sh -tenants t01-t12 -weights t01=4 -rps 150 -dur 10s | tail -1
+curl -s 'localhost:9931/admin/fail?on=0'
+```
+
+</Terminal>
+
+<Predict question="Cell-1 cũng có bốn tenant như cell-2. Hai con số blast radius sẽ là bao nhiêu?">
+
+```text
+cell-1: store hỏng = true
+tenant bị ảnh hưởng (lỗi > 1%): 4/12 (33%) | request lỗi: 700/1495 (47%)
+cell-1: store hỏng = false
+```
+
+Vẫn 4 trên 12 tenant, nhưng gần một nửa lưu lượng: cell-1 chứa 7 trong 15 phần (t01 bốn phần, ba tenant còn lại mỗi tenant một phần). Đây là lý do cần cả hai con số, và lý do tenant lớn thường được đặt ở cell riêng hoặc được tính vào trần của cell theo lưu lượng chứ không theo số khách.
+
+</Predict>
+
+<Check id="d25.1.lab-cells">Chuyển được 12 tenant từ kiến trúc dùng chung sang ba cell chỉ bằng một file kế hoạch, đo được blast radius khi một cell hỏng, và giải thích được vì sao cell chứa tenant lớn cho tỉ lệ request lỗi cao hơn.</Check>
+
+### 4. Thêm một cell khi hệ đang chạy
+
+Hai khách mới, t13 và t14, cần chỗ. Thay vì nhét vào cell đang có (cell nào cũng sẽ có trần), tạo cell-4 từ đúng khuôn của ba cell kia. File `cell4.yaml` là phần thêm vào project Compose; dòng `COMPOSE_FILE` trong `.env` bảo Compose đọc cả hai file, nên mọi lệnh `docker compose` sau này đều thấy cell-4.
+
+Bước này cũng kiểm một tính chất của router: đổi bảng gán **trong lúc** đang có tải không được làm tenant cũ lỗi. Khối lệnh chạy tải 20 giây ở nền cho cả 14 tenant (t13, t14 chưa có trong bảng nên sẽ nhận `404` lúc đầu), sau 8 giây thì thêm hai dòng vào bảng gán bằng `jq` và áp cho router.
+
+<Callout kind="danger">
+
+Dòng `docker rm -f d21-load` xoá container tải còn sót từ một lần chạy bị ngắt (nếu có), để tên `d21-load` dùng lại được.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-d25/cell4.yaml">
+
+```bash
+cat > cell4.yaml <<'EOF'
+services:
+  cell4-store: { image: d21-app:1, cpus: 0.5, mem_limit: 64m, restart: unless-stopped, container_name: d21-cell4-store, command: -role store -cell cell-4, ports: ["127.0.0.1:9934:8080"] }
+  cell4-api: { image: d21-app:1, cpus: 0.5, mem_limit: 64m, restart: unless-stopped, container_name: d21-cell4-api, command: -role api -cell cell-4 -store http://d21-cell4-store:8080 }
+EOF
+echo 'COMPOSE_FILE=compose.yaml:cell4.yaml' > .env
+docker compose up -d 2>&1 | grep 'cell4.*Started'
+docker rm -f d21-load > /dev/null 2>&1
+docker run -d --name d21-load --network d21-net d21-app:1 -role load -tenants t01-t14 -rps 140 -dur 20s
+sleep 8
+jq '.tenants.t13 = ["d21-cell4-api"] | .tenants.t14 = ["d21-cell4-api"]' router/cells.json > router/cells4.json
+./router/apply.sh cells4.json
+docker wait d21-load > /dev/null; docker logs d21-load | grep -E '^(tenant|t01|t12|t13|t14)|bị ảnh hưởng'; docker rm d21-load > /dev/null
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ Container d21-cell4-api Started
+ Container d21-cell4-store Started
+5dae550754d720e858be36293043fb1da5470b59cfc015e1f5745ef190f427de
+4 cluster, 15 route
+cluster_manager.cds.update_rejected: 0
+cluster_manager.cds.update_success: 3
+http.ingress.rds.routes.update_rejected: 0
+http.ingress.rds.routes.update_success: 3
+tenant  phục vụ bởi    ok/tổng   lỗi
+t01     cell-1        200/200     0%
+t12     cell-3        199/199     0%
+t13     cell-4        106/199    47%
+t14     cell-4        107/199    46%
+tenant bị ảnh hưởng (lỗi > 1%): 2/14 (14%) | request lỗi: 185/2795 (7%)
+```
+
+</Expected>
+
+Thứ tự hai dòng `Started` có thể đảo. Dòng chữ số dài là ID của container tải, trên máy bạn sẽ khác. Đọc kết quả:
+
+- **12 tenant cũ không mất request nào** trong lúc router đổi bảng gán: dòng tổng kết chỉ đếm 2 tenant bị ảnh hưởng, là t13 và t14 (bỏ `grep` để xem đủ 14 dòng). Cluster mới được thêm qua CDS, route mới qua RDS; Envoy không khởi động lại, kết nối đang mở dùng ngay bảng route mới.
+- **t13 và t14** lỗi trong khoảng 9–13 giây đầu (8 giây chờ cộng thời gian `apply.sh` chạy và Envoy nạp), rồi được cell-4 phục vụ. Tỉ lệ lỗi của hai tenant này trên máy bạn sẽ trong khoảng 40–70%, tuỳ lúc `apply.sh` xong. Ngoài đời, tenant mới được gán vào bảng **trước** khi được mở cho người dùng; ở đây chúng lỗi để bạn thấy đúng thời điểm bảng gán có hiệu lực.
+- Không cell nào cũ phải đổi gì. Đó là cách hệ cell lớn lên: thêm cell, không phình cell.
+
+<Check id="d25.1.lab-cell-moi">Thêm được một cell mới từ cùng khuôn và gán tenant mới vào nó trong lúc hệ đang có tải, và chứng minh được bằng bảng kết quả rằng tenant ở các cell cũ không mất request nào.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`Pool overlaps with other one on this address space`** khi `docker compose up`: một mạng Docker khác (của bạn hoặc của VPN) đã dùng dải `10.221.21.0/24`. Đổi dải trong `compose.yaml` sang một dải trống khác; D21.2 dùng địa chỉ `10.221.21.11–18`, nên đổi cả ở đó theo cùng dải mới.
+- **Vòng chờ ở bước 1 hết 30 giây mà `curl` vẫn không ra `200`:** xem `docker logs d21-router 2>&1 | tail`. Lỗi `Unable to parse JSON as proto` nghĩa là một file trong `router/xds/` hỏng; chạy lại `./router/apply.sh shared.json`. Nếu `curl localhost:9921/clusters` không có dòng nào, Envoy chưa nạp được CDS: kiểm `ls router/xds/` có đủ `cds.yaml` và `rds.yaml`.
+- **`apply.sh` in `update_rejected: 1`:** Envoy từ chối bản cấu hình mới và giữ bản đang chạy (D9.6). `docker logs d21-router 2>&1 | tail` cho biết trường nào sai (Envoy ghi log ra stderr), thường do file kế hoạch có tên backend gõ sai.
+- **Bảng kết quả có cột `phục vụ bởi` là `-` và mọi tenant lỗi ở bước 3:** store của bước 2 vẫn đang hỏng nếu bạn bỏ qua dòng `admin/fail?on=0`, hoặc container api chưa khởi động. `docker compose ps` để xem.
+
+</Callout>
+
+### Dọn dẹp
+
+Nếu học tiếp D21.2 ngay, chỉ cần khối đầu: dừng và xoá các container, giữ thư mục lab và image `d21-app:1`.
+
+<Callout kind="danger">
+
+`docker compose down` xoá 13 container của lab và mạng `d21-net`. `docker rm -f d21-load` xoá container tải nếu bước 4 bị ngắt giữa chừng; không có container đó thì lệnh không in gì.
+
+</Callout>
+
+<Terminal where="mac" title="Dừng lab, giữ thư mục">
+
+```bash
+cd ~/masteva-d25
+docker rm -f d21-load
+docker compose down
+```
+
+</Terminal>
+
+Khi đã học xong cả chặng, xoá hẳn:
+
+<Callout kind="danger">
+
+`docker rmi` xoá image ứng dụng của lab (và `:2`, `:3` nếu bạn đã làm D21.2, D21.3; image chưa có thì Docker báo `No such image`, bỏ qua). Lệnh cuối xoá thư mục lab cùng mọi file cấu hình và kế hoạch.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá hẳn">
+
+```bash
+docker rmi d21-app:1 d21-app:2 d21-app:3
+cd ~ && rm -rf ~/masteva-d25
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Nhiều cell thì nhiều thứ để hỏng hơn. Sao lại tốt hơn?">
+
+Đúng là số sự cố có thể tăng: 10 cell là 10 database, 10 lần triển khai, 10 bộ thứ để giám sát. Cái được là mỗi sự cố nhỏ đi, và hai tính chất đi kèm. Một là **dự đoán được**: cell có trần cố định nên mọi cell được thử ở đúng cỡ nó sẽ chạy, không có "lần đầu tiên hệ lớn tới mức này" như cell Lambda năm 2023. Hai là **thử được**: một thay đổi đi qua cell đầu tiên với lưu lượng thật, và nếu nó hỏng, chỉ khách của cell đó chịu. Với hệ một khối, lần thử thật đầu tiên là lần chạy trên toàn bộ khách hàng. Cái giá là chi phí vận hành, nên kiến trúc cell chỉ đáng làm khi đã có tự động hoá cho tạo cell, triển khai và giám sát theo cell.
+
+</Reveal>
+
+<Reveal title="Router là thành phần dùng chung duy nhất. Nó hỏng thì sao?">
+
+Thì mọi cell cùng không tới được, nên router được thiết kế để ít có lý do hỏng nhất: không logic nghiệp vụ, không gọi database lúc xử lý request (bảng gán nằm sẵn trong bộ nhớ, như Envoy của lab giữ cấu hình đã nạp), chạy nhiều bản ở nhiều AZ, triển khai từng bản một. Nhiều hệ dùng DNS làm router (mỗi tenant một tên miền con trỏ tới cell của nó) để tận dụng một hệ thống phân tán sẵn có và rất ổn định; cái giá là thời gian đổi bảng gán phụ thuộc TTL (K10.3 dạy chuyện TTL). Bản thân bảng gán cũng là một thay đổi cấu hình: nó cần kiểm trước khi đẩy và đẩy theo nấc như mọi cấu hình khác (D13.4).
+
+</Reveal>
+
+<Reveal title="Khi nào chưa nên làm cell?">
+
+Khi hệ còn nhỏ tới mức một khối vẫn thử được ở cỡ thật, và chưa có tự động hoá để vận hành nhiều bản sao. Một đội nhỏ với một database thường được lợi nhiều hơn từ những bước rẻ hơn: chạy trên nhiều AZ với dự phòng dung lượng (D18.1), triển khai theo wave (D13.4), giới hạn tải theo khách (D9.1, D18.2). Cell đáng làm khi khách hàng phân tách được theo một khoá, khi một khách có thể làm hại khách khác (request độc, quá tải), hoặc khi cam kết SLO đòi giới hạn phạm vi của mọi loại sự cố, kể cả sự cố do chính bạn triển khai.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI liệt kê failure domain của một sơ đồ kiến trúc là việc nó làm khá tốt, nếu bạn đưa đủ sơ đồ: hỏi riêng từng tầng, "những thành phần nào cùng hỏng nếu X hỏng", với X lần lượt là database, file cấu hình, IdP, một bản build. AI hay bỏ sót hai tầng không nằm trên sơ đồ: triển khai và cấu hình (thay đổi đẩy ra mọi nơi), và hạn mức của tài khoản. Khi AI đề xuất "chuyển sang kiến trúc cell", hỏi tiếp khoá phân vùng là gì, lời gọi nào phải đi ngang qua nhiều cell, khách lớn nhất có vừa một cell không, và router giữ bảng gán ở đâu; nếu câu trả lời là router gọi database mỗi request, router đó không mỏng. Kiểm lại blast radius bằng phép thử như lab: làm hỏng một cell và đo, đừng tin con số trên giấy.
+
+</Callout>
+
+<Callout kind="link">
+
+D13.4 và D13.5 dùng cell làm đơn vị của wave và phạm vi của kill switch. D18.1 cho cách tính dung lượng dự phòng theo AZ; D18.2 cho cách giới hạn tải ở biên. D21.2 thêm hai kỹ thuật giữ lỗi trong phạm vi nhỏ: shuffle sharding để một tenant xấu không làm hại tenant khác, và static stability để data plane chạy tiếp khi control plane chết. D21.3 rút lưu lượng khỏi một AZ hay một cell, và tìm các phụ thuộc mà mọi cell cùng gọi. Chặng D20 bàn sao lưu, khôi phục và đa vùng; K10.3 dạy failover giữa các cụm Kubernetes.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d25.1.mastery-map">Với một hệ thống thật đang vận hành, lập được bảng failure domain từ tiến trình tới triển khai và cấu hình, và chỉ ra được ba thành phần có blast radius lớn nhất kèm con số ước tính theo tenant và theo request.</Check>
+
+<Check id="d25.1.mastery-design">Thiết kế được một kiến trúc cell cho một dịch vụ nhiều khách hàng: khoá phân vùng, cách gán, trần của cell theo số khách và theo lưu lượng, cách xử lý khách lớn, nơi giữ bảng gán của router.</Check>
+
+<Check id="d25.1.mastery-test">Dựng và đo được blast radius của một sự cố trên hệ dùng chung và trên hệ chia cell bằng tải có tenant không đều, và trình bày được kết quả theo cả hai cách đo.</Check>
+
+</Mastery>

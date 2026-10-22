@@ -1,0 +1,707 @@
+---
+title: "Vận hành Kafka: KRaft, ISR, consumer lag, retention và nâng cấp rolling"
+description: Kafka 4.x chỉ chạy KRaft và Strimzi 1.x dựng nó bằng node pool; vì sao cùng một cụm ba broker, mất một broker producer acks=all vẫn ghi được, mất hai thì bị từ chối; đo consumer lag khi consumer chậm; thấy Kafka xoá dữ liệu theo segment; và khởi động lại cả cụm theo kiểu rolling trong lúc producer vẫn ghi.
+id: d24.4
+step: d24
+prerequisites: [d24.1, k9.5]
+topics: [d24.kafka-ops]
+status: verified
+verified:
+  date: 2026-10-21
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.36.1 (bản đi kèm Docker Desktop)
+    strimzi: 1.3.0
+    kafka: 4.3.1 (image quay.io/strimzi/kafka:1.3.0-kafka-4.3.1)
+---
+
+<Goal>
+
+SB9.2 đã dùng Kafka từ phía ứng dụng: topic, partition, consumer group, `acks`, lag. Bài này đứng ở phía người giữ cụm Kafka: cụm chịu mất bao nhiêu broker thì vẫn nhận ghi, ai quyết định điều đó, đo consumer tụt lại thế nào, và vì sao đĩa đầy là sự cố hay gặp. Học xong, bạn giải thích được:
+
+- Kafka 4.x không còn ZooKeeper thì metadata của cụm nằm ở đâu, và controller với broker khác nhau thế nào.
+- Vì sao cùng một cụm ba broker, mất một broker thì producer `acks=all` vẫn ghi được, mất hai thì bị từ chối, còn producer `acks=1` thì vẫn ghi nhưng có thể mất dữ liệu.
+- Consumer lag đo bằng gì, cảnh báo thế nào, và vì sao một consumer "khoẻ" vẫn có thể tụt lại hàng giờ.
+- Vì sao Kafka xoá dữ liệu theo segment chứ không theo message, và retention 1 phút vẫn có thể giữ dữ liệu lâu hơn 1 phút.
+- Khởi động lại cả cụm theo kiểu rolling mà producer không thấy lỗi.
+
+</Goal>
+
+<Knowledge>
+
+### Kafka 4.x: KRaft, controller và broker
+
+Từ Kafka 4.0 (03/2025), Kafka **chỉ chạy ở chế độ KRaft**: ZooKeeper bị gỡ hẳn. Metadata của cụm (có những topic nào, partition nào nằm trên broker nào, ai là leader, ai đang đồng bộ) nằm trong một log nội bộ tên `__cluster_metadata`, do một nhóm **controller** giữ bằng giao thức đồng thuận Raft.
+
+```text
+              controller quorum (Raft)
+      +-------------+-------------+-------------+
+      | controller  | controller  | controller  |
+      |  (leader)   |             |             |
+      +------+------+-------------+-------------+
+             | metadata log __cluster_metadata
+             v
+   broker 0       broker 1       broker 2       giữ partition, phục vụ client;
+   (đăng ký,      (đăng ký,      (đăng ký,       mỗi broker heartbeat tới controller,
+    heartbeat)     heartbeat)     heartbeat)      quá broker.session.timeout.ms (9 giây) là bị fence
+```
+
+- **Controller** giữ metadata và ra quyết định (bầu leader cho partition, loại broker hỏng). Nhóm controller cần **quá nửa** còn sống mới hoạt động: ba controller chịu mất một.
+- **Broker** chứa dữ liệu, phục vụ client. Broker không heartbeat kịp thì bị controller **fence** (không được làm leader nữa).
+- Một node có thể giữ cả hai vai (dual-role). Tài liệu Strimzi khuyên tách hai vai cho phần lớn cụm production.
+
+**Strimzi** là operator Kafka thuộc CNCF. Từ bản 1.0 (04/2026) nó chỉ còn API `kafka.strimzi.io/v1` và chỉ chạy KRaft. Một cụm gồm một object `Kafka` (listener, cấu hình broker, phiên bản) và một hoặc nhiều **`KafkaNodePool`** (mỗi pool là một nhóm node cùng vai, cùng kiểu đĩa, cùng tài nguyên). Strimzi không dùng StatefulSet mà tự quản pod qua CRD `StrimziPodSet`, cùng lý do CNPG không dùng StatefulSet (K7.4): thứ tự thao tác phụ thuộc vai trò và trạng thái bên trong Kafka.
+
+<Check id="d24.4.kraft">Giải thích được metadata của cụm Kafka 4.x nằm ở đâu, controller và broker mỗi bên làm gì, vì sao ba controller chịu được mất một, và trong Strimzi object `Kafka` và `KafkaNodePool` mô tả những gì.</Check>
+
+### Replica, ISR và `min.insync.replicas`
+
+SB9.2 đã dạy partition và `acks`. Ở phía cụm, mỗi partition có **replication factor** (RF) bản sao nằm trên RF broker khác nhau; một bản là **leader** nhận mọi ghi, các bản còn lại là **follower** liên tục kéo dữ liệu từ leader.
+
+**ISR** (in-sync replicas) là danh sách các bản sao đang theo kịp leader, kể cả leader. Follower không theo kịp trong `replica.lag.time.max.ms` (mặc định 30 giây) thì bị loại khỏi ISR; theo kịp lại thì được đưa vào lại.
+
+Producer `acks=all` chờ **mọi bản trong ISR hiện tại** ghi xong. Nếu ISR co lại còn mỗi leader, `acks=all` chỉ còn chờ leader: không an toàn hơn `acks=1`. **`min.insync.replicas`** chặn trường hợp đó: leader từ chối ghi `acks=all` khi ISR nhỏ hơn con số này.
+
+| RF = 3, `min.insync.replicas` = 2 | ISR | `acks=all` | `acks=1` |
+|---|---|---|---|
+| Ba broker khoẻ | 3 | Ghi được, có ở 3 bản | Ghi được |
+| Mất một broker | 2 | Ghi được, có ở 2 bản | Ghi được |
+| Mất hai broker | 1 | **Bị từ chối** (`NOT_ENOUGH_REPLICAS`) | Ghi được, chỉ có ở 1 bản: mất broker này là mất |
+| Mất cả ba | 0 | Partition không có leader, không ghi không đọc | Như vậy |
+
+Đây là cùng lựa chọn "thà dừng còn hơn mất dữ liệu" của replication đồng bộ PostgreSQL ở D19.1, nhưng Kafka cho đặt theo từng topic. Mặc định của Kafka là `min.insync.replicas=1`; Strimzi khuyên 2 với RF 3, và tài liệu Strimzi cảnh báo: xoá dòng `min.insync.replicas` khỏi cấu hình thì operator đưa nó về 1.
+
+Hai trạng thái cần alert, đọc được bằng `kafka-topics.sh --describe` hoặc metric JMX của broker:
+
+- **Under-replicated partition** (URP): ISR nhỏ hơn RF. Cụm vẫn chạy nhưng đã mất dư địa. URP lớn hơn 0 kéo dài là dấu hiệu broker chết, quá tải, hoặc mạng chậm.
+- **Under-min-ISR** và **offline partition**: ISR dưới `min.insync.replicas` (producer `acks=all` bị từ chối), hoặc không còn leader. Đây là sự cố đang diễn ra.
+
+Khi mọi bản trong ISR đã chết, partition chờ một bản trong ISR quay lại. `unclean.leader.election.enable` (mặc định `false`) cho phép bầu một bản **không** thuộc ISR làm leader để chạy lại ngay, đổi lại mất phần dữ liệu bản đó chưa có, và offset có thể lùi.
+
+Để hiểu cải tiến của Kafka 4.x ở chỗ này cần một khái niệm: **high watermark** là offset cao nhất mà mọi bản trong ISR đã có. Consumer chỉ đọc được tới high watermark, và producer `acks=all` chỉ được xác nhận khi high watermark đã vượt qua message của nó. Khi ISR nhỏ hơn `min.insync.replicas`, high watermark đứng yên.
+
+Từ Kafka 4.1, cụm mới bật sẵn **Eligible Leader Replicas** (ELR, KIP-966). Theo tài liệu Kafka, vì high watermark không tiến khi ISR dưới mức tối thiểu, một bản sao rời ISR trong lúc đó vẫn có đủ mọi message đã được xác nhận; controller ghi nó vào danh sách ELR và có thể chọn nó làm leader an toàn khi ISR trống. Thứ tự chọn leader: một bản trong ISR, rồi một bản trong ELR chưa bị fence, rồi leader cuối cùng đã biết. Lệnh `kafka-topics.sh --describe` in danh sách này ở cột `Elr`.
+
+<Callout kind="production">
+
+Ngày 05/12/2025, cụm Kafka ở vùng EU của Honeycomb mất dư phòng nghiêm trọng, theo [báo cáo sự cố của họ](https://www.honeycomb.io/blog/incident-report-exercises-cleanups-and-evacuations). Đó là ngày diễn tập mất một availability zone; trong bước dọn dẹp sau diễn tập, làm theo runbook, họ cố ý huỷ một số broker để cân lại cụm, và lỡ huỷ nhầm các broker **cũ**, những broker đang giữ bản sao đồng bộ. Ở production mỗi partition có một bản ở mỗi zone, và trong lúc các broker mới còn đang chép dữ liệu, chỉ các broker cũ có bản đồng bộ; huỷ nhầm chúng làm một số partition mất hết bản sao đồng bộ và **không còn leader**. Họ đã chạy cùng bài tập bốn lần ở pre-production mà không gặp, vì cụm ở đó chỉ có vài node nên về cấu trúc khó rơi vào trường hợp này.
+
+Hậu quả kéo dài nhiều ngày. Bầu leader cho partition không còn bản đồng bộ phải là bầu "bẩn", có thể làm offset lùi lại, và hệ lưu trữ của họ lưu offset nên từ chối xử lý tiếp. Topic offset của consumer group và các topic metadata cũng hỏng một phần: dịch vụ xử lý SLO không thấy dữ liệu mới trên vài partition; ngay khi các topic metadata được sửa, trigger SLO kêu về khoảng 18 giờ dữ liệu trễ. Đĩa của broker đầy dần; người trực cho rằng metadata hỏng làm việc đẩy dữ liệu sang lưu trữ tầng (tiered storage) bị kẹt. Khi còn khoảng 5% đĩa trống họ tắt toàn bộ ingest, và tắt tiered storage thì đĩa được giải phóng ngay. Cuối cùng họ phải sơ tán sang một cụm Kafka mới, có diễn tập trước ở pre-production, trong chưa tới năm ngày làm việc.
+
+Điều rút ra cho bài này (của bài): bước 3 của lab là phiên bản nhỏ của đúng tình huống đó, mất hai trên ba broker. Hai thứ đáng giữ: theo dõi số partition dưới min ISR và không có leader như một sự cố, không như một cảnh báo; và alert phải bắt được cả consumer đứng yên ở một partition, không chỉ lag tăng đều.
+
+</Callout>
+
+<Check id="d24.4.isr">Giải thích được ISR là gì và khi nào một follower bị loại khỏi ISR, vì sao `acks=all` cần đi cùng `min.insync.replicas`, điền được bảng ghi được hay bị từ chối khi mất một, hai, ba broker, và phân biệt được under-replicated với under-min-ISR.</Check>
+
+### Consumer lag
+
+**Consumer lag** của một partition là `log-end-offset` trừ offset mà consumer group đã commit (SB9.2). Lag là chỉ số sức khoẻ quan trọng nhất của phía tiêu thụ: nó trả lời "dữ liệu tới tay người dùng trễ bao lâu".
+
+- Đo bằng `kafka-consumer-groups.sh --describe --group <g>`, hoặc metric: Strimzi triển khai được **Kafka Exporter**, xuất `kafka_consumergroup_lag` theo group, topic, partition cho Prometheus.
+- Lag tính bằng **message**. Để ra **thời gian**, chia cho tốc độ ghi: lag 10.000 message là nhỏ với topic nhận 50.000 message mỗi giây, và là hai tiếng với topic nhận 1,4 message mỗi giây.
+- Alert trên **xu hướng**: lag tăng đều trong nhiều phút nghĩa là consumer xử lý chậm hơn tốc độ ghi và sẽ không tự đuổi kịp.
+- Offset đã commit không đổi trong khi có message mới là kiểu hỏng nguy hiểm hơn: consumer đang treo hoặc kẹt ở một partition, trong khi health check của nó vẫn có thể báo khoẻ.
+
+Lag tăng vì consumer chậm (xử lý từng message lâu, phụ thuộc chậm), vì thiếu consumer (số consumer làm việc tối đa bằng số partition), hoặc vì **rebalance** liên tục: mỗi lần consumer vào ra group, partition được chia lại và việc đọc dừng trong lúc đó. Consumer xử lý một lô lâu hơn `max.poll.interval.ms` (mặc định 5 phút) bị coi là chết, gây rebalance, rồi lô đó bị xử lý lại. Kafka 4.0 đưa giao thức consumer group mới (KIP-848) lên GA, chia lại partition dần dần ở phía broker thay vì dừng cả group; client phải tự bật bằng `group.protocol=consumer`, mặc định vẫn là `classic`.
+
+Nếu lag lớn hơn khoảng retention, consumer **mất dữ liệu**: message chưa kịp đọc đã bị xoá.
+
+<Check id="d24.4.consumer-lag">Đo được consumer lag bằng lệnh và nói được metric tương ứng, đổi được lag từ message sang thời gian, và kể được ba nguyên nhân làm lag tăng cùng hậu quả khi lag vượt retention.</Check>
+
+### Dung lượng: retention, segment và đĩa đầy
+
+Mỗi partition trên đĩa là một thư mục chứa nhiều **segment**: file log nối tiếp nhau. Kafka chỉ ghi vào segment cuối (**active segment**); segment được đóng lại khi đủ `segment.bytes` (mặc định 1 GiB) hoặc đủ `segment.ms` (mặc định 7 ngày).
+
+```text
+ partition orders-0
+   00000000000000000000.log   [đóng]  message mới nhất trong segment đã quá retention.ms -> xoá
+   00000000000000052113.log   [đóng]  còn trong hạn -> giữ
+   00000000000000104227.log   [active] đang được ghi; còn message mới -> giữ
+```
+
+Retention theo thời gian (`retention.ms`, mặc định 7 ngày) và theo kích thước (`retention.bytes`, mặc định không giới hạn, tính **cho mỗi partition**). Ba điều làm người mới bất ngờ:
+
+- Kafka xoá **cả segment**, và chỉ khi message mới nhất trong segment đã quá hạn. Topic ít ghi với segment lớn (mặc định đóng sau 1 GiB hoặc 7 ngày) có segment chứa cả message rất cũ lẫn message mới, nên message cũ sống lâu hơn `retention.ms` nhiều. Khi mọi message, kể cả trong segment đang ghi, đều đã quá hạn, Kafka đóng segment đó, mở một segment rỗng và xoá phần cũ; bước 5 của lab thấy đúng cảnh này.
+- Việc xoá chạy theo chu kỳ `log.retention.check.interval.ms` (mặc định 5 phút), không ngay lúc hết hạn.
+- `retention.bytes` tính theo partition: topic 12 partition, RF 3, `retention.bytes=10GiB` có thể chiếm 12 × 3 × 10 GiB trên toàn cụm.
+
+Dung lượng cần cho một topic, ước lượng thô: tốc độ ghi (byte mỗi giây, sau nén) × retention (giây) × RF, cộng dư địa cho segment chưa xoá và cho việc chép lại khi một broker thay thế. **Đĩa đầy** là sự cố Kafka hay gặp: broker không ghi được vào thư mục log sẽ đánh dấu thư mục đó offline hoặc tự dừng, partition trên đó mất một bản, tải dồn sang broker khác, và broker khác có thể đầy theo. Tài liệu Strimzi gợi ý ba hướng phòng: xem lại retention, đặt quota giới hạn tốc độ producer, và nới dung lượng; cộng thêm alert dự đoán lúc đầy đĩa (D12.3 dạy `predict_linear`).
+
+<Check id="d24.4.retention">Giải thích được segment và active segment, vì sao dữ liệu có thể sống lâu hơn `retention.ms`, ước lượng được dung lượng cần cho một topic từ tốc độ ghi, retention và RF, và kể được chuỗi hậu quả khi đĩa một broker đầy.</Check>
+
+### Cân lại partition và nâng cấp rolling
+
+Hai việc vận hành định kỳ:
+
+- **Cân lại partition giữa các broker.** Thêm broker mới thì broker đó trống: Kafka không tự chuyển partition sang. Chuyển bằng công cụ `kafka-reassign-partitions.sh` (đặt throttle để việc chép không ăn hết băng thông) hoặc bằng **Cruise Control**: một dịch vụ theo dõi tải từng broker và tự đề xuất kế hoạch di chuyển theo các mục tiêu (cân đĩa, cân CPU, mỗi rack một bản…). Strimzi tích hợp Cruise Control qua CRD `KafkaRebalance` và có thể tự cân lại khi tăng giảm số broker trong một node pool. Lab không chạy Cruise Control vì nó cần thêm vài trăm MB RAM.
+- **Nâng cấp và khởi động lại theo kiểu rolling.** Strimzi khởi động lại từng node một. Mục về Drain Cleaner trong tài liệu Strimzi nói Cluster Operator giữ số bản đồng bộ của topic ở mức `min.insync.replicas` trở lên trong lúc di chuyển pod; bước 6 của lab cho thấy một lượt rolling như vậy. Nâng phiên bản Kafka là đổi `spec.kafka.version` (một lượt rolling), rồi khi chắc không cần lùi lại thì đổi `metadataVersion` (định dạng metadata mới; tài liệu Strimzi cảnh báo có thể không lùi được). Khởi động lại một node theo yêu cầu dùng annotation `strimzi.io/manual-rolling-update=true` trên pod, để operator làm thay vì `kubectl delete pod`.
+
+<Check id="d24.4.rolling">Giải thích được vì sao thêm broker không tự làm cụm cân bằng và Cruise Control giúp gì, và kể được cách Strimzi khởi động lại cụm theo kiểu rolling cùng hai bước nâng phiên bản Kafka.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Strimzi 1.3.0: Deploying and Managing](https://strimzi.io/docs/operators/1.3.0/deploying.html): mục "Configuring node pools", "Managing rolling updates" và "Using Cruise Control for cluster rebalancing".
+- [Apache Kafka 4.3: Broker Configs](https://kafka.apache.org/43/configuration/broker-configs/): `min.insync.replicas`, `replica.lag.time.max.ms`, `unclean.leader.election.enable`, `log.retention.check.interval.ms` cùng giá trị mặc định.
+- [Apache Kafka 4.3: Design](https://kafka.apache.org/43/design/design/): mục "Replication" (ISR, unclean leader election, bảo đảm về tính sẵn sàng và độ bền); kèm trang [Log](https://kafka.apache.org/43/implementation/log/) về segment và cách xoá.
+- [Incident Report: Exercises, Cleanups, and Evacuations (Honeycomb)](https://www.honeycomb.io/blog/incident-report-exercises-cleanups-and-evacuations): nguồn của callout; đọc phụ lục kỹ thuật về vì sao partition mất leader.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài dựng lại cụm kind `d19-lab` một node (bài trước đã xoá nó), cài Strimzi 1.3.0 và một cụm Kafka 4.3.1 gồm một controller và ba broker. Cần Docker Desktop, `kind`, `kubectl`, `curl`.
+
+**Profile máy.** Lúc nặng nhất (bước 6, khi hai producer cùng chạy), node kind dùng khoảng 2,9 tới 3,3 GiB RAM của Docker theo `docker stats` (tính cả page cache), và không pod nào bị OOM hay khởi động lại ngoài các lần bài cố ý gây ra: ba broker mỗi cái khoảng 400 tới 450 MiB, controller khoảng 250 MiB, operator khoảng 250 MiB, pod `client` vài trăm MiB lúc chạy công cụ, phần còn lại là control plane của Kubernetes. Lần đầu node phải kéo image Kafka của Strimzi (khoảng 300 MB) và image operator, nên bước 1 và 2 có thể mất 5 tới 10 phút. Máy 8 GB: đặt Docker 5 GB trở lên và dừng mọi VM, cụm khác; với Docker 4 GB, giảm node pool broker xuống 2 replica và đặt `default.replication.factor: 2`, `min.insync.replicas: 1` (khi đó bước 3 chỉ làm được phần mất một broker; cấu hình thu gọn này chưa được chạy thử).
+
+Ba điều lab làm cho gọn mà production không làm: chỉ một controller (production dùng ba, để mất một vẫn còn quá nửa); ba broker nằm trên một node, nên "mất một broker" được giả lập bằng cách chặn lịch node (`kubectl cordon`) rồi xoá pod broker, để pod thay thế không lên được, giống khi một node chết; và heap mỗi broker chỉ 192 MiB, controller 128 MiB, đủ cho vài trăm message mỗi giây của lab.
+
+<Callout kind="danger">
+
+Bài này cố ý xoá pod broker và chặn lịch node của cụm. Mọi lệnh chỉ dành cho cụm lab: khối lệnh đầu in `kubectl config current-context`, phải là `kind-d19-lab`.
+
+</Callout>
+
+### 1. Strimzi và một cụm Kafka KRaft
+
+Tạo cụm kind và cài Cluster Operator của Strimzi từ manifest phát hành, **kiểm sha256** với digest GitHub công bố. Manifest ghi namespace `myproject` trong các RoleBinding; lệnh `sed` đổi nó thành namespace của lab, như hướng dẫn cài đặt của Strimzi. Kiểm sha256 làm trên file gốc, trước khi sửa.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+mkdir -p ~/masteva-d24/d24-4 && cd ~/masteva-d24/d24-4
+kind create cluster --name d19-lab \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+kubectl config current-context
+kubectl create namespace d19-kafka
+kubectl config set-context --current --namespace d19-kafka > /dev/null
+curl -sLO https://github.com/strimzi/strimzi-kafka-operator/releases/download/1.3.0/strimzi-cluster-operator-1.3.0.yaml
+echo "c58da61a66c20169d1c9c42736a9355b183ee17ac7779ab7875beaedbf972232  strimzi-cluster-operator-1.3.0.yaml" | shasum -a 256 -c - \
+  && sed 's/namespace: myproject/namespace: d19-kafka/' strimzi-cluster-operator-1.3.0.yaml | kubectl apply --server-side -f - > /dev/null
+kubectl rollout status deploy/strimzi-cluster-operator --timeout=600s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Creating cluster "d19-lab" ...
+...
+kind-d19-lab
+namespace/d19-kafka created
+strimzi-cluster-operator-1.3.0.yaml: OK
+deployment "strimzi-cluster-operator" successfully rolled out
+```
+
+</Expected>
+
+Cụm Kafka gồm ba object: một `KafkaNodePool` vai `controller` một node, một `KafkaNodePool` vai `broker` ba node, và object `Kafka` mang cấu hình chung. Trong phần `config`: topic mặc định có ba bản sao và `min.insync.replicas=2`, như tài liệu Strimzi khuyên; `log.retention.check.interval.ms` hạ từ 5 phút xuống 10 giây để bước 5 không phải chờ lâu. Lab không bật Entity Operator (Topic Operator và User Operator) để tiết kiệm RAM; topic được tạo bằng `kafka-topics.sh`.
+
+<Terminal where="mac" title="~/masteva-d24/d24-4/kafka.yaml">
+
+```bash
+cat > kafka.yaml <<'EOF'
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: controller
+  labels: { strimzi.io/cluster: d19 }
+spec:
+  replicas: 1
+  roles: [controller]
+  storage: { type: persistent-claim, size: 1Gi }
+  resources:
+    requests: { cpu: 100m, memory: 320Mi }
+    limits: { memory: 320Mi }
+  jvmOptions: { "-Xms": 128m, "-Xmx": 128m }
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: broker
+  labels: { strimzi.io/cluster: d19 }
+spec:
+  replicas: 3
+  roles: [broker]
+  storage: { type: persistent-claim, size: 2Gi }
+  resources:
+    requests: { cpu: 100m, memory: 448Mi }
+    limits: { memory: 448Mi }
+  jvmOptions: { "-Xms": 192m, "-Xmx": 192m }
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: d19
+spec:
+  kafka:
+    version: 4.3.1
+    metadataVersion: "4.3"
+    listeners:
+      - { name: plain, port: 9092, type: internal, tls: false }
+    config:
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      log.retention.check.interval.ms: 10000
+EOF
+kubectl apply -f kafka.yaml
+kubectl wait kafka/d19 --for=condition=Ready --timeout=900s
+kubectl get pods -o custom-columns='POD:.metadata.name,STATUS:.status.phase,POOL:.metadata.labels.strimzi\.io/pool-name'
+kubectl get pod d19-broker-0 -o jsonpath='{.status.containerStatuses[0].imageID}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kafkanodepool.kafka.strimzi.io/controller created
+kafkanodepool.kafka.strimzi.io/broker created
+kafka.kafka.strimzi.io/d19 created
+kafka.kafka.strimzi.io/d19 condition met
+POD                                         STATUS    POOL
+d19-broker-0                                Running   broker
+d19-broker-1                                Running   broker
+d19-broker-2                                Running   broker
+d19-controller-3                            Running   controller
+strimzi-cluster-operator-64785b5d4d-qngcd   Running   <none>
+quay.io/strimzi/kafka@sha256:1f189b1f0f32684302d8b018b1d21b411e2469a9c465fbdc18fa3599cb5bbdad
+```
+
+</Expected>
+
+Bốn pod Kafka, mỗi node pool một nhóm: `d19-broker-0` tới `2` và `d19-controller-3` (Strimzi đánh số node ID liên tục giữa các pool, nên controller nhận số 3), cộng pod operator. Không có StatefulSet nào: các pod thuộc về `StrimziPodSet`. Dòng cuối là digest của image Kafka mà pod broker đang chạy; so nó với bảng "Container Images" trong release notes của Strimzi 1.3.0 (dòng Apache Kafka 4.3.1) để chắc operator kéo đúng image đã công bố.
+
+### 2. Client, topic và quorum
+
+Pod `client` dùng cùng image Kafka để có sẵn các công cụ dòng lệnh, với heap nhỏ. Hàm `k` chạy một công cụ trong pod đó với địa chỉ bootstrap `d19-kafka-bootstrap:9092` (Service Strimzi tạo cho listener `plain`). Topic `orders` có 3 partition; RF 3 và `min.insync.replicas` 2 lấy từ mặc định vừa đặt.
+
+<Terminal where="mac">
+
+```bash
+kubectl run client --image=quay.io/strimzi/kafka:1.3.0-kafka-4.3.1@sha256:1f189b1f0f32684302d8b018b1d21b411e2469a9c465fbdc18fa3599cb5bbdad \
+  --env=KAFKA_HEAP_OPTS="-Xms64m -Xmx192m" --command -- sleep infinity
+kubectl wait --for=condition=Ready pod/client --timeout=300s
+k() { kubectl exec client -- /opt/kafka/bin/$1 --bootstrap-server d19-kafka-bootstrap:9092 "${@:2}"; }
+k kafka-topics.sh --create --topic orders --partitions 3
+k kafka-topics.sh --describe --topic orders
+kubectl exec client -- /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server d19-kafka-bootstrap:9092 describe --status | grep -E 'LeaderId|CurrentVoters|CurrentObservers'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod/client created
+pod/client condition met
+Created topic orders.
+Topic: orders	TopicId: gn37TAdXQBGpuM0OCkIxbA	PartitionCount: 3	ReplicationFactor: 3	Configs: min.insync.replicas=2
+	Topic: orders	Partition: 0	Leader: 1	Replicas: 1,2,0	Isr: 1,2,0	Elr: 	LastKnownElr: 
+	Topic: orders	Partition: 1	Leader: 2	Replicas: 2,0,1	Isr: 2,0,1	Elr: 	LastKnownElr: 
+	Topic: orders	Partition: 2	Leader: 0	Replicas: 0,1,2	Isr: 0,1,2	Elr: 	LastKnownElr: 
+LeaderId:               3
+CurrentVoters:          [{"id": 3, "endpoints": ["CONTROLPLANE-9090://d19-controller-3.d19-kafka-brokers.d19-kafka.svc:9090"]}]
+CurrentObservers:       [{"id": 2, "directoryId": "dFNDbpbtNCEFGHO_PWRyXA"}, {"id": 0, "directoryId": "T8PCemtezFoTLi8lsdTeJg"}, {"id": 1, "directoryId": "vV6pobmEBNHUR_uyI5JjEQ"}]
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Mỗi partition có `Leader` là một broker, `Replicas` là ba broker giữ bản sao, `Isr` hiện đủ cả ba. Ba partition có ba leader khác nhau: tải ghi chia đều cho ba broker. Cột `Elr` và `LastKnownElr` trống; ý nghĩa của chúng hiện ra ở bước 3.
+- `Configs: min.insync.replicas=2` là giá trị lấy từ cấu hình chung của cụm.
+- Quorum: controller 3 là leader và là voter duy nhất (lab chỉ có một controller); ba broker là observer, chỉ đọc metadata log chứ không bỏ phiếu.
+
+Gửi 1.000 message bằng `kafka-verifiable-producer.sh`, công cụ kiểm thử đi kèm Kafka: nó in một dòng JSON cho mỗi lần gửi thành công hay lỗi, và một dòng tổng kết `sent`, `acked`. Hàm `send` gửi `$1` message với `acks=$2` và tốc độ 200 message mỗi giây, rồi đếm số lần thành công và số lỗi theo loại.
+
+<Terminal where="mac">
+
+```bash
+send() { k kafka-verifiable-producer.sh --topic orders --max-messages $1 --throughput 200 --acks $2 2>/dev/null | grep -oE '"name":"producer_send_(success|error)"|"exception":"[^"]*"' | sort | uniq -c; }
+send 1000 -1
+k kafka-get-offsets.sh --topic orders
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1000 "name":"producer_send_success"
+orders:0:464
+orders:1:536
+orders:2:0
+```
+
+</Expected>
+
+`acks=-1` là `acks=all`. Tổng offset của ba partition là 1.000: mọi message đều được nhận. Message không có key nên producer gom chúng theo lô vào từng partition một (sticky partitioner); cách chia giữa ba partition trên máy bạn khác, có thể có partition không nhận message nào.
+
+<Check id="d24.4.lab-cum">Dựng được một cụm Kafka KRaft bằng Strimzi với node pool controller và broker, đọc được quorum controller và phân bố leader, ISR của một topic, và gửi được message `acks=all`.</Check>
+
+**Mở terminal mới giữa chừng bài** thì dán khối dưới trước: nó đặt lại kubeconfig, thư mục, namespace và các hàm mà các bước sau dùng.
+
+<Terminal where="mac" title="Khi mở terminal mới">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+cd ~/masteva-d24/d24-4
+kubectl config set-context --current --namespace d19-kafka > /dev/null
+k() { kubectl exec client -- /opt/kafka/bin/$1 --bootstrap-server d19-kafka-bootstrap:9092 "${@:2}"; }
+send() { k kafka-verifiable-producer.sh --topic orders --max-messages $1 --throughput 200 --acks $2 2>/dev/null | grep -oE '"name":"producer_send_(success|error)"|"exception":"[^"]*"' | sort | uniq -c; }
+```
+
+</Terminal>
+
+### 3. Mất một broker, rồi mất hai
+
+Chặn lịch node, rồi xoá pod `d19-broker-2`. Broker tắt sạch (chuyển leader đi trước khi tắt), và pod thay thế nằm `Pending` vì không node nào nhận lịch. Từ đây cụm còn hai broker.
+
+<Predict question="Còn hai trên ba broker, RF 3, min.insync.replicas 2. Producer acks=all có ghi được không?">
+
+Có. ISR co lại còn hai bản, vẫn bằng `min.insync.replicas`, nên leader nhận ghi `acks=all` và chờ đủ hai bản đó. Cụm đã mất dư địa: mất thêm một broker nữa là bắt đầu từ chối.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl cordon d19-lab-control-plane
+kubectl delete pod d19-broker-2 --wait=true
+kubectl get pod d19-broker-2 -o jsonpath='{.status.phase}{"\n"}'
+for i in $(seq 1 60); do [ -n "$(k kafka-topics.sh --describe --topic orders --under-replicated-partitions)" ] && break; sleep 2; done
+k kafka-topics.sh --describe --topic orders --under-replicated-partitions
+send 500 -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-d19-lab
+node/d19-lab-control-plane cordoned
+pod "d19-broker-2" deleted from d19-kafka namespace
+Pending
+	Topic: orders	Partition: 0	Leader: 1	Replicas: 1,2,0	Isr: 1,0	Elr: 	LastKnownElr: 
+	Topic: orders	Partition: 1	Leader: 0	Replicas: 2,0,1	Isr: 0,1	Elr: 	LastKnownElr: 
+	Topic: orders	Partition: 2	Leader: 0	Replicas: 0,1,2	Isr: 0,1	Elr: 	LastKnownElr: 
+ 500 "name":"producer_send_success"
+```
+
+</Expected>
+
+Pod thay thế của `d19-broker-2` nằm `Pending` vì node bị chặn lịch. Cả ba partition hiện là under-replicated: `Replicas` vẫn liệt kê ba broker, nhưng `Isr` chỉ còn hai; partition 1 vốn do broker 2 làm leader đã chuyển leader sang broker 0 (trên máy bạn, partition nào do broker 2 làm leader thì partition đó đổi leader). 500 message `acks=all` đều gửi thành công.
+
+Giờ xoá thêm `d19-broker-1`. Chỉ còn một broker.
+
+<Terminal where="mac">
+
+```bash
+kubectl delete pod d19-broker-1 --wait=true
+for i in $(seq 1 60); do [ -n "$(k kafka-topics.sh --describe --topic orders --under-min-isr-partitions)" ] && break; sleep 2; done
+k kafka-topics.sh --describe --topic orders --under-min-isr-partitions
+send 200 -1
+send 200 1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pod "d19-broker-1" deleted from d19-kafka namespace
+	Topic: orders	Partition: 0	Leader: 0	Replicas: 1,2,0	Isr: 0	Elr: 1	LastKnownElr: 
+	Topic: orders	Partition: 1	Leader: 0	Replicas: 2,0,1	Isr: 0	Elr: 1	LastKnownElr: 
+	Topic: orders	Partition: 2	Leader: 0	Replicas: 0,1,2	Isr: 0	Elr: 1	LastKnownElr: 
+ 200 "exception":"class org.apache.kafka.common.errors.NotEnoughReplicasException"
+ 200 "name":"producer_send_error"
+ 200 "name":"producer_send_success"
+```
+
+</Expected>
+
+Giờ mỗi partition chỉ còn một bản trong ISR, dưới `min.insync.replicas`, và cả ba partition đều do broker 0 làm leader. Cột `Elr` có broker 1: bản sao rời ISR khi ISR đã ở mức tối thiểu, vẫn có đủ mọi message đã xác nhận, nên đủ điều kiện làm leader nếu broker 0 cũng chết (phần Kiến thức).
+
+Hai producer, hai kết quả:
+
+- `acks=all`: cả 200 message bị từ chối với `NotEnoughReplicasException`. Leader từ chối vì không đủ bản để bảo đảm lời hứa của `acks=all`. Công cụ `kafka-verifiable-producer.sh` đặt `retries=0` nên lỗi hiện ngay; một producer thật với cấu hình mặc định sẽ thử lại tới `delivery.timeout.ms` (mặc định 2 phút) rồi mới báo lỗi cho ứng dụng.
+- `acks=1`: cả 200 message được nhận. Chúng chỉ nằm trên đúng một broker; broker đó hỏng trước khi hai broker kia quay lại là mất.
+
+Bỏ chặn lịch node: hai pod broker lên lại, dùng lại PVC cũ, đuổi theo leader và quay về ISR.
+
+<Terminal where="mac">
+
+```bash
+kubectl uncordon d19-lab-control-plane
+kubectl wait --for=condition=Ready pod/d19-broker-1 pod/d19-broker-2 --timeout=600s > /dev/null
+for i in $(seq 1 120); do [ -z "$(k kafka-topics.sh --describe --topic orders --under-replicated-partitions)" ] && break; sleep 2; done
+k kafka-topics.sh --describe --topic orders
+k kafka-leader-election.sh --election-type preferred --all-topic-partitions
+k kafka-topics.sh --describe --topic orders | grep -o 'Partition: [0-9]*.*Leader: [0-9]*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/d19-lab-control-plane uncordoned
+Topic: orders	TopicId: gn37TAdXQBGpuM0OCkIxbA	PartitionCount: 3	ReplicationFactor: 3	Configs: min.insync.replicas=2
+	Topic: orders	Partition: 0	Leader: 0	Replicas: 1,2,0	Isr: 0,1,2	Elr: 	LastKnownElr: 
+	Topic: orders	Partition: 1	Leader: 0	Replicas: 2,0,1	Isr: 0,1,2	Elr: 	LastKnownElr: 
+	Topic: orders	Partition: 2	Leader: 0	Replicas: 0,1,2	Isr: 0,1,2	Elr: 	LastKnownElr: 
+Successfully completed leader election (PREFERRED) for partitions orders-0, orders-1
+Partition: 0	Leader: 1
+Partition: 1	Leader: 2
+Partition: 2	Leader: 0
+```
+
+</Expected>
+
+Hai broker lên lại với dữ liệu cũ trên PVC, chép phần còn thiếu từ leader rồi quay về ISR: `Isr` lại đủ ba. Nhưng cả ba partition vẫn do broker 0 làm leader, nên một broker đang gánh mọi lượt ghi. Kafka tự đưa leader về bản sao ưu tiên (bản đầu tiên trong `Replicas`) theo chu kỳ, mặc định kiểm mỗi 5 phút (`auto.leader.rebalance.enable`); `kafka-leader-election.sh --election-type preferred` làm việc đó ngay. Sau lệnh đó, ba partition lại có ba leader khác nhau.
+
+<Check id="d24.4.lab-mat-broker">Tái hiện được mất một rồi hai broker, chỉ ra được under-replicated và under-min-ISR partition, cho thấy được `acks=all` ghi được với hai broker và bị từ chối với một broker trong khi `acks=1` vẫn ghi, và đưa được cụm về trạng thái đủ ISR.</Check>
+
+### 4. Consumer chậm, lag tăng
+
+Producer gửi 200 message mỗi giây trong 60 giây. Consumer của group `slow` đọc qua một vòng `while read` nghỉ 20 ms mỗi message, tức xử lý tối đa khoảng 50 message mỗi giây, giống một consumer phải gọi một dịch vụ chậm cho mỗi message. Khối lệnh đọc lag của group ở giây 20 và giây 50.
+
+<Terminal where="mac">
+
+```bash
+kubectl exec client -- sh -c 'nohup /opt/kafka/bin/kafka-producer-perf-test.sh --topic orders --num-records 12000 --throughput 200 --record-size 100 --producer-props bootstrap.servers=d19-kafka-bootstrap:9092 > /tmp/perf.log 2>&1 &'
+kubectl exec client -- sh -c 'nohup sh -c "timeout 70 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server d19-kafka-bootstrap:9092 --topic orders --group slow 2>/dev/null | while read l; do sleep 0.02; done" > /dev/null 2>&1 &'
+sleep 20
+k kafka-consumer-groups.sh --describe --group slow 2>/dev/null | awk '/PARTITION/ || /orders/ {print $3, $4, $5, $6}'
+sleep 30
+k kafka-consumer-groups.sh --describe --group slow 2>/dev/null | awk '/PARTITION/ || /orders/ {print $3, $4, $5, $6}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG
+0 1714 2288 574
+1 852 1479 627
+2 1043 2082 1039
+PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG
+0 1952 4455 2503
+1 1507 3155 1648
+2 1652 4614 2962
+```
+
+</Expected>
+
+Mỗi dòng là một partition: offset đã commit của group `slow`, `log-end-offset`, và lag bằng hiệu hai số. Trong 30 giây giữa hai lần đọc, lag tổng của ba partition tăng thêm khoảng 4.000 tới 5.500 message: producer ghi khoảng 200 message mỗi giây, consumer xử lý chưa tới 50. Chia lag cho tốc độ ghi để ra thời gian: lag tổng khoảng 6.500 tới 7.500 message với tốc độ ghi 200 mỗi giây là dữ liệu tới tay consumer trễ khoảng 35 giây, và đang trễ thêm mỗi giây. Đây là dạng lag mà alert theo xu hướng phải bắt; Kafka Exporter xuất đúng con số này thành `kafka_consumergroup_lag`. Con số cụ thể trên máy bạn khác, vì consumer bắt đầu đọc từ lúc nó tham gia group.
+
+<Check id="d24.4.lab-lag">Tạo được một consumer chậm hơn tốc độ ghi, đọc được consumer lag theo partition bằng `kafka-consumer-groups.sh` ở hai thời điểm, và đổi được lag ra thời gian từ tốc độ ghi.</Check>
+
+### 5. Retention nhỏ: segment bị xoá
+
+Topic `logs` giữ dữ liệu 60 giây, mỗi segment tối đa 1 MiB (mức nhỏ nhất Kafka cho phép) và đóng sau tối đa 10 giây. Gửi khoảng 5 MiB, xem các file segment trên đĩa của broker giữ leader, chờ, rồi xem lại cùng offset sớm nhất của partition.
+
+<Terminal where="mac">
+
+```bash
+k kafka-topics.sh --create --topic logs --partitions 1 --config retention.ms=60000 --config segment.bytes=1048576 --config segment.ms=10000
+k kafka-producer-perf-test.sh --topic logs --num-records 5000 --throughput -1 --record-size 1000 --producer-props bootstrap.servers=d19-kafka-bootstrap:9092 2>/dev/null | tail -1 | cut -c1-60
+L=$(k kafka-topics.sh --describe --topic logs | grep -o 'Leader: [0-9]*' | cut -d' ' -f2)
+seg() { kubectl exec d19-broker-$L -- sh -c 'ls /var/lib/kafka/data/kafka-log*/logs-0/ | grep "\.log$"'; }
+seg
+k kafka-get-offsets.sh --topic logs --time -2
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Created topic logs.
+5000 records sent, 4329.004329 records/sec (4.13 MB/sec), 40
+00000000000000000000.log
+00000000000000001024.log
+00000000000000002048.log
+00000000000000003072.log
+00000000000000004096.log
+logs:0:0
+```
+
+</Expected>
+
+<Predict question="Retention là 60 giây. Sau 90 giây không gửi gì thêm, partition còn bao nhiêu segment, và offset sớm nhất là bao nhiêu?">
+
+Không còn message nào. Mọi message đã quá 60 giây, và sau mỗi chu kỳ kiểm 10 giây Kafka xoá các segment cũ. Kể cả segment đang ghi dở cũng bị đóng lại và xoá, vì message mới nhất trong nó cũng đã quá hạn; thay vào đó là một segment rỗng mới. Offset sớm nhất nhảy lên bằng offset cuối: 5000. Offset không lùi lại, consumer mới sẽ bắt đầu từ 5000.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+sleep 90
+seg
+k kafka-get-offsets.sh --topic logs --time -2
+k kafka-get-offsets.sh --topic logs --time -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+00000000000000005000.log
+logs:0:5000
+logs:0:5000
+```
+
+</Expected>
+
+Năm segment cũ đã mất, chỉ còn một file `00000000000000005000.log` rỗng: tên file là offset đầu tiên của segment. Offset sớm nhất (`--time -2`) và offset cuối (`--time -1`) cùng là 5000: partition không còn message nào, nhưng offset vẫn giữ nguyên chỗ. Một consumer tụt lại quá 60 giây trên topic này sẽ thấy offset đã commit của nó nhỏ hơn offset sớm nhất, và đọc theo `auto.offset.reset`, tức là bỏ qua phần đã bị xoá: dữ liệu đó mất với nó.
+
+<Check id="d24.4.lab-retention">Đặt được retention và kích thước segment cho một topic, chỉ ra được trên đĩa segment nào bị xoá và segment nào còn lại, và giải thích được vì sao offset sớm nhất không về bằng offset cuối.</Check>
+
+### 6. Khởi động lại rolling khi producer vẫn ghi
+
+Đánh dấu cả ba pod broker cần khởi động lại bằng annotation `strimzi.io/manual-rolling-update=true`, như tài liệu Strimzi hướng dẫn, trong lúc hai producer `acks=all` cùng gửi, mỗi cái 25 message mỗi giây: một cái với cấu hình mặc định của công cụ, một cái được phép thử lại (giải thích ở phần đọc kết quả). Operator chỉ thấy annotation ở lần reconcile kế tiếp (mặc định mỗi 2 phút), nên khối lệnh chờ tới khi cả ba pod đã được tạo lại, có giới hạn 10 phút.
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+U0=$(kubectl get pods -l strimzi.io/pool-name=broker -o jsonpath='{.items[*].metadata.uid}')
+kubectl exec client -- sh -c 'echo "retries=2147483647" > /tmp/retry.properties
+  nohup /opt/kafka/bin/kafka-verifiable-producer.sh --bootstrap-server d19-kafka-bootstrap:9092 --topic orders --max-messages 15000 --throughput 25 --acks -1 > /tmp/roll-0.log 2>/dev/null &
+  nohup /opt/kafka/bin/kafka-verifiable-producer.sh --bootstrap-server d19-kafka-bootstrap:9092 --topic orders --max-messages 15000 --throughput 25 --acks -1 --command-config /tmp/retry.properties > /tmp/roll-retry.log 2>/dev/null &'
+kubectl annotate pod d19-broker-0 d19-broker-1 d19-broker-2 strimzi.io/manual-rolling-update=true
+for i in $(seq 1 120); do
+  N=0; for u in $(kubectl get pods -l strimzi.io/pool-name=broker -o jsonpath='{.items[*].metadata.uid}'); do echo "$U0" | grep -q $u || N=$((N + 1)); done
+  [ $N = 3 ] && [ "$(kubectl get pods -l strimzi.io/pool-name=broker --no-headers | grep -c ' 1/1 ')" = 3 ] && break; sleep 5
+done
+kubectl get pods -l strimzi.io/pool-name=broker -o custom-columns='POD:.metadata.name,STARTED:.status.startTime'
+kubectl exec client -- sh -c 'for f in roll-0 roll-retry; do echo "== $f"; grep -oE "\"name\":\"producer_send_(success|error)\"|\"exception\":\"[^\"]*\"" /tmp/$f.log | sort | uniq -c; done'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-d19-lab
+pod/d19-broker-0 annotated
+pod/d19-broker-1 annotated
+pod/d19-broker-2 annotated
+POD            STARTED
+d19-broker-0   2026-10-21T16:07:52Z
+d19-broker-1   2026-10-21T16:08:18Z
+d19-broker-2   2026-10-21T16:08:42Z
+== roll-0
+      6 "exception":"class org.apache.kafka.common.errors.NotLeaderOrFollowerException"
+      6 "name":"producer_send_error"
+   4825 "name":"producer_send_success"
+== roll-retry
+   4832 "name":"producer_send_success"
+```
+
+</Expected>
+
+Ba broker được tạo lại lần lượt, mỗi cái cách nhau khoảng 25 giây: operator chờ broker trước sẵn sàng và theo kịp rồi mới khởi động lại broker sau. Mỗi lần một broker tắt, leader của các partition trên nó chuyển sang broker khác.
+
+Hai producer cùng gửi `acks=all` trong suốt lượt đó:
+
+- `roll-0` dùng cấu hình mặc định của công cụ, `retries=0` (mã nguồn của công cụ đặt cứng giá trị này): vài lần gửi lỗi `NotLeaderOrFollowerException` (6 trong kết quả mẫu, trên máy bạn thường vài lần tới khoảng chục lần), đúng những lúc nó gửi tới một leader vừa chuyển đi. Số lần lỗi đổi giữa các lần chạy vì nó phụ thuộc có bao nhiêu message đang trên đường tới đúng broker vừa tắt, tức phụ thuộc thời điểm.
+- `roll-retry` đặt `retries` rất lớn (như mặc định của producer Kafka): không lỗi lần nào. Lỗi `NotLeaderOrFollower` là lỗi tạm thời; producer làm mới metadata, tìm leader mới và gửi lại.
+
+Khởi động lại rolling đúng cách không làm mất message nào, với điều kiện producer được phép thử lại. Producer tự đặt `retries=0`, hoặc `delivery.timeout.ms` quá ngắn, sẽ thấy lỗi ở mọi lần nâng cấp cụm.
+
+<Check id="d24.4.lab-rolling">Khởi động lại được cả cụm broker theo kiểu rolling qua operator trong lúc producer `acks=all` vẫn gửi, và đếm được số message gửi thành công và lỗi trong lúc đó.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `kafka/d19` không lên `Ready`, pod broker `OOMKilled` | Máy quá chậm hoặc tải lab lớn hơn heap 192 MiB | `kubectl describe pod d19-broker-0`; nâng `limits` lên 512Mi và heap lên 256m nếu Docker còn RAM |
+| `k: command not found` hay `send: command not found` | Terminal mới chưa có hàm | Dán lại dòng định nghĩa `k` (bước 2) và `send` (bước 2) |
+| Bước 3: `--under-replicated-partitions` mãi không in gì | Pod broker thay thế đã lên vì node chưa bị chặn lịch | `kubectl get node`; phải thấy `SchedulingDisabled` |
+| Bước 3: pod broker không quay lại sau `uncordon` | Operator đang chờ reconcile kế tiếp | `kubectl get pods -w`; chờ tối đa vài phút |
+| Bước 6 chờ hết 10 phút mà pod chưa được tạo lại | Operator chưa reconcile, hoặc annotation không vào được pod | `kubectl get pod d19-broker-0 -o jsonpath='{.metadata.annotations}'`; `kubectl logs deploy/strimzi-cluster-operator` |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Khối lệnh dưới xoá cụm kind `d19-lab` cùng cụm Kafka trong đó, và thư mục lab của bài.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm và thư mục lab">
+
+```bash
+kind delete cluster --name d19-lab
+rm -rf ~/masteva-d24/d24-4
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không đặt min.insync.replicas bằng 3 cho an toàn tuyệt đối?">
+
+Với RF 3 và `min.insync.replicas=3`, mất **một** broker là mọi producer `acks=all` bị từ chối: mỗi lần khởi động lại rolling, mỗi lần một node bảo trì, cụm ngừng nhận ghi. RF 3 với min ISR 2 cho phép mất một broker mà vẫn ghi và vẫn có hai bản cho mỗi message. Muốn chịu mất hai broker mà vẫn ghi an toàn thì cần RF 5, min ISR 3, tức tốn gần gấp đôi đĩa và băng thông chép. Đây là phép tính giống số standby đồng bộ ở D19.1.
+
+</Reveal>
+
+<Reveal title="Topic Operator: quản topic bằng YAML có đáng không?">
+
+Lab tạo topic bằng `kafka-topics.sh` để tiết kiệm RAM. Trên cụm thật, Strimzi Topic Operator cho khai topic bằng object `KafkaTopic` (số partition, RF, retention), đặt trong Git và đi qua review như mọi cấu hình khác (D13). Lợi ích lớn nhất là retention và `min.insync.replicas` của từng topic không còn bị đổi tay không dấu vết; tài liệu Strimzi khuyên RF 3 và min ISR 2 cho topic do Topic Operator quản. Cái giá là thêm một tiến trình (vài trăm MB) và một nguồn sự thật phải giữ đồng bộ với topic tạo từ ứng dụng.
+
+</Reveal>
+
+<Reveal title="Chọn số partition cho một topic thế nào?">
+
+Số partition là trần song song của consumer group: 12 partition thì tối đa 12 consumer cùng làm việc. Tăng partition về sau được nhưng làm đổi ánh xạ key sang partition (thứ tự theo key bị xáo trong lúc chuyển), và không giảm được. Mỗi partition còn tốn file mở, bộ nhớ và thời gian bầu leader trên broker. Cách thường làm: ước lượng thông lượng tối đa cần, chia cho thông lượng một consumer xử lý được, nhân thêm dư địa cho tăng trưởng; tránh hàng nghìn partition cho một topic nhỏ.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết manifest `Kafka` và `KafkaNodePool` cho Strimzi 1.x, viết alert PromQL trên `kafka_consumergroup_lag` và số partition under-min-ISR, ước lượng dung lượng đĩa từ tốc độ ghi và retention.
+
+**AI hay sai ở đâu:** viết manifest `kafka.strimzi.io/v1beta2` hoặc có khối `zookeeper` (đã bị bỏ từ Strimzi 1.0 và Kafka 4.0); quên `min.insync.replicas` hoặc để mặc định 1; nói `acks=all` là đủ an toàn mà không nhắc min ISR; nói retention xoá đúng từng message khi hết hạn; khuyên bật `unclean.leader.election.enable` để "tăng sẵn sàng" mà không nhắc mất dữ liệu; và khuyên `kubectl delete pod` để khởi động lại broker thay vì annotation của Strimzi.
+
+**Cách kiểm tra:** `kubectl apply --dry-run=server` bắt API cũ; mọi khẳng định về chịu lỗi phải thử như bước 3 với đúng cấu hình topic; mọi khẳng định về retention phải xem segment trên đĩa như bước 5.
+
+</Callout>
+
+<Callout kind="link">
+
+SB9.2 dạy Kafka phía ứng dụng: producer, consumer group, retry và dead letter topic. K7.4 và K9.5 dạy operator, CRD và vì sao không dùng StatefulSet. D12 dạy Prometheus và alert, dùng cho metric của Kafka Exporter. D19.1 có cùng đánh đổi giữa replication đồng bộ và khả năng ghi. Chép topic giữa các cụm Kafka ở hai vùng (MirrorMaker 2) nằm ngoài phạm vi của chặng này và của D20.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d24.4.mastery-chiu-loi">Với một topic cụ thể, chọn được RF, `min.insync.replicas` và `acks` theo yêu cầu dữ liệu, nói được cụm chịu mất bao nhiêu broker mà vẫn ghi, và đọc được trạng thái URP, under-min-ISR trên một cụm đang chạy.</Check>
+
+<Check id="d24.4.mastery-lag-dung-luong">Đặt được alert cho consumer lag và dung lượng đĩa của một cụm Kafka, ước lượng được dung lượng cần từ tốc độ ghi và retention, và thực hiện được một lượt khởi động lại rolling có theo dõi lỗi phía producer.</Check>
+
+</Mastery>

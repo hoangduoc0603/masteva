@@ -1,0 +1,715 @@
+---
+title: Failover giữa các cụm
+description: Chạy cùng một ứng dụng trên hai cụm, đặt một Envoy ở biên có health check để chuyển lưu lượng khi một cụm chết, đo số request lỗi và thấy retry che được gì; rồi làm failover bằng DNS với health check và một resolver có cache, so TTL 5 giây với 60 giây; hiểu active-active, active-passive, global load balancer, anycast, Multi-cluster Services API và vì sao dữ liệu mới là phần khó.
+id: k10.3
+step: k10
+prerequisites: [k10.2, k6.4]
+topics: [k10.failover-giua-cum]
+status: verified
+verified:
+  date: 2026-10-20
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    kind: 0.33.0
+    kubernetes: 1.37.0 (kindest/node)
+    kubectl: 1.37.1
+    envoy: 1.40.0
+    coredns: 1.14.7
+    busybox: 1.38.0
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+K10.2 đặt cùng một ứng dụng lên hai cụm. Bài này trả lời câu tiếp theo: khi một cụm chết, người dùng có nhận ra không. Học xong, bạn giải thích được:
+
+- Vì sao "chạy ở hai cụm" chưa phải là chịu được mất một cụm, và thứ gì quyết định số giây người dùng thấy lỗi.
+- Vì sao failover bằng DNS với TTL 60 giây có thể làm người dùng lỗi gần một phút dù health check phát hiện trong ba giây, và vì sao hạ TTL không đủ.
+- Global load balancer, anycast và DNS khác nhau ở đâu, và Multi-cluster Services giải quyết một bài toán khác hẳn.
+- Vì sao một hệ thống đã thiết kế active-active vẫn sập khi một trung tâm dữ liệu mất điện, nếu chưa từng diễn tập tắt hẳn trung tâm đó.
+
+</Goal>
+
+<Knowledge>
+
+### Active-active hay active-passive
+
+Với ứng dụng **stateless** (không giữ dữ liệu riêng trong cụm), có hai cách dùng hai cụm:
+
+| | Active-active | Active-passive |
+|---|---|---|
+| Lưu lượng bình thường | Cả hai cụm cùng phục vụ | Chỉ cụm chính phục vụ; cụm dự phòng chạy nhưng không nhận người dùng |
+| Khi mất một cụm | Cụm còn lại nhận phần của cụm chết | Chuyển toàn bộ sang cụm dự phòng |
+| Dung lượng phải có | Mỗi cụm chịu được **toàn bộ** tải (hoặc N cụm, mất một vẫn đủ) | Cụm dự phòng chịu được toàn bộ tải, dù bình thường nó rảnh |
+| Biết cụm dự phòng có chạy được không | Liên tục: nó đang phục vụ thật | Chỉ khi chuyển sang, hoặc khi diễn tập |
+| Hợp với | Ứng dụng stateless, người dùng ở nhiều vùng | Khi dữ liệu chỉ ghi được ở một nơi, hoặc cụm dự phòng rẻ hơn |
+
+Điều bị quên nhiều nhất trong bảng là dòng dung lượng. Hai cụm active-active mỗi cụm chạy 70% công suất thì mất một cụm là cụm kia nhận 140%: failover thành công về mặt định tuyến và sập vì quá tải. Quy tắc N+1 của D18.1 áp dụng cho cụm như cho máy. Skyscanner (sự cố ở K10.2) ghi rằng dịch vụ trong mỗi cell chạy ở mức "n+2": một cụm hỏng và một cụm đang bảo trì vẫn phục vụ đủ.
+
+<Check id="k10.3.active">So sánh được active-active với active-passive theo lưu lượng, dung lượng phải có và mức chắc chắn rằng cụm dự phòng chạy được, và tính được mỗi cụm phải chịu bao nhiêu phần trăm tải để mất một cụm không làm quá tải.</Check>
+
+### Đưa người dùng tới cụm còn sống
+
+Có ba lớp có thể làm việc chuyển hướng, khác nhau ở chỗ quyết định nằm ở đâu:
+
+```text
+                         người dùng
+                             │ 1. hỏi DNS: web.vd.test ở đâu?
+                             ▼
+  ┌──────────── DNS có health check (Route 53, Cloud DNS, NS1...) ────────────┐
+  │ trả IP của cụm còn khoẻ; câu trả lời được cache theo TTL ở resolver, OS,  │
+  │ trình duyệt, thư viện của ứng dụng                                         │
+  └───────────────────────────────┬───────────────────────────────────────────┘
+                                  │ 2. kết nối tới IP nhận được
+                                  ▼
+  ┌──────── Global load balancer / anycast: một IP, nhiều điểm vào ───────────┐
+  │ tự health check từng cụm phía sau, đổi đích trong vài giây,               │
+  │ người dùng không cần hỏi lại DNS                                          │
+  └──────────────┬─────────────────────────────────────┬──────────────────────┘
+                 ▼                                     ▼
+           cụm k10-a                               cụm k10-b
+```
+
+| | DNS failover | Global load balancer | Anycast |
+|---|---|---|---|
+| Cách làm | Máy chủ DNS kiểm sức khoẻ, đổi câu trả lời | Một proxy (hoặc một lớp proxy nhiều nơi) đứng trước mọi cụm | Cùng một IP được quảng bá bằng BGP từ nhiều nơi; mạng đưa gói tới nơi gần nhất còn quảng bá |
+| Thời gian chuyển | Thời gian phát hiện **cộng thời gian cache còn lại**, ở mọi tầng cache | Thời gian phát hiện của health check, thường vài giây | Thời gian rút tuyến BGP, giây tới phút |
+| Phụ thuộc client | Nhiều: client tôn trọng TTL hay không | Không: client giữ nguyên IP | Không |
+| Kết nối đang mở | Không bị ảnh hưởng tới khi client đóng | Proxy đóng hoặc thử lại | Đứt khi tuyến đổi |
+| Ví dụ | Route 53 failover, Cloud DNS routing policy | Load balancer toàn cầu của cloud, CDN (D9.5) | DNS công cộng, CDN, load balancer toàn cầu của các cloud lớn |
+
+Lab dựng hai lớp đầu bằng container: một Envoy làm global load balancer (D9.6 đã dạy Envoy), và một CoreDNS có health check với một CoreDNS làm resolver cache đứng giữa.
+
+**TTL** (time to live) là số giây một câu trả lời DNS được phép giữ trong cache. Ba điều làm TTL ngắn không giải quyết hết:
+
+- **Cache chồng nhiều tầng**: resolver của nhà mạng, resolver nội bộ, OS, trình duyệt. Mỗi tầng giữ tới hết TTL **tính từ lúc nó hỏi**, nên thời gian còn lại khi sự cố xảy ra là ngẫu nhiên trong khoảng 0 tới TTL.
+- **Client không tôn trọng TTL**: JVM giữ kết quả DNS 30 giây theo mặc định của OpenJDK (`networkaddress.cache.ttl`), bất kể TTL của bản ghi; nhiều thư viện HTTP giữ kết nối mở tới IP cũ và không hỏi lại DNS chừng nào kết nối còn sống.
+- **TTL ngắn có giá**: nhiều lượt hỏi DNS hơn, độ trễ của lượt hỏi cộng vào request, và phụ thuộc chặt hơn vào máy chủ DNS.
+
+external-dns của K6.4 tạo bản ghi cho từng cụm; muốn failover, mỗi cụm khai cùng một tên với annotation `external-dns.kubernetes.io/set-identifier` riêng và vai trò: với Route 53 là `external-dns.kubernetes.io/aws-failover: PRIMARY` hoặc `SECONDARY`, kèm `external-dns.kubernetes.io/aws-health-check-id`. Bản external-dns trước 0.22 dùng tiền tố `external-dns.alpha.kubernetes.io/` cho cùng các annotation đó. external-dns chỉ ghi bản ghi; việc kiểm sức khoẻ và chọn câu trả lời là của dịch vụ DNS.
+
+<Check id="k10.3.dinh-tuyen">Vẽ lại được ba lớp chuyển hướng (DNS, global load balancer, anycast), so sánh được chúng theo thời gian chuyển và mức phụ thuộc vào client, và kể được ba lý do TTL ngắn không bảo đảm failover nhanh.</Check>
+
+### Service gọi service giữa các cụm
+
+Các lớp ở trên đưa **người dùng** tới cụm. Bài toán khác là service ở cụm này gọi service ở cụm kia, ví dụ khi `orders` ở `k10-a` chết và `checkout` ở `k10-a` muốn dùng `orders` của `k10-b`.
+
+**Multi-cluster Services API** (MCS, KEP-1645 của SIG Multicluster) chuẩn hoá phần API cho việc đó, không kèm cài đặt: một nhóm cụm tin nhau gọi là **ClusterSet**; trong đó namespace cùng tên được coi là cùng một namespace. Bạn tạo `ServiceExport` cùng tên với một Service để xuất nó; controller của bên cài đặt tạo `ServiceImport` ở mọi cụm của ClusterSet, cùng EndpointSlice chứa backend ở các cụm. Service được gọi bằng tên `<svc>.<ns>.svc.clusterset.local`. API hiện ở `multicluster.x-k8s.io/v1beta1`. Cài đặt có GKE Multi-cluster Services, Submariner, Cilium ClusterMesh và một số service mesh.
+
+**Cilium ClusterMesh** (K6.1 đã dạy Cilium) nối mạng pod của nhiều cụm. Một Service có annotation `service.cilium.io/global: "true"` ở các cụm sẽ được cân bằng tải qua pod của mọi cụm; từ Cilium 1.17 ClusterMesh hỗ trợ cả MCS API. Điều kiện theo tài liệu Cilium: các cụm cùng chế độ datapath, phiên bản Cilium lệch nhau không quá một minor, dải PodCIDR không trùng nhau, node của mọi cụm gọi được nhau qua InternalIP (thường qua peering hoặc VPN), và mỗi cụm có tên và ID riêng. Điều kiện về dải địa chỉ phải tính từ lúc thiết kế cụm: dải pod trùng nhau giữa các cụm là thứ không sửa được về sau mà không dựng lại cụm.
+
+Service mesh nhiều cụm (Istio multi-cluster, chuyển lưu lượng có trọng số giữa cụm, mTLS xuyên cụm) không thuộc chặng này.
+
+<Check id="k10.3.mcs">Phân biệt được bài toán đưa người dùng tới cụm với bài toán service gọi service giữa các cụm, kể được các khái niệm ClusterSet, `ServiceExport`, `ServiceImport`, tên `clusterset.local`, và các điều kiện của Cilium ClusterMesh.</Check>
+
+### Dữ liệu là phần khó
+
+Mọi thứ ở trên giả định ứng dụng stateless. Thực tế, cụm chết thường kéo theo database, hàng đợi, cache trong cụm đó. Chuyển lưu lượng sang cụm khác chỉ có ích khi cụm đó có dữ liệu: bản sao nào, trễ bao nhiêu (RPO: được mất bao nhiêu dữ liệu), ai được ghi (một nơi ghi hay nhiều nơi ghi và giải quyết xung đột), và mất bao lâu để thăng cấp bản sao thành bản chính (RTO). Ví dụ: lớp web chuyển được trong ba giây, nhưng nếu database chính nằm ở cụm vừa chết thì người dùng vẫn lỗi cho tới khi bản sao ở cụm kia được thăng cấp. D19 và D20 (chưa có bài) là hai chặng dành cho dữ liệu stateful và cho sao lưu, khôi phục nhiều vùng; K7.4 đã cho thấy failover của một cụm PostgreSQL trong một cụm Kubernetes.
+
+### Diễn tập failover định kỳ
+
+Đường failover chưa từng chạy là đường hỏng. Nó hỏng vì những phụ thuộc không ai vẽ trên sơ đồ: một service "chạy ở cả hai nơi" nhưng đọc cấu hình từ một nơi; cụm dự phòng thiếu một secret thêm vào tháng trước; dung lượng dự phòng bị cắt vì "chưa dùng bao giờ". Cách duy nhất biết là tắt thật, có kế hoạch:
+
+- **Tắt thật đơn vị lớn nhất bạn tuyên bố chịu được**: tuyên bố chịu được mất một vùng thì diễn tập tắt cả vùng, không chỉ tắt một service trong vùng đó.
+- **Đo**: thời gian phát hiện, thời gian chuyển, số request lỗi, thời gian failback. Lab của bài làm đúng các phép đo này.
+- **Có điều kiện dừng và đường lui** trước khi bắt đầu, như mọi thay đổi production.
+- **Đều đặn**, vì hệ thống đổi mỗi tuần. D17 bàn cách tổ chức một game day.
+
+<Callout kind="production">
+
+Ngày 02/11/2023, control plane (dashboard, API) và hệ thống phân tích của Cloudflare gián đoạn từ 11:44 UTC, theo [bài postmortem của Cloudflare](https://blog.cloudflare.com/post-mortem-on-cloudflare-control-plane-and-analytics-outage/). Chúng chạy chủ yếu ở ba trung tâm dữ liệu quanh Hillsboro, Oregon, được chọn đủ xa nhau và đủ gần để chạy các cụm dữ liệu active-active đồng bộ liên tục; mất một nơi thì hai nơi còn lại tiếp tục. Trung tâm lớn nhất, PDX-04 do Flexential vận hành, mất toàn bộ điện: theo bài viết, nguồn điện lưới, máy phát và ắc quy UPS lần lượt không giữ được.
+
+Phần lớn hệ thống chuyển sang hai trung tâm còn lại đúng như thiết kế. Nhưng một nhóm service được cho là nằm trong cụm sẵn sàng cao lại phụ thuộc vào service **chỉ chạy ở PDX-04**, cụ thể là Kafka và ClickHouse của hệ thống log và phân tích; một số sản phẩm mới chưa từng được chuyển vào cụm sẵn sàng cao. Bài viết ghi họ đã diễn tập tắt hẳn từng trung tâm kia, và tắt phần sẵn sàng cao của PDX-04, nhưng **chưa bao giờ tắt toàn bộ PDX-04**, nên đã bỏ sót các phụ thuộc này. Lúc 13:40 UTC họ quyết định chuyển sang các trung tâm khắc phục thảm hoạ ở châu Âu; khi bật lên ở đó, các API call đã lỗi dồn tới cùng lúc (thundering herd) và họ phải đặt giới hạn tốc độ. Tới 17:57 UTC phần lớn control plane ổn định ở các trung tâm đó; vài sản phẩm mới chưa có quy trình khôi phục được kiểm thử thì không dựng lên được. Toàn bộ dịch vụ phục hồi lúc 04:25 UTC ngày 04/11. Suốt sự cố, mạng toàn cầu và các dịch vụ bảo mật của Cloudflare vẫn phục vụ lưu lượng bình thường.
+
+Trong các thay đổi họ cam kết: mọi sản phẩm muốn công bố chính thức phải dựa vào cụm sẵn sàng cao, không phụ thuộc phần mềm vào một trung tâm cụ thể, và phải có kế hoạch khôi phục **đã được kiểm thử**; và kiểm thử chaos chặt hơn, gồm cả việc gỡ hẳn từng trung tâm dữ liệu lõi.
+
+</Callout>
+
+<Check id="k10.3.dien-tap">Nêu được vì sao dữ liệu quyết định thời gian failover thật, kể được bốn nguyên tắc của một lần diễn tập failover, và chỉ ra được trong sự cố Cloudflare loại phụ thuộc nào đã bị bỏ sót và vì sao diễn tập trước đó không phát hiện.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Multicluster Services API Overview (SIG Multicluster)](https://multicluster.sigs.k8s.io/concepts/multicluster-services-api/): ClusterSet, `ServiceExport`, `ServiceImport` và hành vi chung mà mọi cài đặt phải tuân theo.
+- [Multi-Cluster Services API (Cilium)](https://docs.cilium.io/en/stable/network/clustermesh/mcsapi/): một cài đặt cụ thể của MCS trên ClusterMesh, tên `clusterset.local` và cấu hình CoreDNS.
+- [Health checking (Envoy)](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/health_checking): active health check, ngưỡng healthy và unhealthy, và cách nó kết hợp với outlier detection.
+- [Post mortem on the Cloudflare Control Plane and Analytics Outage (Cloudflare)](https://blog.cloudflare.com/post-mortem-on-cloudflare-control-plane-and-analytics-outage/): nguồn của callout; đọc phần về phụ thuộc chỉ nằm ở PDX-04 và danh sách thay đổi.
+- [RFC 1035, mục 3.2.1 và 4.1.3](https://www.rfc-editor.org/rfc/rfc1035): định nghĩa TTL của bản ghi DNS.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng hai cụm `k10-a`, `k10-b` của K10.2, ứng dụng `web` đang trả về tên cụm ở cổng 9861 và 9862. `kubectl` 1.36 hay 1.37 đều được. Bài không cần hub và Gitea, nên dừng chúng để có thêm RAM; K10.4 bật lại. Lab tải image Envoy (khoảng 70 MB nén) và CoreDNS (khoảng 20 MB nén), dùng lại `busybox`. Cổng mới: **9863** (Envoy) và **9864** (trang quản trị của Envoy), chỉ nghe trên `127.0.0.1`.
+
+**Profile máy.** Hai node kind khoảng 700 tới 900 MiB mỗi node theo `docker stats`; Envoy khoảng 20 MiB, hai CoreDNS và các container `busybox` mỗi cái dưới 20 MiB. Cả lab khoảng 1,6 GiB khi hub và Gitea đã dừng. Máy 8 GB chạy được.
+
+Lab làm một cụm "chết" bằng `docker pause` node của nó: mọi tiến trình trong node bị đóng băng, gói tin tới node không được trả lời. Đó là kiểu hỏng khó nhất cho failover: client không bị từ chối ngay mà phải chờ tới hết hạn (timeout). `docker unpause` cho cụm sống lại với nguyên trạng thái và địa chỉ IP. Không dùng `docker kill` ở đây: khởi động lại, node có thể nhận IP khác trên network `kind`.
+
+<Callout kind="danger">
+
+Khối dưới dừng cụm hub và Gitea: Argo CD ngừng đối chiếu cho tới khi bạn bật lại ở K10.4. Kiểm tên container trước khi chạy để không dừng nhầm container của lab khác.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+mkdir -p edge dns
+docker stop k10-hub-control-plane k10-gitea
+docker start k10-a-control-plane k10-b-control-plane
+for i in $(seq 1 90); do curl -sf -m 1 localhost:9861 >/dev/null && curl -sf -m 1 localhost:9862 >/dev/null && break; sleep 2; done
+curl -s localhost:9861; curl -s localhost:9862
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k10-hub-control-plane
+k10-gitea
+k10-a-control-plane
+k10-b-control-plane
+{"cluster":"k10-a","version":"v2"}
+{"cluster":"k10-b","version":"v2"}
+```
+
+</Expected>
+
+`docker start` trên container đang chạy không làm gì ngoài in tên của nó; khối này dùng được cả khi bạn đã dừng các cụm ở cuối K10.2.
+
+### 1. Một Envoy đứng trước hai cụm
+
+Envoy nằm trên network `kind`, gọi NodePort 30080 của hai node bằng tên container. Những điểm đáng chú ý trong cấu hình:
+
+- `STRICT_DNS`: Envoy hỏi lại DNS định kỳ, nên đổi IP của node không làm Envoy gọi nhầm chỗ.
+- `V4_ONLY`: network `kind` có cả IPv6, còn NodePort của cụm chỉ nghe IPv4.
+- Health check gọi `/healthz` mỗi giây; hai lần hỏng liên tiếp thì loại cụm, hai lần khoẻ thì nhận lại.
+- `no_traffic_interval` phải đặt riêng: với cluster chưa từng nhận lưu lượng, Envoy mặc định chỉ kiểm mỗi 60 giây, và chỉ chuyển về `interval` ở lượt kiểm kế tiếp. Thiếu dòng này, trong phút đầu sau mỗi lần khởi động lại Envoy, một cụm chết vẫn được coi là khoẻ.
+- Chưa có retry; bước 3 thêm.
+
+<Terminal where="mac" title="~/masteva-k10/edge/envoy.yaml">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+cat > edge/envoy.yaml <<'EOF'
+admin:
+  address: { socket_address: { address: 0.0.0.0, port_value: 9901 } }
+static_resources:
+  listeners:
+    - name: web
+      address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: web
+                route_config:
+                  virtual_hosts:
+                    - name: web
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: web, timeout: 2s }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: web
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 0.5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: web
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: k10-a-control-plane, port_value: 30080 } } }
+              - endpoint: { address: { socket_address: { address: k10-b-control-plane, port_value: 30080 } } }
+      health_checks:
+        - timeout: 0.5s
+          interval: 1s
+          no_traffic_interval: 1s
+          unhealthy_threshold: 2
+          healthy_threshold: 2
+          http_health_check: { path: /healthz }
+EOF
+docker run -d --name k10-edge --network kind -p 127.0.0.1:9863:8080 -p 127.0.0.1:9864:9901 \
+  -v "$HOME/masteva-k10/edge:/etc/envoy:ro" \
+  envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de \
+  -c /etc/envoy/envoy.yaml --log-level warn >/dev/null
+for i in $(seq 1 60); do [ "$(curl -s localhost:9864/clusters | grep -c 'health_flags::healthy')" = 2 ] && break; sleep 1; done
+curl -s localhost:9864/clusters | grep health_flags
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+web::172.20.0.4:30080::health_flags::healthy
+web::172.20.0.9:30080::health_flags::healthy
+```
+
+</Expected>
+
+Hai dòng là hai cụm phía sau Envoy, đều khoẻ. IP trên máy bạn sẽ khác. Script `do-tai.sh` gọi một URL liên tục trong N giây, mỗi request chờ tối đa 1 giây; ở giây thứ K nó chạy một lệnh một lần (ví dụ làm chết một cụm). Mỗi giây được xếp vào một kiểu: cả hai cụm trả lời, chỉ một cụm, hay có lỗi; script in một dòng mỗi khi kiểu đổi, và cuối cùng in tổng cùng khoảng giây có lỗi.
+
+<Terminal where="mac" title="~/masteva-k10/do-tai.sh">
+
+```bash
+cd ~/masteva-k10
+cat > do-tai.sh <<'EOF'
+#!/bin/sh
+# Cách dùng: ./do-tai.sh <url> <số giây> [giây chạy lệnh] [lệnh]
+url=$1; dur=$2; at=${3:-0}; cmd=$4
+start=$(date +%s); fired=0; sec=0; a=0; b=0; e=0; prev=""; ta=0; tb=0; te=0; first=""; last=""
+flush() {
+  [ $((a + b + e)) -eq 0 ] && return
+  if [ "$e" -gt 0 ]; then k="có lỗi"; [ -z "$first" ] && first=$sec; last=$sec
+  elif [ "$a" -gt 0 ] && [ "$b" -gt 0 ]; then k="cả hai"
+  elif [ "$a" -gt 0 ]; then k="chỉ k10-a"; else k="chỉ k10-b"; fi
+  [ "$k" != "$prev" ] && printf '%4ss  %s (trong giây này: k10-a %s, k10-b %s, lỗi %s)\n' "$sec" "$k" "$a" "$b" "$e"
+  prev=$k; ta=$((ta + a)); tb=$((tb + b)); te=$((te + e)); a=0; b=0; e=0
+}
+while :; do
+  t=$(( $(date +%s) - start ))
+  while [ "$sec" -lt "$t" ]; do flush; sec=$((sec + 1)); done
+  [ "$t" -ge "$dur" ] && break
+  if [ "$fired" = 0 ] && [ -n "$cmd" ] && [ "$t" -ge "$at" ]; then
+    printf '%4ss  chạy: %s\n' "$t" "$cmd"; sh -c "$cmd" >/dev/null 2>&1 & fired=1
+  fi
+  case "$(curl -s -m 1 "$url")" in
+    *k10-a*) a=$((a + 1)) ;; *k10-b*) b=$((b + 1)) ;; *) e=$((e + 1)) ;;
+  esac
+done
+echo "tổng: $((ta + tb + te)) request, k10-a $ta, k10-b $tb, lỗi $te${first:+, có lỗi từ giây $first tới giây $last}"
+EOF
+chmod +x do-tai.sh
+./do-tai.sh localhost:9863 10
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   0s  cả hai (trong giây này: k10-a 22, k10-b 22, lỗi 0)
+tổng: 909 request, k10-a 455, k10-b 454, lỗi 0
+```
+
+</Expected>
+
+Active-active: Envoy chia đều hai cụm theo vòng (`ROUND_ROBIN`). Số request mỗi giây phụ thuộc máy bạn; giây đầu thường ít hơn vì script bắt đầu giữa chừng giây đó.
+
+### 2. Một cụm chết, rồi sống lại
+
+<Callout kind="danger">
+
+`docker pause` đóng băng toàn bộ cụm `k10-a`: ứng dụng `web` trên đó ngừng trả lời. Trên hệ thống thật, việc tương đương là cắt mạng hoặc tắt cả một vùng; chỉ làm trong một lần diễn tập có kế hoạch.
+
+</Callout>
+
+<Predict question="Health check chạy mỗi giây, cần hai lần hỏng liên tiếp. Sau khi `k10-a` chết, người dùng thấy lỗi trong khoảng bao lâu, và mỗi request lỗi mất bao lâu mới báo lỗi?">
+
+Khoảng hai tới ba giây: hai chu kỳ health check, mỗi lần chờ hết `timeout: 0.5s`. Trong khoảng đó, khoảng một nửa request vẫn được gửi tới `k10-a` và chờ tới hết hạn: `connect_timeout` 0,5 giây ở Envoy, hoặc 1 giây của client nếu kết nối đã mở mà không có trả lời. Sau đó mọi request về `k10-b`.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+./do-tai.sh localhost:9863 15 5 "docker pause k10-a-control-plane"
+curl -s localhost:9864/clusters | grep health_flags
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   0s  cả hai (trong giây này: k10-a 44, k10-b 46, lỗi 0)
+   5s  chạy: docker pause k10-a-control-plane
+   5s  có lỗi (trong giây này: k10-a 6, k10-b 3, lỗi 1)
+   8s  chỉ k10-b (trong giây này: k10-a 0, k10-b 70, lỗi 0)
+tổng: 1124 request, k10-a 238, k10-b 883, lỗi 3, có lỗi từ giây 5 tới giây 7
+web::172.20.0.4:30080::health_flags::/failed_active_hc/active_hc_timeout
+web::172.20.0.9:30080::health_flags::healthy
+```
+
+</Expected>
+
+Lỗi kéo dài hai tới ba giây, đúng như dự đoán, rồi chỉ còn `k10-b`. Chỉ có vài request lỗi vì `do-tai.sh` gửi từng request một: mỗi request rơi vào `k10-a` phải chờ hết hạn (0,5 tới 1 giây) mới báo lỗi, nên trong mấy giây đó script gửi được rất ít request. Số lỗi trên máy bạn có thể từ một tới khoảng chục; với người dùng thật gửi nhiều request song song, hai giây đó là hàng nghìn request lỗi. Dòng `health_flags` cho biết lý do Envoy loại `k10-a`: health check hết hạn chờ (`active_hc_timeout`), không phải bị từ chối.
+
+Giờ cho `k10-a` sống lại và đo failback:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+./do-tai.sh localhost:9863 20 3 "docker unpause k10-a-control-plane"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   0s  chỉ k10-b (trong giây này: k10-a 0, k10-b 45, lỗi 0)
+   3s  chạy: docker unpause k10-a-control-plane
+   4s  cả hai (trong giây này: k10-a 19, k10-b 75, lỗi 0)
+tổng: 1705 request, k10-a 674, k10-b 1031, lỗi 0
+```
+
+</Expected>
+
+Envoy nhận lại `k10-a` sau hai lần health check thành công: khoảng một tới vài giây sau khi rã băng; sau một lần đóng băng lâu có thể tới khoảng 10 giây. Trên máy bạn có thể thấy vài lỗi ngay lúc đó, nếu một request tới `k10-a` khi các thành phần trong node chưa kịp trả lời. Failback cũng là một lần chuyển lưu lượng, và cần được đo như failover.
+
+<Check id="k10.3.lab-edge">Dựng được một load balancer ở biên có health check trước hai cụm, đo được khoảng thời gian và số request lỗi khi một cụm chết và khi nó quay lại, và giải thích được con số bằng chu kỳ và ngưỡng của health check.</Check>
+
+### 3. Retry che được gì
+
+Envoy thử lại request trên một cụm khác khi kết nối hỏng hoặc bị reset, tối đa hai lần, mỗi lần chờ tối đa 0,6 giây. `previous_hosts` bảo lần thử lại tránh host vừa hỏng. Thêm `retry_policy` vào route bằng `yq`, rồi khởi động lại Envoy và làm lại phép thử của bước 2.
+
+<Callout kind="danger">
+
+Khối dưới đóng băng cụm `k10-a` khoảng 15 giây rồi rã băng: `web` trên đó ngừng trả lời trong lúc ấy. Nếu khối bị ngắt giữa chừng, chạy `docker unpause k10-a-control-plane`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+yq -i '.static_resources.listeners[0].filter_chains[0].filters[0].typed_config.route_config.virtual_hosts[0].routes[0].route.retry_policy = {
+  "retry_on": "connect-failure,reset",
+  "num_retries": 2,
+  "per_try_timeout": "0.6s",
+  "retry_host_predicate": [{"name": "envoy.retry_host_predicates.previous_hosts",
+    "typed_config": {"@type": "type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate"}}]
+}' edge/envoy.yaml
+docker restart k10-edge >/dev/null
+for i in $(seq 1 60); do [ "$(curl -s localhost:9864/clusters | grep -c 'health_flags::healthy')" = 2 ] && break; sleep 1; done
+./do-tai.sh localhost:9863 15 3 "docker pause k10-a-control-plane"
+./do-tai.sh localhost:9863 15 3 "docker unpause k10-a-control-plane"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   0s  cả hai (trong giây này: k10-a 16, k10-b 16, lỗi 0)
+   3s  chạy: docker pause k10-a-control-plane
+   4s  chỉ k10-b (trong giây này: k10-a 0, k10-b 3, lỗi 0)
+tổng: 994 request, k10-a 104, k10-b 890, lỗi 0
+   0s  chỉ k10-b (trong giây này: k10-a 0, k10-b 92, lỗi 0)
+   3s  chạy: docker unpause k10-a-control-plane
+   4s  cả hai (trong giây này: k10-a 16, k10-b 73, lỗi 0)
+tổng: 1334 request, k10-a 465, k10-b 869, lỗi 0
+```
+
+</Expected>
+
+Không còn lỗi. Retry không làm health check nhanh hơn: trong hai giây đầu, Envoy vẫn gửi tới `k10-a`, chờ, rồi thử lại ở `k10-b`. Cái giá lộ ra ở số request: trong giây ngay sau khi `k10-a` chết, script chỉ gửi được vài request thay vì vài chục, vì mỗi request phải chờ hết lần thử đầu. Đổi lỗi lấy độ trễ là đổi tốt khi số request phải thử lại ít; D18.2 đã cho thấy retry thành bão khi mọi tầng cùng thử lại một hệ thống đang quá tải, nên retry ở biên cần giới hạn số lần và chỉ thử lại những lỗi chắc chắn là của kết nối.
+
+<Check id="k10.3.lab-retry">Thêm được retry có `previous_hosts` vào route của Envoy, chứng minh được số request lỗi khi mất một cụm về 0, và chỉ ra được cái giá về độ trễ trong output.</Check>
+
+### 4. Failover bằng DNS
+
+Phần này dựng ba container trên network `kind`, đóng vai các thành phần của DNS failover thật:
+
+```text
+  k10-khach (busybox)       k10-dns-cache (CoreDNS)        k10-dns-auth (CoreDNS)
+  mỗi request: hỏi DNS ───▶ cache: giữ câu trả lời ───────▶ có thẩm quyền cho zone k10.test,
+  rồi gọi IP:30080           tới hết TTL                    đọc lại file zone mỗi giây
+                                                                     ▲ ghi file zone
+                                                            k10-dns-hc (busybox)
+                                                            health check k10-a mỗi giây:
+                                                            khoẻ → web.k10.test = IP của k10-a
+                                                            hỏng 2 lần → IP của k10-b
+```
+
+Đây là active-passive: bình thường mọi người dùng tới `k10-a`. `k10-dns-hc` đóng vai health check của dịch vụ DNS (như Route 53 failover). Mỗi lần đổi, nó viết lại zone với số serial mới, và plugin `file` của CoreDNS nạp lại khi thấy serial đổi. TTL của bản ghi đọc từ file `dns/ttl`.
+
+<Terminal where="mac" title="~/masteva-k10/dns: Corefile, kiem-suc-khoe.sh, khach.sh">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+cat > dns/Corefile <<'EOF'
+k10.test {
+    file /dns/k10.test.db { reload 1s }
+}
+EOF
+cat > dns/kiem-suc-khoe.sh <<'EOF'
+#!/bin/sh
+# Hỏi /healthz của k10-a mỗi giây. Hỏng 2 lần liên tiếp: web.k10.test trỏ k10-b; khoẻ 2 lần: trỏ về k10-a.
+ok=0; bad=0; cur=""
+viet() {
+  ttl=$(cat /dns/ttl)
+  cat > /dns/k10.test.db.tmp <<ZONE
+\$ORIGIN k10.test.
+@    3600 IN SOA ns.k10.test. admin.k10.test. $(date +%s) 60 60 3600 5
+@    3600 IN NS  ns.k10.test.
+ns   3600 IN A   127.0.0.1
+web  $ttl IN A   $1
+ZONE
+  mv /dns/k10.test.db.tmp /dns/k10.test.db
+  echo "$(date +%T) web.k10.test -> $1 (TTL $ttl)"
+}
+while :; do
+  if wget -q -T 1 -O /dev/null "http://$A_IP:30080/healthz" 2>/dev/null; then ok=$((ok + 1)); bad=0; else bad=$((bad + 1)); ok=0; fi
+  want=$cur
+  [ "$bad" -ge 2 ] && want=$B_IP
+  [ "$ok" -ge 2 ] && want=$A_IP
+  [ -z "$cur" ] && want=$A_IP
+  [ "$want" != "$cur" ] && viet "$want" && cur=$want
+  [ -f /dns/ttl.doi ] && rm /dns/ttl.doi && viet "$cur"
+  sleep 1
+done
+EOF
+cat > dns/khach.sh <<'EOF'
+#!/bin/sh
+# Cách dùng: khach.sh <số giây>. Mỗi request hỏi web.k10.test qua DNS cache ($CACHE) rồi gọi IP đó ở cổng 30080.
+dur=$1; start=$(date +%s); sec=0; a=0; b=0; e=0; prev=""; ta=0; tb=0; te=0; first=""; last=""
+flush() {
+  [ $((a + b + e)) -eq 0 ] && return
+  if [ "$e" -gt 0 ]; then k="có lỗi"; [ -z "$first" ] && first=$sec; last=$sec
+  elif [ "$a" -gt 0 ] && [ "$b" -gt 0 ]; then k="cả hai"
+  elif [ "$a" -gt 0 ]; then k="chỉ k10-a"; else k="chỉ k10-b"; fi
+  [ "$k" != "$prev" ] && printf '%4ss  %s (trong giây này: k10-a %s, k10-b %s, lỗi %s)\n' "$sec" "$k" "$a" "$b" "$e"
+  prev=$k; ta=$((ta + a)); tb=$((tb + b)); te=$((te + e)); a=0; b=0; e=0
+}
+while :; do
+  t=$(( $(date +%s) - start ))
+  while [ "$sec" -lt "$t" ]; do flush; sec=$((sec + 1)); done
+  [ "$t" -ge "$dur" ] && break
+  ip=$(nslookup -type=A web.k10.test "$CACHE" 2>/dev/null | awk '/^Address/ && !/#/ {print $2}' | tail -1)
+  case "$(wget -q -T 1 -O - "http://$ip:30080/" 2>/dev/null)" in
+    *k10-a*) a=$((a + 1)) ;; *k10-b*) b=$((b + 1)) ;; *) e=$((e + 1)) ;;
+  esac
+  sleep 0.1
+done
+echo "tổng: $((ta + tb + te)) request, k10-a $ta, k10-b $tb, lỗi $te${first:+, có lỗi từ giây $first tới giây $last}"
+EOF
+echo 5 > dns/ttl
+```
+
+</Terminal>
+
+Chạy ba container. CoreDNS cache cần **IP** của máy chủ có thẩm quyền trong lệnh `forward`, nên Corefile của nó được viết sau khi `k10-dns-auth` đã có IP. Khi không có tham số, plugin `cache` giữ mỗi câu trả lời tới hết TTL của bản ghi (tối đa 3600 giây, tối thiểu 5 giây).
+
+<Terminal where="mac" title="~/masteva-k10/dns/Corefile.cache">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+BB=busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+CD=coredns/coredns:1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286
+docker run -d --name k10-dns-hc --network kind -e A_IP=$(ipof k10-a-control-plane) -e B_IP=$(ipof k10-b-control-plane) \
+  -v "$HOME/masteva-k10/dns:/dns" $BB sh /dns/kiem-suc-khoe.sh >/dev/null
+docker run -d --name k10-dns-auth --network kind -v "$HOME/masteva-k10/dns:/dns" $CD -conf /dns/Corefile >/dev/null
+printf '.:53 {\n    forward . %s\n    cache\n}\n' "$(ipof k10-dns-auth)" > dns/Corefile.cache
+docker run -d --name k10-dns-cache --network kind -v "$HOME/masteva-k10/dns:/dns" $CD -conf /dns/Corefile.cache >/dev/null
+for i in $(seq 1 30); do docker run --rm --network kind $BB nslookup -type=A web.k10.test $(ipof k10-dns-cache) >/dev/null 2>&1 && break; sleep 1; done
+docker logs k10-dns-hc
+docker run --rm --network kind $BB nslookup -type=A web.k10.test $(ipof k10-dns-cache) | grep -A1 '^Name'
+echo "k10-a: $(ipof k10-a-control-plane)  k10-b: $(ipof k10-b-control-plane)"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+20:34:29 web.k10.test -> 172.20.0.4 (TTL 5)
+Name:	web.k10.test
+Address: 172.20.0.4
+k10-a: 172.20.0.4  k10-b: 172.20.0.9
+```
+
+</Expected>
+
+Giờ trong log là giờ UTC của container. `web.k10.test` đang trỏ IP của `k10-a`; câu trả lời đi qua cache trước khi tới `nslookup`.
+
+<Check id="k10.3.lab-dns">Dựng được một DNS có thẩm quyền đổi bản ghi theo health check và một resolver cache đứng giữa, và giải thích được vai trò của serial và của plugin `cache`.</Check>
+
+### 5. TTL 5 giây và TTL 60 giây
+
+<Callout kind="danger">
+
+Hai khối dưới lại đóng băng cụm `k10-a`, mỗi khối một lần, rồi rã băng.
+
+</Callout>
+
+`k10-khach` gọi `web.k10.test` liên tục trong 30 giây; ở giây thứ 5, cụm `k10-a` chết. Lệnh `docker pause` chạy nền trong một subshell; terminal của bạn có thể in thêm các dòng kiểu `[1] 12345` và `[1]  + done`, đó là thông báo của zsh về lệnh nền, không phải output của lab:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+BB=busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+(sleep 5; docker pause k10-a-control-plane >/dev/null) &
+docker run --rm --name k10-khach --network kind -e CACHE=$(ipof k10-dns-cache) -v "$HOME/masteva-k10/dns:/dns" $BB sh /dns/khach.sh 30
+docker logs k10-dns-hc 2>&1 | tail -1
+docker unpause k10-a-control-plane
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   0s  chỉ k10-a (trong giây này: k10-a 9, k10-b 0, lỗi 0)
+   4s  có lỗi (trong giây này: k10-a 7, k10-b 0, lỗi 1)
+  11s  chỉ k10-b (trong giây này: k10-a 0, k10-b 6, lỗi 0)
+tổng: 227 request, k10-a 45, k10-b 176, lỗi 6, có lỗi từ giây 4 tới giây 10
+20:35:15 web.k10.test -> 172.20.0.9 (TTL 5)
+k10-a-control-plane
+```
+
+</Expected>
+
+Lỗi bắt đầu ở giây thứ 4 hoặc 5 của `khach.sh`: lệnh `docker pause` chạy ở giây thứ 5 của khối lệnh, còn container `k10-khach` mất khoảng một giây để khởi động. Khoảng bảy giây lỗi: health check cần khoảng ba giây (hai lần hỏng, mỗi lần chờ 1 giây) để đổi bản ghi, cộng phần TTL còn lại của câu trả lời trong cache, tối đa 5 giây. Mỗi giây chỉ có khoảng một request vì mỗi request lỗi chờ hết 1 giây.
+
+Đổi TTL thành 60 giây. Health check viết lại zone ngay; câu trả lời TTL 5 cũ trong cache hết hạn sau tối đa 5 giây, rồi cache lấy câu trả lời mới với TTL 60. Khối dưới chờ 10 giây cho chắc, rồi làm lại phép thử trong 80 giây:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+BB=busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+for i in $(seq 1 60); do docker logs k10-dns-hc 2>&1 | tail -1 | grep -q 'k10-b' || break; sleep 1; done
+echo 60 > dns/ttl && touch dns/ttl.doi
+sleep 10
+docker logs k10-dns-hc 2>&1 | tail -1
+(sleep 5; docker pause k10-a-control-plane >/dev/null) &
+docker run --rm --name k10-khach --network kind -e CACHE=$(ipof k10-dns-cache) -v "$HOME/masteva-k10/dns:/dns" $BB sh /dns/khach.sh 80
+docker unpause k10-a-control-plane
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+20:36:13 web.k10.test -> 172.20.0.4 (TTL 60)
+   0s  chỉ k10-a (trong giây này: k10-a 4, k10-b 0, lỗi 0)
+   5s  có lỗi (trong giây này: k10-a 4, k10-b 0, lỗi 1)
+  60s  chỉ k10-b (trong giây này: k10-a 0, k10-b 2, lỗi 0)
+tổng: 277 request, k10-a 46, k10-b 181, lỗi 50, có lỗi từ giây 5 tới giây 59
+k10-a-control-plane
+```
+
+</Expected>
+
+Vòng `for` đầu khối chờ health check đã trỏ bản ghi về lại `k10-a` sau lần rã băng trước. Lần này lỗi kéo dài khoảng 55 giây, dù health check vẫn đổi bản ghi trong khoảng ba giây như lần trước: cache giữ câu trả lời cũ tới hết TTL **tính từ lúc nó hỏi**.
+
+Trong lab, cache lấy câu trả lời ngay khi `k10-khach` bắt đầu (không ai hỏi DNS trong 10 giây chờ), và `k10-a` chết 5 giây sau đó, nên khoảng lỗi gần như luôn khoảng 55 giây. Với người dùng thật, câu trả lời trong cache đã sống được một phần TTL khi cụm chết, nên khoảng lỗi nằm giữa thời gian phát hiện và thời gian phát hiện cộng TTL. Đó là tính chất của DNS failover: thời gian chuyển xấu nhất là thời gian phát hiện cộng TTL, và với mỗi tầng cache không tôn trọng TTL (JVM giữ 30 giây theo mặc định), còn tệ hơn. So với Envoy ở bước 2: cùng một sự cố, hai ba giây so với gần một phút.
+
+<Check id="k10.3.lab-ttl">Đo được khoảng lỗi khi failover bằng DNS với TTL 5 giây và 60 giây, giải thích được vì sao trong lab khoảng lỗi với TTL 60 gần như cố định còn với người dùng thật nó nằm giữa thời gian phát hiện và thời gian phát hiện cộng TTL, và so sánh được với failover ở load balancer.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Envoy báo cả hai cụm `failed_active_hc` ngay từ đầu | Envoy phân giải tên node ra IPv6; thiếu `dns_lookup_family: V4_ONLY` | `curl -s localhost:9864/clusters \| grep hostname` |
+| `do-tai.sh` có lỗi trước khi làm chết cụm | Cụm vừa rã băng hoặc vừa khởi động, pod `web` chưa sẵn sàng | Chờ `curl localhost:9861` trả lời, chạy lại |
+| `nslookup` trả `NXDOMAIN` hoặc không trả lời | `k10-dns-auth` chưa đọc được zone; sai IP trong `Corefile.cache` | `docker logs k10-dns-auth`; `cat dns/Corefile.cache`; `docker logs k10-dns-hc` |
+| Bản ghi không đổi khi `k10-a` chết | Health check gọi sai IP (cụm đã khởi động lại và đổi IP) | `docker inspect k10-dns-hc \| grep A_IP`; so với `ipof k10-a-control-plane`; tạo lại `k10-dns-hc` |
+| Cụm `k10-a` vẫn đóng băng sau lab | Một khối bị ngắt trước dòng `docker unpause` | `docker ps --filter status=paused`; `docker unpause k10-a-control-plane` |
+
+### Dọn dẹp
+
+K10.4 không dùng Envoy hay DNS của bài này, nhưng cần hub và Gitea.
+
+<Callout kind="danger">
+
+Khối dưới xoá năm container của bài (`docker rm -f`). Các file cấu hình trong `~/masteva-k10/edge` và `~/masteva-k10/dns` được giữ lại.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+docker unpause k10-a-control-plane 2>/dev/null
+docker rm -f k10-edge k10-dns-hc k10-dns-auth k10-dns-cache k10-khach 2>&1 | grep -v 'No such container'
+docker start k10-gitea k10-hub-control-plane
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+k10-edge
+k10-dns-hc
+k10-dns-auth
+k10-dns-cache
+k10-gitea
+k10-hub-control-plane
+```
+
+</Expected>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không đặt TTL 1 giây cho chắc?">
+
+Ba lý do. Mỗi request mới gần như phải hỏi DNS, cộng độ trễ của một lượt hỏi vào thời gian tải trang và đẩy tải lên máy chủ DNS lên nhiều lần. Nhiều resolver đặt TTL tối thiểu của riêng chúng (CoreDNS cache trong lab có mức tối thiểu 5 giây cho câu trả lời thành công theo mặc định), nên giá trị 1 giây không được tôn trọng ở mọi nơi. Và các tầng không tôn trọng TTL (JVM, kết nối HTTP giữ lâu) vẫn quyết định thời gian xấu nhất. TTL 30 tới 60 giây cùng health check nhanh là mức nhiều đội chọn; khi cần chuyển trong vài giây, đặt một lớp load balancer hoặc anycast trước, như Envoy trong lab.
+
+</Reveal>
+
+<Reveal title="Load balancer ở biên chết thì sao?">
+
+Nó trở thành điểm hỏng duy nhất mà bạn vừa dựng hai cụm để tránh. Global load balancer của các cloud là dịch vụ phân tán, quảng bá cùng một IP từ nhiều nơi bằng anycast. Tự dựng thì cần ít nhất hai bản ở hai nơi, và lại cần DNS hoặc anycast để chọn giữa chúng; D9.3 đã dựng VIP bằng Keepalived cho trường hợp trong một trung tâm dữ liệu. Vì vậy hệ thống lớn thường có cả hai lớp: DNS (TTL vừa phải) chọn giữa các điểm vào, và load balancer ở mỗi điểm vào chuyển nhanh giữa các cụm phía sau nó.
+
+</Reveal>
+
+<Reveal title="Có nên tự động failover cả vùng không?">
+
+Tự động cho lớp stateless (load balancer bỏ cụm hỏng) là chuẩn. Tự động thăng cấp database ở vùng khác thì khác: một health check báo sai, một lần đứt mạng ngắn, có thể dẫn tới hai bản chính cùng nhận ghi (split-brain, D9.3 đã gặp với VIP). Nhiều tổ chức để con người bấm nút cho bước thay đổi nơi ghi dữ liệu, với runbook đã diễn tập để bước đó chỉ mất vài phút. Cùng ý với phanh của MachineHealthCheck ở K10.1: tự động hoá phải biết khi nào dừng lại hỏi người.
+
+</Reveal>
+
+<Reveal title="Envoy trong lab gọi NodePort. Trên cloud thì sao?">
+
+Thường là Service kiểu `LoadBalancer` hoặc Gateway (K2.2, K6.2) của mỗi cụm có một IP riêng, và load balancer toàn cầu trỏ vào các IP đó, kiểm sức khoẻ bằng một đường dẫn kiểm cả chiều sâu cần thiết. Chọn đường dẫn health check là việc thiết kế: `/healthz` chỉ trả `ok` như lab thì không phát hiện được cụm còn sống mà database của nó đã chết; còn health check gọi sâu xuống mọi phụ thuộc thì một phụ thuộc chung chết là mọi cụm cùng bị loại. Một mẫu hay dùng: health check cho biết cụm có phục vụ được request điển hình không, với phụ thuộc chỉ thuộc riêng cụm đó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết cấu hình health check và retry cho Envoy, tính thời gian chuyển xấu nhất của một chuỗi DNS, hay soạn kế hoạch diễn tập failover là cách dùng tốt. AI hay sai ở: hứa "TTL 60 giây nghĩa là chuyển trong 60 giây" mà quên thời gian phát hiện và các tầng cache; bật retry cho mọi lỗi 5xx và mọi phương thức, kể cả `POST` không idempotent; bỏ qua dung lượng của cụm còn lại; và đề xuất ClusterMesh mà không kiểm dải PodCIDR có trùng không. Kiểm bằng cách làm như lab: đóng băng một cụm có chủ đích và đo, không tin con số trên giấy.
+
+</Callout>
+
+<Callout kind="link">
+
+K6.4 dạy external-dns, thứ ghi bản ghi cho từng cụm; bài này thêm việc chọn câu trả lời theo sức khoẻ. D9.6 dạy Envoy và outlier detection, có thể dùng cùng active health check của lab. D18.1 dạy tính dung lượng, cần cho active-active; D18.2 dạy retry storm. K7.4 failover PostgreSQL trong một cụm; chặng D19 và D20 (chưa có bài) dành cho dữ liệu. D17 bàn cách tổ chức game day. K11 (chặng sau) dạy service mesh trong một cụm (mTLS, điều phối lưu lượng); mesh nhiều cụm nằm ngoài cả K10 lẫn K11.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k10.3.mastery-thiet-ke">Với một ứng dụng stateless chạy ở hai vùng, thiết kế được đường failover: active-active hay active-passive, lớp chuyển hướng (DNS, load balancer, anycast), TTL, health check, dung lượng mỗi cụm, và thời gian chuyển xấu nhất có tính toán.</Check>
+
+<Check id="k10.3.mastery-do">Lập được và chạy được một lần diễn tập mất một cụm: điều kiện dừng, cách gây sự cố, các số đo (thời gian phát hiện, khoảng lỗi, số request lỗi, failback), và đọc được kết quả để chỉ ra tầng nào làm chậm.</Check>
+
+<Check id="k10.3.mastery-mcs">Giải thích được cho đội ứng dụng khi nào cần Multi-cluster Services hay ClusterMesh thay vì chỉ chuyển người dùng giữa các cụm, và những điều kiện phải có từ lúc thiết kế cụm.</Check>
+
+</Mastery>

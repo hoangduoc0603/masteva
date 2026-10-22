@@ -1,0 +1,787 @@
+---
+title: Shuffle sharding và static stability
+description: Tính và mô phỏng vì sao gán mỗi tenant một tổ hợp worker ngẫu nhiên thu phạm vi của một tenant độc từ một phần tư xuống còn đúng nó; dựng shuffle sharding thật bằng router Envoy có retry sang worker khác; rồi tắt config service để thấy một service giữ bản cấu hình tốt gần nhất vẫn chạy, kể cả khi khởi động lại, còn service đòi cấu hình mới thì chết.
+id: d25.2
+step: d25
+prerequisites: [d25.1]
+topics: [d25.shuffle-sharding, d25.static-stability]
+status: verified
+verified:
+  date: 2026-10-21
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    envoy: 1.40.0
+    golang-image: 1.27.2-alpine
+    python: 3.14.3
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Giữ lỗi trong phạm vi nhỏ ở hai tình huống mà cell của D21.1 chưa đủ: một khách hàng gửi thứ làm hỏng chính máy phục vụ nó, và thành phần điều khiển (control plane) chết. Học xong bài này, bạn giải thích được:
+
+- Vì sao với 8 worker, chia thành 4 shard cố định thì một tenant độc kéo theo 25% tenant khác, còn shuffle sharding chỉ kéo theo khoảng 3,6%, và vì sao con số đó gần bằng 0 khi có 100 worker.
+- Vì sao shuffle sharding cần client (hay proxy) biết thử lại sang worker khác.
+- Data plane và control plane khác nhau thế nào, và "static stability" đòi hỏi những gì ngoài việc cache cấu hình.
+- Vì sao sau sự cố DynamoDB tháng 10/2025, máy EC2 đang chạy vẫn khoẻ mà máy mới thì nhiều giờ không tạo được.
+
+</Goal>
+
+<Knowledge>
+
+### Một tenant xấu trong một cell
+
+Cell giới hạn sự cố trong một phần khách hàng, nhưng trong cell đó mọi tenant vẫn dùng chung worker. Có những lỗi do **chính một tenant** gây ra:
+
+- **Request độc** (poison request): một loại dữ liệu kích hoạt lỗi làm tiến trình chết, ví dụ một bản tin làm bộ phân tích cú pháp panic. Worker khởi động lại, request được gửi lại, worker lại chết.
+- **Tải bất thường**: một tenant bị tấn công DDoS, hay một job của khách chạy sai gửi gấp trăm lần bình thường.
+
+Trong cả hai trường hợp, những tenant xui xẻo dùng chung worker với tenant đó cùng chịu. Câu hỏi là có bao nhiêu tenant xui xẻo như vậy.
+
+### Sharding thường và shuffle sharding
+
+Ví dụ của Amazon Builders' Library: 8 worker, mỗi tenant được phục vụ bởi 2 worker.
+
+- **Sharding thường**: chia 8 worker thành 4 shard cố định, mỗi shard 2 worker; mỗi tenant thuộc một shard. Tenant độc làm chết shard của nó, và **mọi tenant cùng shard** mất hết worker: khoảng 25% tenant.
+- **Shuffle sharding**: mỗi tenant được gán **một tổ hợp 2 worker bất kỳ** trong 8. C(n, k), đọc là "tổ hợp chập k của n", là số cách chọn k phần tử trong n phần tử không kể thứ tự, bằng n! / (k! · (n − k)!); ở đây C(8, 2) = 8 · 7 / 2 = 28 cặp worker khác nhau. Tenant độc làm chết 2 worker của nó; tenant khác chỉ mất hết worker nếu có **đúng cùng tổ hợp**, xác suất 1/28 ≈ 3,6%. Tenant chỉ trùng một worker thì vẫn còn worker kia.
+
+```text
+ sharding thường (4 shard)             shuffle sharding (28 tổ hợp)
+ shard A: w1 w2 ◀ t01 t02 t03          t07: w2 w5   ◀ tenant độc làm chết w2, w5
+ shard B: w3 w4 ◀ t04 t05 t06          t01: w2 w7   còn w7
+ shard C: w5 w6 ◀ t07 t08 t09          t04: w1 w5   còn w1
+ shard D: w7 w8 ◀ t10 t11 t12          t11: w5 w6   còn w6
+ t07 độc → t08, t09 mất hết worker     không tenant nào khác có đúng {w2, w5}
+```
+
+Tổng quát, với N worker và mỗi tenant k worker, ta hỏi: một tenant khác (tổ hợp chọn ngẫu nhiên) trùng **đúng j** worker với tenant độc với xác suất bao nhiêu. Đếm số tổ hợp như vậy: chọn j worker trong k worker của tenant độc, và k − j worker còn lại trong N − k worker kia; chia cho tổng số tổ hợp:
+
+```text
+ P(trùng j) = C(k, j) · C(N − k, k − j) / C(N, k)
+ N = 8, k = 2:   trùng 2 (mất hẳn) = 1/28 ≈ 3,6%   trùng 1 = 12/28 ≈ 42,9%   trùng 0 = 15/28 ≈ 53,6%
+```
+
+Con số giảm rất nhanh khi N lớn lên: 100 worker, mỗi tenant 5 worker cho C(100, 5) = 75.287.520 tổ hợp. Route 53 dùng cùng ý tưởng: theo bài của AWS, có 2.048 máy chủ tên ảo, mỗi tên miền được gán 4, cho khoảng 730 tỉ tổ hợp, đủ để mỗi tên miền một tổ hợp riêng, và không tên miền nào dùng chung quá hai máy chủ với tên miền khác.
+
+Ba điều kiện để shuffle sharding có tác dụng:
+
+| Điều kiện | Vì sao | Lab làm thế nào |
+|---|---|---|
+| Client hoặc proxy **thử lại sang worker khác** trong tổ hợp | Tenant trùng một worker với tenant độc chỉ an toàn nếu request thất bại ở worker chết được gửi sang worker còn lại | Envoy retry khi kết nối hỏng, `previous_hosts` để lần thử lại tránh host vừa lỗi (K10.3 dùng cùng cơ chế) |
+| Loại nhanh worker chết | Không tốn một lần thử hỏng cho mỗi request | Outlier detection của Envoy (D9.6) sau 2 lỗi kết nối liên tiếp |
+| Gán tổ hợp **khác nhau** cho từng tenant | Gán ngẫu nhiên thuần vẫn có thể cho hai tenant cùng tổ hợp | Kế hoạch của lab bỏ tổ hợp đã dùng và chọn lại; thư viện Infima của Route 53 làm việc này kèm giới hạn số worker được trùng |
+
+Retry cũng có mặt trái: chính request độc cũng được thử lại, và nó làm chết luôn worker thứ hai trong tổ hợp. Vì thế số lần thử lại phải nằm trong tổ hợp của tenant đó, không lan ra worker ngoài tổ hợp; Envoy làm đúng như vậy vì mỗi tenant là một cluster riêng chỉ có hai endpoint.
+
+Shuffle sharding không giúp khi lỗi không do một tenant gây ra: một bản build lỗi chạy trên mọi worker vẫn hỏng mọi tổ hợp. Nó bổ sung cho cell và triển khai theo wave, không thay chúng. AWS gọi cách áp nó ở nhiều tầng (tổ hợp cell, rồi tổ hợp worker trong cell) là shuffle sharding đệ quy.
+
+<Check id="d25.2.shuffle">Tính được xác suất một tenant khác trùng toàn bộ và trùng một phần tổ hợp với tenant độc theo N và k, so sánh được với sharding thường, và kể được ba điều kiện để shuffle sharding có tác dụng.</Check>
+
+### Static stability: data plane chạy tiếp khi control plane chết
+
+Hầu hết hệ thống có hai phần:
+
+- **Control plane** (mặt điều khiển): phần **thay đổi** hệ thống. Tạo máy, gán tenant, phát cấu hình, cập nhật bảng định tuyến. Nó phức tạp, ít được gọi, và có thể chậm.
+- **Data plane** (mặt dữ liệu): phần **làm việc** hằng ngày với từng request. Chuyển gói tin, phục vụ API, đọc ghi database. Nó được gọi liên tục và cần đơn giản.
+
+| Hệ thống | Control plane | Data plane |
+|---|---|---|
+| EC2 | Tạo máy mới: tìm máy chủ, cấp card mạng, cài luật security group | Máy đang chạy chuyển gói tin, đọc ghi EBS |
+| Kubernetes | API server, scheduler, controller | Kubelet giữ pod đang chạy, kube-proxy giữ luật chuyển tiếp |
+| Envoy (D9.6) | Control plane xDS phát cấu hình | Envoy phục vụ request với cấu hình đã nạp |
+| Router của D21.1 | `gen.py` và `apply.sh` | Envoy với bảng gán đang có |
+
+Theo bài "Static stability using Availability Zones" của Amazon Builders' Library, một thiết kế **ổn định tĩnh** (statically stable) là thiết kế mà hệ thống tiếp tục chạy khi một phụ thuộc bị suy giảm: thứ đang chạy trước khi phụ thuộc hỏng thì chạy tiếp, có thể chỉ không nhận được cập nhật mới. Bài học gom các khuyến nghị của bài đó thành ba nguyên tắc:
+
+1. **Data plane không cần control plane để tiếp tục phục vụ.** Nó giữ **bản tốt gần nhất** (last-known-good, LKG) của cấu hình, bảng gán, chứng chỉ, và dùng tiếp khi không hỏi được control plane. Máy EC2 có sẵn mọi thông tin cần để chuyển gói tin; Envoy giữ cấu hình đã nạp khi control plane xDS chết.
+2. **Dự phòng dung lượng trước, không mở rộng lúc sự cố.** Bài của AWS lấy ví dụ một dịch vụ chạy trên ba AZ được cấp dư 50%: mỗi AZ chạy ở khoảng 66% dung lượng đã load test, nên mất một AZ thì hai AZ còn lại gánh được mà không cần tạo máy mới. Tạo máy mới lúc sự cố là đặt **control plane** vào đường phục hồi, đúng lúc nó dễ hỏng nhất. D18.1 đã tính headroom theo vùng bằng cùng công thức.
+3. **Không phụ thuộc vào thành phần chỉ cần khi phục hồi.** Đường khởi động lại, đường thay máy, đường chuyển vùng chỉ chạy lúc có sự cố, nên ít được kiểm nhất. Nếu một service khởi động lại phải hỏi config service mới chạy được, thì config service chết cộng một lần restart (do OOM, do node bị thay) là service chết.
+
+LKG có ba cái bẫy:
+
+- **Bản tốt phải thật sự tốt.** Chỉ nhận một bản làm LKG sau khi kiểm hợp lệ (schema, giá trị trong khoảng). D13.4 kể sự cố Azure Front Door 29/10/2025, khi bản "tốt gần nhất" cũng đã bị cập nhật theo cấu hình xấu vì tín hiệu sức khoẻ vẫn tốt.
+- **Biết bản đang dùng cũ bao lâu.** Dùng LKG không được im lặng: phát metric tuổi của cấu hình và đặt alert theo tuổi, thay vì để service tự chết theo tuổi.
+- **Có thứ không được giữ mãi.** Danh sách thu hồi chứng chỉ, quyền vừa bị gỡ của một nhân viên nghỉ việc: giữ bản cũ là giữ một lỗ hổng. Những thứ này cần một hạn tối đa có chủ đích, và một quyết định rõ ràng là khi hết hạn thì đóng (fail closed) hay mở (fail open).
+
+<Callout kind="production">
+
+Theo bản tóm tắt của AWS, từ 23:48 ngày 19/10/2025 tới 14:20 ngày 20/10/2025 (giờ PDT), vùng US-EAST-1 gián đoạn theo ba giai đoạn. Sự cố bắt đầu ở hệ thống tự động quản lý DNS của DynamoDB: hai tiến trình áp kế hoạch DNS chạy tranh nhau, một tiến trình bị chậm áp một kế hoạch đã cũ đè lên kế hoạch mới, rồi bước dọn dẹp xoá kế hoạch cũ đó, làm bản ghi DNS của endpoint `dynamodb.us-east-1.amazonaws.com` trống. Tự động hoá không sửa được trạng thái này, cần người can thiệp. Khách hàng và các dịch vụ nội bộ của AWS không kết nối được DynamoDB qua endpoint đó tới 02:25; tới 02:40 bản ghi DNS cũ trong cache hết hạn và kết nối trở lại bình thường.
+
+Với EC2, bản tóm tắt ghi: **các máy EC2 đã chạy trước khi sự cố bắt đầu vẫn khoẻ** suốt sự cố. Thứ hỏng là việc tạo máy mới. DropletWorkflow Manager (DWFM) quản lý các máy chủ vật lý và giữ một hợp đồng thuê (lease) cho từng máy, kiểm trạng thái vài phút một lần; việc kiểm đó phụ thuộc DynamoDB, nên từ 23:48 lease lần lượt hết hạn, và máy chủ không có lease thì không nhận máy mới. Khi DynamoDB hồi phục lúc 02:25, DWFM cố lập lại lease cho cả đội máy; khối việc lớn tới mức các lần thử hết hạn trước khi xong, việc thử lại chồng lên, và DWFM rơi vào **congestive collapse** (sụp vì nghẽn), một tình huống chưa có quy trình phục hồi lập sẵn. Từ 04:14, kỹ sư giới hạn lượng việc đầu vào và khởi động lại có chọn lọc các máy DWFM; 05:28 mọi máy chủ có lại lease. Sau đó hệ thống truyền cấu hình mạng bị dồn việc, máy mới tạo được nhưng thiếu kết nối mạng tới 10:36; tới 13:50 mọi API và việc tạo máy của EC2 mới bình thường.
+
+Trong các việc AWS nêu: tắt tự động hoá DNS của DynamoDB trên toàn thế giới cho tới khi sửa xong; thêm bộ kiểm thử cho luồng phục hồi của DWFM; giới hạn tốc độ của các hệ thống truyền dữ liệu của EC2 theo độ dài hàng đợi.
+
+Phần của bài: data plane (máy đang chạy) ổn định tĩnh và đứng vững. Đường phục hồi (tạo máy mới, lập lại lease) phụ thuộc vào một dịch vụ khác và chưa từng được chạy ở quy mô cả đội máy. D18.2 gọi kiểu "hồi phục rồi vẫn kẹt vì việc thử lại chồng chất" là metastable; cách xếp này là của bài học.
+
+</Callout>
+
+<Check id="d25.2.static">Phân biệt được control plane với data plane qua ít nhất ba hệ thống, nêu được ba nguyên tắc của static stability, và chỉ ra được trong sự cố tháng 10/2025 phần nào ổn định tĩnh và phần nào nằm trên đường phục hồi.</Check>
+
+<Check id="d25.2.lkg">Kể được ba cái bẫy của bản tốt gần nhất và với mỗi loại dữ liệu điều khiển (cấu hình, bảng gán, chứng chỉ, quyền), quyết định được giữ bản cũ bao lâu và hết hạn thì đóng hay mở.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Workload isolation using shuffle-sharding (Amazon Builders' Library)](https://builder.aws.com/content/3F06NpJ8YeoIGP8VHTw4n81pFn8/workload-isolation-using-shuffle-sharding): ví dụ 8 worker, phép tính 28 tổ hợp và cách Route 53 áp dụng; đọc phần về điều kiện client chịu lỗi.
+- [Static stability using Availability Zones (Amazon Builders' Library)](https://builder.aws.com/content/3K9SiqiJ369TGkkGzqPM95BuYWI/static-stability-using-availability-zones): định nghĩa, control plane và data plane của EC2, dự phòng dung lượng theo AZ.
+- [awslabs/route53-infima](https://github.com/awslabs/route53-infima): thư viện shuffle sharding của Route 53, có cách gán tổ hợp giới hạn số worker trùng nhau.
+- [Summary of the Amazon DynamoDB Service Disruption in the Northern Virginia (US-EAST-1) Region](https://aws.amazon.com/message/101925/): nguồn của callout; đọc phần EC2 về DWFM và danh sách việc làm sau sự cố.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D21.1: có image `d21-app:1`, thư mục `~/masteva-d25` với `app/`, `router/` và `load.sh`, và đã chạy khối "Dừng lab" của D21.1 (không còn container `d21-*`). Nếu đã xoá thư mục, làm lại bước 0, khối `router` ở bước 1, và đoạn tạo `load.sh` trong khối `compose.yaml` của D21.1 (từ `cat > load.sh` tới `chmod +x load.sh`). Dùng cổng **9920**, **9921** (router), **9922**, **9923** (hai service đọc cấu hình) và **9925** (config service), chỉ nghe trên `127.0.0.1`. Mọi khối lệnh chạy trong `~/masteva-d25`.
+
+**Profile máy:** 12 container (router, 8 worker, config service và hai service đọc cấu hình), khoảng 75 MiB RAM theo `docker stats` (router khoảng 22 MiB, mỗi container Go 3–11 MiB), container tải thêm khoảng 11 MiB; mỗi container ứng dụng giới hạn 0,25 CPU và 64 MiB. Mô phỏng ở bước 1 chạy bằng Python trên máy, mất vài giây. Máy 8 GB chạy thoải mái.
+
+### 0. Thêm hai hành vi cho ứng dụng
+
+Hai file Go mới, gắn vào `starts` và `guards` của D21.1:
+
+- `poison.go`: với cờ `-crash-on-poison`, request có `?q=poison` làm tiến trình thoát với mã 3. Docker khởi động lại container theo `restart: unless-stopped`; theo tài liệu `docker run`, mỗi lần khởi động lại liên tiếp Docker chờ lâu gấp đôi lần trước (100 ms, 200 ms, 400 ms… tối đa 1 phút), nên một worker bị giết liên tục sẽ nằm chết phần lớn thời gian.
+- `static.go`: vai `config` (config service, phát một số phiên bản), và cho vai `api` các cờ `-config` (hỏi config service 2 giây một lần), `-config-mode strict|lkg`, `-lkg-file`. Ở chế độ `strict`, cấu hình cũ hơn 10 giây bị coi là hỏng và service trả `503`, một thiết kế nghe hợp lý ("đừng chạy với cấu hình cũ"). Ở chế độ `lkg`, service giữ bản tốt gần nhất, ghi nó ra file, và đọc lại file đó khi khởi động. Bản nhận về có `version` không dương bị bỏ, không được làm LKG.
+
+<Terminal where="mac" title="~/masteva-d25/app/poison.go và static.go">
+
+```bash
+cd ~/masteva-d25
+cat > app/poison.go <<'EOF'
+package main
+
+import (
+	"flag"
+	"log"
+	"net/http"
+	"os"
+)
+
+var crash = flag.Bool("crash-on-poison", false, "api: request có ?q=poison làm tiến trình thoát")
+
+// Request độc: một lỗi chỉ một loại dữ liệu kích hoạt được, ví dụ một bản tin làm bộ phân tích cú pháp panic.
+func init() {
+	guards = append(guards, func(r *http.Request) (string, error) {
+		if *crash && r.URL.Query().Get("q") == "poison" {
+			log.Printf("request độc của tenant %s, tiến trình thoát", r.Header.Get("x-tenant"))
+			os.Exit(3)
+		}
+		return "", nil
+	})
+}
+EOF
+cat > app/static.go <<'EOF'
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+)
+
+var (
+	cfgURL  = flag.String("config", "", "api: URL của config service; trống thì không dùng")
+	cfgMode = flag.String("config-mode", "strict", "api: strict = cấu hình cũ quá 10 giây là hỏng; lkg = giữ bản tốt gần nhất")
+	lkgFile = flag.String("lkg-file", "", "api, lkg: file lưu bản tốt gần nhất, đọc lại khi khởi động")
+	version = flag.Int("version", 1, "config: phiên bản cấu hình lúc đầu")
+)
+
+type config struct {
+	Version int `json:"version"`
+}
+
+var cfg struct {
+	sync.Mutex
+	c   *config
+	at  time.Time // lúc bản đang dùng được lấy về
+	src string
+}
+
+func init() {
+	roles["config"] = runConfig
+	starts = append(starts, startConfig)
+	guards = append(guards, checkConfig)
+}
+
+// config service: control plane của lab, phát một phiên bản cấu hình.
+func runConfig() {
+	var mu sync.Mutex
+	v := *version
+	http.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		json.NewEncoder(w).Encode(config{Version: v})
+	})
+	http.HandleFunc("/admin/set", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		fmt.Sscan(r.URL.Query().Get("version"), &v)
+		fmt.Fprintf(w, "config: phiên bản %d\n", v)
+	})
+	serve()
+}
+
+func use(c config, src string, at time.Time) {
+	cfg.Lock()
+	cfg.c, cfg.src, cfg.at = &c, src, at
+	cfg.Unlock()
+}
+
+// refresh hỏi config service; thành công thì dùng bản mới và (ở chế độ lkg) ghi nó ra file.
+func refresh() {
+	client := http.Client{Timeout: time.Second}
+	resp, err := client.Get(*cfgURL)
+	var c config
+	if err == nil {
+		err = json.NewDecoder(resp.Body).Decode(&c)
+		resp.Body.Close()
+	}
+	if err == nil && c.Version <= 0 {
+		err = errors.New("cấu hình không hợp lệ") // không nhận bản hỏng làm bản tốt
+	}
+	if err != nil {
+		log.Printf("không lấy được cấu hình: %v", err)
+		return
+	}
+	use(c, "config service", time.Now())
+	if *cfgMode == "lkg" && *lkgFile != "" {
+		b, _ := json.Marshal(c)
+		if os.WriteFile(*lkgFile+".tmp", b, 0o644) == nil {
+			os.Rename(*lkgFile+".tmp", *lkgFile)
+		}
+	}
+}
+
+func startConfig() {
+	if *cfgURL == "" {
+		return
+	}
+	if *cfgMode == "lkg" && *lkgFile != "" {
+		var c config
+		b, err := os.ReadFile(*lkgFile)
+		st, _ := os.Stat(*lkgFile)
+		if err == nil && json.Unmarshal(b, &c) == nil {
+			use(c, "file lkg", st.ModTime())
+			log.Printf("khởi động với bản tốt gần nhất trong %s: phiên bản %d", *lkgFile, c.Version)
+		}
+	}
+	refresh()
+	go func() {
+		for range time.Tick(2 * time.Second) {
+			refresh()
+		}
+	}()
+}
+
+func checkConfig(r *http.Request) (string, error) {
+	if *cfgURL == "" {
+		return "", nil
+	}
+	cfg.Lock()
+	c, src, age := cfg.c, cfg.src, time.Since(cfg.at)
+	cfg.Unlock()
+	if c == nil {
+		return "", errors.New("chưa có cấu hình")
+	}
+	if *cfgMode == "strict" && age > 10*time.Second {
+		return "", fmt.Errorf("cấu hình đã cũ %.1fs, quá hạn 10s", age.Seconds())
+	}
+	return fmt.Sprintf("cấu hình phiên bản %d, lấy từ %s %.0fs trước", c.Version, src, age.Seconds()), nil
+}
+EOF
+docker build -q -t d21-app:2 app
+```
+
+</Terminal>
+
+`d21-app:2` chứa cả code của D21.1 và hai file mới. Dòng in ra là ID của image, trên máy bạn sẽ khác.
+
+### 1. Mô phỏng trước khi dựng
+
+Trước khi dựng hệ thật, tính bằng mô phỏng. `shuffle.py sim` lần lượt cho **từng** tenant làm tenant độc, giết mọi worker trong tổ hợp của nó, rồi đếm bao nhiêu tenant khác mất hết worker (mất hẳn) và bao nhiêu mất một phần. Ba cấu hình: 8 worker mỗi tenant 2, 16 worker mỗi tenant 4, 100 worker mỗi tenant 5. Shuffle sharding ở đây gán ngẫu nhiên thuần, không tránh trùng, để so được với công thức. `shuffle.py plan` dùng ở bước 2.
+
+<Terminal where="mac" title="~/masteva-d25/shuffle.py">
+
+```bash
+cat > shuffle.py <<'EOF'
+"""shuffle.py sim: so sharding thường với shuffle sharding bằng mô phỏng.
+shuffle.py plan: sinh kế hoạch router cho 12 tenant trên 8 worker của lab."""
+import json
+import math
+import random
+import sys
+
+
+def regular(n, k, tenants):
+    # n/k shard cố định, tenant chia lần lượt vào từng shard
+    return [frozenset(range((t % (n // k)) * k, (t % (n // k)) * k + k)) for t in range(tenants)]
+
+
+def shuffle(n, k, tenants, rng):
+    # mỗi tenant một tổ hợp k worker chọn ngẫu nhiên, không tránh trùng
+    return [frozenset(rng.sample(range(n), k)) for _ in range(tenants)]
+
+
+def blast(shards):
+    # lần lượt cho từng tenant gửi request độc làm chết mọi worker trong shard của nó,
+    # rồi đếm tenant khác mất hết worker (mất hẳn) và mất một phần worker
+    full = part = 0
+    for p, dead in enumerate(shards):
+        for t, s in enumerate(shards):
+            if t != p:
+                full += s <= dead
+                part += bool(s & dead) and not s <= dead
+    others = len(shards) * (len(shards) - 1)
+    return 100 * full / others, 100 * part / others
+
+
+def sim():
+    rng = random.Random(21)
+    for n, k, tenants in [(8, 2, 1000), (16, 4, 1000), (100, 5, 2000)]:
+        combos = math.comb(n, k)
+        print(f"{n} worker, mỗi shard {k} worker, {tenants} tenant, {combos:,} tổ hợp")
+        f, p = blast(regular(n, k, tenants))
+        print(f"  sharding thường : tenant khác mất hẳn {f:5.2f}%  mất một phần {p:5.2f}%")
+        f, p = blast(shuffle(n, k, tenants, rng))
+        print(f"  shuffle sharding: tenant khác mất hẳn {f:5.2f}%  mất một phần {p:5.2f}%"
+              f"  (lý thuyết mất hẳn 1/{combos:,} = {100 / combos:.4f}%)")
+
+
+def plan():
+    workers = [f"10.221.21.{11 + i}" for i in range(8)]
+    names = [f"t{i:02d}" for i in range(1, 13)]
+    reg = {t: workers[(i // 3) * 2:(i // 3) * 2 + 2] for i, t in enumerate(names)}
+    used, shuf = set(), {}
+    for t in names:
+        rng = random.Random(t)  # cùng tenant luôn ra cùng tổ hợp
+        while (pair := frozenset(rng.sample(range(8), 2))) in used:
+            pass
+        used.add(pair)
+        shuf[t] = [workers[i] for i in sorted(pair)]
+    json.dump({"tenants": reg, "retries": 2, "outlier": True, "label": "thuong-"}, open("router/regular.json", "w"), indent=1)
+    json.dump({"tenants": shuf, "retries": 2, "outlier": True, "label": "shuffle-"}, open("router/shuffle.json", "w"), indent=1)
+    w = {ip: f"w{i + 1}" for i, ip in enumerate(workers)}
+    for t in names:
+        print(t, "thường:", " ".join(w[x] for x in reg[t]), "| shuffle:", " ".join(w[x] for x in shuf[t]))
+
+
+{"sim": sim, "plan": plan}[sys.argv[1]]()
+EOF
+python3 shuffle.py sim
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+8 worker, mỗi shard 2 worker, 1000 tenant, 28 tổ hợp
+  sharding thường : tenant khác mất hẳn 24.92%  mất một phần  0.00%
+  shuffle sharding: tenant khác mất hẳn  3.57%  mất một phần 42.91%  (lý thuyết mất hẳn 1/28 = 3.5714%)
+16 worker, mỗi shard 4 worker, 1000 tenant, 1,820 tổ hợp
+  sharding thường : tenant khác mất hẳn 24.92%  mất một phần  0.00%
+  shuffle sharding: tenant khác mất hẳn  0.06%  mất một phần 72.64%  (lý thuyết mất hẳn 1/1,820 = 0.0549%)
+100 worker, mỗi shard 5 worker, 2000 tenant, 75,287,520 tổ hợp
+  sharding thường : tenant khác mất hẳn  4.95%  mất một phần  0.00%
+  shuffle sharding: tenant khác mất hẳn  0.00%  mất một phần 23.09%  (lý thuyết mất hẳn 1/75,287,520 = 0.0000%)
+```
+
+</Expected>
+
+Đọc từng dòng:
+
+- **Sharding thường** cho đúng 1/(số shard) trừ chính tenant độc: 4 shard thì khoảng 25%, 20 shard (100 worker chia 5) thì khoảng 5%. Không ai "mất một phần": hoặc cùng shard, hoặc không dính gì.
+- **Shuffle sharding** cho tỉ lệ mất hẳn khớp với 1/C(N, k): 3,57% so với lý thuyết 3,5714%; 0,06% so với 0,0549% (độ lệch nhỏ vì tổ hợp gán ngẫu nhiên). Với 100 worker, không tenant nào trong 2.000 mất hẳn.
+- Cái giá là cột **mất một phần**: 42,9% tenant dùng chung một worker với tenant độc, đúng 12/28 của công thức. Những tenant này chỉ an toàn nếu request được thử lại sang worker còn sống. Bước 2 kiểm đúng điều đó.
+
+Kết quả là tất định: script cố định hạt giống ngẫu nhiên, nên máy bạn in đúng các số trên.
+
+<Check id="d25.2.lab-sim">Chạy được mô phỏng so sánh sharding thường với shuffle sharding, đối chiếu được tỉ lệ mất hẳn với 1/C(N, k), và giải thích được cột mất một phần đòi hỏi điều gì ở client.</Check>
+
+### 2. Shuffle sharding thật, với một tenant độc
+
+Hệ của bước này: router đứng trước 8 worker `d21-w1` tới `d21-w8`, mỗi worker có địa chỉ cố định `10.221.21.11` tới `.18` để router không phụ thuộc DNS khi worker liên tục chết và sống lại. `.env` được làm rỗng để bỏ dòng `COMPOSE_FILE` của D21.1. Compose file cũng có config service và hai service đọc cấu hình, dùng ở bước 3.
+
+`shuffle.py plan` sinh hai kế hoạch cho router: `regular.json` (4 shard cố định, mỗi shard 3 tenant) và `shuffle.json` (mỗi tenant một tổ hợp 2 worker không trùng tenant nào khác, chọn theo mã tenant nên luôn ra cùng kết quả). Cả hai bật `retries: 2` và `outlier: true`, tức Envoy thử lại tối đa hai lần sang worker khác trong tổ hợp khi kết nối hỏng, và loại một worker sau 2 lỗi kết nối liên tiếp. Tiền tố `label` cho tên cluster của hai kế hoạch khác nhau, để trạng thái outlier của kế hoạch này không lẫn sang kế hoạch kia.
+
+<Terminal where="mac" title="~/masteva-d25/compose.yaml">
+
+```bash
+printf '' > .env && mkdir -p state
+cat > compose.yaml <<'EOF'
+name: d21
+x-app: &app
+  image: d21-app:2
+  cpus: 0.25
+  mem_limit: 64m
+  restart: unless-stopped
+services:
+  router:
+    image: envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de
+    container_name: d21-router
+    command: ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "2", "--log-level", "warn"]
+    volumes: ["./router/envoy.yaml:/etc/envoy/envoy.yaml:ro", "./router/xds:/xds"]
+    ports: ["127.0.0.1:9920:8080", "127.0.0.1:9921:9901"]
+    cpus: 1
+    mem_limit: 128m
+  w1: { <<: *app, container_name: d21-w1, command: -role api -cell w1 -crash-on-poison, networks: { default: { ipv4_address: 10.221.21.11 } } }
+  w2: { <<: *app, container_name: d21-w2, command: -role api -cell w2 -crash-on-poison, networks: { default: { ipv4_address: 10.221.21.12 } } }
+  w3: { <<: *app, container_name: d21-w3, command: -role api -cell w3 -crash-on-poison, networks: { default: { ipv4_address: 10.221.21.13 } } }
+  w4: { <<: *app, container_name: d21-w4, command: -role api -cell w4 -crash-on-poison, networks: { default: { ipv4_address: 10.221.21.14 } } }
+  w5: { <<: *app, container_name: d21-w5, command: -role api -cell w5 -crash-on-poison, networks: { default: { ipv4_address: 10.221.21.15 } } }
+  w6: { <<: *app, container_name: d21-w6, command: -role api -cell w6 -crash-on-poison, networks: { default: { ipv4_address: 10.221.21.16 } } }
+  w7: { <<: *app, container_name: d21-w7, command: -role api -cell w7 -crash-on-poison, networks: { default: { ipv4_address: 10.221.21.17 } } }
+  w8: { <<: *app, container_name: d21-w8, command: -role api -cell w8 -crash-on-poison, networks: { default: { ipv4_address: 10.221.21.18 } } }
+  config: { <<: *app, container_name: d21-config, command: -role config -version 7, ports: ["127.0.0.1:9925:8080"] }
+  app-strict:
+    <<: *app
+    container_name: d21-app-strict
+    command: -role api -cell app-strict -config http://d21-config:8080/config -config-mode strict
+    ports: ["127.0.0.1:9922:8080"]
+  app-lkg:
+    <<: *app
+    container_name: d21-app-lkg
+    command: -role api -cell app-lkg -config http://d21-config:8080/config -config-mode lkg -lkg-file /data/lkg.json
+    volumes: ["./state:/data"]
+    ports: ["127.0.0.1:9923:8080"]
+networks:
+  default:
+    name: d21-net
+    ipam: { config: [ { subnet: 10.221.21.0/24 } ] }
+EOF
+python3 shuffle.py plan
+./router/apply.sh regular.json
+docker compose up -d 2>&1 | grep -c Started
+for i in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'x-tenant: t07' localhost:9920/)" = 200 ] && break; sleep 1; done
+curl -s -H 'x-tenant: t07' localhost:9920/
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+t01 thường: w1 w2 | shuffle: w2 w7
+t02 thường: w1 w2 | shuffle: w1 w2
+t03 thường: w1 w2 | shuffle: w1 w3
+t04 thường: w3 w4 | shuffle: w1 w5
+t05 thường: w3 w4 | shuffle: w5 w8
+t06 thường: w3 w4 | shuffle: w6 w8
+t07 thường: w5 w6 | shuffle: w2 w5
+t08 thường: w5 w6 | shuffle: w4 w5
+t09 thường: w5 w6 | shuffle: w7 w8
+t10 thường: w7 w8 | shuffle: w4 w6
+t11 thường: w7 w8 | shuffle: w5 w6
+t12 thường: w7 w8 | shuffle: w1 w4
+4 cluster, 13 route
+12
+w5 tenant=t07
+```
+
+</Expected>
+
+`4 cluster, 13 route` là kế hoạch thường (4 shard, 12 tenant cộng route mặc định); `12` là số container đã khởi động. Bảng in ra là tổ hợp của từng tenant trong hai kế hoạch. Với kế hoạch thường, t07 nằm ở shard `w5 w6` cùng t08 và t09; với shuffle, t07 có `w2 w5`, và không tenant nào khác có đúng hai worker đó. Request cuối đi tới một trong hai worker của t07.
+
+Giờ cho t07 gửi request độc trong 20 giây (10 request mỗi giây cho mỗi tenant, cả t07). Kế hoạch thường trước:
+
+<Terminal where="mac">
+
+```bash
+./load.sh -tenants t01-t12 -poison t07 -rps 120 -dur 20s
+docker ps --filter name=d21-w --format '{{.Names}} {{.Status}}' | sort
+```
+
+</Terminal>
+
+<Predict question="t07 làm chết hai worker của shard C. t08 và t09 ở cùng shard, Envoy có retry sang worker khác. Chúng có thoát không?">
+
+```text
+tenant  phục vụ bởi    ok/tổng   lỗi
+t01     w1,w2         200/200     0%
+t02     w1,w2         200/200     0%
+t03     w1,w2         200/200     0%
+t04     w3,w4         200/200     0%
+t05     w3,w4         200/200     0%
+t06     w3,w4         200/200     0%
+t07     -               0/200   100%
+t08     w5,w6           7/200    96%
+t09     w5,w6           2/200    99%
+t10     w7,w8         200/200     0%
+t11     w7,w8         200/200     0%
+t12     w7,w8         199/199     0%
+tenant bị ảnh hưởng (lỗi > 1%): 3/12 (25%) | request lỗi: 591/2399 (25%)
+d21-w1 Up 41 seconds
+d21-w2 Up 41 seconds
+d21-w3 Up 41 seconds
+d21-w4 Up 40 seconds
+d21-w5 Restarting (3) 6 seconds ago
+d21-w6 Up Less than a second
+d21-w7 Up 41 seconds
+d21-w8 Up 41 seconds
+```
+
+Không. Retry chỉ đi trong cluster của tenant, mà cluster của t08 và t09 cũng chỉ có `w5`, `w6`, cả hai đều đang chết hoặc đang chờ Docker khởi động lại. Ba tenant trên mười hai mất gần hết request; con số 25% của bảng tính cả t07, còn tenant vô tội là 2/11 ≈ 18% số tenant khác; khi số tenant lớn, tỉ lệ này tiến tới khoảng 25% như mô phỏng ở bước 1. Vài request của t08, t09 thành công trong những khoảnh khắc một worker vừa sống lại. Cột trạng thái cho thấy `w5`, `w6` đang `Restarting` hoặc mới `Up` vài giây; trên máy bạn, worker nào đang ở trạng thái nào sẽ khác.
+
+</Predict>
+
+Chờ các worker sống lại hẳn (Docker có thể đang chờ tới 1 phút trước lần khởi động lại kế tiếp), rồi chuyển sang kế hoạch shuffle và chạy lại đúng thí nghiệm đó:
+
+<Terminal where="mac">
+
+```bash
+for i in $(seq 90); do [ "$(docker ps -q --filter name=d21-w --filter status=running | wc -l | tr -d ' ')" = 8 ] && break; sleep 2; done
+docker ps --filter name=d21-w --format '{{.Names}} {{.Status}}' | sort | tr '\n' ' '; echo
+./router/apply.sh shuffle.json | tail -1
+./load.sh -tenants t01-t12 -poison t07 -rps 120 -dur 20s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d21-w1 Up About a minute d21-w2 Up About a minute d21-w3 Up About a minute d21-w4 Up About a minute d21-w5 Up 13 seconds d21-w6 Up 20 seconds d21-w7 Up About a minute d21-w8 Up About a minute 
+http.ingress.rds.routes.update_success: 2
+tenant  phục vụ bởi    ok/tổng   lỗi
+t01     w7            200/200     0%
+t02     w1,w2         200/200     0%
+t03     w1,w3         200/200     0%
+t04     w1,w5         200/200     0%
+t05     w8            199/199     0%
+t06     w6,w8         199/199     0%
+t07     -               0/199   100%
+t08     w4            199/199     0%
+t09     w7,w8         199/199     0%
+t10     w4,w6         199/199     0%
+t11     w6            199/199     0%
+t12     w1,w4         199/199     0%
+tenant bị ảnh hưởng (lỗi > 1%): 1/12 (8%) | request lỗi: 199/2392 (8%)
+```
+
+</Expected>
+
+Chỉ t07 lỗi. Đọc kết quả:
+
+- Dòng đầu là trạng thái 8 worker lúc bắt đầu: `w5`, `w6` vừa sống lại vài chục giây.
+- Những tenant dùng chung một worker với t07 (`w2` hoặc `w5`) là t01, t02, t04, t05, t08, t11, và cả sáu đều 0% lỗi. Mỗi khi request của chúng tới worker vừa bị t07 giết, kết nối hỏng, Envoy thử lại sang worker kia trong tổ hợp. Sau 2 lỗi liên tiếp, outlier detection loại worker chết khỏi cluster của tenant đó.
+- Cột "phục vụ bởi" cho thấy hai kiểu: có tenant chỉ còn worker không dùng chung với t07 (ở kết quả trên, t01 chỉ còn `w7`, t08 chỉ còn `w4`), có tenant vẫn ghi cả worker chung vì worker đó trả lời được trong những khoảng ngắn giữa hai lần bị giết. Trên máy bạn, tenant nào rơi vào kiểu nào sẽ khác; cột lỗi 0% thì giống.
+
+Tenant độc thì vẫn mất mọi request: shuffle sharding không cứu nó, mà cứu những người dùng chung với nó. Ngoài đời, bước tiếp theo là tìm ra tenant độc và chặn riêng nó. Log của worker ghi lại tenant đó (Go ghi log ra stderr, nên cần `2>&1`; giờ trong log là UTC):
+
+<Terminal where="mac">
+
+```bash
+docker logs d21-w2 2>&1 | tail -3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2026/10/21 16:22:50 request độc của tenant t07, tiến trình thoát
+2026/10/21 16:23:07 request độc của tenant t07, tiến trình thoát
+```
+
+</Expected>
+
+Mỗi dòng là một lần `w2` bị giết; số dòng và giờ trên máy bạn sẽ khác. Log giữ qua các lần khởi động lại vì Docker không tạo container mới.
+
+<Check id="d25.2.lab-shuffle">Dựng được shuffle sharding bằng một cluster Envoy riêng cho từng tenant, có retry trong tổ hợp và outlier detection, và chứng minh được bằng bảng kết quả rằng tenant độc chỉ làm hỏng chính nó, so với kế hoạch shard cố định.</Check>
+
+### 3. Control plane chết: strict và last-known-good
+
+Ba container của bước này đã chạy từ bước 2: `d21-config` (cổng 9925) phát cấu hình phiên bản 7, `d21-app-strict` (cổng 9922) và `d21-app-lkg` (cổng 9923) cùng hỏi nó 2 giây một lần. Thư mục `state/` trên máy được gắn vào `d21-app-lkg` ở `/data`, nên file LKG còn lại khi container khởi động lại, và bạn đọc được nó.
+
+<Callout kind="danger">
+
+`docker stop d21-config` dừng config service; hai service đọc cấu hình mất nguồn cấu hình cho tới khi bước sau chạy `docker start d21-config`.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+curl -s localhost:9922/; curl -s localhost:9923/; cat state/lkg.json; echo
+docker stop d21-config
+for s in 1 2 3; do sleep 5; curl -s -w ' [%{http_code}]\n' localhost:9922/; curl -s -w ' [%{http_code}]\n' localhost:9923/; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+app-strict | cấu hình phiên bản 7, lấy từ config service 1s trước
+app-lkg | cấu hình phiên bản 7, lấy từ config service 1s trước
+{"version":7}
+d21-config
+app-strict | cấu hình phiên bản 7, lấy từ config service 6s trước
+ [200]
+app-lkg | cấu hình phiên bản 7, lấy từ config service 6s trước
+ [200]
+app-strict: cấu hình đã cũ 10.8s, quá hạn 10s
+ [503]
+app-lkg | cấu hình phiên bản 7, lấy từ config service 11s trước
+ [200]
+app-strict: cấu hình đã cũ 15.9s, quá hạn 10s
+ [503]
+app-lkg | cấu hình phiên bản 7, lấy từ config service 16s trước
+ [200]
+```
+
+</Expected>
+
+Dòng `[200]` hay `[503]` dưới mỗi câu trả lời là mã HTTP. Trong 10 giây đầu, cả hai vẫn phục vụ với phiên bản 7. Sau đó `app-strict` tự coi mình hỏng: control plane chết đã kéo data plane chết theo, dù cấu hình phiên bản 7 vẫn còn nguyên trong bộ nhớ của nó và vẫn đúng. `app-lkg` tiếp tục phục vụ và nói rõ cấu hình đã cũ bao lâu; con số đó là thứ để đặt alert. Số giây trên máy bạn sẽ lệch vài giây tuỳ lúc bạn chạy khối lệnh so với lần hỏi cấu hình gần nhất.
+
+Giờ kiểm nguyên tắc thứ ba: đường khởi động lại. Khởi động lại cả hai service **trong lúc config service vẫn chết**, như khi node chứa chúng bị thay giữa sự cố:
+
+<Callout kind="danger">
+
+`docker restart` dừng rồi chạy lại hai container `d21-app-strict` và `d21-app-lkg`; request tới chúng trong lúc đó sẽ lỗi.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker restart d21-app-strict d21-app-lkg
+sleep 2
+curl -s -w ' [%{http_code}]\n' localhost:9922/; curl -s -w ' [%{http_code}]\n' localhost:9923/
+docker logs d21-app-lkg 2>&1 | grep 'khởi động với'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d21-app-strict
+d21-app-lkg
+app-strict: chưa có cấu hình
+ [503]
+app-lkg | cấu hình phiên bản 7, lấy từ file lkg 39s trước
+ [200]
+2026/10/21 16:24:26 khởi động với bản tốt gần nhất trong /data/lkg.json: phiên bản 7
+```
+
+</Expected>
+
+`app-strict` khởi động xong nhưng không có cấu hình nào, nên trả `503` cho mọi request tới khi config service quay lại. `app-lkg` đọc lại file LKG lúc khởi động và phục vụ ngay (dòng log cuối; giờ trong log là UTC); tuổi của cấu hình tính từ lúc file được ghi, nên con số này tiếp tục tăng chứ không về 0. Nếu `app-lkg` chỉ giữ LKG trong bộ nhớ, nó đã chết giống `app-strict` ở lần khởi động lại này: một thiết kế "có cache" vẫn có thể không ổn định tĩnh.
+
+Bật lại config service và đổi phiên bản, để thấy đường cập nhật vẫn chạy khi control plane khoẻ:
+
+<Terminal where="mac">
+
+```bash
+docker start d21-config
+sleep 3
+curl -s 'localhost:9925/admin/set?version=8'
+sleep 3
+curl -s localhost:9922/; curl -s localhost:9923/; cat state/lkg.json; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+d21-config
+config: phiên bản 8
+app-strict | cấu hình phiên bản 8, lấy từ config service 0s trước
+app-lkg | cấu hình phiên bản 8, lấy từ config service 0s trước
+{"version":8}
+```
+
+</Expected>
+
+Sau tối đa 2 giây (chu kỳ hỏi), cả hai nhận phiên bản 8 và file LKG được ghi lại. Ngoài đời, bước "ghi file" chỉ nên xảy ra sau khi bản mới qua kiểm hợp lệ, như `static.go` bỏ bản có `version` không dương; một bản hỏng mà được ghi làm LKG thì lần khởi động lại sau sẽ nạp đúng bản hỏng đó.
+
+<Check id="d25.2.lab-lkg">Tái hiện được việc một service đòi cấu hình mới chết theo config service còn service giữ bản tốt gần nhất vẫn phục vụ, kiểm được cả đường khởi động lại trong lúc config service chết, và chỉ ra được tuổi của cấu hình là tín hiệu để alert.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`Pool overlaps` hoặc `Address already in use` khi `docker compose up`:** dải `10.221.21.0/24` đã có mạng khác dùng, hoặc container của D21.1 còn chạy. Chạy khối "Dừng lab" của D21.1; nếu vẫn lỗi, đổi dải trong `compose.yaml` và địa chỉ worker trong `shuffle.py` theo cùng dải mới.
+- **Ở kế hoạch shuffle, một tenant vô tội lỗi khoảng 5–15%:** thường do worker của nó chưa sống lại hẳn khi bắt đầu đo, hoặc outlier detection của cluster đó còn đang loại worker còn sống từ lượt trước. Chờ vòng `for` báo đủ 8 worker `Up` hơn 10 giây rồi chạy lại khối lệnh.
+- **Vòng chờ worker hết 3 phút mà chưa đủ 8:** `docker ps -a --filter name=d21-w` để xem worker nào kẹt; `docker start <tên>` để chạy lại ngay thay vì chờ Docker.
+- **`cat: state/lkg.json: No such file or directory`:** `d21-app-lkg` chưa hỏi được config service lần nào (config service khởi động sau nó). Chờ vài giây rồi chạy lại; nếu vẫn không có, xem `docker logs d21-app-lkg`.
+- **Trên Linux với Docker Engine, `state/lkg.json` không được tạo** (chưa chạy thử trên Linux): container chạy bằng uid 65532, có thể không có quyền ghi vào thư mục `state/` của user bạn. `chmod 777 state` rồi `docker restart d21-app-lkg`.
+- **`app-strict` vẫn `200` ở cả ba lần hỏi sau khi dừng config service:** khối lệnh chạy nhanh hơn 10 giây kể từ lần hỏi thành công cuối. Chạy thêm `sleep 10; curl -s localhost:9922/`.
+
+</Callout>
+
+### Dọn dẹp
+
+D21.3 dựng hệ khác trên cùng thư mục. Dừng các container của bài, giữ thư mục và image.
+
+<Callout kind="danger">
+
+`docker compose down` xoá 12 container của bài và mạng `d21-net`. File `state/lkg.json` vẫn còn trong thư mục lab; khối "Xoá hẳn" của D21.1 xoá nó cùng thư mục.
+
+</Callout>
+
+<Terminal where="mac" title="Dừng lab, giữ thư mục">
+
+```bash
+cd ~/masteva-d25
+docker compose down
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Chọn k (số worker mỗi tenant) thế nào?">
+
+k lớn thì mỗi tenant có nhiều worker hơn: chịu được nhiều worker chết cùng lúc vì lý do khác (máy hỏng, triển khai), và một tenant lớn có nhiều sức chứa hơn. Đổi lại, tổ hợp của tenant độc lớn hơn, nên nhiều tenant khác dùng chung một phần với nó hơn; với N cố định, số tổ hợp C(N, k) tăng tới k = N/2 rồi giảm. Thực tế k nhỏ (2 tới 5) và N đủ lớn để C(N, k) vượt xa số tenant. Thêm một ràng buộc: k phải đủ để phần còn lại gánh được tải của tenant khi mất một worker, giống quy tắc N+1 của D18.1 nhưng áp cho từng tổ hợp.
+
+</Reveal>
+
+<Reveal title="Shuffle sharding có dùng được với hàng đợi và database không?">
+
+Có, ở dạng khác. Với hàng đợi, mỗi tenant được gán một tổ hợp vài hàng trong nhiều hàng, producer gửi vào một trong các hàng của tổ hợp, consumer đọc mọi hàng; một tenant gửi ồ ạt chỉ làm đầy các hàng của nó. Với database có dữ liệu riêng của từng tenant thì khó hơn, vì dữ liệu phải nằm ở mọi phần của tổ hợp (bản sao) hoặc ở một phần (khi đó quay về sharding thường). Shuffle sharding hợp nhất với tầng không giữ trạng thái hoặc trạng thái sao chép được: worker, máy chủ tên, hàng đợi, endpoint.
+
+</Reveal>
+
+<Reveal title="Kubernetes ổn định tĩnh tới đâu khi API server chết?">
+
+Pod đang chạy vẫn chạy: kubelet không tắt container khi mất liên lạc với API server, và kube-proxy giữ luật chuyển tiếp đã có. Thứ dừng là mọi thay đổi: không tạo pod mới, không thay pod chết trên node khác, HPA không mở rộng, Endpoint không cập nhật khi pod chết. Nghĩa là cụm ổn định tĩnh với lưu lượng hôm qua, nhưng không với một node chết hôm nay. Muốn chịu được cả hai cùng lúc, workload phải có sẵn bản sao dư trên nhiều node (K5.2) chứ không trông vào việc tạo pod mới.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Khi nhờ AI thiết kế một service đọc cấu hình động, nó hay viết vòng hỏi lại có timeout và "fail nếu không lấy được cấu hình" cho chắc chắn, đúng kiểu `strict` của lab. Hỏi thêm: khi config service chết 10 phút thì sao, khi service khởi động lại lúc config service đang chết thì sao, bản LKG được kiểm hợp lệ ở đâu. Với shuffle sharding, AI thường đưa công thức đúng nhưng quên ba điều kiện vận hành: retry sang worker khác trong tổ hợp, loại nhanh worker chết, và gán tổ hợp không trùng. Kiểm bằng phép thử như bước 2, với một tenant thật sự giết được worker.
+
+</Callout>
+
+<Callout kind="link">
+
+D21.1 dựng router và cell mà bài này dùng lại. D9.6 dạy outlier detection và cách Envoy giữ cấu hình khi control plane xDS gửi bản hỏng; D13.4 và D13.5 bàn bản tốt gần nhất và kill switch trong GitOps; D18.1 tính dung lượng dự phòng theo AZ, chính là nguyên tắc thứ hai. D21.3 dùng dung lượng dự phòng đó để rút lưu lượng khỏi một zone, và tìm những phụ thuộc mà một cache như LKG chỉ che được trong một thời gian.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d25.2.mastery-shuffle">Với một dịch vụ nhiều tenant cho trước, chọn được N và k cho shuffle sharding, tính được phạm vi ảnh hưởng của một tenant độc, và cấu hình được proxy để tenant dùng chung một worker không bị ảnh hưởng.</Check>
+
+<Check id="d25.2.mastery-static">Rà được một service đang chạy theo ba nguyên tắc static stability: nó cần gì để phục vụ tiếp, cần gì để khởi động lại, cần gì để thay một bản chết, và sửa được chỗ phụ thuộc control plane bằng bản tốt gần nhất có kiểm hợp lệ và alert theo tuổi.</Check>
+
+<Check id="d25.2.mastery-test">Viết được một phép thử tắt control plane rồi khởi động lại data plane, và đọc được kết quả để biết service có thật sự ổn định tĩnh không.</Check>
+
+</Mastery>

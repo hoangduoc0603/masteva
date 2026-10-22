@@ -231,8 +231,8 @@ test('khung chi tiết: nút Tiếp, Trước chuyển chủ đề và giữ foc
 });
 
 test('khung chi tiết chưa có bài vẫn có hướng đi tiếp', async ({ page }) => {
-  await page.goto('/vi/roadmaps/devops#d19.internal-developer-platform');
-  const panel = page.locator('[data-panel="d19.internal-developer-platform"]');
+  await page.goto('/vi/roadmaps/devops#d26.landing-zone');
+  const panel = page.locator('[data-panel="d26.landing-zone"]');
   await expect(panel.locator('.rm-empty')).toBeVisible();
   await expect(panel.locator('a[rel="next"]')).toBeVisible();
 

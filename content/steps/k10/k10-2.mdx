@@ -1,0 +1,920 @@
+---
+title: GitOps cho nhiều cụm
+description: Một Argo CD ở cụm hub triển khai cùng một ứng dụng tới nhiều cụm; đăng ký cụm bằng Secret và hiểu credential đó mở cửa tới đâu, sinh Application theo cụm bằng generator cluster và matrix, overlay riêng từng cụm, rồi đẩy thay đổi theo đợt canary trước bằng Progressive Syncs, dừng đợt khi cụm canary hỏng, và biết giới hạn của một Argo CD quản nhiều cụm.
+id: k10.2
+step: k10
+prerequisites: [k10.1, d14.4]
+topics: [k10.gitops-nhieu-cum]
+status: verified
+verified:
+  date: 2026-10-20
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0 (Docker Desktop)
+    kind: 0.33.0
+    kubernetes: 1.37.0 (kindest/node)
+    kubectl: 1.37.1
+    argo-cd: 3.5.5 (core-install)
+    gitea: 28.1.0
+    busybox: 1.38.0
+    git: 2.39.3
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+D13 đưa một cụm về đúng trạng thái trong Git. Bài này làm điều đó cho nhiều cụm cùng lúc, và thêm điều D13 chưa cần: một thay đổi không được tới mọi cụm cùng một lúc. Học xong, bạn giải thích được:
+
+- Vì sao một Argo CD trung tâm vừa tiện vừa là điểm rủi ro lớn nhất của cả fleet, và khi nào nên chọn agent trên từng cụm.
+- Một ApplicationSet sinh đúng một Application cho mỗi cặp (cụm, ứng dụng) thế nào, và vì sao thêm một cụm vào fleet chỉ là thêm một Secret.
+- Vì sao một commit sửa một file cấu hình có thể xoá sạch ứng dụng ở mọi vùng trong vài phút, và cách chia thay đổi thành đợt để điều đó chỉ xảy ra ở một cụm.
+- Vì sao khi bật rollout theo đợt, Argo CD thôi tự sửa drift, và cái giá đó đáng hay không.
+
+</Goal>
+
+<Knowledge>
+
+### Hub-and-spoke hay agent trên từng cụm
+
+Có hai cách đặt GitOps lên nhiều cụm. **Hub-and-spoke**: một Argo CD chạy ở một cụm trung tâm (hub), cầm credential của mọi cụm đích (spoke), và gọi API server của từng cụm để áp manifest. **Agent trên từng cụm**: mỗi cụm có agent GitOps riêng (Flux là cách làm điển hình), tự kéo từ Git, không ai bên ngoài cầm credential của nó.
+
+```text
+ Hub-and-spoke (bài này)                     Agent trên từng cụm (Flux)
+
+          Git                                         Git
+           ▲ kéo                               ▲ kéo   ▲ kéo   ▲ kéo
+     ┌─────┴──────┐                         ┌──┴───┐ ┌─┴────┐ ┌┴─────┐
+     │ hub        │                         │ cụm a│ │ cụm b│ │ cụm c│
+     │ Argo CD    │ token của mọi cụm       │ flux │ │ flux │ │ flux │
+     └──┬─────┬───┘                         └──────┘ └──────┘ └──────┘
+   gọi API│     │gọi API                     mỗi cụm chỉ cần ra được Git;
+     ┌────▼┐ ┌──▼──┐                          không ai cầm token của cụm khác
+     │cụm a│ │cụm b│
+     └─────┘ └─────┘
+```
+
+| | Hub-and-spoke (Argo CD tập trung) | Agent trên từng cụm (Flux) |
+|---|---|---|
+| Một màn hình cho cả fleet | Có sẵn: mọi Application ở một chỗ | Phải gom trạng thái từ từng cụm |
+| Credential | Hub giữ token của **mọi** cụm: chiếm hub là chiếm fleet | Mỗi cụm chỉ có quyền đọc Git |
+| Hướng mạng | Hub phải gọi tới API server của mọi cụm | Mỗi cụm chỉ cần ra được Git |
+| Hub hoặc mạng tới hub hỏng | Không triển khai được ở đâu; ứng dụng vẫn chạy | Mỗi cụm vẫn tự đối chiếu |
+| Điều phối giữa các cụm | Một controller thấy mọi cụm, nên rollout theo đợt dễ | Cần công cụ thêm để biết cụm nào xong trước |
+| Tải | Một controller cache tài nguyên của mọi cụm (phần cuối bài) | Chia đều cho từng cụm |
+
+Có cách lai: dự án **argocd-agent** (thuộc argoproj-labs, bản mới nhất là 0.10 phát hành tháng 08/2026, chưa có bản 1.0) đặt một agent trên mỗi cụm, giữ giao diện tập trung nhưng để cụm đích tự kéo. Bài này dùng hub-and-spoke vì nó là mô hình phổ biến nhất của Argo CD, và vì rollout theo đợt dựng trên nó gọn nhất.
+
+<Check id="k10.2.hub-spoke">So sánh được hub-and-spoke với agent trên từng cụm theo credential, hướng mạng, cách hỏng và khả năng điều phối, và chọn được một mô hình cho một tình huống cho trước.</Check>
+
+### Một ApplicationSet cho cả fleet
+
+D13.2 đã dùng ApplicationSet với generator `git` để sinh mỗi môi trường một Application. Với nhiều cụm, thêm hai generator:
+
+| Generator | Sinh tham số từ | Tham số dùng được | Dùng khi |
+|---|---|---|---|
+| `clusters` | Các Secret cụm mà Argo CD biết, lọc bằng `selector` theo nhãn | `name`, `server`, `metadata.labels`, `metadata.annotations` | Mỗi cụm thoả điều kiện nhận ứng dụng: thêm cụm là thêm Secret |
+| `list` | Danh sách viết thẳng trong ApplicationSet | Trường bất kỳ bạn khai | Danh sách nhỏ, ít đổi, hoặc cụm Argo CD không quản |
+| `git` | Thư mục hoặc file trong repo | `path.path`, `path.basename`, nội dung file | Mỗi thư mục là một ứng dụng hoặc môi trường |
+| `matrix` | Tích của hai generator con; con thứ hai dùng được tham số của con thứ nhất | Hợp của hai bộ tham số | Mỗi cặp (cụm, ứng dụng) |
+
+Lab dùng `matrix` với `clusters` làm con thứ nhất và `git` làm con thứ hai, đường dẫn có tên cụm: `clusters/{{ .name }}/*`. Với mỗi cụm, `git` liệt kê thư mục ứng dụng của **chính cụm đó**, nên cụm không có thư mục cho một ứng dụng thì không nhận ứng dụng ấy.
+
+Cấu hình khác nhau giữa các cụm nằm trong **overlay theo cụm** của Kustomize (K3.1), cùng cách D13.2 làm overlay theo môi trường:
+
+```text
+fleet/
+├── base/web/                 # cái chung: Deployment, Service, ConfigMap
+└── clusters/
+    ├── k10-a/web/            # overlay của cụm k10-a: CLUSTER=k10-a, có thể thêm vùng, số bản sao
+    └── k10-b/web/            # overlay của cụm k10-b
+```
+
+Khi có cả môi trường lẫn cụm, cách hay gặp là hai tầng: `envs/prod` kế thừa `base`, rồi `clusters/prod-sg-1` kế thừa `envs/prod`. Quy tắc giữ cho cây không rối: cái gì chung cho mọi cụm của một môi trường thì nằm ở tầng môi trường; overlay của cụm chỉ chứa điều thật sự riêng của cụm đó (tên, vùng, dung lượng).
+
+<Check id="k10.2.generators">Kể được bốn generator `clusters`, `list`, `git`, `matrix` cùng tham số của chúng, và tổ chức được repo theo base, môi trường và cụm sao cho một ApplicationSet sinh đúng một Application cho mỗi cặp cụm và ứng dụng.</Check>
+
+### Rollout theo đợt qua các cụm
+
+ApplicationSet mặc định cập nhật mọi Application **cùng lúc** (`AllAtOnce`). Với mười cụm, một commit xấu tới mười cụm trong cùng một lượt đối chiếu. D13.4 đã chia production thành wave trong một cụm; ở đây đơn vị của wave là cả một cụm.
+
+**Progressive Syncs** của ApplicationSet (beta từ Argo CD 3.3, phải bật bằng `applicationsetcontroller.enable.progressive.syncs: "true"`) thêm chiến lược `RollingSync`: chia các Application thành từng bước theo nhãn, đồng bộ bước sau chỉ khi mọi Application của bước trước đã `Healthy`.
+
+Lab chia bước bằng nhãn `ring` trên mỗi Application: `ring=canary` cho cụm chạy trước, `ring=main` cho phần còn lại. Nhãn lấy từ nhãn `masteva.dev/ring` của Secret cụm. Trong lúc rollout, ApplicationSet ghi cho mỗi Application một trong bốn trạng thái (ở `status.applicationStatus`):
+
+| Trạng thái | Nghĩa |
+|---|---|
+| `Waiting` | Có thay đổi chưa áp, đang chờ tới lượt bước của nó |
+| `Pending` | Đã tới lượt; ApplicationSet vừa kích hoạt sync, chờ Application bắt đầu chạy |
+| `Progressing` | Đang sync hoặc tài nguyên chưa khoẻ |
+| `Healthy` | Đã `Synced` và `Healthy` ở commit mới; bước này được tính là xong |
+
+```text
+ commit mới ─▶ mọi Application chuyển OutOfSync ─▶ ApplicationSet đặt chúng ở "Waiting"
+                                  │
+   bước 1: ring=canary  ──▶ Pending ──▶ Progressing ──▶ Healthy ?
+           (cụm k10-a)                                    │ có            │ không bao giờ
+                                                          ▼               ▼
+   bước 2: ring=main    ──▶ Pending ──▶ Progressing ──▶ Healthy      dừng ở đây: k10-b vẫn Waiting
+           (cụm k10-b)                                                   (vẫn chạy bản cũ)
+```
+
+Bốn điều cần biết (theo tài liệu và mã nguồn của ApplicationSet controller), lab cho bạn thấy ba điều đầu:
+
+- `Healthy` ở đây là health của Argo CD: với Deployment là rollout đã xong, pod mới đã sẵn sàng. Không có bake time có sẵn. Hai cách thêm: `minReadySeconds` của Deployment (pod phải sẵn sàng liên tục N giây mới được tính), và hook của Argo CD chạy một Job kiểm thử sau khi sync, như cổng kiểm của D13.4.
+- `RollingSync` **buộc tắt** auto-sync của mọi Application nó sinh ra; chính nó kích hoạt sync. Hệ quả: `selfHeal` không còn, drift trên các cụm không tự được kéo về.
+- Muốn sync có `prune` (xoá tài nguyên đã bỏ khỏi Git, ví dụ ConfigMap mang hash cũ), vẫn khai `syncPolicy.automated.prune: true` trong template; RollingSync tắt phần tự động nhưng giữ giá trị `prune` cho các lần sync nó kích hoạt. Thiếu nó, ConfigMap cũ còn đó, Application ở `OutOfSync` mãi, bước 1 không bao giờ được coi là xong và đợt dừng vĩnh viễn.
+- Application không khớp bước nào thì không được RollingSync đụng tới, phải sync tay.
+
+Chọn thứ tự: cụm canary là cụm nhỏ nhất, ít người dùng nhất nhưng **có lưu lượng thật**, giống one-box của D13.4. Với nhiều cụm hơn, `maxUpdate` của từng bước giới hạn số cụm sync cùng lúc (ví dụ 10% của nhóm `main` mỗi lần). Khi cần điều phối phức tạp hơn (cổng duyệt, thăng cấp giữa môi trường theo luật), có công cụ chuyên cho việc đó như Kargo; ý tưởng không đổi.
+
+<Callout kind="production">
+
+Ngày 25/08/2021, Skyscanner sập toàn cầu khoảng bốn tiếng rưỡi: website và ứng dụng di động không dùng được. Theo [bài postmortem của Skyscanner Engineering](https://web.archive.org/web/20240121215741/https://medium.com/@SkyscannerEng/how-a-couple-of-characters-brought-down-our-site-356ccaf1fbc3) (bản lưu trên Internet Archive), hạ tầng của họ chia thành các cell; mỗi cell nằm trong một vùng và gồm nhiều cụm Kubernetes ở các availability zone.
+
+Khoảng 15:30 GMT, một kỹ sư gửi một thay đổi vào hệ thống template, chuẩn bị cho một thay đổi lớn hơn về sau và được tin là không làm đổi hành vi gì. Thay đổi được review, merge vào nhánh chính, và tự động triển khai. File đó nằm ở gốc cấu hình của các cell và rất ít khi đổi; vì nó phân phối cấu hình theo vùng, hệ thống đẩy nó **ra toàn cầu, ngay lập tức**. Thay đổi thiếu cặp `{{ }}`, nên template không còn được áp và mọi namespace dùng cấu hình này (tất cả) bị áp lại với cấu hình hỏng. Lúc 16:00 GMT, Argo CD đối chiếu cấu hình các cụm; cấu hình mới không còn namespace hợp lệ nào, nên nó bắt đầu xoá hàng loạt toàn bộ 478 service, ở mọi namespace, mọi availability zone, mọi vùng.
+
+Họ khôi phục ưu tiên một vùng và các service quan trọng; khoảng 20:30 GMT website phục vụ lại từ một vùng, các vùng còn lại trở lại trong hai ngày sau. Bài viết ghi GitOps giúp phục hồi: cấu hình đúng được đưa lại thì cụm tự dựng lại mình. Các bài học họ nêu gồm: **đừng triển khai cấu hình ra toàn cầu một lần**; cấu hình có template và logic thì đã là code và cần test, ít nhất là lint; kịch bản sự cố chưa đủ bi quan; bản sao lưu sẵn sàng nhưng một thay đổi chính sách IAM làm việc lấy chúng khó khăn đúng lúc cần; và tự hỏi có cần template cấu hình này theo vùng không, vì bớt tự động thì có drift, còn tự động thì có thể lan ra mọi vùng.
+
+Phần của bài này: lab bước 6 đẩy một thay đổi hỏng qua RollingSync; nó dừng ở cụm canary. Nguồn không nói Argo CD xoá qua đường nào. Nếu Application còn nguyên và Git mô tả "không có gì" thì `prune` xoá tài nguyên, và `preserveResourcesOnDeletion` của D13.2 không chặn được; chỉ rollout theo đợt mới giới hạn được phạm vi.
+
+</Callout>
+
+<Check id="k10.2.rolling-sync">Kể được các trạng thái Waiting, Pending, Progressing, Healthy của RollingSync, điều kiện để sang bước sau, ba hệ quả của việc bật nó (không bake time có sẵn, tắt selfHeal, cần `prune` trong template), và chỉ ra được trong sự cố Skyscanner bước nào của quy trình lẽ ra chặn được thay đổi.</Check>
+
+### Secret kết nối cụm
+
+Argo CD biết một cụm qua một Secret trong namespace `argocd` có nhãn `argocd.argoproj.io/secret-type: cluster`, gồm `name`, `server` (địa chỉ API server) và `config` (cách xác thực). Lệnh `argocd cluster add` làm ba việc mà lab sẽ làm tay: tạo ServiceAccount `argocd-manager` trong `kube-system` của cụm đích, gắn nó với một ClusterRole có toàn quyền trên cụm (lab dùng thẳng `cluster-admin`), rồi lưu token của nó vào Secret trên hub.
+
+Toàn quyền trên mọi cụm, gom vào một namespace của hub, là lý do hub là mục tiêu giá trị nhất của fleet. Các cách thu hẹp:
+
+| Cách | Làm gì | Đổi lại |
+|---|---|---|
+| `namespaces` trong Secret cụm | Argo CD chỉ thấy và quản các namespace liệt kê; tài nguyên cấp cụm bị bỏ qua trừ khi `clusterResources: "true"` | ServiceAccount trên cụm đích cần Role tương ứng thay cho toàn quyền; không cài được CRD hay add-on |
+| AppProject `destinations` theo tên cụm | Project của đội A chỉ được nhắm vào cụm `prod-*` của đội A | Không giảm quyền của token, chỉ giảm ai dùng được nó |
+| Credential ngắn hạn qua `execProviderConfig` | Token lấy lúc cần từ IAM của cloud (EKS, GKE, AKS) thay cho token sống mãi | Cần danh tính workload cho chính Argo CD |
+| Xoay token | Xoá Secret token cũ trên cụm đích, tạo lại, cập nhật Secret trên hub | Phải tự động, nếu không sẽ không ai làm |
+
+Token của Secret kiểu `kubernetes.io/service-account-token` (lab dùng) **không hết hạn**: lộ nó là lộ quyền vào cụm cho tới khi bạn xoá Secret đó. Lab dùng nó vì cụm kind không có IAM nào để mượn.
+
+<Check id="k10.2.secret-cum">Kể được ba việc `argocd cluster add` làm, giải thích được vì sao hub là mục tiêu tấn công, và nêu được ít nhất ba cách thu hẹp quyền của Argo CD trên cụm đích cùng cái giá của từng cách.</Check>
+
+### Giới hạn của một Argo CD quản nhiều cụm
+
+Application controller giữ một **cache** của tài nguyên ở mọi cụm nó quản, qua watch của API, để đối chiếu nhanh. Bộ nhớ và CPU của nó vì thế tăng theo tổng số tài nguyên của cả fleet, không theo số Application. Các điểm nghẽn hay gặp và cách xử lý:
+
+| Điểm nghẽn | Dấu hiệu | Cách xử lý |
+|---|---|---|
+| Bộ nhớ của application controller | OOMKilled, đối chiếu chậm dần khi thêm cụm | **Sharding**: tăng số bản của StatefulSet `argocd-application-controller`, đặt `ARGOCD_CONTROLLER_REPLICAS`; mỗi bản lo một phần các cụm. Thuật toán chọn bằng `controller.sharding.algorithm`: `legacy` (mặc định, theo UID, chia không đều), `round-robin` và `consistent-hashing` (cả hai còn ở mức thử nghiệm); hoặc gán tay trường `shard` trong Secret cụm |
+| Tài nguyên churn cao | CPU của controller cao vì một loại object đổi liên tục (report của policy engine, Lease, EndpointSlice) | `resource.exclusions` trong `argocd-cm` để Argo CD không watch loại đó. Bản cài của Argo CD 3.5 đã loại sẵn Endpoints, EndpointSlice, Lease và các loại report của Kyverno; thêm vào danh sách khi bạn cài công cụ khác có object đổi liên tục |
+| Repo server | Render chậm, Application chờ "ComparisonError" | Thêm bản sao repo-server, cache manifest, tránh render nặng ở mỗi lượt |
+| Hỏi Git | Mỗi Application hỏi Git mỗi khoảng 3 phút; nghìn Application là nghìn lượt hỏi | Webhook từ Git (D13.1), tăng `timeout.reconciliation` |
+| Mạng tới cụm xa | Cụm ở vùng khác chậm làm chậm cả shard | Hub gần các cụm, hoặc nhiều hub, mỗi hub một vùng |
+
+Khi một hub không còn đủ, cách thường gặp là **nhiều hub**, mỗi hub cho một vùng hoặc một môi trường, cùng đọc một repo. Việc chia này cũng giới hạn blast radius của chính hệ thống GitOps.
+
+<Check id="k10.2.gioi-han">Giải thích được vì sao bộ nhớ của application controller tăng theo số tài nguyên của fleet, kể được năm điểm nghẽn cùng cách xử lý, và mô tả được sharding với các thuật toán của nó.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Cluster Generator (Argo CD ApplicationSet)](https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster/): tham số sinh từ Secret cụm, lọc theo nhãn, và cụm `in-cluster`.
+- [Matrix Generator (Argo CD ApplicationSet)](https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Matrix/): ghép hai generator, generator con thứ hai dùng tham số của con thứ nhất.
+- [Progressive Syncs (Argo CD ApplicationSet)](https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Progressive-Syncs/): cách bật, `RollingSync`, `maxUpdate`, và các giới hạn như tắt auto-sync.
+- [Declarative Setup (Argo CD), mục Clusters](https://argo-cd.readthedocs.io/en/stable/operator-manual/declarative-setup/#clusters): định dạng Secret cụm, `namespaces`, `clusterResources`, `execProviderConfig`.
+- [High Availability (Argo CD)](https://argo-cd.readthedocs.io/en/stable/operator-manual/high_availability/): sharding application controller, các thuật toán và tham số hiệu năng.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Đã làm D13.1 (Gitea và Argo CD trên một cụm) và K10.1. Bạn cần Docker, `kind`, `kubectl` (1.36 hay 1.37 đều được), `git`, `curl`, `jq`, `yq`. Lab tải image Argo CD (khoảng 190 MB nén), Redis, Gitea (khoảng 120 MB nén) và `busybox`. Dùng các cổng **9860** (Gitea), **9861** và **9862** (ứng dụng trên hai cụm đích), đều chỉ nghe trên `127.0.0.1`.
+
+**Profile máy.** Ba cụm kind một node. Theo `docker stats`, mỗi node đích khoảng 650 tới 900 MiB, node hub (có Argo CD bản core) khoảng 1,2 GiB, Gitea khoảng 60 tới 180 MiB: cả lab khoảng 2,7 tới 3 GiB. Khoảng 250 MiB mỗi node trong số đó là cache file mà kernel thu hồi được khi thiếu bộ nhớ; phần bộ nhớ thật sự phải giữ là khoảng 2,1 GiB. Máy 8 GB: cấp cho Docker ít nhất 4 GB và không chạy lab khác cùng lúc. K10.3 và K10.4 dùng tiếp các cụm này.
+
+Mỗi khối lệnh mở bằng `cd ~/masteva-k10 && . ./lab.sh`, nên mở tab mới giữa chừng không mất gì. Các cụm và Gitea trong bài mang tên `k10-hub`, `k10-a`, `k10-b`, `k10-gitea`.
+
+### 1. Ba cụm và một máy chủ Git
+
+`lab.sh` khai các hàm dùng suốt chặng. Ba hàm `hub`, `ka`, `kb` gọi `kubectl` vào từng cụm bằng `--context`, để không lệnh nào chạy nhầm cụm vì quên đổi context. `argocd` chạy CLI có sẵn trong pod controller ở chế độ `--core`, như D13.1. `lam_moi` bảo Argo CD hỏi lại Git ngay (bước 5 giải thích). `ipof` in địa chỉ IPv4 của một container trên network `kind`, K10.3 dùng.
+
+<Terminal where="mac" title="~/masteva-k10/lab.sh">
+
+```bash
+mkdir -p ~/masteva-k10 && cd ~/masteva-k10
+cat > lab.sh <<'EOF'
+export KUBECONFIG=$HOME/masteva-k10/kubeconfig
+[ -f "$HOME/masteva-k10/gitea.env" ] && . "$HOME/masteva-k10/gitea.env"
+G=http://localhost:9860/api/v1
+hub() { kubectl --context kind-k10-hub "$@"; }
+ka()  { kubectl --context kind-k10-a "$@"; }
+kb()  { kubectl --context kind-k10-b "$@"; }
+an_git() { git -c http.extraHeader="Authorization: token $AN_TOKEN" "$@"; }
+argocd() { hub -n argocd exec argocd-application-controller-0 -- argocd --core "$@"; }
+lam_moi() { hub -n argocd annotate applications --all argocd.argoproj.io/refresh=normal --overwrite >/dev/null; }
+ipof() { docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' "$1"; }
+EOF
+. ./lab.sh
+```
+
+</Terminal>
+
+Ba cụm cùng một khuôn. Hai cụm đích mở NodePort 30080 của node ra cổng 9861 và 9862 trên máy bạn, để gọi thẳng ứng dụng của từng cụm:
+
+<Terminal where="mac" title="~/masteva-k10/kind-hub.yaml, kind-a.yaml, kind-b.yaml">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+for c in hub a b; do
+  cat > kind-$c.yaml <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k10-$c
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+EOF
+done
+echo '    extraPortMappings: [{ containerPort: 30080, hostPort: 9861, listenAddress: 127.0.0.1 }]' >> kind-a.yaml
+echo '    extraPortMappings: [{ containerPort: 30080, hostPort: 9862, listenAddress: 127.0.0.1 }]' >> kind-b.yaml
+for c in hub a b; do kind create cluster --config kind-$c.yaml 2>&1 | grep 'Set kubectl'; done
+kubectl config get-contexts -o name
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Set kubectl context to "kind-k10-hub"
+Set kubectl context to "kind-k10-a"
+Set kubectl context to "kind-k10-b"
+kind-k10-a
+kind-k10-b
+kind-k10-hub
+```
+
+</Expected>
+
+Ba context nằm trong cùng file `~/masteva-k10/kubeconfig`, file K10.1 đã dùng. Gitea chạy trên network `kind` để Argo CD trong cụm hub gọi được nó bằng tên `k10-gitea`, như D13.1. Lab có hai danh tính: **an** viết cấu hình, **argocd** chỉ được đọc repo `fleet`.
+
+<Terminal where="mac" title="~/masteva-k10/gitea.env">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+docker run -d --name k10-gitea --network kind -p 127.0.0.1:9860:3000 \
+  -e GITEA__security__INSTALL_LOCK=true \
+  -e GITEA__server__ROOT_URL=http://k10-gitea:3000/ \
+  -e GITEA__database__DB_TYPE=sqlite3 \
+  -e GITEA__service__DISABLE_REGISTRATION=true \
+  -v k10-gitea-data:/data \
+  gitea/gitea:28.1.0@sha256:f505a0d3a41323b786e05942fc7a4075e07ae7c169fd9485649aa55ee543a21a >/dev/null
+for i in $(seq 1 90); do curl -sf localhost:9860/api/healthz >/dev/null && break; sleep 1; done
+for u in an argocd; do
+  docker exec -u git k10-gitea gitea admin user create --username $u \
+    --email $u@example.com --random-password --must-change-password=false 2>/dev/null | tail -1
+done
+{
+  echo "AN_TOKEN=$(docker exec -u git k10-gitea gitea admin user generate-access-token \
+    -u an -t lab --scopes write:repository,write:user --raw 2>/dev/null)"
+  echo "ARGOCD_TOKEN=$(docker exec -u git k10-gitea gitea admin user generate-access-token \
+    -u argocd -t pull --scopes read:repository --raw 2>/dev/null)"
+} > gitea.env
+chmod 600 gitea.env && . ./lab.sh
+grep -c '=.\+' gitea.env
+curl -s -H "Authorization: token $AN_TOKEN" -H 'Content-Type: application/json' \
+  -X POST -d '{"name":"fleet","private":true,"default_branch":"main"}' $G/user/repos | jq -c '{full_name, private}'
+curl -s -o /dev/null -w "argocd được đọc repo fleet: HTTP %{http_code}\n" -H "Authorization: token $AN_TOKEN" \
+  -H 'Content-Type: application/json' -X PUT -d '{"permission":"read"}' $G/repos/an/fleet/collaborators/argocd
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+New user 'an' has been successfully created!
+New user 'argocd' has been successfully created!
+2
+{"full_name":"an/fleet","private":true}
+argocd được đọc repo fleet: HTTP 204
+```
+
+</Expected>
+
+Dòng `2` đếm số dòng có giá trị trong `gitea.env`: cả hai token đã được tạo. Lệnh tạo user và token ẩn thông báo phụ của Gitea (`2>/dev/null`); nếu dòng này in `0` hoặc `1`, chạy lại riêng lệnh `docker exec ... generate-access-token` không có `2>/dev/null` để thấy lỗi. File `gitea.env` giữ token nên chỉ bạn đọc được (`chmod 600`).
+
+### 2. Argo CD trên hub
+
+Hub chỉ cần bản **core** của Argo CD: application controller, ApplicationSet controller, repo server và Redis, không có giao diện web hay SSO. Bản này nhẹ hơn bản đầy đủ của D13.1 và đủ cho mọi việc của chặng. Khối dưới cài nó, bật Progressive Syncs, rồi khai repo `fleet` bằng token chỉ đọc. Mất khoảng một tới ba phút để kéo image:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+hub create namespace argocd
+hub apply -n argocd --server-side \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.5/manifests/core-install.yaml | grep -c serverside-applied
+hub -n argocd patch configmap argocd-cmd-params-cm --type merge \
+  -p '{"data":{"applicationsetcontroller.enable.progressive.syncs":"true"}}'
+hub -n argocd rollout restart deployment argocd-applicationset-controller
+hub -n argocd wait --for=condition=Available deployment --all --timeout=600s
+hub -n argocd rollout status statefulset argocd-application-controller --timeout=600s
+hub -n argocd create secret generic repo-fleet --from-literal=type=git \
+  --from-literal=url=http://k10-gitea:3000/an/fleet.git \
+  --from-literal=username=argocd --from-literal=password="$ARGOCD_TOKEN"
+hub -n argocd label secret repo-fleet argocd.argoproj.io/secret-type=repository
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/argocd created
+34
+configmap/argocd-cmd-params-cm patched
+deployment.apps/argocd-applicationset-controller restarted
+deployment.apps/argocd-applicationset-controller condition met
+deployment.apps/argocd-redis condition met
+deployment.apps/argocd-repo-server condition met
+partitioned roll out complete: 1 new pods have been updated...
+secret/repo-fleet created
+secret/repo-fleet labeled
+```
+
+</Expected>
+
+Con số 34 là số object của bản core mà `apply` vừa tạo. ApplicationSet controller đọc cấu hình lúc khởi động, nên sau khi bật Progressive Syncs phải khởi động lại nó.
+
+### 3. Đăng ký hai cụm đích
+
+Script `dang-ky-cum.sh` làm đúng ba việc của `argocd cluster add` (phần Kiến thức), cộng một việc nữa: gắn nhãn cho Secret cụm. Nhãn `masteva.dev/env` để ApplicationSet chọn cụm; nhãn `masteva.dev/ring` cho biết cụm thuộc đợt nào. Địa chỉ `https://k10-a-control-plane:6443` là tên container của node trên network `kind`, gọi được từ hub; chứng chỉ của API server có tên này.
+
+<Terminal where="mac" title="~/masteva-k10/dang-ky-cum.sh">
+
+```bash
+cd ~/masteva-k10
+cat > dang-ky-cum.sh <<'EOF'
+#!/bin/sh
+# Cách dùng: ./dang-ky-cum.sh <tên cụm kind, ví dụ k10-a> <ring>
+set -e
+c=$1; ring=$2; ctx=kind-$c
+kubectl --context $ctx apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: argocd-manager, namespace: kube-system }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argocd-manager-token
+  namespace: kube-system
+  annotations: { kubernetes.io/service-account.name: argocd-manager }
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: argocd-manager }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin }
+subjects:
+  - { kind: ServiceAccount, name: argocd-manager, namespace: kube-system }
+YAML
+for i in $(seq 1 30); do
+  T=$(kubectl --context $ctx -n kube-system get secret argocd-manager-token -o jsonpath='{.data.token}' | base64 -d)
+  [ -n "$T" ] && break; sleep 1
+done
+CA=$(kubectl --context $ctx -n kube-system get secret argocd-manager-token -o jsonpath='{.data.ca\.crt}')
+kubectl --context kind-k10-hub -n argocd apply -f - <<YAML
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cluster-$c
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+    masteva.dev/env: prod
+    masteva.dev/ring: $ring
+type: Opaque
+stringData:
+  name: $c
+  server: https://$c-control-plane:6443
+  config: |
+    {"bearerToken": "$T", "tlsClientConfig": {"caData": "$CA"}}
+YAML
+EOF
+chmod +x dang-ky-cum.sh
+```
+
+</Terminal>
+
+`k10-a` là cụm canary, `k10-b` thuộc đợt chính:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+./dang-ky-cum.sh k10-a canary
+./dang-ky-cum.sh k10-b main
+hub -n argocd get secrets -l argocd.argoproj.io/secret-type=cluster -L masteva.dev/ring
+ka auth can-i '*' '*' --as=system:serviceaccount:kube-system:argocd-manager
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+secret/cluster-k10-a created
+secret/cluster-k10-b created
+NAME            TYPE     DATA   AGE   RING
+cluster-k10-a   Opaque   3      1s    canary
+cluster-k10-b   Opaque   3      0s    main
+yes
+```
+
+</Expected>
+
+Dòng `yes` cuối cùng là câu trả lời cho "danh tính mà hub đang cầm được làm gì trên `k10-a`": mọi thứ, với mọi tài nguyên. Token này nằm trong Secret `cluster-k10-a` của hub và không hết hạn. Ai đọc được Secret trong namespace `argocd` của hub là có quyền admin trên cả hai cụm.
+
+<Check id="k10.2.lab-dang-ky">Đăng ký được một cụm vào Argo CD bằng Secret có nhãn, giải thích được từng object script tạo trên cụm đích, và chứng minh được bằng `kubectl auth can-i` phạm vi quyền của credential đó.</Check>
+
+### 4. Một ApplicationSet cho hai cụm
+
+Ứng dụng `web` là một `busybox httpd` trả về tên cụm và phiên bản, đọc từ ConfigMap. Base có `minReadySeconds: 15`: pod mới phải sẵn sàng liên tục 15 giây mới được tính, một chút "bake" trong từng cụm để đợt kế không bắt đầu ngay khi pod vừa lên. Overlay của mỗi cụm chỉ thêm tên cụm.
+
+<Terminal where="mac" title="~/masteva-k10/fleet: base/web và clusters/*/web">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+an_git clone -q http://localhost:9860/an/fleet.git && cd fleet
+git config user.name an && git config user.email an@example.com && git symbolic-ref HEAD refs/heads/main
+mkdir -p base/web clusters/k10-a/web clusters/k10-b/web
+cat > base/web/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: web
+resources: [namespace.yaml, deployment.yaml, service.yaml]
+configMapGenerator:
+  - name: web
+    literals: [VERSION=v1]
+EOF
+cat > base/web/namespace.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: { name: web }
+EOF
+cat > base/web/service.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata: { name: web }
+spec:
+  type: NodePort
+  selector: { app: web }
+  ports:
+    - { port: 80, targetPort: 8080, nodePort: 30080 }
+EOF
+cat > base/web/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  replicas: 2
+  minReadySeconds: 15
+  progressDeadlineSeconds: 60
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: web
+          image: busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+          command: ["sh", "-c"]
+          args:
+            - |
+              mkdir -p /tmp/www && echo ok > /tmp/www/healthz
+              printf '{"cluster":"%s","version":"%s"}\n' "$CLUSTER" "$VERSION" > /tmp/www/index.html
+              exec httpd -f -p 8080 -h /tmp/www
+          envFrom:
+            - configMapRef: { name: web }
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 2
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 32Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+EOF
+for c in k10-a k10-b; do
+  cat > clusters/$c/web/kustomization.yaml <<EOF
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [../../../base/web]
+configMapGenerator:
+  - name: web
+    behavior: merge
+    literals: [CLUSTER=$c]
+EOF
+done
+kubectl kustomize clusters/k10-b/web | yq -N 'select(.kind == "ConfigMap") | {"name": .metadata.name, "data": .data}'
+git add -A && git commit -qm "web: base và overlay cho k10-a, k10-b" && an_git push -q origin main
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+warning: You appear to have cloned an empty repository.
+name: web-fg72t67hm9
+data:
+  CLUSTER: k10-b
+  VERSION: v1
+```
+
+</Expected>
+
+ConfigMap mang hash nội dung trong tên (K3.1): đổi `VERSION` là đổi tên ConfigMap, kéo theo đổi pod template, tức một lần rollout.
+
+Giờ tới ApplicationSet. Đọc từ trên xuống: `matrix` ghép generator `clusters` (mọi cụm có nhãn `masteva.dev/env: prod`) với generator `git` (thư mục `clusters/<tên cụm>/web`); template đặt nhãn `ring` lấy từ nhãn của Secret cụm; `strategy` chia hai bước theo nhãn đó. AppProject `fleet` chỉ cho triển khai vào cụm tên `k10-*`, namespace `web`. Sau khi áp, vòng `for` chờ tới khi cả hai Application `Healthy` (tối đa 3 phút), rồi gọi thử hai cụm.
+
+<Terminal where="mac" title="~/masteva-k10/appset-web.yaml">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+cat > appset-web.yaml <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: { name: fleet, namespace: argocd }
+spec:
+  sourceRepos: [http://k10-gitea:3000/an/fleet.git]
+  destinations:
+    - { name: "k10-*", namespace: web }
+  clusterResourceWhitelist:
+    - { group: "", kind: Namespace }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata: { name: web, namespace: argocd }
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - matrix:
+        generators:
+          - clusters:
+              selector:
+                matchLabels: { masteva.dev/env: prod }
+          - git:
+              repoURL: http://k10-gitea:3000/an/fleet.git
+              revision: main
+              directories:
+                - path: 'clusters/{{ .name }}/web'
+  strategy:
+    type: RollingSync
+    rollingSync:
+      steps:
+        - matchExpressions:
+            - { key: ring, operator: In, values: [canary] }
+        - matchExpressions:
+            - { key: ring, operator: In, values: [main] }
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+  template:
+    metadata:
+      name: 'web-{{ .name }}'
+      labels:
+        ring: '{{ index .metadata.labels "masteva.dev/ring" }}'
+    spec:
+      project: fleet
+      source:
+        repoURL: http://k10-gitea:3000/an/fleet.git
+        targetRevision: main
+        path: '{{ .path.path }}'
+      destination:
+        name: '{{ .name }}'
+        namespace: web
+      syncPolicy:
+        automated: { prune: true }
+EOF
+hub apply -f appset-web.yaml
+for i in $(seq 1 60); do [ "$(hub -n argocd get applications -o jsonpath='{.items[*].status.health.status}')" = "Healthy Healthy" ] && break; sleep 3; done
+hub -n argocd get applications -L ring
+curl -s localhost:9861; curl -s localhost:9862
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+appproject.argoproj.io/fleet created
+applicationset.argoproj.io/web created
+NAME        SYNC STATUS   HEALTH STATUS   RING
+web-k10-a   Synced        Healthy         canary
+web-k10-b   Synced        Healthy         main
+{"cluster":"k10-a","version":"v1"}
+{"cluster":"k10-b","version":"v1"}
+```
+
+</Expected>
+
+Hai Application từ một object. Mỗi cụm trả lời bằng tên của chính nó: cùng một base, overlay khác nhau. Thêm cụm thứ ba vào fleet là chạy `./dang-ky-cum.sh k10-c main` và thêm thư mục `clusters/k10-c/web`; không phải sửa ApplicationSet.
+
+<Predict question="Template khai `automated: { prune: true }`, nhưng ApplicationSet dùng `RollingSync`. Application `web-k10-a` có auto-sync không?">
+
+Không. RollingSync buộc tắt auto-sync của mọi Application nó quản, vì chính nó quyết định lúc nào sync. Nó chỉ giữ lại giá trị `prune` để dùng khi tự kích hoạt sync. Khối dưới đọc lại `syncPolicy` thật của Application.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+hub -n argocd get application web-k10-a -o jsonpath='{.spec.syncPolicy}'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"automated":{"enabled":false,"prune":true}}
+```
+
+</Expected>
+
+<Check id="k10.2.lab-appset">Viết được một ApplicationSet dùng `matrix` của `clusters` và `git` để triển khai một ứng dụng với overlay riêng từng cụm, và chỉ ra được nhãn nào của Secret cụm đi vào Application và được dùng để chia đợt.</Check>
+
+### 5. Một thay đổi đi qua từng cụm
+
+Core install không có `argocd-server` nên không nhận webhook của Gitea; Argo CD chỉ thấy commit mới ở lần hỏi Git kế tiếp, tối đa khoảng 3 phút. Hàm `lam_moi` gắn annotation `argocd.argoproj.io/refresh` lên các Application để Argo CD hỏi lại ngay, thay cho webhook.
+
+Script `theo-doi.sh` in một dòng mỗi khi trạng thái RollingSync của hai cụm đổi, kèm phiên bản mà mỗi cụm đang trả lời. Nó dừng khi cả hai `Healthy` và cùng phục vụ phiên bản cần chờ, hoặc khi hết giờ.
+
+<Terminal where="mac" title="~/masteva-k10/theo-doi.sh">
+
+```bash
+cd ~/masteva-k10
+cat > theo-doi.sh <<'EOF'
+#!/bin/sh
+# Cách dùng: ./theo-doi.sh <phiên bản cần chờ> [số giây tối đa, mặc định 300]
+want=$1; max=${2:-300}; prev=""; start=$(date +%s)
+while :; do
+  t=$(( $(date +%s) - start ))
+  s=$(kubectl --context kind-k10-hub -n argocd get applicationset web -o json \
+      | jq -r '[.status.applicationStatus[] | "\(.application | sub("web-";""))=\(.status)"] | join(" ")')
+  va=$(curl -s -m 2 localhost:9861 | jq -r .version 2>/dev/null)
+  vb=$(curl -s -m 2 localhost:9862 | jq -r .version 2>/dev/null)
+  if [ "$s" != "$prev" ]; then
+    printf '%4ss  %-36s k10-a: %-4s k10-b: %s\n' "$t" "$s" "${va:--}" "${vb:--}"; prev=$s
+  fi
+  if [ "$s" = "k10-a=Healthy k10-b=Healthy" ] && [ "$va" = "$want" ] && [ "$vb" = "$want" ]; then
+    printf '%4ss  %-36s k10-a: %-4s k10-b: %s\n' "$t" "xong" "$va" "$vb"; break
+  fi
+  [ "$t" -ge "$max" ] && echo "dừng theo dõi sau $max giây" && break
+  sleep 2
+done
+EOF
+chmod +x theo-doi.sh
+```
+
+</Terminal>
+
+Đổi `VERSION` ở base, tức một thay đổi cho mọi cụm, rồi theo dõi:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+cd fleet && sed -i.bak 's/VERSION=v1/VERSION=v2/' base/web/kustomization.yaml && rm base/web/kustomization.yaml.bak
+git commit -qam "web: v2" && an_git push -q origin main && cd ..
+lam_moi
+./theo-doi.sh v2 300
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   0s  k10-a=Pending k10-b=Waiting          k10-a: v1   k10-b: v1
+   2s  k10-a=Progressing k10-b=Waiting      k10-a: v1   k10-b: v1
+  31s  k10-a=Healthy k10-b=Pending          k10-a: v2   k10-b: v1
+  34s  k10-a=Healthy k10-b=Progressing      k10-a: v2   k10-b: v2
+  63s  k10-a=Healthy k10-b=Healthy          k10-a: v2   k10-b: v2
+  63s  xong                                 k10-a: v2   k10-b: v2
+```
+
+</Expected>
+
+Đọc theo sơ đồ ở phần Kiến thức. Commit mới làm cả hai Application `OutOfSync`; ApplicationSet đưa `k10-a` (bước 1) qua `Pending` rồi `Progressing`, còn `k10-b` (bước 2) phải `Waiting`. Trạng thái `Pending` chỉ kéo dài một hai giây nên có lần script không bắt được. Khoảng nửa phút sau `k10-a` mới `Healthy`: hai pod được thay lần lượt, mỗi pod phải sẵn sàng đủ 15 giây theo `minReadySeconds`. Chỉ khi đó `k10-b` mới bắt đầu. Trong lúc một cụm đang rollout, gọi nó có lúc ra `v1`, có lúc ra `v2`: đó là rolling update bình thường trong một cụm, và là lý do dòng 34s đã thấy `k10-b` trả `v2` khi nó còn `Progressing`. Số giây trên máy bạn sẽ khác, nhưng thứ tự thì không: `k10-b` không bao giờ đổi trước khi `k10-a` `Healthy`.
+
+<Check id="k10.2.lab-rollout">Đẩy được một thay đổi qua hai cụm theo đợt, đọc được từ output các trạng thái Waiting, Pending, Progressing, Healthy, và giải thích được vì sao cụm thứ hai chờ.</Check>
+
+### 6. Cụm canary hỏng, đợt dừng
+
+Một thay đổi tưởng vô hại: nâng `VERSION` lên `v3` và, trong cùng commit, gõ nhầm tag image thành `1.380`. Đây là loại lỗi review dễ bỏ sót: diff có hai dòng, dòng nào trông cũng hợp lý. Lệnh `yq` thay cả chuỗi image, nên digest cũng mất theo, đúng kiểu một người sửa tay "chỉ đổi tag"; image `busybox:1.380` không tồn tại nên pod mới không kéo được.
+
+<Predict question="Thay đổi hỏng tới `k10-a` trước. `k10-a` có ngừng phục vụ không, và `k10-b` sẽ ra sao?">
+
+`k10-a` vẫn phục vụ `v2`: rolling update tạo pod mới trước, pod mới không kéo được image nên không bao giờ sẵn sàng, và pod cũ không bị xoá. Application của `k10-a` không bao giờ `Healthy`, nên RollingSync không bao giờ bắt đầu bước 2: `k10-b` đứng yên ở `Waiting` với `v2`.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+cd fleet
+yq -i '.spec.template.spec.containers[0].image = "busybox:1.380"' base/web/deployment.yaml
+sed -i.bak 's/VERSION=v2/VERSION=v3/' base/web/kustomization.yaml && rm base/web/kustomization.yaml.bak
+git commit -qam "web: v3" && an_git push -q origin main && cd ..
+lam_moi
+./theo-doi.sh v3 120
+hub -n argocd get applications -L ring
+ka -n web get pods
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+   0s  k10-a=Healthy k10-b=Healthy          k10-a: v2   k10-b: v2
+   2s  k10-a=Progressing k10-b=Waiting      k10-a: v2   k10-b: v2
+dừng theo dõi sau 120 giây
+NAME        SYNC STATUS   HEALTH STATUS   RING
+web-k10-a   Synced        Degraded        canary
+web-k10-b   OutOfSync     Healthy         main
+NAME                   READY   STATUS         RESTARTS   AGE
+web-677654b87c-xqwl9   0/1     ErrImagePull   0          2m1s
+web-7c9944fd-7zbn7     1/1     Running        0          3m19s
+web-7c9944fd-j95ch     1/1     Running        0          3m34s
+```
+
+</Expected>
+
+Sau 60 giây (`progressDeadlineSeconds` của Deployment), health của `web-k10-a` chuyển `Degraded`. `web-k10-b` biết có commit mới (`OutOfSync`) nhưng không được đồng bộ: thay đổi hỏng chỉ tới một cụm, và ngay cả cụm đó vẫn phục vụ bản cũ. Không có gì ở đây tự lui: đợt chỉ **dừng**. Việc lui là của bạn, bằng một commit:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+cd fleet && git revert --no-edit HEAD >/dev/null && an_git push -q origin main && git log --oneline -3 && cd ..
+lam_moi
+./theo-doi.sh v2 300
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+53ce538 Revert "web: v3"
+4c86dff web: v3
+376a552 web: v2
+   0s  k10-a=Progressing k10-b=Waiting      k10-a: v2   k10-b: v2
+   2s  k10-a=Healthy k10-b=Healthy          k10-a: v2   k10-b: v2
+   2s  xong                                 k10-a: v2   k10-b: v2
+```
+
+</Expected>
+
+Pod hỏng có thể hiện `ErrImagePull` hoặc `ImagePullBackOff`, tuỳ lúc bạn xem. Mã commit trên máy bạn sẽ khác. Commit revert đưa Git về đúng nội dung `v2`. `k10-b` không phải làm gì: nội dung Git trùng với thứ nó đang chạy, nên nó trở lại `Synced` và `Healthy`. `k10-a` sync lại về `v2`; hai pod `v2` vẫn đang chạy nên xong trong vài giây, và pod hỏng bị xoá khi Deployment quay về template cũ.
+
+Cuối cùng là cái giá đã nêu ở phần Kiến thức. Ai đó scale tay `web` trên `k10-b` lên 4 bản sao. Khối dưới chờ tới khi Argo CD đã thấy drift (`OutOfSync`), bảo nó hỏi lại, chờ đúng một phút, rồi đọc trạng thái và số bản sao. Hai dòng cuối sync tay để trả `k10-b` về đúng Git:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-k10 && . ./lab.sh
+kb -n web scale deploy web --replicas=4
+for i in $(seq 1 30); do [ "$(hub -n argocd get application web-k10-b -o jsonpath='{.status.sync.status}')" = OutOfSync ] && break; sleep 2; done
+lam_moi
+sleep 60
+hub -n argocd get application web-k10-b -o jsonpath='{.status.sync.status}{"\n"}'
+kb -n web get deploy web -o jsonpath='{.spec.replicas}{"\n"}'
+argocd app sync web-k10-b 2>&1 | grep -E '^(Sync Status|Phase)'
+kb -n web get deploy web -o jsonpath='{.spec.replicas}{"\n"}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/web scaled
+OutOfSync
+4
+Sync Status:        Synced to main (53ce538)
+Phase:              Succeeded
+2
+```
+
+</Expected>
+
+Một phút sau lần sửa tay, Argo CD vẫn chỉ **báo** `OutOfSync`, và `k10-b` vẫn 4 bản sao. Với RollingSync, drift trên cụm không tự được kéo về; bạn phải sync tay như hai dòng cuối, hoặc chờ commit kế tiếp. Ứng dụng thay đổi thường xuyên thì đổi lấy rollout theo đợt là đáng. Với cấu hình nền phải luôn đúng như policy bảo mật, K10.4 chọn ngược lại: `AllAtOnce` với `selfHeal`.
+
+<Check id="k10.2.lab-dung-dot">Tái hiện được một thay đổi hỏng dừng ở cụm canary trong khi cụm sau vẫn chạy bản cũ, lui được bằng `git revert`, và chứng minh được RollingSync không tự sửa drift.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| ApplicationSet không sinh Application nào | Secret cụm thiếu nhãn `masteva.dev/env: prod`, hoặc thư mục `clusters/<tên>/web` chưa có trên `main` | `hub -n argocd get applicationset web -o yaml \| yq '.status.conditions'` |
+| Application `Unknown`, báo không gọi được cụm | Sai `server`, token rỗng, hoặc cụm đích đang dừng | `argocd cluster list`; `docker ps \| grep k10-` |
+| Bước 1 ở `Progressing` mãi dù pod đã chạy | Application `OutOfSync` vì ConfigMap cũ chưa bị xoá: template thiếu `automated.prune: true` | `hub -n argocd get application web-k10-a -o json \| jq '.status.resources[] \| select(.status != "Synced")'` |
+| Trạng thái không đổi sau khi push | Argo CD chưa hỏi lại Git (tối đa khoảng 3 phút) | Chạy `lam_moi` |
+| `strategy` bị bỏ qua, hai cụm sync cùng lúc | Progressive Syncs chưa bật, hoặc ApplicationSet controller chưa khởi động lại | `hub -n argocd get cm argocd-cmd-params-cm -o yaml \| grep progressive` |
+| `curl localhost:9861` không trả lời | Pod chưa sẵn sàng, hoặc NodePort khác 30080 | `ka -n web get pods,svc` |
+
+### Dọn dẹp
+
+K10.3 và K10.4 dùng tiếp ba cụm, Gitea và repo `fleet`. Nếu nghỉ giữa chừng, dừng các container để giải phóng RAM rồi bật lại sau.
+
+<Callout kind="danger">
+
+Khối dưới dừng ba node và Gitea: mọi ứng dụng của lab ngừng phục vụ cho tới khi bạn bật lại. Kiểm tên container trước khi chạy để không dừng nhầm container của lab khác.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+docker stop k10-hub-control-plane k10-a-control-plane k10-b-control-plane k10-gitea
+```
+
+</Terminal>
+
+Bật lại bằng `docker start k10-gitea k10-hub-control-plane k10-a-control-plane k10-b-control-plane`, chờ khoảng một phút cho các cụm sẵn sàng. Cách xoá hẳn lab nằm ở cuối K10.4.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Hub chết thì sao, và dựng lại hub thế nào?">
+
+Ứng dụng trên các cụm đích vẫn chạy: hub không nằm trên đường đi của request. Thứ dừng lại là mọi lần triển khai, và (nếu dùng auto-sync) mọi lần tự sửa drift. Dựng lại hub nhanh nếu chính hub được mô tả trong Git: cài Argo CD, áp các Secret cụm và repo (từ kho secret, không phải từ Git thường), áp các ApplicationSet. Application mới sinh ra sẽ thấy tài nguyên đang chạy trên cụm đích khớp với Git và báo `Synced`, không tạo lại gì. Phần khó là Secret cụm: nếu chúng chỉ tồn tại trong hub cũ, bạn phải tạo lại token trên từng cụm. Đó là một lý do để quản credential cụm bằng một hệ thống ngoài (External Secrets với kho bí mật) thay vì chỉ trong hub.
+
+</Reveal>
+
+<Reveal title="Vì sao không dùng một ApplicationSet duy nhất cho mọi ứng dụng của mọi đội?">
+
+Một ApplicationSet với `matrix` của mọi cụm và mọi thư mục ứng dụng là một chỗ quyết định cho cả công ty: một lỗi trong template, một generator trả về danh sách rỗng vì Git trả lỗi, và mọi Application cùng bị ảnh hưởng. Chia ApplicationSet theo đội hoặc theo nhóm ứng dụng, mỗi cái một AppProject, giới hạn blast radius của chính cấu hình GitOps. ApplicationSet còn có `applicationsSync: create-update` (D13.2) để cấm controller xoá Application, đáng bật ở những ApplicationSet quản production.
+
+</Reveal>
+
+<Reveal title="RollingSync tắt selfHeal. Có cách nào có cả hai?">
+
+Không trong cùng một ApplicationSet. Các cách đội vận hành hay dùng: tách ứng dụng (rollout theo đợt, không selfHeal) khỏi cấu hình nền (selfHeal, không đợt) như chặng này làm; cảnh báo khi một Application `OutOfSync` quá N phút, để drift được người xử lý; hoặc điều phối đợt bên ngoài Argo CD: mỗi đợt là một thư mục hoặc một nhánh riêng trong Git, công cụ điều phối (pipeline, Kargo) thăng cấp thay đổi từ thư mục canary sang thư mục main sau khi kiểm, còn Application nào cũng bật auto-sync với selfHeal. Cách cuối đưa "đợt" vào Git: lịch sử Git cho biết thay đổi đã tới đợt nào, đổi lại là thêm một hệ thống phải vận hành.
+
+</Reveal>
+
+<Reveal title="Đợt canary nên chờ bao lâu, và đo gì?">
+
+`Healthy` chỉ nói "pod đã lên". D13.4 đã dạy bake time và cổng kiểm theo metric; áp sang cụm: sau khi cụm canary `Healthy`, một Job hook (PostSync) chờ khoảng bake time rồi hỏi hệ quan sát (D16.3 gom metric nhiều cụm về một chỗ, có nhãn cụm) xem tỉ lệ lỗi và độ trễ của **cụm canary** có lệch so với các cụm khác không, và thoát lỗi nếu lệch. Tài liệu Progressive Syncs khuyên dùng hook cho loại kiểm thử này. Độ dài bake tính như D13.4: theo lỗi chậm nhất bạn từng gặp và theo lưu lượng của cụm canary.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI viết ApplicationSet cho một danh sách cụm, chuyển một thư mục overlay thành cấu trúc base, môi trường, cụm, hay soạn script đăng ký cụm là cách dùng tốt. AI hay sai ở: dùng cú pháp template cũ `{{name}}` khi đã bật `goTemplate` (phải là `{{ .name }}`); đặt `selfHeal: true` cùng `RollingSync` rồi tin là có cả hai; quên `prune` trong template làm đợt kẹt; đặt `server` là `https://127.0.0.1:<cổng>` lấy từ kubeconfig trên máy, địa chỉ mà pod trong hub không gọi tới được; và cấp `cluster-admin` mà không nhắc tới cách thu hẹp. Kiểm bằng `kubectl apply --dry-run=server`, đọc `status.conditions` của ApplicationSet, và thử một commit hỏng như bước 6 trước khi tin vào đợt.
+
+</Callout>
+
+<Callout kind="link">
+
+D13.1 dạy Argo CD, `selfHeal` và lui bằng commit; D13.2 dạy ApplicationSet theo thư mục, AppProject và `preserveResourcesOnDeletion`; D13.4 dạy wave, bake time và cổng kiểm trong một cụm, bài này đưa wave lên mức cụm. K10.1 tạo cụm bằng CAPI; ghép với bài này, một cụm mới vào fleet là một `Cluster` của CAPI cộng một Secret cụm. K10.3 dùng hai cụm đích để chuyển lưu lượng khi một cụm chết; K10.4 dùng cùng hub để đẩy policy và add-on tới mọi cụm với `selfHeal`. D16.3 gom metric nhiều cụm, nguồn cho cổng kiểm của đợt canary.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="k10.2.mastery-thiet-ke">Thiết kế được cách triển khai GitOps cho một fleet cụ thể: hub-and-spoke hay agent, cấu trúc repo theo base, môi trường, cụm, các ApplicationSet và AppProject, thứ tự đợt, và cách thu hẹp credential của hub.</Check>
+
+<Check id="k10.2.mastery-dot">Dựng được rollout theo đợt qua nhiều cụm bằng RollingSync, chứng minh bằng một thay đổi hỏng rằng đợt dừng ở cụm đầu, và lui được bằng Git.</Check>
+
+<Check id="k10.2.mastery-van-hanh">Với một hub có dấu hiệu quá tải (bộ nhớ controller tăng, đối chiếu chậm), chỉ ra được nguyên nhân có thể từ số tài nguyên, loại tài nguyên churn hay repo server, và chọn được giữa sharding, loại trừ tài nguyên và tách hub.</Check>
+
+</Mastery>

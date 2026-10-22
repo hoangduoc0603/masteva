@@ -1,0 +1,917 @@
+---
+title: Kho secret - OpenBao, policy và dynamic secret
+description: Thay mật khẩu tĩnh nằm trong biến môi trường và repo bằng một kho secret - dựng OpenBao trên kind, unseal bằng Shamir và thấy kho đứng im sau một lần khởi động lại, viết policy theo đường dẫn, cấp cho ứng dụng user PostgreSQL sống hai phút rồi tự bị thu hồi, và sửa ứng dụng để nó sống được với credential đổi liên tục.
+id: d15.1
+step: d15
+prerequisites: [k8.5, d14.1]
+topics: [d15.vault-kms-external-secrets]
+status: verified
+verified:
+  date: 2026-10-20
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    helm: 4.3.0
+    openbao: 2.7.1 (chart 0.30.4)
+    postgres: 18.6-alpine3.24
+    jq: 1.8.2
+    yq: 4.54.1
+    openssl: 3.6.2
+---
+
+<Goal>
+
+Biết vì sao một mật khẩu dùng chung, sống mãi là thứ đáng sợ nhất trong hạ tầng, và tự dựng được con đường khác: secret nằm ở một chỗ, có chủ, có hạn, có dấu vết. Học xong, bạn giải thích được:
+
+- Vì sao một pod OpenBao vừa khởi động lại thì mọi ứng dụng phụ thuộc vào nó đều lỗi, và auto-unseal bằng KMS đổi điều đó ra sao.
+- Vì sao token chỉ có quyền `read` trên `kv/data/shop/*` lại bị từ chối khi gõ `bao kv list kv/shop`.
+- Vì sao một ứng dụng lấy credential động lúc khởi động vẫn chạy "khoẻ" theo Kubernetes trong khi mọi truy vấn đã thất bại, và thu hồi credential có cắt kết nối đang mở hay không.
+
+</Goal>
+
+<Knowledge>
+
+### Secret tĩnh hỏng ở đâu
+
+Một **secret** là thứ cho ai cầm nó quyền làm gì đó: mật khẩu database, API key của cổng thanh toán, khoá ký, token. Cách quen thuộc là tạo một lần, dán vào biến môi trường, file `.env`, Secret của Kubernetes hay biến của CI, rồi để đó. Cách đó hỏng ở năm chỗ:
+
+| Vấn đề | Hệ quả |
+|---|---|
+| Sống mãi | Lộ hôm nay hay ba năm trước đều dùng được như nhau |
+| Dùng chung | Mười service, hai mươi người cùng một mật khẩu: log database chỉ ghi một tên user, không biết ai làm |
+| Nằm rải rác | Repo, image layer, log CI, máy laptop, Slack. Xoá ở một chỗ không xoá được các bản sao |
+| Xoay khó | Đổi mật khẩu phải sửa mọi nơi dùng nó cùng lúc, nên không ai đổi |
+| Không biết ai đang giữ | Không có danh sách "credential này đã cấp cho ai, còn hạn tới khi nào" để thu hồi |
+
+Một kho secret giải quyết năm chỗ đó bằng bốn tính chất: **tập trung** (một nguồn sự thật), **có danh tính** (mỗi người, mỗi service xác thực riêng rồi mới được cấp), **có hạn** (credential tự hết hiệu lực), và **có dấu vết** (audit log ghi ai lấy gì lúc nào).
+
+<Callout kind="production">
+
+**Một token chia sẻ sống tới năm 2051, Microsoft 2020–2023.** Theo [bài của Wiz Research](https://www.wiz.io/blog/38-terabytes-of-private-data-accidentally-exposed-by-microsoft-ai-researchers), ngày 20/07/2020 một nhóm nghiên cứu AI của Microsoft đưa lên repo công khai `robust-models-transfer` trên GitHub một URL tải mô hình. URL mang theo một **SAS token** của Azure Storage (chuỗi ký sẵn; ai có URL là có đúng những quyền ghi trong token). Token được cấp cho **cả storage account** chứ không cho một thư mục, với quyền "full control" thay vì chỉ đọc; hạn ban đầu là 05/10/2021, rồi ngày 06/10/2021 được gia hạn tới 06/10/2051. Theo Wiz, storage account chứa thêm 38 TB dữ liệu riêng, gồm bản sao lưu máy của nhân viên có mật khẩu dịch vụ, khoá bí mật và hơn 30.000 tin nhắn Teams nội bộ. Wiz báo cho Microsoft ngày 22/06/2023, token bị vô hiệu hoá ngày 24/06/2023.
+
+[Bài của MSRC](https://www.microsoft.com/en-us/msrc/blog/2023/09/microsoft-mitigated-exposure-of-internal-information-in-a-storage-account-due-to-overly-permissive-sas-token) (18/09/2023) xác nhận lộ bản sao lưu hồ sơ máy của hai cựu nhân viên và tin nhắn Teams của họ, không có dữ liệu khách hàng. MSRC kể thêm: hệ quét secret của họ đã thấy chính URL này trong repo nhưng kết quả bị đánh dấu nhầm là báo động giả. Khuyến nghị của MSRC: hạn ngắn (Azure Storage khuyên SAS từ một giờ trở xuống), phạm vi hẹp nhất có thể, chỉ quyền cần dùng, và coi URL có SAS là secret. Wiz nêu thêm vì sao loại token này khó quản: nó được ký phía client nên Azure không có danh sách các token đã cấp, và không thu hồi được riêng một token, chỉ có cách xoay khoá của cả storage account.
+
+Nhận xét của bài: đủ cả năm vấn đề ở bảng trên trong một chuỗi ký tự. Phần còn lại của bài dựng từng tính chất ngược lại: hạn tính bằng phút, phạm vi theo đường dẫn, mỗi lần cấp có một mã để thu hồi riêng.
+
+</Callout>
+
+<Check id="d15.1.secret-tinh">Kể được năm cách secret tĩnh gây hại và bốn tính chất một kho secret phải có, và chỉ ra được các tính chất đó thiếu ở đâu trong vụ SAS token của Microsoft.</Check>
+
+### OpenBao và Vault
+
+**HashiCorp Vault** là kho secret phổ biến nhất trong tin tuyển dụng, tới mức "Vault" thành tên gọi chung của loại công cụ này. **OpenBao** là bản tách (fork) từ Vault bản cộng đồng, do cộng đồng phát triển dưới Linux Foundation, giấy phép MPL-2.0. Lệnh của OpenBao là `bao` thay cho `vault`, còn cấu trúc lệnh, đường dẫn API và khái niệm giống nhau; trang [Libraries](https://openbao.org/docs/api/libraries/) của OpenBao ghi phần lớn thư viện client viết cho Vault dùng được với OpenBao. Bài dùng OpenBao để lab chạy bằng phần mềm mở; mọi thứ bạn học ở đây áp dụng được cho Vault.
+
+<Callout kind="pitfall">
+
+**Giấy phép.** Từ Vault 1.15 (08/2023), Vault chuyển từ MPL-2.0 sang Business Source License 1.1 (BSL): bạn vẫn dùng nội bộ và học được, nhưng đó không còn là giấy phép mã nguồn mở; giấy phép cấm cung cấp Vault cho bên thứ ba dưới dạng dịch vụ hosted hoặc nhúng vào sản phẩm để cạnh tranh với bản trả phí. Bên cấp phép nay là IBM, sau khi IBM mua HashiCorp. Trước khi chọn cho công ty, đọc bản giấy phép đi kèm đúng phiên bản bạn dùng. Hai bên cũng đã tách dần: hướng dẫn chuyển từ Vault sang OpenBao ([In-Place Migration from Vault CE](https://openbao.org/docs/guides/migration/)) chỉ kiểm với Vault 1.14.1, và token mới của OpenBao có dạng khác (`s.…` thay cho `hvs.…` của Vault), nên đoạn code nào giả định định dạng token sẽ gãy.
+
+</Callout>
+
+### Seal và unseal
+
+OpenBao lưu mọi thứ đã mã hoá. Khi tiến trình vừa khởi động, nó biết dữ liệu nằm đâu nhưng chưa giải mã được: trạng thái **sealed** (niêm phong). Ở trạng thái này nó từ chối gần như mọi yêu cầu, trừ hỏi trạng thái và unseal. Dữ liệu được bảo vệ bằng ba lớp khoá:
+
+```text
+ unseal key ──mã hoá──▶ root key ──mã hoá──▶ keyring (encryption key) ──mã hoá──▶ dữ liệu
+     ▲
+     │ Shamir: tách thành N phần (share), cần K phần để ghép lại
+     │
+  share 1 (người A)   share 2 (người B)   share 3 (người C)        ví dụ N = 3, K = 2
+
+ Khởi động lại pod  ──▶  sealed  ──▶  K người nộp share  ──▶  unsealed, phục vụ yêu cầu
+```
+
+Mặc định unseal key được tách bằng **Shamir's Secret Sharing**: N phần trao cho N người, đủ K phần thì ghép lại được, ít hơn K phần thì không suy ra được gì. Lợi ích: không một người nào tự mở kho được. Cái giá: **mỗi lần tiến trình khởi động lại, kho đứng im cho tới khi đủ K người có mặt.** Node bị drain lúc 3 giờ sáng, pod OpenBao chạy lại ở node khác, sealed; mọi ứng dụng xin credential đều lỗi.
+
+**Auto-unseal** chuyển việc giữ khoá cho một dịch vụ đáng tin: KMS của cloud (AWS KMS, Google Cloud KMS, Azure Key Vault), HSM (hardware security module, thiết bị phần cứng giữ khoá và không cho xuất khoá ra), hoặc một OpenBao khác qua engine `transit` (engine mã hoá và giải mã theo yêu cầu mà không trả khoá ra, biến OpenBao kia thành một "KMS" tự host). Lúc khởi động, OpenBao gửi root key đã mã hoá cho KMS nhờ giải mã, và tự unseal. Đổi lại có hai điều tài liệu [Seal/Unseal](https://openbao.org/docs/concepts/seal/) nhấn mạnh:
+
+- Kho phụ thuộc chặt vào KMS: khoá trong KMS bị xoá là dữ liệu mất vĩnh viễn, kể cả từ bản sao lưu.
+- Lúc init với auto-unseal bạn nhận **recovery key** chứ không phải unseal key. Recovery key chỉ dùng để uỷ quyền thao tác nhạy cảm (tạo root token mới), **không** unseal được kho khi KMS không trả lời.
+
+Bước 1 của lab dùng Shamir với 3 phần, ngưỡng 2, và cho bạn thấy pod khởi động lại là sealed.
+
+<Check id="d15.1.seal">Vẽ được ba lớp khoá của OpenBao, giải thích được vì sao kho dùng Shamir đứng im sau mỗi lần khởi động lại, và nêu được auto-unseal bằng KMS đổi lấy rủi ro gì.</Check>
+
+### Secret engine, lease và policy
+
+Mọi thứ trong OpenBao nằm dưới một **đường dẫn**. Mỗi đường dẫn gốc được gắn (mount) một **secret engine**, thành phần quyết định đọc ghi ở đó nghĩa là gì. Bài dùng hai engine:
+
+| Engine | Đọc `…/x` trả về gì | Ví dụ dùng |
+|---|---|---|
+| `kv-v2` | Giá trị bạn đã ghi, kèm số phiên bản | API key của đối tác, chứng chỉ, cấu hình nhạy cảm |
+| `database` | Một user **mới tạo** trong database, mật khẩu ngẫu nhiên, có hạn | Credential PostgreSQL, MySQL, MongoDB cho từng service |
+
+`kv-v2` giữ nhiều phiên bản của mỗi secret, và vì thế tách API thành hai nhánh: giá trị nằm ở `kv/data/<đường dẫn>`, thông tin phiên bản và danh sách khoá nằm ở `kv/metadata/<đường dẫn>`. Lệnh `bao kv get kv/shop/x` thật ra gọi `kv/data/shop/x`; `bao kv list kv/shop` gọi `kv/metadata/shop`. Đây là nguồn của rất nhiều lỗi `permission denied`.
+
+Engine `database` là chỗ một kho secret khác hẳn một file mật khẩu mã hoá. Mỗi lần đọc `database/creds/shop-app`, OpenBao kết nối vào PostgreSQL bằng tài khoản quản trị của nó, chạy câu lệnh tạo user bạn khai sẵn, rồi trả về user và mật khẩu đó kèm một **lease**:
+
+```text
+ app ──read database/creds/shop-app──▶ OpenBao ──CREATE ROLE "v-…-x7Q" … VALID UNTIL …──▶ PostgreSQL
+     ◀── username, password, lease_id, lease_duration = 120s
+
+ trong thời hạn:   bao lease renew <lease_id>   gia hạn thêm, nhưng không vượt max_ttl tính từ lúc cấp
+ hết hạn:          OpenBao tự chạy câu lệnh thu hồi (mặc định: thu quyền rồi DROP ROLE)
+ khẩn cấp:         bao lease revoke <lease_id>               thu hồi một credential
+                   bao lease revoke -prefix database/creds/shop-app   thu hồi mọi credential của role
+ thu hồi token:    mọi lease mà token đó đã xin bị thu hồi theo
+```
+
+Ba tham số định nghĩa một role: `default_ttl` (hạn của lần cấp), `max_ttl` (tổng thời gian tối đa kể cả gia hạn), và các câu lệnh tạo, thu hồi user. Mỗi service, mỗi pod có user riêng nên log của database cho biết ai chạy câu truy vấn nào; và vì user hết hạn sau vài phút tới vài giờ, credential bị lộ chỉ có giá trị trong khoảng đó. Tài khoản quản trị mà OpenBao dùng cũng nên được xoay ngay sau khi cấu hình (`rotate-root`): từ đó không người nào biết mật khẩu của nó.
+
+**Token** là credential của OpenBao: một chuỗi (bản này có dạng `s.…`) gửi kèm mọi yêu cầu. Mỗi token có hạn, mang một danh sách policy, và được cấp sau khi đăng nhập bằng một **auth method** (D15.3 dùng danh tính của pod) hoặc tạo trực tiếp từ một token khác. **Root token** sinh lúc init có mọi quyền và chỉ nên dùng để cấu hình ban đầu.
+
+**Policy** quyết định một token được làm gì, viết theo đường dẫn:
+
+```hcl
+path "kv/data/shop/*" {
+  capabilities = ["read"]
+}
+```
+
+Mặc định là từ chối. Mỗi khối `path` cho một tập **capability**: `create`, `read`, `update`, `patch`, `delete`, `list`, `scan`, `sudo`, `deny`. Dấu `*` ở cuối khớp mọi thứ phía sau; dấu `+` khớp đúng một đoạn đường dẫn (`kv/data/+/config`). `deny` thắng mọi thứ. Mỗi token mang một hoặc vài policy, và mọi credential nó xin được gắn với nó: thu hồi token là thu hồi luôn các credential đó.
+
+<Check id="d15.1.engine-policy">Phân biệt được engine `kv-v2` và `database`, giải thích được hai nhánh `data/` và `metadata/` của `kv-v2`, kể được vòng đời của một lease, và viết được policy chỉ cho đọc một nhánh đường dẫn.</Check>
+
+### Đưa secret tới ứng dụng
+
+Kho có secret rồi, còn ứng dụng lấy nó bằng cách nào? Bốn cách hay gặp, từ gần ứng dụng nhất tới gần Kubernetes nhất:
+
+| Cách | Ứng dụng thấy gì | Credential động, xoay vòng | Cái giá |
+|---|---|---|---|
+| Ứng dụng gọi API của kho | Gọi thẳng bằng thư viện client | Tốt nhất: tự gia hạn, tự xin mới | Sửa code mọi service; ứng dụng phải sống chung với kho |
+| Agent cạnh ứng dụng (sidecar hoặc init container) | File trong một volume chung | Tốt, nếu agent chạy suốt đời pod và ứng dụng đọc lại file | Thêm container mỗi pod |
+| CSI driver (Secrets Store CSI) | File mount từ volume của driver | Có xoay vòng, tuỳ cấu hình | Thêm DaemonSet; secret gắn với vòng đời volume |
+| Đồng bộ thành Secret của Kubernetes (External Secrets Operator) | Secret thường: biến môi trường hoặc file | Kém: phù hợp secret tĩnh hơn credential vài phút | Secret lại nằm trong etcd |
+
+Không có lựa chọn đúng cho mọi trường hợp. Hai câu hỏi quyết định: ứng dụng có tự đọc lại credential khi nó đổi không, và bạn có chấp nhận secret nằm trong etcd của cụm không.
+
+Bài này làm cách thứ hai; D15.2 làm cách thứ tư. Bước 4 của lab cho bạn thấy cái bẫy của cách thứ hai khi agent chỉ chạy một lần lúc khởi động: credential hết hạn sau hai phút, ứng dụng hỏng, nhưng pod vẫn `Running` và `Ready`. Readiness probe không biết gì về database; muốn Kubernetes thấy lỗi này, probe phải thử đúng thứ ứng dụng cần (K1.3 đã bàn probe kiểm gì).
+
+<Check id="d15.1.dua-secret">So sánh được bốn cách đưa secret tới ứng dụng theo hai câu hỏi: ứng dụng có đọc lại credential khi nó đổi không, và secret có nằm trong etcd không.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Seal/Unseal (OpenBao)](https://openbao.org/docs/concepts/seal/): ba lớp khoá, Shamir, auto-unseal và recovery key.
+- [Databases (OpenBao)](https://openbao.org/docs/secrets/databases/): dynamic role, static role, và cảnh báo khi xoay tài khoản quản trị bằng `rotate-root`.
+- [Lease, Renew, and Revoke (OpenBao)](https://openbao.org/docs/concepts/lease/): gia hạn, thu hồi theo tiền tố, và quan hệ giữa token với lease.
+- [Policies (OpenBao)](https://openbao.org/docs/concepts/policies/): cú pháp `path`, capability, dấu `*` và `+`, thứ tự ưu tiên khi nhiều khối cùng khớp.
+- [Microsoft mitigated exposure of internal information in a storage account due to overly-permissive SAS token (MSRC)](https://www.microsoft.com/en-us/msrc/blog/2023/09/microsoft-mitigated-exposure-of-internal-information-in-a-storage-account-due-to-overly-permissive-sas-token): nguồn của callout, cùng với [bài của Wiz Research](https://www.wiz.io/blog/38-terabytes-of-private-data-accidentally-exposed-by-microsoft-ai-researchers).
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài tạo cụm kind `d15-lab` một node, cài OpenBao và PostgreSQL vào đó. D15.2 tới D15.4 dùng tiếp cụm và OpenBao này. Bạn cần Docker, `kind`, `kubectl` (1.36 hay 1.37 đều được), `helm` 4, `jq`, `yq`, `openssl` và mạng để tải image và chart.
+
+**Profile máy.** Lab cần khoảng 1 GiB RAM của Docker (node kind gồm OpenBao, PostgreSQL và vài pod nhỏ) và 1 CPU. Máy 8 GB chạy được nếu không có cụm nào khác đang chạy. Lab tải khoảng 250 MB image.
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-d15 && cd ~/masteva-d15
+export KUBECONFIG=~/masteva-d15/kubeconfig
+cat > kind.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: d15-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+EOF
+kind create cluster --config kind.yaml > /dev/null 2>&1 || echo "kind create cluster lỗi: chạy lại 'kind create cluster --config kind.yaml' để xem lý do"
+kubectl wait --for=condition=Ready node --all --timeout=180s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/d15-lab-control-plane condition met
+```
+
+</Expected>
+
+Mọi khối lệnh của bài chạy trong `~/masteva-d15` với biến `KUBECONFIG` trên. Nếu mở tab Terminal mới, chạy lại hai dòng `cd ~/masteva-d15` và `export KUBECONFIG=…`.
+
+### 1. OpenBao: init, unseal, và khởi động lại
+
+Chart OpenBao 0.30.4 (OpenBao 2.7.1) tải dạng `.tgz`, so sha256 với `index.yaml` chính thức của kho chart, và chỉ cài khi khớp. Chế độ `standalone` mặc định của chart: một pod, dữ liệu trên PVC. File values tắt `injector` (bài không dùng) và viết lại cấu hình máy chủ để thêm một **audit device**: mọi yêu cầu tới kho và phản hồi của nó được ghi thành một dòng JSON ra stdout của pod. Từ bản 2.3.2, OpenBao mặc định không cho bật audit device qua API (thử sẽ nhận lỗi `cannot enable audit device via API`), vì theo [tài liệu Audit Devices](https://openbao.org/docs/audit/), bật qua API cho phép người gọi tạo file ở đường dẫn tuỳ ý trên máy chủ hoặc gửi request tới địa chỉ tuỳ ý; muốn bật qua API phải đặt `unsafe_allow_api_audit_creation`. Audit device khai trong file cấu hình thì cũng không tắt được qua API (bước này thử ngay sau khi có `bao.sh`), nên người cầm token quản trị không tự xoá được dấu vết của mình. D15.3 đọc audit log này.
+
+Listener trong file values tắt TLS (`tls_disable = 1`) để lab gọn: OpenBao chỉ nhận kết nối từ trong cụm, qua Service. Production luôn bật TLS, vì token và secret đi trên chính kết nối này.
+
+<Terminal where="mac" title="~/masteva-d15/openbao-values.yaml">
+
+```bash
+cat > openbao-values.yaml <<'EOF'
+injector:
+  enabled: false
+server:
+  dataStorage:
+    size: 1Gi
+  standalone:
+    config: |
+      listener "tcp" {
+        tls_disable = 1
+        address = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+      storage "pebbledb" {
+        path = "/openbao/data/pebbledb"
+      }
+      audit "file" "stdout" {
+        description = "Audit log ra stdout của pod"
+        options {
+          file_path = "stdout"
+        }
+      }
+EOF
+curl -fsSLO https://github.com/openbao/openbao-helm/releases/download/openbao-0.30.4/openbao-0.30.4.tgz
+SUM=$(curl -fsSL https://openbao.github.io/openbao-helm/index.yaml | yq '.entries.openbao[] | select(.version == "0.30.4") | .digest')
+if echo "$SUM  openbao-0.30.4.tgz" | shasum -a 256 -c; then
+  helm install openbao ./openbao-0.30.4.tgz -n openbao --create-namespace -f openbao-values.yaml 2>&1 | grep -E '^(STATUS|Error)'
+fi
+kubectl -n openbao wait --for=jsonpath='{.status.phase}'=Running pod/openbao-0 --timeout=180s
+for i in $(seq 1 60); do kubectl -n openbao exec openbao-0 -- bao status > /dev/null 2>&1; [ $? -eq 2 ] && break; sleep 2; done
+kubectl -n openbao get pods
+kubectl -n openbao exec openbao-0 -- bao status | grep -E 'Initialized|Sealed|Version'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+openbao-0.30.4.tgz: OK
+STATUS: deployed
+pod/openbao-0 condition met
+NAME        READY   STATUS    RESTARTS   AGE
+openbao-0   0/1     Running   0          17s
+command terminated with exit code 2
+Initialized        false
+Sealed             true
+Version            2.7.1
+```
+
+</Expected>
+
+`bao status` trả mã thoát 2 khi kho đang chạy nhưng sealed (dòng `command terminated with exit code 2` là `kubectl` báo lại mã đó), và mã 1 khi chưa kết nối được tới tiến trình. Vòng chờ trong khối lệnh dừng ở mã 2, vì vài giây đầu sau khi pod `Running` tiến trình chưa nghe cổng. Pod `Running` nhưng `0/1`: readiness probe của chart cũng chạy `bao status`, nên pod chỉ `Ready` khi kho đã mở. Dòng `command terminated with exit code 2` đi ra stderr, nên trên máy bạn nó có thể hiện ở vị trí khác trong output. Kho cũng chưa được init: chưa có khoá nào. Init tạo khoá, tách unseal key thành 3 phần với ngưỡng 2, và trả về một **root token** (token có mọi quyền, dùng để cấu hình ban đầu). Kết quả ghi vào `init.json`.
+
+<Callout kind="danger">
+
+`init.json` chứa cả ba phần unseal key lẫn root token: ai có file này là chủ kho. Lab để nó trong thư mục lab cho tiện. Trên production, mỗi phần trao cho một người (thường mã hoá bằng khoá PGP của họ qua `-pgp-keys`), và root token bị thu hồi ngay sau khi cấu hình xong.
+
+</Callout>
+
+Script `unseal.sh` đưa từng phần unseal key vào pod qua stdin (`read -r k`) chứ không ghi thẳng trên dòng lệnh `kubectl exec`: lệnh đó nằm nguyên văn trong audit log của API server (K8.5 đã cho thấy `requestURI` của `exec` chứa lệnh).
+
+<Terminal where="mac">
+
+```bash
+kubectl -n openbao exec openbao-0 -- bao operator init -key-shares=3 -key-threshold=2 -format=json > init.json
+chmod 600 init.json
+jq -c '{unseal_shares, unseal_threshold, so_phan: (.unseal_keys_b64 | length), token: (.root_token[0:2] + "…")}' init.json
+cat > unseal.sh <<'EOF'
+#!/bin/sh
+# unseal.sh: đưa hai trong ba phần unseal key vào pod openbao-0 qua stdin
+for i in 0 1; do
+  jq -r ".unseal_keys_b64[$i]" "$HOME/masteva-d15/init.json" |
+    kubectl -n openbao exec -i openbao-0 -- sh -c 'read -r k; bao operator unseal "$k"' | grep -E '^(Sealed|Unseal Progress)'
+done
+EOF
+chmod +x unseal.sh
+./unseal.sh
+kubectl -n openbao wait --for=condition=Ready pod/openbao-0 --timeout=60s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"unseal_shares":3,"unseal_threshold":2,"so_phan":3,"token":"s.…"}
+Sealed             true
+Unseal Progress    1/2
+Sealed          false
+pod/openbao-0 condition met
+```
+
+</Expected>
+
+Phần thứ nhất đưa tiến độ lên `1/2`, kho vẫn sealed; phần thứ hai đủ ngưỡng, kho mở và pod chuyển `Ready`. Hai phần nào trong ba đều được, theo thứ tự bất kỳ.
+
+<Predict question="Xoá pod `openbao-0`. StatefulSet tạo lại pod mới, cùng PVC, cùng dữ liệu. Pod mới có tự `Ready` không?">
+
+Không. Unseal key chỉ nằm trong bộ nhớ của tiến trình cũ; tiến trình mới đọc được dữ liệu đã mã hoá nhưng không có khoá. Pod mới `Running`, `0/1`, `Sealed true`, cho tới khi lại có đủ hai phần.
+
+</Predict>
+
+<Callout kind="danger">
+
+Lệnh dưới xoá pod `openbao-0` để mô phỏng một lần khởi động lại. Kiểm `kubectl config current-context` in ra `kind-d15-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl -n openbao delete pod openbao-0
+kubectl -n openbao wait --for=jsonpath='{.status.phase}'=Running pod/openbao-0 --timeout=120s
+for i in $(seq 1 60); do kubectl -n openbao exec openbao-0 -- bao status > /dev/null 2>&1; [ $? -eq 2 ] && break; sleep 2; done
+kubectl -n openbao exec openbao-0 -- bao status -format=json | jq -c '{initialized, sealed, progress, t}'
+./unseal.sh
+kubectl -n openbao wait --for=condition=Ready pod/openbao-0 --timeout=60s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-d15-lab
+pod "openbao-0" deleted from openbao namespace
+pod/openbao-0 condition met
+command terminated with exit code 2
+{"initialized":true,"sealed":true,"progress":0,"t":2}
+Sealed             true
+Unseal Progress    1/2
+Sealed          false
+pod/openbao-0 condition met
+```
+
+</Expected>
+
+Đây là lý do production gần như luôn dùng auto-unseal, hoặc chạy OpenBao ba node (Raft) để một node khởi động lại không làm cả kho dừng. Nếu bạn khởi động lại Docker hay máy giữa chừng bài (kể cả giữa D15.1 và các bài sau), kho sẽ sealed: chạy `cd ~/masteva-d15 && ./unseal.sh`.
+
+Từ đây, mọi lệnh quản trị gọi `bao` trong pod qua script `bao.sh`. Script đọc token từ file (mặc định là root token trong `init.json`, hoặc file chỉ định bằng biến `TOKEN_FILE`) và đưa vào pod qua stdin, cùng lý do như unseal key.
+
+<Terminal where="mac" title="~/masteva-d15/bao.sh">
+
+```bash
+cat > bao.sh <<'EOF'
+#!/bin/sh
+# bao.sh <lệnh bao...>: chạy bao trong pod openbao-0.
+# Token lấy từ $TOKEN_FILE, mặc định là root token của lab; đi qua stdin, không nằm trên dòng lệnh exec.
+if [ -n "$TOKEN_FILE" ]; then TOKEN=$(cat "$TOKEN_FILE"); else TOKEN=$(jq -r .root_token "$HOME/masteva-d15/init.json"); fi
+if [ -t 0 ]; then printf '%s\n' "$TOKEN"; else printf '%s\n' "$TOKEN"; cat; fi |
+  kubectl -n openbao exec -i openbao-0 -- sh -c 'read -r BAO_TOKEN; export BAO_TOKEN; exec bao "$@"' bao "$@"
+EOF
+chmod +x bao.sh
+./bao.sh secrets list
+./bao.sh audit list
+./bao.sh audit disable stdout 2>&1 | grep -o 'cannot disable.*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Path          Type         Accessor              Description
+----          ----         --------              -----------
+cubbyhole/    cubbyhole    cubbyhole_24162f1e    per-token private secret storage
+identity/     identity     identity_e9d52202     identity store
+sys/          system       system_8d6a5e1c       system endpoints used for control, policy and debugging
+Path       Type    Description
+----       ----    -----------
+stdout/    file    Audit log ra stdout của pod
+cannot disable configuration-managed audit device
+```
+
+</Expected>
+
+Ba engine có sẵn; mã `Accessor` trên máy bạn sẽ khác. Audit device `stdout` khai trong file values đã chạy, và lệnh tắt nó bằng root token bị từ chối. Khi stdin không phải terminal (bạn dùng `<` hay `|`), script gửi tiếp nội dung stdin cho `bao` sau dòng token; các bước sau dùng cách này để nạp policy và mật khẩu.
+
+<Check id="d15.1.lab-unseal">Init được OpenBao với Shamir 3 phần ngưỡng 2, unseal bằng hai phần đưa qua stdin, và chứng minh được pod khởi động lại thì kho sealed cho tới khi unseal lại.</Check>
+
+### 2. KV và policy theo đường dẫn
+
+Ghi hai secret ở hai nhánh, `shop` và `billing`, rồi tạo policy chỉ cho đọc nhánh `shop`:
+
+<Terminal where="mac" title="~/masteva-d15/shop-read.hcl">
+
+```bash
+./bao.sh secrets enable -path=kv kv-v2
+./bao.sh kv put kv/shop/payment-gateway api_key=pk_test_2026_aaa | grep '^version'
+./bao.sh kv put kv/billing/bank api_key=bank_2026_xyz > /dev/null && echo "đã ghi kv/billing/bank"
+cat > shop-read.hcl <<'EOF'
+path "kv/data/shop/*" {
+  capabilities = ["read"]
+}
+EOF
+./bao.sh policy write shop-read - < shop-read.hcl
+./bao.sh token create -policy=shop-read -ttl=24h -field=token > eso.token
+chmod 600 eso.token
+cut -c1-2 eso.token
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Success! Enabled the kv-v2 secrets engine at: kv/
+version            1
+đã ghi kv/billing/bank
+Success! Uploaded policy: shop-read
+s.
+```
+
+</Expected>
+
+`eso.token` là một token chỉ mang policy `shop-read`, hạn 24 giờ; D15.2 (bước 2) đưa nó cho External Secrets Operator. Giờ dùng chính token đó thử bốn việc:
+
+<Predict question="Token có `read` trên `kv/data/shop/*`. Bốn lệnh: đọc `kv/shop/payment-gateway`, đọc `kv/billing/bank`, ghi đè `kv/shop/payment-gateway`, liệt kê `kv/shop`. Lệnh nào qua?">
+
+Chỉ lệnh đầu. Đọc nhánh `billing` và ghi đều không có trong policy. Lệnh `list` bị từ chối dù nhìn có vẻ cùng nhánh: nó gọi `kv/metadata/shop`, một đường dẫn policy không nhắc tới, và cần capability `list` chứ không phải `read`.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+thu() {
+  printf '%-48s -> ' "bao $*"
+  TOKEN_FILE=eso.token ./bao.sh "$@" 2>&1 | grep -oE '^pk_test_2026_aaa|URL: [A-Z]+ [^ ]+|Code: [0-9]+' | tr '\n' ' '
+  echo
+}
+thu kv get -field=api_key kv/shop/payment-gateway
+thu kv get kv/billing/bank
+thu kv put kv/shop/payment-gateway api_key=x
+thu kv list kv/shop
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+bao kv get -field=api_key kv/shop/payment-gateway -> pk_test_2026_aaa 
+bao kv get kv/billing/bank                       -> URL: GET http://127.0.0.1:8200/v1/kv/data/billing/bank Code: 403 
+bao kv put kv/shop/payment-gateway api_key=x     -> URL: PUT http://127.0.0.1:8200/v1/kv/data/shop/payment-gateway Code: 403 
+bao kv list kv/shop                              -> URL: GET http://127.0.0.1:8200/v1/kv/metadata/shop?list=true Code: 403 
+```
+
+</Expected>
+
+Dòng `URL:` trong thông báo lỗi là chỗ đáng đọc nhất khi gỡ `permission denied`: nó cho biết đường dẫn API thật mà policy phải khớp. Muốn token này liệt kê được thì thêm một khối `path "kv/metadata/shop/*"` với `list`.
+
+<Check id="d15.1.lab-policy">Viết được policy cho một nhánh của `kv-v2`, chứng minh được token mang nó đọc được đúng nhánh đó, và giải thích được lỗi 403 của `kv list` bằng đường dẫn `metadata/` trong thông báo lỗi.</Check>
+
+### 3. PostgreSQL và engine database
+
+PostgreSQL chạy trong cụm bằng image chính thức, ghim digest. Mật khẩu của user `postgres` sinh ngẫu nhiên vào một Secret; đó là tài khoản quản trị sẽ giao cho OpenBao. Lab không gắn volume cho database, nên dữ liệu mất khi pod khởi động lại; với bài này như vậy là đủ.
+
+<Terminal where="mac" title="~/masteva-d15/postgres.yaml">
+
+```bash
+kubectl create namespace d15-app
+kubectl -n d15-app create secret generic pg-admin --from-literal=password="$(openssl rand -hex 16)"
+cat > postgres.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: d15-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+          env:
+            - name: POSTGRES_DB
+              value: shop
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: pg-admin, key: password }
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "shop"]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: d15-app
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+EOF
+kubectl apply -f postgres.yaml
+kubectl -n d15-app rollout status deploy/postgres --timeout=180s
+for i in $(seq 1 60); do
+  kubectl -n d15-app exec deploy/postgres -- sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d shop -tAc "select 1"' 2> /dev/null | grep -q 1 && break
+  sleep 2
+done
+kubectl -n d15-app exec deploy/postgres -- psql -U postgres -d shop -c \
+  "CREATE TABLE products(id int PRIMARY KEY, name text); INSERT INTO products VALUES (1, 'ao thun'), (2, 'giay');"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/d15-app created
+secret/pg-admin created
+deployment.apps/postgres created
+service/postgres created
+Waiting for deployment "postgres" rollout to finish: 0 of 1 updated replicas are available...
+deployment "postgres" successfully rolled out
+CREATE TABLE
+INSERT 0 2
+```
+
+</Expected>
+
+Readiness probe hỏi qua `127.0.0.1` chứ không qua unix socket, và có thêm vòng chờ trước `CREATE TABLE`, vì một chi tiết của image chính thức: lần chạy đầu, script khởi tạo của image bật một PostgreSQL tạm chỉ nghe unix socket để tạo database `shop`, rồi tắt nó và bật server thật. Một phép thử qua socket có thể trả lời "sẵn sàng" từ chính server tạm đó, và lệnh tiếp theo rơi vào lúc server tạm đang tắt (`the database system is shutting down`). Hỏi qua TCP chỉ thành công khi server thật đã nghe.
+
+Lệnh `psql` cuối khối đăng nhập qua unix socket, nơi image chính thức cho phép không cần mật khẩu; đó là đường của quản trị viên có quyền `exec`, không phải của ứng dụng.
+
+Bật engine `database`, khai kết nối, rồi xoay mật khẩu quản trị. Mật khẩu đi qua stdin (`password=-`). Sau `rotate-root`, mật khẩu trong Secret `pg-admin` không còn đúng nữa: chỉ OpenBao biết mật khẩu mới. Pod thử `thu-pg-admin` cuối khối đưa mật khẩu cũ lên dòng lệnh (`--env`); chấp nhận được ở đây vì mật khẩu đó vừa bị xoay, không còn giá trị. Với mật khẩu còn dùng, đừng làm vậy: nó nằm trong spec của pod và audit log.
+
+<Callout kind="danger">
+
+`rotate-root` không lui được: sau lệnh này chỉ OpenBao biết mật khẩu của `postgres`. Production tạo một user riêng cho OpenBao (có quyền `CREATEROLE`) thay vì giao superuser; lab dùng `postgres` cho gọn.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+./bao.sh secrets enable database
+kubectl -n d15-app get secret pg-admin -o jsonpath='{.data.password}' | base64 -d |
+  ./bao.sh write database/config/shop plugin_name=postgresql-database-plugin allowed_roles=shop-app \
+    connection_url='postgresql://{{username}}:{{password}}@postgres.d15-app.svc:5432/shop?sslmode=disable' \
+    username=postgres password=-
+./bao.sh write -f database/rotate-root/shop
+kubectl -n d15-app run thu-pg-admin --restart=Never \
+  --image=postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873 \
+  --env=PGPASSWORD="$(kubectl -n d15-app get secret pg-admin -o jsonpath='{.data.password}' | base64 -d)" \
+  -- psql -h postgres -U postgres -d shop -c 'select 1'
+kubectl -n d15-app wait --for=jsonpath='{.status.phase}'=Failed pod/thu-pg-admin --timeout=90s
+kubectl -n d15-app logs thu-pg-admin | grep -o 'password authentication failed for user "postgres"'
+kubectl -n d15-app delete pod thu-pg-admin
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Success! Enabled the database secrets engine at: database/
+Success! Data written to: database/config/shop
+Success! Data written to: database/rotate-root/shop
+pod/thu-pg-admin created
+pod/thu-pg-admin condition met
+password authentication failed for user "postgres"
+pod "thu-pg-admin" deleted from d15-app namespace
+```
+
+</Expected>
+
+Dòng cuối là điều muốn thấy: mật khẩu cũ, thứ từng nằm trong một Secret và trong biến môi trường của PostgreSQL, giờ vô dụng.
+
+Role `shop-app` định nghĩa user được tạo thế nào. `{{name}}`, `{{password}}`, `{{expiration}}` do OpenBao điền. `VALID UNTIL` để chính PostgreSQL từ chối mật khẩu sau hạn, kể cả khi OpenBao chưa kịp dọn. Câu thu hồi có thêm `pg_terminate_backend` để cắt kết nối đang mở của user đó; mục Đào sâu giải thích vì sao. Hạn 2 phút, tối đa 5 phút, để bạn thấy được trong lúc học; production thường là một tới vài giờ.
+
+<Terminal where="mac" title="~/masteva-d15/shop-db.hcl">
+
+```bash
+./bao.sh write database/roles/shop-app db_name=shop default_ttl=2m max_ttl=5m \
+  creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT SELECT ON products TO \"{{name}}\";" \
+  revocation_statements="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{{name}}'; REVOKE ALL ON products FROM \"{{name}}\"; DROP ROLE IF EXISTS \"{{name}}\";"
+cat > shop-db.hcl <<'EOF'
+path "database/creds/shop-app" {
+  capabilities = ["read"]
+}
+EOF
+./bao.sh policy write shop-db - < shop-db.hcl
+./bao.sh read -format=json database/creds/shop-app | jq '{lease_id, lease_duration, renewable, username: .data.username}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Success! Data written to: database/roles/shop-app
+Success! Uploaded policy: shop-db
+{
+  "lease_id": "database/creds/shop-app/ruNVtcsLjsoNpIABnKApLKLz",
+  "lease_duration": 120,
+  "renewable": true,
+  "username": "v-root-shop-app-V0FRlBuR5AmMshoIFue7-1792578059"
+}
+```
+
+</Expected>
+
+Một lần đọc, một user mới trong PostgreSQL: tên ghép từ tên token đã xin (`root`), tên role, một chuỗi ngẫu nhiên và thời điểm tạo. `lease_id` là mã để gia hạn hay thu hồi riêng credential này. User này sẽ tự biến mất sau 120 giây.
+
+<Check id="d15.1.lab-dynamic">Cấu hình được engine `database` cho PostgreSQL, xoay được mật khẩu quản trị và chứng minh mật khẩu cũ hết tác dụng, và viết được role có hạn với câu tạo và câu thu hồi user.</Check>
+
+### 4. Ứng dụng nhận user động
+
+`shop-api` mô phỏng một service: cứ 15 giây đọc credential từ file `/creds/db.json` và chạy một truy vấn. Một init container dùng image OpenBao lấy credential **một lần** lúc pod khởi động và ghi vào volume chung trong bộ nhớ. Token của nó nằm trong Secret `bao-token`, chỉ mang policy `shop-db`.
+
+<Terminal where="mac" title="~/masteva-d15/shop-api.yaml">
+
+```bash
+./bao.sh token create -policy=shop-db -ttl=24h -display-name=shop-api -field=token > app.token
+chmod 600 app.token
+kubectl -n d15-app create secret generic bao-token --from-literal=token="$(cat app.token)"
+cat > shop-api.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-api
+  namespace: d15-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: shop-api }
+  template:
+    metadata:
+      labels: { app: shop-api }
+    spec:
+      terminationGracePeriodSeconds: 5
+      volumes:
+        - name: creds
+          emptyDir: { medium: Memory }
+      initContainers:
+        - name: lay-credential
+          image: quay.io/openbao/openbao:2.7.1@sha256:6d2b93856e3fcf7b18ad855a0b51eaba474dc8b79cf554379ea32034797d2acf
+          command: ["sh", "-c", "bao read -format=json database/creds/shop-app > /creds/db.json"]
+          env:
+            - { name: BAO_ADDR, value: "http://openbao.openbao.svc:8200" }
+            - name: BAO_TOKEN
+              valueFrom:
+                secretKeyRef: { name: bao-token, key: token }
+          volumeMounts:
+            - { name: creds, mountPath: /creds }
+      containers:
+        - name: app
+          image: postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+          command: ["sh", "-c"]
+          args:
+            - |
+              while true; do
+                U=$(grep '"username"' /creds/db.json | cut -d'"' -f4)
+                export PGPASSWORD=$(grep '"password"' /creds/db.json | cut -d'"' -f4)
+                R=$(psql -h postgres -U "$U" -d shop -tAc 'select count(*) from products' 2>&1 | tail -1)
+                echo "$(date +%T) user=$U -> $R"
+                sleep 15
+              done
+          volumeMounts:
+            - { name: creds, mountPath: /creds, readOnly: true }
+EOF
+kubectl apply -f shop-api.yaml
+kubectl -n d15-app rollout status deploy/shop-api --timeout=120s
+kubectl -n d15-app logs deploy/shop-api -c app
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+secret/bao-token created
+deployment.apps/shop-api created
+Waiting for deployment "shop-api" rollout to finish: 0 of 1 updated replicas are available...
+deployment "shop-api" successfully rolled out
+10:21:31 user=v-token-sh-shop-app-bECxniIUSjwF13i4ivms-1792578090 -> 2
+```
+
+</Expected>
+
+User bắt đầu bằng `v-token-sh-…`: OpenBao ghép tên hiển thị của token (`token-shop-api`, cắt ngắn) vào tên user, nên người xem log database biết credential này cấp cho ai. Giờ là múi giờ UTC của container.
+
+<Predict question="Lease của user này 120 giây. Sau khoảng hai phút, log sẽ ra sao, và `kubectl get pods` báo pod thế nào?">
+
+Truy vấn bắt đầu thất bại với `password authentication failed`: OpenBao đã thu hồi lease và xoá user. Pod vẫn `Running`, `1/1`, không restart lần nào: Kubernetes không có cách nào biết tiến trình bên trong đang lỗi.
+
+</Predict>
+
+Vòng chờ dưới dừng khi log có dòng lỗi đầu tiên (thường khoảng hai phút sau khi pod khởi động, tối đa 5 phút):
+
+<Terminal where="mac">
+
+```bash
+for i in $(seq 1 60); do kubectl -n d15-app logs deploy/shop-api -c app | grep -q FATAL && break; sleep 5; done
+kubectl -n d15-app logs deploy/shop-api -c app --tail=3 | cut -c1-150
+kubectl -n d15-app get pods -l app=shop-api
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10:23:01 user=v-token-sh-shop-app-bECxniIUSjwF13i4ivms-1792578090 -> 2
+10:23:16 user=v-token-sh-shop-app-bECxniIUSjwF13i4ivms-1792578090 -> 2
+10:23:31 user=v-token-sh-shop-app-bECxniIUSjwF13i4ivms-1792578090 -> psql: error: connection to server at "postgres" (10.96.13.152), port 5432 failed:
+NAME                        READY   STATUS    RESTARTS   AGE
+shop-api-646b7646bf-vjcnh   1/1     Running   0          2m3s
+```
+
+</Expected>
+
+Đúng như dự đoán. Credential động buộc ứng dụng phải sống được với việc credential đổi. Cách sửa không cần đổi ứng dụng, gồm bốn ý:
+
+- Biến init container thành **sidecar**: init container với `restartPolicy: Always` (có từ Kubernetes 1.29, K1.3 đã dạy), chạy suốt đời pod.
+- Sidecar cứ 60 giây xin credential mới, tức trước khi credential cũ (2 phút) hết hạn.
+- Ghi đè file theo kiểu nguyên tử: ghi file tạm rồi `mv`, để ứng dụng không bao giờ đọc phải file ghi dở.
+- `startupProbe` giữ container `app` chờ tới khi file đầu tiên có mặt. Ứng dụng đã đọc lại file mỗi lần truy vấn nên tự nhận user mới.
+
+<Terminal where="mac" title="~/masteva-d15/shop-api-sidecar.yaml">
+
+```bash
+yq '.spec.template.spec.initContainers[0].restartPolicy = "Always"
+  | .spec.template.spec.initContainers[0].command = ["sh", "-c",
+      "while true; do bao read -format=json database/creds/shop-app > /creds/tmp.json && mv /creds/tmp.json /creds/db.json; sleep 60; done"]
+  | .spec.template.spec.initContainers[0].startupProbe = {"exec": {"command": ["test", "-s", "/creds/db.json"]}, "periodSeconds": 1}' \
+  shop-api.yaml > shop-api-sidecar.yaml
+kubectl apply -f shop-api-sidecar.yaml
+kubectl -n d15-app rollout status deploy/shop-api --timeout=120s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment.apps/shop-api configured
+Waiting for deployment "shop-api" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "shop-api" rollout to finish: 1 old replicas are pending termination...
+deployment "shop-api" successfully rolled out
+```
+
+</Expected>
+
+Để pod chạy hơn ba phút rồi xem log, số lease đang sống và user đang có trong PostgreSQL. Vòng chờ dừng khi log có đủ 13 dòng, khoảng ba phút:
+
+<Terminal where="mac">
+
+```bash
+for i in $(seq 1 60); do [ "$(kubectl -n d15-app logs deploy/shop-api -c app | wc -l)" -ge 13 ] && break; sleep 5; done
+kubectl -n d15-app logs deploy/shop-api -c app | awk '{print $1, substr($2, 1, 45), $3, $4}'
+./bao.sh list sys/leases/lookup/database/creds/shop-app
+kubectl -n d15-app exec deploy/postgres -- psql -U postgres -d shop -tAc "select rolname, rolvaliduntil from pg_roles where rolname like 'v-%'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+10:24:05 user=v-token-sh-shop-app-liscBjdWR7JkQkuKNsLX -> 2
+10:24:20 user=v-token-sh-shop-app-liscBjdWR7JkQkuKNsLX -> 2
+10:24:35 user=v-token-sh-shop-app-liscBjdWR7JkQkuKNsLX -> 2
+10:24:50 user=v-token-sh-shop-app-liscBjdWR7JkQkuKNsLX -> 2
+10:25:05 user=v-token-sh-shop-app-I1r3pIiu7IrBKmxyMBHK -> 2
+10:25:21 user=v-token-sh-shop-app-I1r3pIiu7IrBKmxyMBHK -> 2
+10:25:36 user=v-token-sh-shop-app-I1r3pIiu7IrBKmxyMBHK -> 2
+10:25:51 user=v-token-sh-shop-app-I1r3pIiu7IrBKmxyMBHK -> 2
+10:26:06 user=v-token-sh-shop-app-sbxZCzUiMYvUiq69lrem -> 2
+10:26:21 user=v-token-sh-shop-app-sbxZCzUiMYvUiq69lrem -> 2
+10:26:36 user=v-token-sh-shop-app-sbxZCzUiMYvUiq69lrem -> 2
+10:26:51 user=v-token-sh-shop-app-sbxZCzUiMYvUiq69lrem -> 2
+10:27:06 user=v-token-sh-shop-app-apejZemmKRAraSwJGGJa -> 2
+Keys
+----
+SvDINxiuyJuIOOidmGYaxmOI
+ymVHCEJh9FaRgS4ICQHthYbS
+v-token-sh-shop-app-sbxZCzUiMYvUiq69lrem-1792578364|2026-10-21 10:28:09+00
+v-token-sh-shop-app-apejZemmKRAraSwJGGJa-1792578424|2026-10-21 10:29:09+00
+```
+
+</Expected>
+
+Cách đọc phần dưới chữ `Keys`: mỗi dòng là phần cuối của một `lease_id` còn sống của role `shop-app`; hai dòng cuối cùng là các user tương ứng trong PostgreSQL kèm hạn `VALID UNTIL`. Mỗi phút một user mới, ứng dụng không lỗi lần nào. Lúc nào cũng chỉ có khoảng hai user sống, mỗi user hai phút: user cũ tự hết hạn và bị xoá mà không ai phải dọn. Tên user và giờ trên máy bạn sẽ khác.
+
+Còn việc thu hồi khẩn cấp: giả sử bạn nghi credential của `shop-app` bị lộ, thu hồi một lượt mọi lease của role đó.
+
+<Callout kind="danger">
+
+`lease revoke -prefix` xoá ngay mọi user database mà role đã cấp và cắt kết nối của chúng: mọi pod dùng role đó lỗi cho tới khi xin được credential mới.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+./bao.sh lease revoke -prefix database/creds/shop-app
+kubectl -n d15-app exec deploy/postgres -- psql -U postgres -d shop -tAc "select count(*) from pg_roles where rolname like 'v-%'"
+n=$(kubectl -n d15-app logs deploy/shop-api -c app | wc -l)
+for i in $(seq 1 30); do [ "$(kubectl -n d15-app logs deploy/shop-api -c app | wc -l)" -ge $((n + 5)) ] && break; sleep 5; done
+kubectl -n d15-app logs deploy/shop-api -c app --tail=5 | cut -c1-100
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+All revocation operations queued successfully!
+0
+10:27:51 user=v-token-sh-shop-app-apejZemmKRAraSwJGGJa-1792578424 -> psql: error: connection to serv
+10:28:06 user=v-token-sh-shop-app-5sVphpT3KfHqgOyCxNOV-1792578484 -> 2
+10:28:21 user=v-token-sh-shop-app-5sVphpT3KfHqgOyCxNOV-1792578484 -> 2
+10:28:36 user=v-token-sh-shop-app-5sVphpT3KfHqgOyCxNOV-1792578484 -> 2
+10:28:51 user=v-token-sh-shop-app-5sVphpT3KfHqgOyCxNOV-1792578484 -> 2
+```
+
+</Expected>
+
+Không còn user nào trong PostgreSQL. Ứng dụng lỗi cho tới lần làm mới kế tiếp của sidecar (tối đa 60 giây, số dòng lỗi trên máy bạn tuỳ thời điểm), rồi tự hồi phục bằng user mới. Nhưng hãy để ý: nếu thứ bị lộ là **token** trong Secret `bao-token` chứ không phải user database, kẻ cầm token cũng xin được user mới như sidecar. Khi đó phải thu hồi chính token (`bao token revoke`), và mọi lease nó đã xin bị thu hồi theo. Token tĩnh nằm trong một Secret là điểm yếu còn lại của bước này; D15.3 thay nó bằng danh tính của pod.
+
+<Check id="d15.1.lab-app">Tái hiện được ứng dụng lỗi khi credential lấy một lần hết hạn trong khi pod vẫn `Ready`, sửa bằng sidecar làm mới credential, và thu hồi khẩn cấp được mọi credential của một role.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm và sửa |
+|---|---|---|
+| `openbao-0` `Running` nhưng `0/1`, ứng dụng báo lỗi kết nối tới OpenBao | Kho sealed sau khi pod, Docker hay máy khởi động lại | `kubectl -n openbao exec openbao-0 -- bao status`; rồi `cd ~/masteva-d15 && ./unseal.sh` |
+| `helm install` xong ngay nhưng pod chưa có | Bình thường: lệnh không chờ pod; bài chờ bằng `kubectl wait` | Chạy tiếp khối lệnh, `kubectl -n openbao get pods` |
+| `Code: 403` dù policy có vẻ đúng | Đường dẫn trong policy thiếu `data/` hoặc `metadata/` của `kv-v2`, hoặc thiếu capability `list` | Đọc dòng `URL:` của lỗi, so với khối `path` trong policy |
+| `relation "products" does not exist` khi tạo role hoặc khi `shop-api` truy vấn; init container của `shop-api` ở `Init:Error` | Lệnh `CREATE TABLE` đã chạy lúc PostgreSQL còn là server khởi tạo tạm và thất bại (`the database system is shutting down`) | Chạy lại khối bước 3 từ dòng `kubectl apply -f postgres.yaml`; xác nhận bằng `kubectl -n d15-app exec deploy/postgres -- psql -U postgres -d shop -c '\dt'` |
+| `shop-api` lỗi `password authentication failed` ngay từ đầu | Init container đọc credential thất bại (token hết hạn, kho sealed) | `kubectl -n d15-app logs deploy/shop-api -c lay-credential` |
+| Vòng chờ ở bước 4 chạy hết 5 phút mà không thấy lỗi | Init container lấy credential lúc pod khởi động; nếu pod khởi động lại, đồng hồ hai phút tính lại từ đầu | `kubectl -n d15-app get pods -l app=shop-api` xem cột `RESTARTS` và `AGE` |
+
+Nếu mở terminal mới giữa bài: `cd ~/masteva-d15` và `export KUBECONFIG=~/masteva-d15/kubeconfig`; kho sealed thì chạy `./unseal.sh`.
+
+### Dọn dẹp
+
+D15.2 dùng tiếp cụm, OpenBao (đã unseal), secret `kv/shop/payment-gateway` và file `eso.token`; D15.3 dùng tiếp PostgreSQL, engine `database` và Deployment `shop-api`. Bài này không cần dọn gì. Nếu dừng hẳn ở đây, xoá cụm và thư mục lab bằng khối cuối bài D15.4.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Lease hết hạn thì kết nối đang mở có bị cắt không?">
+
+Không, nếu bạn để câu thu hồi mặc định. Thu hồi chạy `DROP ROLE`, và PostgreSQL cho xoá một role đang có phiên mở: phiên đó tiếp tục chạy truy vấn, chỉ là `pg_stat_activity` không còn hiện tên user. Bạn có thể tự thử: viết lại role `shop-app` với `revocation_statements=""` (về câu mặc định) hoặc một câu không có `pg_terminate_backend`; nếu bỏ hẳn tham số này, OpenBao giữ câu cũ. Xin một credential mới, mở một phiên `psql` chạy `select pg_sleep(600)` bằng credential đó, rồi `lease revoke`; role biến mất khỏi `pg_roles` nhưng phiên vẫn `active`. `VALID UNTIL` cũng chỉ chặn lần đăng nhập mới. Với connection pool sống lâu (HikariCP, pgbouncer), credential đã thu hồi vẫn dùng được tới khi kết nối bị đóng. Vì vậy câu thu hồi của bài cắt kết nối trước khi xoá role, và pool của ứng dụng nên có tuổi tối đa của kết nối ngắn hơn TTL của credential.
+
+</Reveal>
+
+<Reveal title="Dynamic secret có phải lúc nào cũng tốt hơn static role?">
+
+Không. Mỗi lần cấp là một `CREATE ROLE`; một Deployment 200 pod, TTL một giờ là vài nghìn role tạo và xoá mỗi ngày, và một số hệ (database cũ, hệ thống bên thứ ba có giới hạn số user) không chịu được. OpenBao có **static role**: một user cố định trong database, OpenBao xoay mật khẩu của nó theo lịch và trả mật khẩu hiện tại cho client. Bạn mất "mỗi pod một user" nhưng vẫn giữ "không ai biết mật khẩu lâu dài". Chọn dynamic khi muốn truy vết tới từng phiên và giới hạn thiệt hại theo phút; chọn static khi database không chịu nổi số user, hoặc khi ứng dụng không xử lý được việc đổi user.
+
+</Reveal>
+
+<Reveal title="OpenBao sập thì sao?">
+
+Ứng dụng đang chạy với credential còn hạn vẫn chạy cho tới hết hạn; ứng dụng cần credential mới (pod mới, sidecar làm mới) thì lỗi. TTL vì thế là một đánh đổi: ngắn thì thiệt hại khi lộ nhỏ, dài thì chịu được kho ngừng lâu hơn. Ba việc production làm: chạy OpenBao nhiều node với Raft và auto-unseal; đặt TTL dài hơn thời gian khôi phục kho mà bạn đo được; và theo dõi kho như một dịch vụ cấp 0 (sealed, độ trễ, lỗi đăng nhập), vì gần như mọi thứ khác phụ thuộc vào nó. Đây cũng là lý do ESO hấp dẫn: Secret đã nằm trong cụm, kho ngừng một giờ thì pod mới vẫn khởi động được.
+
+</Reveal>
+
+<Reveal title="Secret đã lộ vào Git thì làm gì?">
+
+Coi nó đã bị lấy, xoay ngay ở nguồn (đổi mật khẩu, thu hồi token), rồi mới dọn lịch sử Git. Viết lại lịch sử (`git filter-repo`) không xoá các bản clone, fork, cache của nền tảng, bản sao lưu CI; nó chỉ làm cho người sau khó tìm thấy hơn. Trong vụ Microsoft, URL được thay trên GitHub ngày 07/07/2023, hai tuần sau khi token đã bị vô hiệu hoá, đúng thứ tự đó. Phần chặn từ trước, quét secret ngay trong pipeline, có ở D15.6.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết policy OpenBao và role của engine `database` nhanh, và hay sai ở: (1) policy cho `kv/shop/*` mà thiếu `data/` (chạy được với kv-v1, không với kv-v2); (2) `capabilities = ["*"]` hoặc policy cho `sys/*` khi chỉ cần đọc một nhánh; (3) khuyên đặt root token vào Secret cho ứng dụng dùng; (4) role không có `revocation_statements` hay `VALID UNTIL`, rồi khẳng định "credential hết hạn là kết nối bị cắt"; (5) ứng dụng đọc credential một lần lúc khởi động. Kiểm bằng lab: chạy lệnh bằng chính token mang policy đó và đọc dòng `URL:` khi bị từ chối; để ứng dụng chạy quá `default_ttl` rồi xem log.
+
+</Callout>
+
+<Callout kind="link">
+
+K1.3 dạy sidecar và probe, dùng lại ở bước 4. K8.5 cho thấy lệnh `kubectl exec` nằm trong audit log, lý do bài đưa unseal key và token qua stdin. D8.2 dạy Ansible Vault, một cách giữ secret tĩnh đã mã hoá. D15.2 đồng bộ secret của kho vào cụm bằng External Secrets Operator, mã hoá secret trong repo GitOps bằng SOPS, và bàn KMS; D15.3 thay token tĩnh của `shop-api` bằng danh tính của pod.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d15.1.mastery-thiet-ke">Thiết kế được cách một service lấy credential database từ kho secret: chọn dynamic hay static role, TTL, cách ứng dụng nhận và làm mới credential, và cách thu hồi khẩn cấp.</Check>
+
+<Check id="d15.1.mastery-van-hanh">Lập được kế hoạch đưa OpenBao lên production: Shamir hay auto-unseal, bao nhiêu node, ai giữ khoá, thu hồi root token sau khi cấu hình, và theo dõi những gì.</Check>
+
+<Check id="d15.1.mastery-lo-secret">Kể được các bước khi một secret bị lộ, theo đúng thứ tự: xoay hoặc thu hồi ở nguồn trước, dọn dấu vết sau.</Check>
+
+</Mastery>

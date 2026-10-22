@@ -1,0 +1,911 @@
+---
+title: Service mesh, sidecar và ambient, mTLS tự động
+description: Cài Istio 1.31 ở chế độ ambient lên cụm kind, bắt gói trên node để thấy cùng một request đi dạng chữ thường trước khi vào mesh và thành luồng mã hoá trên cổng 15008 sau khi vào, đọc danh tính SPIFFE trong chứng chỉ 24 giờ mà ztunnel giữ cho từng pod, bật STRICT để chặn pod ngoài mesh, và viết AuthorizationPolicy cho phép theo danh tính chứ không theo IP.
+id: d18.1
+step: d18
+prerequisites: [k6.1, k6.2]
+topics: [d18.sidecar-ambient, d18.mtls-tu-dong]
+status: verified
+verified:
+  date: 2026-10-19
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.36.1
+    istio: 1.31.2
+    gateway-api: 1.6.3 (standard)
+    fortio: 1.75.3
+    curl-image: 8.22.0
+    alpine: 3.24.2 (tcpdump 4.99.6)
+    openssl: LibreSSL 3.3.6
+    jq: 1.8.2
+---
+
+<Goal>
+
+Từ K1 tới K10, mọi lời gọi giữa các pod trong cụm đi dạng chữ thường, và một pod biết IP của pod khác là gọi được nếu NetworkPolicy (K2.4) không chặn. Service mesh đổi điều đó mà không sửa một dòng code ứng dụng. Học xong bài này, bạn giải thích được:
+
+- Service mesh làm những việc gì cho các service, và vì sao làm ở hạ tầng thay vì trong thư viện của từng ngôn ngữ.
+- Mô hình sidecar (một Envoy cạnh mỗi pod) khác mô hình ambient (một ztunnel mỗi node, waypoint khi cần tầng 7) ở đâu, và cái giá của từng mô hình.
+- Vì sao `tcpdump` trên node thấy rõ mật khẩu trong request trước khi vào mesh, và chỉ thấy luồng mã hoá trên cổng 15008 sau khi vào.
+- Danh tính của một pod trong mesh là gì, ai cấp chứng chỉ cho nó, chứng chỉ sống bao lâu.
+- Vì sao một AuthorizationPolicy viết theo ServiceAccount vẫn đúng khi pod bị tạo lại với IP mới, và nó khác NetworkPolicy ở chỗ nào.
+
+</Goal>
+
+<Knowledge>
+
+### Service mesh giải quyết việc gì
+
+Một hệ có ba mươi service, viết bằng Java, Go và Node.js. Mỗi lời gọi giữa chúng cần cùng một nhóm việc: mã hoá đường truyền, biết chắc bên kia là ai, quyết định ai được gọi ai, đếm request và lỗi, đặt timeout, thử lại, chia lưu lượng khi ra bản mới. Nếu mỗi đội tự làm trong code, bạn có ba thư viện TLS, ba kiểu retry, ba định dạng metric, và không ai chắc service nào đã bật mã hoá.
+
+**Service mesh** chuyển nhóm việc đó xuống hạ tầng: một lớp proxy đứng trên đường đi của mọi lời gọi giữa các service, cùng một **control plane** (mặt phẳng điều khiển) cấu hình các proxy đó từ một chỗ. Ứng dụng vẫn gọi `http://web` như cũ; proxy làm phần còn lại.
+
+| Việc | Không có mesh | Có mesh |
+|---|---|---|
+| Danh tính dịch vụ | IP của pod, đổi mỗi lần pod được tạo lại | Chứng chỉ mang tên ServiceAccount, cấp và xoay tự động |
+| Mã hoá giữa các service | Từng service tự cấu hình TLS, thường bỏ qua trong cụm | mTLS (TLS hai chiều) giữa mọi cặp workload trong mesh |
+| Ai được gọi ai | NetworkPolicy theo label và IP (K2.4) | AuthorizationPolicy theo danh tính, thêm điều kiện HTTP khi có proxy tầng 7 |
+| Số liệu | Mỗi đội tự gắn thư viện metric | Proxy đếm request, lỗi, độ trễ theo cùng một bộ nhãn |
+| Điều phối lưu lượng | Retry, timeout trong code; canary theo số pod (D13.3) | Retry, timeout, chia theo tỉ lệ, theo header ở proxy (K11.2) |
+
+Mesh **không** thay được những việc chỉ ứng dụng biết: request nào lặp lại an toàn, dữ liệu nào nhạy cảm, khi nào nên báo lỗi cho người dùng. Nó cũng thêm một tầng phải vận hành; K11.3 nói khi nào không nên dùng.
+
+Bài này dùng **Istio**, một trong những mesh dùng rộng rãi nhất, là dự án đã tốt nghiệp của CNCF. Kiến trúc chung của mọi mesh giống nhau:
+
+```text
+                 control plane: istiod
+     (đọc Service, Pod, policy từ Kubernetes API;
+      làm CA cấp chứng chỉ; đẩy cấu hình xuống proxy)
+          |  xDS qua gRPC (D9.6)        |  cấp chứng chỉ
+          v                             v
+ +------------------------------------------------------+
+ |  data plane: các proxy đứng trên đường đi của request |
+ |  pod A ──► proxy ═══ mTLS ═══► proxy ──► pod B        |
+ +------------------------------------------------------+
+```
+
+D9.6 đã cho thấy Envoy nhận cấu hình qua **xDS** (bộ API mà control plane dùng để đẩy listener, route, cluster, endpoint xuống proxy) và từ chối bản cấu hình hỏng. Trong mesh, istiod là chương trình đứng ở đầu kia của xDS, cho hàng trăm hoặc hàng nghìn proxy cùng lúc.
+
+<Check id="d18.1.mesh-lam-gi">Kể được năm việc service mesh làm thay ứng dụng, phân biệt control plane với data plane, và nêu được một việc mesh không làm thay được.</Check>
+
+### Sidecar: một Envoy cạnh mỗi pod
+
+Mô hình đầu tiên, và vẫn phổ biến nhất trên các cụm đang chạy: mỗi pod có thêm một container Envoy tên `istio-proxy`.
+
+```text
+ node 1                                         node 2
+ +-------------------------------+              +-------------------------------+
+ | pod A                         |              | pod B                         |
+ |  app ──► iptables ──► Envoy ══╪═══ mTLS ═════╪══► Envoy ──► iptables ──► app |
+ |  (gọi http://b)    (sidecar)  |              |  (sidecar)                    |
+ +-------------------------------+              +-------------------------------+
+```
+
+- **Tiêm sidecar**: namespace gắn label `istio-injection=enabled`; một mutating webhook (K8.3) sửa spec của mọi pod mới, thêm container Envoy và luật iptables chuyển mọi gói vào/ra pod qua Envoy.
+- Mọi request đi qua **hai Envoy**: của bên gọi và của bên nhận. Cả hai hiểu HTTP, nên mọi tính năng tầng 7 có ở khắp nơi.
+- Cái giá: mỗi pod tốn thêm RAM và CPU cho một Envoy (K11.3 đo con số); muốn nâng cấp proxy phải khởi động lại pod; thứ tự khởi động giữa app và sidecar phải đúng (K1.3 đã dạy native sidecar); và Envoy xử lý HTTP ngay cả khi bạn chỉ cần mã hoá.
+
+### Ambient: ztunnel mỗi node, waypoint khi cần tầng 7
+
+**Ambient** (ổn định từ Istio 1.24, cuối năm 2024) tách mesh thành hai lớp:
+
+- **ztunnel** ("zero trust tunnel"): một proxy viết bằng Rust, chạy dạng DaemonSet, **một bản mỗi node**. Nó chỉ làm tầng 4 (TCP): mTLS, danh tính, chính sách theo danh tính và cổng, số liệu TCP. Nó **không** đọc HTTP.
+- **waypoint**: một Envoy chạy thành Deployment riêng, thường một cái cho cả namespace, **chỉ dựng khi cần tầng 7** (định tuyến HTTP, retry, chính sách theo đường dẫn). K11.2 dùng nó.
+
+**HBONE** (HTTP-Based Overlay Network Environment) là cách ztunnel chở kết nối TCP của ứng dụng: một kết nối mTLS tới cổng 15008, bên trong dùng HTTP/2 `CONNECT` để mở nhiều "đường hầm", mỗi đường hầm một kết nối TCP gốc. Nhiều kết nối giữa cùng một cặp danh tính dùng chung một kết nối mTLS.
+
+```text
+ node 1                                              node 2
+ +----------------------------------+                +----------------------------------+
+ | pod A (chỉ có app)               |                | pod B (chỉ có app)               |
+ |  app ─► luật chuyển hướng ─► [ztunnel nghe       |  [ztunnel nghe ─► app             |
+ |         trong netns của pod]  cổng 15001] ══ HBONE: mTLS, cổng 15008 ══► cổng 15008] |
+ +----------------------------------+                +----------------------------------+
+        ^                                                     ^
+   ztunnel (DaemonSet) node 1                         ztunnel (DaemonSet) node 2
+   giữ chứng chỉ của pod A                            giữ chứng chỉ của pod B
+```
+
+Điểm tinh tế: ztunnel chạy một pod trên node, nhưng **socket của nó nằm trong network namespace của từng pod**. Khi pod vào mesh, `istio-cni` (agent của Istio trên mỗi node) đặt luật chuyển hướng bên trong pod, rồi chuyển cho ztunnel một file descriptor của network namespace đó; ztunnel mở các cổng 15001, 15006, 15008 ngay trong pod. Vì vậy gói rời pod đã được mã hoá.
+
+| | Sidecar | Ambient |
+|---|---|---|
+| Proxy nằm ở đâu | Trong mỗi pod | ztunnel mỗi node; waypoint mỗi namespace khi cần |
+| Đưa pod vào mesh | Label namespace rồi **tạo lại pod** để webhook tiêm sidecar | Label namespace; pod đang chạy vào mesh ngay, **không khởi động lại** |
+| Tầng 7 | Ở mọi pod, luôn bật | Chỉ khi có waypoint |
+| Nâng cấp proxy | Khởi động lại từng pod | ztunnel nâng tại chỗ theo node; waypoint như một Deployment (K11.3) |
+| RAM mỗi pod | Thêm một Envoy | Không thêm gì trong pod |
+| Chính sách thực thi ở | Envoy bên nhận | ztunnel bên nhận (tầng 4), waypoint (tầng 7) |
+| Rủi ro dùng chung | Lỗi của một sidecar chỉ ảnh hưởng một pod | ztunnel hỏng ảnh hưởng mọi pod trong mesh trên node đó |
+
+Hai chế độ sống chung trong một mesh: pod sidecar và pod ambient gọi nhau được qua mTLS.
+
+<Check id="d18.1.sidecar-ambient">Vẽ được đường đi của một request trong mô hình sidecar và trong ambient, kể được ztunnel làm gì và không làm gì, và nêu được hai cái giá của sidecar mà ambient tránh được cùng một rủi ro ambient thêm vào.</Check>
+
+### Danh tính dịch vụ và mTLS tự động
+
+Trong mesh, danh tính của một workload không phải IP mà là **ServiceAccount** của pod, viết theo chuẩn **SPIFFE** (Secure Production Identity Framework for Everyone), dạng URI:
+
+```text
+spiffe://cluster.local/ns/k11-app/sa/web
+         └ trust domain └ namespace └ ServiceAccount
+```
+
+Danh tính nằm trong một chứng chỉ X.509 (ở trường Subject Alternative Name dạng URI), do **istiod làm CA** ký. Luồng cấp chứng chỉ ở ambient:
+
+```text
+ (1) pod web chạy trên node 2, ServiceAccount "web"
+ (2) ztunnel node 2 tạo khoá, gửi CSR (yêu cầu ký chứng chỉ) cho istiod: "cho tôi chứng chỉ của sa/web",
+     kèm token ServiceAccount của chính ztunnel
+ (3) istiod kiểm: trên node 2 có pod nào dùng sa/web không?  có -> ký, không -> từ chối
+ (4) chứng chỉ lá sống 24 giờ; ztunnel tự xin chứng chỉ mới trước khi hết hạn
+ (5) khi pod A gọi pod B: hai ztunnel bắt tay mTLS, mỗi bên trình chứng chỉ của pod mình
+     và kiểm chứng chỉ bên kia được ký bởi cùng chứng chỉ gốc
+```
+
+Bước (3) quan trọng: ztunnel của một node chỉ xin được danh tính của các pod đang chạy trên node đó. Chiếm được một node không có nghĩa là mạo danh được mọi service trong cụm.
+
+Chứng chỉ lá **ngắn hạn** (24 giờ) nên mesh không phải dựa vào việc thu hồi: lộ một chứng chỉ cùng khoá thì kẻ xấu chỉ dùng được nó trong tối đa một ngày, với điều kiện kẻ xấu không còn giữ quyền trên node để xin chứng chỉ mới. Ngược lại, **chứng chỉ gốc** tự ký mà istiod tạo khi cài lần đầu sống lâu (10 năm ở các bản hiện nay, bước 4 sẽ đọc ngày đó), và đó là thứ dễ bị quên.
+
+**PeerAuthentication** quyết định workload có nhận kết nối chưa mã hoá không:
+
+| Chế độ | Workload nhận gì | Dùng khi |
+|---|---|---|
+| `PERMISSIVE` (mặc định) | Cả mTLS từ trong mesh lẫn chữ thường từ ngoài mesh | Đang đưa dần các service vào mesh, còn client chưa vào |
+| `STRICT` | Chỉ mTLS | Mọi client đã vào mesh; muốn chặn đường vòng qua IP pod |
+| `DISABLE` | Chỉ chữ thường | Có ở sidecar; ambient **bỏ qua** chính sách này vì ztunnel luôn mã hoá |
+
+PeerAuthentication đặt trong `istio-system` áp cho cả mesh; trong một namespace thì áp cho namespace đó; có `selector` thì chỉ áp cho pod khớp label.
+
+<Callout kind="production">
+
+**Chứng chỉ gốc một năm của Istio, 2019.** Ngày 07/06/2019, dự án Istio đăng [cảnh báo trên blog](https://istio.io/latest/blog/2019/root-transition/): chứng chỉ gốc tự ký của Istio có thời hạn mặc định một năm; cụm mới tạo bằng các bản tới 1.0.7 và 1.1.7 bị ảnh hưởng, và việc chứng chỉ gốc hết hạn "may lead to an unexpected cluster-wide outage" (có thể gây sự cố toàn cụm bất ngờ). Bài blog khuyên xoay khoá và chứng chỉ gốc hằng năm. Trang hướng dẫn đi kèm, [Extending Self-Signed Certificate Lifetime](https://istio.io/v1.4/docs/ops/configuration/security/root-transition/), có script kiểm số ngày còn lại rồi chuyển sang chứng chỉ gốc mới hạn 10 năm, và nêu ba điều: sidecar cũ hơn 1.0.8 và 1.1.8 không tự nạp chứng chỉ gốc mới nên phải nâng cấp trước; trong lúc chuyển, Envoy được khởi động lại nóng (hot restart) nên kết nối sống lâu có thể bị ảnh hưởng; và Pilot (tiền thân của istiod) không có sidecar có thể mất kết nối với Envoy.
+
+Nhận xét của bài: chứng chỉ lá 24 giờ tự xoay hàng ngày nên lỗi lộ ra sớm; thứ nguy hiểm là thứ hiếm khi đổi. Hãy biết chứng chỉ gốc của mesh hết hạn ngày nào (bước 4 đọc nó), theo dõi nó như chứng chỉ công khai ở D9.4, và trên production dùng CA nội bộ của tổ chức (Istio cho cắm CA riêng qua Secret `cacerts` hoặc qua cert-manager) thay vì để istiod tự ký.
+
+</Callout>
+
+<Check id="d18.1.spiffe-mtls">Đọc được một SPIFFE ID, kể được luồng ztunnel xin chứng chỉ cho pod và vì sao istiod kiểm node, giải thích được vì sao chứng chỉ lá 24 giờ không phải dựa vào thu hồi mà chứng chỉ gốc vẫn phải theo dõi, và chọn được `PERMISSIVE` hay `STRICT` cho một tình huống.</Check>
+
+### AuthorizationPolicy: cho phép theo danh tính
+
+**AuthorizationPolicy** của Istio nói workload nào được gọi workload nào. Với chính sách `ALLOW`, quy tắc giống NetworkPolicy ở K2.4: workload không có policy nào thì mọi thứ được phép; có ít nhất một policy `ALLOW` chọn nó thì chỉ những gì được liệt kê mới qua. Istio xét theo thứ tự `CUSTOM`, rồi `DENY`, rồi `ALLOW`, nên một policy `DENY` khớp request thì không policy `ALLOW` nào cứu được nó.
+
+Ở ambient, policy dùng `selector` được ztunnel **bên nhận** thực thi, nên chỉ dùng được thuộc tính tầng 4: danh tính nguồn (`principals`), namespace nguồn, dải IP, cổng đích. Điều kiện HTTP (method, đường dẫn, header) cần waypoint (K11.2). Nếu bạn viết điều kiện HTTP vào một policy mà ztunnel thực thi, ztunnel không hiểu được nó và chọn cách an toàn: coi policy đó là `DENY`.
+
+| | NetworkPolicy (K2.4) | AuthorizationPolicy (Istio) |
+|---|---|---|
+| Chọn nguồn theo | Label pod, namespace, dải IP | Danh tính SPIFFE (ServiceAccount), namespace, dải IP |
+| Ai thực thi | CNI, trên gói tin | ztunnel hoặc Envoy, trên kết nối đã xác thực mTLS |
+| Bằng chứng về nguồn | IP nguồn của gói | Chứng chỉ do CA của mesh ký |
+| Điều kiện HTTP | Không | Có, khi có waypoint hoặc sidecar |
+| Kết quả khi bị chặn | Gói bị bỏ, client chờ tới hết giờ | Kết nối bị đóng ngay (ở ambient), có dòng log ghi lý do |
+| Pod ngoài mesh | Vẫn bị chặn hoặc cho qua như mọi pod | Không có danh tính; chỉ lọt qua khi workload để `PERMISSIVE` và không policy nào đòi danh tính |
+
+Hai lớp này bổ sung cho nhau. NetworkPolicy vẫn chặn được ở tầng gói ngay cả khi mesh hỏng hoặc bị gỡ; mesh cho bạn danh tính có mật mã đứng sau. Khi dùng cả hai với ambient, NetworkPolicy phải cho phép cổng 15008 (HBONE) vào pod.
+
+Danh tính chỉ đáng tin bằng quyền tạo pod: ai tạo được pod chạy bằng ServiceAccount `client` thì mang được danh tính `client`. Quyền đó đi theo RBAC (K2.3) của namespace.
+
+<Check id="d18.1.authz-vs-netpol">So sánh được AuthorizationPolicy với NetworkPolicy ở cách chọn nguồn, nơi thực thi và cách bị chặn, giải thích được vì sao policy có điều kiện HTTP mà do ztunnel thực thi lại thành `DENY`, và nêu được ai có thể mạo danh một ServiceAccount.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Overview (Istio Ambient Mode)](https://istio.io/latest/docs/ambient/overview/) và [Ambient data plane](https://istio.io/latest/docs/ambient/architecture/data-plane/): hai lớp ztunnel và waypoint, đường đi của request, cách ztunnel giữ chứng chỉ cho từng pod.
+- [HBONE (Istio)](https://istio.io/latest/docs/ambient/architecture/hbone/): HTTP/2, `CONNECT` và mTLS ghép thành đường hầm trên cổng 15008.
+- [SPIFFE Concepts](https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/): SPIFFE ID, SVID và trust domain, chuẩn mà danh tính của Istio tuân theo.
+- [Use Layer 4 security policy (Istio)](https://istio.io/latest/docs/ambient/usage/l4-policy/): thuộc tính nào ztunnel thực thi được, PeerAuthentication ở ambient, và chuyện policy tầng 7 thành `DENY`.
+- [Extending Istio Self-Signed Root Certificate Lifetime](https://istio.io/latest/blog/2019/root-transition/): cảnh báo năm 2019, nguồn của callout.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị**
+
+- Docker Desktop đang chạy, đã có `kind`, `kubectl`, `jq`, `openssl` (có sẵn trên macOS) từ D0. Bài tải `istioctl` vào thư mục lab, không cài vào hệ thống.
+- Đã học K2.4 (NetworkPolicy) và K6.2 (Gateway API).
+- Thư mục lab `~/masteva-d18`, cụm kind tên `k11-lab`. Cụm này dùng cho K11.1 và K11.2; K11.3 dựng cụm mới.
+- **Profile máy:** ba node kind cộng Istio ambient và các pod của bài cần khoảng 1,4 tới 2 GiB RAM tổng cộng (đo bằng `docker stats`: node control plane khoảng 0,9 tới 1,4 GiB, mỗi worker 0,2 tới 0,4 GiB). Máy 8 GB: cho Docker Desktop 4 GB, tắt các cụm và container khác trước khi học.
+
+**Nếu mở terminal mới giữa chừng**, chạy lại hai dòng này trước khi dán tiếp:
+
+<Terminal where="mac" title="Terminal mới">
+
+```bash
+cd ~/masteva-d18
+export KUBECONFIG=~/masteva-d18/kubeconfig
+```
+
+</Terminal>
+
+### 1. Dựng cụm và cài Istio ambient
+
+Tải `istioctl` bản 1.31.2 cùng file checksum, kiểm checksum, rồi mới giải nén. File `.sha256` của Istio chỉ có một khoảng trắng giữa mã băm và tên file, nên lệnh `echo` dựng lại dòng đúng định dạng mà `shasum -c` đọc. Mac chip Intel thay `osx-arm64` bằng `osx-amd64`; Linux dùng `linux-amd64` và `sha256sum -c`.
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-d18/bin && cd ~/masteva-d18/bin
+V=1.31.2; F=istioctl-$V-osx-arm64.tar.gz
+curl -sLO https://github.com/istio/istio/releases/download/$V/$F
+curl -sLO https://github.com/istio/istio/releases/download/$V/$F.sha256
+echo "$(cut -d' ' -f1 $F.sha256)  $F" | shasum -a 256 -c - && tar xzf $F && ./istioctl version --remote=false
+cd ~/masteva-d18
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+istioctl-1.31.2-osx-arm64.tar.gz: OK
+client version: 1.31.2
+```
+
+</Expected>
+
+Trước khi chọn phiên bản Kubernetes cho cụm, mở trang [Supported Releases](https://istio.io/latest/docs/releases/supported-releases/) của Istio: hàng 1.31 ghi hỗ trợ Kubernetes 1.32 tới 1.37. Cụm của bài dùng Kubernetes 1.37.0, nằm trong khoảng đó. Thói quen này quan trọng: mỗi bản Istio chỉ hỗ trợ một dải năm, sáu bản Kubernetes, và K11.3 sẽ gặp hệ quả của nó khi nâng cấp.
+
+Cụm có một control plane và hai worker để request đi qua mạng giữa hai node, nơi bạn sẽ bắt gói. Image node được ghim theo digest của kind 0.33. `KUBECONFIG` trỏ vào file trong thư mục lab để không đụng `~/.kube/config`.
+
+<Terminal where="mac" title="~/masteva-d18/kind-k11.yaml">
+
+```bash
+export KUBECONFIG=~/masteva-d18/kubeconfig
+cat > kind-k11.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: k11-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  - role: worker
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+EOF
+kind create cluster --config kind-k11.yaml
+kubectl wait --for=condition=Ready node --all --timeout=180s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Creating cluster "k11-lab" ...
+...
+node/k11-lab-control-plane condition met
+node/k11-lab-worker condition met
+node/k11-lab-worker2 condition met
+```
+
+</Expected>
+
+Waypoint ở K11.2 là một object `Gateway` của Gateway API, nên cài bộ CRD kênh standard (như K6.2) trước. Sau đó `istioctl x precheck` kiểm cụm có cài được Istio không, và `istioctl install` với profile `ambient` cài ba thành phần: istiod, ztunnel và istio-cni.
+
+<Terminal where="mac">
+
+```bash
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml | grep -c serverside-applied
+./bin/istioctl x precheck
+./bin/istioctl install --set profile=ambient --skip-confirmation
+kubectl -n istio-system get pods -o wide | awk '{print $1, $2, $3, $7}' | column -t
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+12
+✔ No issues found when checking the cluster. Istio is safe to install or upgrade!
+  To get started, check out https://istio.io/latest/docs/setup/getting-started/.
+...
+✔ Istio core installed ⛵️
+...
+✔ Istiod installed 🧠
+✔ CNI installed 🪢
+...
+✔ Ztunnel installed 🔒
+- Pruning removed resources
+✔ Installation completeThe ambient profile has been installed successfully, enjoy Istio without sidecars!
+NAME                     READY  STATUS   NODE
+istio-cni-node-8krmw     1/1    Running  k11-lab-worker2
+istio-cni-node-99sbc     1/1    Running  k11-lab-worker
+istio-cni-node-c6mph     1/1    Running  k11-lab-control-plane
+istiod-779854df95-h6b7g  1/1    Running  k11-lab-worker
+ztunnel-6lp25            1/1    Running  k11-lab-control-plane
+ztunnel-kvw8v            1/1    Running  k11-lab-worker2
+ztunnel-rf7wl            1/1    Running  k11-lab-worker
+```
+
+</Expected>
+
+Con số `12` là số object mà file của Gateway API tạo: 10 CRD, cộng một ValidatingAdmissionPolicy tên `safe-upgrades` và binding của nó (chính sách này chặn cài nhầm CRD kênh experimental đè lên kênh standard).
+
+`istio-cni-node` và `ztunnel` là hai DaemonSet, mỗi node một pod; istiod là một Deployment. Trước các dòng `✔` là một hình chữ Istio vẽ bằng ký tự, bỏ qua được; thứ tự các dòng `✔` có thể khác. Hậu tố tên pod và node chứa istiod trên máy bạn sẽ khác. Lần đầu, lệnh `install` mất khoảng nửa phút tới hai phút tuỳ tốc độ tải image.
+
+<Check id="d18.1.lab-cai">Tải `istioctl` có kiểm checksum, kiểm được phiên bản Kubernetes có nằm trong danh sách hỗ trợ của Istio, cài Istio ambient và chỉ ra được ba thành phần cùng kiểu workload của từng cái.</Check>
+
+### 2. Ứng dụng ngoài mesh: request đi dạng chữ thường
+
+Dựng một ứng dụng nhỏ trong namespace `k11-app`, **chưa** đưa vào mesh:
+
+- `web`: một pod **fortio** (công cụ HTTP mà chính Istio dùng để đo hiệu năng; ở chế độ `server` nó trả lại nội dung request ở đường dẫn `/echo`), chạy bằng ServiceAccount `web`, ghim lên node `k11-lab-worker2`.
+- `client` và `khac`: hai pod có `curl`, mỗi pod một ServiceAccount riêng, ghim lên `k11-lab-worker`.
+- `ngoai`: một pod `curl` trong namespace `k11-ngoai`, namespace này sẽ không bao giờ vào mesh.
+
+Ghim node để request từ `client` tới `web` luôn đi qua card mạng `eth0` giữa hai node, chỗ bạn sẽ bắt gói.
+
+<Terminal where="mac" title="~/masteva-d18/app.yaml">
+
+```bash
+cat > app.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: {name: k11-app}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: k11-ngoai}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: web, namespace: k11-app}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: client, namespace: k11-app}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: khac, namespace: k11-app}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: k11-app}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      serviceAccountName: web
+      nodeSelector: {kubernetes.io/hostname: k11-lab-worker2}
+      containers:
+        - name: fortio
+          image: fortio/fortio:1.75.3
+          args: ["server", "-http-port", "8080", "-grpc-port", "disabled", "-redirect-port", "disabled"]
+          ports: [{containerPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: k11-app}
+spec:
+  selector: {app: web}
+  ports: [{name: http, port: 80, targetPort: 8080}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: client, namespace: k11-app, labels: {app: client}}
+spec:
+  serviceAccountName: client
+  nodeSelector: {kubernetes.io/hostname: k11-lab-worker}
+  containers:
+    - {name: curl, image: "curlimages/curl:8.22.0", command: ["sleep", "infinity"]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: khac, namespace: k11-app, labels: {app: khac}}
+spec:
+  serviceAccountName: khac
+  nodeSelector: {kubernetes.io/hostname: k11-lab-worker}
+  containers:
+    - {name: curl, image: "curlimages/curl:8.22.0", command: ["sleep", "infinity"]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: ngoai, namespace: k11-ngoai, labels: {app: ngoai}}
+spec:
+  nodeSelector: {kubernetes.io/hostname: k11-lab-worker}
+  containers:
+    - {name: curl, image: "curlimages/curl:8.22.0", command: ["sleep", "infinity"]}
+EOF
+kubectl apply -f app.yaml > /dev/null
+kubectl -n k11-app rollout status deploy/web --timeout=180s
+kubectl -n k11-app wait --for=condition=Ready pod/client pod/khac --timeout=180s
+kubectl -n k11-ngoai wait --for=condition=Ready pod/ngoai --timeout=180s
+kubectl -n k11-app get pods -o wide | awk '{print $1, $2, $5, $6, $7}' | column -t
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "web" successfully rolled out
+pod/client condition met
+pod/khac condition met
+pod/ngoai condition met
+NAME                  READY  AGE  IP          NODE
+client                1/1    11s  10.244.2.5  k11-lab-worker
+khac                  1/1    11s  10.244.2.6  k11-lab-worker
+web-5fbdc5fcfc-wl6cm  1/1    11s  10.244.1.4  k11-lab-worker2
+```
+
+</Expected>
+
+Mỗi pod có một container (`1/1`). IP pod trên máy bạn sẽ khác.
+
+Để thấy những gì đi trên dây, bạn bắt gói trên `eth0` của node `k11-lab-worker2`. Node kind là một container Docker. Lệnh `docker run --network container:k11-lab-worker2` chạy một container `alpine` dùng chung mạng với node đó. Container này cài `tcpdump` từ kho gói của Alpine, rồi nghe các gói tới hoặc đi từ cổng 8080 (cổng của `web`) và 15008 (cổng HBONE, dùng ở bước sau). Script dưới bọc việc đó: chờ `tcpdump` sẵn sàng, chạy lệnh bạn truyền vào, rồi in các gói có dữ liệu và đếm số dòng chứa chuỗi `mat-khau`.
+
+<Terminal where="mac" title="~/masteva-d18/bat-goi.sh">
+
+```bash
+cat > bat-goi.sh <<'EOF'
+#!/bin/sh
+# Bắt gói trên card eth0 của node k11-lab-worker2 trong lúc chạy lệnh truyền vào
+docker run --rm -d --name k11-bat-goi --network container:k11-lab-worker2 alpine:3.24.2 \
+  sh -c 'apk add -q tcpdump && tcpdump -i eth0 -nn -l -A "tcp port 8080 or tcp port 15008"' > /dev/null
+for i in $(seq 60); do
+  docker logs k11-bat-goi 2>&1 | grep -q 'listening on eth0' && break
+  sleep 1
+done
+"$@"
+echo
+sleep 2
+docker logs k11-bat-goi > goi.txt 2>&1
+docker stop -t 1 k11-bat-goi > /dev/null
+echo "--- gói có dữ liệu: nguồn > đích, số byte"
+grep -E ' IP .*length [1-9]' goi.txt | sed -E 's/.* IP ([^ ]+) > ([^ ]+): .*length ([0-9]+).*/\1 > \2 \3/'
+echo "--- số dòng chứa chuỗi mat-khau: $(grep -c 'mat-khau' goi.txt)"
+EOF
+chmod +x bat-goi.sh
+./bat-goi.sh kubectl -n k11-app exec client -- curl -s web/echo -d 'mat-khau=hoa-hong-do'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mat-khau=hoa-hong-do
+--- gói có dữ liệu: nguồn > đích, số byte
+10.244.2.5.56352 > 10.244.1.4.8080 161
+10.244.1.4.8080 > 10.244.2.5.56352 145
+--- số dòng chứa chuỗi mat-khau: 2
+```
+
+</Expected>
+
+Dòng đầu là response của `web`: nó trả lại đúng nội dung bạn gửi. Hai gói có dữ liệu đi thẳng từ IP pod `client` tới IP pod `web` cổng 8080: request 161 byte và response 145 byte. Chuỗi `mat-khau` xuất hiện hai lần trong bản bắt gói, một ở request, một ở response. Bất kỳ ai đọc được mạng giữa hai node (một tiến trình có quyền trên node, một thiết bị mạng, một bản sao lưu lượng) đều đọc được nó. Xem toàn văn request trong bản bắt gói. `tcpdump -A` in mỗi gói thành vài dòng ký tự, phần đầu là header IP và TCP không đọc được; lệnh `awk` dưới tìm dòng chứa `POST /echo` trong phần dữ liệu và in 8 dòng từ đó:
+
+<Terminal where="mac">
+
+```bash
+awk '/POST \/echo/ && !/ IP / {n=8} n-- > 0' goi.txt | sed 's/.*POST/POST/' | grep -v '^$'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+POST /echo HTTP/1.1
+Host: web
+User-Agent: curl/8.22.0
+Accept: */*
+Content-Length: 20
+Content-Type: application/x-www-form-urlencoded
+mat-khau=hoa-hong-do
+```
+
+</Expected>
+
+Tên máy (`Host: web`), `User-Agent` của `curl` và nội dung form nằm nguyên văn trên dây.
+
+Trên máy chạy Docker Desktop, lần đầu chạy script mất thêm vài giây để tải image `alpine` và gói `tcpdump`.
+
+<Check id="d18.1.lab-plaintext">Bắt được gói trên card mạng của node bằng một container dùng chung mạng với node, và chỉ ra được nội dung request trong bản bắt gói khi pod chưa vào mesh.</Check>
+
+### 3. Đưa namespace vào mesh
+
+<Predict question="Gắn label `istio.io/dataplane-mode=ambient` lên namespace `k11-app`. Pod `web` có bị khởi động lại không? Cột READY còn là `1/1` không? Bắt gói lại thì thấy cổng nào?">
+
+Không khởi động lại, vẫn `1/1`: ambient không thêm container nào vào pod. `istio-cni` thấy label mới, đặt luật chuyển hướng ngay trong network namespace của các pod đang chạy, rồi báo ztunnel nhận chúng. Bắt gói lại, bạn không còn thấy cổng 8080 mà thấy cổng 15008, và không còn chuỗi `mat-khau`.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl label namespace k11-app istio.io/dataplane-mode=ambient
+sleep 3
+kubectl -n k11-app get pods
+./bin/istioctl ztunnel-config workloads --workload-namespace k11-app
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/k11-app labeled
+NAME                   READY   STATUS    RESTARTS   AGE
+client                 1/1     Running   0          86s
+khac                   1/1     Running   0          86s
+web-5fbdc5fcfc-wl6cm   1/1     Running   0          86s
+NAMESPACE POD NAME             ADDRESS    NODE            WAYPOINT PROTOCOL
+k11-app   client               10.244.2.5 k11-lab-worker  None     HBONE
+k11-app   khac                 10.244.2.6 k11-lab-worker  None     HBONE
+k11-app   web-5fbdc5fcfc-wl6cm 10.244.1.4 k11-lab-worker2 None     HBONE
+```
+
+</Expected>
+
+`RESTARTS` vẫn là 0 và `AGE` không đổi: pod chưa hề bị tạo lại. `istioctl ztunnel-config workloads` hỏi ztunnel nó biết những workload nào; cột `PROTOCOL` là `HBONE` nghĩa là ztunnel sẽ chở traffic của pod này qua đường hầm mTLS. Cột `WAYPOINT` là `None`: chưa có proxy tầng 7, K11.2 mới thêm.
+
+Gửi lại đúng request cũ và bắt gói:
+
+<Terminal where="mac">
+
+```bash
+./bat-goi.sh kubectl -n k11-app exec client -- curl -s web/echo -d 'mat-khau=hoa-hong-do'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+mat-khau=hoa-hong-do
+--- gói có dữ liệu: nguồn > đích, số byte
+10.244.2.5.53866 > 10.244.1.4.15008 215
+10.244.1.4.15008 > 10.244.2.5.53866 1016
+10.244.2.5.53866 > 10.244.1.4.15008 804
+...
+10.244.2.5.53866 > 10.244.1.4.15008 192
+10.244.1.4.15008 > 10.244.2.5.53866 176
+...
+--- số dòng chứa chuỗi mat-khau: 0
+```
+
+</Expected>
+
+Ứng dụng không biết gì: `client` vẫn gọi `web/echo`, `web` vẫn trả đúng nội dung. Trên dây thì khác hẳn:
+
+- Đích là cổng **15008** của IP pod `web`, không còn 8080. ztunnel trong network namespace của `client` đã nhận kết nối, mở đường hầm HBONE tới ztunnel trong network namespace của `web`.
+- Vài gói đầu (215, 1016, 804 byte) là bắt tay TLS: hai bên trao chứng chỉ. Các gói sau là dữ liệu đã mã hoá.
+- Không còn dòng nào chứa `mat-khau`.
+
+Số gói và kích thước trên máy bạn có thể khác vài dòng. Gọi lại lần nữa ngay sau đó, bạn có thể thấy ít gói bắt tay hơn: ztunnel giữ và dùng lại kết nối mTLS giữa cùng một cặp danh tính.
+
+<Check id="d18.1.lab-mesh">Đưa được một namespace vào ambient mà không khởi động lại pod, kiểm được bằng `istioctl ztunnel-config workloads`, và giải thích được vì sao bản bắt gói chuyển sang cổng 15008 và không còn nội dung request.</Check>
+
+### 4. Danh tính: chứng chỉ ztunnel giữ cho pod
+
+ztunnel trên `k11-lab-worker2` giữ chứng chỉ cho các pod trên node đó. Xem danh sách, rồi giải mã chứng chỉ lá bằng `openssl` để đọc danh tính bên trong. Ở dạng JSON, `istioctl` trả chứng chỉ PEM được mã hoá thêm một lớp base64, nên cần `base64 -d` để ra lại PEM mà `openssl` đọc được:
+
+<Terminal where="mac">
+
+```bash
+./bin/istioctl ztunnel-config certificates --node k11-lab-worker2
+./bin/istioctl ztunnel-config certificates --node k11-lab-worker2 -o json \
+  | jq -r '.[0].certChain[0].pem' | base64 -d \
+  | openssl x509 -noout -text | grep -E 'Issuer:|Subject:|Not |URI:'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CERTIFICATE NAME                             TYPE     STATUS        VALID CERT     SERIAL NUMBER                        NOT AFTER                NOT BEFORE
+spiffe://cluster.local/ns/k11-app/sa/web     Leaf     Available     true           45f7caa3802db2649e173272e00a8b09     2026-10-20T14:43:22Z     2026-10-19T14:41:22Z
+spiffe://cluster.local/ns/k11-app/sa/web     Root     Available     true           f04d216fc829871e208fb048d1bf0e38     2036-10-16T14:41:13Z     2026-10-19T14:41:13Z
+        Issuer: O=cluster.local
+            Not Before: Oct 19 14:41:22 2026 GMT
+            Not After : Oct 20 14:43:22 2026 GMT
+        Subject: 
+                URI:spiffe://cluster.local/ns/k11-app/sa/web
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- ztunnel của `k11-lab-worker2` chỉ giữ **một** danh tính: `sa/web`. Nó không có chứng chỉ của `client` hay `khac`, vì hai pod đó chạy trên node khác.
+- Chứng chỉ lá (`Leaf`): `Not After` trừ `Not Before` ra 24 giờ 2 phút. Chứng chỉ hết hạn đúng 24 giờ sau lúc cấp; `Not Before` được lùi sớm hơn lúc cấp 2 phút, một khoảng đệm để máy có đồng hồ lệch chút ít vẫn chấp nhận chứng chỉ. Chứng chỉ gốc (`Root`) do istiod tự tạo lúc cài, hạn 10 năm.
+- `Subject` để trống. Danh tính nằm ở phần mở rộng Subject Alternative Name, dạng URI SPIFFE. Bên nhận kiểm URI này, không kiểm tên miền như TLS của trình duyệt.
+
+Ngày giờ và số serial trên máy bạn sẽ khác, theo lúc bạn cài Istio và lúc pod vào mesh.
+
+Mỗi kết nối qua mesh được ztunnel ghi một dòng log kèm danh tính hai đầu. Đọc dòng gần nhất ở ztunnel của node `client` (chiều `outbound`):
+
+<Terminal where="mac">
+
+```bash
+Z1=$(kubectl -n istio-system get pod -l app=ztunnel --field-selector spec.nodeName=k11-lab-worker -o name)
+kubectl -n istio-system logs $Z1 --since=10m | grep 'connection complete' | tail -1 | tr ' ' '\n' \
+  | grep -E '^(src.workload|src.identity|dst.addr|dst.hbone_addr|dst.identity|direction)='
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+src.workload="client"
+src.identity="spiffe://cluster.local/ns/k11-app/sa/client"
+dst.addr=10.244.1.4:15008
+dst.hbone_addr=10.244.1.4:8080
+dst.identity="spiffe://cluster.local/ns/k11-app/sa/web"
+direction="outbound"
+```
+
+</Expected>
+
+`dst.addr` là địa chỉ trên dây (cổng 15008), `dst.hbone_addr` là đích thật bên trong đường hầm (cổng 8080 của `web`). Hai trường `identity` là hai danh tính đã xác thực trong bắt tay mTLS. Đây là chỗ đầu tiên bạn nhìn khi một kết nối trong mesh có vấn đề.
+
+<Check id="d18.1.lab-danh-tinh">Đọc được chứng chỉ lá và chứng chỉ gốc mà ztunnel giữ, chỉ ra được SPIFFE ID, thời hạn và lý do một ztunnel chỉ giữ danh tính của pod trên node mình, và đọc được dòng log kết nối của ztunnel.</Check>
+
+### 5. STRICT: chặn pod ngoài mesh
+
+Lúc này mesh đang ở chế độ mặc định `PERMISSIVE`. Pod `ngoai` (ngoài mesh) vẫn gọi được `web` bằng chữ thường. Trước khi bật `STRICT` trên production, bạn cần biết còn client nào gọi vào bằng chữ thường. ztunnel bên nhận ghi mọi kết nối chiều `inbound`; kết nối chữ thường không có trường `src.identity`. Khối dưới gọi thử từ `ngoai`, rồi đếm các kết nối như vậy theo tên workload nguồn trong 10 phút gần nhất:
+
+<Terminal where="mac">
+
+```bash
+kubectl -n k11-ngoai exec ngoai -- curl -s -o /dev/null -w '%{http_code}\n' web.k11-app/debug
+Z2=$(kubectl -n istio-system get pod -l app=ztunnel --field-selector spec.nodeName=k11-lab-worker2 -o name)
+kubectl -n istio-system logs $Z2 --since=10m | grep 'connection complete' | grep 'direction="inbound"' \
+  | grep -v 'src.identity=' | grep -oE 'src\.workload="[^"]+"' | sort | uniq -c
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+200
+   1 src.workload="ngoai"
+```
+
+</Expected>
+
+Một kết nối chữ thường, từ `ngoai`. Kết nối từ `client` không hiện vì có `src.identity`. Trên production, đây là lệnh cần ra rỗng (trong một khoảng đủ dài, ví dụ cả một chu kỳ batch) trước khi bật `STRICT`.
+
+Áp PeerAuthentication `STRICT` cho namespace `k11-app`, chờ ztunnel nhận chính sách, rồi thử lại từ `ngoai` và từ `client`. Lệnh cuối đọc log của ztunnel trên node của `web` (chiều `inbound`) để xem lý do từ chối.
+
+<Terminal where="mac" title="~/masteva-d18/strict.yaml">
+
+```bash
+cat > strict.yaml <<'EOF'
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: k11-app
+spec:
+  mtls:
+    mode: STRICT
+EOF
+kubectl apply -f strict.yaml
+sleep 3
+kubectl -n k11-ngoai exec ngoai -- curl -s -o /dev/null -w '%{http_code}\n' web.k11-app/debug
+kubectl -n k11-app exec client -- curl -s -o /dev/null -w '%{http_code}\n' web/debug
+Z2=$(kubectl -n istio-system get pod -l app=ztunnel --field-selector spec.nodeName=k11-lab-worker2 -o name)
+kubectl -n istio-system logs $Z2 --since=10m | grep 'src.workload="ngoai"' | tail -1 | grep -o 'error=.*'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+peerauthentication.security.istio.io/default created
+000
+command terminated with exit code 56
+200
+error="connection closed due to policy rejection: explicitly denied by: istio-system/istio_converted_static_strict"
+```
+
+</Expected>
+
+- `ngoai` nhận `000` và mã thoát 56 của `curl` (lỗi khi nhận dữ liệu): kết nối được mở rồi bị đóng ngay, chưa có byte HTTP nào. Không phải hết giờ chờ như khi NetworkPolicy bỏ gói.
+- `client` (trong mesh) vẫn `200`, vì nó đến qua mTLS.
+- ztunnel bên nhận ghi rõ lý do: chính sách `STRICT` (Istio tự đổi nó thành một luật từ chối nội bộ tên `istio_converted_static_strict`).
+
+Đây là cách khoá một namespace sau khi mọi client đã vào mesh. Nếu bật `STRICT` khi còn client ngoài mesh, chính những client đó hỏng đúng như `ngoai`; vì vậy thứ tự là: đưa client vào mesh trước, kiểm log không còn kết nối chữ thường bằng lệnh ở đầu bước này, rồi mới bật `STRICT`.
+
+<Check id="d18.1.lab-strict">Bật được `STRICT` cho một namespace, tái hiện được việc pod ngoài mesh bị từ chối, và đọc được lý do trong log của ztunnel bên nhận.</Check>
+
+### 6. AuthorizationPolicy theo danh tính
+
+Giờ chỉ cho `client` gọi `web`. Policy chọn pod `app: web` bằng `selector` nên ztunnel thực thi; nguồn được phép là danh tính của ServiceAccount `client` (bỏ tiền tố `spiffe://`).
+
+<Terminal where="mac" title="~/masteva-d18/authz.yaml">
+
+```bash
+cat > authz.yaml <<'EOF'
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: web-chi-cho-client
+  namespace: k11-app
+spec:
+  selector:
+    matchLabels: {app: web}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/k11-app/sa/client"]
+EOF
+kubectl apply -f authz.yaml
+sleep 3
+Z2=$(kubectl -n istio-system get pod -l app=ztunnel --field-selector spec.nodeName=k11-lab-worker2 -o name)
+for p in client khac; do
+  echo "$p: $(kubectl -n k11-app exec $p -- curl -s -o /dev/null -w '%{http_code}' web/debug)"
+done
+kubectl -n istio-system logs $Z2 --since=10m | grep 'src.workload="khac"' | tail -1 \
+  | grep -oE 'src\.identity="[^"]+"|error="[^"]+"'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+authorizationpolicy.security.istio.io/web-chi-cho-client created
+client: 200
+command terminated with exit code 56
+khac: 000
+src.identity="spiffe://cluster.local/ns/k11-app/sa/khac"
+error="connection closed due to policy rejection: allow policies exist, but none allowed"
+```
+
+</Expected>
+
+`khac` cũng ở trong mesh, cũng đi qua mTLS, nhưng danh tính `sa/khac` không có trong danh sách, nên ztunnel bên nhận đóng kết nối. Lý do trong log: "allow policies exist, but none allowed", đúng quy tắc đã nói ở phần Kiến thức.
+
+<Predict question="Xoá pod `client` rồi tạo lại từ cùng file. Pod mới có IP khác. Nó còn gọi được `web` không, khi bạn không sửa policy nào?">
+
+Được. Policy không nhắc tới IP nào; nó nói "danh tính `sa/client`". Pod mới chạy bằng cùng ServiceAccount, ztunnel trên node của nó xin chứng chỉ cho `sa/client`, và ztunnel bên `web` thấy đúng danh tính đó. Một NetworkPolicy theo `ipBlock` sẽ phải sửa; NetworkPolicy theo label pod thì vẫn đúng, nhưng label là thứ ai sửa được pod đều đặt được, còn chứng chỉ thì do CA của mesh ký.
+
+</Predict>
+
+<Callout kind="danger">
+
+Khối dưới xoá pod `client` trong namespace `k11-app` của cụm lab. Kiểm `kubectl config current-context` trả `kind-k11-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl -n k11-app get pod client -o jsonpath='IP cũ: {.status.podIP}{"\n"}'
+kubectl -n k11-app delete pod client
+kubectl apply -f app.yaml > /dev/null
+kubectl -n k11-app wait --for=condition=Ready pod/client --timeout=120s > /dev/null
+kubectl -n k11-app get pod client -o jsonpath='IP mới: {.status.podIP}{"\n"}'
+kubectl -n k11-app exec client -- curl -s -o /dev/null -w 'client: %{http_code}\n' web/debug
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-k11-lab
+IP cũ: 10.244.2.5
+pod "client" deleted from k11-app namespace
+IP mới: 10.244.2.8
+client: 200
+```
+
+</Expected>
+
+IP đổi, quyền giữ nguyên. Hai IP trên máy bạn sẽ khác nhau và khác con số trên.
+
+<Check id="d18.1.lab-authz">Viết được AuthorizationPolicy cho phép một danh tính và chặn danh tính khác, đọc được lý do từ chối trong log ztunnel, và chứng minh được quyền đi theo ServiceAccount chứ không theo IP.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `shasum` báo `no properly formatted SHA checksum lines found` | Chạy `shasum -c` thẳng trên file `.sha256` của Istio (chỉ một khoảng trắng) | Dùng dòng `echo "$(cut …)  $F"` như bước 1 |
+| `istioctl x precheck` báo phiên bản Kubernetes không được hỗ trợ | Node kind khác bản đã ghim | `kubectl get nodes`; so với trang Supported Releases |
+| Pod `istio-cni-node` hay `ztunnel` kẹt `ImagePullBackOff` | Mạng chậm hoặc bị chặn tới `docker.io` | `kubectl -n istio-system describe pod <tên>` |
+| `ztunnel-config workloads` không có pod của `k11-app` | Thiếu label trên namespace, hoặc gõ sai giá trị | `kubectl get ns -L istio.io/dataplane-mode` |
+| Bắt gói không thấy gì | Pod `client` và `web` cùng node (bỏ `nodeSelector`), gói không qua `eth0` | `kubectl -n k11-app get pods -o wide` |
+| `docker: ... name "/k11-bat-goi" is already in use` | Lần chạy script trước bị ngắt giữa chừng, container bắt gói còn chạy | `docker rm -f k11-bat-goi` rồi chạy lại script |
+| Script bắt gói đứng 60 giây rồi không in gói nào | Container `alpine` không tải được gói `tcpdump` | `docker logs k11-bat-goi` trong lúc script chạy |
+| `client` cũng bị từ chối sau bước 6 | Sai danh tính trong `principals` (thừa `spiffe://`, sai namespace) | Log ztunnel bên nhận: so `src.identity` với `principals` |
+
+### Dọn dẹp
+
+K11.2 dùng tiếp cụm `k11-lab` và Istio, nhưng không dùng namespace `k11-app` hay `k11-ngoai`. Xoá hai namespace để cụm nhẹ đi, giữ cụm.
+
+<Callout kind="danger">
+
+Khối thứ nhất xoá hai namespace của bài cùng mọi thứ trong đó, kể cả các policy. Khối thứ hai xoá cả cụm và thư mục lab; chỉ chạy khi bạn không học tiếp K11.2.
+
+</Callout>
+
+<Terminal where="mac" title="Dọn dẹp, giữ cụm cho K11.2">
+
+```bash
+kubectl config current-context
+kubectl delete namespace k11-app k11-ngoai
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Chỉ khi dừng hẳn ở đây">
+
+```bash
+kind delete cluster --name k11-lab
+rm -rf ~/masteva-d18
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao ztunnel cố ý không đọc HTTP?">
+
+Vì nó là thành phần dùng chung. Mọi pod trong mesh trên một node đi qua cùng một ztunnel. Mỗi tính năng tầng 7 (bộ phân tích HTTP, bộ lọc, mã mở rộng) là thêm mã có thể có lỗi, thêm bộ nhớ, thêm bề mặt tấn công; một lỗi ở đó ảnh hưởng mọi ứng dụng trên node, của mọi đội. Giữ ztunnel ở tầng 4 làm nó nhỏ (bài đo ở K11.3 cho thấy vài MiB RAM) và ổn định. Ai cần tầng 7 thì trả giá riêng bằng một waypoint cho namespace của mình; một waypoint hỏng chỉ ảnh hưởng các service dùng nó.
+
+</Reveal>
+
+<Reveal title="mTLS của mesh khác mã hoá WireGuard của Cilium (K6.1) ở đâu?">
+
+WireGuard hoặc IPsec của CNI mã hoá gói giữa các **node**: đường truyền an toàn, nhưng bên nhận chỉ biết gói đến từ node nào, không biết pod nào, càng không có danh tính có chữ ký. mTLS của mesh xác thực **từng workload** bằng chứng chỉ mang tên ServiceAccount, nên policy viết được theo danh tính và log ghi được ai gọi ai. Ngược lại, mã hoá ở CNI phủ mọi giao thức và mọi pod, kể cả pod chưa vào mesh. Nhiều cụm dùng cả hai. Cilium cũng có "mutual authentication" theo SPIFFE, đang ở mức beta; K11.3 so sánh.
+
+</Reveal>
+
+<Reveal title="Thay CA tự ký của istiod bằng CA của tổ chức thế nào?">
+
+Hai cách phổ biến. Một: tạo một CA trung gian ký bởi CA gốc của tổ chức (D9.4 dựng CA ba tầng), đặt chứng chỉ và khoá vào Secret `cacerts` trong `istio-system` trước khi cài; istiod dùng nó để ký chứng chỉ lá, và mọi cụm có CA trung gian cùng gốc tin nhau được (nền của mesh nhiều cụm, nằm ngoài phạm vi K11). Hai: cho cert-manager (K6.2) làm CA qua thành phần `istio-csr`, để khoá CA không nằm trong istiod. SPIFFE còn có một hiện thực khác ngoài mesh là SPIRE (D15 nói về nó); lưu ý tài liệu Istio ghi ambient chưa hỗ trợ SPIRE làm nguồn chứng chỉ.
+
+</Reveal>
+
+<Reveal title="Đã có mesh STRICT và AuthorizationPolicy, còn cần NetworkPolicy không?">
+
+Nên giữ, như một lớp phòng thủ thứ hai. AuthorizationPolicy chỉ có hiệu lực khi traffic đi qua proxy của mesh: pod có label `istio.io/dataplane-mode=none`, namespace bị gỡ label, istio-cni lỗi trên một node, hay ai đó gỡ Istio, đều làm lớp đó biến mất. NetworkPolicy do CNI thực thi, độc lập với mesh. Khi dùng cả hai với ambient, nhớ mở cổng 15008 cho chiều vào; tài liệu Istio cũng lưu ý health check của kubelet tới pod ambient đi từ một địa chỉ link-local riêng (169.254.7.127), CNI nào có chính sách chặn mặc định phải cho phép địa chỉ đó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI giải thích một dòng log ztunnel, viết khung AuthorizationPolicy hay PeerAuthentication, hoặc so sánh sidecar với ambient cho một hệ cụ thể. AI hay sai ở: (1) viết điều kiện HTTP (`methods`, `paths`) vào policy dùng `selector` ở ambient mà không có waypoint, và policy đó thành `DENY` toàn bộ; (2) ghi `principals` kèm tiền tố `spiffe://`; (3) đề xuất `istio-injection=enabled` khi bạn hỏi về ambient, hoặc gắn cả hai label lên một namespace; (4) cho rằng `PeerAuthentication` mode `DISABLE` tắt được mã hoá ở ambient; (5) dùng `apiVersion: security.istio.io/v1beta1` cũ. Kiểm bằng cụm thật: `istioctl ztunnel-config workloads` cho biết pod có vào mesh không, và một lời gọi kèm log ztunnel bên nhận cho biết policy làm gì.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.4 dạy NetworkPolicy, lớp mà AuthorizationPolicy bổ sung chứ không thay. K2.3 là RBAC quyết định ai tạo được pod mang ServiceAccount nào. K8.3 và K9.4 dạy admission webhook, cơ chế tiêm sidecar. D9.6 dạy Envoy và xDS, nền của waypoint và sidecar. D9.4 và K6.2 là CA nội bộ và cert-manager để thay CA tự ký của istiod. K11.2 thêm waypoint để có định tuyến và chính sách tầng 7; K11.3 đo cái giá của sidecar so với ambient và nâng cấp Istio. D15 đi vào SPIFFE và SPIRE ngoài mesh. Mesh nhiều cụm nằm ngoài phạm vi K11; K10 nói về vận hành nhiều cụm.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d18.1.mastery-giai-thich">Tự đưa được một namespace khác (ứng dụng của bạn, không phải `k11-app`) vào ambient, rồi chứng minh cho đồng đội bằng `tcpdump` trên node và log ztunnel rằng traffic của nó đã được mã hoá và mang danh tính đúng.</Check>
+
+<Check id="d18.1.mastery-khoa-namespace">Tự khoá được một namespace theo đúng thứ tự: đưa client vào mesh, kiểm log, bật `STRICT`, rồi viết AuthorizationPolicy theo ServiceAccount và kiểm bằng log ztunnel.</Check>
+
+<Check id="d18.1.mastery-danh-tinh">Lập được danh sách các ServiceAccount đang có danh tính trong mesh ở namespace của mình, và chỉ ra được ai (theo RBAC) có quyền tạo pod mang từng danh tính đó.</Check>
+
+</Mastery>

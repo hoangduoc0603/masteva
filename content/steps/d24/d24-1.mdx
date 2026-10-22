@@ -1,0 +1,995 @@
+---
+title: "PostgreSQL HA khi vận hành: commit đồng bộ, replication lag và connection pooling"
+description: Đo cái giá của replication đồng bộ và chọn mức synchronous_commit cho từng loại dữ liệu, làm một replica tụt lại bằng truy vấn dài để thấy đọc ra dữ liệu cũ và đo lag bằng pg_stat_replication cùng metric của CloudNativePG, dựng PgBouncer bằng Pooler để 150 client dùng chung 10 kết nối thật, rồi đo điều client thấy khi failover và switchover, kể cả một lỗi xác thực thật của CNPG 1.30 với pooler.
+id: d24.1
+step: d24
+prerequisites: [k7.4]
+topics: [d24.postgres-ha, d24.pooling-replication-lag]
+status: verified
+verified:
+  date: 2026-10-22
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.36.1 (bản đi kèm Docker Desktop)
+    cloudnative-pg: 1.30.1 (operator và plugin kubectl cnpg)
+    postgresql: 18.6 (image ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie)
+    pgbouncer: 1.26.1 (image ghcr.io/cloudnative-pg/pgbouncer:1.26.1)
+---
+
+<Goal>
+
+K7.4 đã dựng một cụm CloudNativePG ba instance, đo failover và cho thấy replication đồng bộ có thể làm ghi đứng yên. Bài này đi tiếp ở phía vận hành hằng ngày: những con số bạn phải theo dõi và những quyết định bạn phải chọn khi cụm đó phục vụ ứng dụng thật. Học xong, bạn giải thích được:
+
+- Mỗi lệnh `COMMIT` chờ những gì ở từng mức `synchronous_commit`, đo được cái giá của replication đồng bộ, và chọn mức nào cho loại dữ liệu nào.
+- Replica tụt lại phía sau vì đâu, đo độ trễ đó bằng cách nào, và vì sao người dùng thấy "vừa lưu xong mà không thấy".
+- Vì sao PostgreSQL cần connection pooler, PgBouncer ở chế độ transaction đổi lấy gì, và dựng nó bằng `Pooler` của CNPG.
+- Ứng dụng thấy gì khi primary đổi, có và không có pooler, và làm sao để một lần switchover có kế hoạch không trả lỗi nào cho client.
+
+</Goal>
+
+<Knowledge>
+
+### `COMMIT` chờ những gì
+
+K7.4 đã dạy WAL, streaming replication và hai chế độ bất đồng bộ, đồng bộ. Ở mức vận hành cần nhìn kỹ hơn: "đồng bộ" có năm mức, chọn bằng tham số `synchronous_commit`, và tham số đó đặt được **cho từng transaction**.
+
+Đường đi của một commit khi có một standby đồng bộ:
+
+```text
+ client        primary                          standby đồng bộ
+   |  COMMIT     |                                   |
+   |-----------> | (1) ghi WAL, flush xuống đĩa       |
+   |             | ---------- gửi WAL --------------> |
+   |             |                                   | (2) write: WAL vào bộ nhớ đệm của OS
+   |             |                                   | (3) flush: WAL xuống đĩa
+   |             |                                   | (4) apply: phát lại, query trên standby thấy được
+   |             | <------- phản hồi vị trí ---------|
+   | <---------- | trả "COMMIT" khi đã đủ mức chờ     |
+```
+
+| `synchronous_commit` | `COMMIT` trả về khi | Mất gì nếu sự cố ngay sau đó |
+|---|---|---|
+| `off` | Chưa cần flush WAL trên primary | Primary crash: mất các commit trong tối đa 3 × `wal_writer_delay` (mặc định 3 × 200 ms); dữ liệu không hỏng, như thể các transaction đó bị huỷ |
+| `local` | (1) xong | Primary mất hẳn: mất những gì standby chưa nhận |
+| `remote_write` | (2) xong trên đủ standby đồng bộ | Primary và OS của standby cùng chết: có thể mất |
+| `on` (mặc định) | (3) xong trên đủ standby đồng bộ | Chỉ mất khi đĩa của primary và mọi standby đồng bộ cùng hỏng |
+| `remote_apply` | (4) xong trên đủ standby đồng bộ | Như `on`, và đọc trên standby đó thấy ngay giá trị vừa ghi |
+
+Ba điểm hay bị hiểu sai:
+
+- Khi `synchronous_standby_names` rỗng (cụm bất đồng bộ, mặc định của CNPG), `remote_write`, `on` và `remote_apply` đều chỉ chờ (1), giống `local`. Replication đồng bộ bật bằng danh sách standby, không bằng `synchronous_commit`. Trong CNPG danh sách đó do operator điền khi bạn khai `.spec.postgresql.synchronous` (K7.4: `method: any`, `number: 1` cho ra `ANY 1 (...)`).
+- `off` không làm hỏng database. Nó đổi vài trăm mili giây commit cuối cùng lấy tốc độ, khác hẳn `fsync = off` (có thể làm hỏng dữ liệu).
+- Tham số đổi được trong một transaction: `SET LOCAL synchronous_commit = local` chỉ áp cho transaction đang chạy. Một cụm có thể bật đồng bộ cho đơn hàng và thanh toán, còn ghi log truy cập hay phiên đăng nhập thì chỉ chờ đĩa của primary.
+
+<Check id="d24.1.synchronous-commit">Kể được năm mức `synchronous_commit`, mỗi mức `COMMIT` chờ tới bước nào và mất gì khi sự cố, và giải thích được vì sao `on` trên cụm không có standby đồng bộ chỉ chờ đĩa của primary.</Check>
+
+### Cái giá của đồng bộ, và chọn mức cho từng loại dữ liệu
+
+Với mức `on`, thời gian một commit tối thiểu bằng flush trên primary cộng một vòng mạng tới standby cộng flush trên standby. Trong cùng một máy, vòng mạng chỉ vài chục micro giây; giữa hai availability zone (AZ, các trung tâm dữ liệu tách biệt trong một vùng cloud) thường cỡ 1 tới 2 ms; giữa hai vùng là hàng chục mili giây. Mỗi kết nối chỉ commit tuần tự, nên độ trễ đó chia thẳng vào số transaction mỗi giây của từng kết nối. Bước 2 của lab đo con số này bằng cách thêm độ trễ mạng giả lập vào đường tới replica.
+
+Cái giá thứ hai K7.4 đã cho thấy: với `dataDurability: required` (mặc định khi bật `synchronous`), thiếu standby thì ghi đứng yên. `dataDurability: preferred` cho primary tiếp tục ghi bất đồng bộ khi không đủ standby, đổi lại RPO (lượng dữ liệu có thể mất) không còn là 0 trong lúc đó.
+
+| Loại dữ liệu | Mức gợi ý | Lý do |
+|---|---|---|
+| Tiền, đơn hàng, thứ không tạo lại được | `on` với `ANY 1` trên cụm ba instance | Mất một commit đã báo thành công là sự cố nghiêm trọng; ba instance chịu được mất một standby mà vẫn ghi |
+| Dữ liệu ghi xong phải đọc lại ngay từ replica | `remote_apply` cho đúng các transaction đó | Đọc trên standby đồng bộ thấy ngay; chậm hơn `on` vì chờ phát lại |
+| Log truy cập, phiên đăng nhập, bộ đếm | `local`, hoặc `off` | Tạo lại được hoặc mất vài giây không sao; không nên trả độ trễ mạng cho chúng |
+| Cụm hai instance | Cân nhắc `preferred` hoặc bất đồng bộ | `required` với một standby: standby khởi động lại là ghi đứng |
+
+Đồng bộ chỉ che mất dữ liệu khi **mất một máy**. Nó không che lệnh xoá nhầm (lệnh đó được chép sang standby ngay) và không thay được backup.
+
+<Check id="d24.1.gia-dong-bo">Giải thích được độ trễ commit ở mức `on` gồm những phần nào và vì sao nó tăng theo khoảng cách tới standby, và chọn được mức `synchronous_commit` cho ba loại dữ liệu khác nhau có lý do.</Check>
+
+### Replication lag: replica tụt lại bao xa
+
+**Replication lag** (độ trễ replication) là khoảng cách giữa điều primary đã commit và điều replica đã phát lại. View `pg_stat_replication` trên primary có một dòng cho mỗi standby, với ba vị trí WAL và ba độ trễ thời gian tương ứng ba bước (2), (3), (4) ở sơ đồ trên:
+
+| Cột | Ý nghĩa |
+|---|---|
+| `sent_lsn` | WAL primary đã gửi đi |
+| `write_lsn`, `flush_lsn`, `replay_lsn` | WAL standby đã ghi, đã flush, đã phát lại |
+| `write_lag`, `flush_lag`, `replay_lag` | Thời gian từ lúc primary flush một đoạn WAL tới lúc standby báo đã tới bước tương ứng |
+
+Lag đo bằng **byte** (`pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)`) cho biết replica còn bao nhiêu việc; đo bằng **thời gian** cho biết dữ liệu trên replica cũ bao lâu.
+
+Trên replica, `now() - pg_last_xact_replay_timestamp()` là tuổi của transaction cuối cùng đã phát lại. Con số này cũng tăng khi primary đơn giản là không có ai ghi, nên chỉ đọc nó cùng với lag tính bằng byte. CNPG xuất sẵn metric `cnpg_pg_replication_lag` (giây, tính theo đúng công thức đó) trên cổng 9187 của mỗi pod; kết quả truy vấn được cache 30 giây. D12.2 đã dạy cách Prometheus thu metric như vậy.
+
+Replica tụt lại vì bốn nhóm nguyên nhân:
+
+- **Phát lại không kịp:** primary ghi rất nhiều (backfill, xoá hàng loạt; D19.3 bàn kỹ), hoặc replica thiếu CPU hay I/O vì đang phục vụ truy vấn đọc nặng. Phát lại WAL chạy trên một tiến trình duy nhất.
+- **Xung đột với truy vấn trên replica:** một truy vấn đang đọc bảng trên replica, trong khi WAL tới cần một khoá `ACCESS EXCLUSIVE` trên đúng bảng đó (do `ALTER TABLE`, `TRUNCATE`, `DROP` trên primary) hoặc cần dọn những dòng truy vấn đó còn thấy. Replica phải chọn: chờ truy vấn, hoặc huỷ nó. Nó chờ tối đa `max_standby_streaming_delay` (mặc định 30 giây), rồi huỷ truy vấn với lỗi `canceling statement due to conflict with recovery`. Trong lúc chờ, **toàn bộ** việc phát lại dừng, không riêng bảng đó.
+- **Mạng chậm hoặc đứt** giữa primary và replica.
+- **Replica dừng hẳn.**
+
+Hậu quả của lag, theo thứ tự hay gặp:
+
+1. **Đọc thấy dữ liệu cũ.** Người dùng lưu xong, trang tải lại đọc từ replica (Service `-ro`) và không thấy thứ vừa lưu. Đây là vấn đề **đọc-sau-ghi** (read-after-write): đọc ngay sau khi ghi phải đi vào primary, hoặc chờ replica theo kịp.
+2. **Đĩa của primary đầy.** CNPG mặc định tạo một **replication slot** cho mỗi replica: primary giữ lại mọi WAL mà replica chưa nhận. Replica dừng lâu thì `pg_wal` trên primary phình mãi, trừ khi đặt `max_slot_wal_keep_size` (tài liệu CNPG khuyên đặt rõ).
+3. **Failover mất dữ liệu.** Với replication bất đồng bộ, replica được promote thiếu đúng phần lag của nó.
+
+Cách xử lý ở phía vận hành:
+
+- Cảnh báo trên lag theo cả byte lẫn giây.
+- Đưa truy vấn báo cáo dài sang một replica riêng, và đặt `max_standby_streaming_delay` theo vai của replica: replica dự phòng cho HA đặt thấp, replica báo cáo đặt cao hơn.
+- Dùng readiness probe kiểu `streaming` của CNPG với `maximumLag` để rút replica tụt quá xa khỏi Service. Tài liệu CNPG cảnh báo dùng tuỳ chọn này thận trọng: replica không sẵn sàng cũng mất tư cách được promote khi failover.
+- `hot_standby_feedback = on` tránh được loại xung đột do dọn dòng cũ, đổi lại primary giữ dòng chết lâu hơn (bloat).
+
+<Callout kind="production">
+
+Theo [bài tường thuật của Intercom](https://www.finstatus.com/us-hosting/incidents/01KGYCNMW8NH671AAGHE91BG33/write-up), ngày 27/01/2026 từ 17:03 tới 22:09 UTC, dưới 1% khách hàng thấy độ trễ thất thường và **dữ liệu cũ** khi đọc. Database của họ là PlanetScale (MySQL với Vitess), chia shard. Trên một shard, hai việc nặng chạy cùng lúc: tiến trình xoá dữ liệu của các workspace bị huỷ, chạy nhiều bước song song hơn thường lệ và **không giới hạn tốc độ**, và pipeline ETL đọc dữ liệu cho phân tích. Hai replica của shard đó lên 100% CPU, không phát lại kịp luồng thay đổi từ primary, và lag tăng dần tới **2,2 giờ**. Người dùng thấy hội thoại vừa tạo không hiện ra, tin nhắn tưởng như chưa gửi dù đã ghi thành công, thay đổi cài đặt như không có tác dụng. Ghi vẫn chạy bình thường suốt sự cố và họ không thấy dấu hiệu mất dữ liệu.
+
+Mốc thời gian theo bài: 17:25 alert về hàng đợi tồn của worker tự mở sự cố; 18:25 tắt ETL; 21:33 hạ số worker xoá về 0 và bật lại ETL; 22:09 replica về mức CPU bình thường, hết lag. Việc đã làm sau đó: tăng dung lượng shard, thêm giới hạn tốc độ cho tiến trình xoá để nó lùi lại khi database đang tải cao; việc đang làm: tách tải nền như ETL khỏi tải phục vụ khách, và cảnh báo lag sớm hơn, gắn được với tải gây ra nó.
+
+Điều rút ra cho bài này (của bài): alert đầu tiên đến từ một triệu chứng gián tiếp, 22 phút sau khi lag bắt đầu; một alert trực tiếp trên lag sẽ chỉ thẳng vào nguyên nhân. Và việc nền chạy không điều tiết là nguồn lag hay gặp; D19.3 làm một backfill có điều tiết theo đúng tín hiệu này.
+
+</Callout>
+
+<Check id="d24.1.replication-lag">Đọc được `pg_stat_replication` và chỉ ra lag theo byte và theo thời gian, kể được bốn nhóm nguyên nhân làm replica tụt lại và ba hậu quả của lag, và giải thích được vì sao một truy vấn dài trên replica có thể dừng toàn bộ việc phát lại.</Check>
+
+### Vì sao PostgreSQL cần connection pooler
+
+PostgreSQL tạo **một tiến trình hệ điều hành cho mỗi kết nối**. Mỗi tiến trình tốn bộ nhớ riêng (vài MB lúc rảnh, nhiều hơn hẳn khi chạy truy vấn có sắp xếp hay băm, theo `work_mem`), và nhiều kết nối làm tăng chi phí quản lý chung của server (khoá, snapshot của transaction). `max_connections` mặc định là 100, trong đó vài kết nối để dành cho superuser (`superuser_reserved_connections`, mặc định 3); hết chỗ, kết nối mới của user thường bị từ chối ngay với lỗi `remaining connection slots are reserved for roles with the SUPERUSER attribute` (hoặc `sorry, too many clients already` khi hết hẳn).
+
+Phía ứng dụng, mỗi pod giữ một pool riêng (HikariCP, pool kết nối mặc định của Spring Boot, mở tối đa 10 kết nối; SB12 dạy cách cấu hình). Nhân lên theo số pod: 30 pod là 300 kết nối mở sẵn, vượt xa `max_connections`; HPA thêm pod lúc cao điểm là thêm kết nối đúng lúc database đang bận; và phần lớn các kết nối đó đang rảnh.
+
+Một **connection pooler** đứng giữa: nhận hàng trăm, hàng nghìn kết nối từ client và chia nhau một số ít kết nối thật tới PostgreSQL.
+
+```text
+  pod 1 (pool 10) ---\                       /--- kết nối thật 1
+  pod 2 (pool 10) ----+--> PgBouncer ----+------- kết nối thật 2      PostgreSQL
+  ...                 |  (300 kết nối     |       ...                  (pg-rw)
+  pod 30 (pool 10) --/    client, mỗi cái \--- kết nối thật 20
+                          chỉ tốn vài KB)
+```
+
+**PgBouncer** là pooler phổ biến nhất cho PostgreSQL. Nó có ba chế độ, khác nhau ở lúc trả kết nối thật về pool:
+
+| Chế độ | Kết nối thật thuộc về client trong | Tiết kiệm kết nối | Tương thích |
+|---|---|---|---|
+| `session` | Cả phiên kết nối của client | Ít: chỉ có lợi khi client đóng mở kết nối liên tục | Mọi tính năng |
+| `transaction` | Một transaction | Nhiều: 300 client rảnh phần lớn thời gian dùng chung 20 kết nối | Mất các tính năng gắn với phiên (bảng dưới) |
+| `statement` | Một câu lệnh; cấm transaction nhiều câu | Nhiều nhất | Hẹp nhất |
+
+Chế độ `transaction` là lý do chính để dùng PgBouncer, và cái giá là những gì gắn với **phiên** không còn đúng nữa, vì hai transaction liên tiếp của cùng một client có thể chạy trên hai kết nối thật khác nhau:
+
+| Tính năng | Ở chế độ transaction | Hậu quả |
+|---|---|---|
+| `SET` (không có `LOCAL`) | Không dùng được | Giá trị nằm lại trên kết nối thật và rò sang client khác dùng kết nối đó sau; dùng `SET LOCAL` trong transaction |
+| `PREPARE`, `EXECUTE` bằng SQL | Không dùng được | `prepared statement ... does not exist` khi lần sau rơi vào kết nối khác |
+| Prepared statement ở mức giao thức (JDBC, pgx dùng) | Dùng được từ PgBouncer 1.21 khi `max_prepared_statements` khác 0; mặc định bật (200) từ 1.24 | PgBouncer tự chuẩn bị lại câu lệnh trên kết nối mới |
+| Advisory lock mức phiên, `LISTEN`, bảng tạm sống qua transaction, cursor `WITH HOLD` | Không dùng được | Khoá hay sự kiện gắn với một kết nối thật mà client không còn giữ |
+
+CNPG dựng PgBouncer bằng CRD **`Pooler`**: một Deployment chạy PgBouncer, một Service cùng tên, trỏ vào Service `-rw` (hoặc `-ro`) của một Cluster. Operator tự tạo user `cnpg_pooler_pgbouncer` và một hàm tra mật khẩu để PgBouncer xác thực client bằng chính user và mật khẩu trong PostgreSQL; ứng dụng chỉ đổi host, giữ nguyên tài khoản. Metric của PgBouncer nằm trên cổng 9127 với tiền tố `cnpg_pgbouncer_`. Hai metric cần nhìn: `cnpg_pgbouncer_pools_cl_waiting` (client đang chờ một kết nối thật) và `cnpg_pgbouncer_pools_maxwait` (client chờ lâu nhất bao nhiêu giây); hai số này tăng nghĩa là pool thật quá nhỏ hoặc database chậm.
+
+<Check id="d24.1.pooler">Giải thích được vì sao mỗi kết nối PostgreSQL đắt và số kết nối nhân lên thế nào theo số pod, so sánh được ba chế độ của PgBouncer, và kể được ít nhất ba tính năng không dùng được ở chế độ transaction cùng cách tránh.</Check>
+
+### Failover nhìn từ phía ứng dụng
+
+Khi primary đổi, mọi kết nối tới primary cũ đứt. Ứng dụng thấy gì phụ thuộc vào nó nối thẳng hay qua pooler:
+
+| | Nối thẳng `pg-rw` | Qua PgBouncer |
+|---|---|---|
+| Kết nối của ứng dụng | Đứt; pool phải phát hiện, bỏ, mở lại | Kết nối tới PgBouncer còn nguyên; chỉ kết nối thật phía sau đứt |
+| Transaction đang chạy dở | Lỗi; không biết đã commit hay chưa | Lỗi như vậy |
+| Yêu cầu mới trong lúc chưa có primary | Lỗi kết nối ngay (connection refused hoặc timeout) | Xếp hàng trong PgBouncer, chờ tối đa `query_wait_timeout` (mặc định 120 giây); có thể nhận lỗi trong khoảng `server_login_retry` (mặc định 15 giây) sau một lần nối thất bại |
+| Sau khi có primary mới | Chạy lại khi pool mở kết nối mới | PgBouncer nối lại `pg-rw`, hàng đợi chạy tiếp |
+
+Đoạn tiếp theo cần một khái niệm về xác thực. **SCRAM-SHA-256** là cách PostgreSQL kiểm mật khẩu mà không truyền mật khẩu qua mạng: server chỉ lưu một *verifier* gồm salt ngẫu nhiên, số vòng lặp và hai khoá băm từ mật khẩu; đặt lại cùng một mật khẩu sẽ ra salt và verifier mới.
+
+Pooler không xoá được gián đoạn; nó đổi một phần **lỗi** thành **chờ**, với một điều kiện ít được nhắc: PgBouncer phải đăng nhập được vào primary mới thay cho client. CNPG cho PgBouncer lấy thông tin xác thực SCRAM của user qua một truy vấn tra cứu (`auth_query`); PgBouncer dùng lại khoá SCRAM của client để mở kết nối thật, và tài liệu PgBouncer nói rõ cách này chỉ chạy khi bí mật SCRAM trên server **giống hệt** (cùng salt, không chỉ cùng mật khẩu). Bước 5 của lab cho thấy điều đó vỡ ra sao sau failover với CNPG 1.30.
+
+Với switchover có kế hoạch thì làm được hơn thế: lệnh `PAUSE` của PgBouncer chờ các transaction đang chạy xong, đóng kết nối thật, và giữ mọi yêu cầu mới lại; đổi primary xong thì `RESUME`. CNPG cho làm việc đó bằng một trường: `spec.pgbouncer.paused: true` trên `Pooler`. Tài liệu CNPG hướng dẫn đúng trình tự: tạm dừng pooler, `kubectl cnpg promote`, rồi bỏ tạm dừng. Bước 6 của lab làm và đo trình tự này.
+
+Phía ứng dụng vẫn phải có ba thứ: thử lại có giới hạn khi gặp lỗi kết nối (D18.2 đã cho thấy thử lại không giới hạn biến một lần failover thành bão request), timeout khi chờ lấy kết nối, và thao tác ghi quan trọng phải idempotent (làm hai lần cho kết quả như một lần) vì transaction lỗi giữa chừng có thể đã commit.
+
+<Check id="d24.1.failover-client">So sánh được điều ứng dụng thấy khi failover lúc nối thẳng và lúc qua PgBouncer, và giải thích được `PAUSE` của PgBouncer giúp gì cho switchover có kế hoạch và vì sao ứng dụng vẫn cần retry có giới hạn và thao tác idempotent.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [CloudNativePG 1.30: Replication](https://cloudnative-pg.io/docs/1.30/replication/): mục "Synchronous Replication" (quorum, `dataDurability`) và "Replication slots", gồm khuyến nghị đặt `max_slot_wal_keep_size`.
+- [CloudNativePG 1.30: Connection Pooling](https://cloudnative-pg.io/docs/1.30/connection_pooling/): CRD `Pooler`, xác thực qua `auth_query`, các tham số PgBouncer được phép đổi, metric cổng 9127 và mục "Pausing connections".
+- [PostgreSQL 18: Hot Standby](https://www.postgresql.org/docs/18/hot-standby.html): mục 26.4.2 "Handling Query Conflicts", vì sao truy vấn trên replica bị huỷ và `max_standby_streaming_delay`, `hot_standby_feedback` đổi lấy gì.
+- [PgBouncer: Features](https://www.pgbouncer.org/features.html): bảng tính năng của PostgreSQL theo từng chế độ pool; kèm trang [Configuration](https://www.pgbouncer.org/config.html) cho `max_prepared_statements`, `server_login_retry` và giới hạn của SCRAM pass-through.
+- [Intercom: Latency in the inbox for a subset of customers](https://www.finstatus.com/us-hosting/incidents/01KGYCNMW8NH671AAGHE91BG33/write-up): nguồn của callout; đọc phần mốc thời gian và các việc đã làm sau sự cố.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài dựng một cụm kind riêng `d19-lab` một node. Các bài sau của chặng cũng dùng tên cụm này, mỗi bài dựng phần của mình rồi gỡ. Cần Docker Desktop, `kind`, `kubectl` (1.36 hay 1.37 đều được), `curl`.
+
+**Profile máy.** Cụm kind một node với ba instance PostgreSQL, một pod PgBouncer và pod `bench` dùng khoảng 1,4 GiB RAM của Docker lúc nặng nhất (đo bằng `docker stats` ở bước 6), 2 tới 3 GB đĩa. Lần đầu node phải kéo image PostgreSQL (khoảng 80 MB), PgBouncer và operator, nên bước 1 mất 3 tới 10 phút tuỳ mạng. Máy 8 GB: đặt Docker 4 GB, dừng mọi VM và cụm kind khác; bài chạy được nếu giảm `instances` xuống 2 ở bước 1 (khi đó bước 3 dùng replica duy nhất, và bước 6 vẫn làm được).
+
+Ba điều lab làm cho gọn mà production không làm: cả ba instance nằm trên một node (production đặt mỗi instance một node, một zone); độ trễ mạng giữa các zone được giả lập bằng `tc netem` trên node; và pooler chỉ có một pod.
+
+<Callout kind="danger">
+
+Bài này cố ý khoá bảng trên replica, xoá pod primary và đổi primary. Mọi lệnh chỉ dành cho cụm lab. Khối lệnh đầu tiên in `kubectl config current-context`; dòng đó phải là `kind-d19-lab`, và mọi terminal của bài dùng kubeconfig riêng `~/masteva-d24/kubeconfig`.
+
+</Callout>
+
+### 1. Cụm kind và một cụm PostgreSQL ba instance
+
+K7.4 đã dạy từng phần của bước này; ở đây chỉ dựng lại cho nhanh. Khối dưới tạo thư mục lab, một cụm kind với image node ghim theo digest và kubeconfig riêng (không đụng `~/.kube/config`), rồi cài operator CloudNativePG 1.30.1 và plugin `kubectl cnpg` (cần cho bước 6). Cả hai đều được **kiểm sha256** trước khi dùng: manifest so với digest GitHub công bố cho file `cnpg-1.30.1.yaml`, plugin so với file checksum của cùng bản phát hành. Không khớp thì lệnh sau không chạy.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+mkdir -p ~/masteva-d24/d24-1 ~/masteva-d24/bin && cd ~/masteva-d24/d24-1
+kind create cluster --name d19-lab \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+kubectl config current-context
+curl -sLO https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml
+echo "37237f145d8138256ea25ae830f87759255665ff08f8d552fdd8224a5ec032fb  cnpg-1.30.1.yaml" | shasum -a 256 -c - \
+  && kubectl apply --server-side -f cnpg-1.30.1.yaml > /dev/null
+kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=300s
+V=1.30.1; OS=$(uname -s | tr A-Z a-z); ARCH=$(uname -m | sed 's/aarch64/arm64/')
+F=kubectl-cnpg_${V}_${OS}_${ARCH}.tar.gz
+curl -sLO https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v$V/$F
+curl -sL https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v$V/cnpg-$V-checksums.txt \
+  | grep " $F\$" | shasum -a 256 -c - \
+  && tar -xzf $F -C ~/masteva-d24/bin kubectl-cnpg
+export PATH=~/masteva-d24/bin:$PATH
+kubectl cnpg version
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Creating cluster "d19-lab" ...
+...
+kind-d19-lab
+cnpg-1.30.1.yaml: OK
+deployment "cnpg-controller-manager" successfully rolled out
+kubectl-cnpg_1.30.1_darwin_arm64.tar.gz: OK
+Build: {Version:1.30.1 Commit:2a35abb46 Date:2026-09-23}
+```
+
+</Expected>
+
+Kết quả mẫu là của macOS arm64; máy Intel tải đúng file `darwin_x86_64` mà khối lệnh ghép ra. Dòng `rollout status` có thể in thêm vài dòng `Waiting for deployment...` trước dòng cuối.
+
+**Mở terminal mới giữa chừng bài** (ví dụ sau khi máy khởi động lại, hoặc Terminal 2 ở bước 3 cần thêm lệnh) thì dán khối dưới trước: nó đặt lại kubeconfig, `PATH`, thư mục, namespace và ba hàm mà các bước sau dùng. Dán nó ngay bây giờ cũng không sao.
+
+<Terminal where="mac" title="Khi mở terminal mới">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+export PATH=~/masteva-d24/bin:$PATH
+mkdir -p ~/masteva-d24/d24-1 && cd ~/masteva-d24/d24-1
+kubectl config set-context --current --namespace d19-db > /dev/null
+sql() { kubectl exec "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -Atc "$1"; }
+bench() { kubectl exec bench -- env PGOPTIONS="$1" pgbench -h pg-rw -n -c 4 -j 4 -T 15 -f /scripts/commit.sql 2>&1 | grep -E 'latency average|^tps'; }
+load() { kubectl exec bench -- sh -c "pgbench -h $1 -n -c $2 -j 4 -T 15 -f /scripts/select.sql > /tmp/load.out 2>&1 & sleep 8; psql -h pg-rw -Atc \"select 'kết nối thật của app: ' || count(*) from pg_stat_activity where usename = 'app' and backend_type = 'client backend'\"; wait; grep -E '^tps|FATAL' /tmp/load.out | sed 's/.*FATAL: */FATAL: /' | head -1"; }
+```
+
+</Terminal>
+
+Giờ là cụm `pg`, cùng image PostgreSQL 18.6 như K7.4 nhưng ghim thêm digest. Tham số `max_standby_streaming_delay` được nới lên 120 giây để bước 3 kịp quan sát một replica tụt lại; mặc định là 30 giây (phần Kiến thức).
+
+<Terminal where="mac" title="~/masteva-d24/d24-1/pg.yaml">
+
+```bash
+kubectl create namespace d19-db
+kubectl config set-context --current --namespace d19-db > /dev/null
+cat > pg.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage:
+    size: 1Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  postgresql:
+    parameters:
+      max_standby_streaming_delay: "120s"
+EOF
+kubectl apply -f pg.yaml
+kubectl wait --for=condition=Ready cluster/pg --timeout=900s
+kubectl get pods -l cnpg.io/podRole=instance -L cnpg.io/instanceRole
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/d19-db created
+cluster.postgresql.cnpg.io/pg created
+cluster.postgresql.cnpg.io/pg condition met
+NAME   READY   STATUS    RESTARTS   AGE   INSTANCEROLE
+pg-1   1/1     Running   0          48s   primary
+pg-2   1/1     Running   0          28s   replica
+pg-3   1/1     Running   0          11s   replica
+```
+
+</Expected>
+
+Ba pod, một primary và hai replica, cùng nằm trên node duy nhất.
+
+Cần một client nằm trong cụm. Pod `bench` dùng cùng image nên có sẵn `psql` và **`pgbench`** (công cụ đo tải đi kèm PostgreSQL), nhận tài khoản `app` từ Secret `pg-app` mà operator tạo, và mount một ConfigMap chứa ba file dùng ở các bước sau:
+
+- `commit.sql`: kịch bản `pgbench` cho bước 2, mỗi transaction chỉ chèn một dòng, nên thời gian của nó gần như toàn bộ là thời gian commit.
+- `select.sql`: kịch bản cho bước 4, một truy vấn đọc mất khoảng 20 ms.
+- `writer.sh`: "ứng dụng" cho bước 5 và 6. Nó giữ **một** kết nối `psql` mở lâu, như một kết nối trong pool của ứng dụng, chèn 5 dòng mỗi giây vào bảng `ticks` với tên của nó; mọi dòng lỗi, và mỗi lần kết nối đứt phải nối lại, được ghi kèm giờ vào `/tmp/<tên>.log`.
+
+Hàm `sql` chạy một câu SQL bằng user `postgres` trên primary hiện tại, như K7.4.
+
+<Terminal where="mac" title="~/masteva-d24/d24-1/bench.yaml">
+
+```bash
+cat > bench.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bench-scripts
+data:
+  commit.sql: |
+    insert into events (v) values (random());
+  select.sql: |
+    select pg_sleep(0.02);
+  writer.sh: |
+    #!/bin/sh
+    H=$1; N=$2
+    while true; do
+      while true; do echo "insert into ticks (src) values ('$N');"; sleep 0.2; done \
+        | psql -h "$H" -X -q 2>&1 | while read -r l; do echo "$(date -u +%T) $l"; done >> /tmp/$N.log
+      echo "$(date -u +%T) psql thoát, nối lại" >> /tmp/$N.log
+      sleep 0.2
+    done
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: bench
+      image: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+      command: ["sleep", "infinity"]
+      env:
+        - { name: PGDATABASE, value: app }
+        - { name: PGCONNECT_TIMEOUT, value: "2" }
+        - name: PGUSER
+          valueFrom: { secretKeyRef: { name: pg-app, key: username } }
+        - name: PGPASSWORD
+          valueFrom: { secretKeyRef: { name: pg-app, key: password } }
+      volumeMounts:
+        - { name: scripts, mountPath: /scripts }
+  volumes:
+    - name: scripts
+      configMap: { name: bench-scripts, defaultMode: 0755 }
+EOF
+kubectl apply -f bench.yaml
+kubectl wait --for=condition=Ready pod/bench --timeout=300s
+sql() { kubectl exec "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -Atc "$1"; }
+sql "create table events (id bigserial primary key, v float8); alter table events owner to app"
+sql "create table ticks (id bigserial primary key, src text not null, at timestamptz not null default clock_timestamp()); alter table ticks owner to app"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/bench-scripts created
+pod/bench created
+pod/bench condition met
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+```
+
+</Expected>
+
+### 2. Cái giá của một commit đồng bộ
+
+Đo cùng một tải nhiều lần: 4 client, 15 giây, mỗi transaction chèn một dòng qua `pg-rw`. Dòng `latency average` của `pgbench` là thời gian trung bình một transaction, chủ yếu là chờ commit. Hàm `bench` gói lệnh đó; tham số của nó, nếu có, được đưa vào `PGOPTIONS` để đặt tham số PostgreSQL cho phiên của client.
+
+Lần đầu: cụm bất đồng bộ, như mặc định.
+
+<Terminal where="mac">
+
+```bash
+bench() { kubectl exec bench -- env PGOPTIONS="$1" pgbench -h pg-rw -n -c 4 -j 4 -T 15 -f /scripts/commit.sql 2>&1 | grep -E 'latency average|^tps'; }
+sql "show synchronous_standby_names"
+bench ""
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+
+latency average = 0.552 ms
+tps = 7245.415388 (without initial connection time)
+```
+
+</Expected>
+
+Dòng đầu trống: không có standby đồng bộ nào. Giờ bật replication đồng bộ `ANY 1` như K7.4, chờ operator điền danh sách, rồi đo lại.
+
+<Terminal where="mac">
+
+```bash
+kubectl patch cluster pg --type merge -p '{"spec":{"postgresql":{"synchronous":{"method":"any","number":1}}}}'
+for i in $(seq 1 60); do [ -n "$(sql 'show synchronous_standby_names')" ] && break; sleep 2; done
+sql "show synchronous_standby_names"
+bench ""
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cluster.postgresql.cnpg.io/pg patched
+ANY 1 ("pg-2","pg-3","pg-1")
+latency average = 0.837 ms
+tps = 4780.933800 (without initial connection time)
+```
+
+</Expected>
+
+So hai lần đo: độ trễ trung bình tăng từ khoảng 0,45 tới 0,55 ms lên khoảng 0,8 ms, số transaction mỗi giây giảm gần một nửa. Trên máy bạn, con số tuyệt đối khác theo tốc độ đĩa và CPU (thường trong khoảng 0,3 tới 1 ms cho lần bất đồng bộ), nhưng tỉ lệ thì tương tự: mỗi commit giờ chờ thêm một lần gửi WAL sang standby và một lần standby flush xuống đĩa của nó. Đây là trường hợp tốt nhất, vì primary và replica nằm trên cùng một máy, cách nhau vài chục micro giây.
+
+Trên production, replica thường nằm ở zone khác. Khối dưới giả lập điều đó: trên node kind, nó tìm card mạng ảo (veth) dẫn vào mỗi pod replica và dùng `tc qdisc ... netem delay 2ms` để mọi gói tin đi vào replica chậm thêm 2 ms. Primary không bị đụng tới. Sau đó đo hai lần: một lần như bình thường, một lần đặt `synchronous_commit=local` cho phiên của client, tức là "transaction của phiên này không chờ standby".
+
+<Predict question="Replica chậm thêm 2 ms. Với `synchronous_commit=on` (mặc định), độ trễ trung bình mỗi transaction tăng khoảng bao nhiêu? Còn với `local`?">
+
+Với `on`, tăng khoảng 2 ms: mỗi commit phải chờ WAL đi tới một standby, và đường đi đó giờ dài thêm 2 ms; mọi thứ khác giữ nguyên. Với `local`, không tăng gì: commit chỉ chờ đĩa của primary, như cụm bất đồng bộ, dù danh sách standby đồng bộ vẫn còn đó. Replication vẫn chạy, chỉ là transaction đó không chờ.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+for ip in $(kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[*].status.podIP}'); do
+  docker exec d19-lab-control-plane sh -c "tc qdisc add dev \$(ip route get $ip | grep -o 'dev [^ ]*' | cut -d' ' -f2) root netem delay 2ms"
+done
+docker exec d19-lab-control-plane tc qdisc show | grep -c netem
+bench ""
+bench "-c synchronous_commit=local"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2
+latency average = 2.641 ms
+tps = 1514.343578 (without initial connection time)
+latency average = 0.499 ms
+tps = 8016.787446 (without initial connection time)
+```
+
+</Expected>
+
+Dòng `2` là hai qdisc `netem`, mỗi replica một cái. Độ trễ trung bình lên khoảng 2,6 ms, gần bằng 0,8 ms cộng 2 ms giả lập; số transaction mỗi giây của 4 client còn khoảng một phần sáu so với lúc bất đồng bộ. Phiên đặt `synchronous_commit=local` trở về khoảng 0,45 tới 0,5 ms trên cùng cụm đó. Đây là cách áp bảng "chọn mức cho từng loại dữ liệu" ở phần Kiến thức: ứng dụng đặt `SET LOCAL synchronous_commit = local` trong các transaction ghi dữ liệu tạo lại được, và giữ mặc định cho phần còn lại. Với replica ở vùng khác cách 30 ms, mỗi commit đồng bộ sẽ mất ít nhất 30 ms.
+
+Gỡ độ trễ giả lập và tắt replication đồng bộ trước khi sang bước sau.
+
+<Terminal where="mac">
+
+```bash
+for v in $(docker exec d19-lab-control-plane sh -c "tc qdisc show | grep netem | grep -o 'dev [^ ]*' | cut -d' ' -f2"); do
+  docker exec d19-lab-control-plane tc qdisc del dev $v root
+done
+kubectl patch cluster pg --type merge -p '{"spec":{"postgresql":{"synchronous":null}}}'
+for i in $(seq 1 60); do [ -z "$(sql 'show synchronous_standby_names')" ] && break; sleep 2; done
+docker exec d19-lab-control-plane tc qdisc show | grep -c netem
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+0
+```
+
+</Expected>
+
+<Check id="d24.1.lab-dong-bo">Đo được độ trễ commit khi bất đồng bộ, khi đồng bộ, khi replica ở xa, và khi một phiên tự chọn `synchronous_commit=local`, và giải thích được từng con số bằng đường đi của commit.</Check>
+
+### 3. Một truy vấn dài trên replica làm cả replica tụt lại
+
+Kịch bản thường gặp: ai đó chạy truy vấn báo cáo dài trên một replica, đúng lúc một migration `ALTER TABLE` chạy trên primary. Bạn cần hai terminal.
+
+Ở **Terminal 2**, mở một transaction trên replica thứ nhất, đọc bảng `events`, rồi giữ transaction đó mở 180 giây (như một báo cáo dài). Lệnh sẽ đứng yên; để nguyên nó.
+
+<Terminal where="mac" title="Terminal 2">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+R=$(kubectl -n d19-db get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[0].metadata.name}')
+echo "replica bị giữ: $R"
+kubectl -n d19-db exec $R -c postgres -- psql -U postgres app -c "begin" -c "select count(*) from events" -c "select pg_sleep(180)" -c "commit"
+```
+
+</Terminal>
+
+Quay lại **Terminal 1**. Khối dưới chạy `ALTER TABLE` thêm một cột trên primary: trên primary nó xong ngay, vì không ai giữ khoá trên primary. Rồi nó chèn 1.000 dòng mới, nghỉ 5 giây, và so số dòng thấy được trên primary và trên hai replica, cùng `pg_stat_replication` của primary.
+
+<Predict question="Primary đã có 1.000 dòng mới từ 5 giây trước. Replica bị giữ và replica còn lại mỗi bên thấy bao nhiêu dòng?">
+
+Replica còn lại thấy đủ 1.000 dòng: nó không bị gì. Replica bị giữ thấy **0 dòng**: nó không phát lại bất kỳ thứ gì sau `ALTER TABLE`, kể cả các dòng của một bảng hoàn toàn khác, vì việc phát lại WAL đi tuần tự và đang đứng ở bản ghi khoá đó. Replication vẫn nhận WAL bình thường; chỉ bước phát lại dừng.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+R=$(kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[0].metadata.name}')
+R2=$(kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[1].metadata.name}')
+sql "alter table events add column note text"
+sql "insert into ticks (src) select 'lo-1000' from generate_series(1, 1000)"
+sleep 5
+echo "primary: $(sql "select count(*) from ticks")"
+for p in $R $R2; do
+  echo "$p: $(kubectl exec $p -c postgres -- psql -U postgres app -Atc "select count(*) || ' dòng, transaction cuối phát lại cách đây ' || date_trunc('second', now() - pg_last_xact_replay_timestamp()) from ticks")"
+done
+kubectl exec $R -c postgres -- psql -U postgres app -Atc "set statement_timeout = '3s'" -c "select count(*) from events"
+sql "select application_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) as cach_bytes, date_trunc('second', replay_lag) as replay_lag from pg_stat_replication order by 1"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ALTER TABLE
+INSERT 0 1000
+primary: 1000
+pg-2: 0 dòng, transaction cuối phát lại cách đây 00:00:23
+pg-3: 1000 dòng, transaction cuối phát lại cách đây 00:00:05
+SET
+ERROR:  canceling statement due to statement timeout
+command terminated with exit code 1
+pg-2|167 kB|00:00:07
+pg-3|0 bytes|
+```
+
+</Expected>
+
+Đọc từ trên xuống:
+
+- `pg-2` (replica bị giữ, trên máy bạn có thể là `pg-3`) trả **0 dòng** cho bảng `ticks` mà primary đã có 1.000 dòng: đọc từ replica ra dữ liệu cũ. Transaction cuối nó phát lại đã cách đây từ hơn chục giây tới vài phút, tuỳ lúc cụm được ghi lần cuối trước khối này.
+- Đọc bảng `events` trên chính replica đó thì **treo**: truy vấn mới phải xếp hàng sau khoá `ACCESS EXCLUSIVE` mà tiến trình phát lại đang chờ lấy, giống hàng đợi khoá SB5.5 đã dạy, chỉ là trên replica. `statement_timeout` 3 giây cắt nó ra thành lỗi; không có timeout thì nó chờ cùng.
+- `pg_stat_replication` trên primary: `pg-2` chậm khoảng 160 kB WAL (con số trên máy bạn khác chút ít) và `replay_lag` vài giây và đang tăng; `pg-3` không chậm byte nào. `replay_lag` của replica đã theo kịp có thể là `00:00:00` hoặc trống khi nó không còn gì để báo.
+
+CNPG xuất cùng con số đó thành metric. Đọc trang metric của replica bị giữ qua API server (không cần port-forward) và lọc ra `cnpg_pg_replication_lag`. Kết quả truy vấn metric được cache 30 giây, nên con số có thể cũ hơn vài chục giây so với khối trước.
+
+<Terminal where="mac">
+
+```bash
+kubectl get --raw "/api/v1/namespaces/d19-db/pods/$R:9187/proxy/metrics" | grep '^cnpg_pg_replication_lag'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cnpg_pg_replication_lag 57.206267
+```
+
+</Expected>
+
+Chờ ở Terminal 2. Khoảng 2 phút sau `ALTER TABLE`, truy vấn ở đó bị huỷ:
+
+<Expected>
+
+```text
+replica bị giữ: pg-2
+BEGIN
+ count  
+--------
+ 323097
+(1 row)
+
+ERROR:  canceling statement due to conflict with recovery
+DETAIL:  User was holding a relation lock for too long.
+ROLLBACK
+```
+
+</Expected>
+
+Replica chờ truy vấn đúng `max_standby_streaming_delay` (120 giây trong lab, mặc định 30 giây), rồi huỷ nó: `canceling statement due to conflict with recovery`, kèm lý do "giữ khoá trên bảng quá lâu". Transaction ở Terminal 2 bị huỷ, nên `commit` thành `ROLLBACK`. Ngay sau đó replica phát lại phần WAL tồn và theo kịp. Khối dưới chờ tới khi không replica nào còn chậm, rồi đếm lại và đọc bộ đếm xung đột của replica đó.
+
+<Terminal where="mac">
+
+```bash
+for i in $(seq 1 60); do
+  [ "$(sql "select count(*) from pg_stat_replication where replay_lsn < pg_current_wal_lsn()")" = 0 ] && break
+  sleep 1
+done
+echo "$R: $(kubectl exec $R -c postgres -- psql -U postgres app -Atc 'select count(*) from ticks')"
+kubectl exec $R -c postgres -- psql -U postgres app -Atc "select confl_lock from pg_stat_database_conflicts where datname = 'app'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pg-2: 1000
+1
+```
+
+</Expected>
+
+Replica đã có đủ 1.000 dòng. `confl_lock` trong `pg_stat_database_conflicts` đếm số truy vấn bị huỷ vì xung đột khoá trên replica này; đây là con số nên đưa vào dashboard của mọi replica có người chạy truy vấn đọc.
+
+<Check id="d24.1.lab-lag">Tái hiện được một replica tụt lại vì xung đột khoá, đo được lag bằng `pg_stat_replication`, `pg_last_xact_replay_timestamp()` và metric `cnpg_pg_replication_lag`, thấy được đọc từ replica ra dữ liệu cũ, và giải thích được vì sao truy vấn trên replica bị huỷ sau đúng `max_standby_streaming_delay`.</Check>
+
+
+### 4. Nhiều client, ít kết nối thật: `Pooler`
+
+Trước khi có pooler, xem giới hạn: `max_connections` mặc định là 100, trong đó 3 kết nối để dành cho superuser. Chạy 80 client rồi 150 client nối thẳng vào `pg-rw`, mỗi client chạy liên tục câu đọc 20 ms của `select.sql`. Hàm `load` chạy `pgbench` trong nền ở pod `bench`, chờ 8 giây cho mọi client nối xong, đếm số kết nối thật của user `app` trên primary, rồi in hai dòng cuối của `pgbench`.
+
+<Terminal where="mac">
+
+```bash
+load() { kubectl exec bench -- sh -c "pgbench -h $1 -n -c $2 -j 4 -T 15 -f /scripts/select.sql > /tmp/load.out 2>&1 & sleep 8; psql -h pg-rw -Atc \"select 'kết nối thật của app: ' || count(*) from pg_stat_activity where usename = 'app' and backend_type = 'client backend'\"; wait; grep -E '^tps|FATAL' /tmp/load.out | sed 's/.*FATAL: */FATAL: /' | head -1"; }
+sql "show max_connections"
+load pg-rw 80
+load pg-rw 150
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+100
+kết nối thật của app: 81
+tps = 3706.860739 (without initial connection time)
+kết nối thật của app: 1
+FATAL: remaining connection slots are reserved for roles with the SUPERUSER attribute
+```
+
+</Expected>
+
+80 client chạy được: 81 kết nối thật (80 của `pgbench` và một của chính câu đếm). 150 client thì `pgbench` không mở đủ kết nối và bỏ cả lần đo: PostgreSQL từ chối với lỗi hết chỗ, phần còn lại để dành cho superuser. Lúc câu đếm chạy, `pgbench` đã dừng nên chỉ còn 1 kết nối. Với ứng dụng thật, đây là lúc pod mới khởi động không lấy được kết nối nào.
+
+Giờ thêm pooler. Object `Pooler` dưới đây dựng một pod PgBouncer (image ghim digest) trỏ vào `pg-rw`, chế độ `transaction`, mỗi cặp user và database được tối đa 10 kết nối thật (`default_pool_size`), nhận tối đa 500 kết nối client. Service của nó trùng tên Pooler: `pg-pooler-rw`.
+
+<Terminal where="mac" title="~/masteva-d24/d24-1/pooler.yaml">
+
+```bash
+cat > pooler.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: pg-pooler-rw
+spec:
+  cluster:
+    name: pg
+  instances: 1
+  type: rw
+  pgbouncer:
+    image: ghcr.io/cloudnative-pg/pgbouncer:1.26.1@sha256:9738cbb7fd5f31bf83e7e351bafe33e29d8bcad5baffc876f6c2e02bcc78e37c
+    poolMode: transaction
+    parameters:
+      max_client_conn: "500"
+      default_pool_size: "10"
+EOF
+kubectl apply -f pooler.yaml
+for i in $(seq 1 60); do kubectl get deploy pg-pooler-rw > /dev/null 2>&1 && break; sleep 1; done
+kubectl rollout status deploy/pg-pooler-rw --timeout=300s
+load pg-pooler-rw 150
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pooler.postgresql.cnpg.io/pg-pooler-rw created
+deployment "pg-pooler-rw" successfully rolled out
+kết nối thật của app: 11
+tps = 465.655037 (without initial connection time)
+```
+
+</Expected>
+
+150 client đều nối được, nhưng PostgreSQL chỉ thấy 11 kết nối thật của `app`: 10 của pool, 1 của câu đếm. Số transaction mỗi giây là khoảng 450, gần đúng 10 kết nối × 50 truy vấn 20 ms mỗi giây: pool thật là trần đồng thời. Pooler không làm database nhanh hơn; nó giữ database không bị quá tải bởi số kết nối, và bắt client xếp hàng thay vì bị từ chối.
+
+Bên trong PgBouncer, lệnh `SHOW POOLS` trên console quản trị cho thấy hàng đợi. Chạy lại tải 150 client và đọc console trong lúc tải đang chạy; console chỉ mở được từ trong pod PgBouncer.
+
+<Terminal where="mac">
+
+```bash
+P=$(kubectl get pods -l cnpg.io/poolerName=pg-pooler-rw -o jsonpath='{.items[0].metadata.name}')
+kubectl exec bench -- sh -c "pgbench -h pg-pooler-rw -n -c 150 -j 4 -T 15 -f /scripts/select.sql > /dev/null 2>&1 &"
+sleep 8
+kubectl exec $P -c pgbouncer -- psql -h /controller/run -p 5432 -U pgbouncer pgbouncer -c "show pools" | cut -c1-120
+sleep 8
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ database  |         user          | cl_active | cl_waiting | cl_active_cancel_req | cl_waiting_cancel_req | sv_active |
+-----------+-----------------------+-----------+------------+----------------------+-----------------------+-----------+
+ app       | app                   |        10 |        140 |                    0 |                     0 |        10 |
+ pgbouncer | pgbouncer             |         1 |          0 |                    0 |                     0 |         0 |
+ postgres  | cnpg_pooler_pgbouncer |         0 |          0 |                    0 |                     0 |         0 |
+(3 rows)
+```
+
+</Expected>
+
+Dòng `app`: 10 client đang có kết nối thật (`cl_active`), khoảng 140 client chờ (`cl_waiting`), 10 kết nối thật đang bận (`sv_active`). Con số `cl_waiting` trên máy bạn dao động theo thời điểm chụp. Dòng `postgres | cnpg_pooler_pgbouncer` là pool riêng PgBouncer dùng để chạy truy vấn tra cứu mật khẩu (`auth_query`), dòng `pgbouncer` là chính phiên console. Đây là cùng số liệu mà metric `cnpg_pgbouncer_pools_cl_waiting` và `cnpg_pgbouncer_pools_sv_active` xuất ra.
+
+<Check id="d24.1.lab-pooler">Cho thấy được 150 client nối thẳng làm PostgreSQL từ chối kết nối, dựng được `Pooler` chế độ transaction, đo được số kết nối thật khi đi qua pooler, và đọc được `cl_waiting`, `sv_active` trong `SHOW POOLS`.</Check>
+
+### 5. Failover: nối thẳng và qua pooler
+
+Chạy hai "ứng dụng" cùng lúc trong pod `bench`, cùng script `writer.sh`: `thang` nối thẳng `pg-rw`, `pooler` nối qua `pg-pooler-rw`. Mỗi cái giữ một kết nối lâu dài và chèn 5 dòng mỗi giây.
+
+<Terminal where="mac">
+
+```bash
+kubectl exec bench -- sh -c 'rm -f /tmp/*.log; nohup /scripts/writer.sh pg-rw thang > /dev/null 2>&1 & nohup /scripts/writer.sh pg-pooler-rw pooler > /dev/null 2>&1 &'
+sleep 5
+sql "select src, count(*) from ticks where src in ('thang', 'pooler') group by src order by src"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+pooler|26
+thang|26
+```
+
+</Expected>
+
+Giờ xoá pod primary, như K7.4. Biến `N` nhớ dòng cuối trước sự cố. Khối lệnh chờ tới khi có primary mới, cụm sẵn sàng, và cả hai writer đã ghi lại được.
+
+<Predict question="Cả hai writer cùng mất primary trong cùng một khoảng thời gian. Writer nào phải nối lại kết nối, writer nào ghi nhận nhiều dòng lỗi hơn?">
+
+Đoán thông thường: `thang` phải nối lại, `pooler` thì không, vì kết nối tới PgBouncer không đứt. Kết quả đo lại ngược. `thang` mất kết nối, nối lại vài lần trong khoảng một giây và chạy tiếp. `pooler` ngừng ghi khoảng 30 giây và nối lại hàng chục lần, với lỗi `password authentication failed`. Lý do nằm ở cơ chế xác thực, giải thích ngay sau kết quả.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+N=$(sql "select max(id) from ticks")
+P=$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')
+kubectl delete pod $P --wait=false
+for i in $(seq 1 300); do [ "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" != "$P" ] && break; sleep 1; done
+kubectl wait --for=condition=Ready cluster/pg --timeout=600s > /dev/null
+for i in $(seq 1 120); do [ "$(sql "select count(distinct src) from ticks where at > now() - interval '3 seconds'")" = 2 ] && break; sleep 1; done
+echo "primary mới: $(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')"
+sql "select src, count(*), date_trunc('second', max(at - prev)) as ngung_ghi from (select src, at, lag(at) over (partition by src order by id) prev from ticks where id > $N) s group by src order by src"
+kubectl exec bench -- sh -c 'for f in thang pooler; do echo "$f: $(wc -l < /tmp/$f.log) dòng log, $(grep -c "nối lại" /tmp/$f.log) lần nối lại"; done'
+kubectl exec bench -- sh -c 'for f in thang pooler; do echo "== $f"; cut -c1-110 /tmp/$f.log | sort -k2 | uniq -c -f1 | sort -rn | head -4; done'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-d19-lab
+pod "pg-1" deleted from d19-db namespace
+primary mới: pg-2
+pooler|904|00:00:30
+thang|1048|00:00:01
+thang: 13 dòng log, 4 lần nối lại
+pooler: 157 dòng log, 39 lần nối lại
+== thang
+      4 01:34:24 psql thoát, nối lại
+      3 01:34:24 psql: error: connection to server at "pg-rw" (10.96.21.53), port 5432 failed: Connection refused
+      3 01:34:24 Is the server running on that host and accepting TCP/IP connections?
+      1 01:34:24 connection to server was lost
+== pooler
+     39 01:34:39 psql thoát, nối lại
+     39 01:34:39 connection to server was lost
+     39 01:34:39 SSL connection has been closed unexpectedly
+     38 01:34:39 FATAL:  server login has been failing, cached error: password authentication failed for user "app" (s
+```
+
+</Expected>
+
+Cột `ngung_ghi` là khoảng trống dài nhất giữa hai dòng liên tiếp của cùng một writer. Ở cụm lab rảnh, failover do xoá pod rất nhanh: primary cũ tắt sạch, replica lên thay trong khoảng một giây (K7.4 đo được lâu hơn nhiều khi máy bận). Writer nối thẳng chỉ mất khoảng một tới hai giây. Writer qua pooler mất khoảng 30 giây. Phần cuối là log của từng writer, mỗi loại dòng in một lần kèm số lần lặp và giờ xuất hiện đầu tiên (giờ UTC trong pod và IP của Service `pg-rw` trên máy bạn khác).
+
+Writer `pooler` không thấy lỗi nào trong khoảng 15 giây đầu: lần nối của PgBouncer tới `pg-rw` thất bại đúng lúc primary cũ tắt, PgBouncer chờ `server_login_retry` (15 giây) rồi mới thử lại, và trong lúc đó yêu cầu của client nằm trong hàng đợi. Lần thử lại tới được primary mới thì **bị từ chối mật khẩu**; PgBouncer lại nhớ lỗi đó 15 giây và trả ngay lỗi `cached error` cho mọi client, kể cả client mới. Hết khoảng đó, client mới đăng nhập lại được. Cộng lại là khoảng 30 giây.
+
+Chuỗi nguyên nhân, theo mã nguồn CNPG 1.30.1 và tài liệu PgBouncer:
+
+1. Instance manager trên primary **mới** đặt lại mật khẩu của user `app` từ Secret `pg-app` (hàm `refreshCredentialsFromSecret`): nó chỉ nhớ "đã áp phiên bản Secret này" trong bộ nhớ, và trên replica vừa được promote thì bộ nhớ đó trống. Mật khẩu không đổi, nhưng PostgreSQL băm lại với **salt mới**, nên bí mật SCRAM của `app` đổi.
+2. PgBouncer nối vào server thay cho client bằng khoá SCRAM lấy được lúc client đăng nhập. Tài liệu PgBouncer ghi rõ cách này chỉ chạy khi bí mật SCRAM trên server giống hệt, cùng salt, không chỉ cùng mật khẩu. Bí mật đã đổi, nên server từ chối.
+
+Lỗi này đã được báo ở [issue #11676 của CloudNativePG](https://github.com/cloudnative-pg/cloudnative-pg/issues/11676), mở ngày 16/10/2026, chưa được sửa ở bản 1.30.1. Cách vòng qua mà issue đề xuất là bước 6.
+
+### 6. Một role riêng cho ứng dụng, rồi switchover có tạm dừng pooler
+
+Theo cách giải thích ở bước 5, lỗi chỉ xảy ra với user do bootstrap tạo ra (`app`). Role khai trong `spec.managed.roles` của Cluster thì operator ghi lại phiên bản Secret đã áp vào trạng thái của Cluster, nên primary mới không đặt lại mật khẩu của nó. Khối dưới tạo Secret cho role `web`, khai role đó là thành viên của `app` (để có quyền trên bảng của `app`), chờ operator báo `reconciled`, rồi chạy writer thứ ba `web` đăng nhập bằng role này qua pooler.
+
+<Terminal where="mac">
+
+```bash
+kubectl create secret generic web-creds --type=kubernetes.io/basic-auth \
+  --from-literal=username=web --from-literal=password=web-masteva
+kubectl patch cluster pg --type merge -p '{"spec":{"managed":{"roles":[{"name":"web","login":true,"inRoles":["app"],"passwordSecret":{"name":"web-creds"}}]}}}'
+for i in $(seq 1 60); do kubectl get cluster pg -o jsonpath='{.status.managedRolesStatus.byStatus.reconciled}' | grep -q web && break; sleep 1; done
+kubectl get cluster pg -o jsonpath='{.status.managedRolesStatus.byStatus}{"\n"}'
+kubectl exec bench -- sh -c 'PGUSER=web PGPASSWORD=web-masteva nohup /scripts/writer.sh pg-pooler-rw web > /dev/null 2>&1 &'
+sleep 5
+sql "select src, count(*) from ticks where src = 'web' group by src"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+secret/web-creds created
+cluster.postgresql.cnpg.io/pg patched
+{"not-managed":["app"],"reconciled":["web"],"reserved":["postgres","cnpg_metrics_exporter","streaming_replica","cnpg_pooler_pgbouncer"]}
+web|26
+```
+
+</Expected>
+
+Giờ đổi primary có chủ đích theo đúng trình tự tài liệu CNPG gợi ý: đặt `spec.pgbouncer.paused: true` trên Pooler (PgBouncer chạy `PAUSE`: chờ transaction đang chạy xong, đóng kết nối thật, giữ yêu cầu mới lại), `kubectl cnpg promote` sang một replica, chờ cụm sẵn sàng, rồi bỏ tạm dừng. Ba writer vẫn chạy; khối lệnh đếm số dòng log mới của mỗi writer trong lần này.
+
+<Predict question="Sau khi bỏ tạm dừng, writer `pooler` (user `app`) và writer `web` (role riêng), cùng đi qua một PgBouncer, có cùng kết quả không?">
+
+Không. Writer `web` chỉ thấy một dòng `NOTICE` (yêu cầu được xếp hàng) và ghi tiếp sau khi bỏ tạm dừng. Writer `pooler` dùng user `app` vẫn bị từ chối mật khẩu như bước 5, vì switchover cũng đổi primary và primary mới cũng đặt lại mật khẩu `app`. Tạm dừng pooler chỉ giúp được khi PgBouncer đăng nhập lại được.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl exec bench -- sh -c 'for f in thang pooler web; do wc -l < /tmp/$f.log; done' > truoc.txt
+N=$(sql "select max(id) from ticks")
+T=$(kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[0].metadata.name}')
+kubectl patch pooler pg-pooler-rw --type merge -p '{"spec":{"pgbouncer":{"paused":true}}}'
+for i in $(seq 1 60); do [ "$(kubectl get pooler pg-pooler-rw -o jsonpath='{.status.phase}')" = paused ] && break; sleep 1; done
+kubectl cnpg promote pg $T 2>&1 | grep promoted
+for i in $(seq 1 300); do [ "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" = "$T" ] && break; sleep 1; done
+kubectl wait --for=condition=Ready cluster/pg --timeout=600s > /dev/null
+kubectl patch pooler pg-pooler-rw --type merge -p '{"spec":{"pgbouncer":{"paused":false}}}'
+for i in $(seq 1 120); do [ "$(sql "select count(distinct src) from ticks where at > now() - interval '3 seconds'")" = 3 ] && break; sleep 1; done
+sql "select src, count(*), date_trunc('second', max(at - prev)) as ngung_ghi from (select src, at, lag(at) over (partition by src order by id) prev from ticks where id > $N) s group by src order by src"
+kubectl exec bench -- sh -c 'for f in thang pooler web; do wc -l < /tmp/$f.log; done' | paste truoc.txt - | awk 'BEGIN { split("thang pooler web", n) } { print n[NR] ": " $2 - $1 " dòng log mới" }'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-d19-lab
+pooler.postgresql.cnpg.io/pg-pooler-rw patched
+Node pg-1 in cluster pg will be promoted
+pooler.postgresql.cnpg.io/pg-pooler-rw patched
+pooler|6|00:00:30
+thang|121|00:00:07
+web|157|00:00:14
+thang: 40 dòng log mới
+pooler: 157 dòng log mới
+web: 1 dòng log mới
+```
+
+</Expected>
+
+Ba writer, cùng một lần đổi primary:
+
+- `thang` (nối thẳng): ngừng ghi khoảng 7 giây trong kết quả mẫu, vài chục dòng log lỗi và nối lại.
+- `pooler` (user `app` qua PgBouncer): chỉ ghi được vài dòng rồi bị từ chối mật khẩu liên tục, 157 dòng log mới. Cột `ngung_ghi` của nó chỉ tính giữa vài dòng hiếm hoi ghi được, nên không dùng được để đo.
+- `web` (role riêng qua PgBouncer): không lỗi nào, chỉ một dòng `NOTICE`. Thời gian ngừng ghi của nó bằng khoảng tạm dừng; trên máy bạn từ dưới một giây tới khoảng 20 giây (14 giây trong kết quả mẫu), tuỳ thời gian switchover.
+
+Quy tắc vận hành rút ra: với CNPG 1.30 và Pooler, cho ứng dụng đăng nhập bằng role khai trong `spec.managed.roles` thay vì user `app` do bootstrap tạo; và bảo trì có kế hoạch thì tạm dừng pooler, promote, bỏ tạm dừng. Khi issue #11676 được sửa, đọc release notes để biết có bỏ được cách vòng này không.
+
+<Check id="d24.1.lab-failover-pooler">Đo được số lỗi và thời gian ngừng ghi của client nối thẳng và client qua PgBouncer khi failover, giải thích được vì sao client dùng user `app` qua pooler bị từ chối mật khẩu sau khi đổi primary, và thực hiện được switchover có tạm dừng pooler mà client dùng role riêng không thấy lỗi nào.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Pod operator hay PostgreSQL đứng ở `ImagePullBackOff`, sự kiện báo `no such host` | DNS trong Docker Desktop lỗi tạm thời | `docker exec d19-lab-control-plane getent hosts ghcr.io`; kubelet tự thử lại, chờ vài phút |
+| Bước 2 báo `Cannot find device` từ `tc` | Không tìm được veth, thường vì đã chạy khối gỡ `netem` hoặc pod replica đã đổi | Chạy lại `kubectl get pods -l cnpg.io/instanceRole=replica -o wide` rồi khối thêm `netem` |
+| Bước 3: Terminal 2 báo `ROLLBACK` ngay, không chờ | Khối ở Terminal 1 chạy quá muộn, hoặc Terminal 2 nối nhầm vào primary | Dòng `replica bị giữ` phải là tên một replica; chạy lại Terminal 2 rồi chạy ngay khối kế tiếp |
+| Bước 4: `kết nối thật của app: 1` cả khi đi qua pooler | Pod PgBouncer chưa sẵn sàng | `kubectl get pooler pg-pooler-rw`; chờ rồi gọi lại `load pg-pooler-rw 150` |
+| `sql: command not found`, `bench: command not found` hoặc `kubectl cnpg` báo `unknown command` | Terminal mới chưa có hàm hay `PATH` | Dán khối "Khi mở terminal mới" ở bước 1 |
+
+### Dọn dẹp
+
+Dừng hai writer và xoá cụm. Bài D19.2 dựng lại cụm từ đầu.
+
+<Callout kind="danger">
+
+Khối lệnh dưới xoá cụm kind `d19-lab` cùng mọi database trong đó, và xoá thư mục lab của bài.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm và thư mục lab">
+
+```bash
+kind delete cluster --name d19-lab
+rm -rf ~/masteva-d24/d24-1
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao không đọc từ replica cho mọi thứ để giảm tải primary?">
+
+Vì mọi lần đọc từ replica là chấp nhận dữ liệu cũ một khoảng bằng lag, và khoảng đó không có trần: bước 3 cho thấy một truy vấn trên replica làm lag lên hàng chục giây. Cách làm phổ biến là phân loại đường đọc: đọc ngay sau khi ghi (trang xác nhận đơn, hồ sơ vừa sửa) đi vào primary; đọc chịu được cũ vài giây (danh sách, tìm kiếm, báo cáo) đi vào replica. Một số ứng dụng nhớ "người dùng này vừa ghi lúc T" và chỉ đọc từ replica khi replica đã phát lại qua thời điểm đó, so bằng `pg_last_wal_replay_lsn()`. Đọc từ replica cũng không miễn phí cho primary khi bật `hot_standby_feedback`: truy vấn dài trên replica giữ dòng chết trên primary.
+
+</Reveal>
+
+<Reveal title="`max_standby_streaming_delay` nên đặt bao nhiêu?">
+
+Tuỳ vai của replica. Replica dùng để failover cần theo sát primary: đặt thấp (vài giây), chấp nhận truy vấn trên nó bị huỷ. Replica dành cho báo cáo có thể đặt cao (vài phút, thậm chí `-1` là chờ mãi) để báo cáo dài không bị huỷ, đổi lại nó có thể tụt xa. Hai vai đó nên là hai replica khác nhau; trong CNPG, replica báo cáo thường là một **replica cluster** riêng (một Cluster khác nhận WAL từ cụm chính) để cấu hình và tài nguyên tách hẳn. Theo dõi số truy vấn bị huỷ trong `pg_stat_database_conflicts` trên mỗi replica.
+
+</Reveal>
+
+<Reveal title="Đặt `default_pool_size` của PgBouncer bao nhiêu là đủ?">
+
+Bắt đầu từ phía database: số kết nối thật hữu ích xấp xỉ số truy vấn chạy đồng thời mà database phục vụ tốt, thường cỡ vài lần số nhân CPU, không phải hàng trăm. Tổng `default_pool_size` của mọi pooler (nhân số pod pooler, nhân số cặp user và database) phải nằm dưới `max_connections` trừ phần để dành cho operator, monitoring và người vận hành. Sau đó đọc `cl_waiting` và `maxwait`: client chờ thường xuyên mà database còn rảnh CPU thì tăng pool; client chờ mà database đã bận thì tăng pool chỉ dời hàng đợi vào database. Nhiều pod pooler (`instances: 3` cho HA) chia nhau client, và **mỗi pod** có pool riêng.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết câu SQL đọc `pg_stat_replication` và đổi LSN ra byte, viết alert PromQL trên `cnpg_pg_replication_lag`, giải thích một dòng `SHOW POOLS`, rà code ứng dụng tìm chỗ dùng `SET`, `PREPARE` hay advisory lock trước khi chuyển sang PgBouncer chế độ transaction.
+
+**AI hay sai ở đâu:** nói `synchronous_commit = on` là "đã đồng bộ" mà không cần `synchronous_standby_names`; nói PgBouncer chế độ transaction "không hỗ trợ prepared statement" (đúng với bản trước 1.21, sai với bản hiện hành cho prepared statement ở mức giao thức); đặt `default_pool_size` bằng `max_connections`; khuyên đọc từ replica để "giảm tải" mà không nhắc dữ liệu cũ; bỏ qua `max_standby_streaming_delay` khi giải thích lag; và viết cấu hình `Pooler` thiếu trường `cluster` hay đặt tên Pooler trùng tên Cluster (tài liệu CNPG cấm).
+
+**Cách kiểm tra:** mọi con số về độ trễ commit, lag hay số lỗi khi failover phải đo bằng tải thật như bước 2, 3 và 5; `kubectl apply --dry-run=server` bắt lỗi cấu hình `Pooler`; với tính năng gắn phiên, thử đúng câu lệnh qua pooler với ít nhất hai client song song.
+
+</Callout>
+
+<Callout kind="link">
+
+K7.4 là nền: CloudNativePG, failover, replication đồng bộ và fencing. SB5.5 dạy migration không downtime phía ứng dụng (expand/contract, `lock_timeout`), và SB12 dạy pool kết nối HikariCP phía ứng dụng. D12 cho Prometheus để thu metric `cnpg_*` và `cnpg_pgbouncer_*`; D16.1 dạy viết SLO cho độ tươi của dữ liệu đọc. D18.2 giải thích vì sao retry không giới hạn biến failover thành quá tải. D19.2 kiểm tra khôi phục tự động; D19.3 dùng chính replication lag làm tín hiệu điều tiết một backfill lớn. D20.1 đặt RPO, RTO ở mức cả hệ thống, D20.4 dựng replica cluster của CNPG ở vùng khác.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d24.1.mastery-chon-muc">Với một hệ thống cụ thể, chọn được mức replication và `synchronous_commit` cho từng loại dữ liệu, ước lượng được cái giá về độ trễ từ khoảng cách tới replica, và nói được điều gì xảy ra khi mất standby.</Check>
+
+<Check id="d24.1.mastery-lag">Trên một cụm đang chạy, đo được replication lag theo byte và theo thời gian, tìm được nguyên nhân khi một replica tụt lại, và đề xuất được cách giữ việc đọc-sau-ghi đúng.</Check>
+
+<Check id="d24.1.mastery-pooler">Dựng và định cỡ được PgBouncer trước PostgreSQL, liệt kê được những gì ứng dụng phải thay đổi khi dùng chế độ transaction, và lập được quy trình switchover có tạm dừng pooler.</Check>
+
+</Mastery>

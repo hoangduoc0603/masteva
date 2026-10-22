@@ -1,0 +1,796 @@
+---
+title: Rút traffic khỏi zone, và phụ thuộc ẩn vào dịch vụ toàn cầu
+description: Rút lưu lượng khỏi một zone bằng trọng số ở router sau khi kiểm phần còn lại đủ dung lượng, thấy cùng thao tác đó làm quá tải hệ khi tải cao, và rút một zone hỏng một phần mà health check không bắt được; rồi chặn một token service mà mọi zone cùng gọi để thấy các zone độc lập cùng chết, và sửa bằng cache token có hạn, hiểu nó mua được bao nhiêu thời gian.
+id: d25.3
+step: d25
+prerequisites: [d25.2]
+topics: [d25.rut-traffic, d25.phu-thuoc-toan-cau]
+status: verified
+verified:
+  date: 2026-10-21
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    docker-compose: 5.5.1
+    envoy: 1.40.0
+    golang-image: 1.27.2-alpine
+    python: 3.14.3
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Vận hành được nút "rút lưu lượng khỏi chỗ này" một cách an toàn, và tìm ra những thứ mà mọi cell, mọi zone cùng phụ thuộc dù trên sơ đồ chúng độc lập. Học xong bài này, bạn giải thích được:
+
+- Vì sao cùng một thao tác rút một zone, lúc tải thấp thì không ai nhận ra, lúc tải cao thì làm sập phần còn lại.
+- Vì sao health check báo mọi thứ khoẻ trong khi một zone đang trả lỗi cho gần một phần ba request, và ai nên quyết định rút zone đó.
+- Vì sao Slack chọn một nút rút AZ bằng tay thay vì tự động xử lý lỗi xám (gray failure), và vì sao một cơ chế rút tự động của AWS đã làm mất thêm dung lượng trong sự cố tháng 10/2025.
+- Vì sao 47 phút sự cố của một dịch vụ định danh làm gần như mọi dịch vụ cần đăng nhập của Google không dùng được, và cache token che được sự cố như vậy trong bao lâu.
+
+</Goal>
+
+<Knowledge>
+
+### Rút traffic: đưa lưu lượng ra khỏi một phần đang hỏng
+
+**Rút traffic** (drain, traffic shift) là ngừng gửi request mới tới một phần của hệ thống (một AZ, một cell, một vùng) và dồn sang phần còn lại, trong khi request đang dở được làm nốt. Đây là biện pháp giảm nhẹ chung nhất khi chưa biết nguyên nhân: nếu sự cố nằm gọn trong phần bị rút, người dùng hết lỗi ngay, và đội có thời gian tìm nguyên nhân.
+
+| Cách | Làm thế nào | Tốc độ | Điều kiện |
+|---|---|---|---|
+| **Trọng số ở proxy hay load balancer** | Đặt trọng số của zone về 0 trong cấu hình của proxy biên (Envoy weighted cluster, như lab) | Vài giây; đổi từng phần trăm được | Cơ chế đổi trọng số không phụ thuộc vào zone bị rút |
+| **Zonal shift của nhà cung cấp** | Ví dụ Amazon Application Recovery Controller: đánh dấu một AZ là không khoẻ cho load balancer, có thời hạn tối đa 72 giờ ở lần đặt đầu | Vài phút, tuỳ kết nối đang mở và DNS | Theo tài liệu ARC: nếu mọi target trong các AZ đều không khoẻ thì load balancer ở chế độ fail open và zonal shift không chuyển được lưu lượng |
+| **Bản ghi DNS có trọng số** | Đổi trọng số hay gỡ bản ghi của vùng đó | Phút tới giờ, theo TTL ở mọi tầng cache (K10.3) | Theo whitepaper "AWS Fault Isolation Boundaries", đổi trọng số bản ghi Route 53 là thao tác control plane, đặt nó vào đường phục hồi là một anti-pattern |
+| **Rút cell bằng router** | Với cell có dữ liệu riêng của tenant, không có chỗ nào khác phục vụ được tenant đó; "rút" nghĩa là chuyển cell sang chế độ chỉ đọc, từ chối nhanh, hoặc chuyển sang bản sao của cell nếu có | Tuỳ cơ chế | Dữ liệu của tenant phải có ở nơi nhận |
+
+Hàng cuối là điểm khác nhau giữa zone và cell của D21.1. Zone giữ cùng dữ liệu (sao chép giữa các AZ) nên rút một zone chỉ là đổi trọng số. Cell giữ dữ liệu riêng nên rút một cell là quyết định về khách hàng của nó, gần với failover dữ liệu của chặng D20 hơn là với định tuyến.
+
+### Điều kiện trước khi rút
+
+**Phần còn lại phải đủ dung lượng.** D18.1 đã tính headroom theo vùng: ba zone chạy ở mức `u` thì mất một zone, hai zone còn lại chạy ở `1,5 × u`. Rút là tự tay gây ra đúng tình huống đó. Quy tắc đơn giản trước mỗi lần rút: tải hiện tại chia cho số zone còn lại phải dưới ngưỡng an toàn (lab dùng 80% của trần an toàn 180 đo ở bước 1). Nếu không đủ, rút một phần (trọng số 50 thay vì 0) hoặc thêm dung lượng trước.
+
+**Sức khoẻ phải đo ở mức zone, từ phía người gọi.** Health check của load balancer thường chỉ hỏi "tiến trình còn trả lời `/healthz` không". Một zone có thể qua mọi health check mà vẫn trả lỗi cho một phần request: mạng chập chờn, một phụ thuộc chỉ zone đó gọi đang chậm, một bản triển khai lỗi ở một nhánh code. Đây là **lỗi xám** (gray failure): các thành phần không thống nhất với nhau về việc cái gì đang hỏng. Thứ cần nhìn là SLI của từng zone đo tại router: tỉ lệ lỗi và độ trễ của request đi vào zone đó (D16.1).
+
+**Rút dần và đảo ngược được.** Rút theo bậc (100 → 50 → 0), quan sát giữa các bậc, và có sẵn thao tác ngược. Bài viết của Slack đặt mục tiêu: rút được hầu hết lưu lượng khỏi một AZ trong 5 phút, không gây lỗi cho người dùng, đổi được từng 1%, và cơ chế rút không phụ thuộc vào tài nguyên trong AZ bị rút.
+
+<Check id="d25.3.cach-rut">So sánh được bốn cách rút traffic theo tốc độ và điều kiện, giải thích được vì sao rút một cell có dữ liệu riêng khác rút một zone, và nêu được ba điều kiện phải kiểm trước khi rút.</Check>
+
+### Rút thủ công hay tự động
+
+| | Tự động | Thủ công |
+|---|---|---|
+| Ví dụ | Load balancer gỡ target trượt health check; outlier detection của Envoy (D9.6); zonal autoshift của nhà cung cấp | Người trực bấm nút rút sau khi nhìn SLI của từng zone |
+| Mạnh ở | Lỗi rõ ràng, nhanh: máy chết, tiến trình không trả lời | Lỗi xám, lỗi mà hệ tự động nhìn thấy khác nhau ở mỗi chỗ |
+| Nguy cơ | Tự gỡ quá nhiều: health check sai, hay chính hệ health check bị quá tải, thì "rút" thành "tắt" | Chậm: phát hiện, gọi người, quyết định |
+| Phải có | Giới hạn lượng được gỡ (panic threshold của Envoy ở D9.6, giới hạn tốc độ gỡ), và cách tắt nhanh chính cơ chế tự động | Nút bấm làm sẵn, runbook, và diễn tập định kỳ (D17.4) |
+
+Sự cố của AWS tháng 10/2025 ở D21.2 có một ví dụ về nguy cơ của rút tự động. Theo bản tóm tắt, hệ health check của Network Load Balancer đưa máy mới vào phục vụ trước khi cấu hình mạng của chúng truyền xong, nên health check lúc qua lúc trượt; số lần đổi trạng thái làm chính hệ health check quá tải, và việc đó kích hoạt **chuyển DNS tự động khỏi AZ**, gỡ dung lượng khỏi các load balancer nhiều AZ. Ứng dụng không còn đủ dung lượng thấy lỗi kết nối từ 05:30 (giờ PDT); lúc 09:36 kỹ sư tắt chuyển tự động theo health check, đưa mọi node khoẻ trở lại, và lỗi kết nối hết. Trong danh sách việc làm sau sự cố có một cơ chế giới hạn tốc độ để mỗi NLB không gỡ quá một lượng dung lượng khi health check trượt làm chuyển AZ.
+
+Zonal autoshift của AWS là một dạng tự động có kèm điều kiện: theo tài liệu, nó dành cho tài nguyên đã được dự phòng dung lượng ở mọi AZ, và bắt buộc cấu hình **practice run**, khoảng mỗi tuần một lần tự rút thử một AZ để chứng minh phần còn lại gánh được.
+
+<Callout kind="production">
+
+Theo bài "Slack's Migration to a Cellular Architecture" (2023) của Slack Engineering, ngày 30/06/2021 một đường kết nối giữa một AZ và các AZ khác ở vùng US East, nơi đặt phần lớn hệ thống của Slack, bị lỗi chập chờn từ 11:45 (giờ PDT): kết nối chậm và hỏng. Lúc 12:33 nhà cung cấp cloud tự gỡ đường đó và dịch vụ trở lại bình thường; sau khi qua kiểm tự động, đường đó được đưa vào dùng lại, rồi 17:22 lỗi y hệt quay lại, tới 17:31 nhà cung cấp gỡ hẳn.
+
+Người dùng thấy lỗi dù chỉ một AZ có vấn đề. Bài viết giải thích: một request của người dùng toả ra hàng trăm lời gọi RPC; một số kho dữ liệu, trong đó có Vitess, cần một primary duy nhất cho mỗi shard nên primary không với tới được là ghi lỗi; và đây là một **lỗi xám**, hệ thống trong AZ bị ảnh hưởng thấy AZ mình khoẻ và các AZ khác hỏng, còn hệ thống ở AZ khác thấy điều ngược lại. Slack quyết định không tự động hoá việc xử lý lỗi xám, mà làm một cơ chế cho kỹ sư ra lệnh mọi hệ thống tránh một AZ.
+
+Cơ chế đó: các service được "silo" theo AZ, chỉ nhận lưu lượng từ AZ mình và chỉ gọi service trong AZ mình; load balancer ở biên chuyển từ HAProxy sang Envoy, nhận cấu hình từ control plane xDS tự viết (Rotor), và rút một AZ bằng cách đổi trọng số của cluster theo AZ qua RTDS (Runtime Discovery Service, API xDS phát các giá trị runtime như trọng số, đổi được khi Envoy đang chạy). Trọng số về 0 thì request đang dở làm nốt, request mới sang AZ khác; thay đổi lan tới các Envoy trong vài giây, chia được tới 1%. Load balancer biên đặt ở các vùng khác, control plane được sao ra nhiều vùng, nên rút được cả khi AZ đó mất hẳn.
+
+Phần của bài: lỗi xám là loại lỗi mà health check và tự động hoá dễ nhìn sai nhất, nên một nút rút bằng tay, an toàn để thử và đảo ngược được, là biện pháp giảm nhẹ chung. Lab của bài dựng một nút như vậy ở mức nhỏ.
+
+</Callout>
+
+<Check id="d25.3.tu-dong">So sánh được rút tự động với rút thủ công theo loại lỗi phù hợp, nguy cơ và điều kiện phải có, và kể được hai ví dụ có nguồn: rút tự động gỡ quá nhiều dung lượng, và nút rút thủ công cho lỗi xám.</Check>
+
+### Phụ thuộc ẩn vào dịch vụ toàn cầu
+
+Cell, zone và vùng chỉ độc lập với nhau đến mức thứ chúng gọi cũng độc lập. Một **phụ thuộc toàn cầu** là dịch vụ mà mọi cell (hay mọi vùng) cùng gọi, thường nằm ngoài sơ đồ vì "nó luôn chạy":
+
+| Phụ thuộc | Gọi khi nào | Hỏng thì |
+|---|---|---|
+| IAM, STS, token service | Mỗi request, hoặc mỗi khi token hết hạn | Không xác thực được lời gọi tới cloud hay service khác |
+| IdP (SSO, OAuth) | Người dùng đăng nhập, service lấy token | Người dùng mới không vào được; nếu service kiểm token bằng cách gọi IdP mỗi request thì mọi thứ dừng |
+| DNS | Mỗi kết nối mới, theo TTL | Không phân giải được tên của chính phụ thuộc nội bộ |
+| CA, ACME, OCSP | Khi gia hạn chứng chỉ, khi kiểm thu hồi | Chứng chỉ hết hạn ở mọi nơi cùng lúc (D9.4) |
+| Registry image | Khi tạo pod mới, khi node mới kéo image | Không thay được pod chết, không mở rộng được |
+| SaaS: cờ tính năng, thanh toán, gửi email, giám sát, gọi người trực | Tuỳ loại | Từ mất một tính năng tới mất khả năng biết mình đang sự cố (D16.5) |
+
+Với AWS, whitepaper "AWS Fault Isolation Boundaries" phân loại các dịch vụ toàn cầu: control plane của IAM, Organizations, Route 53 nằm ở một vùng (`us-east-1`), còn data plane phân tán ở mọi vùng. Data plane ổn định tĩnh, nên gọi IAM để kiểm quyền vẫn chạy khi control plane của nó gặp sự cố; thứ hỏng là các thao tác tạo, sửa, xoá. Khuyến nghị của whitepaper: không đặt control plane của dịch vụ toàn cầu vào đường phục hồi (không tạo IAM role, không sửa bản ghi DNS lúc failover), và cấu hình SDK dùng **endpoint vùng của STS**. Theo tài liệu SDK của AWS, một số SDK và CLI đời cũ (AWS CLI v1, SDK cho Java 1.x, JavaScript 2.x, Go V1) mặc định gọi endpoint toàn cầu `sts.amazonaws.com`. Tài liệu đó cũng ghi: từ khi AWS đổi cách phục vụ endpoint toàn cầu, request tới `sts.amazonaws.com` từ các vùng bật sẵn được phục vụ ngay trong vùng đó; chỉ vùng opt-in còn đi về us-east-1. Endpoint vùng vẫn là khuyến nghị, vì nó không dựa vào hành vi này, và whitepaper ghi SigV4A bắt buộc dùng thông tin xác thực xin từ endpoint vùng. Sự cố tháng 10/2025 ở D21.2 có một chi tiết đúng loại này: theo bản tóm tắt, khách đăng nhập bằng thông tin root, và khách dùng đăng nhập liên kết được cấu hình với `signin.aws.amazon.com`, gặp lỗi khi đăng nhập bảng điều khiển ở **các vùng ngoài** `us-east-1`, cho tới khi endpoint của DynamoDB ở `us-east-1` gọi được trở lại.
+
+<Callout kind="production">
+
+Theo bản báo cáo sự cố số 20013 trên Google Cloud Status Dashboard, ngày 14/12/2020, từ 03:46 tới 04:33 (giờ US/Pacific, 47 phút), các dịch vụ của Google mà khách dùng cần đăng nhập qua Google OAuth không dùng được. User ID Service, dịch vụ giữ định danh duy nhất của mỗi tài khoản và xử lý thông tin xác thực cho token OAuth và cookie, bị hệ thống hạn mức tự động hạ quota: khi chuyển sang hệ thống hạn mức mới hồi tháng 10, phần còn sót của hệ cũ báo mức dùng của nó là 0, và khi thời gian ân hạn hết, quota bị hạ. Database của dịch vụ không ghi được (leader Paxos không ghi được), dữ liệu đọc ra bị coi là cũ, và vì lý do bảo mật dịch vụ từ chối request khi thấy dữ liệu cũ, nên tra cứu xác thực lỗi.
+
+Phạm vi theo báo cáo: Cloud Console không đăng nhập được với người chưa đăng nhập sẵn, người đã đăng nhập vẫn vào được nhưng có thể gặp tính năng bị suy giảm; BigQuery streaming lỗi khoảng 75%; khoảng 15% request tới Cloud Storage dùng OAuth, HMAC hay xác thực email bị ảnh hưởng; mọi ứng dụng cần xác thực của Google Workspace ngừng trong thời gian đó, và Gmail có thể lỗi thêm tới một giờ sau vì lỗi của dịch vụ định danh đã được cache. Với mạng của Cloud, chỉ thao tác sửa cấu hình data plane của VPC lỗi; cấu hình data plane đang có vẫn chạy. Công cụ nội bộ của đội hỗ trợ cũng bị ảnh hưởng, nên khách không tạo được yêu cầu hỗ trợ và cập nhật trạng thái bị chậm.
+
+Báo cáo cũng ghi đã có các lớp kiểm để ngăn nhiều thay đổi quota ngoài ý muốn, nhưng lúc đó chúng không xét tới trường hợp một dịch vụ duy nhất báo mức dùng bằng 0. Trong các việc làm tiếp: rà lại tự động hoá quota để nó không áp nhanh những thay đổi toàn cầu, và tăng khả năng của các dịch vụ GCP để giới hạn chặt hơn ảnh hưởng lên data plane khi User ID Service hỏng.
+
+Phần của bài: thứ còn chạy (người đã đăng nhập, cấu hình mạng đang có) là thứ đã có sẵn thông tin; thứ hỏng là thứ phải hỏi dịch vụ định danh ngay lúc đó. Cache lỗi của Gmail là mặt trái: cache giữ cả câu trả lời xấu.
+
+</Callout>
+
+### Tìm và giảm phụ thuộc toàn cầu
+
+Tìm:
+
+- **Bản đồ phụ thuộc từ dữ liệu thật**, không từ trí nhớ: trace phân tán (D12.6) cho lời gọi giữa service; log egress và log DNS cho lời gọi ra ngoài (K6.3 dạy kiểm soát egress). Ghi cho mỗi phụ thuộc nó được gọi **khi nào**: mỗi request, khi khởi động, khi triển khai, khi phục hồi.
+- **Chặn thử**: ở môi trường thử, hay trong một game day có điều kiện dừng (D17.4), chặn egress tới một phụ thuộc và xem cái gì hỏng. Phụ thuộc chỉ gọi khi khởi động hay khi phục hồi chỉ lộ ra nếu phép thử có cả bước khởi động lại.
+- **Hỏi câu "nếu nó mất 1 giờ"** cho từng dòng của bảng: IdP mất 1 giờ, registry mất 1 giờ, DNS nội bộ mất 1 giờ.
+
+Giảm:
+
+| Cách | Ví dụ | Giới hạn |
+|---|---|---|
+| **Endpoint vùng** | STS theo vùng; IdP có nhiều vùng; registry có bản sao trong từng vùng | Phải cấu hình đúng ở mọi SDK, mọi service |
+| **Cache có hạn** | Giữ token tới khi hết hạn và xin lại sớm (lab); cache khoá ký JWT (JWKS) để kiểm token không cần gọi IdP | Chỉ mua được thời gian bằng thời hạn còn lại; cache cả lỗi thì kéo dài sự cố |
+| **Chuẩn bị trước** | Gia hạn chứng chỉ sớm nhiều ngày; image có sẵn trên node; tài khoản khẩn cấp (break-glass) không qua IdP | Phải kiểm định kỳ rằng thứ chuẩn bị còn dùng được |
+| **Chế độ suy giảm** | Mất dịch vụ gợi ý thì trang vẫn hiện, chỉ thiếu phần gợi ý; mất cờ tính năng thì dùng giá trị mặc định an toàn (D6.4) | Phải quyết định trước tính năng nào được tắt |
+
+<Check id="d25.3.phu-thuoc">Kể được ít nhất năm loại phụ thuộc toàn cầu cùng thời điểm chúng được gọi, mô tả được cách tìm chúng bằng dữ liệu thật và bằng phép chặn thử, và chọn được cách giảm cho từng loại kèm giới hạn của cách đó.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Slack's Migration to a Cellular Architecture (Slack Engineering)](https://slack.engineering/slacks-migration-to-a-cellular-architecture/): nguồn của callout về lỗi xám; đọc phần về bốn mục tiêu của nút rút AZ và cách dùng trọng số của Envoy.
+- [How a zonal shift works (Amazon Application Recovery Controller)](https://docs.aws.amazon.com/r53recovery/latest/dg/arc-zonal-shift.how-it-works.html): thời hạn của zonal shift và trường hợp nó không chuyển được lưu lượng.
+- [Global services (AWS Fault Isolation Boundaries)](https://docs.aws.amazon.com/whitepapers/latest/aws-fault-isolation-boundaries/global-services.html): control plane và data plane của các dịch vụ toàn cầu, các anti-pattern khi failover, endpoint vùng của STS.
+- [Google Cloud Infrastructure Components Incident #20013](https://status.cloud.google.com/incident/zall/20013): nguồn của callout về dịch vụ định danh; đọc phần nguyên nhân và danh sách dịch vụ bị ảnh hưởng.
+- [Traffic Shifting/Splitting (Envoy)](https://www.envoyproxy.io/docs/envoy/v1.40.0/configuration/http/http_conn_man/traffic_splitting): weighted cluster mà lab dùng để rút zone.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** đã làm D21.1 và D21.2: có image `d21-app:1` và thư mục `~/masteva-d25` với `app/`, `router/`, và đã chạy khối "Dừng lab" của D21.2 (không còn container `d21-*`). Dùng cổng **9920**, **9921** (router), **9926** (token service) và **9927–9929** (trang quản trị của ba zone), chỉ nghe trên `127.0.0.1`. Mọi khối lệnh chạy trong `~/masteva-d25`.
+
+**Profile máy:** 5 container (router, ba zone, token service) dùng khoảng 75 MiB RAM theo `docker stats` (router khoảng 36 MiB, mỗi container Go 8–11 MiB); container tải thêm khoảng 12 MiB lúc chạy 480 request mỗi giây. Mỗi zone giới hạn 0,5 CPU và 64 MiB. Máy 8 GB chạy thoải mái. Mỗi lượt đo mất 20 giây tới 1 phút; bài có khoảng 10 lượt.
+
+### 0. Ba zone có trần cố định
+
+Hệ của bài là ba zone giống hệt nhau của một service không giữ trạng thái, đứng sau router, giống cách Slack coi mỗi AZ là một cell:
+
+```text
+                                     ┌─▶ d21-zone-a ─┐
+ tải ──▶ router :9920 ──trọng số─────┼─▶ d21-zone-b ─┼──▶ d21-token :9926
+        (100 / 100 / 100)            └─▶ d21-zone-c ─┘   (bước 4, 5: mọi zone cùng gọi)
+```
+
+File `zone.go` thêm cho vai `api`:
+
+- `-slots 4 -svc 20ms`: mỗi zone xử lý tối đa 4 request cùng lúc, mỗi request mất 20 ms. Theo định luật Little (D18.1), trần của một zone là 4 / 0,02 s = 200 request mỗi giây. Trần đặt bằng số chỗ thay vì bằng CPU để mọi máy có cùng con số; ngoài đời trần thường đến từ CPU, pool kết nối hay database, và bạn đo nó như D18.1. Request vượt trần xếp hàng chờ chỗ; người gọi bỏ đi (router hết hạn 0,9 giây) thì thôi chờ.
+- Đường `/admin/fail?pct=30`: 30% request trả `503`, còn `/healthz` vẫn trả `ok`. Đó là lỗi xám.
+- Vai `token` (token service cấp token có hạn 30 giây) và cờ `-token`, `-token-cache` cho bước 4 và 5.
+
+<Terminal where="mac" title="~/masteva-d25/app/zone.go">
+
+```bash
+cd ~/masteva-d25
+cat > app/zone.go <<'EOF'
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	slots    = flag.Int("slots", 0, "api: số request xử lý cùng lúc, 0 là không giới hạn")
+	svc      = flag.Duration("svc", 0, "api: thời gian xử lý mỗi request")
+	tokURL   = flag.String("token", "", "api: URL của token service; trống thì không dùng")
+	tokCache = flag.Bool("token-cache", false, "api: giữ token tới khi hết hạn thay vì xin mỗi request")
+	tokTTL   = flag.Duration("ttl", 30*time.Second, "token: thời hạn của token cấp ra")
+	failPct  atomic.Int64 // api: phần trăm request trả lỗi, đặt qua /admin/fail?pct=
+	sem      chan struct{}
+)
+
+type token struct {
+	Value  string    `json:"token"`
+	Expiry time.Time `json:"expiry"`
+	got    time.Time // lúc api nhận token
+}
+
+var tok struct {
+	sync.Mutex
+	t *token
+}
+
+func init() {
+	roles["token"] = runToken
+	starts = append(starts, startZone, startToken)
+	guards = append(guards, checkFail, checkToken, wait)
+}
+
+func startZone() {
+	sem = make(chan struct{}, max(*slots, 1))
+	http.HandleFunc("/admin/fail", func(w http.ResponseWriter, r *http.Request) {
+		p, _ := strconv.Atoi(r.URL.Query().Get("pct"))
+		failPct.Store(int64(p))
+		fmt.Fprintf(w, "%s: %d%% request trả lỗi\n", *cell, p)
+	})
+}
+
+// checkFail: hỏng một phần (gray failure); /healthz vẫn trả ok.
+func checkFail(r *http.Request) (string, error) {
+	if rand.Int64N(100) < failPct.Load() {
+		return "", errors.New("lỗi nội bộ")
+	}
+	return "", nil
+}
+
+// wait: mỗi zone xử lý tối đa -slots request cùng lúc, mỗi request mất -svc; người gọi bỏ đi thì thôi chờ.
+func wait(r *http.Request) (string, error) {
+	if *slots == 0 {
+		return "", nil
+	}
+	select {
+	case sem <- struct{}{}:
+		time.Sleep(*svc)
+		<-sem
+		return "", nil
+	case <-r.Context().Done():
+		return "", errors.New("người gọi đã bỏ đi")
+	}
+}
+
+func runToken() {
+	var n atomic.Int64
+	http.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(token{Value: fmt.Sprintf("tk-%d", n.Add(1)), Expiry: time.Now().Add(*tokTTL)})
+	})
+	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "token đã cấp: %d\n", n.Load()) })
+	serve()
+}
+
+func getToken() (*token, error) {
+	c := http.Client{Timeout: 200 * time.Millisecond}
+	resp, err := c.Get(*tokURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	t := token{got: time.Now()}
+	return &t, json.NewDecoder(resp.Body).Decode(&t)
+}
+
+// startToken: có cache thì xin token lúc khởi động, rồi một vòng chạy nền xin lại mỗi khi token
+// đã qua nửa thời hạn; xin không được thì giữ token cũ và thử lại sau một giây.
+func startToken() {
+	if *tokURL == "" || !*tokCache {
+		return
+	}
+	refresh := func() {
+		tok.Lock()
+		t := tok.t
+		tok.Unlock()
+		if t != nil && time.Now().Before(t.got.Add(t.Expiry.Sub(t.got)/2)) {
+			return
+		}
+		if nt, err := getToken(); err == nil {
+			tok.Lock()
+			tok.t = nt
+			tok.Unlock()
+		}
+	}
+	refresh()
+	go func() {
+		for range time.Tick(time.Second) {
+			refresh()
+		}
+	}()
+}
+
+// checkToken: không cache thì xin token mới cho mỗi request; có cache thì chỉ đọc token đang giữ.
+func checkToken(r *http.Request) (string, error) {
+	if *tokURL == "" {
+		return "", nil
+	}
+	if !*tokCache {
+		if _, err := getToken(); err != nil {
+			return "", fmt.Errorf("không lấy được token: %v", err)
+		}
+		return "", nil
+	}
+	tok.Lock()
+	t := tok.t
+	tok.Unlock()
+	if t == nil || time.Now().After(t.Expiry) {
+		return "", errors.New("token hết hạn, chưa xin được token mới")
+	}
+	return fmt.Sprintf("%s còn %.0fs", t.Value, time.Until(t.Expiry).Seconds()), nil
+}
+EOF
+docker build -q -t d21-app:3 app
+```
+
+</Terminal>
+
+Compose file mới chỉ có router, ba zone và token service. Biến `ZONE_FLAGS` trong `.env` thêm cờ cho cả ba zone; lúc này nó rỗng. Kế hoạch `zones.json` dùng khoá `weights` của `gen.py`: request không có header chia theo trọng số cho ba zone; request có `x-zone: d21-zone-a` đi thẳng tới zone đó (để đo trần từng zone); `health_check: true` bật health check chủ động `/healthz` mỗi giây cho từng zone, kèm `ignore_health_on_host_removal` để khi một zone được tạo lại với địa chỉ IP mới, Envoy bỏ ngay địa chỉ cũ thay vì giữ nó tới khi health check trượt (địa chỉ cũ có thể đã thuộc về zone khác).
+
+<Terminal where="mac" title="~/masteva-d25/compose.yaml">
+
+```bash
+cat > compose.yaml <<'EOF'
+name: d21
+x-zone: &zone
+  image: d21-app:3
+  cpus: 0.5
+  mem_limit: 64m
+  restart: unless-stopped
+services:
+  router:
+    image: envoyproxy/envoy:v1.40.0@sha256:459f2a6404c340fe6afccd69d85527012d47f3c036765493e6f8f3113fa384de
+    container_name: d21-router
+    command: ["-c", "/etc/envoy/envoy.yaml", "--concurrency", "2", "--log-level", "warn"]
+    volumes: ["./router/envoy.yaml:/etc/envoy/envoy.yaml:ro", "./router/xds:/xds"]
+    ports: ["127.0.0.1:9920:8080", "127.0.0.1:9921:9901"]
+    cpus: 1
+    mem_limit: 128m
+  zone-a:
+    <<: *zone
+    container_name: d21-zone-a
+    command: -role api -cell zone-a -slots 4 -svc 20ms ${ZONE_FLAGS}
+    ports: ["127.0.0.1:9927:8080"]
+  zone-b:
+    <<: *zone
+    container_name: d21-zone-b
+    command: -role api -cell zone-b -slots 4 -svc 20ms ${ZONE_FLAGS}
+    ports: ["127.0.0.1:9928:8080"]
+  zone-c:
+    <<: *zone
+    container_name: d21-zone-c
+    command: -role api -cell zone-c -slots 4 -svc 20ms ${ZONE_FLAGS}
+    ports: ["127.0.0.1:9929:8080"]
+  token:
+    <<: *zone
+    container_name: d21-token
+    command: -role token -ttl 30s
+    ports: ["127.0.0.1:9926:8080"]
+networks:
+  default:
+    name: d21-net
+    ipam: { config: [ { subnet: 10.221.21.0/24 } ] }
+EOF
+printf 'ZONE_FLAGS=\n' > .env
+echo '{"weights": {"d21-zone-a": 100, "d21-zone-b": 100, "d21-zone-c": 100}, "health_check": true}' > router/zones.json
+./router/apply.sh zones.json
+docker compose up -d 2>&1 | grep -c Started
+for i in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:9920/)" = 200 ] && break; sleep 1; done
+for i in 1 2 3; do curl -s localhost:9920/; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+3 cluster, 4 route
+5
+zone-a
+zone-b
+zone-a
+```
+
+</Expected>
+
+Ba request liên tiếp có thể tới cùng một zone hay ba zone khác nhau: trọng số bằng nhau nghĩa là mỗi request chọn ngẫu nhiên một zone với xác suất như nhau, không phải xoay vòng.
+
+Ba script phục vụ các bước sau:
+
+- `weight.sh <zone> <trọng số>` sửa `router/zones.json` bằng `jq` rồi áp cho router. Đây là "nút rút".
+- `run.sh <req/s> <số cửa sổ> <giây> <lệnh…>` chạy tải nền (mỗi cửa sổ 5 giây in một dòng), tới giây đã hẹn thì chạy lệnh, rồi in kết quả. Nó dùng vai `load` của `d21-app:1`.
+- `zones.py [zone]` đọc bộ đếm của router hai lần cách nhau 5 giây và in lưu lượng, tỉ lệ lỗi và trạng thái health check của từng zone, nhìn từ router. Có tên zone thì tính thêm: rút zone đó thì mỗi zone còn lại phải gánh bao nhiêu phần trăm trần; vượt 80% thì in `KHÔNG rút` và thoát mã 1. Trần `CAP = 180` lấy từ bước 1.
+
+<Callout kind="danger">
+
+Trong `run.sh`, dòng `docker rm -f d21-load` xoá container tải còn sót từ một lần chạy bị ngắt (nếu có), để tên `d21-load` dùng lại được.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-d25/weight.sh, run.sh, zones.py">
+
+```bash
+cat > weight.sh <<'EOF'
+#!/bin/bash
+# weight.sh <zone> <trọng số>: đổi trọng số một zone trong router/zones.json rồi áp cho router.
+set -euo pipefail
+cd "$(dirname "$0")"
+jq --arg z "d21-$1" --argjson w "$2" '.weights[$z] = $w' router/zones.json > router/zones.tmp && mv router/zones.tmp router/zones.json
+jq -c .weights router/zones.json
+./router/apply.sh zones.json > /dev/null
+EOF
+cat > run.sh <<'EOF'
+#!/bin/bash
+# run.sh <req/s> <số cửa sổ 5 giây> <giây thứ mấy thì làm> <lệnh...>
+# Chạy tải nền, tới giây đã hẹn thì chạy lệnh, chờ tải xong rồi in kết quả từng cửa sổ 5 giây.
+set -u
+rate=$1 windows=$2 at=$3; shift 3
+docker rm -f d21-load > /dev/null 2>&1
+docker run -d --name d21-load --network d21-net d21-app:1 -role load -rps "$rate" -dur 5s -repeat "$windows" > /dev/null || exit 1
+sleep "$at"; echo "--- giây $at: $*"; "$@"
+docker wait d21-load > /dev/null; docker logs d21-load; docker rm d21-load > /dev/null
+EOF
+cat > zones.py <<'EOF'
+"""zones.py [zone sắp rút]: lưu lượng và tỉ lệ lỗi từng zone nhìn từ router trong 5 giây.
+Có tên zone thì tính thêm: rút zone đó, mỗi zone còn lại phải gánh bao nhiêu phần trăm trần."""
+import json
+import re
+import sys
+import time
+import urllib.request
+
+ADMIN, CAP, LIMIT = "http://localhost:9921", 180, 0.8  # trần một zone đo ở bước 1, ngưỡng an toàn
+
+
+def stats():
+    text = urllib.request.urlopen(ADMIN + "/stats").read().decode()
+    return {m[0]: int(m[1]) for m in re.findall(r"^(cluster\.d21-zone-\w\.upstream_rq_(?:2xx|5xx|timeout)): (\d+)$", text, re.M)}
+
+
+a = stats(); time.sleep(5); b = stats()
+weights = json.load(open("router/zones.json"))["weights"]
+health = urllib.request.urlopen(ADMIN + "/clusters").read().decode()
+total = 0
+for z, w in weights.items():
+    d = {k: b.get(f"cluster.{z}.upstream_rq_{k}", 0) - a.get(f"cluster.{z}.upstream_rq_{k}", 0) for k in ("2xx", "5xx", "timeout")}
+    n = d["2xx"] + d["5xx"]
+    total += n / 5
+    hc = re.search(rf"^{z}::[\d.:]+::health_flags::(\S+)$", health, re.M)
+    print(f"{z}: trọng số {w}, {n / 5:5.0f} req/s, lỗi {100 * d['5xx'] / max(n, 1):5.1f}%, health check: {hc[1] if hc else '?'}")
+if len(sys.argv) > 1:
+    drain = "d21-" + sys.argv[1]
+    left = [z for z, w in weights.items() if w > 0 and z != drain]
+    load = total / max(len(left), 1) / CAP
+    print(f"rút {sys.argv[1]}: {len(left)} zone còn lại, mỗi zone {total / max(len(left), 1):.0f} req/s = {100 * load:.0f}% trần {CAP}")
+    if load > LIMIT:
+        print(f"KHÔNG rút: vượt ngưỡng {100 * LIMIT:.0f}%")
+        sys.exit(1)
+    print("đủ dung lượng, rút được")
+EOF
+chmod +x weight.sh run.sh
+```
+
+</Terminal>
+
+### 1. Đo trần một zone trước khi rút bất cứ thứ gì
+
+Gửi tải tăng dần thẳng vào `zone-a` (header `x-zone`), mỗi bậc 5 giây:
+
+<Terminal where="mac">
+
+```bash
+./load.sh -header x-zone=d21-zone-a -rps 100,150,180,200,220 -dur 5s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ 100 req/s: ok 100.0% | p50   21ms | p99   22ms | zone-a=500
+ 150 req/s: ok 100.0% | p50   21ms | p99   22ms | zone-a=750
+ 180 req/s: ok 100.0% | p50   21ms | p99   22ms | zone-a=899
+ 200 req/s: ok 100.0% | p50   96ms | p99  182ms | zone-a=994
+ 220 req/s: ok 100.0% | p50  345ms | p99  673ms | zone-a=1098
+```
+
+</Expected>
+
+Tới 180 request mỗi giây, p50 là thời gian xử lý (20 ms cộng chút đi đường) và p99 ngay sau đó; p99 của bậc đầu có thể cao hơn vài chục mili giây vì bộ tạo tải đang mở kết nối mới. Ở 200, sát trần tính theo Little, p50 tăng gấp mấy lần vì request bắt đầu phải xếp hàng; ở 220, hàng đợi dài dần suốt 5 giây (D18.1 đã thấy hình dạng này). Trần thật thấp hơn 200 một chút vì mỗi request tốn thêm vài phần nghìn giây ngoài 20 ms. Bài lấy **180** làm trần an toàn của một zone, là giá trị `CAP` trong `zones.py`. Số trên máy bạn lệch vài mili giây; bậc mà p50 bắt đầu tăng thì giống.
+
+<Check id="d25.3.lab-capacity">Đo được trần của một zone bằng tải tăng dần theo mô hình mở, đối chiếu được với trần tính theo định luật Little, và chọn được trần an toàn dùng cho quyết định rút.</Check>
+
+### 2. Rút một zone, lúc đủ dung lượng và lúc không
+
+Ở 240 request mỗi giây, mỗi zone nhận khoảng 80, tức khoảng 44% trần. Kiểm điều kiện rồi rút `zone-c` theo hai bậc, 50 rồi 0, cách nhau 5 giây, trong lúc tải đang chạy:
+
+<Terminal where="mac">
+
+```bash
+./run.sh 240 3 3 python3 zones.py zone-c
+./run.sh 240 6 9 sh -c './weight.sh zone-c 50 && sleep 5 && ./weight.sh zone-c 0'
+./weight.sh zone-c 100
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+--- giây 3: python3 zones.py zone-c
+d21-zone-a: trọng số 100,    74 req/s, lỗi   0.0%, health check: healthy
+d21-zone-b: trọng số 100,    88 req/s, lỗi   0.0%, health check: healthy
+d21-zone-c: trọng số 100,    77 req/s, lỗi   0.0%, health check: healthy
+rút zone-c: 2 zone còn lại, mỗi zone 119 req/s = 66% trần 180
+đủ dung lượng, rút được
+t=  0s  240 req/s: ok 100.0% | p50   21ms | p99   25ms | zone-a=394 zone-b=409 zone-c=396
+t=  5s  240 req/s: ok 100.0% | p50   21ms | p99   24ms | zone-a=374 zone-b=440 zone-c=386
+t= 10s  240 req/s: ok 100.0% | p50   21ms | p99   36ms | zone-a=398 zone-b=405 zone-c=390
+--- giây 9: sh -c ./weight.sh zone-c 50 && sleep 5 && ./weight.sh zone-c 0
+{"d21-zone-a":100,"d21-zone-b":100,"d21-zone-c":50}
+{"d21-zone-a":100,"d21-zone-b":100,"d21-zone-c":0}
+t=  0s  240 req/s: ok 100.0% | p50   21ms | p99   24ms | zone-a=448 zone-b=371 zone-c=381
+t=  5s  240 req/s: ok 100.0% | p50   21ms | p99   22ms | zone-a=399 zone-b=404 zone-c=397
+t= 10s  240 req/s: ok 100.0% | p50   21ms | p99   25ms | zone-a=466 zone-b=494 zone-c=240
+t= 15s  240 req/s: ok 100.0% | p50   21ms | p99   25ms | zone-a=548 zone-b=542 zone-c=110
+t= 20s  240 req/s: ok 100.0% | p50   21ms | p99   28ms | zone-a=566 zone-b=634
+t= 25s  240 req/s: ok 100.0% | p50   21ms | p99   25ms | zone-a=602 zone-b=598
+{"d21-zone-a":100,"d21-zone-b":100,"d21-zone-c":100}
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- **Lượt đầu chỉ kiểm**: hai zone còn lại sẽ gánh mỗi zone khoảng 120 request mỗi giây, khoảng 66% trần, dưới ngưỡng 80%.
+- **Lượt sau rút thật.** Lệnh rút chạy ở giây 9 và mỗi lần `weight.sh` mất khoảng 2 giây để router nạp, nên bậc 50 có hiệu lực giữa cửa sổ `t= 10s` và bậc 0 giữa cửa sổ `t= 15s`. `zone-c` giảm dần qua hai cửa sổ đó, từ `t= 20s` thì không còn; `zone-a` và `zone-b` tăng lên khoảng 120 mỗi giây (khoảng 600 mỗi cửa sổ 5 giây).
+- Cột `ok` giữ 100% suốt lượt: request đang dở ở `zone-c` được làm nốt, request mới sang zone khác. Người dùng không nhận ra gì.
+- Dòng cuối của khối lệnh trả `zone-c` về trọng số 100 cho bước sau.
+
+Giờ cùng thao tác đó ở 480 request mỗi giây, mỗi zone khoảng 160 (gần 90% trần, một hệ chạy "tiết kiệm"). `zones.py` sẽ từ chối; lượt thứ hai bỏ qua lời từ chối và rút thẳng về 0, để bạn thấy điều nó đã cảnh báo.
+
+<Callout kind="danger">
+
+Lượt thứ hai cố ý làm quá tải hai zone còn lại trong khoảng 15 giây; khối lệnh trả trọng số về 100 ở dòng cuối.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+./run.sh 480 2 3 python3 zones.py zone-c
+./run.sh 480 6 9 ./weight.sh zone-c 0
+./weight.sh zone-c 100
+```
+
+</Terminal>
+
+<Predict question="Sau khi rút, mỗi zone còn lại phải nhận khoảng 240 request mỗi giây, trên trần khoảng 180. Cột ok và p50 sẽ ra sao?">
+
+```text
+--- giây 3: python3 zones.py zone-c
+d21-zone-a: trọng số 100,   159 req/s, lỗi   0.0%, health check: healthy
+d21-zone-b: trọng số 100,   159 req/s, lỗi   0.0%, health check: healthy
+d21-zone-c: trọng số 100,   157 req/s, lỗi   0.0%, health check: healthy
+rút zone-c: 2 zone còn lại, mỗi zone 237 req/s = 132% trần 180
+KHÔNG rút: vượt ngưỡng 80%
+t=  0s  480 req/s: ok 100.0% | p50   21ms | p99   57ms | zone-a=805 zone-b=792 zone-c=799
+t=  5s  480 req/s: ok 100.0% | p50   22ms | p99   60ms | zone-a=782 zone-b=808 zone-c=808
+--- giây 9: ./weight.sh zone-c 0
+{"d21-zone-a":100,"d21-zone-b":100,"d21-zone-c":0}
+t=  0s  480 req/s: ok 100.0% | p50   21ms | p99   49ms | zone-a=816 zone-b=767 zone-c=803
+t=  5s  480 req/s: ok 100.0% | p50   22ms | p99   63ms | zone-a=784 zone-b=784 zone-c=830
+t= 10s  480 req/s: ok  81.0% | p50  565ms | p99  901ms | zone-a=1007 zone-b=903 zone-c=11
+t= 16s  480 req/s: ok  93.1% | p50  571ms | p99 1012ms | zone-a=1038 zone-b=1021
+t= 22s  480 req/s: ok  79.9% | p50  605ms | p99  903ms | zone-a=825 zone-b=1077
+t= 28s  480 req/s: ok  76.0% | p50  574ms | p99  901ms | zone-a=978 zone-b=838
+{"d21-zone-a":100,"d21-zone-b":100,"d21-zone-c":100}
+```
+
+Lượt kiểm in `KHÔNG rút`: mỗi zone còn lại sẽ phải gánh khoảng 130% trần. Lượt rút thật cho đúng điều đó: từ cửa sổ có lệnh rút, p50 nhảy lên vài trăm mili giây vì request xếp hàng chờ chỗ, rồi các cửa sổ sau chỉ còn khoảng 75–95% request thành công; số còn lại hết hạn 0,9 giây ở router. Hai zone xử lý đúng bằng trần của chúng, phần vượt thành lỗi. Một thao tác "an toàn" lúc tải thấp đã thành sự cố lúc tải cao: rút traffic là tự gây ra tình huống mất một zone, nên nó cần đúng headroom mà D18.1 đã tính.
+
+</Predict>
+
+<Check id="d25.3.lab-drain">Rút được một zone theo bậc bằng trọng số ở router mà không request nào lỗi, kiểm được điều kiện dung lượng trước khi rút, và tái hiện được việc rút ở tải cao làm quá tải phần còn lại.</Check>
+
+### 3. Lỗi xám: health check nói khoẻ, người dùng nói không
+
+Cho `zone-b` trả lỗi 30% request, đọc `zones.py` (nó in trạng thái health check của router cạnh tỉ lệ lỗi), rồi rút `zone-b` nếu đủ dung lượng. Ba việc nằm trong một lệnh chạy ở giây thứ 6 của lượt tải:
+
+<Terminal where="mac">
+
+```bash
+./run.sh 240 6 6 sh -c "curl -s 'localhost:9928/admin/fail?pct=30'; sleep 6; python3 zones.py zone-b && ./weight.sh zone-b 0"
+curl -s 'localhost:9928/admin/fail?pct=0'
+./weight.sh zone-b 100
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+--- giây 6: sh -c curl -s 'localhost:9928/admin/fail?pct=30'; sleep 6; python3 zones.py zone-b && ./weight.sh zone-b 0
+zone-b: 30% request trả lỗi
+d21-zone-a: trọng số 100,    75 req/s, lỗi   0.0%, health check: healthy
+d21-zone-b: trọng số 100,    79 req/s, lỗi  29.8%, health check: healthy
+d21-zone-c: trọng số 100,    85 req/s, lỗi   0.0%, health check: healthy
+rút zone-b: 2 zone còn lại, mỗi zone 119 req/s = 66% trần 180
+đủ dung lượng, rút được
+{"d21-zone-a":100,"d21-zone-b":0,"d21-zone-c":100}
+t=  0s  240 req/s: ok 100.0% | p50   21ms | p99   24ms | zone-a=378 zone-b=412 zone-c=407
+t=  5s  240 req/s: ok  92.5% | p50   21ms | p99   25ms | zone-a=402 zone-b=312 zone-c=387
+t= 10s  240 req/s: ok  90.1% | p50   21ms | p99   22ms | zone-a=376 zone-b=290 zone-c=415
+t= 15s  240 req/s: ok  93.0% | p50   21ms | p99   28ms | zone-a=452 zone-b=167 zone-c=492
+t= 20s  240 req/s: ok 100.0% | p50   21ms | p99   25ms | zone-a=564 zone-c=636
+t= 25s  240 req/s: ok 100.0% | p50   21ms | p99   29ms | zone-a=584 zone-c=615
+zone-b: 0% request trả lỗi
+{"d21-zone-a":100,"d21-zone-b":100,"d21-zone-c":100}
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- **Health check của router báo cả ba zone `healthy`** trong khi `zone-b` trả lỗi khoảng 30% request. `/healthz` chỉ hỏi tiến trình còn sống không; nó không đi qua nhánh code đang hỏng. Router của bước này không bật outlier detection (D9.6). Kể cả có bật, outlier detection chỉ loại từng host **trong** một cluster, còn ở đây mỗi zone là một cluster một host; theo tài liệu Envoy 1.40, `max_ejection_percent` mặc định 10% và Envoy chỉ loại ít nhất một host bất kể giới hạn đó khi bật `always_eject_one_host` (mặc định tắt), nên cluster một host không bị loại host nào. Ngoài đời một zone có nhiều host: outlier detection sẽ loại dần các host trả lỗi, nhưng khi lỗi nằm ở một phụ thuộc chung của cả zone thì mọi host cùng lỗi, outlier detection chỉ loại được tới giới hạn đó, và nếu giới hạn bị nâng cao thì panic threshold (D9.6) khiến Envoy gửi lại cho mọi host khi quá nửa số host bị loại.
+- **Tỉ lệ lỗi theo zone đo ở router** là thứ chỉ ra đúng chỗ hỏng: một zone khoảng 30%, hai zone 0%. Lỗi toàn hệ thống khoảng 6–11% (cột `ok` khoảng 89–94%; theo lý thuyết là 1/3 × 30% = 10%), đủ nhỏ để một alert theo tổng có thể chưa kêu (D16.2).
+- Sau khi rút (khoảng giây 19: 6 giây chờ, 5 giây đo của `zones.py`, 2 giây áp trọng số), cột `ok` về 100%. Không ai cần biết nguyên nhân để làm việc đó; tìm nguyên nhân là việc làm sau, trong lúc người dùng đã hết lỗi. Đó đúng là lập luận của Slack.
+
+<Check id="d25.3.lab-gray">Tái hiện được một lỗi xám mà health check không thấy, nhận ra nó bằng tỉ lệ lỗi theo zone đo tại router, và rút được zone đó sau khi kiểm dung lượng.</Check>
+
+### 4. Một token service mà mọi zone cùng gọi
+
+Giờ cho cả ba zone xin một token từ `d21-token` cho **mỗi** request, như một service gọi STS hay IdP mỗi lần trước khi làm việc. Ba zone vẫn độc lập với nhau theo mọi nghĩa khác. Rồi cho token service treo bằng `docker pause` (tiến trình bị đóng băng: kết nối mở được nhưng không ai trả lời, giống một dịch vụ quá tải hơn là một dịch vụ tắt hẳn).
+
+<Callout kind="danger">
+
+`docker pause d21-token` làm token service ngừng trả lời; khối lệnh `docker unpause` nó ở dòng cuối.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+printf 'ZONE_FLAGS=-token http://d21-token:8080/token\n' > .env
+docker compose up -d 2>&1 | grep -c Started
+for i in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:9920/)" = 200 ] && break; sleep 1; done
+./run.sh 240 4 6 sh -c 'curl -s localhost:9926/stats; docker pause d21-token'
+docker unpause d21-token
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+3
+--- giây 6: sh -c curl -s localhost:9926/stats; docker pause d21-token
+token đã cấp: 1438
+d21-token
+t=  0s  240 req/s: ok 100.0% | p50   21ms | p99   24ms | zone-a=405 zone-b=395 zone-c=400
+t=  5s  240 req/s: ok  20.2% | p50  201ms | p99  202ms | zone-a=78 zone-b=76 zone-c=88
+t= 10s  240 req/s: ok   0.0% | p50  201ms | p99  287ms | không request nào thành công
+t= 15s  240 req/s: ok   0.0% | p50  202ms | p99  315ms | không request nào thành công
+d21-token
+```
+
+</Expected>
+
+`3` là ba zone được tạo lại với cờ mới. `token đã cấp` (khoảng 1.440) là số token đã xin trong 6 giây đầu: 240 request mỗi giây nhân 6 giây, mỗi request một token. Từ giây thứ 6, mọi zone cùng lỗi: mỗi request chờ 200 ms (hạn của lời xin token) rồi trả `503`. Cell và zone giới hạn được những gì nằm **bên trong** chúng; token service nằm ngoài cả ba, nên blast radius của nó là 100%. Không cách rút traffic nào ở bước 2, 3 cứu được, vì không còn zone nào khoẻ để rút sang.
+
+### 5. Cache token có hạn: mua được bao nhiêu thời gian
+
+Bật `-token-cache`: mỗi zone xin token một lần lúc khởi động, rồi một vòng chạy nền xin lại khi token đã qua nửa thời hạn (15 trên 30 giây); xin không được thì giữ token cũ và thử lại mỗi giây. Request chỉ đọc token đang giữ, không gọi token service nữa. Lượt đo dài 50 giây để thấy chuyện gì xảy ra khi token hết hạn.
+
+<Terminal where="mac">
+
+```bash
+printf 'ZONE_FLAGS=-token http://d21-token:8080/token -token-cache\n' > .env
+docker compose up -d 2>&1 | grep -c Started
+for i in $(seq 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:9920/)" = 200 ] && break; sleep 1; done
+curl -s localhost:9926/stats
+./run.sh 240 10 6 sh -c 'curl -s localhost:9926/stats; docker pause d21-token'
+docker unpause d21-token
+sleep 3
+curl -s localhost:9920/
+```
+
+</Terminal>
+
+<Predict question="Token service treo từ giây 6 tới hết lượt. Các zone giữ được bao lâu?">
+
+```text
+3
+token đã cấp: 4718
+--- giây 6: sh -c curl -s localhost:9926/stats; docker pause d21-token
+token đã cấp: 4718
+d21-token
+t=  0s  240 req/s: ok 100.0% | p50   21ms | p99   36ms | zone-a=370 zone-b=403 zone-c=415
+t=  5s  240 req/s: ok 100.0% | p50   21ms | p99   32ms | zone-a=369 zone-b=423 zone-c=405
+t= 10s  240 req/s: ok 100.0% | p50   21ms | p99   29ms | zone-a=415 zone-b=385 zone-c=394
+t= 15s  240 req/s: ok 100.0% | p50   24ms | p99  412ms | zone-a=347 zone-b=333 zone-c=350
+t= 20s  240 req/s: ok 100.0% | p50   25ms | p99   86ms | zone-a=354 zone-b=380 zone-c=346
+t= 25s  240 req/s: ok  87.1% | p50   23ms | p99   67ms | zone-a=310 zone-b=352 zone-c=335
+t= 30s  240 req/s: ok   0.0% | p50    1ms | p99    9ms | không request nào thành công
+t= 35s  240 req/s: ok   0.0% | p50    1ms | p99   11ms | không request nào thành công
+t= 40s  240 req/s: ok   0.0% | p50    1ms | p99   11ms | không request nào thành công
+t= 45s  240 req/s: ok   0.0% | p50    0ms | p99   11ms | không request nào thành công
+d21-token
+zone-a | tk-4830 còn 27s
+```
+
+Từ giây 6 tới khoảng giây 20–30, mọi request vẫn thành công: các zone dùng token đang giữ. Rồi lần lượt từng zone thấy token của mình hết hạn, và từ đó mọi request lỗi ngay (p50 khoảng 1 ms, vì không còn gọi token service mà trả lỗi luôn). Vì mỗi zone xin lại token khi đã qua nửa thời hạn, lúc token service treo, token đang giữ còn từ 15 tới 30 giây; đó chính là khoảng thời gian cache mua được. Trên máy bạn, cửa sổ bắt đầu lỗi rơi vào khoảng giây 20 tới giây 35.
+
+Hai dòng `token đã cấp` (trước lượt đo và lúc bắt đầu treo) bằng nhau: trong 6 giây đầu, ba zone không xin thêm token nào, so với khoảng 1.440 token trong 6 giây ở bước 4. Con số tăng từ khoảng 1.440 lên hơn 4.000 giữa hai bước vì khi bước 4 bỏ đóng băng, token service trả lời một loạt lời xin đã xếp hàng trong lúc treo, cho những request đã bỏ đi từ lâu: đúng kiểu việc làm cho người đã đi của D18.2. Sau khi token service sống lại, mỗi zone xin được token mới trong vòng một giây và phục vụ lại (dòng cuối).
+
+</Predict>
+
+Cache biến một sự cố 100% ngay lập tức thành một khoảng an toàn bằng thời hạn còn lại của token. Nó đủ cho những lần token service chập chờn vài giây, không đủ cho một giờ. Để chịu được lâu hơn, phải bỏ hẳn phụ thuộc toàn cầu: token service đặt ở từng vùng hay từng zone (endpoint vùng của STS), hoặc kiểm token bằng khoá ký đã cache thay vì gọi dịch vụ phát token. Cũng đừng kéo dài thời hạn token chỉ để có khoảng an toàn dài hơn: token sống lâu là token bị lộ thì dùng được lâu.
+
+<Check id="d25.3.lab-token">Tái hiện được việc một token service mà mọi zone cùng gọi làm mọi zone lỗi cùng lúc, sửa được bằng cache token xin lại sớm, và giải thích được bằng kết quả đo rằng cache chỉ mua được thời gian bằng thời hạn còn lại của token.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`zones.py` in lưu lượng 0 cho mọi zone:** nó chạy khi không có tải. Gọi nó qua `run.sh` như trong bài, hoặc chạy tải ở terminal khác.
+- **`./run.sh` báo `Conflict. The container name "/d21-load" is already in use`:** không xảy ra với script của bài (nó xoá container cũ trước); nếu bạn chạy `docker run` tay, xoá bằng `docker rm -f d21-load`.
+- **Bước 1 cho p50 cao ngay từ bậc 100:** máy đang rất bận, hoặc zone bị giới hạn CPU chặt hơn bài (`cpus` trong `compose.yaml`). Đóng bớt ứng dụng rồi chạy lại.
+- **Sau khi đổi `ZONE_FLAGS`, kết quả như cũ:** `docker compose up -d` chỉ tạo lại container khi lệnh của nó đổi; kiểm bằng `docker inspect d21-zone-a --format '{{join .Args " "}}'`.
+- **Trọng số không đổi lại sau khi khối lệnh bị ngắt:** chạy `./weight.sh zone-b 100` và `./weight.sh zone-c 100`, rồi `jq -c .weights router/zones.json` để kiểm.
+- **Token service vẫn bị đóng băng** (mọi request lỗi kể cả sau bước 5): chạy `docker unpause d21-token`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+`docker rm -f d21-load` xoá container tải nếu một lượt đo bị ngắt giữa chừng. `docker compose down` xoá 5 container của bài và mạng `d21-net`. Khối "Xoá hẳn" ở cuối D21.1 xoá image và thư mục lab khi bạn không cần chặng này nữa.
+
+</Callout>
+
+<Terminal where="mac" title="Dừng lab">
+
+```bash
+cd ~/masteva-d25
+docker rm -f d21-load
+docker unpause d21-token 2>/dev/null
+docker compose down
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Vì sao router và nút rút phải ở ngoài zone bị rút?">
+
+Vì lúc cần rút nhất là lúc zone đó tệ nhất: mất mạng, quá tải, hay đang có lỗi xám. Nếu control plane của router chạy trong zone đó, hay thao tác rút cần gọi một dịch vụ chỉ có ở đó, nút rút hỏng đúng lúc cần. Slack đặt load balancer biên ở vùng khác và sao control plane ra nhiều vùng; AWS khuyên dùng thao tác của data plane (zonal shift, cơ chế chuyển của ARC) thay cho sửa bản ghi DNS khi failover. Trong lab, `weight.sh` chạy trên máy bạn và chỉ cần container router; nó chịu được mất cả `zone-c`. Kiểm điều này bằng cách diễn tập: rút một zone khi zone đó đã bị tắt hẳn.
+
+</Reveal>
+
+<Reveal title="Có nên để hệ thống tự rút khi tỉ lệ lỗi một zone vượt ngưỡng?">
+
+Được, nếu có ba lan can: chỉ rút một zone tại một thời điểm, chỉ rút khi phần còn lại đủ dung lượng (như `zones.py`), và có giới hạn tốc độ để một lỗi của chính bộ đo không rút hết. Lỗi xám là nơi tự động dễ sai: nếu chính router ở một zone nhìn thấy sai (như Slack mô tả, mỗi bên thấy bên kia hỏng), quyết định tự động dựa trên nó có thể rút nhầm zone khoẻ. Một cách dung hoà: tự động phát hiện và đề xuất, người trực bấm xác nhận; và tự động hoàn toàn cho loại lỗi đã hiểu rõ, như AWS làm với zonal autoshift kèm practice run mỗi tuần.
+
+</Reveal>
+
+<Reveal title="Cache token, cache DNS, cache JWKS: cái nào nên giữ lâu nhất?">
+
+Giữ theo cái giá khi cache sai. Khoá công khai dùng kiểm chữ ký token (JWKS) đổi hiếm và giữ sai thì chỉ làm token ký bằng khoá mới bị từ chối, nên giữ được lâu, miễn là gặp khoá lạ thì hỏi lại. Bản ghi DNS giữ quá TTL có thể trỏ tới máy đã bị thay (K10.3); một số resolver cho phép "phục vụ bản cũ" khi máy chủ có thẩm quyền không trả lời, đổi rủi ro trỏ sai lấy khả năng chạy tiếp. Token truy cập là quyền: giữ quá hạn là dùng quyền đã hết, nên không giữ quá thời hạn của chính nó, như lab. Cache lỗi (như Gmail trong sự cố 14/12/2020) nên có thời hạn ngắn hơn cache thành công nhiều lần.
+
+</Reveal>
+
+<Callout kind="ai">
+
+Nhờ AI lập bảng phụ thuộc toàn cầu từ manifest, Terraform và cấu hình SDK của dự án là việc hữu ích: nó tìm được endpoint STS toàn cầu, URL IdP, registry, webhook SaaS nằm rải rác. Kiểm lại bằng dữ liệu thật (log egress, trace), vì AI chỉ thấy những gì nằm trong file. Khi nhờ AI viết cơ chế rút traffic, nó hay bỏ bước kiểm dung lượng và hay viết rút một lần về 0; hỏi thêm: phần còn lại gánh bao nhiêu phần trăm trần, rút theo bậc nào, đảo ngược thế nào, và cơ chế rút có phụ thuộc gì nằm trong zone bị rút không. Với cache token, kiểm AI có xin lại sớm (trước khi hết hạn) và có giữ token cũ khi xin lại thất bại không; nhiều mẫu code xoá token rồi mới xin token mới.
+
+</Callout>
+
+<Callout kind="link">
+
+D18.1 tính headroom theo zone mà bước 2 cần; D18.2 dạy load shedding cho lúc phần còn lại quá tải. D9.6 dạy outlier detection (rút tự động ở mức host) và panic threshold (lan can ngăn việc rút tự động gỡ quá nhiều host). D16.1 và D16.2 đo SLI và đặt alert, ở bài này là theo từng zone. D17.4 tổ chức game day, nơi diễn tập rút một zone hay mất IdP; K10.3 dạy failover giữa cụm bằng Envoy và DNS. Chặng D20 bàn DR nhiều vùng, nơi rút cả một vùng gắn với dữ liệu.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d25.3.mastery-drain">Viết được runbook rút một zone hay một cell cho hệ của mình: điều kiện dung lượng tính bằng số, SLI theo zone dùng để quyết định, các bậc trọng số, cách đảo ngược, và vì sao cơ chế rút không phụ thuộc vào zone bị rút.</Check>
+
+<Check id="d25.3.mastery-deps">Lập được bảng phụ thuộc toàn cầu của một hệ đang chạy từ dữ liệu thật, ghi được mỗi phụ thuộc được gọi khi nào, và với ba phụ thuộc rủi ro nhất, đề xuất được cách giảm kèm thời gian nó chịu được.</Check>
+
+<Check id="d25.3.mastery-test">Thiết kế được một phép thử chặn một phụ thuộc toàn cầu có điều kiện dừng, gồm cả bước khởi động lại service trong lúc chặn, và đọc được kết quả để biết hệ chịu được bao lâu.</Check>
+
+</Mastery>

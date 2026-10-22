@@ -1,0 +1,838 @@
+---
+title: "Kiểm tra khôi phục tự động cho PostgreSQL"
+description: Ba câu hỏi theo dõi sao lưu và metric trả lời từng câu; vì sao job backup báo xanh không chứng minh được gì; dựng một CronJob mỗi ngày khôi phục backup mới nhất của CloudNativePG từ SeaweedFS vào một cụm tạm, so số dòng và checksum với cụm nguồn, đo thời gian khôi phục, ghi kết quả thành metric, rồi cho nó thất bại có chủ đích để thấy alert nào kêu.
+id: d24.2
+step: d24
+prerequisites: [d24.1, k7.4]
+topics: [d24.pitr-kiem-tra-khoi-phuc]
+status: verified
+verified:
+  date: 2026-10-21
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.36.1 (bản đi kèm Docker Desktop); 1.37.1 trong image của job kiểm tra
+    cloudnative-pg: 1.30.1
+    plugin-barman-cloud: 0.15.1
+    cert-manager: 1.21.2
+    postgresql: 18.6 (image ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie)
+    seaweedfs: "4.48"
+---
+
+<Goal>
+
+K7.4 đã sao lưu và khôi phục một lần bằng tay. Bài này biến lần khôi phục đó thành việc **máy làm mỗi ngày**: dựng lại database từ backup vào một cụm tạm, kiểm dữ liệu, đo thời gian, báo kết quả thành metric, rồi xoá cụm tạm. Học xong, bạn giải thích được:
+
+- Vì sao "job backup báo xanh" không chứng minh được gì, và những kiểu hỏng nào chỉ lộ ra khi khôi phục thật.
+- Ba câu hỏi theo dõi sao lưu (WAL có đang được đẩy đi, backup gần nhất là bao giờ, khôi phục được không và mất bao lâu) và metric nào trả lời câu nào.
+- Một kiểm tra khôi phục tự động phải kiểm gì để đáng tin, và vì sao alert phải kêu cả khi kiểm tra **không chạy**.
+
+</Goal>
+
+<Knowledge>
+
+### Ba câu hỏi theo dõi sao lưu
+
+K7.4 đã dạy hai nửa của một backup PostgreSQL: base backup và WAL archive, cùng nằm trong object storage. Theo dõi chúng là trả lời ba câu hỏi:
+
+| Câu hỏi | Tín hiệu | Ở đâu |
+|---|---|---|
+| WAL có đang được đẩy đi không? | Số giây từ lần đẩy WAL thành công gần nhất, số lần thất bại | Metric `cnpg_pg_stat_archiver_seconds_since_last_archival`, `cnpg_pg_stat_archiver_failed_count` (đọc từ `pg_stat_archiver` của primary); điều kiện `ContinuousArchiving` của Cluster |
+| Backup gần nhất là bao giờ, cửa sổ khôi phục bắt đầu từ đâu? | Thời điểm backup thành công gần nhất, điểm khôi phục sớm nhất | Metric `barman_cloud_cloudnative_pg_io_last_available_backup_timestamp` và `barman_cloud_cloudnative_pg_io_first_recoverability_point` của plugin Barman Cloud; điều kiện `LastBackupSucceeded` |
+| Khôi phục được không, mất bao lâu, dữ liệu có đúng không? | Kết quả và thời gian của lần khôi phục thử gần nhất | Không có sẵn: phải tự làm, và là việc chính của bài |
+
+Hai dòng đầu chỉ nói backup **đang được tạo ra**. CNPG đặt `archive_timeout` 5 phút, nghĩa là lúc ít ghi WAL có thể được đẩy chậm tới 5 phút, nên alert trên `seconds_since_last_archival` đặt ngưỡng lớn hơn con số đó một khoảng; còn `failed_count` tăng là dấu hiệu sai khoá, đầy bucket hay mất mạng tới object storage. Plugin giữ bao nhiêu backup thì đặt bằng `retentionPolicy` trên `ObjectStore`: `"7d"` nghĩa là giữ đủ để khôi phục về bất kỳ thời điểm nào trong 7 ngày qua, backup cũ hơn bị xoá sau mỗi lần backup mới.
+
+<Check id="d24.2.theo-doi-sao-luu">Kể được ba câu hỏi theo dõi sao lưu và tín hiệu trả lời mỗi câu, và giải thích được vì sao hai câu đầu có metric sẵn mà câu thứ ba thì không.</Check>
+
+### Backup chưa khôi phục được thì chưa phải backup
+
+Job backup thành công chỉ chứng minh **có file được ghi ra**. Nó không chứng minh file đó khôi phục được, khôi phục mất bao lâu, hay dữ liệu khôi phục ra có đúng không. Những thứ hay hỏng mà job backup không thấy:
+
+| Hỏng ở đâu | Job backup | Chỉ lộ ra khi |
+|---|---|---|
+| Thiếu một đoạn WAL (archive lỗi một lúc rồi chạy lại) | Vẫn xanh | Khôi phục tới thời điểm sau chỗ đứt |
+| Khoá truy cập hay quyền bucket đổi, chỉ ghi được mà không đọc được | Vẫn xanh | Đọc backup ra |
+| Backup của cụm khác, sai `serverName`, sai thư mục | Vẫn xanh | Khôi phục ra một database không phải của mình |
+| Thời gian khôi phục vượt RTO cam kết | Không đo | Đo thời gian khôi phục thật |
+| Người trực chưa từng làm, runbook đã cũ | Không đo | Lúc sự cố, trên production |
+
+**Kiểm tra khôi phục tự động** là làm lại lần khôi phục của K7.4 theo lịch, không cần người:
+
+```text
+  CronJob (hằng ngày, sau giờ backup)
+    1. tạo Cluster tạm từ ObjectStore     bootstrap.recovery, không đặt recoveryTarget: tới WAL mới nhất
+    2. chờ sẵn sàng, ghi lại thời gian    -> RTO đo được của một lần khôi phục toàn bộ
+    3. chạy truy vấn kiểm                 đếm dòng, checksum trên dữ liệu không còn đổi, so với cụm nguồn
+    4. ghi kết quả về nơi theo dõi được   -> metric; alert khi thất bại VÀ khi lâu không có kết quả
+    5. xoá Cluster tạm
+```
+
+Bốn điểm thiết kế:
+
+- **Kiểm nội dung, không chỉ kiểm "lên được".** Database khởi động được nhưng thiếu bảng, hay dừng ở một thời điểm cũ vì thiếu WAL, vẫn "lên được". So số dòng và checksum của phần dữ liệu không còn đổi (đơn hàng đã tạo xong) với cụm nguồn, giới hạn tới một mốc cũ hơn hiện tại một khoảng bằng RPO mà cách sao lưu hứa.
+- **Đo thời gian.** Con số RTO trong tài liệu thiết kế chỉ có nghĩa khi đo trên đúng kích thước dữ liệu hiện tại; dữ liệu tăng thì RTO tăng theo, và chỉ phép đo định kỳ mới thấy. Quá ngân sách thời gian là thất bại, kể cả khi cuối cùng database có lên.
+- **Báo cả khi im lặng.** Alert khi kiểm tra thất bại là chưa đủ: CronJob không chạy (lịch sai, image lỗi, quota hết) thì không có gì thất bại. Alert trên **tuổi của lần thành công gần nhất**, cùng ý tưởng dead man's switch của D16.5.
+- **Chạy ở nơi không đụng production.** Cụm tạm có giới hạn tài nguyên và không khai `plugins` sao lưu, để nó không ghi WAL vào bucket của cụm thật.
+
+Kiểm tra tự động không thay được **diễn tập khôi phục** có người tham gia (D20.3, D20.5): nó chứng minh backup dùng được, không chứng minh đội biết dùng.
+
+<Callout kind="production">
+
+Ngày 21/02/2024, Resend (dịch vụ gửi email qua API) ngừng hoàn toàn khoảng 12 giờ, từ 05:01 tới 17:05 UTC, theo [báo cáo sự cố của họ](https://www.resend.com/blog/incident-report-for-february-21-2024). Khi xây một tính năng, một lệnh migration database chạy trên máy của lập trình viên nhưng trỏ nhầm vào production, và xoá mọi bảng trên production. Họ bắt đầu khôi phục từ backup lúc 05:01. Lần khôi phục đầu kéo dài 6 giờ, xong lúc 11:02, và **không khôi phục được dữ liệu**: tới 11:33 họ tìm ra lý do là đã chọn sai mốc thời gian của backup. Họ tăng cấu hình máy database (bộ nhớ từ 128 GB lên 256 GB, CPU từ 32 lên 64 nhân ARM) để khôi phục nhanh hơn, chạy lần thứ hai từ một backup cũ hơn lúc 12:05, xong lúc 17:01. Dữ liệu trở lại, trừ khoảng 5 phút ngay trước sự cố. Trong các việc làm tiếp, họ ghi: không user nào truy cập được có quyền ghi vào database production, và tăng tần suất kiểm thử khôi phục thảm hoạ.
+
+Điều rút ra cho bài này (của bài): 6 trong 12 giờ ngừng dịch vụ là một lần khôi phục sai. Một kiểm tra khôi phục chạy hằng ngày cho sẵn hai thứ trước khi có sự cố: thời gian khôi phục thật trên dữ liệu thật, và một quy trình chọn backup, chọn mốc đã chạy đúng hàng trăm lần.
+
+</Callout>
+
+<Check id="d24.2.kiem-tra-khoi-phuc">Kể được ít nhất bốn kiểu hỏng của backup mà job backup không phát hiện, mô tả được các bước của một kiểm tra khôi phục tự động, và giải thích được vì sao phải alert trên tuổi của lần thành công gần nhất chứ không chỉ trên lần thất bại.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Barman Cloud Plugin: Observability](https://cloudnative-pg.io/plugin-barman-cloud/docs/observability/): ba metric về backup của plugin và ý nghĩa của từng cái.
+- [Barman Cloud Plugin: Retention Policies](https://cloudnative-pg.io/plugin-barman-cloud/docs/retention/): `retentionPolicy` theo cửa sổ khôi phục và backup nào bị xoá khi nào.
+- [CloudNativePG 1.30: Monitoring](https://cloudnative-pg.io/docs/1.30/monitoring/): mục "User defined metrics" (truy vấn metric tự viết, quyền của `cnpg_metrics_exporter`, cache 30 giây).
+- [CloudNativePG 1.30: Recovery](https://cloudnative-pg.io/docs/1.30/recovery/): khôi phục từ object storage vào một Cluster mới, có và không có `recoveryTarget`.
+- [Resend: Incident report for February 21st, 2024](https://www.resend.com/blog/incident-report-for-february-21-2024): nguồn của callout; đọc phần mốc thời gian.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài dựng lại cụm kind `d19-lab` một node từ đầu (D19.1 đã xoá nó ở bước dọn dẹp), cài CloudNativePG, plugin Barman Cloud và SeaweedFS làm object storage. Cần Docker Desktop, `kind`, `kubectl`, `curl`.
+
+**Profile máy.** Node kind dùng khoảng 3 tới 3,3 GiB RAM của Docker theo `docker stats`, cao nhất lúc cụm tạm đang khôi phục; con số này tính cả page cache của dữ liệu và backup, không chỉ bộ nhớ của các tiến trình (control plane, hai instance PostgreSQL, SeaweedFS, operator, cert-manager, cụm tạm). Bài cần khoảng 3 tới 4 GB đĩa của Docker. Lần đầu node phải kéo image PostgreSQL, sidecar của plugin, SeaweedFS (khoảng 70 MB) và cert-manager, nên bước 1 và 2 có thể mất 5 tới 10 phút. Máy 8 GB: đặt Docker 4 GB, dừng mọi VM và cụm khác, và giảm số dòng ở bước 2 xuống 500.000 nếu Docker báo thiếu bộ nhớ.
+
+Hai điều lab làm cho gọn mà production không làm: object storage nằm trong cùng cụm với database (thật thì phải nằm ngoài, K7.4 đã giải thích), và kiểm tra khôi phục chạy theo yêu cầu thay vì chờ lịch hằng ngày.
+
+<Callout kind="danger">
+
+Bài này tạo và xoá các cụm PostgreSQL tạm. Mọi lệnh chỉ dành cho cụm lab: khối lệnh đầu in `kubectl config current-context`, phải là `kind-d19-lab`.
+
+</Callout>
+
+### 1. Cụm kind, operator, plugin và object storage
+
+Cụm và operator CNPG giống bước 1 của D19.1; cert-manager và plugin Barman Cloud giống K7.4. Hàm `get` tải một file rồi **kiểm sha256** với digest GitHub công bố cho file phát hành; lệnh `kubectl apply` sau `&&` chỉ chạy khi khớp.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+mkdir -p ~/masteva-d24/d24-2 && cd ~/masteva-d24/d24-2
+kind create cluster --name d19-lab \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+kubectl config current-context
+get() { curl -sLO "$1" && echo "$2  ${1##*/}" | shasum -a 256 -c -; }
+get https://github.com/cert-manager/cert-manager/releases/download/v1.21.2/cert-manager.yaml \
+  e03b668ec8675214af6b0a671699d088f2601fa3878e0dbe1b41d3feafd1879f \
+  && kubectl apply -f cert-manager.yaml > /dev/null
+get https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml \
+  37237f145d8138256ea25ae830f87759255665ff08f8d552fdd8224a5ec032fb \
+  && kubectl apply --server-side -f cnpg-1.30.1.yaml > /dev/null
+kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=600s > /dev/null
+kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=600s
+get https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/v0.15.1/manifest.yaml \
+  8f377ff4a7d0d3f74fc64b0f7ac4f449fc38ca9e83a40107cca2f9315a9bd920 \
+  && kubectl apply -f manifest.yaml > /dev/null
+kubectl -n cnpg-system rollout status deploy/barman-cloud --timeout=600s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Creating cluster "d19-lab" ...
+...
+kind-d19-lab
+cert-manager.yaml: OK
+cnpg-1.30.1.yaml: OK
+deployment "cnpg-controller-manager" successfully rolled out
+manifest.yaml: OK
+deployment "barman-cloud" successfully rolled out
+```
+
+</Expected>
+
+Object storage là **SeaweedFS** chạy bằng `weed server -s3`: một tiến trình gồm đủ master, volume server, filer và cổng S3 ở cổng 8333, image ghim digest. MinIO bản cộng đồng đã ngừng từ 2026 (K7.4). SeaweedFS đọc cặp khoá S3 từ hai biến môi trường chuẩn `AWS_ACCESS_KEY_ID` và `AWS_SECRET_ACCESS_KEY`, lấy từ Secret `s3-creds`, và tự tạo bucket ở lần ghi đầu tiên. Hai cờ cuối giữ mỗi volume nhỏ (128 MB) để vừa đĩa của lab.
+
+<Terminal where="mac" title="~/masteva-d24/d24-2/seaweedfs.yaml">
+
+```bash
+kubectl create namespace d19-db
+kubectl config set-context --current --namespace d19-db > /dev/null
+kubectl create secret generic s3-creds \
+  --from-literal=ACCESS_KEY_ID=masteva --from-literal=ACCESS_SECRET_KEY=masteva-secret
+cat > seaweedfs.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: seaweedfs }
+  template:
+    metadata:
+      labels: { app: seaweedfs }
+    spec:
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+          args: ["server", "-dir=/data", "-s3", "-master.volumeSizeLimitMB=128", "-volume.max=30"]
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: s3-creds, key: ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: s3-creds, key: ACCESS_SECRET_KEY } }
+          ports:
+            - containerPort: 8333
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: seaweedfs-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+spec:
+  selector: { app: seaweedfs }
+  ports:
+    - { name: s3, port: 8333 }
+EOF
+kubectl apply -f seaweedfs.yaml > /dev/null
+kubectl rollout status deploy/seaweedfs --timeout=300s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/d19-db created
+secret/s3-creds created
+deployment "seaweedfs" successfully rolled out
+```
+
+</Expected>
+
+### 2. Cụm nguồn có sao lưu, và dữ liệu để kiểm
+
+Cụm `pg` hai instance (một primary, một replica) đẩy WAL liên tục qua plugin, như K7.4. Điểm mới là `retentionPolicy: "7d"` trên `ObjectStore`. Bảng `orders` có hai triệu đơn hàng với giờ tạo trải trong một giờ trước.
+
+<Terminal where="mac" title="~/masteva-d24/d24-2/pg.yaml">
+
+```bash
+cat > pg.yaml <<'EOF'
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: s3-store
+spec:
+  retentionPolicy: "7d"
+  configuration:
+    destinationPath: s3://pg-backups/
+    endpointURL: http://seaweedfs:8333
+    s3Credentials:
+      accessKeyId: { name: s3-creds, key: ACCESS_KEY_ID }
+      secretAccessKey: { name: s3-creds, key: ACCESS_SECRET_KEY }
+    wal:
+      compression: gzip
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage:
+    size: 3Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: s3-store
+EOF
+kubectl apply -f pg.yaml
+kubectl wait --for=condition=Ready cluster/pg --timeout=900s
+sql() { kubectl exec "$(kubectl get cluster ${2:-pg} -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -Atc "$1"; }
+sql "create table orders (id bigint primary key, customer_id int not null, amount numeric(12,2) not null, created_at timestamptz not null default now()); alter table orders owner to app"
+sql "insert into orders (id, customer_id, amount, created_at) select g, 1 + g % 50000, round((random() * 1000)::numeric, 2), now() - interval '1 hour' + g * interval '1 ms' from generate_series(1, 2000000) g"
+sql "select count(*), pg_size_pretty(pg_total_relation_size('orders')) from orders"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+objectstore.barmancloud.cnpg.io/s3-store created
+cluster.postgresql.cnpg.io/pg created
+cluster.postgresql.cnpg.io/pg condition met
+CREATE TABLE
+ALTER TABLE
+INSERT 0 2000000
+2000000|158 MB
+```
+
+</Expected>
+
+Giờ thay `Backup` làm tay của K7.4 bằng `ScheduledBackup`: lịch hằng ngày lúc 02:00 (cú pháp cron của CNPG có thêm trường giây ở đầu), `immediate: true` để lấy bản đầu tiên ngay khi tạo. Vòng chờ đợi bản đầu tiên ở trạng thái `completed`.
+
+<Terminal where="mac" title="~/masteva-d24/d24-2/backup.yaml">
+
+```bash
+cat > backup.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: pg-daily
+spec:
+  schedule: "0 0 2 * * *"
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+EOF
+kubectl apply -f backup.yaml
+for i in $(seq 1 300); do [ "$(kubectl get backup -o jsonpath='{.items[*].status.phase}')" = completed ] && break; sleep 2; done
+kubectl get backup -o custom-columns='BACKUP:.metadata.name,PHASE:.status.phase,ON:.status.instanceID.podName,BEGIN-WAL:.status.beginWal'
+kubectl get cluster pg -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' | grep -E 'Archiving|Backup'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+scheduledbackup.postgresql.cnpg.io/pg-daily created
+BACKUP                    PHASE       ON     BEGIN-WAL
+pg-daily-20261021152205   completed   pg-2   000000010000000000000003
+ContinuousArchiving=True
+LastBackupSucceeded=True
+```
+
+</Expected>
+
+Tên backup là tên lịch cộng thời điểm tạo (giờ UTC). Cột `ON` cho thấy backup lấy trên replica `pg-2`, để không thêm tải cho primary (K7.4). Hai điều kiện của Cluster trả lời hai câu hỏi đầu ở phần Kiến thức: WAL đang được đẩy đi, và backup gần nhất thành công. Câu hỏi thứ ba là việc của bước 3 tới 5.
+
+<Check id="d24.2.lab-backup">Dựng được một cụm PostgreSQL đẩy WAL lên SeaweedFS, đặt được retention cho ObjectStore và lịch backup bằng `ScheduledBackup`, và chỉ ra được backup đầu tiên đã xong và WAL đang được đẩy đi.</Check>
+
+**Mở terminal mới giữa chừng bài** thì dán khối dưới trước: nó đặt lại kubeconfig, thư mục, namespace và các hàm mà các bước sau dùng.
+
+<Terminal where="mac" title="Khi mở terminal mới">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+cd ~/masteva-d24/d24-2
+kubectl config set-context --current --namespace d19-db > /dev/null
+sql() { kubectl exec "$(kubectl get cluster ${2:-pg} -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -Atc "$1"; }
+P=$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')
+```
+
+</Terminal>
+
+### 3. Image và quyền cho job kiểm tra khôi phục
+
+Job kiểm tra cần ba thứ: `kubectl` để tạo và xoá cụm tạm, `psql` để chạy truy vấn kiểm, và một shell. Image `registry.k8s.io/kubectl` chính thức chỉ có `kubectl`, không có shell; image PostgreSQL có `psql` và shell nhưng không có `kubectl`. Dockerfile dưới ghép hai thứ đó bằng multi-stage build (D5.2 đã dạy), cả hai image nền ghim digest, rồi nạp image vào node kind (cụm kind không tự kéo được image chỉ có trên máy bạn).
+
+<Terminal where="mac" title="~/masteva-d24/d24-2/Dockerfile">
+
+```bash
+cat > Dockerfile <<'EOF'
+FROM registry.k8s.io/kubectl:v1.37.1@sha256:b7cab618e281b1ee7484e7b706a96e2135fbb6e072c2a573a7dab4e87d7f2385 AS kubectl
+FROM ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+COPY --from=kubectl /bin/kubectl /usr/local/bin/kubectl
+EOF
+docker build -q -t d19-restore-check:1 . > /dev/null
+kind load docker-image d19-restore-check:1 --name d19-lab
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Image: "d19-restore-check:1" with ID "sha256:51a6896c…" not yet present on node "d19-lab-control-plane", loading...
+```
+
+</Expected>
+
+Quyền tối thiểu cho job, trong đúng namespace của bài (K2.3 đã dạy RBAC): tạo, đọc, xoá object `Cluster` của CNPG; đọc pod và `exec` vào pod để chạy `psql`. Hai dòng `auth can-i` cuối kiểm một quyền được cấp và một quyền không được cấp.
+
+<Terminal where="mac" title="~/masteva-d24/d24-2/rbac.yaml">
+
+```bash
+cat > rbac.yaml <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: restore-check
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: restore-check
+rules:
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: restore-check
+subjects:
+  - { kind: ServiceAccount, name: restore-check }
+roleRef:
+  { apiGroup: rbac.authorization.k8s.io, kind: Role, name: restore-check }
+EOF
+kubectl apply -f rbac.yaml
+kubectl auth can-i create clusters.postgresql.cnpg.io --as system:serviceaccount:d19-db:restore-check
+kubectl auth can-i delete persistentvolumeclaims --as system:serviceaccount:d19-db:restore-check
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+serviceaccount/restore-check created
+role.rbac.authorization.k8s.io/restore-check created
+rolebinding.rbac.authorization.k8s.io/restore-check created
+yes
+no
+```
+
+</Expected>
+
+### 4. Script kiểm tra và CronJob
+
+Kết quả mỗi lần kiểm tra được ghi vào bảng `ops.restore_checks` **trên cụm nguồn**, để vừa xem được bằng SQL, vừa xuất được thành metric ở bước 5.
+
+<Terminal where="mac">
+
+```bash
+sql "create schema ops; create table ops.restore_checks (at timestamptz not null default now(), ok boolean not null, seconds int not null, rows_checked bigint, detail text)"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+CREATE SCHEMA
+CREATE TABLE
+```
+
+</Expected>
+
+Script `restore-check.sh` làm năm việc theo sơ đồ ở phần Kiến thức. Đọc nó trước khi chạy; các điểm cần để ý:
+
+- Cụm tạm `pg-restore-check` khôi phục **tới WAL mới nhất** (không đặt `recoveryTarget`), một instance, và không khai `plugins`, nên nó không ghi gì vào bucket của cụm nguồn.
+- `MAX_SECONDS` là ngân sách thời gian khôi phục, tức RTO cam kết cho một lần khôi phục toàn bộ. Quá ngân sách là thất bại.
+- Phép kiểm nội dung so **số dòng và md5** của mọi đơn hàng tạo trước mốc "lúc bắt đầu trừ 6 phút", trên cụm tạm và trên cụm nguồn. Đơn hàng không bị sửa sau khi tạo, nên hai bên phải khớp tuyệt đối. 6 phút là `archive_timeout` 5 phút cộng một khoảng dư: đó là RPO mà cách sao lưu này hứa khi mất cả cụm.
+- Mọi đường ra, thành công hay thất bại, đều ghi một dòng vào `ops.restore_checks` và xoá cụm tạm. Thất bại thì script thoát mã 1, Job bị đánh dấu `Failed`.
+
+<Terminal where="mac" title="~/masteva-d24/d24-2/restore-check.sh">
+
+```bash
+cat > restore-check.sh <<'EOF'
+#!/bin/sh
+set -u
+SRC=pg; TMP=pg-restore-check; MAX_SECONDS=${MAX_SECONDS:-600}
+src() { kubectl exec "$(kubectl get cluster $SRC -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -Atc "$1"; }
+tmp() { kubectl exec $TMP-1 -c postgres -- psql -U postgres app -Atc "$1"; }
+finish() {
+  src "insert into ops.restore_checks (ok, seconds, rows_checked, detail) values ($1, $(( $(date +%s) - START )), ${2:-null}, '$3')"
+  kubectl delete cluster $TMP --wait=false
+  echo "$(date -u +%T) ok=$1 $3"
+  [ "$1" = true ]; exit $?
+}
+START=$(date +%s)
+CUTOFF=$(( START - 360 ))
+echo "$(date -u +%T) bắt đầu, ngân sách ${MAX_SECONDS}s"
+kubectl delete cluster $TMP --ignore-not-found --wait=true
+kubectl apply -f - <<YAML
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: $TMP
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage:
+    size: 3Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  bootstrap:
+    recovery:
+      source: goc
+  externalClusters:
+    - name: goc
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters:
+          barmanObjectName: s3-store
+          serverName: $SRC
+YAML
+if ! kubectl wait --for=condition=Ready cluster/$TMP --timeout=${MAX_SECONDS}s > /dev/null; then
+  finish false "" "không sẵn sàng trong ${MAX_SECONDS}s"
+fi
+echo "$(date -u +%T) cụm tạm sẵn sàng sau $(( $(date +%s) - START ))s"
+Q="select count(*) || ':' || md5(coalesce(string_agg(id || ',' || customer_id || ',' || amount || ',' || created_at, ';' order by id), '')) from orders where created_at < to_timestamp($CUTOFF)"
+GOT=$(tmp "$Q"); WANT=$(src "$Q")
+echo "$(date -u +%T) bản khôi phục $GOT"
+echo "$(date -u +%T) cụm nguồn     $WANT"
+if [ -n "$GOT" ] && [ "$GOT" = "$WANT" ]; then
+  finish true "${GOT%%:*}" "khớp"
+else
+  finish false "${GOT%%:*}" "lệch: $GOT / $WANT"
+fi
+EOF
+kubectl create configmap restore-check --from-file=restore-check.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+configmap/restore-check created
+```
+
+</Expected>
+
+CronJob chạy script đó mỗi ngày lúc 03:00, sau giờ backup; không cho hai lần chạy chồng lên nhau (`concurrencyPolicy: Forbid`); không thử lại khi thất bại (`backoffLimit: 0`), vì một lần kiểm tra hỏng phải được người xem chứ không được tự che đi; và có hạn chót một giờ. Image là image vừa nạp vào node, nên `imagePullPolicy: Never`.
+
+<Terminal where="mac" title="~/masteva-d24/d24-2/cronjob.yaml">
+
+```bash
+cat > cronjob.yaml <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: restore-check
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600
+      template:
+        spec:
+          serviceAccountName: restore-check
+          restartPolicy: Never
+          containers:
+            - name: check
+              image: d19-restore-check:1
+              imagePullPolicy: Never
+              command: ["sh", "/scripts/restore-check.sh"]
+              env:
+                - { name: MAX_SECONDS, value: "600" }
+              volumeMounts:
+                - { name: scripts, mountPath: /scripts }
+          volumes:
+            - name: scripts
+              configMap: { name: restore-check }
+EOF
+kubectl apply -f cronjob.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cronjob.batch/restore-check created
+```
+
+</Expected>
+
+Không chờ tới 03:00: tạo một Job từ CronJob để chạy ngay và theo log tới khi Job kết thúc. Trước đó chèn hai đơn hàng mới; chúng tạo sau mốc "trừ 6 phút" nên nằm ngoài phần được so. Khối này mất vài phút, phần lớn là chờ cụm tạm khôi phục.
+
+<Terminal where="mac">
+
+```bash
+sql "insert into orders (id, customer_id, amount) values (2000001, 7, 99.00), (2000002, 8, 15.50)"
+kubectl create job --from=cronjob/restore-check restore-check-1
+kubectl wait --for=condition=Ready pod -l job-name=restore-check-1 --timeout=120s > /dev/null
+kubectl logs -f job/restore-check-1
+for i in $(seq 1 30); do [ -n "$(kubectl get job restore-check-1 -o jsonpath='{.status.conditions[-1].type}')" ] && break; sleep 1; done
+kubectl get job restore-check-1 -o jsonpath='{.status.conditions[-1].type}{"\n"}'
+sql "select at::time(0), ok, seconds, rows_checked, detail from ops.restore_checks order by at"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+INSERT 0 2
+job.batch/restore-check-1 created
+15:23:18 bắt đầu, ngân sách 600s
+cluster.postgresql.cnpg.io/pg-restore-check created
+15:27:56 cụm tạm sẵn sàng sau 278s
+15:28:01 bản khôi phục 2000000:959fc22fc18fd06045774095c963e0c2
+15:28:01 cụm nguồn     2000000:959fc22fc18fd06045774095c963e0c2
+INSERT 0 1
+cluster.postgresql.cnpg.io "pg-restore-check" deleted from d19-db namespace
+15:28:01 ok=true khớp
+Complete
+15:28:01|t|283|2000000|khớp
+```
+
+</Expected>
+
+Đọc log từ trên xuống: cụm tạm được tạo, sẵn sàng sau 278 giây trong kết quả mẫu; cả hai phía có đúng 2.000.000 đơn hàng tạo trước mốc so, cùng md5; kết quả được ghi vào cụm nguồn (`INSERT 0 1`), cụm tạm bị xoá, và Job ở trạng thái `Complete`. Hai đơn hàng vừa chèn không có trong phép so, đúng như thiết kế: chúng mới hơn mốc "trừ 6 phút".
+
+Thời gian khôi phục trên máy bạn trong khoảng 1 tới 5 phút. Lần khôi phục đầu tiên sau khi dựng cụm thường lâu hơn các lần sau (ví dụ khoảng 2 tới 5 phút cho lần đầu, dưới 1 phút cho các lần sau). Với 158 MB dữ liệu, phần lớn thời gian là các bước của operator (Job khôi phục, khởi động instance, chờ sẵn sàng), không phải chép dữ liệu. Với database vài trăm GB, chép base backup và phát lại WAL mới là phần chính, và đó là con số bạn phải đo trên dữ liệu thật của mình.
+
+<Check id="d24.2.lab-cronjob">Dựng được một CronJob khôi phục backup mới nhất vào cụm tạm, so được số dòng và checksum với cụm nguồn, ghi được kết quả cùng thời gian khôi phục, và xoá được cụm tạm sau đó.</Check>
+
+### 5. Kết quả thành metric, và một lần kiểm tra thất bại
+
+CNPG cho khai thêm **truy vấn metric tự viết**: một ConfigMap chứa câu SQL và mô tả từng cột, trỏ tới từ `spec.monitoring.customQueriesConfigMap` của Cluster; label `cnpg.io/reload` làm instance tự nạp lại khi ConfigMap đổi. Truy vấn chạy bằng role `cnpg_metrics_exporter`, nên cần cấp quyền đọc bảng `ops.restore_checks`. Ba metric: thời điểm lần thành công gần nhất, lần gần nhất có thành công không, và số giây khôi phục của lần thành công gần nhất. Khối cuối lọc trang metric của primary ra cả ba câu hỏi ở phần Kiến thức.
+
+<Terminal where="mac" title="~/masteva-d24/d24-2/restore-metrics.yaml">
+
+```bash
+sql "grant usage on schema ops to cnpg_metrics_exporter; grant select on ops.restore_checks to cnpg_metrics_exporter"
+cat > restore-metrics.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: restore-metrics
+  labels:
+    cnpg.io/reload: ""
+data:
+  queries: |
+    restore_check:
+      target_databases: ["app"]
+      query: |
+        SELECT coalesce(extract(epoch FROM max(at) FILTER (WHERE ok)), 0) AS last_success_timestamp,
+               coalesce((SELECT ok::int FROM ops.restore_checks ORDER BY at DESC LIMIT 1), 0) AS last_ok,
+               coalesce((SELECT seconds FROM ops.restore_checks WHERE ok ORDER BY at DESC LIMIT 1), 0) AS last_success_seconds
+        FROM ops.restore_checks
+      metrics:
+        - last_success_timestamp:
+            usage: GAUGE
+            description: "Thời điểm lần kiểm tra khôi phục thành công gần nhất (unix)"
+        - last_ok:
+            usage: GAUGE
+            description: "1 nếu lần kiểm tra khôi phục gần nhất thành công"
+        - last_success_seconds:
+            usage: GAUGE
+            description: "Số giây khôi phục của lần thành công gần nhất"
+EOF
+kubectl apply -f restore-metrics.yaml
+kubectl patch cluster pg --type merge -p '{"spec":{"monitoring":{"customQueriesConfigMap":[{"name":"restore-metrics","key":"queries"}]}}}'
+P=$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')
+for i in $(seq 1 60); do kubectl get --raw "/api/v1/namespaces/d19-db/pods/$P:9187/proxy/metrics" | grep -q '^cnpg_restore_check_last_ok' && break; sleep 2; done
+kubectl get --raw "/api/v1/namespaces/d19-db/pods/$P:9187/proxy/metrics" \
+  | grep -E '^(cnpg_restore_check|cnpg_pg_stat_archiver_(failed_count|seconds_since_last_archival)|barman_cloud_cloudnative_pg_io_last_available_backup_timestamp)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+GRANT
+GRANT
+configmap/restore-metrics created
+cluster.postgresql.cnpg.io/pg patched
+barman_cloud_cloudnative_pg_io_last_available_backup_timestamp 1.792596128e+09
+cnpg_pg_stat_archiver_failed_count 0
+cnpg_pg_stat_archiver_seconds_since_last_archival 121.747486
+cnpg_restore_check_last_ok 1
+cnpg_restore_check_last_success_seconds 283
+cnpg_restore_check_last_success_timestamp 1.792596481187272e+09
+```
+
+</Expected>
+
+Ba câu hỏi, ba nhóm metric trên cùng một trang:
+
+- `cnpg_pg_stat_archiver_*`: chưa lần đẩy WAL nào thất bại, lần thành công gần nhất cách đây khoảng 2 phút (dưới `archive_timeout` 5 phút).
+- `barman_cloud_cloudnative_pg_io_last_available_backup_timestamp`: thời điểm backup gần nhất, dạng unix.
+- `cnpg_restore_check_*`: lần kiểm tra gần nhất thành công, mất 283 giây, vào thời điểm đó.
+
+Các con số giờ và giây trên máy bạn khác; điều cần thấy là đủ ba nhóm và `last_ok` bằng 1.
+
+Hai alert đi cùng (D12.4 đã dạy cách nạp rule vào Prometheus): một khi lần gần nhất thất bại, một khi lâu không có lần thành công nào. Cái thứ hai là cái bắt được trường hợp CronJob không chạy. Ngưỡng 26 giờ là một ngày cộng hai giờ dư cho lịch chạy hằng ngày.
+
+```yaml
+groups:
+  - name: restore-check
+    rules:
+      - alert: RestoreCheckFailed
+        expr: max by (namespace, pod) (cnpg_restore_check_last_ok) == 0
+        for: 5m
+        labels: { severity: ticket }
+      - alert: RestoreCheckStale
+        expr: time() - max by (namespace) (cnpg_restore_check_last_success_timestamp) > 26 * 3600
+        labels: { severity: ticket }
+```
+
+Giờ một lần kiểm tra thất bại có chủ đích: chạy lại Job với ngân sách `MAX_SECONDS=20`, ít hơn thời gian khôi phục thật vừa đo. Lệnh `create job` in YAML ra, `sed` đổi giá trị ngân sách, rồi `kubectl apply` tạo Job.
+
+<Predict question="Backup vẫn nguyên, dữ liệu vẫn đúng, chỉ ngân sách thời gian giảm. Lần kiểm tra này báo gì, và metric `last_success_timestamp` có đổi không?">
+
+Nó báo thất bại: cụm tạm không sẵn sàng trong 20 giây, Job ở trạng thái `Failed`, `last_ok` về 0. `last_success_timestamp` giữ nguyên giá trị của lần thành công trước, vì truy vấn chỉ lấy các lần `ok`. Nếu các lần sau cứ thất bại như vậy, alert `RestoreCheckStale` sẽ kêu sau 26 giờ ngay cả khi không ai nhìn alert kia. Một kiểm tra khôi phục quá ngân sách là thông tin thật: dữ liệu đã lớn hơn mức RTO cam kết chịu được.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+kubectl create job --from=cronjob/restore-check restore-check-2 --dry-run=client -o yaml \
+  | sed 's/value: "600"/value: "20"/' | kubectl apply -f -
+kubectl wait --for=condition=Ready pod -l job-name=restore-check-2 --timeout=120s > /dev/null
+kubectl logs -f job/restore-check-2
+for i in $(seq 1 30); do [ -n "$(kubectl get job restore-check-2 -o jsonpath='{.status.conditions[-1].type}')" ] && break; sleep 1; done
+kubectl get job restore-check-2 -o jsonpath='{.status.conditions[-1].type}{"\n"}'
+sql "select at::time(0), ok, seconds, detail from ops.restore_checks order by at"
+for i in $(seq 1 45); do kubectl get --raw "/api/v1/namespaces/d19-db/pods/$P:9187/proxy/metrics" | grep -q '^cnpg_restore_check_last_ok 0' && break; sleep 2; done
+kubectl get --raw "/api/v1/namespaces/d19-db/pods/$P:9187/proxy/metrics" | grep '^cnpg_restore_check'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+job.batch/restore-check-2 created
+15:28:08 bắt đầu, ngân sách 20s
+cluster.postgresql.cnpg.io/pg-restore-check created
+error: timed out waiting for the condition on clusters/pg-restore-check
+INSERT 0 1
+cluster.postgresql.cnpg.io "pg-restore-check" deleted from d19-db namespace
+15:28:28 ok=false không sẵn sàng trong 20s
+Failed
+15:28:01|t|283|khớp
+15:28:29|f|20|không sẵn sàng trong 20s
+cnpg_restore_check_last_ok 0
+cnpg_restore_check_last_success_seconds 283
+cnpg_restore_check_last_success_timestamp 1.792596481187272e+09
+```
+
+</Expected>
+
+Hết 20 giây, `kubectl wait` trong script báo hết giờ, script ghi một dòng `ok = false`, xoá cụm tạm, thoát mã 1, và Job ở trạng thái `Failed`. Trên trang metric, `last_ok` về 0 (alert `RestoreCheckFailed` sẽ kêu sau 5 phút), còn `last_success_timestamp` và `last_success_seconds` giữ giá trị của lần thành công trước. Nếu không ai sửa, 26 giờ sau alert `RestoreCheckStale` cũng kêu. Vòng chờ cuối cần tới vài chục giây vì kết quả truy vấn metric được cache 30 giây.
+
+<Check id="d24.2.lab-metric">Xuất được kết quả kiểm tra khôi phục thành metric bằng truy vấn tự viết của CNPG, viết được hai alert (thất bại và quá hạn), và cho thấy được một lần kiểm tra thất bại vì vượt ngân sách RTO làm `last_ok` về 0 mà không đổi thời điểm thành công gần nhất.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Pod đứng ở `ImagePullBackOff`, sự kiện báo `no such host` | DNS trong Docker Desktop lỗi tạm thời | `docker exec d19-lab-control-plane getent hosts ghcr.io`; kubelet tự thử lại sau vài phút |
+| `ContinuousArchiving` không phải `True` | Sai `endpointURL` hay khoá, SeaweedFS chưa chạy | `kubectl logs pg-1 -c plugin-barman-cloud`; `kubectl logs deploy/seaweedfs` |
+| Job `restore-check-*` không có pod, sự kiện `ErrImageNeverPull` | Chưa nạp image vào node | Chạy lại khối `kind load docker-image` ở bước 3 |
+| Log job báo `forbidden` | Thiếu quyền trong Role | `kubectl auth can-i <động từ> <tài nguyên> --as system:serviceaccount:d19-db:restore-check` |
+| Cụm tạm đứng ở job `full-recovery` lỗi | Sai `serverName`, hoặc bucket chưa có backup | `kubectl logs job/pg-restore-check-1-full-recovery`; `kubectl get backup` |
+| Không thấy `cnpg_restore_check_*` | Thiếu quyền của `cnpg_metrics_exporter`, hoặc chưa qua chu kỳ cache 30 giây | Log của pod primary có dòng lỗi truy vấn metric; chờ thêm 30 giây |
+
+### Dọn dẹp
+
+Bài D19.3 dựng một cụm khác, nên xoá cụm này.
+
+<Callout kind="danger">
+
+Khối lệnh dưới xoá cụm kind `d19-lab` cùng mọi database và backup trong đó, và xoá image `d19-restore-check:1` trên máy bạn.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm và image">
+
+```bash
+kind delete cluster --name d19-lab
+docker rmi d19-restore-check:1
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Khôi phục tới WAL mới nhất hay tới một thời điểm ngẫu nhiên?">
+
+Bài khôi phục tới WAL mới nhất: nó kiểm cả base backup lẫn toàn bộ chuỗi WAL tới hiện tại, và đo RTO của trường hợp mất cả cụm. Nhưng sự cố hay gặp hơn là xoá nhầm, cần PITR về một mốc trong quá khứ (K7.4). Một cách mạnh hơn là mỗi lần chọn một mốc ngẫu nhiên trong cửa sổ khôi phục, rồi so với một bảng "ảnh chụp" đã ghi lại ở mốc đó (ví dụ số dòng của các bảng chính mỗi giờ). Cách này bắt được chỗ đứt WAL ở giữa cửa sổ, thứ khôi phục tới mới nhất có thể không thấy nếu chỗ đứt nằm trước base backup gần nhất.
+
+</Reveal>
+
+<Reveal title="Database vài TB thì khôi phục mỗi ngày có còn khả thi?">
+
+Thời gian khôi phục tỉ lệ với kích thước base backup cộng lượng WAL phải phát lại, và chi phí là đĩa, mạng, CPU cho một bản sao đầy đủ. Ba cách giảm mà vẫn giữ giá trị: chạy toàn bộ mỗi tuần và chỉ kiểm WAL hằng ngày (khôi phục từ backup mới nhất, phát lại ít); khôi phục vào một cụm tạm trên node riêng chỉ bật khi cần (K5.4 dạy autoscaler); và theo dõi xu hướng của `last_success_seconds`: khi nó tiến gần RTO cam kết, đó là tín hiệu phải đổi chiến lược (backup thường hơn, snapshot đĩa, hoặc tách database) trước khi sự cố thật bắt bạn đổi.
+
+</Reveal>
+
+<Reveal title="Checksum của cả bảng có làm nặng cụm nguồn không?">
+
+Có. Câu `md5(string_agg(...))` đọc mọi dòng thoả điều kiện trên cả hai cụm, và trên cụm nguồn nó chạy cùng giờ với tải thật. Với bảng lớn, chạy truy vấn đó trên replica (đọc `pg-ro` thay vì primary) hoặc chỉ checksum một mẫu ổn định (ví dụ các khoảng `id` cố định), và đặt lịch vào giờ thấp điểm. Truy vấn so sánh trên replica vẫn đúng vì phần được so là dữ liệu cũ hơn 6 phút, đã có trên replica từ lâu.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết script kiểm tra cho schema của bạn (chọn bảng, chọn cột không đổi để checksum), viết rule alert từ metric, đề xuất truy vấn kiểm nghiệp vụ (tổng tiền theo ngày, số đơn theo trạng thái).
+
+**AI hay sai ở đâu:** coi job backup thành công là đủ; viết kiểm tra chỉ chờ cụm "Ready" mà không so dữ liệu; so checksum trên cả những dòng còn được sửa sau thời điểm backup (kiểm tra sẽ báo lệch giả); quên xoá cụm tạm ở nhánh thất bại; cho cụm tạm khai `plugins` sao lưu trỏ vào bucket của cụm thật; và chỉ alert khi thất bại, quên alert khi không chạy.
+
+**Cách kiểm tra:** cho kiểm tra thất bại có chủ đích như bước 5 (ngân sách quá thấp, hoặc sửa một dòng cũ trên cụm nguồn) và xem đúng alert kêu; xoá CronJob một ngày trên môi trường thử và xem alert quá hạn có kêu không.
+
+</Callout>
+
+<Callout kind="link">
+
+K7.4 dạy base backup, WAL archive và PITR làm tay. D12.4 nạp rule alert vào Prometheus, D16.5 dạy dead man's switch, cùng ý tưởng với alert quá hạn ở đây. K1.4 dạy CronJob và Job. D19.1 đo replication lag, thứ cũng cần theo dõi khi checksum chạy trên replica. Chặng D20 đi tiếp từ đây: D20.1 đặt RPO và RTO cho cả hệ thống, D20.2 sao lưu tài nguyên cụm bằng Velero cùng database CNPG, D20.3 khôi phục sang một cụm khác theo runbook, D20.4 replica cluster nhiều vùng với failover và failback, D20.5 diễn tập DR toàn phần có người tham gia.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d24.2.mastery-thiet-ke">Thiết kế được kiểm tra khôi phục tự động cho một database cụ thể: lịch, nơi chạy, dữ liệu dùng để so, ngân sách thời gian, và hai alert đi kèm.</Check>
+
+<Check id="d24.2.mastery-doc-tin-hieu">Đọc được ba nhóm tín hiệu sao lưu (WAL archive, backup gần nhất, lần khôi phục thử gần nhất) trên một cụm đang chạy và nói được backup hiện tại có đáng tin không.</Check>
+
+</Mastery>

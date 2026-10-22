@@ -1,0 +1,571 @@
+---
+title: "Khôi phục sang cụm khác: diễn tập có runbook"
+description: Những thứ không theo bản backup sang cụm mới (image, PV gắn node, secret ngoài cụm, StorageClass, operator); cách tổ chức một lần diễn tập khôi phục có mốc giờ và đo RTO; rồi xoá namespace ở cụm A, khôi phục sang cụm B bằng Velero cho object và volume, một Cluster bootstrap.recovery cho database, gặp và sửa chỗ vướng, đo RTO, RPO của database và của volume; và tái hiện cái bẫy khi để Velero mang cả object Cluster sang.
+id: d17.3
+step: d17
+prerequisites: [d17.2]
+topics: [d17.dien-tap-khoi-phuc, d17.sao-luu-tai-nguyen-cum]
+status: verified
+verified:
+  date: 2026-10-22
+  os: macOS 14.4.1 (hai cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    cloudnative-pg: 1.30.1
+    plugin-barman-cloud: 0.15.1
+    cert-manager: 1.21.2
+    postgresql: 18.6 (image ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie)
+    seaweedfs: "4.48"
+    velero: 1.18.4 (velero-plugin-for-aws 1.14.4)
+    jq: 1.8.2
+---
+
+<Goal>
+
+D20.2 đã có trong object storage một bản Velero của namespace `shop` và backup liên tục của cụm PostgreSQL. Một bản backup chỉ có giá trị khi khôi phục được, ở một nơi khác, trong một khoảng thời gian biết trước. Bài này làm đúng việc đó, như một lần diễn tập. Học xong, bạn giải thích được:
+
+- Những thứ nào không theo bản backup sang cụm mới, và vì sao chỉ một lần khôi phục thật mới cho bạn danh sách đó.
+- Một lần diễn tập khôi phục có những mốc giờ nào, và RTO đo từ đâu tới đâu.
+- Vì sao database và volume khôi phục xong có thể lệch nhau, và lệch bao nhiêu.
+- Vì sao một cụm database khôi phục "sai cách" vẫn có thể báo sẵn sàng.
+
+</Goal>
+
+<Knowledge>
+
+### Cái gì không theo bản backup sang cụm mới
+
+Một bản Velero khôi phục được object, không khôi phục được **môi trường** mà object đó giả định:
+
+| Thứ | Vì sao không theo | Lộ ra ở cụm mới như thế nào |
+|---|---|---|
+| Image chỉ có ở cụm cũ (nạp bằng `kind load`, registry nội bộ chỉ cụm cũ tới được) | Velero chỉ lưu tên image, không lưu image | Pod `ErrImagePull`, `ImagePullBackOff` |
+| PV gắn node (`local-path`, `hostPath`, local PV) | Dữ liệu nằm trên đĩa của node cũ | Không có FSB thì PVC mới trống; `hostPath` FSB không lấy được |
+| Secret đến từ ngoài cụm (External Secrets, CSI secret store, OpenBao agent) | Cụm mới cần đường tới kho secret, quyền, và khoá của nó | Pod `CreateContainerConfigError`, hoặc ứng dụng lên nhưng không gọi được dịch vụ ngoài |
+| StorageClass, IngressClass, GatewayClass khác tên | Object trỏ tên cụ thể của cụm cũ | PVC `Pending`; Velero có ConfigMap `change-storage-class` để đổi tên lúc khôi phục |
+| CRD và operator | Velero khôi phục CRD trước, nhưng không cài controller | Object custom nằm yên, không ai đối chiếu |
+| Địa chỉ, DNS, chứng chỉ gắn tên cụm cũ | Object chép sang, thế giới bên ngoài thì không đổi theo | Gọi sai địa chỉ, TLS báo sai tên |
+| Phiên bản Kubernetes thấp hơn | Velero không hỗ trợ khôi phục vào cụm có phiên bản cũ hơn cụm nguồn | API version không còn, object bị từ chối |
+
+Không có cách nào liệt kê đủ bảng này cho hệ thống của bạn bằng cách đọc tài liệu. Chỉ một lần khôi phục thật sang một cụm sạch mới cho danh sách đúng, và danh sách đó đổi mỗi khi ai đó thêm một phụ thuộc mới.
+
+<Check id="d17.3.khong-theo-sang">Kể được ít nhất năm thứ không theo bản Velero sang cụm mới, mỗi thứ lộ ra bằng triệu chứng gì, và giải thích được vì sao danh sách này chỉ có được bằng khôi phục thật.</Check>
+
+### Velero khôi phục theo thứ tự nào, và đổi tên namespace
+
+Ba hành vi của `velero restore` cần biết trước khi chạy nó trong một sự cố:
+
+- **Thứ tự cố định.** Với Velero 1.18, danh sách ưu tiên mặc định là CRD, Namespace, StorageClass, các loại của snapshot, PV, PVC, ClusterRole, Role, ServiceAccount, ClusterRoleBinding, RoleBinding, Secret, ConfigMap, LimitRange, PriorityClass, Pod, ReplicaSet, Endpoints, Service; sau đó là mọi loại còn lại (kể cả Deployment) theo thứ tự chữ cái, và cuối cùng là vài loại của Cluster API và Tanzu. Nhờ vậy pod lên khi Secret và PVC của nó đã có. Thứ tự này đổi được bằng cờ của server, nhưng tài liệu khuyên giữ mặc định.
+- **Không ghi đè.** Object đã có ở cụm đích bị bỏ qua và ghi thành cảnh báo (ServiceAccount là ngoại lệ, được gộp). Khôi phục vào một cụm "gần sạch" vì vậy có thể im lặng giữ lại bản cũ của một ConfigMap; `--existing-resource-policy update` vá object đã có, theo kiểu cố hết sức chứ không bảo đảm.
+- **Đổi tên namespace.** `--namespace-mappings shop:shop-kiem` khôi phục mọi object vào namespace mới. Với PV mà Velero tự tạo lại (đường snapshot), nó sửa luôn `claimRef` cho trỏ vào namespace mới; với file-system backup như lab, PVC ở namespace mới nhận một PV cấp động mới. Thứ không được sửa là những chỗ tên namespace nằm **trong dữ liệu**: biến môi trường trỏ `pg-rw.shop.svc.cluster.local`, subject của RoleBinding, NetworkPolicy chọn namespace theo label, cấu hình trong ConfigMap. Ứng dụng của lab nối bằng tên ngắn `pg-rw` nên tự trỏ vào namespace mới.
+
+Đổi tên namespace hợp nhất cho **khôi phục song song**: dựng một bản sao bên cạnh bản đang chạy để kiểm dữ liệu, lấy lại vài file, mà không đụng tới bản thật. Bước 3 của lab làm việc đó.
+
+<Check id="d17.3.thu-tu-mapping">Kể được thứ tự Velero khôi phục object và vì sao, hành vi với object đã có, và những chỗ `--namespace-mappings` không sửa được.</Check>
+
+### Diễn tập khôi phục có kịch bản
+
+Một lần khôi phục để học khác một lần **diễn tập**: diễn tập có kịch bản viết trước, có mốc giờ ghi lại, và kết thúc bằng một con số RTO đo được cùng danh sách chỗ vướng. Khung tối thiểu:
+
+```text
+  T0  tuyên bố thảm hoạ (mốc bắt đầu RTO)
+  T1  cụm DR sẵn sàng: Velero thấy backup, operator chạy
+  T2  tài nguyên ứng dụng đã khôi phục (velero restore Completed)
+  T3  database đã khôi phục, nhận ghi
+  T4  ứng dụng chạy, kiểm dữ liệu đạt  ──►  RTO = T4 - T0
+      ghi lại: mỗi chỗ vướng, mất bao lâu, sửa thế nào
+```
+
+Ba nguyên tắc:
+
+- **Đo cả thời gian người.** Thời gian đọc runbook, gõ lệnh, chờ một quyết định là một phần của RTO. Lab dưới ghi mốc bằng một hàm `mark` và in khoảng cách giữa các mốc.
+- **Mỗi chỗ vướng thành một việc cần làm.** Image không có, Secret thiếu, lệnh trong runbook sai cú pháp: sửa ngay trong hệ thống (registry chung, thêm Secret vào backup, sửa runbook), không chỉ sửa tay trong lần diễn tập.
+- **Diễn tập trên cụm sạch.** Khôi phục vào một cụm đã có sẵn đồ từ lần trước che mất đúng những thứ bảng ở mục trên liệt kê.
+
+D20.5 mở rộng khung này thành một buổi diễn tập DR toàn phần có vai trò và tiêu chí đạt.
+
+<Callout kind="production">
+
+Chiều 14/03/2023 theo giờ Mỹ, Reddit ngừng 314 phút, theo [bài postmortem "You Broke Reddit: The Pi-Day Outage"](https://www.reddit.com/r/RedditEng/comments/11xx5o0/you_broke_reddit_the_piday_outage/) do đội Compute của họ viết. Ngay sau 19:00 UTC, một kỹ sư bắt đầu nâng cụm Kubernetes chạy phần Legacy (cụm lớn nhất, dựng bằng kubeadm) từ 1.23 lên 1.24; khoảng hai phút sau site đứng. Cụm mất toàn bộ metric, DNS nội bộ hỏng. Đường lui tự nhiên là hạ phiên bản, nhưng Kubernetes không có quy trình hạ phiên bản được hỗ trợ: muốn lui phải khôi phục từ backup.
+
+Quy trình nâng cấp của họ có bước sao lưu, nhưng quy trình sao lưu và khôi phục được viết từ nhiều năm trước. Bài viết ghi: khôi phục đã được thử nhiều lần trên các cụm thử nghiệm, nhưng không được cập nhật theo các thay đổi của môi trường, và chưa từng được dùng trên một cụm production. Ước tính ban đầu là hàng giờ ngừng chắc chắn, nên họ chọn tiếp tục điều tra; khoảng phút thứ 60, một nhóm tách ra chuẩn bị khôi phục song song. Sau hơn hai giờ, họ quyết định khôi phục. Những gì gặp phải trong lúc khôi phục, theo bài viết:
+
+- Quy trình viết cho một phiên bản Kubernetes đã hết hỗ trợ và cho Docker, trong khi cụm đã chuyển sang CRI-O; cú pháp lệnh đổi, tham số không còn hợp lệ, quy trình phải viết lại ngay trong lúc chạy.
+- Chỉ riêng việc huỷ mọi worker node trước khi khôi phục mất khoảng 20 phút gọi API.
+- Khôi phục node control plane đầu tiên xong thì cluster autoscaler chạy lại ngay; họ phải tắt nó để giữ cụm ở trạng thái đã biết. Khi dựng hai node control plane còn lại, AWS hết loại máy đó.
+- Node mới không join được: bản backup chạy được trên bất kỳ node control plane nào, nhưng khôi phục phải chạy trên đúng node đã sao lưu, và lần này không phải node đó. Chứng chỉ TLS của node đang chạy không khớp tên máy; họ phải tự sinh chứng chỉ mới, lúng túng vì thiếu tài liệu.
+
+Họ mở lại traffic theo bậc 1%, 5%, 10%, 20%, 35%, 55%, 80%, 100% để tránh dồn tải lên các cache. Nguyên nhân gốc tìm ra sau đó: cấu hình route reflector của Calico, dựng từ nhiều năm trước và không được ghi lại ở đâu, chọn node theo label `node-role.kubernetes.io/master`, label mà Kubernetes 1.24 gỡ bỏ.
+
+Điều rút ra cho bài này (của bài): một quy trình khôi phục "đã thử trên cụm thử nghiệm" vẫn hỏng ở những chỗ cụm thử khác cụm thật: runtime, tên máy, hạn mức. Đó là lý do diễn tập phải chạy trên một môi trường giống production, theo lịch, và mỗi chỗ vướng phải quay lại sửa quy trình.
+
+</Callout>
+
+<Check id="d17.3.dien-tap">Vẽ được khung mốc giờ của một lần diễn tập khôi phục và cách tính RTO từ đó, nêu được ba nguyên tắc của diễn tập, và chỉ ra được trong sự cố Reddit ít nhất ba chỗ quy trình khôi phục hỏng vì môi trường đã đổi.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Velero Docs: Cluster migration](https://velero.io/docs/v1.18/migration-case/): khôi phục sang cụm khác, BSL chỉ đọc, giới hạn về phiên bản Kubernetes.
+- [Velero Docs: Restore Reference](https://velero.io/docs/v1.18/restore-reference/): thứ tự khôi phục, `--namespace-mappings`, chính sách với object đã có, đổi StorageClass.
+- [CloudNativePG 1.30: Recovery](https://cloudnative-pg.io/docs/1.30/recovery/): khôi phục vào Cluster mới, Secret của ứng dụng và lỗi `Expected empty archive`.
+- [You Broke Reddit: The Pi-Day Outage (r/RedditEng)](https://www.reddit.com/r/RedditEng/comments/11xx5o0/you_broke_reddit_the_piday_outage/): nguồn của callout; đọc phần "Let 'Er Rip". Nếu trang chặn trình duyệt của bạn, dùng [bản lưu trên Internet Archive](https://web.archive.org/web/20230727225235/https://www.reddit.com/r/RedditEng/comments/11xx5o0/you_broke_reddit_the_piday_outage/).
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Dùng tiếp hai cụm `d20-a`, `d20-b`, SeaweedFS `d20-s3` và bản backup `shop-1` của D20.2, với ứng dụng `shop` đang chạy ở cụm A. Nếu đã xoá, chạy lại toàn bộ lab của D20.2. Mọi terminal chạy trước tiên `cd ~/masteva-d17 && . ./lab.sh`.
+
+**Profile máy.** Như D20.2: khoảng 3,2 tới 3,3 GiB theo `docker stats` cho hai node và SeaweedFS, kể cả ở bước 2 khi cụm B có thêm một instance PostgreSQL trong vài phút (cụm A lúc đó đã trống namespace `shop`).
+
+<Callout kind="danger">
+
+Bài này xoá namespace `shop` ở cụm A cùng database và volume trong đó. Mọi lệnh đi qua hai hàm `ka`, `kb` có `--context` cố định; không có lệnh nào dựa vào context hiện tại.
+
+</Callout>
+
+
+### 1. Diễn tập: mất namespace ở cụm A, khôi phục sang cụm B
+
+Runbook của lần diễn tập, theo khung mốc giờ ở phần Kiến thức:
+
+```text
+  T0  ghi lại đơn cuối ở cụm A, rồi tuyên bố thảm hoạ: namespace shop ở cụm A mất
+  T1  cụm B thấy bản backup shop-1
+  T2  velero restore xong
+  T3  database khôi phục xong ở cụm B
+  T4  ứng dụng ghi được ở cụm B, dữ liệu đã kiểm
+```
+
+Khối đầu đánh mốc T0 và tạo ra thảm hoạ. Đơn cuối cùng ở cụm A được in ra trước để sau này tính RPO. Trong lúc bạn đọc tới đây, ứng dụng ở cụm A vẫn ghi đơn mới mà bản Velero `shop-1` không có.
+
+<Callout kind="danger">
+
+`ka delete namespace shop` xoá ứng dụng, PVC và cụm PostgreSQL ở cụm A cùng mọi dữ liệu trên đĩa của chúng. Hàm `ka` cố định `--context kind-d20-a`; không chạy lệnh tương tự trên cụm nào khác.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+: > drill.log
+sqla "select 'đơn cuối ở cụm A: ' || max(id) || ' lúc ' || max(at)::time(0) from orders"
+mark "T0 thảm hoạ: xoá namespace shop ở cụm A"
+ka delete namespace shop --wait=false
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+đơn cuối ở cụm A: 165 lúc 23:51:12
+23:51:12 T0 thảm hoạ: xoá namespace shop ở cụm A
+namespace "shop" deleted
+```
+
+</Expected>
+
+Giờ là cụm B. Velero ở cụm B đồng bộ danh sách backup từ bucket mỗi phút, nên `shop-1` có thể chưa xuất hiện ngay; vòng chờ đợi tới khi thấy nó. Rồi khôi phục.
+
+<Predict question="Velero khôi phục xong không lỗi. Pod `shop` ở cụm B sẽ chạy chứ?">
+
+Không. Bản backup có Deployment với `image: d20-shop:1`, nhưng image đó chỉ được nạp vào cụm A. Kubelet ở cụm B thử kéo nó từ Docker Hub và thất bại: pod đứng ở `ErrImagePull` hoặc `ImagePullBackOff`. Velero lưu tên image, không lưu image. Ở hệ thống thật, đây là registry nội bộ chỉ có ở site chính.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+for i in $(seq 1 90); do vb backup get shop-1 > /dev/null 2>&1 && break; sleep 2; done
+mark "T1 cụm B thấy backup shop-1"
+vb restore create shop-1 --from-backup shop-1 --include-namespaces shop --wait
+vb restore describe shop-1 --colorized=false | grep -E '^(Phase|Warnings|Errors)'
+mark "T2 velero restore xong"
+for i in $(seq 1 60); do kb -n shop get pod -l app=shop -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null | grep -q Image && break; sleep 2; done
+kb -n shop get pods
+kb -n shop get secret,objectstore,pvc
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+23:51:43 T1 cụm B thấy backup shop-1
+Restore request "shop-1" submitted successfully.
+Waiting for restore to complete. You may safely press ctrl-c to stop waiting - your restore will continue in the background.
+......
+Restore completed with status: Completed. You may check for more information using the commands `velero restore describe shop-1` and `velero restore logs shop-1`.
+Phase:                       Completed
+Warnings:
+23:51:49 T2 velero restore xong
+NAME                    READY   STATUS         RESTARTS   AGE
+shop-8548f6785c-ngmsv   0/1     ErrImagePull   0          23s
+NAME              TYPE                       DATA   AGE
+secret/s3-creds   Opaque                     2      23s
+secret/shop-db    kubernetes.io/basic-auth   2      23s
+
+NAME                                       AGE
+objectstore.barmancloud.cnpg.io/s3-store   23s
+
+NAME                            STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+persistentvolumeclaim/uploads   Bound    pvc-6f1f6bc5-74c8-4c99-8db1-ef6b21c19412   1Gi        RWO            standard       <unset>                 23s
+```
+
+</Expected>
+
+Velero khôi phục xong trong vài giây: namespace, hai Secret, ObjectStore, PVC `uploads` đã `Bound` vào một PV mới của cụm B. Lệnh `--wait` chỉ trả về sau khi dữ liệu volume đã được node-agent chép vào PVC mới; pod `shop` có thêm init container `restore-wait` do Velero chèn vào cho việc đó. Dòng `Warnings:` là tiêu đề; `velero restore describe shop-1` đầy đủ in bên dưới nó một cảnh báo về ConfigMap `kube-root-ca.crt` đã có sẵn, cảnh báo vô hại vì Kubernetes tự tạo ConfigMap đó trong mọi namespace.
+
+Pod `shop` đứng ở `ErrImagePull` (hoặc `ImagePullBackOff`, tuỳ lúc bạn xem), như đã đoán. Chưa có cụm PostgreSQL nào ở cụm B; đó là phần kế tiếp.
+
+Sửa chỗ vướng thứ nhất: nạp image vào cụm B. Ghi chỗ vướng vào `drill.log` bằng `mark`, để báo cáo cuối có nó.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+mark "VƯỚNG 1: image d20-shop:1 không có ở cụm B; nạp bằng kind load"
+kind load docker-image d20-shop:1 --name d20-b
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+23:52:36 VƯỚNG 1: image d20-shop:1 không có ở cụm B; nạp bằng kind load
+Image: "d20-shop:1" with ID "sha256:69f10e56…" not yet present on node "d20-b-control-plane", loading...
+```
+
+</Expected>
+
+Database. File `pg-dr.yaml` là manifest khôi phục, thứ phải nằm sẵn trong Git cùng runbook chứ không viết lúc sự cố. So với Cluster ở cụm A:
+
+- `bootstrap.recovery` thay `bootstrap.initdb`: dựng từ backup của cụm `pg` (`serverName: pg`) trong ObjectStore `s3-store` vừa được Velero khôi phục; không đặt mục tiêu thời điểm, nên khôi phục tới WAL cuối cùng có trong bucket.
+- `recovery.secret` trỏ Secret `shop-db` cũng vừa được Velero khôi phục: operator đặt lại mật khẩu của role `shop` theo nó.
+- `plugins` đẩy WAL của cụm mới vào `serverName: pg-dr`, một thư mục khác.
+
+<Terminal where="mac" title="~/masteva-d17/d17-2/pg-dr.yaml">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh && cd d17-2
+cat > pg-dr.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata: { name: pg }
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage: { size: 1Gi }
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }
+  bootstrap:
+    recovery:
+      source: pg-site-a
+      database: shop
+      owner: shop
+      secret: { name: shop-db }
+  externalClusters:
+    - name: pg-site-a
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters: { barmanObjectName: s3-store, serverName: pg }
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters: { barmanObjectName: s3-store, serverName: pg-dr }
+EOF
+kb -n shop apply -f pg-dr.yaml
+kb -n shop wait --for=condition=Ready cluster/pg --timeout=900s
+mark "T3 database khôi phục xong ở cụm B"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cluster.postgresql.cnpg.io/pg created
+cluster.postgresql.cnpg.io/pg condition met
+23:54:13 T3 database khôi phục xong ở cụm B
+```
+
+</Expected>
+
+Cuối cùng là kiểm: ứng dụng có đang ghi vào database mới không, đơn cuối khôi phục được là đơn nào, và file trong PVC có khớp với đơn hàng không. Khối lệnh chờ tới khi có đơn mới ghi ở cụm B rồi mới đánh mốc T4, và in khoảng cách giữa các mốc.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+kb -n shop rollout status deploy/shop --timeout=300s
+for i in $(seq 1 60); do [ "$(sqlb "select count(*) from orders where at > now() - interval '30 seconds'")" -gt 3 ] && break; sleep 2; done
+T0=$(head -1 drill.log | cut -d' ' -f1)
+T3=$(awk '$3 == "T3" {print $1; exit}' drill.log)
+N=$(sqlb "select max(id) from orders where at < to_timestamp($T0)")
+sqlb "select 'đơn cuối có trước thảm hoạ: ' || max(id) || ' lúc ' || max(at)::time(0) from orders where at < to_timestamp($T0)"
+sqlb "select 'đơn cuối từ cụm A khôi phục được: ' || max(id) || ' lúc ' || max(at)::time(0) from orders where at < to_timestamp($T3)"
+sqlb "select 'đơn cụm A ghi sau T0, lúc namespace đang xoá: ' || count(*) from orders where at between to_timestamp($T0) and to_timestamp($T3)"
+sqlb "select 'đơn ghi ở cụm B sau khôi phục: ' || count(*) from orders where at > to_timestamp($T3)"
+kb -n shop exec deploy/shop -c shop -- sh -c "n=0; for i in \$(seq 1 $N); do [ -f /uploads/order-\$i.txt ] || n=\$((n+1)); done; echo \"đơn trước thảm hoạ không có file: \$n / $N\""
+mark "T4 ứng dụng ghi được ở cụm B"
+awk 'NR==1{t0=$1} {printf "%5d giây  %s\n", $1-t0, substr($0, index($0,$3))}' drill.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+deployment "shop" successfully rolled out
+đơn cuối có trước thảm hoạ: 164 lúc 23:51:11
+đơn cuối từ cụm A khôi phục được: 170 lúc 23:51:17
+đơn cụm A ghi sau T0, lúc namespace đang xoá: 6
+đơn ghi ở cụm B sau khôi phục: 30
+đơn trước thảm hoạ không có file: 72 / 164
+23:54:44 T4 ứng dụng ghi được ở cụm B
+    0 giây  T0 thảm hoạ: xoá namespace shop ở cụm A
+   31 giây  T1 cụm B thấy backup shop-1
+   37 giây  T2 velero restore xong
+   84 giây  VƯỚNG 1: image d20-shop:1 không có ở cụm B; nạp bằng kind load
+  181 giây  T3 database khôi phục xong ở cụm B
+  212 giây  T4 ứng dụng ghi được ở cụm B
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- **RPO của database.** Lúc T0, đơn cuối ở cụm A là 165. Lệnh xoá namespace không dừng ứng dụng ngay: trong vài giây namespace đang xoá, cụm A còn ghi thêm 6 đơn, và đơn cuối từ cụm A khôi phục được là 170, ghi 5 giây sau T0. Mọi thứ cụm A đã ghi tới lúc PostgreSQL tắt đều có mặt, vì xoá namespace là một lần **tắt có trật tự**: PostgreSQL nhận SIGTERM; khi tắt với archive đang bật, nó đóng file WAL đang dở để archiver đẩy nốt file đó, và instance manager của CNPG chờ việc đẩy WAL trong giới hạn `stopDelay` (mặc định 1 800 giây, theo mục Shutdown control của tài liệu CNPG). Một thảm hoạ thật (mất điện, mất mạng tới cả site) không cho cơ hội đó: RPO khi ấy là tới `archive_timeout`, 5 phút với mặc định của CNPG, như D20.1 đã đo với 60 giây.
+- **RPO của volume.** 72 trên 164 đơn trước thảm hoạ không có file trong PVC: đó là các đơn tạo sau lúc Velero sao lưu ở bước 4 của D20.2. Database và volume được sao lưu ở hai thời điểm khác nhau, nên khôi phục xong chúng lệch nhau đúng bằng khoảng đó. Con số trên máy bạn phụ thuộc bạn nghỉ bao lâu giữa lúc sao lưu ở D20.2 và lúc bắt đầu bài này.
+- **Ứng dụng chạy lại.** Có đơn mới ghi ở cụm B sau T3: Secret `shop-db` đi theo Velero và `recovery.secret` đã đặt đúng mật khẩu cho role `shop`.
+- **RTO.** Khoảng 3 tới 6 phút từ T0 tới T4, gồm cả thời gian đọc và gõ lệnh. Phần lớn là khôi phục database (T2 tới T3, gồm cả kéo image PostgreSQL ở lần đầu) và chỗ vướng image. Trên máy bạn, con số phụ thuộc chủ yếu vào tốc độ bạn đọc runbook: đó đúng là điều phép đo này phải cho thấy.
+
+Hai chỗ lệch này (image, volume lệch database) là danh sách việc cần làm sau lần diễn tập: đưa image vào registry mà cả hai site cùng kéo được, và đặt lịch Velero cho volume dày hơn, hoặc chuyển file sang nơi có RPO như database.
+
+<Check id="d17.3.lab-dien-tap">Khôi phục được namespace sang cụm B theo runbook có mốc giờ: Velero cho object và volume, một Cluster `bootstrap.recovery` cho database; gặp và sửa được chỗ vướng image; đo được RTO từ `drill.log` và RPO từ đơn cuối khôi phục được.</Check>
+
+### 2. Cái bẫy: để Velero mang cả object `Cluster` sang
+
+Bản Velero của D20.2 loại object `Cluster`. Bước này cho thấy vì sao, bằng cách làm đúng điều một bản Velero không loại sẽ làm: tạo ở cụm B, trong một namespace thử `thu-sai`, một Cluster y hệt bản gốc ở cụm A (cùng `shop.yaml`, ứng dụng scale về 0 cho gọn). Khối lệnh bỏ riêng object `ScheduledBackup` bằng `yq`: với `immediate: true`, nó sẽ cho cụm thử lấy ngay một base backup vào đúng thư mục `pg` của cụm A trên bucket. Một base backup lạ nằm giữa các backup thật là thứ bạn không muốn gặp lúc cần khôi phục.
+
+<Predict question="Cluster `pg` mới có `bootstrap.initdb` như bản gốc, ObjectStore trỏ cùng bucket, và trong bucket đã có backup của cụm `pg` ở cụm A. Operator sẽ khôi phục dữ liệu từ đó chứ?">
+
+Không. `bootstrap.initdb` nghĩa là "tạo một database mới": operator chạy `initdb`, tạo database `shop` trống với bảng `orders` trống. Nó không nhìn vào bucket để tìm dữ liệu cũ. Còn plugin, khi bắt đầu đẩy WAL vào thư mục `pg` đã có dữ liệu của cụm cũ, từ chối để không ghi chồng lên backup.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+kb create namespace thu-sai
+yq 'select(.kind != "ScheduledBackup")' d17-2/shop.yaml | kb -n thu-sai apply -f - | grep -E "cluster|objectstore"
+kb -n thu-sai scale deploy/shop --replicas 0
+for i in $(seq 1 90); do kb -n thu-sai get cluster pg -o jsonpath='{.status.phase}{"\n"}'; sleep 4; done | uniq
+kb -n thu-sai exec pg-1 -c postgres -- psql -U postgres -d shop -Atc "select 'số đơn: ' || count(*) from orders"
+kb -n thu-sai get cluster pg -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' | grep -E 'Ready|Archiving'
+kb -n thu-sai logs pg-1 -c plugin-barman-cloud | grep -o 'Expected empty archive' | head -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/thu-sai created
+objectstore.barmancloud.cnpg.io/s3-store created
+cluster.postgresql.cnpg.io/pg created
+deployment.apps/shop scaled
+
+Setting up primary
+Waiting for the instances to become active
+Cluster in healthy state
+số đơn: 0
+Ready=True
+ContinuousArchiving=False
+Expected empty archive
+```
+
+</Expected>
+
+Cluster báo `Cluster in healthy state` và `Ready=True`, ứng dụng nối vào sẽ chạy bình thường, trên một database **trống**. Dấu hiệu duy nhất là `ContinuousArchiving=False`: một cụm database lên được, nhận ghi, mà không được sao lưu. Đó là lý do bản Velero của D20.2 loại object `Cluster`, và lý do D19.2 alert trên trạng thái đẩy WAL. Vòng `for` in pha của Cluster trong khoảng sáu phút; dòng trống đầu tiên là lúc Cluster chưa có trạng thái.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá namespace thử `thu-sai` ở cụm B. Namespace có thể mất vài phút mới biến mất hẳn; `--wait=false` để lệnh trả về ngay.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+kb delete namespace thu-sai --wait=false
+```
+
+</Terminal>
+
+<Check id="d17.3.lab-bay-cluster">Tái hiện được việc một object `Cluster` mang `bootstrap.initdb` khôi phục ở cụm khác cho ra database trống mà vẫn `Ready`, và chỉ ra được tín hiệu duy nhất cho thấy điều đó (`ContinuousArchiving=False`, `Expected empty archive`).</Check>
+
+### 3. Khôi phục song song vào một namespace khác
+
+Bản `shop-1` khôi phục lần nữa vào namespace `shop-kiem` ở cụm B, bên cạnh `shop` đang chạy. Việc cần làm: đếm file trong bản sao để so với bản đang chạy. Trong `shop-kiem` không có database, nên ứng dụng ở đó chỉ báo `ghi thất bại` và không tạo file nào mới; đó vừa là điều mong muốn ở một bản kiểm tra, vừa là ví dụ của việc tên ngắn `pg-rw` tự trỏ vào namespace mới.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+vb restore create shop-kiem --from-backup shop-1 --include-namespaces shop --namespace-mappings shop:shop-kiem --wait > /dev/null
+vb restore get shop-kiem
+kb -n shop-kiem rollout status deploy/shop --timeout=300s
+kb -n shop-kiem exec deploy/shop -c shop -- sh -c 'echo "file trong bản sao: $(ls /uploads | wc -l)"'
+kb -n shop exec deploy/shop -c shop -- sh -c 'echo "file trong bản đang chạy: $(ls /uploads | wc -l)"'
+kb -n shop-kiem logs deploy/shop -c shop --tail 2
+kb get pv -o custom-columns='CLAIM:.spec.claimRef.namespace,NAME:.spec.claimRef.name' | grep uploads
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME        BACKUP   STATUS      STARTED                         COMPLETED                       ERRORS   WARNINGS   CREATED                         SELECTOR
+shop-kiem   shop-1   Completed   2026-10-22 07:02:00 +0700 +07   2026-10-22 07:02:08 +0700 +07   0        1          2026-10-22 07:02:00 +0700 +07   <none>
+deployment "shop" successfully rolled out
+file trong bản sao: 92
+file trong bản đang chạy: 557
+00:02:07 ghi thất bại
+00:02:08 ghi thất bại
+thu-sai     uploads
+shop        uploads
+shop-kiem   uploads
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Bản sao có 92 file: đúng số file có trong bản Velero lúc sao lưu ở D20.2 (164 đơn trước thảm hoạ trừ 72 đơn thiếu file ở bước 1) (trên máy bạn là số file lúc bạn chạy bước 4 của D20.2). Bản đang chạy có nhiều hơn hẳn vì ứng dụng ở `shop` ghi thêm một file mỗi giây từ lúc khôi phục.
+- Một cảnh báo (`WARNINGS 1`) là ConfigMap `kube-root-ca.crt` đã có sẵn, như ở bước 1.
+- Log của ứng dụng trong `shop-kiem` chỉ có `ghi thất bại`: `pg-rw` trong namespace đó không tồn tại.
+- Hai PVC `uploads` ở `shop` và `shop-kiem`, mỗi cái một PV riêng: bản sao không dùng chung đĩa với bản thật. Dòng `thu-sai` là PV của namespace thử ở bước 2, còn trong lúc namespace đó đang được xoá; trên máy bạn dòng này có thể đã biến mất.
+
+<Callout kind="danger">
+
+Lệnh dưới xoá namespace `shop-kiem` cùng bản sao trong đó; namespace `shop` không bị đụng tới.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+kb delete namespace shop-kiem --wait=false
+```
+
+</Terminal>
+
+<Check id="d17.3.lab-song-song">Khôi phục được cùng một bản Velero lần thứ hai vào namespace khác bằng `--namespace-mappings`, kiểm được dữ liệu volume ở đó mà không đụng bản đang chạy, và giải thích được vì sao ứng dụng trong bản sao không ghi được.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| Cụm B không thấy `shop-1` sau vài phút | BSL ở cụm B `Unavailable`, khác bucket | `vb backup-location get` |
+| Cluster khôi phục đứng ở job `full-recovery` | Sai `serverName`, chưa có base backup nào xong ở cụm A | `kb -n shop logs job/pg-1-full-recovery`; kiểm bước 3 có in `completed` |
+| Cluster khôi phục báo `Expected empty archive` | `plugins` của cụm mới đẩy WAL vào đúng thư mục của cụm gốc | `serverName` trong `plugins` phải khác `pg` |
+| Ứng dụng ở cụm B báo `ghi thất bại` mãi | Mật khẩu role không khớp Secret, hoặc `pg-rw` chưa có | `kb -n shop logs deploy/shop`; `kb -n shop get secret shop-db` |
+
+### Dọn dẹp
+
+D20.4 dùng tiếp hai cụm, SeaweedFS và các file trong `~/masteva-d17`, nhưng không cần namespace `shop`. Nếu học tiếp ngay, chỉ xoá namespace `shop` ở cụm B để giải phóng RAM:
+
+<Callout kind="danger">
+
+Lệnh dưới xoá ứng dụng và database đã khôi phục ở cụm B. Bản backup trong SeaweedFS vẫn còn.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+kb delete namespace shop --wait=false
+```
+
+</Terminal>
+
+Nếu dừng ở đây, xoá hẳn mọi thứ của chặng:
+
+<Callout kind="danger">
+
+Khối dưới xoá cả hai cụm, SeaweedFS cùng mọi backup trong đó, image `d20-shop:1` và thư mục lab.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá toàn bộ lab của chặng">
+
+```bash
+kind delete cluster --name d20-a
+kind delete cluster --name d20-b
+docker rm -f d20-s3
+docker volume rm d20-s3-data
+docker rmi d20-shop:1
+rm -rf ~/masteva-d17
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Bản backup giữ được bao lâu, và ai xoá được nó?">
+
+Mỗi bản Velero có TTL, mặc định 30 ngày (720 giờ), đổi bằng `--ttl`; hết hạn, Velero xoá cả object trong bucket lẫn dữ liệu Kopia không còn bản nào dùng. Cụm DR đặt BSL `ReadOnly` nên không xoá được gì, kể cả khi ai đó chạy nhầm `velero backup delete` ở đó. Nhưng Velero ở cụm chính, và bất kỳ ai có khoá S3 của nó, vẫn xoá được. Chống được kẻ có quyền quản trị cụm chính (như mã độc tống tiền ở D20.1) cần thêm một lớp ngoài Velero: object lock của object storage, hoặc chép backup sang một bucket ở tài khoản khác mà cụm chính chỉ có quyền ghi.
+
+</Reveal>
+
+<Reveal title="Lịch sao lưu của Velero và của CNPG có cần khớp nhau không?">
+
+Hai bản sao lưu ở hai thời điểm khác nhau cho hai RPO khác nhau: database khôi phục tới WAL cuối cùng (vài phút trước thảm hoạ), còn volume khôi phục tới lần Velero gần nhất (có thể vài giờ trước). Bước 1 cho thấy điều đó: đơn hàng có trong database nhưng file của chúng không có trong PVC. Ứng dụng phải chịu được sự lệch đó (tạo lại file từ dữ liệu, đánh dấu file thiếu), hoặc file phải nằm ở nơi có RPO giống database, ví dụ object storage có nhân bản thay vì PVC. Đặt lịch Velero dày hơn (`velero schedule create … --schedule "@every 1h"`) thu hẹp khoảng lệch, không xoá được nó.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** soạn runbook khôi phục từ danh sách bước, viết ConfigMap đổi StorageClass hay đổi tên image khi khôi phục, đọc log của một lần restore `PartiallyFailed`, viết truy vấn kiểm dữ liệu sau khôi phục.
+
+**AI hay sai ở đâu:** để Velero khôi phục cả object `Cluster` và PVC của database; quên rằng image và secret ngoài cụm không theo sang; quên `serverName` khác cho cụm khôi phục; coi `Ready` của Cluster là bằng chứng dữ liệu đã về; và nói "khôi phục mất vài phút" mà không có phép đo.
+
+**Cách kiểm tra:** chỉ một lần khôi phục vào cụm sạch, có kiểm dữ liệu như bước 1 (số đơn, file, ứng dụng ghi được), mới chứng minh bản backup dùng được; mốc giờ trong `drill.log` là RTO thật.
+
+</Callout>
+
+<Callout kind="link">
+
+D20.2 tạo bản backup mà bài này khôi phục. K7.4 dạy PITR của CloudNativePG; D19.2 tự động hoá kiểm tra khôi phục và alert trên trạng thái đẩy WAL. D17.3 dạy viết postmortem, khung dùng cho báo cáo sau diễn tập. D20.4 dùng tiếp hai cụm cho replication giữa hai vùng, failover và failback; D20.5 mở rộng runbook có mốc giờ của bài này thành buổi diễn tập DR toàn phần.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d17.3.mastery-khoi-phuc">Khôi phục được một namespace có ứng dụng, volume và database sang một cụm sạch theo runbook có mốc giờ, đo được RTO, kiểm được dữ liệu, và nói được RPO của database và của volume.</Check>
+
+<Check id="d17.3.mastery-viec-can-lam">Biến được mỗi chỗ vướng của một lần diễn tập khôi phục thành một việc cần làm cụ thể trong hệ thống, không chỉ một bước sửa tay.</Check>
+
+</Mastery>

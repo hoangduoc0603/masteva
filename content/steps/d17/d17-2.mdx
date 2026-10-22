@@ -1,0 +1,679 @@
+---
+title: "Sao lưu tài nguyên cụm và database: Velero và CloudNativePG"
+description: etcd snapshot, Velero và backup của database mỗi cái trả lời câu hỏi nào; Velero sao lưu object Kubernetes và dữ liệu volume bằng file-system backup với Kopia; vì sao database có operator đi đường backup riêng và phải loại khỏi bản Velero; rồi dựng hai cụm kind cùng một SeaweedFS ở "site khác", cài operator và Velero ở cả hai, chạy một ứng dụng có PVC và một cụm PostgreSQL, và sao lưu chúng theo hai đường, gặp hai cái bẫy của kind và của Velero trên đường đi.
+id: d17.2
+step: d17
+prerequisites: [d17.1, k7.4]
+topics: [d17.sao-luu-tai-nguyen-cum, d17.sao-luu-khoi-phuc-database]
+status: verified
+verified:
+  date: 2026-10-22
+  os: macOS 14.4.1 (hai cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.37.1
+    cloudnative-pg: 1.30.1
+    plugin-barman-cloud: 0.15.1
+    cert-manager: 1.21.2
+    postgresql: 18.6 (image ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie)
+    seaweedfs: "4.48"
+    velero: 1.18.4 (velero-plugin-for-aws 1.14.4)
+    jq: 1.8.2
+---
+
+<Goal>
+
+D20.1 sao lưu một database đứng một mình. Một ứng dụng trên Kubernetes còn có manifest, Secret, ConfigMap, volume, và một cụm database do operator quản lý. Bài này sao lưu cả thứ đó theo cách khôi phục được ở một cụm khác; D20.3 khôi phục nó. Học xong, bạn giải thích được:
+
+- etcd snapshot, Velero và backup của database mỗi cái trả lời câu hỏi nào, và vì sao một hệ thống thật cần cả ba.
+- Velero lấy dữ liệu volume bằng snapshot hay bằng file-system backup, và vì sao trên cụm không có driver CSI hỗ trợ snapshot thì chỉ còn cách thứ hai.
+- Vì sao database có operator không đi qua Velero, và bản Velero phải loại những gì của nó.
+- Vì sao "bản backup nằm ở đâu" phải là một con số kỹ thuật, không phải một lời hứa.
+
+</Goal>
+
+<Knowledge>
+
+### Ba loại backup, ba câu hỏi
+
+K4.5 đã chụp etcd snapshot và chỉ ra nó chứa mọi object nhưng không chứa dữ liệu trong volume. K7.4 và D20.1 đã sao lưu PostgreSQL. Thứ còn thiếu là một công cụ sao lưu **theo namespace**, lấy được cả object lẫn dữ liệu volume, và khôi phục được sang **cụm khác**. Đó là Velero.
+
+| | etcd snapshot (K4.5) | Velero | Backup của database (CNPG, D20.1) |
+|---|---|---|---|
+| Lấy gì | Toàn bộ kho của một cụm tại một revision | Object Kubernetes đã chọn (theo namespace, loại, label), cộng dữ liệu volume nếu yêu cầu | Dữ liệu của database: base backup cộng WAL |
+| Khôi phục về đâu | Đúng cụm đó (hoặc một cụm dựng lại y hệt), cả cụm một lúc | Cụm bất kỳ có Velero trỏ cùng object storage; chọn được namespace, đổi được tên namespace | Một cụm database mới, ở bất kỳ đâu đọc được object storage |
+| Nhất quán | Nhất quán cho mọi object | Mỗi object một thời điểm; volume đọc khi đang chạy | Nhất quán theo giao dịch, tới từng thời điểm (PITR) |
+| Trả lời câu hỏi | "etcd hỏng, quorum mất, cụm chết vì control plane" | "Mất một namespace, mất cả cụm, cần dựng lại ứng dụng ở cụm khác" | "Mất database, xoá nhầm dữ liệu, cần quay về 10:42" |
+| Không dùng cho | Xoá nhầm một namespace (quay cả cụm về quá khứ là quá tay) | Database đang ghi (bản chép file của PostgreSQL đang chạy chưa chắc khởi động được) | Manifest, Secret, volume của phần còn lại |
+
+Ba loại không thay nhau. Một kế hoạch DR cho cụm Kubernetes thường gồm: manifest trong Git (D13) để dựng lại phần stateless, Velero cho thứ không nằm trong Git (Secret sinh ra lúc chạy, volume của ứng dụng, object do người tạo bằng tay), backup của database cho database, và etcd snapshot cho chính control plane của cụm tự dựng.
+
+<Check id="d17.2.ba-loai-backup">So sánh được etcd snapshot, Velero và backup của database theo thứ được lấy, nơi khôi phục được, mức nhất quán và câu hỏi mỗi loại trả lời, và chọn đúng loại cho ba tình huống: mất quorum etcd, xoá nhầm một namespace, xoá nhầm một bảng.</Check>
+
+### Velero hoạt động thế nào
+
+Velero là một controller chạy trong cụm (namespace `velero`), cộng một CLI `velero` trên máy bạn. Bài dùng bản 1.18; Velero 1.18 mới được thử tới Kubernetes 1.35 (README của dự án), lab chạy Kubernetes 1.37 nằm ngoài dải đã thử, và các bước của bài chạy được trên 1.37. Dự án chuyển từ `vmware-tanzu/velero` sang tổ chức `velero-io` trên GitHub, nhiều tài liệu và câu trả lời cũ còn trỏ về tên cũ.
+
+```text
+  velero backup create shop-1 --include-namespaces shop
+        │  (tạo object Backup)
+        ▼
+  ┌─────────────── cụm A ───────────────┐            ┌──── object storage (site khác) ────┐
+  │ velero server                        │  tarball   │ velero/backups/shop-1/             │
+  │  1. liệt kê object qua API server    ├──────────► │   shop-1.tar.gz  (mọi object JSON) │
+  │  2. ghi từng object ra JSON          │            │   shop-1-logs.gz, ...              │
+  │ node-agent (DaemonSet, mỗi node)     │  Kopia     │ velero/kopia/shop/                 │
+  │  3. đọc file trong volume của pod    ├──────────► │   (kho dữ liệu volume, khử trùng   │
+  │     qua /var/lib/kubelet/pods        │            │    lặp, mã hoá)                    │
+  └──────────────────────────────────────┘            └──────────────┬─────────────────────┘
+                                                                     │ đồng bộ mỗi phút
+  ┌─────────────── cụm B ───────────────┐                            │
+  │ velero server (BSL chỉ đọc)          │ ◄──────────────────────────┘
+  │  velero restore create --from-backup shop-1
+  │  4. tạo lại object theo thứ tự: CRD, Namespace, StorageClass, PV, PVC, Role,
+  │     ServiceAccount, RoleBinding, Secret, ConfigMap, Pod, ReplicaSet, Service,
+  │     rồi mọi loại còn lại theo thứ tự chữ cái
+  │  5. pod có volume cần khôi phục: chèn init container chờ node-agent chép dữ liệu xong
+  └──────────────────────────────────────┘
+```
+
+Các khái niệm cần cho lab:
+
+- **BackupStorageLocation** (BSL): bucket mà Velero ghi backup vào. Hai cụm trỏ cùng một BSL thì cụm B thấy được backup của cụm A sau lần đồng bộ kế tiếp (mặc định mỗi phút). BSL ở cụm khôi phục nên đặt `accessMode: ReadOnly`, để không có thao tác nào ở đó xoá nhầm backup của cụm A.
+- **Dữ liệu volume** có hai đường. **Snapshot**: Velero gọi driver CSI hoặc API của cloud chụp ổ đĩa; nhanh và nhất quán ở mức đĩa, nhưng snapshot thường chỉ dùng được trong cùng nhà cung cấp, cùng vùng. **File-system backup** (FSB): node-agent đọc từng file trong volume đang mount và đẩy lên object storage bằng **Kopia** (công cụ sao lưu có khử trùng lặp và mã hoá); chậm hơn, không nhất quán tại một thời điểm, nhưng khôi phục được sang bất kỳ cụm nào. Cụm kind dùng `local-path` không có snapshot, nên lab dùng FSB. Tài liệu Velero cũng khuyên FSB khi chuyển giữa vùng hoặc giữa nhà cung cấp.
+- **Chọn volume nào**: mặc định FSB là opt-in, pod phải có annotation `backup.velero.io/backup-volumes: <tên volume>`. Cờ `--default-volumes-to-fs-backup` đảo thành opt-out.
+- **Hook**: lệnh chạy trong pod trước hoặc sau khi sao lưu (`pre.hook.backup.velero.io/command`), ví dụ đóng băng file system hay flush ứng dụng để bản FSB nhất quán hơn. Có cả hook khi khôi phục.
+- **Khôi phục không phá huỷ**: object đã tồn tại ở cụm đích thì bị bỏ qua (trừ ServiceAccount được gộp), trừ khi đặt `--existing-resource-policy update`.
+
+Một chi tiết bảo mật: Kopia mã hoá dữ liệu volume bằng một mật khẩu kho mà Velero sinh mặc định trong Secret `velero-repo-credentials`. Tài liệu ghi rõ khoá này giống nhau cho mọi kho, nên ai đọc được bucket là giải mã được; production đặt mật khẩu riêng trước lần backup đầu, và cất mật khẩu đó ở nơi cụm DR lấy được.
+
+<Check id="d17.2.velero-co-che">Mô tả được đường đi của một lần Velero sao lưu và khôi phục (tarball object, Kopia cho volume, đồng bộ BSL, thứ tự khôi phục, init container chờ dữ liệu), phân biệt được snapshot với file-system backup và nói được khi nào chỉ dùng được cái sau.</Check>
+
+<Callout kind="production">
+
+Lúc 00:47 ngày 10/03/2021 (giờ Trung Âu), một phòng trong trung tâm dữ liệu SBG2 của OVHcloud ở Strasbourg bốc cháy. Theo [chuỗi cập nhật chính thức của OVHcloud](https://corporate.ovhcloud.com/en/newsroom/news/informations-site-strasbourg/), lính cứu hoả chỉ chữa cháy được sau khi điện của cả khu được cắt; SBG2 gần như bị phá huỷ hoàn toàn, SBG1 mất bốn trên mười hai phòng, SBG3 và SBG4 bị tắt dù không hư hại. Bản cập nhật ngày 23/04/2021 ghi 14 046 máy chủ đang chạy ở SBG2 đã bị phá huỷ, và ước tính 120 000 dịch vụ bị ảnh hưởng một phần hoặc toàn bộ. Trong một bản cập nhật, OVHcloud viết rằng vì các bản backup được lưu trên dịch vụ Public Cloud Storage, việc khởi động lại dịch vụ đó (ở chính khu Strasbourg) sẽ làm nhiều bản backup dùng được trở lại; ưu tiên số 3 trong kế hoạch của họ là cùng khách hàng triển khai cơ chế khắc phục thảm hoạ (DRP).
+
+Một số khách hàng mất cả dữ liệu lẫn bản sao lưu. Theo [Le Monde du Droit](https://www.lemondedudroit.fr/affaires/272-contrats/85797-perte-des-donnees-et-localisation-des-sauvegardes-manquement-contractuel-d-ovh.html) (báo pháp lý, nguồn thứ cấp), ngày 26/01/2023 Toà thương mại Lille Métropole xử vụ France Bati Courtage kiện OVH: khách mua tuỳ chọn "Backup", và bản sao lưu nằm cùng toà nhà với máy chủ chính nên cháy theo. OVH cho rằng hợp đồng không buộc họ đặt backup ở trung tâm dữ liệu khác; toà dựa vào tài liệu thương mại của OVH mô tả không gian backup "tách biệt vật lý" với hạ tầng chứa máy chủ, và kết luận OVH vi phạm hợp đồng. Theo [Le Monde Informatique ngày 30/04/2025](https://www.lemondeinformatique.fr/actualites/lire-incendie-ovh-la-sauvegarde-physiquement-isolee-en-question-96748.html), Toà phúc thẩm Douai hiểu "tách biệt vật lý" theo nghĩa thông thường, không đòi hạ tầng ở xa về địa lý, bác lỗi của OVH, và giảm bồi thường từ 100 000 euro xuống 1 800,48 euro; quyết định còn có thể bị đưa lên Toà phá án.
+
+Điều rút ra cho bài này (của bài): hai cấp toà hiểu khác nhau một chữ "tách biệt", còn dữ liệu thì đã mất ngay từ đầu. "Backup nằm ở đâu" phải là một con số kỹ thuật ghi rõ (site khác, vùng khác, tài khoản khác), không phải một tính từ trong tài liệu bán hàng. TT 09/2020 (D20.1) cũng viết theo hướng đó: dữ liệu sao lưu phải được cất tách rời với khu vực đặt hệ thống nguồn. Lab của bài đặt object storage ngoài cả hai cụm vì lý do này.
+
+</Callout>
+
+### Database đi đường riêng
+
+Velero lấy được file trong PVC của PostgreSQL, nhưng đó là bản chép file của một database **đang ghi**: không nhất quán tại một thời điểm, không có WAL đi kèm, có thể không khởi động được, và không có PITR. Với database có operator, đường đúng là backup của chính operator (K7.4), và lúc khôi phục là một object `Cluster` mới với `bootstrap.recovery`. Vì vậy bản Velero của bài **loại trừ** mọi thứ CNPG quản lý:
+
+- Object `Cluster`, `Backup`, `ScheduledBackup` bị loại bằng `--exclude-resources`. Nếu để Velero khôi phục object `Cluster` cũ, operator ở cụm B thấy một Cluster chưa có PVC nào và dựng nó theo `bootstrap.initdb` của bản gốc: một database **trống** mang đúng tên database cũ. D20.3 cho thấy Cluster đó vẫn báo sẵn sàng.
+- Object mà operator và plugin sinh ra (pod, PVC, Service, các Secret chứng chỉ, Role của plugin) mang label `app.kubernetes.io/managed-by` là `cloudnative-pg` hoặc `plugin-barman-cloud`; bộ chọn `--selector 'app.kubernetes.io/managed-by notin (cloudnative-pg,plugin-barman-cloud)'` bỏ chúng. Lease mà instance manager dùng để chọn primary chỉ mang label `cnpg.io/cluster`, nên được loại riêng bằng `--exclude-resources`. Operator ở cụm B sẽ tự tạo lại những thứ nó cần.
+- Object `ObjectStore` của plugin Barman Cloud và Secret chứa khoá S3 **được** sao lưu: cụm B cần chúng để đọc backup.
+
+Bên database cũng có hai chỗ phải tính trước, cả hai đều nằm trong tài liệu "Recovery" của CNPG:
+
+- **Secret mật khẩu ứng dụng.** Operator không sao lưu Secret. Database khôi phục mang theo role `shop` với mật khẩu cũ; nếu cụm B sinh một Secret mới với mật khẩu ngẫu nhiên, ứng dụng không đăng nhập được. Lab đặt mật khẩu trong một Secret do bạn quản lý (`shop-db`), khai nó ở `bootstrap.initdb.secret` lúc tạo và ở `bootstrap.recovery.secret` lúc khôi phục; Velero mang Secret đó sang.
+- **Thư mục WAL của cụm mới.** Cụm khôi phục tiếp tục đẩy WAL vào cùng bucket thì phải dùng `serverName` khác; trùng thư mục của cụm gốc thì operator dừng với lỗi `Expected empty archive`, vì ghi chồng lên sẽ làm hỏng chính bản backup vừa dùng.
+
+<Check id="d17.2.database-duong-rieng">Giải thích được vì sao không khôi phục database bằng bản chép file của Velero, vì sao phải loại object `Cluster` khỏi bản Velero và điều gì xảy ra nếu không loại, và kể được hai chỗ phải tính trước khi khôi phục CNPG sang cụm khác (Secret mật khẩu, `serverName`).</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Velero Docs: File System Backup](https://velero.io/docs/v1.18/file-system-backup/): cách node-agent đọc volume, opt-in và opt-out, giới hạn (không lấy `hostPath`, không nhất quán tại một thời điểm, khoá mã hoá chung).
+- [Velero Docs: Resource filtering](https://velero.io/docs/v1.18/resource-filtering/): `--include-namespaces`, `--exclude-resources`, `--selector` và label `velero.io/exclude-from-backup`.
+- [CloudNativePG 1.30: Backup](https://cloudnative-pg.io/docs/1.30/backup/): backup qua plugin, `ScheduledBackup`, chọn instance lấy backup.
+- [Strasbourg datacentre: latest information (OVHcloud)](https://corporate.ovhcloud.com/en/newsroom/news/informations-site-strasbourg/): nguồn chính của callout; đọc các bản cập nhật từ 10/03 tới 23/04/2021.
+- [Incendie OVH : La sauvegarde physiquement isolée en question (Le Monde Informatique)](https://www.lemondeinformatique.fr/actualites/lire-incendie-ovh-la-sauvegarde-physiquement-isolee-en-question-96748.html): phán quyết phúc thẩm về chữ "tách biệt vật lý" (tiếng Pháp).
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài dựng từ đầu hai cụm kind một node, `d20-a` (cụm chính) và `d20-b` (cụm DR), cùng một **SeaweedFS** chạy ngoài cả hai cụm làm object storage ở "site khác". D20.3, D20.4 và D20.5 dùng tiếp hai cụm này. Cần Docker Desktop, `kind`, `kubectl` (1.36 hay 1.37 đều được), `curl`. Cổng dùng, chỉ nghe trên `127.0.0.1`: **9902** (S3 của SeaweedFS), **9910** và **9911** (API server của hai cụm).
+
+**Profile máy.** Hai cụm kind một node cùng cert-manager, CloudNativePG, plugin Barman Cloud, Velero với node-agent, một instance PostgreSQL (giới hạn 256 MiB) và ứng dụng: theo `docker stats` ở cuối bài, node cụm A khoảng 1,9 GiB, node cụm B khoảng 1,1 GiB, SeaweedFS khoảng 300 MiB, tổng khoảng 3,3 GiB; một phần là page cache của các node nên con số dao động vài trăm MiB giữa các lần chạy. Đĩa của Docker cần khoảng 6 GB trống. Lần đầu, mỗi node kéo khoảng 600 MB image (cert-manager, operator, plugin, PostgreSQL, Velero), nên bước 2 và 3 mất 5 tới 15 phút tuỳ mạng. Máy 8 GB: đặt Docker 5 GB, dừng mọi VM và cụm khác, đóng trình duyệt và ứng dụng nặng trong lúc làm; macOS chỉ còn khoảng 3 GB nên máy sẽ chậm.
+
+Ba điều lab làm cho gọn mà production không làm: hai "site" là hai container trên cùng một máy, chung một mạng Docker; một SeaweedFS dùng chung cho cả hai cụm, không nhân bản; và khoá S3 nằm trong một file trên máy bạn.
+
+<Callout kind="danger">
+
+Bài này xoá một namespace có database. Mọi lệnh chỉ dành cho hai cụm lab, và mọi lệnh `kubectl` của bài đi qua hai hàm `ka`, `kb` có ghi rõ `--context`: không có lệnh nào dựa vào context hiện tại. Kubeconfig của bài là file riêng `~/masteva-d17/kubeconfig`, không đụng `~/.kube/config`.
+
+</Callout>
+
+### 1. Hai cụm và một object storage ở site khác
+
+File `lab.sh` gom những thứ mọi terminal của chặng cần: kubeconfig riêng, thư mục `bin` của bài trong `PATH`, và các hàm ngắn. `ka` và `kb` là `kubectl` cố định vào cụm A và cụm B, `va` và `vb` là `velero` cố định vào từng cụm; hàm `mark` ghi một mốc giờ vào `drill.log` cho bước 1 của D20.3. Mỗi cụm được cấu hình để API server nghe ở một cổng cố định (9910, 9911) thay vì cổng ngẫu nhiên.
+
+<Terminal where="mac" title="~/masteva-d17/lab.sh">
+
+```bash
+mkdir -p ~/masteva-d17/bin ~/masteva-d17/d17-2 && cd ~/masteva-d17
+cat > lab.sh <<'EOF'
+export KUBECONFIG=~/masteva-d17/kubeconfig
+export PATH=~/masteva-d17/bin:$PATH
+ka() { kubectl --context kind-d20-a "$@"; }
+kb() { kubectl --context kind-d20-b "$@"; }
+va() { velero --kubecontext kind-d20-a "$@"; }
+vb() { velero --kubecontext kind-d20-b "$@"; }
+mark() { echo "$(date +%s) $(date -u +%T) $*" >> ~/masteva-d17/drill.log; echo "$(date -u +%T) $*"; }
+EOF
+. ./lab.sh
+for c in a b; do
+  cat > kind-$c.yaml <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  apiServerAddress: 127.0.0.1
+  apiServerPort: $([ $c = a ] && echo 9910 || echo 9911)
+EOF
+  kind create cluster --name d20-$c --config kind-$c.yaml \
+    --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+done
+kubectl config get-contexts -o name
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Creating cluster "d20-a" ...
+ ✓ Ensuring node image (kindest/node:v1.37.0) 🖼
+ ✓ Preparing nodes 📦
+...
+Set kubectl context to "kind-d20-a"
+...
+Creating cluster "d20-b" ...
+...
+Set kubectl context to "kind-d20-b"
+...
+kind-d20-a
+kind-d20-b
+```
+
+</Expected>
+
+**Mọi terminal mới dùng cho chặng này chạy một dòng trước tiên:** `cd ~/masteva-d17 && . ./lab.sh`.
+
+SeaweedFS chạy bằng `weed server -s3` như D19.2, ở đây là một container nằm trên network `kind` của Docker: cả hai cụm gọi được nó bằng tên `d20-s3`, còn máy bạn gọi qua `127.0.0.1:9902`. Dữ liệu nằm trong volume `d20-s3-data`. Velero kiểm bucket có tồn tại không ngay khi khởi động, nên khối lệnh tạo sẵn hai bucket bằng `weed shell`: `velero` cho Velero, `cnpg` cho backup của database.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+docker run -d --name d20-s3 --network kind --memory 512m -p 127.0.0.1:9902:8333 \
+  -e AWS_ACCESS_KEY_ID=masteva -e AWS_SECRET_ACCESS_KEY=masteva-secret -v d20-s3-data:/data \
+  chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d \
+  server -dir=/data -s3 -master.volumeSizeLimitMB=128 -volume.max=30 > /dev/null
+for i in $(seq 1 90); do curl -s -o /dev/null http://127.0.0.1:9902/ && break; sleep 1; done
+for b in velero cnpg; do docker exec d20-s3 sh -c "echo 's3.bucket.create -name $b' | weed shell" | tail -1; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+created bucket velero
+created bucket cnpg
+```
+
+</Expected>
+
+### 2. Operator, plugin và Velero trên cả hai cụm
+
+Cụm DR phải có sẵn mọi controller mà bản backup cần: Velero không cài operator, nó chỉ khôi phục object. Khối dưới tải ba manifest (cert-manager, CloudNativePG, plugin Barman Cloud) và kiểm sha256 của từng file với digest GitHub công bố, như D19.2; rồi tải CLI `velero` và kiểm với file `CHECKSUM` của cùng bản phát hành. Không khớp thì lệnh sau `&&` không chạy.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+get() { curl -sLO "$1" && echo "$2  ${1##*/}" | shasum -a 256 -c -; }
+get https://github.com/cert-manager/cert-manager/releases/download/v1.21.2/cert-manager.yaml \
+  e03b668ec8675214af6b0a671699d088f2601fa3878e0dbe1b41d3feafd1879f
+get https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml \
+  37237f145d8138256ea25ae830f87759255665ff08f8d552fdd8224a5ec032fb
+get https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/v0.15.1/manifest.yaml \
+  8f377ff4a7d0d3f74fc64b0f7ac4f449fc38ca9e83a40107cca2f9315a9bd920
+V=v1.18.4; OS=$(uname -s | tr A-Z a-z); ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+F=velero-$V-$OS-$ARCH.tar.gz
+curl -sLO https://github.com/velero-io/velero/releases/download/$V/$F
+curl -sL https://github.com/velero-io/velero/releases/download/$V/CHECKSUM | grep " $F\$" | shasum -a 256 -c - \
+  && tar -xzf $F -C bin --strip-components 1 velero-$V-$OS-$ARCH/velero
+velero version --client-only
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+cert-manager.yaml: OK
+cnpg-1.30.1.yaml: OK
+manifest.yaml: OK
+velero-v1.18.4-darwin-arm64.tar.gz: OK
+Client:
+	Version: v1.18.4
+	Git commit: 4ee1e79a7aed367fd9b767b8219ec65bd0c96892
+```
+
+</Expected>
+
+Script `install.sh` cài mọi thứ vào một cụm, nhận tên context làm tham số. Phần Velero:
+
+- `--provider aws` cùng plugin `velero-plugin-for-aws` 1.14 (bản đi với Velero 1.18): plugin này nói giao thức S3, dùng được với mọi object storage tương thích S3. `s3Url` là địa chỉ mà Velero trong cụm gọi tới; `publicUrl` là địa chỉ CLI trên máy bạn dùng khi tải log hay danh sách object của một backup; `s3ForcePathStyle` vì SeaweedFS dùng dạng `http://host/bucket/…`.
+- `--use-volume-snapshots=false` vì cụm không có snapshot; `--use-node-agent` cài DaemonSet đọc volume cho file-system backup.
+- Image Velero và plugin ghim digest.
+
+<Terminal where="mac" title="~/masteva-d17/install.sh">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+cat > s3-credentials <<'EOF'
+[default]
+aws_access_key_id=masteva
+aws_secret_access_key=masteva-secret
+EOF
+cat > install.sh <<'EOF'
+#!/bin/sh
+set -e
+C=$1
+kubectl --context $C apply -f cert-manager.yaml > /dev/null
+kubectl --context $C apply --server-side -f cnpg-1.30.1.yaml > /dev/null
+kubectl --context $C -n cert-manager wait --for=condition=Available deploy --all --timeout=600s > /dev/null
+kubectl --context $C -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=600s > /dev/null
+kubectl --context $C apply -f manifest.yaml > /dev/null
+kubectl --context $C -n cnpg-system rollout status deploy/barman-cloud --timeout=600s > /dev/null
+velero install --kubecontext $C --provider aws \
+  --image velero/velero:v1.18.4@sha256:c89fb5b6d1fd6afd368e0f483e6f5555fd62851a1eada8ac5c72482e674ca17b \
+  --plugins velero/velero-plugin-for-aws@sha256:c85a7fa803569e3128c33e4f5766f84ab156c8d171c9f1dd2715581d45ce98fa \
+  --bucket velero --secret-file ./s3-credentials --use-volume-snapshots=false --use-node-agent \
+  --backup-location-config region=us-east-1,s3ForcePathStyle=true,s3Url=http://d20-s3:8333,publicUrl=http://127.0.0.1:9902 \
+  --wait > /dev/null
+kubectl --context $C -n velero rollout status ds/node-agent --timeout=600s > /dev/null
+echo "$C: cert-manager, CloudNativePG, Barman Cloud, Velero và node-agent đã chạy"
+EOF
+sh install.sh kind-d20-a && sh install.sh kind-d20-b
+kb -n velero patch backupstoragelocation default --type merge -p '{"spec":{"accessMode":"ReadOnly"}}'
+for i in $(seq 1 60); do [ "$(kb -n velero get bsl default -o jsonpath='{.status.phase}')" = Available ] && break; sleep 2; done
+va backup-location get
+vb backup-location get
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-d20-a: cert-manager, CloudNativePG, Barman Cloud, Velero và node-agent đã chạy
+kind-d20-b: cert-manager, CloudNativePG, Barman Cloud, Velero và node-agent đã chạy
+backupstoragelocation.velero.io/default patched
+NAME      PROVIDER   BUCKET/PREFIX   PHASE       LAST VALIDATED                  ACCESS MODE   DEFAULT
+default   aws        velero          Available   2026-10-22 06:45:58 +0700 +07   ReadWrite     true
+NAME      PROVIDER   BUCKET/PREFIX   PHASE       LAST VALIDATED                  ACCESS MODE   DEFAULT
+default   aws        velero          Available   2026-10-22 06:46:40 +0700 +07   ReadOnly      true
+```
+
+</Expected>
+
+Đọc kết quả: BSL của cả hai cụm `Available` nghĩa là Velero đọc ghi được bucket; cột `ACCESS MODE` của cụm B là `ReadOnly`. Giờ trong cột `LAST VALIDATED` là giờ máy bạn.
+
+Một chi tiết của dòng `--plugins`: image plugin chỉ ghim bằng digest, không kèm tag. Velero đặt tên init container của plugin từ chuỗi image, và với chuỗi dạng `tên:tag@sha256:…` cái tên sinh ra còn dấu `:`; Kubernetes từ chối Deployment với lỗi `Invalid value: "velero-velero-plugin-for-aws:v1-14-4"`, và `velero install` dừng giữa chừng. Ghim bằng digest không tag tránh được lỗi đó mà vẫn cố định đúng bản 1.14.4.
+
+<Check id="d17.2.lab-hai-cum">Dựng được hai cụm kind và một object storage ngoài cả hai, cài được operator, plugin và Velero có node-agent vào cả hai cụm, và đặt được BSL ở cụm DR thành chỉ đọc.</Check>
+
+### 3. Ứng dụng ở cụm A: một PVC và một cụm PostgreSQL
+
+Ứng dụng `shop` mỗi giây chèn một đơn hàng vào PostgreSQL và ghi một file `order-<số đơn>.txt` vào PVC `uploads`, như một ứng dụng lưu ảnh hay hoá đơn của từng đơn ra đĩa. Image `d20-shop:1` được build trên máy bạn và nạp vào **riêng cụm A** bằng `kind load`, như một image chỉ nằm trong registry nội bộ của site chính.
+
+<Terminal where="mac" title="~/masteva-d17/d17-2/app.sh">
+
+```bash
+cd ~/masteva-d17/d17-2
+cat > app.sh <<'EOF'
+#!/bin/sh
+while true; do
+  id=$(psql -qAt -c "insert into orders (amount) values (round((random() * 100)::numeric, 2)) returning id" 2>/dev/null) \
+    && echo "đơn $id" > /uploads/order-$id.txt \
+    || echo "$(date -u +%T) ghi thất bại"
+  sleep 1
+done
+EOF
+cat > Dockerfile <<'EOF'
+FROM postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+COPY app.sh /app.sh
+CMD ["sh", "/app.sh"]
+EOF
+docker build -q -t d20-shop:1 . > /dev/null
+kind load docker-image d20-shop:1 --name d20-a
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Image: "d20-shop:1" with ID "sha256:69f10e56…" not yet present on node "d20-a-control-plane", loading...
+```
+
+</Expected>
+
+Manifest của namespace `shop`, đọc trước khi apply:
+
+- Secret `shop-db` giữ mật khẩu của role `shop`. Cluster khai nó ở `bootstrap.initdb.secret`, nên operator đặt đúng mật khẩu này cho role thay vì sinh mật khẩu ngẫu nhiên; ứng dụng đọc cùng Secret.
+- `postInitApplicationSQL` tạo bảng `orders` ngay khi database được khởi tạo.
+- `ObjectStore` trỏ vào bucket `cnpg` của SeaweedFS ở ngoài cụm, `ScheduledBackup` lấy bản đầu tiên ngay (`immediate: true`), như D19.2.
+- Pod của `shop` có annotation `backup.velero.io/backup-volumes: uploads`: chỉ volume này được Velero sao lưu bằng file-system backup.
+- PVC `uploads` có annotation `volumeType: local`. Provisioner `local-path` có sẵn của kind mặc định tạo PV kiểu `hostPath`, và tài liệu Velero ghi rõ file-system backup không lấy được volume `hostPath`: Velero sẽ bỏ qua nó, chỉ để lại một cảnh báo trong bản backup. Annotation này bảo provisioner tạo PV kiểu `local` (local persistent volume), loại Velero hỗ trợ. PVC của PostgreSQL không có annotation, nên vẫn là `hostPath`; nó không cần Velero.
+
+<Terminal where="mac" title="~/masteva-d17/d17-2/shop.yaml">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh && cd d17-2
+cat > shop.yaml <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata: { name: shop-db }
+type: kubernetes.io/basic-auth
+stringData: { username: shop, password: shop-pass-2026 }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: s3-creds }
+stringData: { ACCESS_KEY_ID: masteva, ACCESS_SECRET_KEY: masteva-secret }
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata: { name: s3-store }
+spec:
+  configuration:
+    destinationPath: s3://cnpg/
+    endpointURL: http://d20-s3:8333
+    s3Credentials:
+      accessKeyId: { name: s3-creds, key: ACCESS_KEY_ID }
+      secretAccessKey: { name: s3-creds, key: ACCESS_SECRET_KEY }
+    wal: { compression: gzip }
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata: { name: pg }
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage: { size: 1Gi }
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }
+  bootstrap:
+    initdb:
+      database: shop
+      owner: shop
+      secret: { name: shop-db }
+      postInitApplicationSQL:
+        - create table orders (id bigserial primary key, amount numeric(10,2) not null, at timestamptz not null default now())
+        - alter table orders owner to shop
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters: { barmanObjectName: s3-store }
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata: { name: pg-daily }
+spec:
+  schedule: "0 0 2 * * *"
+  immediate: true
+  backupOwnerReference: self
+  cluster: { name: pg }
+  method: plugin
+  pluginConfiguration: { name: barman-cloud.cloudnative-pg.io }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads
+  annotations: { volumeType: local }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: shop }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: shop } }
+  template:
+    metadata:
+      labels: { app: shop }
+      annotations: { backup.velero.io/backup-volumes: uploads }
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: shop
+          image: d20-shop:1
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PGHOST, value: pg-rw }
+            - { name: PGDATABASE, value: shop }
+            - { name: PGCONNECT_TIMEOUT, value: "2" }
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: shop-db, key: username } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: shop-db, key: password } }
+          volumeMounts:
+            - { name: uploads, mountPath: /uploads }
+      volumes:
+        - name: uploads
+          persistentVolumeClaim: { claimName: uploads }
+EOF
+ka create namespace shop
+ka -n shop apply -f shop.yaml
+ka -n shop wait --for=condition=Ready cluster/pg --timeout=900s
+ka -n shop rollout status deploy/shop --timeout=300s
+for i in $(seq 1 300); do [ "$(ka -n shop get backup -o jsonpath='{.items[0].status.phase}')" = completed ] && break; sleep 2; done
+ka -n shop get backup -o custom-columns='BACKUP:.metadata.name,PHASE:.status.phase'
+ka get pv -o go-template='{{range .items}}{{.spec.claimRef.name}}: {{if .spec.hostPath}}hostPath{{else}}local{{end}}{{"\n"}}{{end}}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/shop created
+secret/shop-db created
+secret/s3-creds created
+objectstore.barmancloud.cnpg.io/s3-store created
+cluster.postgresql.cnpg.io/pg created
+scheduledbackup.postgresql.cnpg.io/pg-daily created
+persistentvolumeclaim/uploads created
+deployment.apps/shop created
+cluster.postgresql.cnpg.io/pg condition met
+deployment "shop" successfully rolled out
+BACKUP                    PHASE
+pg-daily-20261021234742   completed
+uploads: local
+pg-1: hostPath
+```
+
+</Expected>
+
+Cụm PostgreSQL sẵn sàng và bản base backup đầu tiên đã `completed` trong bucket `cnpg`. Hai dòng cuối xác nhận hai kiểu PV: `uploads` là `local`, `pg-1` là `hostPath` (thứ tự hai dòng trên máy bạn có thể ngược lại). Lần đầu, khối lệnh mất vài phút vì node phải kéo image PostgreSQL.
+
+Hàm `sqla` chạy một câu SQL trên primary của cụm A, như hàm `sql` của K7.4; khối dưới cũng ghi nó vào `lab.sh` cùng hàm `sqlb` cho cụm B. Đếm đơn hàng và file sau vài chục giây chạy:
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17
+cat >> lab.sh <<'EOF'
+sqla() { ka -n ${2:-shop} exec "$(ka -n ${2:-shop} get cluster pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres -d ${3:-shop} -Atc "$1"; }
+sqlb() { kb -n ${2:-shop} exec "$(kb -n ${2:-shop} get cluster pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres -d ${3:-shop} -Atc "$1"; }
+EOF
+. ./lab.sh
+for i in $(seq 1 60); do [ "$(sqla 'select count(*) >= 30 from orders')" = t ] && break; sleep 2; done
+sqla "select count(*), max(id) from orders"
+ka -n shop exec deploy/shop -- sh -c 'ls /uploads | wc -l'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+60|60
+60
+```
+
+</Expected>
+
+### 4. Sao lưu: Velero cho namespace, CNPG cho database
+
+Bản Velero `shop-1` lấy namespace `shop` trừ mọi thứ thuộc CNPG, đúng như phần Kiến thức: sáu loại tài nguyên bị loại bằng `--exclude-resources` (ba loại của CNPG, Lease, hai loại event), và mọi object có label `managed-by` của operator hoặc plugin bị loại bằng `--selector`. `--wait` chờ tới khi backup xong.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d17 && . ./lab.sh
+va backup create shop-1 --include-namespaces shop \
+  --exclude-resources clusters.postgresql.cnpg.io,backups.postgresql.cnpg.io,scheduledbackups.postgresql.cnpg.io,leases.coordination.k8s.io,events,events.events.k8s.io \
+  --selector 'app.kubernetes.io/managed-by notin (cloudnative-pg,plugin-barman-cloud)' --wait
+va backup describe shop-1 --details | sed -n '/^Resource List:/,/^$/p'
+va backup describe shop-1 --details | grep -A3 'Pod Volume Backups'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Backup request "shop-1" submitted successfully.
+Waiting for backup to complete. You may safely press ctrl-c to stop waiting - your backup will continue in the background.
+......
+Backup completed with status: Completed. You may check for more information using the commands `velero backup describe shop-1` and `velero backup logs shop-1`.
+Resource List:
+  apiextensions.k8s.io/v1/CustomResourceDefinition:
+    - objectstores.barmancloud.cnpg.io
+  apps/v1/Deployment:
+    - shop/shop
+  apps/v1/ReplicaSet:
+    - shop/shop-8548f6785c
+  barmancloud.cnpg.io/v1/ObjectStore:
+    - shop/s3-store
+  v1/ConfigMap:
+    - shop/kube-root-ca.crt
+  v1/Namespace:
+    - cert-manager
+    ...
+    - shop
+    - velero
+  v1/PersistentVolume:
+    - pvc-44c55749-2bcd-456b-a2fd-79bc4bc41d61
+  v1/PersistentVolumeClaim:
+    - shop/uploads
+  v1/Pod:
+    - shop/shop-8548f6785c-ngmsv
+  v1/Secret:
+    - shop/s3-creds
+    - shop/shop-db
+  v1/ServiceAccount:
+    - shop/default
+
+  Pod Volume Backups - kopia:
+    Completed:
+      shop/shop-8548f6785c-ngmsv: uploads (size: 819, incremental size: 819)
+```
+
+</Expected>
+
+Đọc danh sách object trong bản backup:
+
+- Có Deployment, ReplicaSet, Pod của `shop`, PVC `uploads` cùng PV của nó, hai Secret `s3-creds`, `shop-db`, và ObjectStore `s3-store` (kèm CRD của nó).
+- **Không** có Cluster, Backup, pod `pg-1`, PVC `pg-1`, Service `pg-rw`, các Secret chứng chỉ `pg-ca`, `pg-server`, `pg-replication`: tất cả mang label `app.kubernetes.io/managed-by` là `cloudnative-pg` hoặc `plugin-barman-cloud`, và bộ chọn `notin` đã loại chúng. Lease mà instance manager dùng để chọn primary (K7.4) không có label đó, nên được loại riêng bằng `--exclude-resources`, cùng với event.
+- Danh sách có object Namespace của mọi namespace: Velero áp `--selector` lên cả object Namespace, và `notin` khớp mọi namespace không mang label đó. Chỉ object Namespace được lấy, không kèm tài nguyên bên trong; D20.3 khôi phục với `--include-namespaces shop` nên các namespace đó không được tạo ở cụm B.
+- `Pod Volume Backups - kopia` có đúng một volume, `uploads`, đã `Completed`. Nếu dòng này ghi `<none included>`, mở phần `Warnings` của `velero backup describe`: lý do thường gặp là volume kiểu `hostPath` hoặc pod thiếu annotation.
+
+Nhìn vào bucket từ phía SeaweedFS: Velero và CNPG mỗi bên một bucket, và trong bucket `velero` có hai nhánh, `backups/` cho object và `kopia/` cho dữ liệu volume.
+
+<Terminal where="mac">
+
+```bash
+docker exec d20-s3 sh -c "echo 'fs.ls /buckets/velero' | weed shell; echo 'fs.ls /buckets/velero/backups' | weed shell; echo 'fs.ls /buckets/cnpg/pg' | weed shell" 2>&1 | grep -v '^>'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+backups
+kopia
+shop-1
+base
+wals
+```
+
+</Expected>
+
+<Check id="d17.2.lab-backup">Tạo được một bản Velero cho namespace có loại trừ mọi thứ thuộc CNPG, đọc được danh sách object và volume trong bản backup, và chỉ ra được trong object storage đâu là backup của Velero, đâu là dữ liệu Kopia, đâu là backup của database.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `velero backup-location get` báo `Unavailable` | Bucket chưa có, sai `s3Url`, hoặc SeaweedFS chưa chạy | `kubectl --context kind-d20-a -n velero logs deploy/velero \| grep -i error`; tạo lại bucket như bước 1 |
+| `velero backup describe --details` báo lỗi tải về | CLI trên máy không gọi được `publicUrl` | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9902/` phải in `403` |
+| Backup `PartiallyFailed`, Pod Volume Backups lỗi | node-agent chưa chạy hoặc pod không có annotation | `ka -n velero get pods -l name=node-agent`; `ka -n shop get pod -l app=shop -o yaml \| grep backup-volumes` |
+| Cụm B không thấy `shop-1` sau vài phút | BSL ở cụm B `Unavailable`, khác bucket | `vb backup-location get` |
+
+### Dọn dẹp
+
+D20.3 khôi phục bản backup vừa tạo sang cụm B; giữ nguyên hai cụm, SeaweedFS và thư mục `~/masteva-d17`. Nếu dừng ở đây và không học tiếp, dùng khối xoá toàn bộ ở cuối D20.3.
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Velero có thay được etcd snapshot cho cụm tự dựng không?">
+
+Không. Velero đọc object qua API server, nên cần một API server đang chạy; khi etcd mất quorum hay hỏng dữ liệu, không có API server nào để Velero hỏi, và cũng không có API server nào để khôi phục vào. Velero cũng không lấy được những thứ nằm ngoài API mà một cụm cần để tự đứng được, như chứng chỉ trong `/etc/kubernetes/pki` và cấu hình kubelet trên từng node (K4.5). Hai công cụ bổ sung cho nhau: etcd snapshot cứu control plane, Velero cứu ứng dụng; với cụm do cloud quản lý, bạn không chạm được etcd, nên Velero cùng Git là đường còn lại.
+
+</Reveal>
+
+<Reveal title="File-system backup đọc volume đang ghi. Dữ liệu có nhất quán không?">
+
+Không nhất quán tại một thời điểm: Kopia đọc từng file theo thứ tự, ứng dụng vẫn ghi trong lúc đó, nên bản backup có thể chứa file A của giây thứ 1 và file B của giây thứ 5. Với file độc lập như ảnh tải lên, điều đó chấp nhận được. Với dữ liệu mà nhiều file phải khớp nhau (database, chỉ mục tìm kiếm), dùng hook trước khi sao lưu để đóng băng ghi (`fsfreeze`, lệnh flush của ứng dụng), dùng snapshot CSI nếu hạ tầng có, hoặc tốt hơn là công cụ sao lưu riêng của phần mềm đó, như bài đã làm với PostgreSQL.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết lệnh `velero backup create` với bộ lọc phức tạp, viết ConfigMap đổi StorageClass hay đổi tên image khi khôi phục, soạn runbook khôi phục từ danh sách bước, đọc log của một lần restore `PartiallyFailed`.
+
+**AI hay sai ở đâu:** trỏ về repo và tài liệu cũ `vmware-tanzu/velero`; dùng restic (đã ngừng nhận backup mới từ Velero 1.17) thay cho Kopia; dùng MinIO làm ví dụ object storage; để Velero sao lưu cả object `Cluster` và PVC của database; quên rằng image và secret ngoài cụm không theo sang; quên `serverName` khác cho cụm khôi phục; và nói "khôi phục mất vài phút" mà không có phép đo.
+
+**Cách kiểm tra:** `velero backup describe --details` cho biết chính xác object nào và volume nào có trong bản backup; chỉ một lần khôi phục vào cụm sạch, có kiểm dữ liệu như bước 1 của D20.3, mới chứng minh bản backup dùng được.
+
+</Callout>
+
+<Callout kind="link">
+
+K4.5 dạy etcd snapshot và PKI của cụm; K7.1 dạy PVC, StorageClass và snapshot CSI; K7.4 dạy backup và khôi phục của CloudNativePG; D19.2 tự động hoá kiểm tra khôi phục. K1.4 dạy Deployment và PVC, K2.3 dạy RBAC. D13 giữ manifest trong Git để dựng lại phần stateless. D20.1 tính RTO và RPO; D20.3 khôi phục bản backup của bài này sang cụm B theo runbook có mốc giờ; D20.4 dùng tiếp hai cụm cho replication giữa hai vùng.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d17.2.mastery-ke-hoach">Viết được kế hoạch sao lưu cho một namespace có ứng dụng, volume và một cụm database có operator: thứ gì đi Velero, thứ gì đi backup của database, thứ gì nằm trong Git, backup nằm ở đâu, và lịch của từng thứ.</Check>
+
+<Check id="d17.2.mastery-doc-backup">Đọc được một bản Velero bằng `velero backup describe --details` và nói được nó có đủ object và volume cần để khôi phục không.</Check>
+
+</Mastery>

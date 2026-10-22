@@ -1,0 +1,567 @@
+---
+title: "Backfill và migration lớn trên PostgreSQL đang chạy"
+description: Vì sao một câu UPDATE hai triệu dòng chạy chưa tới mười giây vẫn là sự cố; đo WAL, replication lag, khoá dòng và bloat của nó trên một cụm CloudNativePG; rồi làm lại cùng việc bằng backfill theo lô có điều tiết theo replication lag, dừng giữa chừng và chạy tiếp, theo dõi autovacuum, và hiểu ALTER TABLE nào khoá bảng cùng pg_repack làm được gì khi bảng đã phình.
+id: d24.3
+step: d24
+prerequisites: [d24.1]
+topics: [d24.migration-lon]
+status: verified
+verified:
+  date: 2026-10-21
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.36.1 (bản đi kèm Docker Desktop)
+    cloudnative-pg: 1.30.1
+    postgresql: 18.6 (image ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie)
+---
+
+<Goal>
+
+SB5.5 đã dạy migration không downtime từ phía ứng dụng. Bài này đứng ở phía database khi việc sửa dữ liệu chạm tới hàng triệu dòng: một câu `UPDATE` cả bảng làm gì với WAL, replica, khoá và đĩa, và một backfill đúng cách chạy theo lô ra sao. Học xong, bạn giải thích được:
+
+- Vì sao một câu `UPDATE` hai triệu dòng chạy chưa tới mười giây trên primary vẫn có thể là sự cố: replica tụt lại hàng trăm MB, ứng dụng không cập nhật được dòng nào trong lúc đó, và bảng phình gấp đôi.
+- Một backfill theo lô có điều tiết theo replication lag, chạy tiếp được sau khi dừng và chạy lại không đổi kết quả.
+- Những thao tác `ALTER TABLE` nào khoá bảng lâu, autovacuum liên quan gì tới backfill, và `pg_repack` làm được gì khi bảng đã phình.
+
+</Goal>
+
+<Knowledge>
+
+### Một câu `UPDATE` cả bảng: vì sao không
+
+Thêm một cột rồi điền giá trị cho hàng triệu dòng cũ gọi là **backfill**. SB5.5 (roadmap Spring Boot) đã dạy phía ứng dụng: expand/contract, tức là đổi schema qua nhiều bản phát hành để mỗi migration tương thích cả code cũ lẫn code mới, và chia backfill thành lô. Bài này là phía vận hành: chuyện gì xảy ra bên trong database, và đo gì.
+
+PostgreSQL không sửa dòng tại chỗ: `UPDATE` ghi một **phiên bản dòng mới** và đánh dấu bản cũ là chết (MVCC). Một câu `UPDATE` hai triệu dòng trong một transaction vì vậy:
+
+- **Sinh WAL bằng cỡ cả bảng, thường nhiều hơn** (thêm full-page write: trang đầu tiên bị sửa sau mỗi checkpoint được ghi nguyên trang vào WAL). Toàn bộ khối WAL đó đổ sang replica; replica phát lại trên một tiến trình và tụt lại (D19.1). WAL archive cũng phải đẩy hết lên object storage (D19.2).
+- **Giữ khoá dòng trên hai triệu dòng tới khi commit.** Ứng dụng cập nhật bất kỳ dòng nào trong đó phải chờ.
+- **Để lại hai triệu dòng chết** mà chỉ `VACUUM` dọn được, và chỉ sau khi transaction kết thúc. Bảng phình gần gấp đôi (**bloat**); `VACUUM` thường đánh dấu chỗ trống để dùng lại chứ không trả đĩa về hệ điều hành. Lần autovacuum dọn chúng cũng sinh thêm WAL.
+- **Không dừng giữa chừng được.** Huỷ ở 90% là rollback toàn bộ, và vẫn để lại dòng chết.
+
+Backfill theo lô sửa từng điểm một:
+
+```text
+  vòng lặp:
+    1. kiểm điều kiện: replication lag < ngưỡng?   (có thể thêm: tải database, khung giờ)
+          không -> nghỉ 1 giây rồi kiểm lại          (điều tiết)
+    2. BEGIN
+         UPDATE ... WHERE id > :last AND id <= :last + :lô AND cột_mới IS NULL
+         UPDATE backfill_progress SET last_id = :last + :lô       (ghi tiến độ cùng transaction)
+       COMMIT                                                       (transaction ngắn, khoá ngắn)
+    3. :last = :last + :lô, quay lại 1
+```
+
+- **Lô theo khoảng khoá chính**, không theo `OFFSET` (càng về sau càng chậm) và không theo `LIMIT` trên một điều kiện chưa có index.
+- **Idempotent**: điều kiện `cột_mới IS NULL` làm việc chạy lại một lô không đổi kết quả.
+- **Chạy tiếp được**: tiến độ nằm trong bảng, cùng transaction với lô; dừng ở đâu chạy lại từ đó.
+- **Điều tiết theo tín hiệu thật**: replication lag tính bằng byte trong `pg_stat_replication` là tín hiệu trực tiếp nhất, vì nó đo đúng thứ backfill làm hỏng. Ngưỡng đặt theo mức dữ liệu cũ chấp nhận được khi đọc từ replica.
+- **Theo dõi** `n_dead_tup`, `last_autovacuum` trong `pg_stat_user_tables`, kích thước bảng, và lượng WAL sinh ra.
+
+Backfill có điều tiết không nhanh hơn: tổng lượng WAL vẫn vậy. Nó đổi **một cú sốc** lấy **một dòng chảy đều**, để replica, WAL archive và ứng dụng không bao giờ bị dồn quá ngưỡng.
+
+<Callout kind="production">
+
+Ngày 24/01/2024, theo [bài tường thuật của Linear](https://linear.app/now/linear-incident-on-jan-24th-2024), một migration xoá nhầm dữ liệu production. Đội đã tạo hai bảng mới cho một tính năng chưa ra mắt và đổ dữ liệu thử vào đó; migration định dọn hai bảng này bằng `TRUNCATE TABLE <bảng mới> CASCADE`. Ý định là xoá cả các dòng thử có khoá ngoại trỏ tới bảng mới, nhưng `CASCADE` xoá **toàn bộ** nội dung của mọi bảng có khoá ngoại tới bảng đó: mô tả issue và tài liệu, bình luận, thông báo, mục yêu thích, reaction. Migration được merge lúc 07:01 UTC và chạy xong lúc 07:20. CI của họ có cảnh báo cho migration nguy hiểm (ví dụ tạo index lớn), pull request đã được thử ở máy và nhiều kỹ sư review, nhưng không ai thấy thao tác cascade.
+
+Lớp cache ở client và trước database che lỗi khoảng 30 phút; lúc 07:52 mới có người thấy thông báo lạ. 09:56 họ bật chế độ bảo trì, 10:48 mở lại với database khôi phục từ backup đầy đủ lúc 04:47. Bài viết nói rõ họ có point-in-time recovery, đủ để quay về 07:01, nhưng **chưa từng thử nó và chưa có công cụ** để khôi phục nhanh bằng cách đó, nên chọn backup đầy đủ, quy trình đã thử thường xuyên, dù mất nhiều dữ liệu hơn. Phần dữ liệu ghi từ 04:47 tới 09:56 được dựng lại từ log của sync engine trong khoảng 36 giờ, trên 99%. Việc làm tiếp gồm: không user nào trên database production có quyền `TRUNCATE`; review migration bởi người quản trị database, tách khỏi review code, kèm lint các thao tác nguy hiểm; tự động thử migration trên staging; dựng và thử công cụ khôi phục theo thời điểm.
+
+Điều rút ra cho bài này (của bài): một migration là một thao tác vận hành trên dữ liệu production, cần được xem như vậy: phân loại theo hậu quả (khoá bao lâu, sinh bao nhiêu WAL, xoá gì), có người hiểu database duyệt, và chạy với quyền hẹp nhất. Và nó nối với D19.2: PITR chỉ cứu được khi đã được thử.
+
+</Callout>
+
+<Check id="d24.3.backfill">Giải thích được bốn hậu quả của một câu `UPDATE` cả bảng lớn (WAL và lag, khoá dòng, bloat, không dừng được), và mô tả được một backfill theo lô có điều tiết, chạy tiếp được và idempotent.</Check>
+
+### Theo dõi gì trong lúc một việc lớn chạy
+
+Một backfill, một lần xoá hàng loạt hay một `pg_repack` kéo dài hàng giờ cần một bảng theo dõi riêng, mở suốt lúc chạy. Năm tín hiệu, câu hỏi đi kèm, và chỗ đọc:
+
+| Tín hiệu | Câu hỏi | Đọc ở đâu |
+|---|---|---|
+| Replication lag (byte, giây) | Replica còn đọc được dữ liệu đủ mới không? | `pg_stat_replication` trên primary; metric `cnpg_pg_replication_lag` (D19.1) |
+| Tốc độ sinh WAL và WAL chờ đẩy đi | Archive có theo kịp không, đĩa `pg_wal` có phình không? | Hiệu `pg_current_wal_lsn()` giữa hai lần đọc; `cnpg_pg_stat_archiver_*` (D19.2) |
+| Khoá và hàng đợi khoá | Có truy vấn của ứng dụng đang chờ việc này không? | `pg_stat_activity` với `wait_event_type = 'Lock'`; `pg_locks` |
+| Dòng chết và autovacuum | Bảng có đang phình, autovacuum có theo kịp không? | `n_dead_tup`, `last_autovacuum` trong `pg_stat_user_tables`; `pg_stat_progress_vacuum` khi vacuum đang chạy |
+| Lỗi và độ trễ của ứng dụng | Người dùng có thấy gì không? | Metric RED của service (D12.3): tỉ lệ lỗi, p99 |
+
+Dòng cuối là quan trọng nhất và hay bị bỏ qua: một backfill "chạy tốt" theo mọi chỉ số của database vẫn có thể làm p99 của ứng dụng tăng gấp đôi. Đặt sẵn điều kiện dừng (lag vượt ngưỡng lâu, tỉ lệ lỗi của ứng dụng tăng) và người được quyền dừng trước khi bắt đầu.
+
+### Khoá khi `ALTER TABLE`, và online schema change
+
+SB5.5 đã dạy hàng đợi khoá: `ALTER TABLE` cần khoá `ACCESS EXCLUSIVE`, chờ sau một truy vấn dài, và mọi truy vấn tới sau xếp hàng sau nó; cách phòng là `SET LOCAL lock_timeout`. Ở phía vận hành cần phân loại thêm:
+
+| Thao tác | Khoá | Thời gian giữ khoá |
+|---|---|---|
+| `ADD COLUMN` nullable, hoặc có default không volatile | `ACCESS EXCLUSIVE` | Rất ngắn: chỉ sửa metadata |
+| `ADD COLUMN ... DEFAULT gen_random_uuid()` (volatile), `ALTER COLUMN TYPE` đổi định dạng lưu trữ | `ACCESS EXCLUSIVE` | Viết lại cả bảng: phút tới giờ, chặn cả đọc |
+| `CREATE INDEX` | `SHARE` | Cả quá trình tạo: chặn ghi |
+| `CREATE INDEX CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` | Không chặn đọc ghi; chậm hơn, có thể để lại index `INVALID` |
+| `VACUUM FULL`, `CLUSTER` | `ACCESS EXCLUSIVE` | Viết lại cả bảng |
+
+Thêm một điều D19.1 đã cho thấy: khoá `ACCESS EXCLUSIVE` được ghi vào WAL và **phát lại trên replica**, nên nó xung đột với truy vấn đang đọc bảng đó trên replica và có thể dừng việc phát lại tới `max_standby_streaming_delay`.
+
+Khi bảng đã phình vì bloat, `VACUUM FULL` lấy lại đĩa nhưng khoá bảng suốt thời gian viết lại. Các công cụ **online schema change** viết lại bảng trong lúc ứng dụng vẫn đọc ghi:
+
+- **`pg_repack`** (extension cộng công cụ dòng lệnh): tạo bảng log và trigger ghi lại mọi thay đổi trên bảng gốc, chép dữ liệu sang bảng mới, dựng index, áp các thay đổi đã ghi, rồi tráo bảng mới vào chỗ bảng cũ. Theo tài liệu của nó, khoá `ACCESS EXCLUSIVE` chỉ giữ một lúc ngắn ở đầu và ở bước tráo cuối; suốt phần còn lại chỉ là `SHARE UPDATE EXCLUSIVE`, ghi vẫn chạy. Cần dung lượng trống cỡ gấp đôi bảng và index, và bảng phải có khoá chính hoặc unique index trên cột `NOT NULL`.
+- **`pg_squeeze`** (extension): cùng mục tiêu, nhưng đọc thay đổi bằng logical decoding thay vì trigger, và có thể tự chạy theo lịch.
+
+Cả hai đều là extension phải có sẵn trong image PostgreSQL, và cả hai vẫn sinh WAL bằng cỡ cả bảng: chạy chúng cũng cần theo dõi lag như một backfill. Lab không chạy hai công cụ này.
+
+<Check id="d24.3.khoa-online">Phân loại được các thao tác `ALTER TABLE` theo khoá và thời gian giữ khoá, giải thích được vì sao khoá trên primary có thể làm replica tụt lại, và nêu được `pg_repack` làm gì, đổi lại cần gì.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [PostgreSQL 18: Routine Vacuuming](https://www.postgresql.org/docs/18/routine-vacuuming.html): vì sao dòng chết cần `VACUUM`, khác biệt giữa `VACUUM` và `VACUUM FULL`, autovacuum.
+- [PostgreSQL 18: Explicit Locking](https://www.postgresql.org/docs/18/explicit-locking.html): bảng các mức khoá bảng và mức nào chặn mức nào.
+- [PostgreSQL 18: WAL Configuration](https://www.postgresql.org/docs/18/wal-configuration.html): checkpoint và full-page write, lý do một `UPDATE` lớn sinh nhiều WAL hơn kích thước dữ liệu.
+- [pg_repack](https://reorg.github.io/pg_repack/): mục "Details" mô tả từng bước và lúc nào giữ khoá nào; mục yêu cầu về khoá chính và dung lượng.
+- [Linear incident on Jan 24th 2024](https://linear.app/now/linear-incident-on-jan-24th-2024): nguồn của callout; đọc phần "What happened" và danh sách việc làm tiếp.
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài dựng lại cụm kind `d19-lab` một node với CloudNativePG và một cụm PostgreSQL hai instance (một primary, một replica); không cần sao lưu. Cần Docker Desktop, `kind`, `kubectl`, `curl`.
+
+**Profile máy.** Node kind với hai instance PostgreSQL và pod `bench` dùng khoảng 1,4 tới 1,7 GiB RAM của Docker theo `docker stats` ở cuối bài, trong đó bộ nhớ của các tiến trình chưa tới 1 GiB, phần còn lại là page cache. Bảng hai triệu dòng và WAL của các lần cập nhật cần khoảng 3 GB đĩa của Docker. Máy 8 GB chạy được bài này với Docker 4 GB, miễn là không có cụm nào khác.
+
+Một điều lab làm khác production: replica nằm cùng node với primary, nên nó nhận WAL nhanh hơn một replica ở zone khác. Để thấy rõ lag, bước 1 giả lập đường mạng tới replica chỉ còn 100 Mbit/s bằng `tc netem` (D19.1 đã dùng `netem` để thêm độ trễ).
+
+<Callout kind="danger">
+
+Bài này chạy `UPDATE` trên hai triệu dòng của một bảng đang được ghi, và giới hạn băng thông của pod replica. Mọi lệnh chỉ dành cho cụm lab: khối lệnh đầu in `kubectl config current-context`, phải là `kind-d19-lab`.
+
+</Callout>
+
+### 1. Cụm, bảng hai triệu dòng và ba công cụ quan sát
+
+Cụm kind và operator như D19.1, manifest kiểm sha256 trước khi apply.
+
+<Terminal where="mac">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+mkdir -p ~/masteva-d24/d24-3 && cd ~/masteva-d24/d24-3
+kind create cluster --name d19-lab \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+kubectl config current-context
+curl -sLO https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml
+echo "37237f145d8138256ea25ae830f87759255665ff08f8d552fdd8224a5ec032fb  cnpg-1.30.1.yaml" | shasum -a 256 -c - \
+  && kubectl apply --server-side -f cnpg-1.30.1.yaml > /dev/null
+kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=600s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Creating cluster "d19-lab" ...
+...
+kind-d19-lab
+cnpg-1.30.1.yaml: OK
+deployment "cnpg-controller-manager" successfully rolled out
+```
+
+</Expected>
+
+Cụm `pg` hai instance và pod `bench` làm client, cùng image PostgreSQL. ConfigMap của `bench` chứa bốn script, đọc trước khi chạy:
+
+- `app.sh`: "ứng dụng". Mỗi 0,1 giây nó cập nhật trạng thái của một đơn hàng ngẫu nhiên, với `lock_timeout = '500ms'`: chờ khoá quá nửa giây thì bỏ, ghi `lỗi`. Mỗi lần thử ghi một dòng `giờ ok` hoặc `giờ lỗi` vào `/tmp/app.log`.
+- `lag.sh`: mỗi giây ghi replication lag (MB) của replica vào `/tmp/lag.log`.
+- `backfill.sh <cột> <biểu thức> <lô> <ngưỡng MB>`: backfill theo sơ đồ ở phần Kiến thức. Trước mỗi lô nó đọc lag; lag từ ngưỡng trở lên thì in `nghỉ` và chờ 1 giây.
+- `summary.sh <giờ>`: đọc hai file log, in lag lớn nhất và số lần ghi được, số lần lỗi của ứng dụng kể từ mốc giờ đó; hàm `summary` trên máy bạn gọi nó.
+
+Đọc `pg_stat_replication` cần quyền của role `pg_monitor`, nên khối cuối cấp nó cho user `app`.
+
+<Terminal where="mac" title="~/masteva-d24/d24-3/lab.yaml">
+
+```bash
+kubectl create namespace d19-db
+kubectl config set-context --current --namespace d19-db > /dev/null
+cat > lab.yaml <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+  storage:
+    size: 3Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bench-scripts
+data:
+  app.sh: |
+    while true; do
+      ID=$(shuf -i 1-2000000 -n 1)
+      if psql -h pg-rw -XAtq -c "set lock_timeout = '500ms'" -c "update orders set status = 'paid' where id = $ID" > /dev/null 2>&1
+      then echo "$(date -u +%T) ok"; else echo "$(date -u +%T) lỗi"; fi
+      sleep 0.1
+    done >> /tmp/app.log
+  lag.sh: |
+    while true; do
+      echo "$(date -u +%T) $(psql -h pg-rw -XAtq -c 'select coalesce(max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)), 0)::bigint / 1048576 from pg_stat_replication')"
+      sleep 1
+    done >> /tmp/lag.log
+  backfill.sh: |
+    COL=$1; EXPR=$2; BATCH=$3; MAXLAG_MB=$4
+    q() { psql -h pg-rw -XAtq -c "$1"; }
+    q "insert into backfill_progress (job, last_id) values ('$COL', 0) on conflict (job) do nothing"
+    LAST=$(q "select last_id from backfill_progress where job = '$COL'")
+    MAX=$(q "select max(id) from orders")
+    echo "$(date -u +%T) bắt đầu từ id $LAST, tới id $MAX, lô $BATCH dòng, ngưỡng lag $MAXLAG_MB MB"
+    while [ "$LAST" -lt "$MAX" ]; do
+      LAG=$(q "select coalesce(max(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)), 0)::bigint / 1048576 from pg_stat_replication")
+      if [ "$LAG" -ge "$MAXLAG_MB" ]; then echo "$(date -u +%T) lag $LAG MB, nghỉ"; sleep 1; continue; fi
+      NEXT=$((LAST + BATCH))
+      q "begin; update orders set $COL = $EXPR where id > $LAST and id <= $NEXT and $COL is null; update backfill_progress set last_id = $NEXT where job = '$COL'; commit;"
+      LAST=$NEXT
+      if [ $((LAST % (BATCH * 20))) -eq 0 ]; then echo "$(date -u +%T) tới id $LAST, lag $LAG MB"; fi
+    done
+    echo "$(date -u +%T) xong"
+  summary.sh: |
+    awk -v t="$1" '$1 >= t && $2 + 0 > m { m = $2 + 0 } END { print "lag lớn nhất: " m + 0 " MB" }' /tmp/lag.log
+    awk -v t="$1" '$1 >= t { n[$2]++ } END { print "ứng dụng: " n["ok"] + 0 " lần ghi được, " n["lỗi"] + 0 " lần lỗi" }' /tmp/app.log
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: bench
+      image: ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie@sha256:0675340b02be838319b9b6f323c206693e519dcd62ec729d539be9f46bb7a2f9
+      command: ["sleep", "infinity"]
+      env:
+        - { name: PGDATABASE, value: app }
+        - name: PGUSER
+          valueFrom: { secretKeyRef: { name: pg-app, key: username } }
+        - name: PGPASSWORD
+          valueFrom: { secretKeyRef: { name: pg-app, key: password } }
+      volumeMounts:
+        - { name: scripts, mountPath: /scripts }
+  volumes:
+    - name: scripts
+      configMap: { name: bench-scripts }
+EOF
+kubectl apply -f lab.yaml
+kubectl wait --for=condition=Ready cluster/pg --timeout=900s
+kubectl wait --for=condition=Ready pod/bench --timeout=300s
+sql() { kubectl exec "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -Atc "$1"; }
+summary() { kubectl exec bench -- sh /scripts/summary.sh "$1"; }
+sql "grant pg_monitor to app"
+sql "create table orders (id bigint primary key, customer_id int not null, amount numeric(12,2) not null, status text, created_at timestamptz not null default now()); alter table orders owner to app"
+sql "create table backfill_progress (job text primary key, last_id bigint not null); alter table backfill_progress owner to app"
+sql "insert into orders (id, customer_id, amount) select g, 1 + g % 50000, round((random() * 1000)::numeric, 2) from generate_series(1, 2000000) g"
+sql "vacuum analyze orders"
+sql "select count(*), pg_size_pretty(pg_total_relation_size('orders')) from orders"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/d19-db created
+cluster.postgresql.cnpg.io/pg created
+configmap/bench-scripts created
+pod/bench created
+cluster.postgresql.cnpg.io/pg condition met
+pod/bench condition met
+GRANT ROLE
+CREATE TABLE
+ALTER TABLE
+CREATE TABLE
+ALTER TABLE
+INSERT 0 2000000
+VACUUM
+2000000|158 MB
+```
+
+</Expected>
+
+Giờ giới hạn đường vào pod replica còn 100 Mbit/s (khoảng 12 MB/s), cách giống bước 2 của D19.1 nhưng với `rate` thay cho `delay`, rồi bật hai script nền trong `bench`.
+
+<Terminal where="mac">
+
+```bash
+ip=$(kubectl get pods -l cnpg.io/cluster=pg,cnpg.io/instanceRole=replica -o jsonpath='{.items[0].status.podIP}')
+docker exec d19-lab-control-plane sh -c "tc qdisc add dev \$(ip route get $ip | grep -o 'dev [^ ]*' | cut -d' ' -f2) root netem rate 100mbit"
+docker exec d19-lab-control-plane tc qdisc show | grep -c netem
+kubectl exec bench -- sh -c 'nohup sh /scripts/app.sh > /dev/null 2>&1 & nohup sh /scripts/lag.sh > /dev/null 2>&1 &'
+sleep 5
+kubectl exec bench -- sh -c 'tail -2 /tmp/app.log; tail -2 /tmp/lag.log'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1
+15:40:52 ok
+15:40:52 ok
+15:40:51 0
+15:40:52 0
+```
+
+</Expected>
+
+Mỗi dòng của `app.log` là một lần ứng dụng ghi; mỗi dòng của `lag.log` là lag (MB) tại giây đó.
+
+**Mở terminal mới giữa chừng bài** thì dán khối dưới trước: nó đặt lại kubeconfig, thư mục, namespace và các hàm mà các bước sau dùng.
+
+<Terminal where="mac" title="Khi mở terminal mới">
+
+```bash
+export KUBECONFIG=~/masteva-d24/kubeconfig
+cd ~/masteva-d24/d24-3
+kubectl config set-context --current --namespace d19-db > /dev/null
+sql() { kubectl exec "$(kubectl get cluster pg -o jsonpath='{.status.currentPrimary}')" -c postgres -- psql -U postgres app -Atc "$1"; }
+summary() { kubectl exec bench -- sh /scripts/summary.sh "$1"; }
+```
+
+</Terminal>
+
+### 2. Cách sai: một câu `UPDATE` cho cả bảng
+
+Thêm cột `amount_minor` (số tiền tính bằng đơn vị nhỏ nhất) rồi điền nó cho hai triệu dòng bằng một câu lệnh. Khối lệnh ghi lại vị trí WAL trước và sau để tính lượng WAL sinh ra, mốc giờ trong pod để `summary` chỉ tính phần sau mốc đó, rồi chờ 60 giây để replica có thời gian đuổi theo.
+
+<Predict question="Câu UPDATE chạy trên primary vài giây là xong. Lag lớn nhất của replica cỡ bao nhiêu, và ứng dụng có bị gì không?">
+
+Primary xong trong vài giây vì nó chỉ ghi WAL và trang dữ liệu xuống đĩa của chính nó. Nhưng toàn bộ khối WAL đó, cỡ 550 MB, phải đi qua đường 12 MB/s tới replica: lag lên tới vài trăm MB và cần khoảng 40 tới 50 giây để tan. Ứng dụng cũng bị: trong lúc câu `UPDATE` chạy, mọi dòng của bảng đang bị nó khoá, nên mỗi lần ứng dụng cập nhật một đơn hàng đều phải chờ, và quá nửa giây là lỗi.
+
+</Predict>
+
+<Terminal where="mac">
+
+```bash
+sql "alter table orders add column amount_minor bigint"
+T=$(kubectl exec bench -- date -u +%T); W=$(sql "select pg_current_wal_lsn()")
+S0=$(date +%s)
+sql "update orders set amount_minor = (amount * 100)::bigint"
+echo "UPDATE mất $(( $(date +%s) - S0 )) giây"
+sql "select pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '$W')) as wal_sinh_ra"
+sleep 60
+summary $T
+sql "select n_dead_tup, pg_size_pretty(pg_total_relation_size('orders')) from pg_stat_user_tables where relname = 'orders'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ALTER TABLE
+UPDATE 2000000
+UPDATE mất 7 giây
+567 MB
+lag lớn nhất: 486 MB
+ứng dụng: 473 lần ghi được, 8 lần lỗi
+368|331 MB
+```
+
+</Expected>
+
+Đọc kết quả:
+
+- Câu `UPDATE` chạy khoảng 7 giây và sinh khoảng 560 MB WAL, gấp hơn ba lần kích thước bảng (158 MB): mỗi dòng có một phiên bản mới, cộng full-page write.
+- Lag lớn nhất của replica khoảng 450 tới 550 MB. Trong suốt khoảng đó, ai đọc từ replica thấy dữ liệu cũ dần đi, tới gần một phút.
+- Ứng dụng lỗi vài lần (8 trong kết quả mẫu): mỗi lần là một request cập nhật đơn hàng chờ khoá quá nửa giây. Số lỗi xấp xỉ thời gian câu `UPDATE` chạy chia cho khoảng giữa hai lần ghi của ứng dụng, nên trên máy bạn dao động theo tốc độ máy. Với bảng lớn gấp trăm lần, câu lệnh chạy hàng phút và mọi cập nhật trên bảng đó đều chờ hàng phút.
+- Bảng từ 158 MB lên khoảng 330 MB. `n_dead_tup` trên máy bạn có thể là khoảng 2 triệu (autovacuum chưa chạy) hoặc gần 0 (autovacuum vừa dọn xong trong 60 giây chờ); dọn hay chưa thì bảng vẫn giữ kích thước đó.
+
+Trước bước sau, dọn dòng chết bằng `VACUUM` và chờ replica theo kịp, để hai cách được đo từ cùng một điểm xuất phát.
+
+<Terminal where="mac">
+
+```bash
+sql "vacuum orders"
+for i in $(seq 1 120); do [ "$(kubectl exec bench -- tail -1 /tmp/lag.log | cut -d' ' -f2)" = 0 ] && break; sleep 1; done
+kubectl exec bench -- tail -1 /tmp/lag.log
+sql "select n_dead_tup, pg_size_pretty(pg_total_relation_size('orders')) from pg_stat_user_tables where relname = 'orders'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+VACUUM
+15:42:00 0
+3|331 MB
+```
+
+</Expected>
+
+Dòng chết đã được dọn, nhưng bảng vẫn khoảng 330 MB: `VACUUM` đánh dấu chỗ trống để dùng lại cho các lần ghi sau, không trả đĩa về hệ điều hành. Muốn bảng về 158 MB thì phải viết lại bảng: `VACUUM FULL` (khoá cả bảng) hoặc `pg_repack` (khoá rất ngắn), như phần Kiến thức đã nói.
+
+<Check id="d24.3.lab-naive">Đo được lượng WAL, lag lớn nhất của replica, số lần ứng dụng ghi lỗi và kích thước bảng sau một câu `UPDATE` cả bảng, và giải thích được vì sao `VACUUM` không làm bảng nhỏ lại.</Check>
+
+### 3. Backfill theo lô, điều tiết theo lag
+
+Cùng việc đó cho cột mới `tax_minor`, nhưng bằng `backfill.sh`: lô 20.000 dòng, ngưỡng lag 16 MB. Khối lệnh dưới in các dòng tiến độ (bỏ các dòng `nghỉ` cho gọn) rồi tóm tắt.
+
+<Terminal where="mac">
+
+```bash
+sql "alter table orders add column tax_minor bigint"
+T=$(kubectl exec bench -- date -u +%T)
+S0=$(date +%s)
+kubectl exec bench -- sh /scripts/backfill.sh tax_minor 'round(amount * 10)::bigint' 20000 16 | grep -v nghỉ
+echo "backfill mất $(( $(date +%s) - S0 )) giây"
+summary $T
+sql "select last_autovacuum, n_dead_tup from pg_stat_user_tables where relname = 'orders'"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ALTER TABLE
+15:42:01 bắt đầu từ id 0, tới id 2000000, lô 20000 dòng, ngưỡng lag 16 MB
+15:42:10 tới id 400000, lag 4 MB
+15:42:23 tới id 800000, lag 11 MB
+15:42:34 tới id 1200000, lag 14 MB
+15:42:44 tới id 1600000, lag 15 MB
+15:42:56 tới id 2000000, lag 6 MB
+15:42:56 xong
+backfill mất 55 giây
+lag lớn nhất: 26 MB
+ứng dụng: 419 lần ghi được, 0 lần lỗi
+2026-10-21 15:42:13.827399+00|1540080
+```
+
+</Expected>
+
+So với bước 2, cùng hai triệu dòng và cùng lượng WAL:
+
+- Backfill mất khoảng 50 tới 60 giây thay vì 7 giây; tổng thời gian tới khi replica theo kịp thì gần bằng nhau, vì đường tới replica vẫn chỉ 12 MB/s. Điều tiết không làm việc nhanh hơn, nó trải việc ra.
+- Lag lớn nhất khoảng 15 tới 30 MB, quanh ngưỡng 16 MB, thay vì vài trăm MB. Mỗi lô sinh khoảng 5 MB WAL; script chỉ chạy lô mới khi lag dưới ngưỡng, nên phần backfill tự gây ra vượt ngưỡng nhiều nhất là một lô.
+- Ứng dụng không lỗi lần nào: mỗi lô chỉ khoá 20.000 dòng trong một transaction ngắn.
+- Dòng cuối là lần autovacuum gần nhất và số dòng chết còn lại. Trong kết quả mẫu, autovacuum đã chạy **giữa** backfill (15:42:13) vì các lô để lại hàng trăm nghìn dòng chết, và sau đó vẫn còn khoảng 1,5 triệu dòng chết chờ lần sau; trên máy bạn, thời điểm đó có thể là lúc giữa backfill hoặc vẫn là lần ở bước 2. Lần dọn đó cũng sinh WAL và đẩy lag lên, nên lag lớn nhất có thể vượt ngưỡng hơn một lô. Backfill thấy lag vượt ngưỡng thì tự nghỉ: điều tiết theo lag thật bảo vệ replica khỏi cả những nguồn WAL không do nó gây ra.
+
+<Check id="d24.3.lab-throttled">Chạy được một backfill theo lô có điều tiết theo replication lag, so được lag lớn nhất và số lần ứng dụng ghi lỗi với cách một câu lệnh, và giải thích được vì sao lag vẫn có thể vượt ngưỡng (autovacuum).</Check>
+
+### 4. Dừng giữa chừng, chạy tiếp
+
+Một backfill thật chạy hàng giờ và sẽ bị dừng: pod bị đuổi, người vận hành dừng lúc cao điểm. Khối dưới chạy backfill cho cột `fee_minor` và cắt nó sau 15 giây bằng `timeout` (mã thoát 124), đọc tiến độ đã lưu, rồi chạy lại cùng lệnh.
+
+<Terminal where="mac">
+
+```bash
+sql "alter table orders add column fee_minor bigint"
+kubectl exec bench -- timeout 15 sh /scripts/backfill.sh fee_minor 'round(amount * 2)::bigint' 20000 16 | grep -v nghỉ
+sql "select last_id, (select count(*) from orders where fee_minor is not null) as da_dien from backfill_progress where job = 'fee_minor'"
+kubectl exec bench -- sh /scripts/backfill.sh fee_minor 'round(amount * 2)::bigint' 20000 16 | grep -v nghỉ | sed -n '1p;$p'
+sql "select count(*) filter (where fee_minor is null) as con_trong, count(*) filter (where fee_minor <> round(amount * 2)) as sai from orders"
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+ALTER TABLE
+command terminated with exit code 124
+15:42:57 bắt đầu từ id 0, tới id 2000000, lô 20000 dòng, ngưỡng lag 16 MB
+15:43:07 tới id 400000, lag 15 MB
+520000|520000
+15:43:13 bắt đầu từ id 520000, tới id 2000000, lô 20000 dòng, ngưỡng lag 16 MB
+15:44:09 xong
+0|0
+```
+
+</Expected>
+
+Lần chạy đầu bị cắt sau 15 giây (dòng `exit code 124` của `timeout`), lúc đã tới id 520.000 trong kết quả mẫu (trên máy bạn là vài trăm nghìn, tuỳ tốc độ máy). Bảng tiến độ ghi đúng mốc đó, và số dòng đã điền bằng đúng mốc: tiến độ và dữ liệu nằm trong cùng một transaction, nên không bao giờ lệch nhau. Lần chạy sau bắt đầu từ mốc đó, không làm lại phần đã xong. Câu kiểm cuối: không còn dòng nào trống, không dòng nào sai giá trị.
+
+<Check id="d24.3.lab-resume">Dừng được một backfill giữa chừng, chỉ ra được tiến độ đã lưu, chạy tiếp từ đó, và kiểm được không còn dòng nào trống hay sai.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm |
+|---|---|---|
+| `lag.log` toàn `0` kể cả lúc `UPDATE` lớn | Chưa giới hạn băng thông, hoặc giới hạn nhầm card mạng | `docker exec d19-lab-control-plane tc qdisc show \| grep netem` phải có một dòng `rate 100Mbit` |
+| `backfill.sh` in `nghỉ` mãi không dừng | Replica dừng hẳn hoặc đang tụt rất xa | `sql "select application_name, state from pg_stat_replication"`; `kubectl get pods` |
+| `permission denied for table orders` | Bảng chưa đổi owner sang `app` | Chạy lại các câu `alter table ... owner to app` ở bước 1 |
+| `summary` in toàn `0` | Mốc giờ `T` lấy sai, hoặc hai script nền chưa chạy | `kubectl exec bench -- tail -3 /tmp/app.log /tmp/lag.log` |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Khối lệnh dưới xoá cụm kind `d19-lab` cùng database trong đó, và thư mục lab của bài.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm và thư mục lab">
+
+```bash
+kind delete cluster --name d19-lab
+rm -rf ~/masteva-d24/d24-3
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Chọn kích thước lô thế nào?">
+
+Hai giới hạn kéo ngược nhau. Lô nhỏ: transaction ngắn, khoá dòng ngắn, lag tăng từng chút; nhưng mỗi lô có chi phí cố định (một lần mở kết nối, một commit, một lần đọc lag), và quá nhỏ thì backfill kéo dài vô tận. Lô lớn: ít chi phí cố định, nhưng mỗi lô giữ khoá lâu hơn và đẩy một cục WAL lớn hơn. Cách thực dụng: chọn lô sao cho mỗi transaction xong trong khoảng 100 tới 500 ms trên primary lúc bận, đo, rồi điều chỉnh. Với lô 20.000 dòng, mỗi lô sinh khoảng 5 MB WAL, nhỏ hơn hẳn ngưỡng 16 MB, nên điều tiết có tác dụng trước khi một lô kịp làm lag vượt xa ngưỡng.
+
+</Reveal>
+
+<Reveal title="Autovacuum chạy giữa backfill có nên tắt đi không?">
+
+Không. Autovacuum là thứ dọn dòng chết mà backfill tạo ra; tắt nó thì bảng phình mãi và nguy cơ cạn transaction ID tăng lên. Việc nên làm là đưa nó vào phép đo: lag sinh ra từ autovacuum là lag thật replica phải chịu, và backfill điều tiết theo lag sẽ tự nghỉ trong lúc đó. Nếu autovacuum chạy quá chậm so với tốc độ backfill tạo dòng chết, có thể chủ động chạy `VACUUM` sau mỗi một hai trăm lô, hoặc chỉnh `autovacuum_vacuum_cost_limit` cho riêng bảng đó.
+
+</Reveal>
+
+<Reveal title="Backfill bằng một Job trên Kubernetes thì cần thêm gì?">
+
+Bốn thứ. `backoffLimit` và `restartPolicy: OnFailure` để Job tự chạy lại khi pod chết: an toàn vì backfill chạy tiếp từ tiến độ đã lưu và idempotent. Một role riêng cho backfill với đúng quyền cần (cập nhật bảng đó, đọc `pg_stat_replication`), thay vì dùng tài khoản của ứng dụng như lab. Metric về tiến độ (id đã tới, số lô mỗi phút, số lần nghỉ) để biết nó còn bao lâu. Và một cách dừng sạch không cần xoá Job, ví dụ một dòng cờ trong bảng tiến độ mà script đọc trước mỗi lô.
+
+</Reveal>
+
+<Callout kind="ai">
+
+**Nên nhờ AI:** viết script backfill theo lô cho schema của bạn, viết câu SQL đo bloat và theo dõi autovacuum, kiểm một migration xem thao tác nào giữ khoá `ACCESS EXCLUSIVE` lâu.
+
+**AI hay sai ở đâu:** dùng `OFFSET` để chia lô; quên điều kiện `IS NULL` nên chạy lại là ghi đè; lưu tiến độ ngoài transaction của lô; không điều tiết gì cả; khẳng định `VACUUM` làm bảng nhỏ lại; đề xuất `VACUUM FULL` trên bảng đang phục vụ mà không nhắc nó khoá toàn bảng; và quên rằng `pg_repack` cũng sinh WAL bằng cỡ cả bảng.
+
+**Cách kiểm tra:** chạy script trên một bản sao dữ liệu thật với replica và tải giả lập như lab này; đo lag, số lỗi của ứng dụng, kích thước bảng; dừng giữa chừng và chạy lại để thấy nó không làm lại từ đầu.
+
+</Callout>
+
+<Callout kind="link">
+
+SB5.5 dạy expand/contract và `lock_timeout` phía ứng dụng. D19.1 đo replication lag và xung đột khoá trên replica; D19.2 đẩy WAL lên object storage, nơi một backfill lớn cũng làm WAL archive dồn lại. D6.4 dạy migration trong pipeline CI/CD. D18.2 dạy cùng ý tưởng điều tiết ở tầng request: load shedding và retry có budget.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d24.3.mastery-ke-hoach">Lập được kế hoạch cho một backfill hàng chục triệu dòng trên production: kích thước lô, tín hiệu điều tiết và ngưỡng, cách lưu tiến độ, thứ cần theo dõi trong lúc chạy và cách dừng.</Check>
+
+<Check id="d24.3.mastery-khoa">Đọc một migration và chỉ ra được thao tác nào khoá bảng lâu, sinh nhiều WAL hay để lại bloat, cùng cách viết lại an toàn hơn.</Check>
+
+</Mastery>

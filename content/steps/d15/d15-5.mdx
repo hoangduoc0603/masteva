@@ -1,0 +1,910 @@
+---
+title: Truy cập của người - SSO vào cụm, quyền tối thiểu, JIT và break-glass
+description: Cho kỹ sư đăng nhập kubectl bằng SSO qua Dex, phân quyền theo group thay vì từng người, đo quyền thật bằng kubectl auth can-i và thấy role edit cho nhiều hơn bạn nghĩ, cấp quyền tạm có người duyệt và tự gỡ khi hết hạn, và giữ một chứng chỉ break-glass mà mỗi lần dùng đều lộ ra trong audit log.
+id: d15.5
+step: d15
+prerequisites: [k8.5, k2.3]
+topics: [d15.truy-cap-nguoi, d15.quyen-toi-thieu-cloud-cum, d15.audit-log]
+status: verified
+verified:
+  date: 2026-10-20
+  os: macOS 14.4.1 (cụm kind trong Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0
+    kubectl: 1.36 hoặc 1.37
+    dex: 2.46.0
+    kubelogin: 1.36.4
+    openssl: LibreSSL 3.3.6 (macOS) hoặc OpenSSL 3.x
+    alpine: 3.24.2
+    jq: 1.8.2
+    yq: 4.54.1
+---
+
+<Goal>
+
+Workload đã có danh tính riêng (D15.3, D15.4). Còn con người: kỹ sư vận hành, lập trình viên trực sự cố, người của đội khác cần đọc log. Trên nhiều cụm, tất cả dùng chung một file kubeconfig quyền quản trị gửi qua chat. Bài này thay nó bằng một hệ thống mà ai làm gì cũng có tên, quyền thường ngày nhỏ nhất có thể, quyền lớn chỉ có trong vài giờ, và có một lối thoát khi mọi thứ hỏng. Học xong, bạn giải thích được:
+
+- Vì sao kubeconfig quản trị dùng chung là thứ đầu tiên phải bỏ, và SSO vào API server chạy thế nào.
+- Vì sao phân quyền theo group từ nhà cung cấp danh tính bền hơn phân quyền từng người, và vì sao ClusterRole `edit` cho nhiều hơn tên gọi của nó.
+- Một quyền tạm "có người duyệt, tự gỡ" cần những thành phần nào để không thành quyền vĩnh viễn.
+- Vì sao một chứng chỉ thuộc group `system:masters` không thu hồi được bằng RBAC, và vì sao đó vừa là lý do nó làm break-glass, vừa là lý do mỗi lần dùng nó phải bị phát hiện.
+
+</Goal>
+
+<Knowledge>
+
+### Kubeconfig dùng chung và SSO vào API server
+
+File kubeconfig mà `kind`, `kubeadm` (và kubeconfig `--admin` của AKS) cấp lúc tạo cụm thường chứa một **chứng chỉ client** quyền quản trị. Chép file đó cho cả đội là gặp đủ vấn đề của secret tĩnh ở D15.1: dùng chung, sống tới một năm, không thu hồi riêng được (K2.3 đã nói chứng chỉ client không thu hồi riêng lẻ được), và audit log (K8.5) chỉ ghi một cái tên cho mọi người. EKS và GKE thường không phát chứng chỉ mà dùng plugin `exec` gọi CLI của cloud, nhưng vẫn gặp cùng câu hỏi: ai được làm gì, theo danh tính nào.
+
+Nhắc lại vài từ từ D6.5 và D15.3: **ID token** là một JWT do **issuer** (bên cấp, xác định bằng một URL) ký; **claim** là từng trường trong token (`iss` là issuer, `aud` là bên nhận được dành cho, `exp` là hạn, cộng các trường như `email`, `groups`); bên nhận kiểm chữ ký bằng khoá công khai mà issuer công bố qua **JWKS**.
+
+**SSO** (single sign-on) thay chứng chỉ bằng token ngắn hạn do **nhà cung cấp danh tính** (IdP: Okta, Entra ID, Google Workspace, Keycloak, hoặc Dex đứng trước các nguồn đó) cấp sau khi người dùng đăng nhập, theo chuẩn OIDC:
+
+```text
+ kỹ sư ── kubectl ──▶ plugin kubelogin ──(1) đăng nhập: trình duyệt, hoặc user/mật khẩu ở lab──▶ IdP (Dex)
+                          │◀────────────── (2) ID token (JWT): iss, aud=kubernetes, email, groups, sống 10 phút
+                          │ (3) lưu token trong cache, trả cho kubectl
+        kubectl ──Bearer <ID token>──▶ API server
+                                         (4) kiểm chữ ký bằng JWKS của issuer, kiểm iss, aud, hạn
+                                         (5) claimMappings: email → user "oidc:an@example.com"
+                                                            groups → group "oidc:dev-shop"
+                                         (6) RBAC quyết định theo user và group
+```
+
+Cấu hình bước 4 và 5 nằm trong file **AuthenticationConfiguration** (có từ Kubernetes 1.29, ổn định từ 1.34) (cờ `--authentication-config` của API server), thay cho bộ cờ `--oidc-*` cũ. File cho khai nhiều issuer, ánh xạ claim bằng biểu thức CEL, luật kiểm claim và kiểm user, và API server tự nạp lại khi file đổi.
+
+Hai chi tiết quan trọng. Một: **tiền tố** (`oidc:`) để một người tên `admin` trong IdP không trùng với user `admin` sẵn có trong cụm. Hai: luật `userValidationRules` chặn username bắt đầu bằng `system:`, tên dành riêng cho thành phần của Kubernetes; với tiền tố `oidc:` thì luật này chưa bao giờ khớp, nó là lớp phòng cho ngày ai đó sửa cấu hình và bỏ tiền tố. Trên cụm managed, nhà cung cấp làm phần này cho bạn: EKS ánh xạ danh tính IAM qua access entry, GKE nhận tài khoản Google, AKS nhận Entra ID.
+
+Lợi ích không chỉ là "không còn file chung". Nghỉ việc là bị khoá ở IdP, và mọi cụm theo đó; token sống vài phút nên khoá ở IdP có hiệu lực gần như ngay; MFA của IdP áp cho cả `kubectl`; và audit log ghi đúng tên từng người.
+
+<Callout kind="production">
+
+**Hơn 1.000 nhân viên giữ công cụ quản trị, Twitter 2020.** Theo [báo cáo điều tra của Sở Dịch vụ Tài chính New York](https://www.dfs.ny.gov/reports-and-publications/other-reports/Twitter_Report) (NYDFS, 10/2020), chiều 14/07/2020 kẻ tấn công gọi điện cho một số nhân viên Twitter, tự xưng là bộ phận IT đang xử lý lỗi VPN, và dẫn họ vào một trang giả giống hệt trang đăng nhập VPN. Chúng nhập ngay thông tin đó vào trang thật; trang thật gửi yêu cầu xác nhận MFA về điện thoại, và một số nhân viên đã xác nhận. Tài khoản đầu tiên không có quyền vào công cụ quản lý tài khoản người dùng, nhưng cho chúng đọc intranet, nơi có thông tin cách vào các ứng dụng nội bộ khác. Ngày 15/07, chúng nhắm vào những nhân viên có quyền đó. Công cụ nội bộ đổi được email, mật khẩu, tắt được MFA của bất kỳ tài khoản nào. Tổng cộng 130 tài khoản bị chiếm, 45 tài khoản bị dùng để đăng bài lừa bitcoin, khoảng 118.000 USD bị lấy.
+
+Phần đánh giá của báo cáo nêu ba điều liên quan trực tiếp tới bài: hơn 1.000 nhân viên Twitter vẫn có quyền vào công cụ nội bộ; với chức năng rủi ro cao nên có thêm bước duyệt của người thứ hai trước khi thực hiện; và MFA dạng ứng dụng điện thoại bị vượt qua bằng cách thuyết phục nạn nhân bấm xác nhận, trong khi khoá bảo mật phần cứng sẽ chặn được vụ này, và Twitter đang chuyển sang dùng nó.
+
+</Callout>
+
+<Check id="d15.5.sso">Kể được những gì sai khi dùng chung kubeconfig chứng chỉ quản trị, vẽ được luồng SSO vào API server, và giải thích được tiền tố và luật chặn `system:` trong AuthenticationConfiguration.</Check>
+
+### Quyền tối thiểu trong cụm
+
+Ba quy tắc thực dụng cho quyền của người:
+
+- **Gắn quyền cho group, không cho người.** Group đến từ IdP; người chuyển đội thì đổi group ở IdP, không ai phải sửa RoleBinding ở hai chục cụm.
+- **Quyền thường ngày theo namespace, chỉ đọc khi có thể.** Lập trình viên sửa được namespace của đội mình; người trực đọc được cả cụm nhưng không sửa.
+- **Đo quyền thật, đừng đoán qua tên role.** ClusterRole có sẵn `edit` nghe như "sửa tài nguyên ứng dụng", nhưng nó gồm cả đọc Secret, `exec` vào pod, **impersonate** (đóng vai) mọi ServiceAccount và xin token cho chúng trong namespace: tức là có mọi quyền mà ServiceAccount nào trong namespace đó có.
+
+Công cụ đo quyền có sẵn là `kubectl auth can-i`: hỏi API server một câu cụ thể ("tôi tạo được pod không") hoặc liệt kê tất cả (`--list`), cho chính bạn hoặc cho người khác (`--as`, `--as-group`, cần quyền impersonate). Bước 4 của lab chạy một bảng các quyền nguy hiểm mà K2.3 đã liệt kê cho từng người. Ở quy mô lớn, các công cụ mở như `kubectl-who-can` hỏi theo chiều ngược ("ai làm được việc X") và `rbac-tool` tìm quyền nguy hiểm trong toàn bộ RBAC của cụm; chạy chúng định kỳ và xem lại kết quả như một phần của rà quyền.
+
+### Quyền tối thiểu trên cloud
+
+Trên cloud, cùng nguyên tắc nhưng có nhiều lớp hơn. Lab không có tài khoản cloud nên phần này dừng ở khái niệm; D22 đi sâu tổ chức nhiều tài khoản.
+
+| Lớp | Làm gì | Ví dụ AWS (tương đương GCP, Azure) |
+|---|---|---|
+| Policy gắn với danh tính | Cấp quyền cho user, group, role | IAM policy trên role `dev-shop` |
+| Permission boundary | Trần quyền của một danh tính: dù policy cấp gì, không vượt được trần | Cho đội nền tảng tự tạo role nhưng role tạo ra không vượt boundary |
+| Guardrail ở cấp tổ chức | Cấm một số việc cho cả tài khoản, kể cả với quản trị viên của tài khoản đó; không cấp quyền gì | SCP của AWS Organizations; Organization Policy của GCP; Azure Policy |
+
+Ngoài ba lớp này còn policy gắn với tài nguyên (bucket policy, key policy) và công cụ rà quyền không dùng (IAM Access Analyzer). Quyền thật trên cloud là giao của các lớp, nên câu "role này có quyền gì" phải trả lời bằng công cụ mô phỏng của cloud (IAM policy simulator, Policy Troubleshooter), giống `can-i` trong cụm.
+
+<Check id="d15.5.cloud">Nêu được ba quy tắc quyền tối thiểu cho người trong cụm, phân biệt được policy gắn với danh tính, permission boundary và guardrail cấp tổ chức, và nói được vì sao guardrail không cấp quyền.</Check>
+
+### JIT: quyền lớn chỉ có khi cần
+
+Người trực sự cố đôi khi cần sửa namespace của đội khác lúc 2 giờ sáng. Cấp sẵn quyền đó (standing privilege) là để quyền nằm đó 365 ngày cho vài phút cần dùng. **JIT** (just-in-time access) cấp quyền theo yêu cầu, có hạn:
+
+```text
+ (1) xin:   binh xin "edit trên namespace shop, 3 phút, lý do INC-2026-1042"
+ (2) duyệt: lan, trưởng nhóm trực (không phải binh), duyệt; hệ thống từ chối nếu người xin tự duyệt
+ (3) cấp:   RoleBinding mang hạn, người xin, người duyệt, lý do      ──▶ audit log ghi lần tạo
+ (4) dùng:  binh làm việc bằng chính danh tính SSO của mình           ──▶ audit log ghi từng lệnh
+ (5) gỡ:    quá hạn, một CronJob xoá RoleBinding, không cần ai nhớ     ──▶ audit log ghi lần xoá
+```
+
+Thiếu thành phần nào thì JIT thoái hoá: không có hạn tự gỡ thì thành quyền vĩnh viễn; người xin tự duyệt được thì chỉ là thủ tục; không ghi lý do thì không rà được sau này. Sản phẩm có sẵn: Azure Privileged Identity Management, Google Cloud Privileged Access Manager, AWS IAM Identity Center kèm giải pháp TEAM (Temporary Elevated Access Management), Teleport access request. Lab tự dựng một bản tối giản bằng script và CronJob để bạn thấy đủ các thành phần.
+
+<Check id="d15.5.jit">Kể được năm bước của JIT và giải thích được mỗi bước thiếu thì hệ thống thoái hoá thế nào.</Check>
+
+### Break-glass
+
+Khi IdP sập, hay ai đó xoá nhầm binding quản trị, SSO không cứu được: cần một lối vào không phụ thuộc vào thứ đang hỏng. Đó là tài khoản **break-glass** (đập kính khi khẩn cấp). Trên cụm `kubeadm` (và `kind`, vốn dùng `kubeadm`), từ Kubernetes 1.29 có hai file:
+
+| File | Danh tính | Quyền đến từ đâu | Thu hồi bằng cách nào |
+|---|---|---|---|
+| `admin.conf` | user `kubernetes-admin`, group `kubeadm:cluster-admins` | ClusterRoleBinding `kubeadm:cluster-admins` → `cluster-admin` | Xoá binding đó |
+| `super-admin.conf` | user `kubernetes-super-admin`, group `system:masters` | Group `system:masters` **bỏ qua mọi kiểm tra quyền** của RBAC | Không xoá được bằng RBAC; chỉ có chờ chứng chỉ hết hạn hoặc thay CA của cụm |
+
+Chính vì không phụ thuộc RBAC hay IdP, `super-admin.conf` là ứng viên break-glass, và cũng chính vì thế nó phải được canh. Quy trình tối thiểu:
+
+- **Cất ngoài cụm và ngoài máy cá nhân**: két mật khẩu với quyền mở cần hai người, hoặc phong bì niêm phong trong két sắt.
+- **Mỗi lần dùng là một sự cố**: cảnh báo tự động trên audit log khi có yêu cầu từ group `system:masters` (trừ chính API server), và ghi biên bản.
+- **Sau khi dùng**: bản cũ vẫn có hiệu lực tới hết hạn (`kubeadm` mặc định một năm); nếu nghi đã lộ, chỉ có cách thay CA của cụm (K4.5). Vì vậy nên cấp chứng chỉ break-glass hạn ngắn (`kubeadm kubeconfig user --validity-period`), cấp lại theo lịch, và cất bản mới vào két.
+- **Diễn tập**: break-glass chưa từng thử là break-glass không chạy được lúc cần.
+
+Bước 6 của lab mô phỏng một lần xoá nhầm binding quản trị, dùng break-glass để sửa, và tìm lại dấu vết trong audit log.
+
+<Check id="d15.5.break-glass">Giải thích được khác biệt giữa `admin.conf` và `super-admin.conf`, vì sao `system:masters` không thu hồi được bằng RBAC, và kể được bốn việc của quy trình break-glass.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Authenticating: Authentication configuration from a file (Kubernetes)](https://kubernetes.io/docs/reference/access-authn-authz/authentication/): AuthenticationConfiguration, `claimMappings`, `userValidationRules`, và việc tự nạp lại file.
+- [Using RBAC Authorization (Kubernetes)](https://kubernetes.io/docs/reference/access-authn-authz/rbac/): các ClusterRole có sẵn, đọc kỹ phần `edit` và cảnh báo về quyền trên Secret và impersonate.
+- [kubelogin (int128)](https://github.com/int128/kubelogin): plugin OIDC cho `kubectl`, các kiểu grant và cache token.
+- [Twitter Investigation Report (NYDFS)](https://www.dfs.ny.gov/reports-and-publications/other-reports/Twitter_Report): nguồn của callout, đọc phần "Access Management and Authentication".
+
+</Resources>
+
+<Practice>
+
+### Chuẩn bị
+
+Bài tạo một cụm `d15-lab` mới với cấu hình xác thực OIDC và audit log, và chạy Dex trong Docker làm IdP. Nếu cụm `d15-lab` của D15.1 tới D15.4 còn chạy, xoá nó bằng khối cuối bài D15.4 trước. Cần Docker, `kind`, `kubectl`, `jq`, `yq`, `openssl`, `htpasswd` (có sẵn trên macOS), `unzip`, và mạng để tải image Dex (khoảng 40 MB), image kubectl và alpine, và binary kubelogin. Bài dùng cổng 9843 trên máy bạn.
+
+**Profile máy.** Node kind khoảng 0,7 tới 1 GiB RAM của Docker, Dex dưới 150 MiB. Máy 8 GB chạy thoải mái.
+
+Mọi người dùng, mật khẩu và secret trong bài đều do bài tự sinh cho Dex chạy trên máy bạn; đừng dùng mật khẩu thật nào.
+
+### 1. CA, chứng chỉ cho Dex và hai người dùng
+
+API server chỉ nói chuyện với issuer qua HTTPS. Bài tạo một CA nhỏ của lab (D2.3 đã làm CA tự ký) và ký cho Dex một chứng chỉ có tên `127.0.0.1`. Issuer là `https://127.0.0.1:9843/dex`, cùng một địa chỉ cho cả `kubectl` trên máy bạn lẫn API server trong node; lý do nằm ở bước 2.
+
+<Terminal where="mac">
+
+```bash
+mkdir -p ~/masteva-d15/dex ~/masteva-d15/apiserver ~/masteva-d15/audit ~/masteva-d15/bin && cd ~/masteva-d15
+export KUBECONFIG=~/masteva-d15/kubeconfig
+cd dex
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=d15 lab CA" 2>/dev/null
+openssl req -newkey rsa:2048 -nodes -keyout tls.key -out tls.csr -subj "/CN=dex" 2>/dev/null
+printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > ext.cnf
+openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 30 -extfile ext.cnf 2>/dev/null
+openssl x509 -in tls.crt -noout -text | grep -A1 'Subject Alternative Name'
+cd ~/masteva-d15
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+            X509v3 Subject Alternative Name: 
+                IP Address:127.0.0.1
+```
+
+</Expected>
+
+Hai người dùng: `an` thuộc group `dev-shop` (lập trình viên của đội shop), `binh` thuộc group `sre` (người trực). Mật khẩu sinh ngẫu nhiên vào `users.env`; Dex chỉ giữ hash bcrypt của chúng. `CLIENT_SECRET` là secret của **client** `kubernetes`, tức ứng dụng được đăng ký với IdP để xin token thay người dùng (ở đây là `kubectl` cùng kubelogin). Hạn ID token đặt 10 phút. Grant `password` (gửi thẳng tên và mật khẩu cho IdP) chỉ để lab chạy được không cần trình duyệt; production dùng `authorization_code` qua trình duyệt, nơi MFA của IdP được áp.
+
+<Terminal where="mac" title="~/masteva-d15/dex/config.yaml">
+
+```bash
+umask 077
+echo "an=$(openssl rand -hex 12)" > users.env
+echo "binh=$(openssl rand -hex 12)" >> users.env
+echo "CLIENT_SECRET=$(openssl rand -hex 16)" >> users.env
+. ./users.env
+cat > dex/config.yaml <<EOF
+issuer: https://127.0.0.1:9843/dex
+storage:
+  type: memory
+web:
+  https: 0.0.0.0:9843
+  tlsCert: /etc/dex/tls.crt
+  tlsKey: /etc/dex/tls.key
+expiry:
+  idTokens: 10m
+oauth2:
+  grantTypes: ["authorization_code", "refresh_token", "password"]
+  passwordConnector: local
+  skipApprovalScreen: true
+enablePasswordDB: true
+staticClients:
+  - id: kubernetes
+    name: kubectl
+    secret: $CLIENT_SECRET
+    redirectURIs: ["http://localhost:8000"]
+staticPasswords:
+  - email: an@example.com
+    hash: "$(htpasswd -bnBC 10 "" "$an" | tr -d ':\n')"
+    username: an
+    userID: "1001"
+    emailVerified: true
+    groups: ["dev-shop"]
+  - email: binh@example.com
+    hash: "$(htpasswd -bnBC 10 "" "$binh" | tr -d ':\n')"
+    username: binh
+    userID: "1002"
+    emailVerified: true
+    groups: ["sre"]
+EOF
+umask 022
+grep -c '\$2y\$10\$' dex/config.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+2
+```
+
+</Expected>
+
+`2`: hai hash bcrypt (`$2y$10$…`) đã nằm trong file, mật khẩu thật thì không. `umask 077` làm các file vừa tạo chỉ chủ sở hữu đọc được.
+
+Nếu mở terminal mới ở bất kỳ bước nào sau đây, chạy lại: `cd ~/masteva-d15 && export KUBECONFIG=~/masteva-d15/kubeconfig && . ./users.env`.
+
+### 2. Cụm tin Dex
+
+**AuthenticationConfiguration** cho API server: issuer, audience `kubernetes`, CA để kiểm HTTPS của Dex, ánh xạ `email` thành user và `groups` thành group, cả hai thêm tiền tố `oidc:`, và luật chặn username `system:…`. Audit policy là bản của K8.5 viết gọn mỗi rule một dòng, bỏ rule riêng cho `exec`: Secret chỉ ở mức `Metadata`, mọi thay đổi RBAC ở mức `RequestResponse` (bước 5 cần đọc body của RoleBinding).
+
+<Terminal where="mac" title="~/masteva-d15/apiserver">
+
+```bash
+{
+  cat <<'EOF'
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+jwt:
+  - issuer:
+      url: https://127.0.0.1:9843/dex
+      audiences: ["kubernetes"]
+      certificateAuthority: |
+EOF
+  sed 's/^/        /' dex/ca.crt
+  cat <<'EOF'
+    claimMappings:
+      username:
+        claim: email
+        prefix: "oidc:"
+      groups:
+        claim: groups
+        prefix: "oidc:"
+    userValidationRules:
+      - expression: "!user.username.startsWith('system:')"
+        message: "username không được dùng tiền tố system:"
+EOF
+} > apiserver/auth-config.yaml
+cat > apiserver/audit-policy.yaml <<'EOF'
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  - { level: None, nonResourceURLs: ["/healthz*", "/livez*", "/readyz*", "/version", "/openapi*"] }
+  - { level: None, verbs: ["get", "list", "watch"], users: ["system:kube-proxy", "system:kube-scheduler", "system:kube-controller-manager", "system:apiserver"] }
+  - { level: None, verbs: ["get", "list", "watch"], userGroups: ["system:nodes"] }
+  - { level: None, resources: [{ group: "coordination.k8s.io", resources: ["leases"] }, { group: "", resources: ["events"] }] }
+  - { level: Metadata, resources: [{ group: "", resources: ["secrets", "configmaps", "serviceaccounts/token"] }, { group: "authentication.k8s.io", resources: ["tokenreviews"] }] }
+  - { level: RequestResponse, resources: [{ group: "rbac.authorization.k8s.io" }] }
+  - { level: Request, verbs: ["create", "update", "patch", "delete", "deletecollection"] }
+  - { level: Metadata }
+EOF
+grep -c 'BEGIN CERTIFICATE' apiserver/auth-config.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+1
+```
+
+</Expected>
+
+Cụm kind mở cổng 9843 của node ra `127.0.0.1:9843` trên máy bạn. Dex chạy trong Docker với `--network container:d15-lab-control-plane`, tức dùng chung network namespace với node: Dex nghe cổng 9843 **bên trong node**. Nhờ vậy cùng một URL `https://127.0.0.1:9843/dex` đúng ở cả hai phía: API server (chạy với mạng của node) thấy Dex ở `127.0.0.1` của node, còn `kubectl` trên máy bạn thấy nó qua cổng đã mở. Issuer phải là một URL duy nhất vì nó phải trùng claim `iss` trong token. Trên production, Dex hay IdP có một tên DNS thật mà cả người dùng lẫn API server cùng phân giải được.
+
+<Callout kind="danger">
+
+Khối dưới tạo cụm `d15-lab` mới. Nếu một cụm cùng tên còn chạy, `kind` báo lỗi; xoá cụm cũ bằng khối cuối D15.4 trước.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-d15/kind.yaml">
+
+```bash
+cat > kind.yaml <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: d15-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraPortMappings:
+      - { containerPort: 9843, hostPort: 9843, listenAddress: "127.0.0.1" }
+    extraMounts:
+      - { hostPath: $HOME/masteva-d15/apiserver, containerPath: /etc/kubernetes/masteva, readOnly: true }
+      - { hostPath: $HOME/masteva-d15/audit, containerPath: /var/log/kubernetes/audit }
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            - { name: authentication-config, value: /etc/kubernetes/masteva/auth-config.yaml }
+            - { name: audit-policy-file, value: /etc/kubernetes/masteva/audit-policy.yaml }
+            - { name: audit-log-path, value: /var/log/kubernetes/audit/audit.log }
+            - { name: audit-log-maxsize, value: "20" }
+            - { name: audit-log-maxbackup, value: "3" }
+          extraVolumes:
+            - { name: masteva, hostPath: /etc/kubernetes/masteva, mountPath: /etc/kubernetes/masteva, readOnly: true, pathType: Directory }
+            - { name: audit-log, hostPath: /var/log/kubernetes/audit, mountPath: /var/log/kubernetes/audit, readOnly: false, pathType: DirectoryOrCreate }
+EOF
+kind create cluster --config kind.yaml > /dev/null 2>&1 || echo "kind create cluster lỗi: chạy lại 'kind create cluster --config kind.yaml' để xem lý do"
+kubectl wait --for=condition=Ready node --all --timeout=180s
+docker run -d --name d15-dex --network container:d15-lab-control-plane -v "$HOME/masteva-d15/dex:/etc/dex:ro" \
+  ghcr.io/dexidp/dex:v2.46.0@sha256:933fcd3f523338c847b88ef84a7145fb2fcb7b9917f08418612afeaaa2001777 dex serve /etc/dex/config.yaml > /dev/null
+for i in $(seq 1 60); do curl -sf --cacert dex/ca.crt https://127.0.0.1:9843/dex/.well-known/openid-configuration > /dev/null && break; sleep 1; done
+curl -s --cacert dex/ca.crt https://127.0.0.1:9843/dex/.well-known/openid-configuration | jq -c '{issuer, grant_types_supported}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/d15-lab-control-plane condition met
+{"issuer":"https://127.0.0.1:9843/dex","grant_types_supported":["authorization_code","password","refresh_token"]}
+```
+
+</Expected>
+
+Cụm khởi động được trước khi Dex chạy: API server tự thử tải discovery của issuer cho tới khi thành công. `curl` ở đây kiểm chứng chỉ của Dex bằng `--cacert`; nếu `~/.curlrc` của bạn có `-k`, xem mục Gỡ lỗi.
+
+<Check id="d15.5.lab-cum">Cấu hình được Dex với client và người dùng theo group, cấu hình được API server tin Dex bằng AuthenticationConfiguration, và giải thích được vì sao issuer phải là cùng một URL với cả người dùng lẫn API server.</Check>
+
+### 3. Đăng nhập: bằng `curl`, rồi bằng kubelogin
+
+Trước tiên tự xin token bằng `curl` để thấy nó chứa gì, rồi tạo một file kubeconfig cho `an` chỉ có thông tin cụm và token đó, không có chứng chỉ nào.
+
+<Terminal where="mac" title="~/masteva-d15/kubeconfig-an">
+
+```bash
+. ./users.env
+TOK=$(curl -s --cacert dex/ca.crt https://127.0.0.1:9843/dex/token -u "kubernetes:$CLIENT_SECRET" \
+  -d grant_type=password -d username=an@example.com --data-urlencode "password=$an" -d "scope=openid email groups" | jq -r .id_token)
+echo "$TOK" | jq -R -c 'split(".")[1] | gsub("-"; "+") | gsub("_"; "/") | @base64d | fromjson | {iss, aud, email, groups, ttl: (.exp - .iat)}'
+kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > cluster-ca.crt
+SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+KUBECONFIG=kubeconfig-an kubectl config set-cluster d15-lab --server="$SERVER" --certificate-authority=cluster-ca.crt --embed-certs > /dev/null
+KUBECONFIG=kubeconfig-an kubectl config set-credentials an --token="$TOK" > /dev/null
+KUBECONFIG=kubeconfig-an kubectl config set-context an --cluster=d15-lab --user=an > /dev/null
+KUBECONFIG=kubeconfig-an kubectl config use-context an > /dev/null
+KUBECONFIG=kubeconfig-an kubectl auth whoami
+KUBECONFIG=kubeconfig-an kubectl get pods -A 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"iss":"https://127.0.0.1:9843/dex","aud":"kubernetes","email":"an@example.com","groups":["dev-shop"],"ttl":600}
+ATTRIBUTE                                           VALUE
+Username                                            oidc:an@example.com
+Groups                                              [oidc:dev-shop system:authenticated]
+Extra: authentication.kubernetes.io/credential-id   [JTI=beef7af0-8734-4a10-a35d-cbc1f355edb7]
+Error from server (Forbidden): pods is forbidden: User "oidc:an@example.com" cannot list resource "pods" in API group "" at the cluster scope
+```
+
+</Expected>
+
+API server nhận ra `oidc:an@example.com` thuộc `oidc:dev-shop` (cùng `system:authenticated`, group của mọi người đã đăng nhập). Chưa có RoleBinding nào nên chưa làm được gì: xác thực và phân quyền là hai bước riêng. `credential-id` là mã `jti` của token (trên máy bạn sẽ khác), cũng được ghi vào audit log, để lần ra một yêu cầu đến từ token nào. Token trong `kubeconfig-an` hết hạn sau 10 phút; sau đó phải xin lại.
+
+Xin lại bằng tay mỗi 10 phút là thứ không ai làm. **kubelogin** là plugin `exec` của `kubectl` làm việc đó: `kubectl` gọi nó mỗi khi cần token, nó trả token còn hạn từ cache hoặc xin token mới. Tải bản phát hành, so sha256 với file `.sha256` đi kèm, giải nén vào `bin` của lab.
+
+<Terminal where="mac">
+
+```bash
+cd ~/masteva-d15/bin
+ARCH=$(uname -m | sed 's/x86_64/amd64/')
+V=v1.36.4
+curl -fsSLO https://github.com/int128/kubelogin/releases/download/$V/kubelogin_darwin_$ARCH.zip
+if curl -fsSL https://github.com/int128/kubelogin/releases/download/$V/kubelogin_darwin_$ARCH.zip.sha256 | shasum -a 256 -c; then
+  unzip -o -q kubelogin_darwin_$ARCH.zip kubelogin
+fi
+./kubelogin --version
+cd ~/masteva-d15
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kubelogin_darwin_arm64.zip: OK
+kubelogin version v1.36.4
+```
+
+</Expected>
+
+Trên Mac chip Intel, dòng đầu là `kubelogin_darwin_amd64.zip: OK`.
+
+`binh` dùng kubelogin. Cấu hình `exec` trong kubeconfig nói: gọi `kubelogin get-token` với issuer, client, CA của Dex, các scope cần, và cache token trong thư mục lab.
+
+<Callout kind="pitfall">
+
+Để chạy được không cần trình duyệt, bài đưa mật khẩu của `binh` vào tham số `--password` trong `kubeconfig-binh`. Đừng làm vậy với tài khoản thật: trên máy làm việc, bỏ `--grant-type`, `--username`, `--password`; kubelogin sẽ mở trình duyệt tới trang đăng nhập của IdP, nơi có MFA.
+
+</Callout>
+
+<Terminal where="mac" title="~/masteva-d15/kubeconfig-binh">
+
+```bash
+cp kubeconfig-an kubeconfig-binh
+KUBECONFIG=kubeconfig-binh kubectl config set-credentials binh --exec-api-version=client.authentication.k8s.io/v1 \
+  --exec-interactive-mode=Never --exec-command="$HOME/masteva-d15/bin/kubelogin" \
+  --exec-arg=get-token --exec-arg=--oidc-issuer-url=https://127.0.0.1:9843/dex \
+  --exec-arg=--oidc-client-id=kubernetes --exec-arg=--oidc-client-secret="$CLIENT_SECRET" \
+  --exec-arg=--certificate-authority="$HOME/masteva-d15/dex/ca.crt" \
+  --exec-arg=--oidc-extra-scope=email --exec-arg=--oidc-extra-scope=groups \
+  --exec-arg=--grant-type=password --exec-arg=--username=binh@example.com --exec-arg=--password="$binh" \
+  --exec-arg=--token-cache-dir="$HOME/masteva-d15/oidc-cache" > /dev/null
+KUBECONFIG=kubeconfig-binh kubectl config set-context binh --cluster=d15-lab --user=binh > /dev/null
+KUBECONFIG=kubeconfig-binh kubectl config use-context binh > /dev/null
+chmod 600 kubeconfig-an kubeconfig-binh
+KUBECONFIG=kubeconfig-binh kubectl auth whoami | sed -n '2,3p'
+ls oidc-cache | wc -l
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Username                                            oidc:binh@example.com
+Groups                                              [oidc:sre system:authenticated]
+       2
+```
+
+</Expected>
+
+Lần gọi đầu, kubelogin xin token từ Dex và ghi vào `oidc-cache` (một file token và một file `.lock`); các lần sau trong 10 phút dùng lại token đó, quá hạn thì tự xin mới. Với grant `authorization_code` trên máy thật, lần xin mới mở trình duyệt; người dùng thấy điều đó vài lần một ngày, không phải mỗi lệnh.
+
+<Check id="d15.5.lab-dang-nhap">Lấy được ID token từ Dex và đọc được claim của nó, dùng được token đó với `kubectl`, và cấu hình được kubelogin làm plugin `exec` có cache token.</Check>
+
+### 4. Quyền theo group, và đo quyền thật
+
+Group `oidc:dev-shop` nhận ClusterRole `edit` trong namespace `shop`. Group `oidc:sre` nhận `view` trên cả cụm. Không có binding nào nhắc tên người.
+
+<Terminal where="mac">
+
+```bash
+kubectl create namespace shop
+kubectl -n shop create rolebinding dev-shop-edit --clusterrole=edit --group=oidc:dev-shop
+kubectl create clusterrolebinding sre-view --clusterrole=view --group=oidc:sre
+KUBECONFIG=kubeconfig-an kubectl -n shop auth can-i --list | grep -E '^(Resources|pods |secrets |serviceaccounts)'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace/shop created
+rolebinding.rbac.authorization.k8s.io/dev-shop-edit created
+clusterrolebinding.rbac.authorization.k8s.io/sre-view created
+Resources                                       Non-Resource URLs   Resource Names   Verbs
+pods                                            []                  []               [create delete deletecollection patch update get list watch]
+serviceaccounts/token                           []                  []               [create]
+secrets                                         []                  []               [get list watch create delete deletecollection patch update]
+serviceaccounts                                 []                  []               [impersonate create delete deletecollection patch update get list watch]
+```
+
+</Expected>
+
+`--list` in mọi quyền của người đang đăng nhập trong namespace; danh sách đầy đủ dài vài chục dòng, lệnh lọc giữ bốn dòng đáng chú ý: toàn quyền trên `secrets`, `impersonate` trên `serviceaccounts`, và `create` trên `serviceaccounts/token` (xin token cho một ServiceAccount). Script dưới hỏi API server từng quyền nguy hiểm, cho từng file kubeconfig, rồi in thành bảng. Mỗi ô là câu trả lời thật của `kubectl auth can-i`, không phải suy ra từ tên role.
+
+<Terminal where="mac" title="~/masteva-d15/kiem-quyen.sh">
+
+```bash
+cat > kiem-quyen.sh <<'EOF'
+#!/bin/sh
+# kiem-quyen.sh <namespace> <kubeconfig...>: hỏi API server các quyền nguy hiểm của từng người
+ns=$1; shift
+printf '%-32s' "namespace $ns"; for kc in "$@"; do printf '%-7s' "${kc#kubeconfig-}"; done; echo
+while read -r verb res scope; do
+  printf '%-32s' "$verb $res"
+  for kc in "$@"; do
+    if [ "$scope" = cum ]; then a=$(KUBECONFIG=$kc kubectl auth can-i "$verb" "$res" 2>/dev/null)
+    else a=$(KUBECONFIG=$kc kubectl auth can-i "$verb" "$res" -n "$ns" 2>/dev/null); fi
+    printf '%-7s' "${a:-no}"
+  done
+  echo
+done <<'LIST'
+get secrets ns
+create pods ns
+create pods/exec ns
+impersonate serviceaccounts ns
+create serviceaccounts/token ns
+create rolebindings ns
+bind clusterroles cum
+escalate clusterroles cum
+impersonate users cum
+get nodes/proxy cum
+list secrets cum
+LIST
+EOF
+chmod +x kiem-quyen.sh
+./kiem-quyen.sh shop kubeconfig-an kubeconfig-binh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+namespace shop                  an     binh   
+get secrets                     yes    no     
+create pods                     yes    no     
+create pods/exec                yes    no     
+impersonate serviceaccounts     yes    no     
+create serviceaccounts/token    yes    no     
+create rolebindings             no     no     
+bind clusterroles               no     no     
+escalate clusterroles           no     no     
+impersonate users               no     no     
+get nodes/proxy                 no     no     
+list secrets                    no     no     
+```
+
+</Expected>
+
+Năm dòng đầu của `an` là cái giá của `edit`: đọc mọi Secret của `shop`, chạy lệnh trong mọi pod, và đóng vai hoặc xin token cho mọi ServiceAccount của namespace, kể cả ServiceAccount của ứng dụng có quyền rộng hơn `an`. `an` không tự cấp quyền được (`create rolebindings`, `bind`, `escalate` là `no`). `binh` đọc được cả cụm nhưng không đọc được Secret nào: `view` cố ý bỏ Secret. Nếu đội shop chỉ cần sửa Deployment và xem log, một Role riêng hẹp hơn `edit` là đúng; còn nếu giữ `edit`, phải chấp nhận rằng ai có `edit` là có quyền của mọi ServiceAccount trong namespace.
+
+<Check id="d15.5.lab-quyen">Phân quyền được theo group của IdP, đo được quyền thật của từng người bằng `kubectl auth can-i`, và chỉ ra được các quyền nguy hiểm mà ClusterRole `edit` mang theo.</Check>
+
+### 5. JIT: quyền tạm, có người duyệt, tự gỡ
+
+Hai phần. Phía cụm: một CronJob chạy mỗi phút, xoá mọi RoleBinding mang nhãn `jit.masteva.dev/managed=true` đã quá giờ ghi trong annotation `jit.masteva.dev/expires-at`. Image của nó ghép `kubectl` từ image chính thức `registry.k8s.io/kubectl` (image đó không có shell) với `alpine` và `jq`; bài build trên máy rồi nạp thẳng vào node bằng `kind load`. ServiceAccount của nó chỉ được `list` và `delete` RoleBinding.
+
+<Terminal where="mac" title="~/masteva-d15/jit">
+
+```bash
+mkdir -p jit
+cat > jit/sweep.sh <<'EOF'
+#!/bin/sh
+# Xoá mọi RoleBinding JIT đã quá hạn (annotation jit.masteva.dev/expires-at, dạng ISO 8601 UTC).
+now=$(date -u +%s)
+kubectl get rolebindings -A -l jit.masteva.dev/managed=true -o json |
+  jq -r --argjson now "$now" '.items[]
+    | select((.metadata.annotations["jit.masteva.dev/expires-at"] | fromdateiso8601) <= $now)
+    | "\(.metadata.namespace) \(.metadata.name)"' |
+  while read -r ns name; do
+    kubectl -n "$ns" delete rolebinding "$name"
+  done
+EOF
+cat > jit/Dockerfile <<'EOF'
+FROM registry.k8s.io/kubectl:v1.37.0@sha256:5ed410ebac5dc976cc717098994dcdb29bbbd38f6bd65f582311f5be4ba719cf AS kubectl
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+RUN apk add --no-cache jq
+COPY --from=kubectl /bin/kubectl /usr/local/bin/kubectl
+COPY sweep.sh /sweep.sh
+USER 65534:65534
+ENTRYPOINT ["/bin/sh", "/sweep.sh"]
+EOF
+cat > jit/cronjob.yaml <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: jit-sweeper, namespace: jit-system }
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: jit-sweeper
+          restartPolicy: Never
+          containers:
+            - name: sweep
+              image: d15-jit-sweeper:1
+              imagePullPolicy: Never
+EOF
+docker build -q -t d15-jit-sweeper:1 jit > /dev/null && kind load docker-image d15-jit-sweeper:1 --name d15-lab > /dev/null 2>&1 && echo "đã nạp image vào node"
+kubectl create namespace jit-system
+kubectl -n jit-system create serviceaccount jit-sweeper
+kubectl create clusterrole jit-sweeper --verb=list,delete --resource=rolebindings.rbac.authorization.k8s.io
+kubectl create clusterrolebinding jit-sweeper --clusterrole=jit-sweeper --serviceaccount=jit-system:jit-sweeper
+kubectl apply -f jit/cronjob.yaml
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+đã nạp image vào node
+namespace/jit-system created
+serviceaccount/jit-sweeper created
+clusterrole.rbac.authorization.k8s.io/jit-sweeper created
+clusterrolebinding.rbac.authorization.k8s.io/jit-sweeper created
+cronjob.batch/jit-sweeper created
+```
+
+</Expected>
+
+Không thấy dòng `đã nạp image vào node` thì chạy lại `docker build -t d15-jit-sweeper:1 jit` (bỏ `-q`) để xem lỗi build. Lưu ý ClusterRole `jit-sweeper` xoá được **mọi** RoleBinding của cụm, không chỉ những cái mang nhãn JIT: RBAC không giới hạn quyền theo nhãn. Đây không phải quyền tối thiểu; trên cụm thật, giới hạn thêm bằng một chính sách admission chỉ cho ServiceAccount này xoá RoleBinding có nhãn `jit.masteva.dev/managed=true` (K8.3).
+
+Phía người: script `jit-grant.sh` do người duyệt chạy bằng quyền quản trị. Nó từ chối khi người xin tự duyệt hoặc xin quá 240 phút, rồi tạo RoleBinding mang nhãn, hạn, người xin, người duyệt và lý do. Trong một tổ chức thật, bước này nằm sau một form xin quyền hoặc một pull request có người duyệt; script chỉ giữ phần cốt lõi.
+
+<Terminal where="mac" title="~/masteva-d15/jit-grant.sh">
+
+```bash
+cat > jit-grant.sh <<'EOF'
+#!/bin/sh
+# jit-grant.sh <người xin> <namespace> <ClusterRole> <số phút> <người duyệt> <lý do>
+set -eu
+user=$1 ns=$2 role=$3 mins=$4 approver=$5 reason=$6
+[ "$user" != "$approver" ] || { echo "người xin không tự duyệt cho mình" >&2; exit 1; }
+[ "$mins" -le 240 ] || { echo "tối đa 240 phút" >&2; exit 1; }
+exp=$(date -u -v+"${mins}"M +%Y-%m-%dT%H:%M:%SZ)
+name="jit-${user%%@*}-$(date -u +%s)"
+kubectl -n "$ns" create rolebinding "$name" --clusterrole="$role" --user="oidc:$user" --dry-run=client -o yaml |
+  kubectl label --local -f - jit.masteva.dev/managed=true -o yaml |
+  kubectl annotate --local -f - jit.masteva.dev/requested-by="$user" jit.masteva.dev/approved-by="$approver" \
+    jit.masteva.dev/reason="$reason" jit.masteva.dev/expires-at="$exp" -o yaml |
+  kubectl apply -f -
+echo "hết hạn lúc $exp"
+EOF
+chmod +x jit-grant.sh
+./jit-grant.sh binh@example.com shop edit 3 binh@example.com "tự duyệt thử"
+./jit-grant.sh binh@example.com shop edit 3 lan@example.com "INC-2026-1042: shop-api lỗi 500"
+KUBECONFIG=kubeconfig-binh kubectl -n shop auth can-i create pods/exec
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+người xin không tự duyệt cho mình
+rolebinding.rbac.authorization.k8s.io/jit-binh-1792590074 created
+hết hạn lúc 2026-10-21T13:44:14Z
+yes
+```
+
+</Expected>
+
+Lần đầu bị từ chối vì tự duyệt. Lần hai `binh` có `edit` trên `shop` trong ba phút. `date -v+3M` là cú pháp `date` của macOS; trên Linux dùng `date -u -d '+3 min'`. Giờ chờ RoleBinding tự biến mất: CronJob chạy đầu mỗi phút, nên việc gỡ thường xảy ra trong vòng một phút sau giờ hết hạn. Vòng chờ dừng khi không còn RoleBinding JIT nào, tối đa 5 phút.
+
+<Terminal where="mac">
+
+```bash
+kubectl -n shop get rolebinding -l jit.masteva.dev/managed=true \
+  -o 'custom-columns=NAME:.metadata.name,USER:.subjects[0].name,EXPIRES:.metadata.annotations.jit\.masteva\.dev/expires-at'
+for i in $(seq 1 60); do [ -z "$(kubectl -n shop get rolebinding -l jit.masteva.dev/managed=true -o name)" ] && break; sleep 5; done
+date -u +%H:%M:%S
+KUBECONFIG=kubeconfig-binh kubectl -n shop auth can-i create pods/exec
+jq -c 'select(.objectRef.resource == "rolebindings" and .objectRef.namespace == "shop" and (.verb == "create" or .verb == "delete"))
+  | {time: .requestReceivedTimestamp[11:19], verb, user: .user.username, name: .objectRef.name,
+     approved: .requestObject.metadata.annotations["jit.masteva.dev/approved-by"]}' audit/audit.log
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+NAME                  USER                    EXPIRES
+jit-binh-1792590074   oidc:binh@example.com   2026-10-21T13:44:14Z
+13:45:03
+no
+{"time":"13:40:09","verb":"create","user":"kubernetes-admin","name":"dev-shop-edit","approved":null}
+{"time":"13:41:14","verb":"create","user":"kubernetes-admin","name":"jit-binh-1792590074","approved":"lan@example.com"}
+{"time":"13:45:00","verb":"delete","user":"system:serviceaccount:jit-system:jit-sweeper","name":"jit-binh-1792590074","approved":null}
+```
+
+</Expected>
+
+Audit log kể đủ câu chuyện: ai tạo quyền (kèm người duyệt, vì body của thao tác RBAC được ghi ở mức `RequestResponse`), và CronJob gỡ nó lúc nào. Giờ trên máy bạn sẽ khác; khoảng cách giữa giờ hết hạn và lần xoá thường trong vòng một phút. Nếu bảng đầu tiên trống, RoleBinding đã bị gỡ trước khi bạn chạy khối này. Lệnh `create` cùng tên user `kubernetes-admin` cho thấy một điều còn thiếu: người duyệt đang dùng kubeconfig quản trị chung, nên audit log không biết đó là `lan`. Bước kế tiếp trên một cụm thật là cho người duyệt đăng nhập SSO như mọi người khác.
+
+<Check id="d15.5.lab-jit">Dựng được một cơ chế JIT tối giản có kiểm tự duyệt, hạn và tự gỡ bằng CronJob, và dùng audit log kể lại được ai cấp, ai duyệt, lúc nào gỡ.</Check>
+
+### 6. Break-glass
+
+Chép `super-admin.conf` ra khỏi node vào thư mục `breakglass` (quyền đọc chỉ cho bạn), sửa địa chỉ API server cho khớp cổng trên máy, và xem nó là ai.
+
+<Terminal where="mac" title="~/masteva-d15/breakglass/kubeconfig">
+
+```bash
+umask 077 && mkdir -p breakglass
+docker cp d15-lab-control-plane:/etc/kubernetes/super-admin.conf breakglass/kubeconfig > /dev/null
+umask 022
+KUBECONFIG=breakglass/kubeconfig kubectl config set-cluster d15-lab --server="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" > /dev/null
+KUBECONFIG=breakglass/kubeconfig kubectl auth whoami | sed -n '2,3p'
+kubectl get clusterrolebinding kubeadm:cluster-admins -o jsonpath='{.subjects[0].name} -> {.roleRef.name}'; echo
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+Username                                            kubernetes-super-admin
+Groups                                              [system:masters system:authenticated]
+kubeadm:cluster-admins -> cluster-admin
+```
+
+</Expected>
+
+Kubeconfig quản trị thường ngày (`kubeconfig` của lab, user `kubernetes-admin`) có quyền nhờ binding `kubeadm:cluster-admins`. Giờ mô phỏng một lỗi có thật trong vận hành: ai đó dọn RBAC và xoá nhầm binding đó.
+
+<Callout kind="danger">
+
+Khối dưới xoá ClusterRoleBinding `kubeadm:cluster-admins`: từ lúc đó kubeconfig quản trị của cụm không làm được gì nữa, chỉ break-glass còn vào được. Chỉ chạy trên cụm lab; kiểm `kubectl config current-context` là `kind-d15-lab` trước khi chạy.
+
+</Callout>
+
+<Terminal where="mac">
+
+```bash
+kubectl config current-context
+kubectl get clusterrolebinding kubeadm:cluster-admins -o yaml > crb-admin-truoc-khi-xoa.yaml
+[ "$(kubectl config current-context)" = kind-d15-lab ] && kubectl delete clusterrolebinding kubeadm:cluster-admins
+kubectl get nodes 2>&1 | tail -1
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+kind-d15-lab
+clusterrolebinding.rbac.authorization.k8s.io "kubeadm:cluster-admins" deleted
+Error from server (Forbidden): nodes is forbidden: User "kubernetes-admin" cannot list resource "nodes" in API group "" at the cluster scope
+```
+
+</Expected>
+
+Cả đội bị khoá ngoài. Dùng break-glass để tạo lại đúng binding đó:
+
+<Terminal where="mac">
+
+```bash
+KUBECONFIG=breakglass/kubeconfig kubectl create clusterrolebinding kubeadm:cluster-admins \
+  --clusterrole=cluster-admin --group=kubeadm:cluster-admins
+kubectl get nodes --no-headers | awk '{print $1, $2}'
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+clusterrolebinding.rbac.authorization.k8s.io/kubeadm:cluster-admins created
+d15-lab-control-plane Ready
+```
+
+</Expected>
+
+`system:masters` không cần binding nào nên vẫn vào được khi RBAC đã hỏng. Giờ là phần quan trọng không kém: phát hiện mỗi lần break-glass được dùng. Truy vấn dưới lấy mọi yêu cầu từ group `system:masters`, trừ chính API server (nó cũng thuộc group đó). Trên production, đây là một luật cảnh báo trên hệ thống log tập trung (D12.5), gửi thẳng tới kênh sự cố.
+
+<Terminal where="mac" title="~/masteva-d15/canh-bao-breakglass.sh">
+
+```bash
+cat > canh-bao-breakglass.sh <<'EOF'
+#!/bin/sh
+# In mọi yêu cầu tới API server từ group system:masters, trừ chính API server
+jq -c 'select((.user.groups // []) | index("system:masters")) | select(.user.username != "system:apiserver")
+  | {time: .requestReceivedTimestamp[11:19], user: .user.username, verb, res: .objectRef.resource, name: .objectRef.name, code: .responseStatus.code}' \
+  "$HOME/masteva-d15/audit/audit.log"
+EOF
+chmod +x canh-bao-breakglass.sh
+./canh-bao-breakglass.sh
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+{"time":"13:38:10","user":"kubernetes-super-admin","verb":"create","res":"clusterrolebindings","name":"kubeadm:cluster-admins","code":201}
+{"time":"13:45:23","user":"kubernetes-super-admin","verb":"create","res":"selfsubjectreviews","name":null,"code":201}
+{"time":"13:46:03","user":"kubernetes-super-admin","verb":"create","res":"clusterrolebindings","name":"kubeadm:cluster-admins","code":201}
+```
+
+</Expected>
+
+Ba dòng. Dòng đầu là lúc dựng cụm: `kubeadm` dùng chính `super-admin.conf` để tạo binding `kubeadm:cluster-admins` lần đầu, nên trên cụm `kubeadm` thật, luật cảnh báo phải bỏ qua khoảng thời gian dựng cụm hoặc chỉ xét từ sau đó. Hai dòng sau là đúng hai lệnh bạn đã chạy bằng break-glass: lệnh `whoami` (một `selfsubjectreviews`) và lệnh tạo lại binding. Ngoài chúng, trong suốt bài không ai dùng `system:masters`. Sau một lần dùng thật, quy trình tiếp theo là xoay: ký chứng chỉ break-glass mới, cất lại, và ghi biên bản.
+
+<Check id="d15.5.lab-break-glass">Dùng được chứng chỉ `system:masters` để khôi phục binding quản trị bị xoá nhầm, và viết được truy vấn audit log phát hiện mọi lần dùng break-glass.</Check>
+
+### Gỡ lỗi
+
+| Hiện tượng | Nguyên nhân thường gặp | Cách kiểm và sửa |
+|---|---|---|
+| `kubectl auth whoami` với token OIDC báo `Unauthorized` | API server chưa tải được discovery của Dex, token hết hạn (10 phút), hoặc `aud` khác `kubernetes` | `docker logs d15-dex`; giải mã token xem `exp`, `aud`; `kubectl -n kube-system logs kube-apiserver-d15-lab-control-plane \| grep -i jwt` |
+| `curl` tới Dex chạy dù chứng chỉ sai, hoặc báo lỗi lạ về TLS | `~/.curlrc` có `-k` (bỏ kiểm chứng chỉ) | Chạy bước 2, 3 với `CURL_HOME` trỏ tới một thư mục có `.curlrc` rỗng |
+| `docker run … --network container:…` báo không tìm thấy container | Cụm chưa tạo xong hoặc tên node khác | `docker ps --format '{{.Names}}' \| grep d15-lab` |
+| Dex khởi động lại thì mọi phiên đăng nhập mất | Bài dùng `storage: memory` | Bình thường cho lab; đăng nhập lại. Production dùng storage bền (database, CRD) |
+| CronJob không xoá RoleBinding hết hạn | Image chưa được nạp vào node (`ErrImageNeverPull`), hoặc annotation không đúng dạng `…Z` | `kubectl -n jit-system get pods`; `kubectl -n jit-system logs job/<tên>` |
+| `jit-grant.sh` báo `date: illegal option -- v` | Đang chạy trên Linux (lệnh `date` của GNU hoặc uutils) | Thay bằng `date -u -d "+${mins} min" +%Y-%m-%dT%H:%M:%SZ` (chưa chạy trong lab) |
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Hai khối dưới xoá container Dex, cụm `d15-lab` và image `d15-jit-sweeper:1`, rồi xoá thư mục lab gồm CA, mật khẩu thử, kubeconfig break-glass và audit log. D15.6 tạo lại những gì nó cần.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá container, cụm và image">
+
+```bash
+docker rm -f d15-dex
+kind delete cluster --name d15-lab
+docker rmi d15-jit-sweeper:1
+```
+
+</Terminal>
+
+<Terminal where="mac" title="Xoá thư mục lab">
+
+```bash
+rm -rf ~/masteva-d15
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="IdP sập thì sao, và break-glass có đủ không?">
+
+Khi IdP không trả lời, không ai xin được token mới; token đang có còn dùng được tới hết hạn (10 phút ở lab), rồi mọi người bị khoá ngoài. Break-glass mở được cụm, nhưng đó là một chứng chỉ quyền tối cao cho cả đội đang trực, đúng thứ bài muốn tránh. Ba cách giảm phụ thuộc: IdP có độ sẵn sàng cao hơn cụm nó bảo vệ; AuthenticationConfiguration khai hai issuer (IdP chính và một Dex dự phòng nối vào nguồn khác), vì file cho phép nhiều issuer; và có một quy trình break-glass "nhẹ" hơn `system:masters`, như một chứng chỉ client hạn vài giờ ký bằng CA của cụm cho group có quyền đọc và sửa có giới hạn, cấp qua quy trình hai người. Tính sẵn sàng của hệ đăng nhập là một phần của DR (D20).
+
+</Reveal>
+
+<Reveal title="Vì sao không cấp `cluster-admin` cho người trực sự cố cho nhanh?">
+
+Vì sự cố là lúc dễ sai nhất: người mệt, áp lực thời gian, lệnh gõ vội. Quyền rộng biến một lệnh gõ nhầm namespace thành sự cố thứ hai. Và tài khoản của người trực là mục tiêu tốt nhất cho kẻ tấn công, đúng như vụ Twitter: họ không nhắm vào người đầu tiên lừa được, mà dò xem ai có quyền vào công cụ quản trị. Mức hợp lý là quyền đọc rộng thường trực (để chẩn đoán), và quyền sửa qua JIT theo từng namespace, có hạn ngắn, kèm lý do là mã sự cố.
+
+</Reveal>
+
+<Reveal title="Chứng chỉ client có hết được hạn sớm không?">
+
+Không thu hồi được, nhưng có thể cấp với hạn ngắn ngay từ đầu. API server không kiểm danh sách thu hồi chứng chỉ (CRL) cho chứng chỉ client, nên cách duy nhất làm một chứng chỉ mất hiệu lực sớm là thay CA của cụm (mọi chứng chỉ khác cũng mất theo, K4.5 đã làm việc với chứng chỉ của cụm). Vì vậy chứng chỉ cho người nên được cấp qua API CertificateSigningRequest với `expirationSeconds` ngắn (vài giờ), và chứng chỉ break-glass `system:masters` là ngoại lệ, vẫn nên cấp với hạn ngắn bằng `kubeadm kubeconfig user --validity-period` và cấp lại theo lịch, được cất và canh như bước 6.
+
+</Reveal>
+
+<Reveal title="Bastion hay truy cập có danh tính (Teleport, Boundary)?">
+
+D2.4 đã dùng **bastion**: một máy SSH duy nhất mở ra ngoài, mọi kết nối vào trong đi qua nó. Bastion giảm bề mặt tấn công nhưng giữ nguyên khoá SSH dài hạn, và log của nó chỉ biết "khoá nào", không biết "người nào, phiên làm gì". **Truy cập có danh tính** (identity-aware access) thay bastion bằng một proxy đăng nhập qua SSO, cấp chứng chỉ SSH hoặc Kubernetes sống vài giờ cho từng phiên, áp RBAC và JIT, và ghi lại phiên. Hai sản phẩm hay gặp là Teleport (SSH, Kubernetes, database, web, RDP) và HashiCorp Boundary (SSH, database, Kubernetes qua TCP). Kiểm giấy phép của đúng phiên bản trước khi chọn: theo [thông báo của Teleport](https://github.com/gravitational/teleport/discussions/39158) (03/2024), mã nguồn là AGPLv3 nhưng binary Community Edition từ v16 dùng giấy phép riêng, chỉ miễn phí cho tổ chức dưới 100 nhân viên **và** dưới 10 triệu USD doanh thu định kỳ hằng năm, và bản cộng đồng không có một số tính năng như đăng nhập OIDC; Boundary dùng BSL 1.1 từ bản 0.14.0. Bài không làm lab với hai công cụ này.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết RoleBinding, cấu hình OIDC và kubeconfig `exec` nhanh, và hay sai ở: (1) gắn quyền cho user thay vì group; (2) đề xuất `edit` hay `admin` mà không nói chúng gồm Secret và impersonate ServiceAccount; (3) quên tiền tố cho username và group, để tên từ IdP trùng tên có sẵn; (4) dùng cờ `--oidc-*` cùng lúc với `--authentication-config` (API server sẽ không khởi động); (5) "sửa" lỗi khoá ngoài bằng cách phát `super-admin.conf` cho cả đội. Kiểm bằng lab: chạy `kiem-quyen.sh` cho mỗi group sau khi đổi RBAC, và chạy truy vấn break-glass trên audit log.
+
+</Callout>
+
+<Callout kind="link">
+
+K2.3 dạy RBAC và các quyền nguy hiểm mà bước 4 đo; K8.5 dạy audit log mà bước 5 và 6 dùng; K4.5 dạy chứng chỉ của cụm. D2.4 dạy SSH và bastion; D9.4 dạy CA nội bộ (step-ca); cùng ý tưởng cấp chứng chỉ ngắn hạn, áp cho SSH, là nền của truy cập có danh tính. D15.3 là cùng ý tưởng cho workload. D22 đi sâu IAM, SCP và Identity Center trên cloud; D24 là chặng về tuân thủ, nơi bạn biến yêu cầu của luật và tiêu chuẩn thành kiểm soát có bằng chứng; audit log của bài này là một trong những bằng chứng đó.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d15.5.mastery-thiet-ke">Thiết kế được mô hình truy cập của người cho một cụm production: SSO, group, quyền thường trực, JIT và break-glass, có lý do cho từng mức.</Check>
+
+<Check id="d15.5.mastery-ra-quyen">Rà được quyền của một group trên cụm bằng `kubectl auth can-i`, và chỉ ra được quyền nào nguy hiểm hơn tên role của nó.</Check>
+
+<Check id="d15.5.mastery-break-glass">Viết được quy trình break-glass: nơi cất, ai mở, cảnh báo khi dùng, việc phải làm sau khi dùng.</Check>
+
+</Mastery>

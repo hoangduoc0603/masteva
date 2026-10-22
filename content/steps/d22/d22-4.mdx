@@ -1,0 +1,827 @@
+---
+title: Game day và chaos engineering
+description: Chạy thí nghiệm chaos có giả thuyết trên trạng thái ổn định đo bằng SLO, giới hạn phạm vi ảnh hưởng và có điều kiện dừng tự động; phân biệt game day với chaos tự động và diễn tập cả con người lẫn runbook; rồi trên một cụm kind có Chaos Mesh 2.8, giết pod, chèn độ trễ mạng giữa hai service (và gặp cái bẫy của Service ClusterIP), đo tải thật trên từng pod rồi ép CPU với cường độ tăng dần, để một script gỡ thí nghiệm ngay khi SLO vượt ngưỡng, và ghi kết quả vào một mẫu game day.
+id: d22.4
+step: d22
+prerequisites: [d22.3]
+topics: [d22.game-day]
+status: verified
+verified:
+  date: 2026-10-19
+  os: macOS 14.4.1 (Docker Desktop)
+  tools:
+    docker: 29.8.0
+    kind: 0.33.0
+    kubernetes: 1.37.0 (kindest/node)
+    kubectl: 1.37.1
+    helm: 4.3.0
+    chaos-mesh: 2.8.5
+    prometheus: 3.15.0
+    jq: 1.8.2
+    curl: 8.4.0
+---
+
+<Goal>
+
+Tìm ra điểm yếu của hệ thống và của quy trình vào một buổi chiều đã hẹn trước, thay vì lúc 3 giờ sáng. Học xong bài này, bạn giải thích được:
+
+- Một thí nghiệm chaos khác "thử tắt một pod xem sao" ở đâu: giả thuyết, trạng thái ổn định, phạm vi ảnh hưởng, điều kiện dừng.
+- Vì sao một thí nghiệm có thể báo "đã tiêm lỗi thành công" mà hệ thống không hề bị ảnh hưởng, và cách nhận ra điều đó.
+- Vì sao nên mở rộng phạm vi và cường độ từng bước, và vì sao "một trên hai pod" không có nghĩa là một nửa người dùng.
+- Game day kiểm được những gì mà chaos chạy tự động không kiểm được: con người, runbook, kênh liên lạc.
+
+</Goal>
+
+<Knowledge>
+
+### Chaos engineering là thí nghiệm, không phải phá hoại
+
+Trang "Principles of Chaos Engineering" định nghĩa **chaos engineering** là môn thí nghiệm trên một hệ thống để xây dựng niềm tin vào khả năng chịu đựng điều kiện hỗn loạn ở production của nó. Mỗi thí nghiệm đi qua bốn bước:
+
+```text
+ 1. TRẠNG THÁI ỔN ĐỊNH          2. GIẢ THUYẾT                       3. BIẾN SỐ                    4. TÌM CÁCH BÁC BỎ
+ đầu ra đo được của hệ          "trạng thái ổn định sẽ giữ          sự kiện giống đời thật:       so trạng thái ổn định
+ thống khi bình thường:         nguyên khi …"                       server chết, mạng chậm,       của nhóm thí nghiệm
+ SLI lỗi, SLI chậm (D16)                                            CPU bị tranh, DNS hỏng        với nhóm đối chứng
+        │                                                                                                │
+        └────────────────── giả thuyết đứng vững → thêm niềm tin; bị bác bỏ → một điểm yếu để sửa ───────┘
+```
+
+Cùng trang đó nêu năm nguyên tắc nâng cao:
+
+| Nguyên tắc | Nghĩa trong thực hành |
+|---|---|
+| Giả thuyết xoay quanh trạng thái ổn định | Đo **đầu ra** người dùng thấy (thông lượng, tỉ lệ lỗi, độ trễ), không đo thuộc tính bên trong như CPU của một máy |
+| Biến số phản ánh sự kiện thật | Ưu tiên theo ảnh hưởng tiềm năng hoặc tần suất: máy chết, phản hồi sai định dạng, lưu lượng tăng vọt |
+| Chạy trên production | Chỉ traffic thật mới phản ánh đúng đường đi của request; môi trường khác cho niềm tin ít hơn |
+| Tự động hoá để chạy liên tục | Thí nghiệm chạy tay tốn công và không bền |
+| Giảm thiểu phạm vi ảnh hưởng | Người chạy thí nghiệm có trách nhiệm giữ thiệt hại nhỏ và khoanh lại được |
+
+Hai nguyên tắc "chạy trên production" và "giảm thiểu phạm vi" kéo nhau. Cách các đội cân bằng là đi từng bậc, mỗi bậc có điều kiện để lên bậc sau.
+
+### Trạng thái ổn định, phạm vi ảnh hưởng, điều kiện dừng
+
+**Trạng thái ổn định đo bằng SLO.** D16.1 đã có SLI lỗi và SLI chậm; chúng là thước đo tự nhiên của trạng thái ổn định. Lab dùng hai con số trong cửa sổ 1 phút: tỉ lệ request `/api` lỗi, và tỉ lệ request `/api` chậm hơn 300 ms. Cửa sổ ngắn vì thí nghiệm ngắn; error budget 30 ngày vẫn là giới hạn tổng của mọi thí nghiệm.
+
+**Giả thuyết phải cụ thể tới mức sai được.** Bài của Slack ở callout dưới đưa một ví dụ: dừng một MySQL master sẽ làm các request phụ thuộc database đó chậm thêm 20 giây, không làm chậm request khác, và gây dưới 1.000 request API lỗi, tất cả được client thử lại. Câu "hệ thống sẽ ổn" thì không bao giờ sai, nên không dạy được gì.
+
+**Phạm vi ảnh hưởng** (blast radius) là phần hệ thống và người dùng một thí nghiệm có thể làm hỏng. Các cần gạt, từ hẹp tới rộng:
+
+| Cần gạt | Hẹp | Rộng |
+|---|---|---|
+| Số đích | Một pod (`mode: one`) | Mọi pod (`mode: all`) |
+| Môi trường | Cụm thử, môi trường dev | Production |
+| Thời lượng | Vài chục giây, có `duration` | Không giới hạn |
+| Cường độ | Trễ 50 ms, 1 worker CPU | Trễ vài giây, ép hết CPU |
+| Phần traffic | Một phần trăm, một nhóm người dùng | Toàn bộ |
+
+Số đích chỉ là cách đo gần đúng của phạm vi: bước 6 cho thấy một pod có thể nhận gần hết lưu lượng hoặc gần như không có gì. Phạm vi thật tính bằng phần lưu lượng, phần người dùng bị ảnh hưởng.
+
+**Điều kiện dừng** (abort condition) là ngưỡng mà vượt qua thì gỡ thí nghiệm ngay, không bàn cãi: thường là một ngưỡng SLI chặt hơn ngưỡng alert page. Điều kiện dừng phải **tự động**: người đang hồi hộp xem dashboard phản ứng chậm hơn một script đo mỗi 5 giây. Chaos Mesh có sẵn một cơ chế cho việc này trong Workflow: node `StatusCheck` gửi request HTTP định kỳ, và với `abortWithStatusCheck: true` thì huỷ cả workflow khi kiểm tra thất bại. Tiêu chí của nó chỉ là mã trạng thái HTTP, nên muốn dừng theo SLO bạn cần một endpoint trả mã khác 200 khi SLO vượt ngưỡng. Lab viết script `guard` làm cùng việc đó ở phía máy bạn, để bạn thấy từng lần đo.
+
+Thêm một điều kiện trước: **không bắt đầu khi hệ thống chưa ổn định**. Thí nghiệm chạy chồng lên một sự cố đang diễn ra thì không đo được gì, và làm sự cố tệ hơn.
+
+<Check id="d22.4.nguyen-tac">Viết được một thí nghiệm chaos đủ bốn bước với giả thuyết đo được, chọn được cần gạt để giới hạn phạm vi ảnh hưởng, và đặt được điều kiện dừng tự động dựa trên SLI.</Check>
+
+### Chạy ở đâu, theo thứ tự nào
+
+| Bậc | Kiểm được | Không kiểm được |
+|---|---|---|
+| Bàn giấy (tabletop): đọc kế hoạch, đi qua từng bước trong đầu | Lỗ hổng hiển nhiên của kế hoạch, runbook thiếu | Hành vi thật của hệ thống |
+| Môi trường thử, cụm dev | Cơ chế tự phục hồi có chạy không, công cụ tiêm lỗi có đúng không | Hành vi dưới tải và dữ liệu thật |
+| Production, phạm vi nhỏ | Hệ thống thật, traffic thật | Tình huống phạm vi rộng |
+| Production, mở rộng dần | Giới hạn thật của dự phòng | |
+
+Mỗi bậc kết thúc bằng một quyết định đi tiếp hay dừng. Dừng ở một bậc không phải thất bại: nó có nghĩa là bậc đó đã tìm ra điều đáng sửa.
+
+### Game day và chaos tự động
+
+| | Game day | Chaos tự động |
+|---|---|---|
+| Lịch | Hẹn trước, công bố rộng | Liên tục, theo lịch (ví dụ `Schedule` của Chaos Mesh) |
+| Người | Cả nhóm có mặt, có người điều phối, đủ vai D17.1 | Không ai ngồi xem; kết quả thành alert hoặc báo cáo |
+| Kiểm | Hệ thống **và** con người: alert có tới không, runbook đúng không, kênh liên lạc chạy không, ai quyết | Hệ thống: một khả năng chịu lỗi đã biết vẫn còn sau mỗi lần thay đổi |
+| Phù hợp | Kịch bản mới, rủi ro chưa rõ, huấn luyện người trực | Kịch bản đã qua game day, chi phí thấp, kết quả tất định |
+
+Các dạng diễn tập đã gặp ở chặng này: Google có DiRT, đợt diễn tập khôi phục thảm hoạ toàn công ty, và Wheel of Misfortune, nơi một sự cố cũ được diễn lại với người mới đóng vai trực (D17.3). PagerDuty có Failure Friday hằng tuần, mỗi lần chỉ định một IC đang tập (SRE Workbook, chương Incident Response). Game day **diễn tập con người**: đặt người trực vào vai thật, cho page đi qua đúng đường thật, dùng runbook thật; ghi lại chỗ runbook sai, chỗ dashboard thiếu, chỗ không ai biết ai quyết. Một game day tốt thường kết thúc bằng một postmortem ngắn theo D17.3.
+
+<Callout kind="production">
+
+Theo bài viết của Slack Engineering năm 2019, từ tháng 1/2018 Slack chạy chương trình "Disasterpiece Theater": cố ý gây ra những lỗi có khả năng xảy ra và phải chịu được, ngay trên production. Mỗi buổi có giờ và địa điểm công bố trước, các chuyên gia liên quan có mặt; một hai người chủ trì viết kế hoạch chi tiết tới từng lệnh, ghi log, metric, alert cần theo dõi, runbook có thể cần, và một giả thuyết cụ thể. Buổi diễn tập luôn gây lỗi ở môi trường dev trước, rồi dừng lại quyết định có lên production hay không; họ cân nhắc huỷ nếu cơ chế tự phục hồi không chạy, chạy không trọn, quá lâu, hoặc nếu lỗi sẽ gây nhiều hơn một đợt tăng độ trễ ngắn cho khách hàng. Bài kể ba kết quả. Khi đọc lại kế hoạch cho một buổi về memcached, nhóm phát hiện thuật toán thay thế instance có thể để lại dữ liệu cache cũ, và xác nhận lỗi đó ở dev. Một buổi về phân vùng mạng cho 25% Channel Server phải thử ba lần mới tạo được đúng kiểu phân vùng: lần đầu cô lập máy nhiều hơn dự định vì quên lớp mạng mã hoá phủ lên, lần hai Consul định tuyến vòng qua phân vùng tốt tới mức không server nào hỏng. Và một kết quả âm: hệ thống đổi cấu hình dùng khi xử lý sự cố có "chế độ khẩn cấp" bỏ qua bước kiểm tra cần tới Slack, nhưng cả hai chế độ đều gửi thông báo vào một kênh Slack mà không có timeout, trong khi toàn bộ thao tác có timeout; nên khi chính Slack sập, chế độ khẩn cấp cũng không bao giờ đổi được cấu hình. Thí nghiệm này được dựng để tái hiện đúng một lần công cụ đó không chạy như mong đợi trong một sự cố tệ.
+
+</Callout>
+
+<Check id="d22.4.game-day">So sánh được game day với chaos chạy tự động về lịch, người tham gia, thứ được kiểm và khi nào dùng, và kể được những gì một game day kiểm ở con người và runbook.</Check>
+
+### Chaos Mesh hoạt động thế nào
+
+Chaos Mesh là một dự án của CNCF (mức incubating) tiêm lỗi vào Kubernetes bằng CRD. Hai thành phần chính:
+
+```text
+ bạn: kubectl apply NetworkChaos ──▶ chaos-controller-manager (Deployment)
+                                       chọn pod theo selector, mode; theo dõi duration
+                                       │ gRPC
+                                       ▼
+                                     chaos-daemon (DaemonSet, privileged, mỗi node một pod)
+                                       vào network namespace, PID namespace của container đích
+                                       chạy tc, iptables, stress-ng… như thể ở trong pod đó
+```
+
+| CRD | Tiêm | Lab dùng |
+|---|---|---|
+| `PodChaos` | Giết pod, làm pod hỏng, giết container | Có |
+| `NetworkChaos` | Trễ, mất gói, trùng gói, băng thông, phân vùng | Có |
+| `StressChaos` | Ép CPU, bộ nhớ trong container đích | Có |
+| `IOChaos`, `DNSChaos`, `TimeChaos`, `HTTPChaos` | Lỗi I/O, DNS, lệch đồng hồ, sửa HTTP | Không |
+| `Schedule`, `Workflow` | Chạy theo lịch; nối nhiều thí nghiệm, có `StatusCheck` | Không |
+
+Hai hệ quả cần biết. Thứ nhất, chaos-daemon chạy **privileged** và vào được mọi container trên node: ai tạo được CRD của Chaos Mesh thì gây được sự cố. Ở cụm thật, giới hạn quyền tạo các CRD này bằng RBAC (K2.3) và chỉ cho phép thí nghiệm trong một số namespace. Thứ hai, NetworkChaos tác động lên **mạng của pod được chọn**, lọc theo địa chỉ của pod đích; nó không biết gì về Service. Bước 5 cho bạn gặp hệ quả này.
+
+Lựa chọn khác: LitmusChaos (cũng là dự án CNCF, chạy thí nghiệm như workflow có điều kiện đánh giá), và các dịch vụ của cloud như AWS Fault Injection Service, Azure Chaos Studio cho tài nguyên ngoài Kubernetes.
+
+<Check id="d22.4.chaos-mesh">Mô tả được cách Chaos Mesh tiêm lỗi qua controller và daemon, chọn được loại CRD cho một kịch bản, và nêu được rủi ro bảo mật của chaos-daemon cùng cách giới hạn.</Check>
+
+</Knowledge>
+
+<Resources>
+
+- [Principles of Chaos Engineering](https://principlesofchaos.org/): định nghĩa, bốn bước, năm nguyên tắc nâng cao.
+- [Simulate Network Faults (Chaos Mesh)](https://chaos-mesh.org/docs/simulate-network-chaos-on-kubernetes/): `selector`, `target`, `direction` của NetworkChaos và yêu cầu kernel.
+- [Simulate Stress Scenarios (Chaos Mesh)](https://chaos-mesh.org/docs/simulate-heavy-stress-on-kubernetes/): `workers`, `load` của StressChaos.
+- [Status Check in Workflow (Chaos Mesh)](https://chaos-mesh.org/docs/status-check-in-workflow/): `StatusCheck` và `abortWithStatusCheck` để huỷ thí nghiệm tự động.
+- [Disasterpiece Theater (Slack Engineering)](https://slack.engineering/disasterpiece-theater-slacks-process-for-approachable-chaos-engineering/): bài trong callout; đọc phần chuẩn bị và ba kết quả.
+
+</Resources>
+
+<Practice>
+
+**Chuẩn bị:** Docker Desktop đang chạy, kind 0.33, kubectl 1.37 (`kubectl version --client` in 1.36, bản Docker Desktop cài vào `/usr/local/bin`, cũng được), Helm 4, `jq`, `curl`, `bc` (D0.2). Bài dùng image ứng dụng mẫu `d16-app:1.0.0` của D16.1; nếu `docker image inspect d16-app:1.0.0 --format '{{.Id}}'` báo `No such image`, chạy lại khối bước 1 của D16.1. Bài không cần hệ thống của D17.1 tới D17.3: dừng nó trước để nhường RAM (`cd ~/masteva-d22/ir && docker compose stop`). Lab tải image node kind (nếu chưa có), Prometheus và hai image của Chaos Mesh (khoảng 100 MB nén). Dùng cổng **9810** (Prometheus của cụm). Thư mục lab `~/masteva-d22/gameday`.
+
+Mọi terminal dùng cho bài cần dòng `export KUBECONFIG=~/masteva-d22/kubeconfig`, để kind ghi cấu hình vào thư mục lab thay vì `~/.kube/config`. Nếu mở terminal mới giữa bài, chạy lại dòng đó và `cd ~/masteva-d22/gameday`.
+
+**Profile máy:** cụm kind một node có Chaos Mesh, ứng dụng và Prometheus: bộ nhớ của các tiến trình khoảng 1,1 GiB; `docker stats` báo khoảng 1,3 tới 1,7 GiB cho container node vì tính cả page cache (khoảng 0,5 GiB, kernel thu hồi được khi thiếu bộ nhớ). Máy 8 GB với Docker VM 4 GB chạy được nếu không còn cụm hay hệ thống nào khác. **Thời gian:** khoảng 30 phút.
+
+### 1. Cụm và hệ thống
+
+Cụm một node, ghim image Kubernetes 1.37.0 theo digest, mở cổng NodePort 30090 của Prometheus ra `127.0.0.1:9810`. Hệ thống giống D17.1 nhưng chạy trên Kubernetes: `shop` và `stock` mỗi service 2 replica có readiness probe, `loadgen` 20 request mỗi giây. `shop` có giới hạn CPU 200m; bước 6 dùng tới nó. Prometheus tìm từng pod qua **headless Service** (Service không có ClusterIP, DNS trả về IP của từng pod sẵn sàng) và có hai recording rule: tỉ lệ request `/api` lỗi và tỉ lệ request `/api` chậm hơn 300 ms, trong cửa sổ 1 phút.
+
+<Terminal where="mac" title="~/masteva-d22/gameday">
+
+```bash
+export KUBECONFIG=~/masteva-d22/kubeconfig
+mkdir -p ~/masteva-d22/gameday && cd ~/masteva-d22/gameday
+cat > kind.yaml <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: d17-lab
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraPortMappings:
+      - { containerPort: 30090, hostPort: 9810, listenAddress: "127.0.0.1" }
+EOF
+kind create cluster --config kind.yaml > /dev/null 2>&1 || echo "kind create cluster lỗi: chạy lại 'kind create cluster --config kind.yaml' để xem lý do"
+kubectl wait --for=condition=Ready node --all --timeout=180s
+kind load docker-image d16-app:1.0.0 --name d17-lab > /dev/null 2>&1 && echo "đã nạp d16-app:1.0.0 vào node"
+cat > app.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata: { name: shop }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: shop, namespace: shop }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: shop } }
+  template:
+    metadata: { labels: { app: shop } }
+    spec:
+      containers:
+        - name: app
+          image: d16-app:1.0.0
+          env: [{ name: STOCK_URL, value: "http://stock:8080" }, { name: OTEL_SERVICE_NAME, value: shop }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 2 }
+          resources: { requests: { cpu: 100m, memory: 32Mi }, limits: { cpu: 200m, memory: 64Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: stock, namespace: shop }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: stock } }
+  template:
+    metadata: { labels: { app: stock } }
+    spec:
+      containers:
+        - name: app
+          image: d16-app:1.0.0
+          env: [{ name: OTEL_SERVICE_NAME, value: stock }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 2 }
+          resources: { requests: { cpu: 50m, memory: 32Mi }, limits: { cpu: 200m, memory: 64Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: loadgen, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: loadgen } }
+  template:
+    metadata: { labels: { app: loadgen } }
+    spec:
+      containers:
+        - name: app
+          image: d16-app:1.0.0
+          env: [{ name: MODE, value: loadgen }, { name: TARGET, value: "http://shop:8080" }, { name: RPS, value: "20" }]
+          resources: { requests: { cpu: 50m, memory: 32Mi }, limits: { cpu: 200m, memory: 64Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shop, namespace: shop }
+spec: { selector: { app: shop }, ports: [{ port: 8080 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: stock, namespace: shop }
+spec: { selector: { app: stock }, ports: [{ port: 8080 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shop-pods, namespace: shop }
+spec: { clusterIP: None, selector: { app: shop }, ports: [{ port: 8080 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: stock-pods, namespace: shop }
+spec: { clusterIP: None, selector: { app: stock }, ports: [{ port: 8080 }] }
+EOF
+cat > prometheus.yaml <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: prometheus, namespace: shop }
+data:
+  prometheus.yml: |
+    global: { scrape_interval: 5s, evaluation_interval: 5s }
+    rule_files: [/etc/prometheus/slo.yml]
+    scrape_configs:
+      - job_name: shop
+        dns_sd_configs: [{ names: [shop-pods.shop.svc.cluster.local], type: A, port: 8080, refresh_interval: 5s }]
+      - job_name: stock
+        dns_sd_configs: [{ names: [stock-pods.shop.svc.cluster.local], type: A, port: 8080, refresh_interval: 5s }]
+  slo.yml: |
+    groups:
+      - name: slo
+        rules:
+          - record: slo:error:ratio_rate1m
+            expr: |
+              (sum(rate(http_requests_total{job="shop", route=~"/api/.+", status=~"5.."}[1m])) or vector(0))
+              / sum(rate(http_requests_total{job="shop", route=~"/api/.+"}[1m]))
+          - record: slo:slow:ratio_rate1m
+            expr: |
+              1 - sum(rate(http_request_duration_seconds_bucket{job="shop", route=~"/api/.+", le="0.3"}[1m]))
+              / sum(rate(http_request_duration_seconds_count{job="shop", route=~"/api/.+"}[1m]))
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: prometheus, namespace: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: prometheus } }
+  template:
+    metadata: { labels: { app: prometheus } }
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+          args: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.retention.time=1d]
+          volumeMounts: [{ name: config, mountPath: /etc/prometheus }]
+          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 384Mi } }
+      volumes: [{ name: config, configMap: { name: prometheus } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: prometheus, namespace: shop }
+spec: { type: NodePort, selector: { app: prometheus }, ports: [{ port: 9090, nodePort: 30090 }] }
+EOF
+kubectl apply -f app.yaml -f prometheus.yaml | grep -c -E 'created|configured'
+kubectl -n shop wait --for=condition=Available deploy --all --timeout=180s
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+node/d17-lab-control-plane condition met
+đã nạp d16-app:1.0.0 vào node
+11
+deployment.apps/loadgen condition met
+deployment.apps/prometheus condition met
+deployment.apps/shop condition met
+deployment.apps/stock condition met
+```
+
+</Expected>
+
+`kind load docker-image` chép image `d16-app:1.0.0` từ Docker của bạn vào node kind, vì node không kéo được image chỉ có trên máy bạn. `11` là số đối tượng đã tạo. Lệnh `wait` cuối chờ mọi Deployment sẵn sàng.
+
+### 2. Cài Chaos Mesh
+
+Chart Chaos Mesh tải về dạng `.tgz` và chỉ được cài khi sha256 khớp với giá trị trong `index.yaml` chính thức của kho chart (`https://charts.chaos-mesh.org/index.yaml`, mục `chaos-mesh` bản 2.8.5). Các giá trị đặt cho kind:
+
+- `chaosDaemon.runtime=containerd` và `socketPath`: node kind dùng containerd, không dùng Docker; mặc định của chart là Docker.
+- `controllerManager.replicaCount=1`: mặc định là 3, quá nhiều cho cụm một node.
+- `dashboard.create=false`, `dnsServer.create=false`: lab không dùng giao diện web và DNSChaos.
+- Hai image ghim theo digest (`tag@sha256:…`) bằng cách đặt `image.tag` của từng thành phần; chart ghép thành `repository:tag`.
+
+<Terminal where="mac">
+
+```bash
+curl -sLO https://charts.chaos-mesh.org/chaos-mesh-2.8.5.tgz
+if echo "342aa09792d77c874d7ce7ca4083005bf7342c5aace12ea818010e20eac8cb54  chaos-mesh-2.8.5.tgz" | shasum -a 256 -c; then
+  helm install chaos-mesh ./chaos-mesh-2.8.5.tgz -n chaos-mesh --create-namespace \
+    --set chaosDaemon.runtime=containerd --set chaosDaemon.socketPath=/run/containerd/containerd.sock \
+    --set controllerManager.replicaCount=1 --set dashboard.create=false --set dnsServer.create=false \
+    --set controllerManager.image.tag=v2.8.5@sha256:942bff26d591537f655df50532e3880d73fa8b6fca34a233fc69f8ccfd36188d \
+    --set chaosDaemon.image.tag=v2.8.5@sha256:d794bf427ab1dfacfd51c2f417d26731ce46919637b1c83620f0afd40f580bd4 \
+    --wait --timeout 6m | grep -E '^(NAME|STATUS):'
+fi
+kubectl -n chaos-mesh get pods
+kubectl get crd | grep -c chaos-mesh.org
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+chaos-mesh-2.8.5.tgz: OK
+NAME: chaos-mesh
+STATUS: deployed
+NAME                                        READY   STATUS    RESTARTS   AGE
+chaos-controller-manager-69985b58ff-pj9sh   1/1     Running   0          64s
+chaos-daemon-fwjtk                          1/1     Running   0          64s
+23
+```
+
+</Expected>
+
+Nếu dòng đầu không phải `chaos-mesh-2.8.5.tgz: OK`, khối dừng ở đó và không cài gì. Hai pod: controller (nhận CRD, chọn đích) và daemon (một pod mỗi node, làm việc tiêm lỗi). Chart cài 23 CRD, kể cả những loại lab không dùng.
+
+### 3. Trạng thái ổn định, điều kiện dừng và mẫu game day
+
+Ba công cụ cho buổi game day. Script `slo` in hai SLI hiện tại. Script `guard` là điều kiện dừng tự động: trước hết nó từ chối chạy nếu `kubectl` không trỏ vào cụm `kind-d17-lab`, rồi chờ tối đa 2 phút cho hệ thống **ổn định** (lỗi dưới 0,5%, chậm dưới 1%) rồi mới áp thí nghiệm, đo SLI mỗi 5 giây, và gỡ thí nghiệm ngay khi một SLI vượt ngưỡng hoặc khi hết giờ; mọi dòng in ra được ghi vào `results/<tên thí nghiệm>.log`. File `gameday.md` là mẫu kế hoạch: mỗi thí nghiệm một giả thuyết, ngưỡng dừng, phạm vi, và chỗ ghi kết quả. Bạn viết giả thuyết **trước** khi chạy.
+
+<Terminal where="mac">
+
+```bash
+cat > slo <<'EOF'
+#!/bin/sh
+# slo: hai SLI của shop trong 1 phút qua (lỗi, chậm hơn 300 ms), theo phần trăm
+q() { curl -s localhost:9810/api/v1/query --data-urlencode "query=$1" | jq -r '.data.result[0].value[1] // "0" | tonumber * 10000 | round / 100'; }
+echo "$(date -u +%H:%M:%S)  lỗi $(q 'slo:error:ratio_rate1m')%  chậm $(q 'slo:slow:ratio_rate1m')%"
+EOF
+cat > guard <<'EOF'
+#!/bin/sh
+# guard <thí nghiệm.yaml> <số giây> <lỗi tối đa %> <chậm tối đa %>
+# Chờ trạng thái ổn định, áp thí nghiệm, đo SLI mỗi 5 giây, gỡ ngay khi vượt ngưỡng hoặc hết giờ.
+set -u
+ctx=$(kubectl config current-context 2>/dev/null)
+[ "$ctx" = kind-d17-lab ] || { echo "Sai cụm (context: ${ctx:-không có}). Chạy export KUBECONFIG=~/masteva-d22/kubeconfig"; exit 1; }
+f=$1 secs=$2 max_err=$3 max_slow=$4
+mkdir -p results
+log=results/$(basename "$f" .yaml).log
+q() { curl -s localhost:9810/api/v1/query --data-urlencode "query=$1" | jq -r '.data.result[0].value[1] // "0" | tonumber * 100'; }
+over() { [ "$(echo "$(q 'slo:error:ratio_rate1m') > $1 || $(q 'slo:slow:ratio_rate1m') > $2" | bc -l)" = 1 ]; }
+for i in $(seq 24); do over 0.5 1 || break; sleep 5; done
+if over 0.5 1; then echo "Chưa ở trạng thái ổn định sau 2 phút, không bắt đầu."; exit 1; fi
+{
+  kubectl apply -f "$f" > /dev/null || exit 1
+  echo "$(date -u +%H:%M:%S)  BẮT ĐẦU $f (dừng nếu lỗi > $max_err% hoặc chậm > $max_slow%)"
+  reason="hết giờ"
+  for i in $(seq $((secs / 5))); do
+    sleep 5
+    err=$(q 'slo:error:ratio_rate1m') slow=$(q 'slo:slow:ratio_rate1m')
+    printf '%s  +%3ss  lỗi %5.2f%%  chậm %5.2f%%\n' "$(date -u +%H:%M:%S)" $((i * 5)) "$err" "$slow"
+    if [ "$(echo "$err > $max_err || $slow > $max_slow" | bc -l)" = 1 ]; then reason="VƯỢT NGƯỠNG"; break; fi
+  done
+  kubectl delete -f "$f" > /dev/null
+  echo "$(date -u +%H:%M:%S)  DỪNG ($reason): đã gỡ thí nghiệm"
+} | tee "$log"
+EOF
+chmod +x slo guard
+cat > gameday.md <<'EOF'
+# Game day: shop chịu lỗi của stock và của chính nó
+
+Ngày: (điền) | Điều phối: (điền) | IC: (điền) | Ghi chép: (điền)
+Trạng thái ổn định: lỗi /api (1 phút) < 0,5%, chậm hơn 300 ms (1 phút) < 1%
+Môi trường: cụm kind d17-lab (bậc "môi trường thử")
+
+| # | Thí nghiệm | Giả thuyết | Phạm vi | Dừng khi |
+|---|---|---|---|---|
+| 1 | Giết 1 pod stock | Lỗi < 1%, chậm < 5%; Deployment tạo pod mới | 1 trên 2 pod stock | lỗi > 1% hoặc chậm > 5% |
+| 2 | Trễ 300 ms ± 50 ms giữa shop và stock | Lỗi giữ 0; chậm tăng vì checkout vượt 300 ms | mọi pod shop và stock | lỗi > 1% hoặc chậm > 10% |
+| 3a | Ép CPU mọi pod shop, 1 worker | Lỗi giữ 0, chậm < 10% | mọi pod shop, cường độ thấp | lỗi > 1% hoặc chậm > 10% |
+| 3b | Ép CPU mọi pod shop, 4 worker | Như 3a | mọi pod shop, cường độ cao | lỗi > 1% hoặc chậm > 10% |
+
+## Kết quả
+EOF
+for i in 1 2 3; do ./slo; sleep 10; done
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+17:30:48  lỗi 0%  chậm 0%
+17:30:58  lỗi 0%  chậm 0.11%
+17:31:08  lỗi 0%  chậm 0.12%
+```
+
+</Expected>
+
+Khi chạy một thí nghiệm, nếu `guard` im lặng một lúc trước khi in `BẮT ĐẦU`, nó đang chờ cửa sổ 1 phút sạch hết request lỗi hoặc chậm của thí nghiệm trước.
+
+Trạng thái ổn định: không lỗi, không request nào chậm hơn 300 ms (`products` mất 5 tới 25 ms, `checkout` khoảng 30 tới 100 ms). Nếu `slo` in ra số khác 0 ngay sau bước 1, chờ thêm một phút cho cửa sổ đầy. Đọc lại bảng giả thuyết: thí nghiệm 2 **dự đoán** SLI chậm sẽ tăng. Một thí nghiệm có thể có giả thuyết "sẽ hỏng theo cách này", để kiểm rằng hệ thống hỏng đúng như bạn nghĩ và điều kiện dừng thật sự dừng nó.
+
+<Check id="d22.4.lab-guard">Đo được trạng thái ổn định bằng SLI từ Prometheus, viết được script điều kiện dừng tự động có kiểm trạng thái ổn định trước khi bắt đầu, và viết được giả thuyết, phạm vi, ngưỡng dừng cho từng thí nghiệm trước khi chạy.</Check>
+
+### 4. Thí nghiệm 1: giết một pod stock
+
+<Callout kind="danger">
+
+Từ bước này, các thí nghiệm giết pod, làm chậm mạng và ép CPU trên cụm mà `kubectl` đang trỏ tới. `guard` từ chối chạy nếu `kubectl config current-context` không phải `kind-d17-lab`; nếu nó báo sai cụm, chạy lại `export KUBECONFIG=~/masteva-d22/kubeconfig`. Mọi thao tác thủ công với `kubectl` cũng nên kiểm context trước. Ở cụm thật, đây là lúc báo trong kênh chung rằng buổi diễn tập bắt đầu.
+
+</Callout>
+
+`PodChaos` với `action: pod-kill`, `mode: one`: Chaos Mesh chọn ngẫu nhiên một pod `stock` và xoá nó. Deployment sẽ tạo pod thay thế.
+
+<Terminal where="mac">
+
+```bash
+cat > pod-kill.yaml <<'EOF'
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata: { name: kill-stock, namespace: shop }
+spec:
+  action: pod-kill
+  mode: one
+  selector: { namespaces: [shop], labelSelectors: { app: stock } }
+EOF
+./guard pod-kill.yaml 60 1 5
+kubectl -n shop get pods -l app=stock
+```
+
+</Terminal>
+
+<Predict question="Một trong hai pod stock bị xoá. Bao nhiêu phần trăm request lỗi?">
+
+```text
+17:31:29  BẮT ĐẦU pod-kill.yaml (dừng nếu lỗi > 1% hoặc chậm > 5%)
+17:31:34  +  5s  lỗi  0.00%  chậm  0.12%
+17:31:39  + 10s  lỗi  0.00%  chậm  0.12%
+…
+17:32:24  + 55s  lỗi  0.00%  chậm  0.00%
+17:32:29  + 60s  lỗi  0.00%  chậm  0.00%
+17:32:30  DỪNG (hết giờ): đã gỡ thí nghiệm
+NAME                     READY   STATUS    RESTARTS   AGE
+stock-69b87f4844-2g4w2   1/1     Running   0          4m8s
+stock-69b87f4844-k7tzf   1/1     Running   0          61s
+```
+
+Không request nào lỗi, gần như không request nào chậm, trong suốt 60 giây (kết quả mẫu bỏ bớt các dòng giữa; 0,12% chậm ở vài lần đo đầu là vài request chậm từ trước khi thí nghiệm bắt đầu, vẫn trong cửa sổ 1 phút, và dưới ngưỡng ổn định 1%). Pod `stock` có `AGE` 60 giây là pod Deployment tạo thay pod vừa bị xoá. Giả thuyết đứng vững. Nhưng hãy đọc nó cho đúng: nó đúng **ở tải này và với kiểu chết này**; phần Đào sâu bàn các biến thể đáng thử tiếp. Con số trên máy bạn có thể là vài phần trăm của một phần trăm nếu đúng lúc pod chết có request đang dở; vẫn dưới ngưỡng 1%.
+
+</Predict>
+
+<Check id="d22.4.lab-pod-kill">Chạy được thí nghiệm giết pod có điều kiện dừng, đọc được kết quả so với giả thuyết, và kiểm được Deployment đã thay pod.</Check>
+
+### 5. Thí nghiệm 2: độ trễ mạng, và một cái bẫy
+
+Cách viết "tự nhiên" của thí nghiệm: chọn các pod `shop` (`selector`), làm chậm gói tin **đi tới** (`direction: to`) các pod `stock` (`target`) thêm 300 ms ± 50 ms. Chạy 60 giây và xem.
+
+<Terminal where="mac">
+
+```bash
+cat > delay-shop-stock.yaml <<'EOF'
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata: { name: delay-shop-stock, namespace: shop }
+spec:
+  action: delay
+  mode: all
+  selector: { namespaces: [shop], labelSelectors: { app: shop } }
+  direction: to
+  target:
+    mode: all
+    selector: { namespaces: [shop], labelSelectors: { app: stock } }
+  delay: { latency: 300ms, jitter: 50ms }
+  duration: 5m
+EOF
+kubectl apply -f delay-shop-stock.yaml > /dev/null && sleep 5
+kubectl -n shop get networkchaos delay-shop-stock -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"  "}{end}'; echo
+kubectl delete -f delay-shop-stock.yaml > /dev/null
+./guard delay-shop-stock.yaml 60 1 10 | tail -3
+```
+
+</Terminal>
+
+<Predict question="Chaos Mesh báo đã tiêm lỗi. SLI chậm có tăng không?">
+
+```text
+Selected=True  AllInjected=True  AllRecovered=False  Paused=False  
+17:33:51  + 55s  lỗi  0.00%  chậm  0.00%
+17:33:56  + 60s  lỗi  0.00%  chậm  0.00%
+17:33:56  DỪNG (hết giờ): đã gỡ thí nghiệm
+```
+
+Không. Chaos Mesh báo `AllInjected=True`: nó đã cài độ trễ vào mạng của cả hai pod `shop`. Nhưng suốt 60 giây, không request nào chậm hơn 300 ms. Thứ tự các điều kiện trên dòng đầu có thể khác trên máy bạn. Đây là kết quả nguy hiểm nhất của một thí nghiệm: không phải "hệ thống chịu được độ trễ", mà là **thí nghiệm không làm điều nó nói**. Nếu bạn ghi "giả thuyết sai, hệ thống miễn nhiễm với mạng chậm" vào báo cáo, bạn vừa tạo ra niềm tin giả.
+
+Vì sao? `shop` gọi `stock` qua Service, tức gửi tới **ClusterIP** của `stock` (`http://stock:8080`). K2.1 đã dạy: việc đổi ClusterIP thành IP của một pod (DNAT) do luật của kube-proxy làm **trên node**, sau khi gói tin đã rời pod `shop`. Chaos Mesh cài độ trễ trong mạng của pod `shop` và chỉ áp cho gói tin có **đích là IP của pod `stock`** (lấy từ `target`); trong pod `shop`, đích của gói tin vẫn là ClusterIP, nên không gói nào khớp. Cách nhận ra: luôn so SLI với giả thuyết, và nghi thí nghiệm trước khi tin kết quả "không có gì xảy ra".
+
+</Predict>
+
+Bản sửa đảo chiều: chọn pod `stock`, làm chậm gói **đi tới** pod `shop`. Phản hồi của `stock` gửi thẳng tới IP của pod `shop` (việc dịch ngược địa chỉ của Service xảy ra ở node), nên bộ lọc theo IP khớp. Request vẫn nhanh, phản hồi chậm 300 ms: với người gọi, kết quả như nhau.
+
+<Terminal where="mac">
+
+```bash
+cat > delay-stock-shop.yaml <<'EOF'
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata: { name: delay-stock-shop, namespace: shop }
+spec:
+  action: delay
+  mode: all
+  selector: { namespaces: [shop], labelSelectors: { app: stock } }
+  direction: to
+  target:
+    mode: all
+    selector: { namespaces: [shop], labelSelectors: { app: shop } }
+  delay: { latency: 300ms, jitter: 50ms }
+  duration: 5m
+EOF
+./guard delay-stock-shop.yaml 120 1 10
+kubectl get networkchaos -A
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+17:34:17  BẮT ĐẦU delay-stock-shop.yaml (dừng nếu lỗi > 1% hoặc chậm > 10%)
+17:34:22  +  5s  lỗi  0.00%  chậm  0.00%
+17:34:27  + 10s  lỗi  0.00%  chậm  0.22%
+17:34:32  + 15s  lỗi  0.00%  chậm  1.96%
+17:34:37  + 20s  lỗi  0.00%  chậm  3.22%
+17:34:42  + 25s  lỗi  0.00%  chậm  5.86%
+17:34:47  + 30s  lỗi  0.00%  chậm  8.33%
+17:34:52  + 35s  lỗi  0.00%  chậm 10.08%
+17:34:52  DỪNG (VƯỢT NGƯỠNG): đã gỡ thí nghiệm
+No resources found
+```
+
+</Expected>
+
+- SLI chậm tăng dần, khoảng 1,5 tới 2,5% mỗi 5 giây: cửa sổ 1 phút đầy dần bằng request `checkout` chậm (mỗi request đặt hàng giờ mất hơn 300 ms). Nếu để chạy đủ một phút, nó sẽ lên quanh 25%, đúng phần `checkout` trong request `/api`.
+- SLI lỗi giữ 0: 300 ms vẫn dưới mọi timeout (`shop` chờ `stock` 3 giây, khách chờ 2 giây). Giả thuyết của thí nghiệm 2 đứng vững: hỏng đúng như dự đoán, chỉ về độ trễ.
+- `guard` gỡ thí nghiệm ở lần đo đầu tiên vượt 10%, khoảng 30 đến 45 giây sau khi bắt đầu; mốc chính xác trên máy bạn lệch vài giây. `kubectl get networkchaos -A` trống: không còn gì cài trong mạng của pod. Không có điều kiện dừng, thí nghiệm sẽ chạy đủ 5 phút (`duration`), tiêu error budget của SLO latency suốt thời gian đó.
+
+<Check id="d22.4.lab-delay">Nhận ra được một thí nghiệm "đã tiêm" mà không có tác dụng bằng cách so SLI với giả thuyết, giải thích được vì sao NetworkChaos lọc theo IP pod không bắt được lời gọi qua ClusterIP ở chiều đi, sửa được thí nghiệm, và thấy được điều kiện dừng tự động gỡ nó.</Check>
+
+### 6. Thí nghiệm 3: ép CPU, tăng cường độ từng bước
+
+Trước khi chọn đích, xem tải đang chia cho hai pod `shop` thế nào. Lệnh đầu in tên và IP của pod; lệnh sau hỏi Prometheus số request `/api` mỗi giây của từng pod (label `instance` là IP và cổng của pod).
+
+<Terminal where="mac">
+
+```bash
+kubectl -n shop get pods -l app=shop -o custom-columns=POD:.metadata.name,IP:.status.podIP --no-headers
+curl -s localhost:9810/api/v1/query --data-urlencode 'query=sum by (instance) (rate(http_requests_total{job="shop", route=~"/api/.+"}[1m]))' \
+  | jq -r '.data.result[] | "\(.metric.instance)  \(.value[1] | tonumber | . * 10 | round / 10) request/giây"'
+```
+
+</Terminal>
+
+<Predict question="Service chia tải cho hai pod. Mỗi pod nhận khoảng 8 request mỗi giây?">
+
+```text
+shop-d55b97f77-gxg6n   10.244.0.6
+shop-d55b97f77-pzg82   10.244.0.5
+10.244.0.6:8080  3.8 request/giây
+10.244.0.5:8080  11.9 request/giây
+```
+
+Có thể gần như vậy, hoặc lệch hẳn: kết quả mẫu là 3,8 và 11,9; có lần bạn sẽ thấy 1,6 và 14,7, có lần 7,4 và 8,4. Chạy lại khối này sau khi khởi động lại `loadgen` (`kubectl -n shop rollout restart deploy/loadgen`, chờ hơn một phút) và bạn có thể thấy kiểu chia khác. K2.1 đã giải thích: Service cân bằng tải **theo kết nối**, chọn pod một lần lúc kết nối TCP mở; `loadgen` dùng lại vài kết nối keep-alive, nên phân bố phụ thuộc mấy kết nối đó rơi vào pod nào.
+
+Hệ quả cho game day: "ép CPU một trong hai pod" có thể ảnh hưởng gần hết người dùng, hoặc gần như không ai, tuỳ lúc. Phạm vi ảnh hưởng phải đo bằng lưu lượng, không bằng số pod.
+
+</Predict>
+
+`StressChaos` chạy `stress-ng` **bên trong cgroup của container đích**, nên các tiến trình ép CPU tranh phần 200m mà container `shop` được phép dùng; khi cả container dùng hết hạn mức của một chu kỳ 100 ms, mọi tiến trình trong nó, kể cả ứng dụng, phải chờ chu kỳ sau (throttle, K1.2). Vì tải chia không đều, thí nghiệm này chọn **mọi** pod `shop` và tăng **cường độ** từng bước: 1 worker (3a), rồi chỉ khi giả thuyết đứng vững mới lên 4 worker (3b).
+
+<Terminal where="mac">
+
+```bash
+cat > stress-1.yaml <<'EOF'
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata: { name: cpu-shop, namespace: shop }
+spec:
+  mode: all
+  selector: { namespaces: [shop], labelSelectors: { app: shop } }
+  stressors:
+    cpu: { workers: 1, load: 100 }
+  duration: 5m
+EOF
+./guard stress-1.yaml 60 1 10 | tail -3
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+17:36:53  + 55s  lỗi  0.00%  chậm  0.00%
+17:36:58  + 60s  lỗi  0.00%  chậm  0.00%
+17:36:59  DỪNG (hết giờ): đã gỡ thí nghiệm
+```
+
+</Expected>
+
+Một worker ép CPU trong mỗi pod `shop` gần như không làm request nào chậm hơn 300 ms trong 60 giây: ứng dụng vẫn còn đủ phần CPU trong giới hạn 200m. Giả thuyết 3a đứng vững, nên được phép lên cường độ cao hơn.
+
+<Terminal where="mac">
+
+```bash
+sed -e 's/workers: 1/workers: 4/' stress-1.yaml > stress-4.yaml
+./guard stress-4.yaml 60 1 10
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+17:37:09  BẮT ĐẦU stress-4.yaml (dừng nếu lỗi > 1% hoặc chậm > 10%)
+17:37:14  +  5s  lỗi  0.00%  chậm  0.00%
+17:37:19  + 10s  lỗi  0.00%  chậm  0.00%
+17:37:24  + 15s  lỗi  0.00%  chậm  3.04%
+17:37:29  + 20s  lỗi  0.00%  chậm  6.29%
+17:37:34  + 25s  lỗi  0.00%  chậm  9.06%
+17:37:39  + 30s  lỗi  0.00%  chậm 10.77%
+17:37:40  DỪNG (VƯỢT NGƯỠNG): đã gỡ thí nghiệm
+```
+
+</Expected>
+
+Bốn worker trong mỗi pod: SLI chậm tăng đều và vượt 10% sau khoảng 30 đến 45 giây, `guard` gỡ thí nghiệm. Giả thuyết 3b bị bác bỏ: `shop` không chịu được việc bị tranh phần lớn CPU trong giới hạn 200m. Đó là một phát hiện thật, không phải thất bại của buổi diễn tập: nó cho biết `shop` chậm đi thế nào khi một tiến trình khác trong cùng container (một thư viện chạy nền, một job ghi log nặng) ăn CPU, và dẫn tới các câu hỏi cho việc cần làm: giới hạn 200m có hợp lý không, có alert nào về throttle không (D5.1 đọc `nr_throttled`). Đi từ 1 worker lên 4 worker, thay vì bắt đầu ở 4, là cách giữ phạm vi ảnh hưởng nhỏ nhất có thể cho tới khi biết hệ thống chịu được tới đâu.
+
+<Check id="d22.4.lab-stress">Đo được tải thật trên từng pod trước khi chọn phạm vi thí nghiệm, giải thích được vì sao số pod bị chọn không cho biết phần người dùng bị ảnh hưởng, và tăng được cường độ thí nghiệm từng bước tới khi điều kiện dừng kích hoạt.</Check>
+
+### 7. Ghi kết quả và rút kinh nghiệm
+
+Script `gd-summary` đọc các file trong `results/` và in một dòng cho mỗi thí nghiệm: SLI lỗi và chậm lớn nhất đã đo, cách thí nghiệm kết thúc. Kết quả được nối vào `gameday.md`.
+
+<Terminal where="mac">
+
+```bash
+cat > gd-summary <<'EOF'
+#!/bin/sh
+# gd-summary: mỗi thí nghiệm trong results/ một dòng: lỗi lớn nhất, chậm lớn nhất, cách kết thúc
+echo "| Thí nghiệm | Lỗi lớn nhất | Chậm lớn nhất | Kết thúc |"
+echo "|---|---|---|---|"
+for f in results/*.log; do
+  awk -v name="$(basename "$f" .log)" '
+    /s  lỗi/ { split($0, a, "lỗi"); split(a[2], b, "chậm"); e = b[1] + 0; s = b[2] + 0
+               if (e > me) me = e; if (s > ms) ms = s }
+    /DỪNG/ { sub(/.*DỪNG \(/, ""); sub(/\).*/, ""); how = $0 }
+    END { printf "| %s | %.2f%% | %.2f%% | %s |\n", name, me, ms, how }' "$f"
+done
+EOF
+chmod +x gd-summary
+./gd-summary | tee -a gameday.md
+```
+
+</Terminal>
+
+<Expected>
+
+```text
+| Thí nghiệm | Lỗi lớn nhất | Chậm lớn nhất | Kết thúc |
+|---|---|---|---|
+| delay-shop-stock | 0.00% | 0.00% | hết giờ |
+| delay-stock-shop | 0.00% | 10.08% | VƯỢT NGƯỠNG |
+| pod-kill | 0.00% | 0.12% | hết giờ |
+| stress-1 | 0.00% | 0.00% | hết giờ |
+| stress-4 | 0.00% | 10.77% | VƯỢT NGƯỠNG |
+```
+
+</Expected>
+
+So bảng kết quả với bảng giả thuyết ở đầu `gameday.md`:
+
+| # | Giả thuyết | Kết quả | Việc cần làm (ví dụ) |
+|---|---|---|---|
+| 1 | Lỗi dưới 1% khi mất một pod `stock` | Đứng vững ở tải 20 request mỗi giây | Lặp lại ở tải cao (D18.1) và với `gracePeriod` khác 0 |
+| 2 (bản đầu) | Chậm tăng | **Thí nghiệm không có tác dụng**: lọc theo IP pod không bắt lời gọi qua ClusterIP | Ghi vào hướng dẫn chaos của đội: kiểm SLI thay đổi trước khi tin kết quả; mẫu NetworkChaos theo chiều phản hồi |
+| 2 | Chậm tăng, lỗi giữ 0 | Đứng vững; điều kiện dừng gỡ thí nghiệm sau khoảng 30 đến 45 giây | Alert ticket khi `stock` chậm (như `StockSlow` ở D17.2) |
+| 3a | Lỗi 0, chậm dưới 10% với 1 worker | Đứng vững | Không |
+| 3b | Như 3a với 4 worker | **Bị bác bỏ**: chậm vượt 10% sau khoảng 30 đến 45 giây | Xem lại giới hạn CPU của `shop`, thêm metric throttle vào dashboard |
+
+Phần còn lại của buổi game day là phần không script nào làm được. Theo câu hỏi rút kinh nghiệm của Slack ở callout: mất bao lâu để phát hiện và xử lý, người dùng có nhận ra không, có ai phải can thiệp tay không, điều gì đáng sợ, tài liệu nào sai, dashboard nào cũ. Ghi câu trả lời vào `gameday.md`, và biến mỗi giả thuyết bị bác bỏ thành việc cần làm có chủ và hạn theo cách của D17.3.
+
+<Check id="d22.4.lab-ket-qua">Tổng hợp được kết quả game day so với từng giả thuyết, và chuyển được mỗi giả thuyết bị bác bỏ thành việc cần làm có chủ và hạn.</Check>
+
+### Khi gặp lỗi
+
+<Callout kind="pitfall">
+
+- **`helm install` báo `cluster unreachable` hoặc trỏ tới `localhost:8080`:** thiếu `export KUBECONFIG=~/masteva-d22/kubeconfig` trong terminal này.
+- **Pod `chaos-daemon` ở `CrashLoopBackOff`, log nói không kết nối được `docker.sock`:** thiếu hai cờ `chaosDaemon.runtime` và `socketPath`; chart mặc định dùng Docker, node kind dùng containerd.
+- **`guard` in `Chưa ở trạng thái ổn định sau 2 phút`:** một thí nghiệm trước chưa được gỡ, hoặc hệ thống đang chậm vì máy bận. `kubectl get podchaos,networkchaos,stresschaos -A` phải trống; xem `./slo`.
+- **`slo` in `lỗi 0%  chậm 0%` ngay cả khi thí nghiệm đang chạy và bạn tin nó có tác dụng:** kiểm Prometheus có scrape được pod không: `curl -s localhost:9810/api/v1/targets | jq -r '.data.activeTargets[] | "\(.labels.job) \(.health)"'`.
+- **NetworkChaos báo lỗi về `netem`:** kernel của node không có module `sch_netem`. Kernel của Docker Desktop có sẵn; trên Linux, `sudo modprobe sch_netem`.
+- **Lệnh `kubectl delete` trong `guard` treo:** controller của Chaos Mesh đang gỡ lỗi khỏi pod (có finalizer). Chờ; nếu treo quá một phút, xem log của `chaos-controller-manager`.
+
+</Callout>
+
+### Dọn dẹp
+
+<Callout kind="danger">
+
+Khối dưới xoá cụm `d17-lab` (mọi pod, Chaos Mesh, dữ liệu Prometheus của cụm) và thư mục `~/masteva-d22/gameday` gồm `gameday.md` và `results/`. Chép những gì muốn giữ ra chỗ khác trước. Kiểm `kind get clusters` để chắc tên cụm.
+
+</Callout>
+
+<Terminal where="mac" title="Xoá cụm và thư mục lab">
+
+```bash
+kind delete cluster --name d17-lab
+cd ~ && rm -rf ~/masteva-d22/gameday ~/masteva-d22/kubeconfig
+```
+
+</Terminal>
+
+Nếu đã dọn hệ thống của D17.1 tới D17.3 theo cuối D17.3, thư mục `~/masteva-d22` giờ trống. `rmdir` chỉ xoá được thư mục rỗng, nên nó báo lỗi thay vì xoá nếu còn sót gì:
+
+<Terminal where="mac">
+
+```bash
+rmdir ~/masteva-d22
+```
+
+</Terminal>
+
+</Practice>
+
+<DeepDive>
+
+<Reveal title="Pod-kill không gây lỗi nào, vậy là hệ thống chịu được pod chết?">
+
+Chịu được **kiểu chết này, ở tải này**. Theo tài liệu Chaos Mesh, `pod-kill` xoá pod với `gracePeriod` mặc định là 0, tức không chờ ứng dụng tắt êm; pod biến mất khỏi Service ngay và Deployment tạo pod mới. Ở khoảng 4 request mỗi giây vào `stock`, mỗi request vài chục mili giây, gần như không có request nào đang dở đúng lúc pod chết, nên không có gì để hỏng. Những biến thể đáng thử tiếp, mỗi cái là một giả thuyết riêng: tải cao hơn nhiều (D18.1) để luôn có request đang dở; `gracePeriod: 30` để kiểm đường tắt êm của ứng dụng (D1.1, K1.3); `action: pod-failure` để pod còn đó nhưng không phục vụ; giết cả hai pod cùng lúc để xem alert nào kêu và PDB (K5.2) có ngăn được không (PDB chỉ chặn việc xoá đi qua eviction, không chặn một lệnh xoá trực tiếp).
+
+</Reveal>
+
+<Reveal title="Có nên chạy chaos trên production không?">
+
+Nguyên tắc nói có, vì chỉ production có traffic và cấu hình thật. Điều kiện để làm điều đó có trách nhiệm: đã qua bậc môi trường thử; có điều kiện dừng tự động và người có quyền dừng tay; phạm vi bắt đầu nhỏ; error budget còn đủ (D16.1: thí nghiệm tiêu budget như sự cố thật); giờ chạy là giờ đủ người. Slack ở callout chỉ lên production sau khi dev cho kết quả tốt, và coi việc dừng ở dev là một kết quả có giá trị. Một tổ chức chưa có SLO và alert đáng tin thì chưa nên chạy chaos trên production: bạn không đo được mình đã làm hỏng gì.
+
+</Reveal>
+
+<Reveal title="Game day thì diễn tập con người thế nào cho thật?">
+
+Vài cách tăng dần: báo trước cả kịch bản (người trực biết sắp có gì, tập công cụ); chỉ báo trước khung giờ (người trực phải tự phát hiện và chẩn đoán, như D17.1); không báo trước cho người trực nhưng có người điều phối theo dõi và dừng được bất cứ lúc nào. Ghi lại thời gian từ lúc tiêm lỗi tới page, tới ack, tới tuyên bố, tới giảm thiệt hại; so với sự cố thật trong postmortem (D17.3). Diễn lại một postmortem cũ là kịch bản tốt: nó kiểm các việc cần làm của postmortem đó đã thật sự có tác dụng chưa. SRE Workbook cũng gợi ý luyện bằng cách coi một sự cố nhỏ như sự cố lớn, để quy trình được dùng thật mà rủi ro thấp.
+
+</Reveal>
+
+<Reveal title="Chạy chaos tự động liên tục thì cần gì thêm?">
+
+Một thí nghiệm đã qua game day và có kết quả ổn định có thể chuyển thành `Schedule` của Chaos Mesh, hoặc thành một bước trong pipeline sau mỗi lần triển khai lên môi trường thử. Cần thêm: điều kiện dừng không phụ thuộc người (Workflow với `StatusCheck` và `abortWithStatusCheck`, trỏ vào một endpoint trả lỗi khi SLO vượt ngưỡng); kết quả đi vào nơi có người đọc (alert ticket khi giả thuyết bị bác bỏ); giới hạn quyền tạo thí nghiệm; và một công tắc tắt toàn bộ chaos khi có sự cố thật, để không ai phải đoán lỗi đang thấy là thí nghiệm hay thật.
+
+</Reveal>
+
+<Callout kind="ai">
+
+AI viết manifest Chaos Mesh và kế hoạch game day nhanh. Chỗ hay sai: dùng trường của phiên bản cũ hay của LitmusChaos; viết NetworkChaos với `target` là pod phía server và `direction: to` rồi khẳng định nó tác động lên lời gọi qua Service (đúng cái bẫy của bước 5); quên `duration` nên thí nghiệm chạy mãi nếu không ai gỡ; viết giả thuyết không đo được ("hệ thống sẽ ổn định"); và đề xuất chạy thẳng trên production. Kiểm lại: so trường với tài liệu của đúng bản Chaos Mesh đang chạy; chạy thí nghiệm với `guard` và xem SLI có đổi như giả thuyết không; nếu không đổi gì, nghi thí nghiệm trước khi tin hệ thống.
+
+</Callout>
+
+<Callout kind="link">
+
+D16.1 cung cấp SLI làm trạng thái ổn định; D17.1 là quy trình người trực theo trong game day; D17.2 là runbook và lịch trực được diễn tập; D17.3 là nơi kết quả game day thành việc cần làm. K5.2 (PDB) và K1.3 (probe, tắt êm) là các cơ chế thí nghiệm 1 kiểm; D18.2 (timeout, bỏ việc quá hạn) là cách xử lý điều thí nghiệm 2 cho thấy; D18.1 dạy kiểm thử tải, cần cho biến thể tải cao. D20 dùng cùng cách tư duy cho diễn tập khôi phục và chuyển vùng.
+
+</Callout>
+
+</DeepDive>
+
+<Mastery>
+
+<Check id="d22.4.mastery-ke-hoach">Lập được kế hoạch game day cho một dịch vụ: trạng thái ổn định theo SLO, ba tới năm thí nghiệm có giả thuyết đo được, phạm vi tăng dần, điều kiện dừng tự động, vai của người tham gia.</Check>
+
+<Check id="d22.4.mastery-chay">Chạy được thí nghiệm bằng Chaos Mesh với điều kiện dừng, nhận ra được thí nghiệm không có tác dụng, và giải thích được kết quả bằng cơ chế của Kubernetes và của công cụ.</Check>
+
+<Check id="d22.4.mastery-hoc">Chuyển được kết quả một game day thành việc cần làm theo cách của postmortem, và chọn được thí nghiệm nào nên chuyển thành chaos chạy tự động.</Check>
+
+</Mastery>
