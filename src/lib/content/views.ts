@@ -110,6 +110,7 @@ export interface RoadmapView {
   title: string;
   description: string;
   recommended: StepRef[];
+  notTaught: { name: string; reason: string }[];
   levels: LevelView[];
   stepCount: number;
   topicCount: number;
@@ -275,6 +276,7 @@ export function buildRoadmapView(input: ViewInput, roadmapId: string): RoadmapVi
     title: pick(roadmap.title, input.lang),
     description: pick(roadmap.description, input.lang),
     recommended: roadmap.recommended.map(idx.stepRef),
+    notTaught: roadmap.notTaught.map((n) => ({ name: n.name, reason: pick(n.reason, input.lang) })),
     levels,
     stepCount: number,
     topicCount: levels.flatMap((l) => l.steps).reduce((n, s) => n + s.topics.length, 0),

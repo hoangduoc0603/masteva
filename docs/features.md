@@ -17,7 +17,7 @@ Ký hiệu giai đoạn:
 
 1. Vào trang chủ, xem danh sách roadmap (hoặc tìm theo tên roadmap, chủ đề), chọn một roadmap (ví dụ "Java backend, từ nền tảng tới Senior").
 2. Xem các bước theo thứ tự, biết bước nào đã xong và bước nào tiếp theo.
-3. Mở một bước, học bài theo khung 6 phần: mục tiêu, kiến thức, tài liệu, thực hành, đào sâu, dấu hiệu nắm chắc.
+3. Mở một bước, học bài theo khung của dạng bài: bài đọc có mục tiêu, kiến thức, tài liệu; bài lab thêm thực hành, đào sâu, dấu hiệu nắm chắc.
 4. Làm lab trên máy mình theo hướng dẫn, so kết quả với kết quả mong đợi.
 5. Trả lời câu hỏi tự kiểm tra, đánh dấu hoàn thành từng mục.
 6. Tới mốc dự án thì làm phần dự án tương ứng.

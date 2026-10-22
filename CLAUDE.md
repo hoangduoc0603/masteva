@@ -44,8 +44,9 @@ TDD bắt buộc chỉ cho logic lõi: tiến độ (`src/lib/progress`), kiểm
 Theo `docs/content-standard.md`. Những điểm hay sai:
 
 - Bài nằm ở `content/steps/<bước>/<mã-bài>.mdx`, ví dụ `d1/d1-1.mdx` với `id: d1.1`. Thêm slug vào `pages` trong `meta.json` của bước.
-- Đủ 6 component theo đúng thứ tự: `<Goal>`, `<Knowledge>`, `<Resources>`, `<Practice>`, `<DeepDive>`, `<Mastery>`. Không tự viết tiêu đề cho 6 phần.
-- Mỗi `<Check id="…">` có mã cố định dạng `<mã bài>.<slug>`. **Không đổi hoặc xoá mã đã có trong `content/ids.lock.json`**; nếu phải gộp hay đổi tên, thêm cặp `mã cũ → mã mới` vào `replacements`.
+- Frontmatter `kind` bắt buộc: `reading` (bài đọc: Java, Spring Boot, Microservices) hoặc `lab` (bài lab: DevOps, Kubernetes).
+- Bài đọc: đúng 3 component `<Goal>`, `<Knowledge>`, `<Resources>`, không có `<Check>`; viết theo §3 của chuẩn. Bài lab: đủ 6 component theo đúng thứ tự `<Goal>`, `<Knowledge>`, `<Resources>`, `<Practice>`, `<DeepDive>`, `<Mastery>`. Không tự viết tiêu đề cho các phần.
+- Mỗi `<Check id="…">` có mã cố định dạng `<mã bài>.<slug>`. **Không đổi hoặc xoá mã đã có trong `content/ids.lock.json`**; nếu phải gộp hay đổi tên, thêm cặp `mã cũ → mã mới` vào `replacements`. Ngoại lệ một lần: khi chuyển bài lab sang bài đọc, mã mục cũ của bài xoá thẳng khỏi `ids` (ADR-0011, chuẩn §3.6).
 - Lệnh trong bài đặt trong `<Terminal where="mac|vm|container|pod|linux">`. Lệnh phá huỷ dữ liệu phải có `<Callout kind="danger">` đứng trước.
 - Chỉ đặt `status: verified` khi mọi lệnh đã chạy thật, kèm `verified` (ngày, hệ điều hành, phiên bản công cụ).
 

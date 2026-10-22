@@ -112,6 +112,8 @@ export const roadmapSchema = z.object({
   description: localized,
   /** Bước của roadmap khác nên học trước. */
   recommended: z.array(z.string()).default([]),
+  /** Công nghệ roadmap cố ý không dạy, kèm lý do (thường là thứ được dạy thay). */
+  notTaught: z.array(z.object({ name: z.string().min(1), reason: localized })).default([]),
   levels: z
     .array(z.object({ id: z.enum(LEVELS), title: localized, goal: localized, steps: z.array(z.string()).min(1) }))
     .min(1),

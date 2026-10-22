@@ -16,11 +16,11 @@
 
 Định vị đầy đủ:
 
-> Masteva là nơi lập trình viên học kỹ thuật phần mềm theo lộ trình đầy đủ, trực quan và thực chiến. Mỗi bước có giải thích đủ sâu để không phải đi tìm nơi khác, có lab chạy trên máy thật, và nối vào một dự án lớn như ngân hàng số hay hệ thống chat. Khác với danh sách đường link hay khoá video, người học ra khỏi mỗi bài là làm được việc đó.
+> Masteva là nơi lập trình viên học kỹ thuật phần mềm theo lộ trình đầy đủ, trực quan và thực chiến. Mỗi bài giải thích đầy đủ và đủ sâu để không phải đi tìm nơi khác. Người học thực hành bằng một dự án lớn như ngân hàng số hay hệ thống chat, và ôn phỏng vấn bằng bộ câu hỏi kèm lời giải; riêng DevOps và Kubernetes có lab chạy trên máy thật ngay trong bài. Khác với danh sách đường link hay khoá video, người học ra khỏi mỗi chặng là hiểu tận gốc và làm được việc đó.
 
 **Phạm vi nội dung:**
 - Masteva dành cho lập trình viên nói chung: backend, frontend, mobile, DevOps, data, AI engineering và kiến thức nền tảng.
-- Nhóm roadmap đầu tiên là **backend**, gồm ba roadmap Java, DevOps và Microservices, mỗi roadmap đi từ nền tảng tới Senior, cùng hai dự án xuyên suốt (Neobank mini, Hub hội thoại). Đây là nơi người sáng lập có chuyên môn và đang tự học, nên nội dung được kiểm chứng tốt nhất.
+- Nhóm roadmap đầu tiên là **backend**, gồm các roadmap Java, Spring Boot, Microservices, DevOps và Kubernetes, mỗi roadmap đi từ nền tảng tới Senior, cùng hai dự án xuyên suốt (Neobank mini, Hub hội thoại). Đây là nơi người sáng lập có chuyên môn và đang tự học, nên nội dung được kiểm chứng tốt nhất.
 - Các mảng khác được thêm dần sau khi chuẩn nội dung và trang web đã ổn định.
 
 **Ngôn ngữ:** tiếng Việt là ngôn ngữ mặc định. Nội dung và trang web được thiết kế sẵn cho đa ngôn ngữ, bản tiếng Anh là ngôn ngữ thứ hai dự kiến.
@@ -29,7 +29,7 @@
 
 | Persona | Mô tả | Vấn đề | Masteva giúp gì |
 |---|---|---|---|
-| **P1. Dev đi làm muốn lên Senior** (ưu tiên số 1) | 1–5 năm kinh nghiệm, biết code nhưng thiếu chiều sâu về nền tảng, hạ tầng, kiến trúc | Học rời rạc, không biết thứ tự, ít cơ hội làm hệ thống lớn ở công ty | Lộ trình Senior có thứ tự, lab và dự án mô phỏng production |
+| **P1. Dev đi làm muốn lên Senior** (ưu tiên số 1) | 1–5 năm kinh nghiệm, biết code nhưng thiếu chiều sâu về nền tảng, hạ tầng, kiến trúc | Học rời rạc, không biết thứ tự, ít cơ hội làm hệ thống lớn ở công ty | Lộ trình Senior có thứ tự, bài đủ sâu và dự án mô phỏng production |
 | **P2. Vibe coder / builder dùng AI** | Làm sản phẩm chủ yếu bằng AI, nền tảng còn mỏng | Không đọc hiểu được code AI viết, không tự debug, deploy hay bảo mật được | Kiến thức nền giải thích dễ hiểu, kèm phần "dùng AI thế nào cho đúng" ở mỗi bài |
 | **P3. Sinh viên, fresher** | Sắp hoặc mới đi làm | Kiến thức ở trường cách xa thực tế công việc | Lộ trình từ nền tảng, thực hành giống công việc thật |
 | P4. Team lead, doanh nghiệp (sau này) | Cần đào tạo nhân sự nội bộ | Tự soạn giáo trình tốn công | Lộ trình có sẵn, theo dõi tiến độ cả nhóm |
@@ -38,16 +38,18 @@
 
 ## 4. Giá trị cốt lõi
 
-### 4.1 Đầy đủ và tự chứa
+### 4.1 Bài đọc đầy đủ và sâu
 
 - Mỗi bài giải thích đủ để học mà **không cần rời trang**. Tài liệu bên ngoài chỉ là "đọc thêm", không bắt buộc.
 - Giải thích từ nền lên: *cái gì*, *vì sao*, *bên dưới chạy thế nào*, *dùng khi nào*, *sai ở đâu*.
-- Khác biệt với roadmap.sh, nơi mỗi mục chủ yếu trỏ ra nguồn ngoài.
+- Java, Spring Boot và Microservices dùng **bài đọc** (Mục tiêu → Kiến thức → Tài liệu): trường hợp biên, quyết định thiết kế, cơ chế bên trong và những hành vi khó đoán mà tài liệu chính thức không ghi đều nằm ngay trong phần kiến thức, kèm ví dụ code chạy được và output thật ([ADR-0011](adr/0011-bai-doc-thay-lab-cho-roadmap-ly-thuyet.md)).
+- Khác biệt với roadmap.sh, nơi mỗi mục chủ yếu trỏ ra nguồn ngoài: Masteva khác ở độ đủ và độ sâu của bài, cùng dự án và bộ câu hỏi phỏng vấn.
 
 ### 4.2 Thực chiến
 
-- Mọi khái niệm quan trọng đều đi kèm **lab chạy được trên máy thật** và **tình huống production**: sự cố, số đo, quyết định thiết kế.
-- **Dự án xuyên suốt** nối các bài lại: hub hội thoại đa kênh, ngân hàng số mini (Neobank).
+- **Thực hành ở dự án:** với Java, Spring Boot và Microservices, người học thực hành bằng cách tự xây **dự án xuyên suốt** (hub hội thoại đa kênh, ngân hàng số mini Neobank), không bằng lab lẻ trong từng bài.
+- **Bài lab cho DevOps và Kubernetes:** ở đó lab chính là nội dung, nên mọi khái niệm quan trọng đi kèm lab chạy được trên máy thật.
+- Mọi bài có **tình huống production**: sự cố, số đo, quyết định thiết kế.
 - Ví dụ thật thay cho ví dụ đồ chơi. Ví dụ: hiểu SIGTERM thông qua việc giải thích vì sao `docker stop` mất 10 giây và pod báo exit code 137.
 
 ### 4.3 Trực quan
@@ -56,9 +58,10 @@
 - Khối lệnh có **kết quả mong đợi** và giải thích từng phần.
 - Trước khi xem kết quả, người học được mời **đoán output**.
 
-### 4.4 Học có kiểm chứng
+### 4.4 Ôn phỏng vấn và tự kiểm tra
 
-- Mỗi bài có **câu hỏi tự kiểm tra** và **dấu hiệu đã nắm chắc**. Cách làm này dựa trên nghiên cứu: tự kiểm tra là kỹ thuật học hiệu quả nhất ([Dunlosky 2013](https://www.psychologicalscience.org/news/releases/which-study-strategies-make-the-grade.html)).
+- **Bộ câu hỏi phỏng vấn** là nơi ôn của Java, Spring Boot và Microservices: câu hỏi kèm lời giải, mỗi câu trỏ về bài liên quan (giai đoạn sau; nguồn câu hỏi được gom dần khi viết lại bài). Tự kiểm tra là kỹ thuật học có bằng chứng mạnh nhất ([Dunlosky 2013](https://www.psychologicalscience.org/news/releases/which-study-strategies-make-the-grade.html)).
+- Bài đọc có vài chỗ **đoán trước output** và một nút "Đã học xong bài". Bài lab có **ô tự kiểm tra** và **dấu hiệu đã nắm chắc**.
 - Lab có thể kiểm tra tự động bằng CLI chạy trên máy người học (giai đoạn sau).
 - Ôn tập giãn cách cho các khái niệm đã học (giai đoạn sau).
 
@@ -102,7 +105,7 @@
 | **North star** | Số bước được hoàn thành mỗi tuần (tổng các người học) | Người học thật sự học, không chỉ ghé xem |
 | Kích hoạt | Tỷ lệ người đăng ký hoàn thành bước đầu tiên trong 7 ngày | Bài đầu có đủ hấp dẫn và dễ bắt đầu không |
 | Giữ chân | Tỷ lệ còn học sau 4 tuần | Giá trị dài hạn |
-| Chất lượng | Tỷ lệ lab chạy thành công; số lỗi nội dung được báo trên mỗi bài | Nội dung có đáng tin không |
+| Chất lượng | Tỷ lệ lab và ví dụ code trong bài chạy thành công; số lỗi nội dung được báo trên mỗi bài | Nội dung có đáng tin không |
 | Giai đoạn tự học | Số bước người sáng lập hoàn thành và số bài đạt trạng thái "đã kiểm chứng" | Dùng trước khi mở cho người khác |
 
 ## 8. Lộ trình phát triển sản phẩm
@@ -110,7 +113,7 @@
 | Giai đoạn | Mục tiêu | Kết quả |
 |---|---|---|
 | **0. Nền móng** | Chuẩn nội dung, khung trang web, roadmap đầu tiên chạy được | Site đọc được bài theo roadmap, có đánh dấu tiến độ |
-| **1. Hoàn thiện 3 roadmap** | Viết đủ nội dung Java, DevOps, Microservices theo chuẩn, cùng đề cương hai dự án | 58 chặng có bài học; lab đã chạy thử |
+| **1. Hoàn thiện 3 roadmap** | Viết đủ nội dung Java, DevOps, Microservices theo chuẩn, cùng đề cương hai dự án | 58 chặng có bài học; lab và code trong bài đã chạy thử |
 | **2. Vừa học vừa tối ưu** | Người sáng lập học thật, sửa nội dung và trang web theo trải nghiệm | Bài đạt trạng thái "đã kiểm chứng"; mở beta công khai |
 | **3. Cộng đồng và kiểm chứng tự động** | Tài khoản, đồng bộ tiến độ, CLI chấm bài, thảo luận theo bài | Người học bên ngoài dùng thường xuyên |
 | **4. Mở rộng** | Roadmap cho các mảng khác (frontend, mobile, data…), ngôn ngữ thứ hai, AI hỏi đáp, ôn tập giãn cách, cân nhắc thu tiền | Theo dữ liệu metric |
@@ -130,3 +133,4 @@ Giai đoạn 0 và 1 làm trước khi tiếp tục học, theo quyết định 
 | 03/10/2026 | Kiến trúc đã duyệt: static export trên Cloudflare Pages, nội dung chung repo, CC BY-NC-SA cho nội dung và MIT cho code mẫu ([architecture.md](architecture.md)) |
 | 03/10/2026 | Tách thành ba roadmap độc lập Java, DevOps, Microservices (từ nền tảng tới Senior, 58 chặng, 379 chủ đề); dự án thành trang riêng ([spec](superpowers/specs/2026-10-03-tach-roadmap-design.md)) |
 | 03/10/2026 | Giao diện theo hướng Night Lab, theme tối mặc định ([design-direction.md](design-direction.md)) |
+| 22/10/2026 | Java, Spring Boot, Microservices chuyển sang bài đọc; thực hành ở dự án, ôn phỏng vấn ở bộ câu hỏi phỏng vấn; DevOps và Kubernetes giữ bài lab ([ADR-0011](adr/0011-bai-doc-thay-lab-cho-roadmap-ly-thuyet.md)) |

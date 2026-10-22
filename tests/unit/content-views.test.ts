@@ -14,6 +14,7 @@ const input: ViewInput = {
       title: { vi: 'Java', en: 'Java EN' },
       description: { vi: 'Mô tả' },
       recommended: [],
+      notTaught: [{ name: 'TestNG', reason: { vi: 'Dạy JUnit Jupiter.', en: 'JUnit Jupiter is taught.' } }],
       levels: [
         { id: 'foundation', title: { vi: 'Nền tảng' }, goal: { vi: 'Mục tiêu 1' }, steps: ['j1'] },
         { id: 'middle', title: { vi: 'Middle' }, goal: { vi: 'Mục tiêu 2' }, steps: ['j2'] },
@@ -26,6 +27,7 @@ const input: ViewInput = {
       title: { vi: 'DevOps' },
       description: { vi: 'Mô tả' },
       recommended: ['j1'],
+      notTaught: [],
       levels: [{ id: 'foundation', title: { vi: 'Nền tảng' }, goal: { vi: 'G' }, steps: ['d1', 'd2'] }],
     },
   ],
@@ -59,6 +61,11 @@ describe('buildRoadmapView', () => {
     ]);
     expect(view.stepCount).toBe(2);
     expect(view.topicCount).toBe(2);
+  });
+
+  it('lists what the roadmap deliberately does not teach, with localized reasons', () => {
+    expect(buildRoadmapView({ ...input, lang: 'en' }, 'java')!.notTaught).toEqual([{ name: 'TestNG', reason: 'JUnit Jupiter is taught.' }]);
+    expect(buildRoadmapView(input, 'devops')!.notTaught).toEqual([]);
   });
 
   it('attaches lessons, items, requires, links and project uses', () => {

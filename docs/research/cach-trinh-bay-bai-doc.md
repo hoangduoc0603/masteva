@@ -178,7 +178,7 @@ Hai callout `ai` và `link` đứng liền nhau ở cuối bài là ngoại lệ
 
 ## 2. Đối chiếu với chuẩn hiện có của Masteva
 
-Chuẩn hiện có: `docs/content-standard.md` §2.2, §3, §3.1 (đọc ngày 22/10/2026).
+Chuẩn hiện có: `docs/content-standard.md` §2.2, §3, §3.1 (đọc ngày 22/10/2026). Sau ticket 03, §3 và §3.1 của bản đó thành §4 và §4.1; chuẩn bài đọc rút từ bảng này nằm ở §3 mới.
 
 | Quy định hiện tại | Bằng chứng nói gì | Giữ / Đổi / Bổ sung | Đề xuất cụ thể |
 |---|---|---|---|

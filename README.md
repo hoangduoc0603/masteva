@@ -23,7 +23,7 @@ pnpm dev            # http://localhost:3000/vi
 | `pnpm start` | Phục vụ `out/` để xem bản build |
 | `pnpm typecheck` / `pnpm lint` | Kiểm tra TypeScript và ESLint |
 | `pnpm test` | Unit test (Vitest) |
-| `pnpm content:check` | Kiểm tra nội dung: khung 6 phần, mã mục, chủ đề, quan hệ roadmap/chặng/dự án, file khoá, link nội bộ |
+| `pnpm content:check` | Kiểm tra nội dung: khung bài theo dạng bài (bài đọc 3 phần, bài lab 6 phần), mã mục, chủ đề, quan hệ roadmap/chặng/dự án, file khoá, link nội bộ |
 | `pnpm content:lock` | Như trên và thêm mã mục, mã chủ đề, mã mốc mới vào file khoá |
 | `pnpm exec serve design -l 4400` | Xem thiết kế local (`design/index.html`) |
 | `pnpm e2e` | Build với `vi,en` rồi chạy E2E (Playwright). Lần đầu chạy `pnpm exec playwright install chromium` |

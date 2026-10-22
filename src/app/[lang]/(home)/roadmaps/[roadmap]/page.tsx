@@ -63,6 +63,21 @@ export default async function RoadmapPage(props: PageProps<'/[lang]/roadmaps/[ro
             ))}
           </p>
         ) : null}
+        {view.notTaught.length > 0 ? (
+          <details className="rm-not-taught">
+            <summary>
+              <span className="ms-chev" aria-hidden="true" />
+              {format(t.roadmap.notTaught, { count: view.notTaught.length })}
+            </summary>
+            <ul>
+              {view.notTaught.map((n) => (
+                <li key={n.name}>
+                  <strong>{n.name}</strong>: {n.reason}
+                </li>
+              ))}
+            </ul>
+          </details>
+        ) : null}
         <RoadmapClient lang={lang} lite={lite} replacements={getReplacements()} />
       </header>
       <RoadmapToolbar lite={lite} levels={view.levels.map((l) => ({ id: l.id, title: l.title }))} />
