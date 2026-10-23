@@ -201,6 +201,18 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 - **Xoá tài khoản:** xoá toàn bộ bản ghi của người dùng (FR-ACCOUNT-002).
 - Không cần máy chủ riêng; site vẫn là static export.
 
+### 7.3 Làm việc với Supabase
+
+Quy ước khi sửa schema, cấu hình Auth hay code tài khoản (chuyển từ `CLAUDE.md` ngày 23/10/2026).
+
+- Project: local (`supabase start`) để phát triển; production là `jnmwvzognbveagudeizr` (Singapore, đã `supabase link`). Chưa có project dev riêng.
+- Đưa lên production chỉ khi người dùng đồng ý: `supabase db push` cho migration; `supabase config diff` rồi `supabase config push` cho Auth (giá trị riêng của production nằm ở `[remotes.production]` trong `config.toml`, Google secret đọc từ `supabase/.env`).
+- URL và khoá publishable của production nằm trong `.env.production` (commit được, là giá trị công khai); `.env.local` trỏ Supabase local.
+- Nguồn sự thật của schema là `supabase/migrations/` (tạo bằng `supabase migration new`). Không dùng Drizzle.
+- Đổi schema thì kèm test pgTAP trong `supabase/tests/database/`, chạy `pnpm test:db` (pgTAP và test adapter với database local) và `supabase db advisors --local`.
+- Hàm `security definer` đặt trong schema `private` (không lộ ra Data API), gọi qua hàm `security invoker` ở `public`.
+- Đăng nhập chỉ bằng Google. Trình duyệt chỉ dùng khoá `sb_publishable_…`; `supabase-js` chỉ tải khi đăng nhập hoặc đã có phiên.
+
 ## 8. Tìm kiếm
 
 - **Công cụ:** zbsearch. Lúc build, route tĩnh `src/app/[lang]/search/[file]/route.ts` xuất nội dung các bài (tiêu đề, đề mục, đoạn văn, đường dẫn), **mỗi roadmap có bài một hoặc vài file** `/<lang>/search/<roadmap>-<n>.json`; trình duyệt dựng một chỉ mục chung từ các file này (`src/lib/search/lesson-index.ts`, `lesson-client.ts`), xem ADR-009.
@@ -224,15 +236,22 @@ Lúc build, `src/lib/content/manifest.ts` đọc thẳng thư mục `content/` v
 - **Khối lệnh:** Shiki tô màu lúc build; `<Terminal>` thêm khung, nhãn nơi chạy và kết quả mong đợi (FR-LESSON-003).
 - **Sơ đồ:** SVG tĩnh hoặc component SVG viết tay, có mô tả thay thế, đổi màu theo chế độ sáng/tối (FR-LESSON-006, NFR-003, NFR-004). Không tải thư viện vẽ sơ đồ ở trình duyệt. Sơ đồ tương tác (FR-LESSON-007, G2) là component riêng, chỉ tải trên trang dùng nó.
 - **Nhãn trạng thái:** trang hiển thị nhãn "Nháp", "Đã kiểm chứng ngày… với phiên bản…" hoặc "Cần cập nhật" từ metadata (FR-LESSON-009).
+- **Bố cục của Fumadocs** (`DocsPage`, bản 16), cần biết khi đặt thứ gì dính hay nổi trên trang bài:
+  - Cột mục lục bên phải chỉ hiện từ `xl` (80rem). Hẹp hơn, mục lục thu thành thanh dính ở đầu (`[data-toc-popover]`, cao 40px, `z-index` 10).
+  - `--fd-docs-row-3` là vị trí ngay dưới thanh mục lục đó (bằng 0 khi cột mục lục hiện), dùng làm `top` cho phần tử dính của trang. Thanh đầu bài đọc (`LessonBar`) dính ở đây, `z-index` 9 để danh sách mục lục mở ra phủ lên nó.
+  - Các mảnh bên trong thanh mục lục không được export; muốn thêm vào cột mục lục thì dùng `tableOfContent.header`/`footer` của `DocsPage`.
+  - Phím Escape không đóng danh sách mục lục; E2E đóng bằng cách bấm lại `[data-toc-popover-trigger]`.
 
 ## 10. Kiểm tra nội dung và CI
 
-Chạy trên mọi pull request và trước mỗi lần deploy.
+Hook `pre-push` (`.githooks/`, bật bằng `pnpm install`) chạy `pnpm verify` trước mỗi lần push, vì push lên `master` là deploy và Workers Builds không chờ CI. CI (`.github/workflows/ci.yml`) chạy lại cùng các bước trên mọi pull request và khi push lên `master`.
 
 | Bước | Kiểm tra | Chặn build? |
 |---|---|---|
 | Schema | Metadata đúng schema; bài `verified` có ngày và môi trường | Có |
-| Khung bài | Đủ 6 component theo đúng thứ tự | Có |
+| Khung bài | Đúng khung theo dạng bài: bài đọc 3 component, bài lab 6 component, theo đúng thứ tự | Có |
+| Quy tắc cơ học của bài đọc | `###` trong Kiến thức, cặp callout khép bài, số callout production, code không `title=` hay `...`, từ cấm (`reading-style.ts`) | Có |
+| Code của bài đọc | `pnpm content:run-code`: mọi ví dụ Java chạy ra đúng output ghi trong bài; CI dùng Temurin đúng bản ghi trong `verified`. Không nằm trong `pnpm verify` vì cần `java` | Có, ở CI |
 | Mã mục | Không trùng; khớp file khoá; bản dịch không có mã lạ | Có |
 | Liên kết nội bộ | Không trỏ tới trang hoặc mục không tồn tại | Có |
 | Code | Typecheck, lint, unit test | Có |
@@ -276,6 +295,8 @@ Việc chạy lại lab tự động (FR-CONTENT-004) để sang G3.
 | E2E (Playwright) | Mở bài, tích mục, tải lại trang vẫn còn; hai tab đồng bộ; tìm "tien trinh" ra bài D1.1; mở `/en/...` của bài chưa dịch thấy thông báo; trang `/` chuyển sang `/vi/`; tài khoản với Supabase giả lập (khách không tải supabase-js, kéo và đẩy tiến độ, đăng xuất, callback lỗi) |
 | Hiệu năng | Lighthouse CI theo ngân sách ở mục 1 |
 | Khả năng truy cập | Kiểm tra tự động bằng axe trong E2E; điều hướng bàn phím trên trang bài học |
+
+`pnpm e2e` (và `pnpm verify`) build lại `out/` với cấu hình E2E (thêm tiếng Anh, Supabase giả lập), ghi đè bản build thường. Muốn xem thử site như bản deploy sau khi chạy E2E thì `pnpm build` lại. Đừng tách bản E2E ra thư mục khác bằng `distDir`: đã thử ngày 23/10/2026, lần build kế tiếp in lỗi giả `Can't resolve './tokens.css'` (do cache của lần build trước dùng cấu hình khác), và vì `verify` luôn chạy hai bản build xen kẽ nên lần verify nào cũng dính.
 
 ## 14. Quyết định kiến trúc (ADR)
 

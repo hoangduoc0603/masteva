@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { extractLesson, splitFrontmatter, type ExtractedLesson } from './extract';
+import { validateReadingStyle } from './reading-style';
 import {
   LESSON_SECTIONS,
   idsLockSchema,
@@ -163,7 +164,8 @@ function parseLesson(file: LessonFile): ParsedLesson {
   const extracted = extractLesson(body, LESSON_SECTIONS);
   if (!frontmatter) return { file, frontmatter, extracted, itemIds: [], errors };
   const structure = validateLessonStructure(frontmatter.id, frontmatter.kind, extracted);
-  return { file, frontmatter, extracted, itemIds: structure.itemIds, errors: [...errors, ...structure.errors] };
+  const style = frontmatter.kind === 'reading' ? validateReadingStyle(body) : [];
+  return { file, frontmatter, extracted, itemIds: structure.itemIds, errors: [...errors, ...structure.errors, ...style] };
 }
 
 let lessonsCache: LessonEntry[] | undefined;

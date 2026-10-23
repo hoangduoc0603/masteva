@@ -14,7 +14,7 @@ Dự án theo luồng của bộ skill engineering (mattpocock-skills). Trạng 
 
 ## Git và deploy
 
-Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva` (alias SSH `github.com-personal`). **Push lên `master` là tự deploy** bằng Workers Builds (ADR-010). Cache của Impeccable (`hook.cache.json`, `live/`) nằm trong `.gitignore`; bản critique trong `.impeccable/critique/` được commit.
+Nhánh mặc định `master`, remote `origin` là GitHub `hoangduoc0603/masteva` (alias SSH `github.com-personal`). **Push lên `master` là tự deploy** bằng Workers Builds (ADR-010). Hook `pre-push` chạy `pnpm verify` (bật sẵn khi `pnpm install`); chỉ dùng `git push --no-verify` khi người dùng đồng ý. Cache của Impeccable (`hook.cache.json`, `live/`) nằm trong `.gitignore`; bản critique trong `.impeccable/critique/` được commit.
 
 ## Stack riêng của project
 
@@ -25,15 +25,7 @@ Fumadocs trên Next.js, static export (không có máy chủ), host tĩnh trên 
 
 ## Supabase
 
-Tài khoản và đồng bộ tiến độ, thiết kế ở `docs/superpowers/specs/2026-10-07-tai-khoan-dong-bo-tien-do-design.md`.
-
-- Project: local (`supabase start`) để phát triển; production là `jnmwvzognbveagudeizr` (Singapore, đã `supabase link`). Chưa có project dev riêng.
-- Đưa lên production chỉ khi người dùng đồng ý: `supabase db push` cho migration; `supabase config diff` rồi `supabase config push` cho Auth (giá trị riêng của production nằm ở `[remotes.production]` trong `config.toml`, Google secret đọc từ `supabase/.env`).
-- URL và khoá publishable của production nằm trong `.env.production` (commit được, là giá trị công khai); `.env.local` trỏ Supabase local.
-- Nguồn sự thật của schema là `supabase/migrations/` (tạo bằng `supabase migration new`). Không dùng Drizzle.
-- Đổi schema thì kèm test pgTAP trong `supabase/tests/database/`, chạy `pnpm test:db` (pgTAP và test adapter với database local) và `supabase db advisors --local`.
-- Hàm `security definer` đặt trong schema `private` (không lộ ra Data API), gọi qua hàm `security invoker` ở `public`.
-- Đăng nhập chỉ bằng Google. Trình duyệt chỉ dùng khoá `sb_publishable_…`; `supabase-js` chỉ tải khi đăng nhập hoặc đã có phiên.
+Tài khoản và đồng bộ tiến độ. Đọc `docs/architecture.md` §7.3 (project, migration, test pgTAP, quy ước bảo mật) trước khi đụng `supabase/` hay code tài khoản. Đưa migration hay cấu hình Auth lên production (`jnmwvzognbveagudeizr`) chỉ khi người dùng đồng ý.
 
 ## Kiểm thử
 

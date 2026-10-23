@@ -100,6 +100,8 @@ Mọi bài lab có đủ 6 phần theo đúng thứ tự. Bài đọc dùng khun
 
 Bài đọc dạy kiến thức mà không có lab đi kèm, nên phần Kiến thức phải tự làm được việc của lab: cho người học thấy khái niệm vận hành qua ví dụ code và output thật. Các quy tắc dưới đây rút từ nghiên cứu `docs/research/cach-trinh-bay-bai-doc.md`; mã trong ngoặc (ví dụ 1.3) là mã khuyến nghị trong file đó.
 
+`pnpm content:check` kiểm bằng máy các quy tắc cơ học của bài đọc (`src/lib/content/reading-style.ts`): `###` chỉ nằm trong `<Knowledge>`; `<Knowledge>` kết thúc bằng đúng một callout `ai` rồi một `link`; tối đa 2 callout `production`; khối code không có `title=` và không lược bỏ bằng `...`; văn không dùng các từ cấm ở §4. `pnpm content:run-code` kiểm code và output (§3.3). Người duyệt chấm phần còn lại, là những quy tắc cần phán đoán.
+
 ### 3.1 Khung ba phần
 
 - Đúng ba component theo thứ tự: `<Goal>`, `<Knowledge>`, `<Resources>`. Không có `<Practice>`, `<DeepDive>`, `<Mastery>`, không có `<Check>`. Không tự viết tiêu đề cho ba phần.
@@ -212,19 +214,17 @@ Cặp `ai` và `link` liền nhau ở cuối `<Knowledge>` là ngoại lệ có 
 
 Câu hỏi–lời giải của phần Đào sâu được giữ lại làm nguồn cho bộ câu hỏi phỏng vấn sau này. Nguồn không hiển thị trên trang và `content:check` không đọc nó.
 
-- Mỗi roadmap một file Markdown thường (không phải MDX): `content/interview/<roadmap>.md`, ví dụ `java.md`, `spring-boot.md`. Roadmap của bài xác định theo `content/roadmaps/*.json`, không theo tên thư mục (chặng `j11` thuộc Spring Boot).
-- Câu hỏi nhóm theo bài gốc. Mỗi bài là một đề mục `##` ghi mã bài (`id` trong frontmatter) và tên bài; nhóm xếp theo thứ tự bài trên roadmap.
-- Mỗi câu là một đề mục `###` chép nguyên `title` của `<Reveal>`, thân là lời giải chép nguyên văn. Không sửa, không rút gọn; biên tập là việc của spec bộ câu hỏi phỏng vấn.
+- Mỗi bài một file Markdown thường (không phải MDX): `content/interview/<roadmap>/<mã-bài>.md`, ví dụ `java/j5-3.md`, `spring-boot/j11-2.md`. Mỗi bài một file để các ticket viết lại chạy song song không cùng sửa một file. Roadmap của bài xác định theo `content/roadmaps/*.json`, không theo tên thư mục (chặng `j11` thuộc Spring Boot); tên file theo tên file bài.
+- Đề mục `#` ghi mã bài (`id` trong frontmatter) và tên bài.
+- Mỗi câu là một đề mục `##` chép nguyên `title` của `<Reveal>`, thân là lời giải chép nguyên văn. Không sửa, không rút gọn; biên tập là việc của spec bộ câu hỏi phỏng vấn.
 - Callout `ai` và `link` của phần Đào sâu không chép vào đây, vì chúng đã chuyển sang bài đọc.
 
 ```markdown
-# Câu hỏi phỏng vấn: Java
+# j5.2 · Generics, wildcard và PECS
 
-Nguồn cho bộ câu hỏi phỏng vấn, chép từ phần Đào sâu khi chuyển bài lab sang bài đọc. Chưa hiển thị trên trang.
+Nguồn cho bộ câu hỏi phỏng vấn, chép nguyên văn từ phần Đào sâu khi chuyển bài lab sang bài đọc. Chưa hiển thị trên trang. Định dạng: `docs/content-standard.md` §3.7.
 
-## j5.2 · Generics, wildcard và PECS
-
-### Mảng thì List[] được gán cho Object[], sao generics lại cấm?
+## Mảng thì List[] được gán cho Object[], sao generics lại cấm?
 
 Mảng trong Java là **hiệp biến** (covariant): …(lời giải chép nguyên văn)
 ```
