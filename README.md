@@ -25,6 +25,7 @@ pnpm dev            # http://localhost:3000/vi
 | `pnpm test` | Unit test (Vitest) |
 | `pnpm content:check` | Kiểm tra nội dung: khung bài theo dạng bài (bài đọc 3 phần, bài lab 6 phần), mã mục, chủ đề, quan hệ roadmap/chặng/dự án, file khoá, link nội bộ |
 | `pnpm content:lock` | Như trên và thêm mã mục, mã chủ đề, mã mốc mới vào file khoá |
+| `pnpm content:run-code [mã chặng \| mã bài]` | Chạy ví dụ Java của bài đọc và so với output ghi trong bài (cần `java`) |
 | `pnpm exec serve design -l 4400` | Xem thiết kế local (`design/index.html`) |
 | `pnpm e2e` | Build với `vi,en` rồi chạy E2E (Playwright). Lần đầu chạy `pnpm exec playwright install chromium` |
 | `pnpm verify` | Chạy tất cả các bước trên |

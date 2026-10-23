@@ -4,12 +4,12 @@
 
 **Blocked by:** 02, 03
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Phần kiến thức gồm kiến thức của phần đào sâu cũ và các phát hiện từ lab cũ kèm output thật; hai callout "Khi làm cùng AI" và "Liên hệ bài khác" ở cuối phần kiến thức
 - [x] Câu hỏi–lời giải của phần đào sâu cũ chép vào nguồn câu hỏi phỏng vấn của roadmap Java, ghi mã bài gốc (lần đầu tạo nguồn này)
 - [x] Nghiệm thu theo quy định ticket nội dung trong `CLAUDE.md`; `status: verified` chỉ khi mọi đoạn code và output đã chạy thật
-- [ ] Chủ dự án đọc và duyệt bài mẫu; góp ý được đưa ngược vào chuẩn nội dung trước khi đóng ticket
+- [x] Chủ dự án đọc và duyệt bài mẫu; góp ý được đưa ngược vào chuẩn nội dung trước khi đóng ticket
 
 **Kết quả (22/10/2026):** J5.3 viết lại theo `docs/content-standard.md` §3: 7 khái niệm (`###`), 18 ví dụ chạy được với Java 25.0.3 trên macOS 14.4.1 kèm output thật, 3 chỗ Đoán trước, 1 câu nhắc tự giải thích, 1 callout production, 1 pitfall. Khẳng định về API dẫn Javadoc ngay trong câu hoặc có output.
 
@@ -23,4 +23,4 @@
 - Nút "Đã học xong bài" thành chip trên thanh đầu bài đọc (breadcrumb + chip), dính khi cuộn ở mọi kích thước màn hình. Bản đặt dưới mục lục và nổi ở góc bị chủ dự án chê nên đã bỏ. E2E kiểm nút nằm trong màn hình khi đang đọc giữa bài.
 - Ví dụ code chỉ hiện code và lời giải thích: bỏ đoạn hướng dẫn lưu và chạy file, bỏ tên file trên khối code. Quy tắc ghi vào `docs/content-standard.md` §3.3.
 
-Còn lại: chủ dự án đọc tiếp và duyệt.
+**Duyệt:** chủ dự án duyệt J5.3 ngày 23/10/2026. Góp ý đã đưa vào chuẩn nội dung (§3.3) và thiết kế (thanh đầu bài).

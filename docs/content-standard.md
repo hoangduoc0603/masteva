@@ -169,9 +169,10 @@ Bài đọc dạy kiến thức mà không có lab đi kèm, nên phần Kiến 
 - Comment trong code chỉ dành cho chỗ không hiển nhiên và nói "vì sao". Văn quanh code không kể lại điều comment đã nói (3.5).
 - Đi từ ví dụ tối thiểu → ví dụ gần thực tế → trường hợp biên. Ví dụ **tối thiểu** (nhỏ, cô lập một cơ chế) được phép; ví dụ **đồ chơi** (vô nghĩa, không gắn thực tế) thì không (1.5, 3.8).
 - Dùng một bối cảnh xuyên suốt chặng, ví dụ `Product` và giỏ hàng ở J5. Khi cần cho thấy quy tắc là chung, thêm một ví dụ có bề mặt khác. Khi ví dụ chỉ bao phủ một phần cách dùng, ghi rõ phần nó không bao phủ (3.7, 3.8).
-- Output là output thật, chạy với phiên bản ghi trong `verified`. Phần thay đổi giữa các lần chạy (hash, thời gian, thứ tự phần tử của `Set.of`) ghi rõ là sẽ khác (3.9).
+- Output là output thật, chạy với phiên bản ghi trong `verified`. Phần thay đổi giữa các lần chạy (hash, thời gian, thứ tự phần tử của `Set.of`) ghi rõ là sẽ khác (3.9), và khối output đó có meta `varies` (` ```text varies `).
 - Mỗi `###` đọc hiểu được theo hai cách: chỉ đọc văn, hoặc chỉ lướt code và output. Lời dẫn và câu đọc output là cầu nối giữa hai cách (3.10).
 - Ví dụ chỉ gồm code và lời giải thích điều cần truyền đạt. Không hướng dẫn lưu file hay chạy ví dụ, không ghi tên file trên khối code (chủ dự án quyết khi duyệt J5.3, 23/10/2026). Việc lưu và chạy từng khối để lấy output là việc của tác giả khi kiểm chứng (§5).
+- `pnpm content:run-code [mã chặng | mã bài]` chạy mọi khối ` ```java ` của bài đọc và so với khối ` ```text ` ngay sau nó, kể cả khi output nằm trong `<Predict>`. Khối output có meta `varies` chỉ được chạy, không so. Khối Java không chạy riêng được (ví dụ code Spring cần cả project) ghi meta `norun` (` ```java norun `) và phải kiểm theo cách khác, ghi rõ trong ticket. Tên file khi chạy lấy từ `public class` hoặc từ stack trace trong output, mặc định `Main.java`.
 - Lệnh shell chỉ xuất hiện khi chính lệnh là kiến thức của bài (ví dụ `javac`, `mvn`), đặt trong `<Terminal where="…">` theo quy định của bài lab (§2.4).
 
 ### 3.4 Sơ đồ
@@ -205,7 +206,7 @@ Cặp `ai` và `link` liền nhau ở cuối `<Knowledge>` là ngoại lệ có 
 5. Chuyển hai callout `ai` và `link` xuống cuối `<Knowledge>`; sửa câu nào còn nói về lab.
 6. Gỡ `<Practice>`, `<DeepDive>`, `<Mastery>` và mọi `<Check>`. Lab cũ vẫn còn trong lịch sử Git.
 7. **Xoá mã mục cũ:** xoá mọi mã mục cũ của bài (`<mã bài>.<slug>`) khỏi danh sách `ids` của `content/ids.lock.json`, không thêm vào `replacements`. Đây là lần đặt lại một lần theo ADR-0011, chỉ áp cho lần chuyển bài lab sang bài đọc; mọi thay đổi khác vẫn theo BR-003. Sau đó chạy `pnpm content:lock` để khoá mã `<mã bài>.done`. Bài đã đặt lại từ trước (J5.3) thì bỏ qua bước này.
-8. Chạy lại mọi đoạn code và lệnh, cập nhật `verified` theo §5.
+8. Chạy lại mọi đoạn code và lệnh (`pnpm content:run-code <mã chặng>`), cập nhật `verified` theo §5.
 
 ### 3.7 Nguồn câu hỏi phỏng vấn
 
@@ -272,7 +273,7 @@ Một bài đi qua ba trạng thái:
 | **Đã kiểm chứng** | Mọi lệnh và code đã chạy thành công trên môi trường ghi trong metadata; kiến thức đã được rà lại với nguồn chính thức | Nhãn "Đã kiểm chứng ngày …, với phiên bản …" |
 | **Cần cập nhật** | Công cụ ra phiên bản mới làm thay đổi kết quả, hoặc có lỗi được báo | Nhãn cảnh báo và mô tả phần có thể đã cũ |
 
-**`verified` của bài đọc:** mọi đoạn code và output trong bài đã chạy thật với phiên bản ghi trong `verified` (ngày, hệ điều hành, phiên bản công cụ), và mọi khẳng định về hành vi API có tài liệu chính thức hoặc output trong bài làm dẫn chứng. Khẳng định chỉ dựa vào tài liệu chính thức thì trỏ tới tài liệu đó, ở phần Tài liệu hoặc ngay trong câu. Thiếu một trong hai thì bài để `status: draft`.
+**`verified` của bài đọc:** mọi đoạn code và output trong bài đã chạy thật với phiên bản ghi trong `verified` (ngày, hệ điều hành, phiên bản công cụ), và mọi khẳng định về hành vi API có tài liệu chính thức hoặc output trong bài làm dẫn chứng. Khẳng định chỉ dựa vào tài liệu chính thức thì trỏ tới tài liệu đó, ở phần Tài liệu hoặc ngay trong câu. Thiếu một trong hai thì bài để `status: draft`. `pnpm content:run-code` phải chạy qua không lỗi trên đúng phiên bản `java` ghi trong `verified`.
 
 **Ngoại lệ khi kiểm chứng** (người dùng chấp nhận ngày 03/10/2026): lệnh cài đặt làm thay đổi hệ thống (`brew install`, trình cài gói) và lệnh dọn dẹp cuối bài (`rm -rf` thư mục lab) không bắt buộc chạy thật, miễn là lệnh cài đã được kiểm bằng chế độ thử (ví dụ `--dry-run`) và lệnh dọn dẹp chỉ xoá thứ bài vừa tạo. Bước chỉ làm được trên giao diện (IDE, JDK Mission Control) được chấp nhận khi điều nó khẳng định đã được kiểm bằng công cụ dòng lệnh tương đương, ví dụ `jdb` thay cho debugger của IDE, `jfr print` thay cho JMC (người dùng chấp nhận ngày 04/10/2026).
 

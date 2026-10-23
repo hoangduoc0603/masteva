@@ -9,7 +9,7 @@ Dự án theo luồng của bộ skill engineering (mattpocock-skills). Trạng 
 - **Đầu session:** liệt kê ticket còn mở (`grep -rL "^\*\*Status:\*\* done" .scratch/*/issues/*.md`); ticket không bị chặn, số nhỏ nhất làm trước.
 - **Ý tưởng mới:** `/grill-with-docs` → `/to-spec` → `/to-tickets` trong cùng một cửa sổ hội thoại, rồi `/clear` và `/implement` từng ticket (hoặc `/implement-spec` cho cả spec).
 - **Việc phát sinh, lỗi, góp ý:** ghi thành ticket `needs-triage` trong `.scratch/`, xử lý bằng `/triage`. Lỗi khó tái hiện: `/diagnosing-bugs`.
-- **Ticket nội dung** (viết hoặc sửa bài): không áp TDD. Nghiệm thu bằng `pnpm content:check`, `pnpm build`, chạy thật mọi đoạn code và lệnh trong bài, và một lượt đọc với vai người học (lần đầu học chủ đề). `/code-review` chấm trục Standards theo `docs/content-standard.md`.
+- **Ticket nội dung** (viết hoặc sửa bài): không áp TDD. Nghiệm thu bằng `pnpm content:check`, `pnpm build`, chạy thật mọi đoạn code và lệnh trong bài (bài đọc: `pnpm content:run-code <mã chặng>`), và một lượt đọc với vai người học (lần đầu học chủ đề). `/code-review` chấm trục Standards theo `docs/content-standard.md`.
 - Chỉ commit, push, deploy khi được yêu cầu rõ. Người dùng thích tài liệu gọn, có bảng; không thích bị giao bài hay phải gửi lại output.
 
 ## Git và deploy
@@ -56,7 +56,7 @@ Theo `docs/content-standard.md`. Những điểm hay sai:
 pnpm verify
 ```
 
-Với thay đổi chỉ ở nội dung, tối thiểu chạy `pnpm content:check` và `pnpm build`.
+Với thay đổi chỉ ở nội dung, tối thiểu chạy `pnpm content:check` và `pnpm build`; bài đọc thêm `pnpm content:run-code <mã chặng>` (cần `java`, nên không nằm trong `pnpm verify`).
 
 ## Agent skills
 
