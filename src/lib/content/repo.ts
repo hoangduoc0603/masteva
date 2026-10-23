@@ -12,6 +12,7 @@ import {
   roadmapSchema,
   stepFields,
   type IdsLock,
+  type LessonKind,
   type Project,
   type Roadmap,
 } from './schema';
@@ -59,6 +60,7 @@ export interface LessonEntry {
   /** Đường dẫn không kèm ngôn ngữ, ví dụ `/learn/d1/d1-1`. */
   path: string;
   title: string;
+  kind: LessonKind;
   /** Mã mục của bài: các `<Check>` của bài lab, hoặc `<mã bài>.done` của bài đọc. */
   itemIds: string[];
   /** Chủ đề trên sơ đồ mà bài bao phủ. */
@@ -177,6 +179,8 @@ export function loadLessons(): LessonEntry[] {
         slug: f.slug,
         path: `/learn/${f.stepId}/${f.slug}`,
         title: frontmatter?.title ?? f.slug,
+        // Frontmatter hỏng thì content:check đã báo lỗi; coi là bài lab để trang vẫn dựng được.
+        kind: frontmatter?.kind ?? 'lab',
         itemIds,
         topics: frontmatter?.topics ?? [],
         sourceHash: hashContent(f.raw),

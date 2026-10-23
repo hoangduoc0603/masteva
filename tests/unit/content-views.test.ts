@@ -37,7 +37,7 @@ const input: ViewInput = {
     ['d1', { id: 'd1', code: 'D1', title: 'Linux', optional: false, topics: [topic('d1.x'), topic('d1.y', { kind: 'opt' })], links: [], pages: ['d1-1'] }],
     ['d2', { id: 'd2', code: 'D2', title: 'Mesh', optional: true, topics: [topic('d2.z')], links: [], pages: [] }],
   ]),
-  lessons: [{ id: 'd1.1', stepId: 'd1', slug: 'd1-1', path: '/learn/d1/d1-1', title: 'Tiến trình', itemIds: ['d1.1.a', 'd1.1.b'], topics: ['d1.x'] }],
+  lessons: [{ id: 'd1.1', stepId: 'd1', slug: 'd1-1', path: '/learn/d1/d1-1', title: 'Tiến trình', kind: 'lab', itemIds: ['d1.1.a', 'd1.1.b'], topics: ['d1.x'] }],
   projects: [
     {
       id: 'neobank',
@@ -98,18 +98,21 @@ describe('buildRoadmapView', () => {
     expect(devops[0].topics[1]).toMatchObject({ position: { index: 2, count: 2 }, prev: { id: 'd1.x' }, next: { id: 'd2.z' } });
   });
 
-  it("orders a topic's lessons by the step's pages, not by file name", () => {
+  it("orders a topic's lessons by the step's pages, not by file name, and keeps each lesson's kind", () => {
     const d1 = input.steps.get('d1')!;
     const ordered: ViewInput = {
       ...input,
       steps: new Map([...input.steps, ['d1', { ...d1, pages: ['d1-10', 'd1-1'] }]]),
       lessons: [
         ...input.lessons,
-        { id: 'd1.10', stepId: 'd1', slug: 'd1-10', path: '/learn/d1/d1-10', title: 'Mười', itemIds: ['d1.10.a'], topics: ['d1.x'] },
+        { id: 'd1.10', stepId: 'd1', slug: 'd1-10', path: '/learn/d1/d1-10', title: 'Mười', kind: 'reading', itemIds: ['d1.10.done'], topics: ['d1.x'] },
       ],
     };
     const view = buildRoadmapView(ordered, 'devops')!;
-    expect(view.levels[0].steps[0].topics[0].lessons.map((l) => l.id)).toEqual(['d1.10', 'd1.1']);
+    expect(view.levels[0].steps[0].topics[0].lessons.map((l) => [l.id, l.kind])).toEqual([
+      ['d1.10', 'reading'],
+      ['d1.1', 'lab'],
+    ]);
     expect(toLite(view).levels[0].steps[0].topics[0].lesson).toBe('/learn/d1/d1-10');
   });
 

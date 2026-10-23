@@ -1,4 +1,4 @@
-import type { Level, TopicKind, Track } from './constants';
+import type { LessonKind, Level, TopicKind, Track } from './constants';
 import type { Project, Roadmap, Topic } from './schema';
 import type { LiteTopic, RoadmapLite } from '@/lib/progress/roadmap';
 import type { CatalogIndex } from '@/lib/search/catalog';
@@ -23,6 +23,7 @@ export interface LessonInput {
   slug: string;
   path: string;
   title: string;
+  kind: LessonKind;
   itemIds: string[];
   topics: string[];
 }
@@ -39,6 +40,8 @@ export interface LessonRef {
   id: string;
   title: string;
   path: string;
+  /** Dạng bài: khung chủ đề hiện "Đã học xong" cho bài đọc, "n/m mục" cho bài lab. */
+  kind: LessonKind;
   items: string[];
   /** Mã bài theo mã chặng và thứ tự trong `pages`, ví dụ `SB3.2`. */
   code: string;
@@ -173,6 +176,7 @@ function indexContent(input: ViewInput) {
     id: l.id,
     title: l.title,
     path: l.path,
+    kind: l.kind,
     items: l.itemIds,
     code: `${input.steps.get(l.stepId)?.code ?? l.stepId.toUpperCase()}.${pageOrder(l) + 1}`,
   });

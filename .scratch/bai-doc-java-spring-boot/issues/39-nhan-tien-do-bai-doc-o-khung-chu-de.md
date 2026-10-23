@@ -4,10 +4,10 @@
 
 **Blocked by:** None
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Chốt nhãn tiến độ của bài đọc ở khung chủ đề
-- [ ] Bài lab giữ nhãn "n/m mục"
+- [x] Bài lab giữ nhãn "n/m mục"
 
 ## Comments
 
@@ -34,14 +34,16 @@ Mỗi bài trong danh sách "Học trên Masteva" của khung chi tiết chủ �
 - Component khung chủ đề (`TopicPanel`): chọn nhãn theo `lesson.kind`.
 
 **Acceptance criteria:**
-- [ ] Test của module view (viết trước, theo TDD của `src/lib/content`): `LessonRef` của bài đọc có `kind: 'reading'`, của bài lab có `kind: 'lab'`
-- [ ] Trang roadmap Java, chủ đề có bài đọc J5.3: dòng bài ghi "Chưa học xong"; sau khi bấm "Đã học xong bài" ở trang J5.3 thì ghi "Đã học xong" màu xanh
-- [ ] Chủ đề có bài lab (ví dụ một chủ đề DevOps) vẫn ghi "n/m mục"
-- [ ] E2E luồng bài đọc hiện có kiểm thêm nhãn trong khung chủ đề trước và sau khi đánh dấu
-- [ ] `pnpm verify` xanh
+- [x] Test của module view (viết trước, theo TDD của `src/lib/content`): `LessonRef` của bài đọc có `kind: 'reading'`, của bài lab có `kind: 'lab'`
+- [x] Trang roadmap Java, chủ đề có bài đọc J5.3: dòng bài ghi "Chưa học xong"; sau khi bấm "Đã học xong bài" ở trang J5.3 thì ghi "Đã học xong" màu xanh
+- [x] Chủ đề có bài lab (ví dụ một chủ đề DevOps) vẫn ghi "n/m mục"
+- [x] E2E luồng bài đọc hiện có kiểm thêm nhãn trong khung chủ đề trước và sau khi đánh dấu
+- [x] `pnpm verify` xanh
 
 **Out of scope:**
 - Đổi nhãn "Tự kiểm tra" hay số mục của bài lab
 - Đổi cách tính trạng thái chủ đề hay nút trạng thái "Chưa học / Đang học / Đã xong / Bỏ qua" của chủ đề
 - Nhãn tiến độ ở chỗ khác (thẻ chặng, chế độ danh sách, trang chủ)
+
+23/10/2026, implement: `LessonRef` và `LessonEntry` mang `kind`; khung chủ đề ghi "Chưa học xong" / "Đã học xong" (xanh) cho bài đọc, bài lab giữ "n/m mục". Lệch brief một điểm: nhãn chữ của bài đọc dùng font giao diện 13px thay cho font mono của số mục, vì chữ tiếng Việt trong font mono bị giãn (mono chỉ dùng cho số, mã). E2E luồng bài đọc kiểm nhãn trước và sau khi đánh dấu; test "Chưa học thắng mục đã tích" kiểm bài lab D1.1 vẫn ghi "1/n mục". Trong lúc làm, tách test axe theo trang và theme (backlog 13) vì nó làm `pnpm verify` đỏ.
 

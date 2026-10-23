@@ -303,6 +303,9 @@ test('bài đọc: ba phần, mục lục lồng đề mục của Kiến thức
   await expect(done).toHaveAttribute('aria-pressed', 'true');
   await page.goto('/vi/roadmaps/java');
   await expect(chip(page, READING_TOPIC)).toHaveAttribute('data-st', 'done');
+  // Khung chủ đề ghi trạng thái của bài đọc, không ghi "1/1 mục".
+  await page.goto(`/vi/roadmaps/java#${READING_TOPIC}`);
+  await expect(page.locator(`[data-panel="${READING_TOPIC}"] .rm-lesson-n`)).toHaveText('Đã học xong');
 
   await page.goto(READING);
   await done.click();
@@ -310,6 +313,8 @@ test('bài đọc: ba phần, mục lục lồng đề mục của Kiến thức
   await expect(progress).toContainText('Chưa học xong');
   await page.goto('/vi/roadmaps/java');
   await expect(chip(page, READING_TOPIC)).toHaveAttribute('data-st', 'todo');
+  await page.goto(`/vi/roadmaps/java#${READING_TOPIC}`);
+  await expect(page.locator(`[data-panel="${READING_TOPIC}"] .rm-lesson-n`)).toHaveText('Chưa học xong');
 });
 
 test('nút Vào học không dời chỗ khi bắt đầu học', async ({ page }) => {
@@ -383,6 +388,8 @@ test('"Chưa học" thắng mục đã tích trong bài', async ({ page }) => {
   await page.goto(LESSON);
   await page.locator(CHECK).check();
   await page.goto(`${DEVOPS}#${PROCESS_TOPIC}`);
+  // Bài lab vẫn ghi số mục đã tích trong khung chủ đề.
+  await expect(page.locator(`[data-panel="${PROCESS_TOPIC}"] .rm-lesson-n`).first()).toHaveText(/^1\/\d+ mục$/);
   const todo = page.locator(`[data-panel="${PROCESS_TOPIC}"]`).getByRole('button', { name: 'Chưa học' });
   await todo.click();
   await expect(chip(page, PROCESS_TOPIC)).toHaveAttribute('data-st', 'todo');
@@ -560,15 +567,16 @@ test('mobile: không cuộn ngang, có thanh Học tiếp ở đáy', async ({ p
   await expect(page.locator('.rm-dock')).toBeVisible();
 });
 
-test('không có lỗi truy cập nghiêm trọng, sáng và tối', async ({ page }) => {
-  for (const scheme of ['light', 'dark'] as const) {
-    await page.emulateMedia({ colorScheme: scheme });
-    for (const url of [LESSON, READING, '/vi', '/vi/roadmaps/java', '/vi/projects/neobank']) {
+// Mỗi trang, mỗi theme một test: gộp chung thì một test quét 10 trang, vượt 30 giây khi máy bận (backlog 13).
+for (const scheme of ['light', 'dark'] as const) {
+  for (const url of [LESSON, READING, '/vi', '/vi/roadmaps/java', '/vi/projects/neobank']) {
+    test(`không có lỗi truy cập nghiêm trọng: ${url} (${scheme})`, async ({ page }) => {
+      await page.emulateMedia({ colorScheme: scheme });
       await page.goto(url);
-      expect(await seriousViolations(page), `${url} (${scheme})`).toEqual([]);
-    }
+      expect(await seriousViolations(page)).toEqual([]);
+    });
   }
-});
+}
 
 test('roadmap Spring Boot có 14 chặng, SB1 có bài; Java còn 14 chặng', async ({ page }) => {
   await page.goto('/vi/roadmaps/spring-boot');

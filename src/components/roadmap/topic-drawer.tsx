@@ -3,7 +3,7 @@ import { Fragment } from 'react';
 import { format } from '@/lib/format';
 import type { Progress } from '@/lib/progress/model';
 import { topicState } from '@/lib/progress/roadmap';
-import type { TopicDetail, TopicRef } from '@/lib/content/views';
+import type { LessonRef, TopicDetail, TopicRef } from '@/lib/content/views';
 import { useMessages } from '@/components/messages-provider';
 
 const MARKS = ['todo', 'learning', 'done', 'skipped'] as const;
@@ -59,6 +59,21 @@ function Chevron({ back = false }: { back?: boolean }) {
   );
 }
 
+/** Bài đọc chỉ có một mục ẩn (`.done`), nên hiện "Đã học xong" thay cho "1/1 mục"; bài lab giữ số mục. */
+function LessonProgressLabel({ lesson, progress }: { lesson: LessonRef; progress: Progress }) {
+  const t = useMessages();
+  const done = lesson.items.filter((id) => progress.items[id]).length;
+  if (lesson.kind === 'reading') {
+    const finished = lesson.items.length > 0 && done === lesson.items.length;
+    return (
+      <span className="rm-lesson-n" data-kind="reading" data-finished={finished || undefined}>
+        {finished ? t.lesson.finished : t.lesson.notFinished}
+      </span>
+    );
+  }
+  return <span className="rm-lesson-n">{format(t.roadmap.itemCount, { done, total: lesson.items.length })}</span>;
+}
+
 function topicHref(ref: TopicRef, roadmapId: string, lang: string) {
   return ref.roadmapId === roadmapId ? `#${ref.id}` : `/${lang}/roadmaps/${ref.roadmapId}#${ref.id}`;
 }
@@ -92,9 +107,7 @@ function TopicPanel({ topic, progress, roadmapId, lang }: { topic: TopicDetail; 
               <a className="rm-lesson" href={`/${lang}${lesson.path}`} target="_blank" rel="noopener">
                 <span className="rm-lesson-t">{lesson.title}</span>
                 <span className="sr-only">{t.roadmap.newTabSr}</span>
-                <span className="rm-lesson-n">
-                  {format(t.roadmap.itemCount, { done: lesson.items.filter((id) => progress.items[id]).length, total: lesson.items.length })}
-                </span>
+                <LessonProgressLabel lesson={lesson} progress={progress} />
                 <Chevron />
               </a>
             </li>
