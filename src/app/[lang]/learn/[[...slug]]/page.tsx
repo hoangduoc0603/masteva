@@ -12,7 +12,7 @@ import { getMDXComponents } from '@/components/mdx';
 import { sectionToc } from '@/components/lesson/sections';
 import { LessonStatusBadge } from '@/components/lesson/lesson-meta';
 import { LessonProgress } from '@/components/progress/progress-bar';
-import { LessonDone } from '@/components/lesson/lesson-done';
+import { LessonBar } from '@/components/lesson/lesson-bar';
 import { doneItemId } from '@/lib/content/constants';
 
 export const dynamicParams = false;
@@ -52,19 +52,21 @@ export default async function LessonPage(props: PageProps<'/[lang]/learn/[[...sl
   const [stepId, slug] = page.slugs;
   const sourceHash = getLessonSourceHash(stepId, slug);
   const context = getLessonContext(page.data.id, lang);
+  const reading = page.data.kind === 'reading';
+  const crumb = context ? (
+    <nav className="ls-crumb" aria-label={t.lesson.breadcrumb}>
+      <a href={`/${lang}/roadmaps/${context.roadmap.id}`}>{context.roadmap.title}</a>
+      <span aria-hidden="true">/</span>
+      <a href={`/${lang}/roadmaps/${context.roadmap.id}#step-${context.step.id}`}>
+        {context.step.code} {context.step.title}
+      </a>
+    </nav>
+  ) : null;
   const staleTranslation = !showingFallback && lang !== DEFAULT_LANGUAGE && page.data.source !== sourceHash;
 
   return (
     <DocsPage toc={sectionToc(t, page.data.kind, page.data.toc)} breadcrumb={{ enabled: false }}>
-      {context ? (
-        <nav className="ls-crumb" aria-label={t.lesson.breadcrumb}>
-          <a href={`/${lang}/roadmaps/${context.roadmap.id}`}>{context.roadmap.title}</a>
-          <span aria-hidden="true">/</span>
-          <a href={`/${lang}/roadmaps/${context.roadmap.id}#step-${context.step.id}`}>
-            {context.step.code} {context.step.title}
-          </a>
-        </nav>
-      ) : null}
+      {reading ? <LessonBar doneId={doneItemId(page.data.id)}>{crumb}</LessonBar> : crumb}
       <DocsTitle className="ms-title">{page.data.title}</DocsTitle>
       <DocsDescription className="ms-lede mb-0">{page.data.description}</DocsDescription>
       <div className="ms-head flex flex-col gap-3">
@@ -96,7 +98,6 @@ export default async function LessonPage(props: PageProps<'/[lang]/learn/[[...sl
       </div>
       <DocsBody className="ms-lesson">
         <MDX components={getMDXComponents(t, { a: createRelativeLink(source, page) })} />
-        {page.data.kind === 'reading' ? <LessonDone id={doneItemId(page.data.id)} /> : null}
       </DocsBody>
     </DocsPage>
   );

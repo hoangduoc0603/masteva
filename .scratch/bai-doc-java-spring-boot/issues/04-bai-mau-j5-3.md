@@ -19,4 +19,8 @@
 - **Nghiệm thu:** `pnpm content:check`, `pnpm build`, E2E xanh. Mọi khối code được trích tự động từ bài, chạy và đối chiếu với khối output ngay sau. Một lượt đọc với vai người học và review hai trục, góp ý đã đưa vào bài.
 - Bài dài khoảng 4.000 từ văn và 380 dòng code, ở ngưỡng gợi ý 30–40 phút đọc.
 
-Còn lại: chủ dự án đọc và duyệt; góp ý đưa ngược vào chuẩn nội dung trước khi đóng ticket.
+**Góp ý lần 1 (23/10/2026), đã sửa:**
+- Nút "Đã học xong bài" thành chip trên thanh đầu bài đọc (breadcrumb + chip), dính khi cuộn ở mọi kích thước màn hình. Bản đặt dưới mục lục và nổi ở góc bị chủ dự án chê nên đã bỏ. E2E kiểm nút nằm trong màn hình khi đang đọc giữa bài.
+- Ví dụ code chỉ hiện code và lời giải thích: bỏ đoạn hướng dẫn lưu và chạy file, bỏ tên file trên khối code. Quy tắc ghi vào `docs/content-standard.md` §3.3.
+
+Còn lại: chủ dự án đọc tiếp và duyệt.

@@ -118,6 +118,7 @@ Ghi chú và bản xem trước ở `design/components/*.md` và `design/system.
 | Terminal | Nền `sunk`, góc 12px, thanh tiêu đề có hình dấu và nhãn nơi chạy viết đủ, nút "Sao chép" dạng viên; dấu nhắc `$` màu `accent` |
 | Expected | Viền nét đứt `field`, chữ `muted`, không có nút sao chép |
 | Check | Hàng có viền, nhãn "Tự kiểm tra", ô tích 22px; khi xong thì ô `green` có tick và cả hàng nền xanh nhạt |
+| Thanh đầu bài đọc | Breadcrumb bên trái, chip viên "Đã học xong bài" bên phải. Dính khi cuộn, ngay dưới thanh mục lục của Fumadocs; đường kẻ dưới chỉ hiện khi đã dính. Chip viền `field`, hover `accent`; khi xong thì chấm `green` có tick và nền xanh nhạt. Màn hình hẹp chỉ giữ link chặng (23/10/2026, theo mẫu ô "Viewed" khi review của GitHub) |
 | Predict | Khung nét đứt `accent`, câu hỏi Bricolage, ô ghi dự đoán, `<details>` "Xem đáp án" |
 | Reveal | Khối viền `rule` có mũi tên |
 | Callout | Nhãn có chấm màu ở trên, nền nhạt theo loại; không viền trái màu, không icon |

@@ -284,11 +284,18 @@ test('bài đọc: ba phần, mục lục lồng đề mục của Kiến thức
     nested,
   );
   expect(targets).toEqual(nested.map(() => 'H3:Knowledge'));
-  if (mobile) await page.keyboard.press('Escape');
+  // Đóng danh sách mục lục: khi mở, nó phủ lên thanh đầu bài như dự định.
+  if (mobile) {
+    await page.locator('[data-toc-popover-trigger]').click();
+    await expect(page.locator('[data-toc-popover]')).not.toHaveAttribute('data-open');
+  }
 
   const progress = page.getByTestId('lesson-progress');
   const done = page.getByRole('button', { name: 'Đã học xong bài' });
   await expect(progress).toContainText('Chưa học xong');
+  // Đang đọc ở giữa bài vẫn bấm được nút: thanh đầu bài dính lại khi cuộn.
+  await page.locator('[data-section="Knowledge"] h3').nth(3).scrollIntoViewIfNeeded();
+  await expect(done).toBeInViewport();
   await done.click();
   await expect(done).toHaveAttribute('aria-pressed', 'true');
   await expect(progress).toContainText('Đã học xong');

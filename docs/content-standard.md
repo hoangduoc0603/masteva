@@ -171,7 +171,8 @@ Bài đọc dạy kiến thức mà không có lab đi kèm, nên phần Kiến 
 - Dùng một bối cảnh xuyên suốt chặng, ví dụ `Product` và giỏ hàng ở J5. Khi cần cho thấy quy tắc là chung, thêm một ví dụ có bề mặt khác. Khi ví dụ chỉ bao phủ một phần cách dùng, ghi rõ phần nó không bao phủ (3.7, 3.8).
 - Output là output thật, chạy với phiên bản ghi trong `verified`. Phần thay đổi giữa các lần chạy (hash, thời gian, thứ tự phần tử của `Set.of`) ghi rõ là sẽ khác (3.9).
 - Mỗi `###` đọc hiểu được theo hai cách: chỉ đọc văn, hoặc chỉ lướt code và output. Lời dẫn và câu đọc output là cầu nối giữa hai cách (3.10).
-- Lệnh shell (ví dụ `java Main.java`) đặt trong `<Terminal where="…">`, theo cùng quy định với bài lab (§2.4).
+- Ví dụ chỉ gồm code và lời giải thích điều cần truyền đạt. Không hướng dẫn lưu file hay chạy ví dụ, không ghi tên file trên khối code (chủ dự án quyết khi duyệt J5.3, 23/10/2026). Việc lưu và chạy từng khối để lấy output là việc của tác giả khi kiểm chứng (§5).
+- Lệnh shell chỉ xuất hiện khi chính lệnh là kiến thức của bài (ví dụ `javac`, `mvn`), đặt trong `<Terminal where="…">` theo quy định của bài lab (§2.4).
 
 ### 3.4 Sơ đồ
 
