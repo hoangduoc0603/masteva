@@ -27,7 +27,6 @@
 **Ghi cho ticket 38:**
 
 - `content/steps/j13/j13-1.mdx:521`: "Thêm nó vào `pom.xml` bằng `perl` (như J1.3)". J1.3 không còn dạy `perl -pi`. Đề xuất: giải thích `perl -0pi -e` ngay tại chỗ (một câu: lệnh tìm và thay trong file tại chỗ), bỏ "(như J1.3)".
-- `content/steps/j2/j2-1.mdx:284`: "Lệnh `perl` dưới đây sửa file tại chỗ như ở J1.3". Cùng lý do; có thể đã mất khi J2 viết lại thành bài đọc, kiểm lại sau khi gộp.
 - `content/steps/d4/d4-1.mdx:352`: "J1.3 đã làm fast-forward và một conflict cơ bản trên project Java". J1.3 giờ là bài đọc. Đề xuất: "J1.3 đã giải thích fast-forward và một conflict cơ bản trên project Java."
-- `content/steps/j2/j2-1.mdx:164`: "đã làm chặng J1". Đề xuất "đã học chặng J1" (có thể đã đổi trong J2 mới).
+- Hai chỗ ở J2.1 cũ ("`perl` sửa file tại chỗ như ở J1.3", "đã làm chặng J1") đã mất khi J2 viết lại (kiểm sau khi gộp `bai-doc-dot-1`), không cần sửa.
 - Các chỗ "JDK 25 như bài J1.1", "đặt lại `JAVA_HOME` như J1.1", "cấu hình Git như J1.3", "`@throws` (J1.3)", "Frames (J1.2)", "`-cp` ở J1.1", "JIT (J1.1)", "`List.of(...).add` (J1.3)" vẫn đúng: bài mới giữ các kiến thức này.
