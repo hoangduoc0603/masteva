@@ -30,6 +30,7 @@
 - **Khối `varies`:** `stdout.encoding` (theo locale), token `SecureRandom`, `ZoneId.systemDefault()`, số mili giây của regex, output `keytool -list` (có ngày tạo).
 - **Nghiệm thu:** `pnpm content:check` xanh; `pnpm content:run-code j9` 3 bài, 44 ví dụ, 0 lỗi; `pnpm build` xanh; mọi lệnh shell trong bài chạy thật. Một lượt đọc với vai người học do một agent riêng làm; các góp ý đã sửa: ký tự BOM vô hình trong code, câu kể cách lấy output ở J9.3, khẳng định sai "hai regex chấp nhận cùng tập" (thêm ví dụ dấu cách cuối), XOR dùng trước khi định nghĩa, "chứng chỉ" chưa định nghĩa, câu dẫn sai số tình huống và số mẫu, "thread" chưa giới thiệu ở mục timeout, callout lặp tình huống. Ví dụ `sendAsync` ban đầu so thời gian với ngưỡng 2 giây và lệch một lần khi máy bận; đã đổi sang đếm số request server xử lý cùng lúc để output ổn định.
 - **Cần chủ dự án quyết:** J9.1 dài khoảng 6.000 từ văn và 12 khái niệm (J5.3 khoảng 3.900 từ), vượt gợi ý 30–40 phút của §3.1, phần lớn do JCA (5 khái niệm). Đề xuất tách JCA thành bài J9.4 với chủ đề mới (ví dụ `j9.mat-ma-jca`); việc này sửa `meta.json` và khoá mã chủ đề, ngoài phạm vi ticket.
+  **Chủ dự án quyết (24/10/2026):** giữ nguyên độ dài, không tách bài.
 
 **Ghi cho ticket 38:** sáu bài nhắc tới ghi chú "Maven chạy trên JDK 25 in thêm `WARNING:`" của lab J9.3, mà bài đọc J9.3 không còn (không còn `mvn -v` hay `exec:java`). Đề xuất đổi "Như J9.3" thành bài Maven của J7 có cùng ghi chú, hoặc viết thẳng ghi chú tại chỗ:
 

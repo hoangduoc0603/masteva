@@ -30,6 +30,7 @@
 - **Mã mục:** xoá 20 mã `j2.1.*`, `j2.2.*`, `j2.3.*` cũ khỏi `ids`; `pnpm content:lock` thêm `j2.1.done`, `j2.2.done`, `j2.3.done`.
 - **Nghiệm thu:** `pnpm content:check`, `pnpm content:run-code j2`, `pnpm build` xanh. Một lượt đọc với vai người học; đã sửa: giải thích field của file nguồn gọn, `Math.random()`, ví dụ `return` cho pass-by-value, generics `<Long>` khi nói `var`, câu mở tình huống cho mục điều khiển luồng, thêm output cho `deepToString`, `equals` của mảng, record bất biến nông và lỗi field trong record.
 - **Cần chủ dự án quyết:** J2.1 dài khoảng 800 dòng (lớn hơn J5.3 khoảng 726 dòng) vì thêm mục pass-by-value; có thể vượt ngưỡng 30–40 phút đọc. Nếu muốn, tách "Toán tử, ép kiểu, điều khiển luồng" sang bài riêng. Chương trình cuối J2.2 (khoảng 45 dòng) và J2.3 (khoảng 50 dòng) dài hơn mức 5–20 dòng của §3.3; giữ nguyên vì là ví dụ ghép lại gần thực tế và tách ra thì không chạy riêng được.
+  **Chủ dự án quyết (24/10/2026):** giữ nguyên độ dài, không tách bài.
 
 **Ghi cho ticket 38:**
 
